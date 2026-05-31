@@ -1663,3 +1663,102 @@ body {
 @keyframes landingSpin {
   to { transform: rotate(360deg); }
 }
+
+/* === Input attach (+) menu === */
+.attach-menu { position: relative; display: inline-flex; }
+
+.attach-btn {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  border: 1px solid var(--app-input-border);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.attach-btn:hover { color: var(--app-brand); border-color: var(--app-brand); }
+
+.attach-popover {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  min-width: 248px;
+  max-width: 340px;
+  padding: 4px;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-large);
+  background: var(--app-input-secondary-background);
+  box-shadow: 0 6px 24px #00000033;
+  display: flex;
+  flex-direction: column;
+}
+
+.attach-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  color: var(--app-primary-foreground);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.attach-row:hover:not(:disabled) { background: var(--app-ghost-button-hover-background); }
+.attach-row-label { flex: 1; }
+.attach-row-hint { font-size: 11px; color: var(--app-secondary-foreground); opacity: 0.8; }
+.attach-row-disabled { opacity: 0.5; cursor: default; }
+
+.attach-divider { height: 1px; background: var(--app-input-border); margin: 4px 2px; }
+
+.attach-section-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px 3px;
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+}
+
+.attach-skill-list {
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.attach-note { padding: 7px 9px; font-size: 12px; color: var(--app-secondary-foreground); }
+
+.attach-skill-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  padding: 6px 9px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+}
+.attach-skill-row:hover { background: var(--app-ghost-button-hover-background); }
+.attach-skill-name {
+  font-size: 12px;
+  font-family: var(--app-monospace-font-family);
+  color: var(--app-primary-foreground);
+}
+.attach-skill-desc {
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

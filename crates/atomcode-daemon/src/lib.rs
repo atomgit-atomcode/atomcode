@@ -3106,6 +3106,26 @@ pub fn list_subdirs(dir: &std::path::Path) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+/// List regular (non-directory) files in `dir`, skipping hidden (`.`-prefixed)
+/// entries. Used by the webui file picker to insert an absolute file path into
+/// the chat input.
+pub fn list_files(dir: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if !name.starts_with('.') {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 #[derive(serde::Deserialize)]
 pub struct FsListQuery {
     pub path: String,
@@ -3122,6 +3142,8 @@ async fn fs_list(
         Ok(dirs) => Json(serde_json::json!({
             "path": dir.to_string_lossy(),
             "dirs": dirs,
+            // 文件列表供 webui 文件选择器使用；出错则空数组（不影响目录浏览）。
+            "files": list_files(&dir).unwrap_or_default(),
         }))
         .into_response(),
         Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
@@ -3563,6 +3585,27 @@ mod tests {
             PathBuf::from("/x"),
         );
         assert_eq!(resolved, here);
+    }
+
+    #[test]
+    fn list_files_returns_files_skips_dirs_and_hidden() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atomcode_list_files_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("b.txt"), b"x").unwrap();
+        std::fs::write(tmp.join("a.txt"), b"x").unwrap();
+        std::fs::write(tmp.join(".hidden"), b"x").unwrap();
+        std::fs::create_dir_all(tmp.join("subdir")).unwrap();
+
+        let files = list_files(&tmp).unwrap();
+        assert_eq!(files, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        // 目录不混入文件列表，但仍出现在 list_subdirs。
+        assert!(list_subdirs(&tmp).unwrap().contains(&"subdir".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]

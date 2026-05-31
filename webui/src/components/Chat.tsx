@@ -6,6 +6,8 @@ import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels } f
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { Suggestions } from './Suggestions';
+import { AttachMenu } from './AttachMenu';
+import { FilePicker } from './FilePicker';
 import { useT } from '../settings';
 
 interface ToolRow {
@@ -69,6 +71,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
   const [provider, setProvider] = useState<string | null>(null);
+  const [showFilePicker, setShowFilePicker] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -375,6 +378,37 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     });
   }
 
+  // 在 textarea 光标处插入文本（skill 命令 / 文件路径），并复位高度、聚焦。
+  function insertAtCursor(text: string) {
+    const ta = textareaRef.current;
+    if (!ta) {
+      setInput((v) => v + text);
+      return;
+    }
+    const start = ta.selectionStart ?? ta.value.length;
+    const end = ta.selectionEnd ?? ta.value.length;
+    const next = ta.value.slice(0, start) + text + ta.value.slice(end);
+    setInput(next);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      const pos = start + text.length;
+      el.setSelectionRange(pos, pos);
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+    });
+  }
+
+  // 文件选择器选中 → 插入绝对路径（前面光标非空白则补一个空格，末尾留空格）。
+  function handlePickFile(path: string) {
+    const ta = textareaRef.current;
+    const start = ta?.selectionStart ?? input.length;
+    const before = (ta?.value ?? input).slice(0, start);
+    const needLead = before.length > 0 && !/\s$/.test(before);
+    insertAtCursor((needLead ? ' ' : '') + path + ' ');
+  }
+
   const lastIdx = messages.length - 1;
 
   // 新对话落地态：无会话、无消息、无历史提示 → claude.ai 风格的居中落地页。
@@ -403,13 +437,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         onKeyDown={handleKeyDown}
       />
       <div class="input-footer">
-        <ModelSelector value={provider} onChange={setProvider} />
+        <AttachMenu onInsert={insertAtCursor} onPickFile={() => setShowFilePicker(true)} />
         <span class="footer-spacer" />
         {tokens && (
           <span class="footer-tokens">
             {(tokens.total / 1000).toFixed(1)}k tokens
           </span>
         )}
+        <ModelSelector value={provider} onChange={setProvider} />
         {busy ? (
           <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
             <span class="stop-square" />
@@ -429,21 +464,33 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     </div>
   );
 
+  // 文件选择器模态（落地态与常规态共用一份）。
+  const filePickerModal = showFilePicker && (
+    <FilePicker
+      current={cwd}
+      onPick={handlePickFile}
+      onClose={() => setShowFilePicker(false)}
+    />
+  );
+
   if (landing) {
     return (
-      <div class="chat-landing">
-        <div class="landing-inner">
-          <div class="landing-brand">AtomCode</div>
-          {cwd && (
-            <div class="landing-subtitle">
-              <span class="landing-project">{projName}</span>
-              <span class="landing-path">{projPath}</span>
-            </div>
-          )}
-          {inputBox}
-          <Suggestions cwd={cwd} onPick={fillInput} />
+      <>
+        <div class="chat-landing">
+          <div class="landing-inner">
+            <div class="landing-brand">AtomCode</div>
+            {cwd && (
+              <div class="landing-subtitle">
+                <span class="landing-project">{projName}</span>
+                <span class="landing-path">{projPath}</span>
+              </div>
+            )}
+            {inputBox}
+            <Suggestions cwd={cwd} onPick={fillInput} />
+          </div>
         </div>
-      </div>
+        {filePickerModal}
+      </>
     );
   }
 
@@ -529,6 +576,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
 
       {/* Floating input */}
       <div class="input-container">{inputBox}</div>
+      {filePickerModal}
     </>
   );
 }
