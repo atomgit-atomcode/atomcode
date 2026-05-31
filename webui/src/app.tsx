@@ -8,7 +8,7 @@ import { ThemeDialog, LanguageDialog, ModelConfigDialog } from './components/Set
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
-import { getProject, SessionMetaWithProject } from './api';
+import { getProject, listSessions, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
 
 function cwdDisplay(cwd: string): { prefix: string; name: string } {
@@ -18,9 +18,18 @@ function cwdDisplay(cwd: string): { prefix: string; name: string } {
   return { prefix: clean.slice(0, idx + 1), name: clean.slice(idx + 1) };
 }
 
+// 从 URL (?session=<id>) 读取要打开的会话 id，用于刷新后恢复。
+function readSessionIdFromUrl(): string | null {
+  try {
+    return new URLSearchParams(window.location.search).get('session');
+  } catch {
+    return null;
+  }
+}
+
 export function App() {
   const t = useT();
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(() => readSessionIdFromUrl());
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
   const [cwd, setCwd] = useState('');
   const [pending, setPending] = useState<any | null>(null);
@@ -58,15 +67,49 @@ export function App() {
     setSidebarOpen((o) => !o);
   }
 
-  // Seed cwd from /project on mount
+  // Seed cwd from /project on mount（恢复会话时以会话目录为准，故只在仍为空时填充）
   useEffect(() => {
     getProject()
       .then((p) => {
-        if (p.working_dir) setCwd(p.working_dir);
+        if (p.working_dir) setCwd((c) => c || p.working_dir);
       })
       .catch(() => {
         // Ignore; cwd stays empty
       });
+  }, []);
+
+  // 把当前 session id 同步进 URL（?session=<id>），刷新后可恢复。
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (sessionId) {
+      url.searchParams.set('session', sessionId);
+    } else {
+      url.searchParams.delete('session');
+    }
+    window.history.replaceState(null, '', url.pathname + url.search + url.hash);
+  }, [sessionId]);
+
+  // 刷新后若 URL 带 session 但还没有会话元数据，去会话列表里找回完整元数据
+  // （project_hash + working_dir），Chat 才能据此加载历史。仅在挂载时执行一次。
+  useEffect(() => {
+    if (!sessionId || activeSession) return;
+    let cancelled = false;
+    listSessions()
+      .then((list) => {
+        if (cancelled) return;
+        const found = list.find((s) => s.id === sessionId);
+        if (found) {
+          setActiveSession(found);
+          if (found.working_dir) setCwd(found.working_dir);
+        }
+      })
+      .catch(() => {
+        /* 找不到就维持现状：Chat 会显示「继续会话」提示 */
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function handleNewSession() {

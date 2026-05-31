@@ -14,6 +14,7 @@ interface UserInfo {
   username: string;
   name?: string | null;
   email?: string | null;
+  avatar_url?: string | null;
 }
 
 const L = {
@@ -124,6 +125,7 @@ export function LoginButton() {
   if (loggedIn) {
     const label = user?.name || user?.username || 'account';
     const initial = label.slice(0, 1).toUpperCase();
+    const avatar = user?.avatar_url;
     return (
       <div class="sidebar-login" ref={menuRef}>
         <button
@@ -131,7 +133,22 @@ export function LoginButton() {
           onClick={() => setMenuOpen((o) => !o)}
           title={label}
         >
-          <span class="login-avatar">{initial}</span>
+          <span class="login-avatar">
+            {avatar ? (
+              <img
+                class="login-avatar-img"
+                src={avatar}
+                alt={label}
+                referrerpolicy="no-referrer"
+                onError={(e) => {
+                  // Fall back to the initial if the image fails to load.
+                  (e.currentTarget as HTMLImageElement).style.display = 'none';
+                }}
+              />
+            ) : (
+              initial
+            )}
+          </span>
           <span class="login-name">{label}</span>
         </button>
         {menuOpen && (

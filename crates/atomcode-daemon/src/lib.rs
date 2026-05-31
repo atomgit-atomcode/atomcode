@@ -3016,19 +3016,23 @@ pub async fn ensure_server_and_open(host: &str, port: u16) -> String {
         ));
     }
 
-    // 绑定了非回环地址：给出可供其它设备访问的 URL + 安全提示。
+    // 绑定了非回环地址：给出访问 URL + 安全/作用域提示。
     if !is_loopback_authority(&bound_host) {
-        let ext_host = if bound_host == "0.0.0.0" || bound_host == "::" {
-            primary_lan_ipv4()
+        if bound_host == "0.0.0.0" || bound_host == "::" {
+            // 绑定通配地址：探测本机局域网 IP 作为可访问地址。
+            if let Some(ip) = primary_lan_ipv4() {
+                msg.push_str(&format!("\n局域网访问：http://{ip}:{actual_port}/?token={token}"));
+            }
+            msg.push_str(
+                "\n⚠️ 上面是局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
+            );
         } else {
-            Some(bound_host.clone())
-        };
-        if let Some(ip) = ext_host {
-            msg.push_str(&format!("\n外部访问：http://{ip}:{actual_port}/?token={token}"));
+            // 显式指定了具体地址。
+            msg.push_str(&format!("\n访问地址：http://{bound_host}:{actual_port}/?token={token}"));
+            msg.push_str(
+                "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
+            );
         }
-        msg.push_str(
-            "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
-        );
     }
 
     msg
