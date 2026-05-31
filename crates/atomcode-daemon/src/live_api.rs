@@ -1,0 +1,228 @@
+//! LiveSession 的 daemon 侧：独立 turn 构造 + 真实 TurnExecutor + /live 端点。
+//! 不依赖也不修改 process_chat_request / `/chat`（以少量重复换 /chat 零回归）。
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use atomcode_core::config::Config;
+use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
+use atomcode_core::provider;
+use atomcode_core::tool::diagnostics::DiagnosticsTool;
+use atomcode_core::tool::{ToolContext, ToolRegistry};
+use atomcode_core::lsp::manager::build_lsp_manager;
+use atomcode_telemetry::Telemetry;
+use tokio::sync::RwLock;
+
+use crate::CachedMcpRegistry;
+
+/// All components needed to run one agent turn.
+pub(crate) struct TurnParts {
+    pub provider: Arc<dyn atomcode_core::provider::LlmProvider>,
+    pub tools: Arc<ToolRegistry>,
+    pub context: ToolContext,
+    pub config: Config,
+    pub ctx: Arc<dyn atomcode_core::ctx::CtxBuilder>,
+    pub system_prompt: String,
+    pub hook_executor: Arc<atomcode_core::hook::executor::HookExecutor>,
+}
+
+/// 独立构造 turn 组件（与 process_chat_request 等价，但不复用其代码）。
+/// `provider_name` 为 None 时用 config.default_provider。
+pub(crate) async fn build_turn_parts(
+    working_dir: &Path,
+    provider_name: Option<&str>,
+    mcp_cache: &Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
+    telemetry: Arc<Telemetry>,
+) -> anyhow::Result<TurnParts> {
+    use atomcode_core::tool::{
+        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool,
+        list_dir::ListDirTool, read::ReadFileTool, search_replace::SearchReplaceTool,
+        todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool,
+        write::WriteFileTool,
+    };
+
+    // Load config
+    let config_path = Config::default_path();
+    let config = Config::load(&config_path)?;
+
+    // Determine provider
+    let resolved_provider_name = provider_name
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| config.default_provider.clone());
+    let provider_config = config
+        .providers
+        .get(&resolved_provider_name)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved_provider_name))?;
+
+    // Create provider instance
+    let provider = provider::create_provider(provider_config)?;
+
+    // Build tool context — use "live" as session-id label
+    let mut tool_context = ToolContext::with_telemetry(
+        working_dir.to_path_buf(),
+        "live",
+        telemetry,
+    );
+
+    let mut tool_registry = ToolRegistry::new();
+
+    // Honour ATOMCODE_DISABLE_TOOLS env var (same logic as process_chat_request)
+    let disabled_tools: std::collections::HashSet<String> =
+        std::env::var("ATOMCODE_DISABLE_TOOLS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+    let enabled = |name: &str| !disabled_tools.contains(name);
+
+    if enabled("read_file") {
+        tool_registry.register_sync(Box::new(ReadFileTool));
+    }
+    if enabled("write_file") {
+        tool_registry.register_sync(Box::new(WriteFileTool));
+    }
+    if enabled("edit_file") {
+        tool_registry.register_sync(Box::new(EditFileTool));
+    }
+    if enabled("bash") {
+        tool_registry.register_sync(Box::new(BashTool));
+    }
+    if enabled("grep") {
+        tool_registry.register_sync(Box::new(GrepTool));
+    }
+    if enabled("glob") {
+        tool_registry.register_sync(Box::new(GlobTool));
+    }
+    if enabled("list_directory") {
+        tool_registry.register_sync(Box::new(ListDirTool));
+    }
+    if enabled("web_search") {
+        tool_registry.register_sync(Box::new(WebSearchTool));
+    }
+    if enabled("web_fetch") {
+        tool_registry.register_sync(Box::new(WebFetchTool));
+    }
+    if enabled("search_replace") {
+        tool_registry.register_sync(Box::new(SearchReplaceTool));
+    }
+    if enabled("todo") {
+        tool_registry.register_sync(Box::new(TodoTool::new()));
+    }
+
+    // Load skills and register use_skill tool
+    let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
+    skill_registry.reload(working_dir);
+    let has_skills = !skill_registry.is_empty();
+    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
+    if has_skills && enabled("use_skill") {
+        tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
+            registry: skill_registry.clone(),
+        }));
+    }
+
+    // Register MCP tools using per-project cache (same pattern as process_chat_request)
+    let working_dir_buf = working_dir.to_path_buf();
+    let mcp_registry: Arc<McpRegistry> = {
+        let cache = mcp_cache.read().await;
+        if let Some(cached) = cache.get(&working_dir_buf) {
+            cached.registry.clone()
+        } else {
+            drop(cache);
+            // Cache miss — create new registry for this project
+            let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir_buf));
+            new_registry
+                .wait_for_initial_connections(Duration::from_secs(5))
+                .await;
+            // Store in cache
+            let mut cache = mcp_cache.write().await;
+            // Evict LRU if cache is full
+            if cache.len() >= crate::MCP_CACHE_MAX {
+                if let Some(oldest_key) = cache
+                    .iter()
+                    .min_by_key(|(_, v)| v.last_used)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest_key);
+                }
+            }
+            cache.insert(
+                working_dir_buf.clone(),
+                CachedMcpRegistry {
+                    registry: new_registry.clone(),
+                    last_used: std::time::Instant::now(),
+                },
+            );
+            new_registry
+        }
+    };
+    // Update last_used timestamp
+    {
+        let mut cache = mcp_cache.write().await;
+        if let Some(entry) = cache.get_mut(&working_dir_buf) {
+            entry.last_used = std::time::Instant::now();
+        }
+    }
+    let mcp_tools = mcp_registry.list_all_tools().await;
+    if !mcp_tools.is_empty() {
+        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
+    }
+
+    // Build LSP manager from config and inject into ToolContext.
+    let lsp_manager = build_lsp_manager(&config.lsp, working_dir);
+    if lsp_manager.is_some() && enabled("diagnostics") {
+        tool_registry.register_sync(Box::new(DiagnosticsTool));
+    }
+    tool_context.lsp = lsp_manager;
+
+    // Build ctx for the RESOLVED provider (not default) so context-window /
+    // truncation matches the model actually being called when a non-default
+    // provider is selected. (process_chat_request uses default here; build_turn_parts
+    // exposes provider_name explicitly, so we calibrate ctx to it.)
+    let ctx = match config.providers.get(&resolved_provider_name) {
+        Some(pc) => atomcode_core::ctx::for_provider(pc),
+        None => atomcode_core::ctx::for_provider(
+            &atomcode_core::config::provider::ProviderConfig {
+                provider_type: String::new(),
+                api_key: None,
+                model: String::new(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: 128_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                skip_tls_verify: false,
+                ephemeral: true,
+            },
+        ),
+    };
+
+    // Build system prompt
+    let system_prompt =
+        crate::build_api_system_prompt(&working_dir_buf, &config, provider_config, &skill_registry);
+
+    // Build hook executor
+    let hook_executor = Arc::new(atomcode_core::hook::executor::HookExecutor::new(
+        atomcode_core::hook::json_config::load_hooks_config(working_dir),
+    ));
+
+    Ok(TurnParts {
+        provider: provider.into(),
+        tools: Arc::new(tool_registry),
+        context: tool_context,
+        config,
+        ctx,
+        system_prompt,
+        hook_executor,
+    })
+}

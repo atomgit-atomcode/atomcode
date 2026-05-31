@@ -10,6 +10,7 @@ mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
+pub(crate) mod live_api;
 mod telemetry_scope;
 pub mod auth_token;
 pub mod permission_bridge;
@@ -2569,7 +2570,7 @@ async fn process_chat_request(
 /// full rules). The only omission is plan mode (not applicable in API mode).
 ///
 /// This function is self-contained — it does NOT touch any TUI code path.
-fn build_api_system_prompt(
+pub(crate) fn build_api_system_prompt(
     working_dir: &PathBuf,
     _config: &Config,
     provider_config: &atomcode_core::config::provider::ProviderConfig,
