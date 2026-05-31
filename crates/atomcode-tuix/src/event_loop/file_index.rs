@@ -5,7 +5,7 @@
 // See spec: docs/superpowers/specs/2026-05-06-at-mention-design.md
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
@@ -100,10 +100,17 @@ pub fn split_token(token: &str) -> (String, String) {
 // ---------------------------------------------------------------------------
 
 /// Lazy project file/directory index, gitignore-filtered, cached for the
-/// session. Built on first `filter()` call.
+/// session. Built on first `filter()` call in a background thread so the
+/// event loop is never blocked by a synchronous file-system walk.
 pub struct FileIndex {
     root: PathBuf,
     entries: RefCell<Option<Vec<Entry>>>,
+    /// When `Some`, a background build is in progress. The receiver
+    /// returns the completed entries once the walk finishes.
+    pending: RefCell<Option<std::sync::mpsc::Receiver<Vec<Entry>>>>,
+    /// True once the initial background build has been kicked off, so we
+    /// don't spawn a second thread while the first is still running.
+    building: RefCell<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,20 +127,90 @@ impl FileIndex {
         Self {
             root,
             entries: RefCell::new(None),
+            pending: RefCell::new(None),
+            building: RefCell::new(false),
         }
+    }
+
+    /// Kick off a background build if none is running and no cached
+    /// entries exist. Returns `true` when a background thread was
+    /// spawned (first-ever call), `false` otherwise.
+    ///
+    /// **Staged warm-up**: before spawning the full-tree walk, the
+    /// root's direct children are collected synchronously via a quick
+    /// `read_dir` and stored immediately. This lets `filter()` return
+    /// results on the very first `@` keystroke (showing top-level
+    /// files/dirs) without waiting for the full walk to finish.
+    /// The background thread replaces the cache with the complete
+    /// index when it completes.
+    pub fn build_async(&self) -> bool {
+        if self.entries.borrow().is_some() {
+            return false; // already cached (shallow or full)
+        }
+        if *self.building.borrow() {
+            return false; // already building
+        }
+        *self.building.borrow_mut() = true;
+
+        // Stage 1: quick synchronous scan of root's direct children.
+        // This is a single `read_dir` syscall — effectively instant.
+        *self.entries.borrow_mut() = Some(Self::scan_shallow(&self.root));
+
+        // Stage 2: spawn background thread for the full walk.
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.pending.borrow_mut() = Some(rx);
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let walked = Self::walk_inner(root);
+            let _ = tx.send(walked);
+        });
+        true
     }
 
     /// Returns matching entries under `scope_dir` filtered by substring
     /// `filter` (case-insensitive). Sorted by direct-child priority,
     /// dir-first, alphabetical. Capped at 30.
+    ///
+    /// If the index has not been built yet, attempts a non-blocking
+    /// drain of the background walk. Returns whatever is available —
+    /// empty `Vec` when the thread is still working is fine; the
+    /// caller will re-invoke `filter` on the next keystroke and get
+    /// the fresh results then.
     pub fn filter(&self, scope_dir: &str, filter: &str) -> Vec<Entry> {
-        // Lazy build on first call.
-        if self.entries.borrow().is_none() {
-            let walked = self.walk();
-            *self.entries.borrow_mut() = Some(walked);
+        // Kick off background build on first call if not already building/cached.
+        self.build_async();
+
+        // Drain background walk result if available.
+        // Note: entries is never None after build_async (it has a shallow
+        // snapshot), so we check pending instead.
+        if self.pending.borrow().is_some() {
+            let mut pending = self.pending.borrow_mut();
+            if let Some(rx) = pending.as_mut() {
+                match rx.try_recv() {
+                    Ok(walked) => {
+                        *self.entries.borrow_mut() = Some(walked);
+                        *self.building.borrow_mut() = false;
+                        *pending = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Background walk still in progress — use shallow entries.
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Thread panicked or dropped — fall back to synchronous walk.
+                        let walked = Self::walk_inner(self.root.clone());
+                        *self.entries.borrow_mut() = Some(walked);
+                        *self.building.borrow_mut() = false;
+                        *pending = None;
+                    }
+                }
+            }
         }
+        // entries is guaranteed to be Some (shallow at minimum), but be defensive.
         let entries = self.entries.borrow();
-        let entries = entries.as_ref().expect("just initialised above");
+        let entries = match entries.as_ref() {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
 
         let filter_lower = filter.to_lowercase();
         let scope_depth = if scope_dir.is_empty() {
@@ -175,22 +252,22 @@ impl FileIndex {
         matched
     }
 
-    fn walk(&self) -> Vec<Entry> {
+    fn walk_inner(root: PathBuf) -> Vec<Entry> {
         let mut out = Vec::new();
-        let walker = WalkBuilder::new(&self.root)
-            .hidden(false) // keep dotfiles
+        let walker = WalkBuilder::new(&root)
+            .hidden(false)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
             .ignore(true)
             .parents(true)
-            .require_git(false) // apply .gitignore even without `.git/`
+            .require_git(false)
             .max_filesize(None)
             .build();
 
         for result in walker {
             let Ok(dent) = result else { continue };
-            let Ok(rel) = dent.path().strip_prefix(&self.root) else {
+            let Ok(rel) = dent.path().strip_prefix(&root) else {
                 continue;
             };
             if rel.as_os_str().is_empty() {
@@ -226,12 +303,56 @@ impl FileIndex {
         out
     }
 
+    /// Fast synchronous scan of a single directory's direct children
+    /// (no recursion). Used by the staged warm-up to show immediate
+    /// results before the full-tree `walk_inner` completes.
+    ///
+    /// Behaviour is deliberately kept in sync with `walk_inner`:
+    /// - Hidden files/dirs are **not** skipped (walk_inner uses `.hidden(false)`)
+    /// - Only `.git/` is explicitly excluded
+    /// - Paths containing whitespace are excluded
+    fn scan_shallow(root: &Path) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(root) else {
+            return out;
+        };
+        for result in rd {
+            let Ok(dent) = result else {
+                continue;
+            };
+            let Ok(name) = dent.file_name().into_string() else {
+                continue;
+            };
+            // Skip `.git/` specifically (same as walk_inner).
+            if name == ".git" {
+                continue;
+            }
+            // v1 limitation: skip paths containing whitespace.
+            if name.contains(char::is_whitespace) {
+                continue;
+            }
+            let is_dir = dent.file_type().map_or(false, |t| t.is_dir());
+            let mut rel = name;
+            if is_dir {
+                rel.push('/');
+            }
+            out.push(Entry {
+                rel_path: rel,
+                is_dir,
+                depth: 1,
+            });
+        }
+        out
+    }
+
     /// Test-only: construct an index with hand-built entries, bypassing walk.
     #[cfg(test)]
     pub fn from_entries(root: PathBuf, entries: Vec<Entry>) -> Self {
         Self {
             root,
             entries: RefCell::new(Some(entries)),
+            pending: RefCell::new(None),
+            building: RefCell::new(false),
         }
     }
 }
@@ -449,6 +570,24 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
     }
 
+    /// Busy-wait helper for tests: keeps calling `filter()` until the
+    /// background walk completes and returns the full-tree entries.
+    /// Times out after 5 seconds so a stuck test fails fast.
+    fn filter_walk(idx: &FileIndex, scope_dir: &str, filter: &str) -> Vec<Entry> {
+        for _ in 0..500 {
+            let result = idx.filter(scope_dir, filter);
+            // Background thread is done when `pending` is consumed (set to None).
+            if idx.pending.borrow().is_none() {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!(
+            "filter_walk timed out after 5s (scope_dir={:?}, filter={:?})",
+            scope_dir, filter
+        );
+    }
+
     #[test]
     fn walk_includes_top_level_files_and_dirs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -456,7 +595,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("crates")).unwrap();
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
-        let result = idx.filter("", "");
+        let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
 
         assert!(names.contains(&"Cargo.toml"), "got: {:?}", names);
@@ -469,7 +608,7 @@ mod tests {
         write_file(&tmp.path().join(".env"), "KEY=val");
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
-        let result = idx.filter("", "");
+        let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         assert!(names.contains(&".env"), "got: {:?}", names);
     }
@@ -482,7 +621,7 @@ mod tests {
         write_file(&tmp.path().join("kept.txt"), "y");
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
-        let result = idx.filter("", "");
+        let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         assert!(names.contains(&"kept.txt"));
         assert!(
@@ -500,7 +639,7 @@ mod tests {
         write_file(&tmp.path().join("Cargo.toml"), "[package]");
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
-        let result = idx.filter("", "");
+        let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         assert!(names.contains(&"Cargo.toml"));
         assert!(
@@ -517,7 +656,7 @@ mod tests {
         write_file(&tmp.path().join("with space.txt"), "y");
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
-        let result = idx.filter("", "");
+        let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         assert!(names.contains(&"normal.txt"));
         assert!(
@@ -525,5 +664,47 @@ mod tests {
             "paths with spaces should be skipped: {:?}",
             names
         );
+    }
+
+    #[test]
+    fn build_async_only_spawns_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("a.txt"), "x");
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+
+        // First call spawns the thread.
+        assert!(idx.build_async());
+        // Second call should be a no-op.
+        assert!(!idx.build_async());
+        // Third call still no-op.
+        assert!(!idx.build_async());
+
+        // Walking is still in progress (or may have finished on a fast FS).
+        // Either way, entries are available after the background thread
+        // completes.
+        let result = filter_walk(&idx, "", "");
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn filter_returns_results_immediately_via_shallow_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("hello.txt"), "x");
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+
+        // First call triggers staged warm-up: shallow scan (read_dir)
+        // returns direct children instantly, background thread fills in
+        // the full tree for substring search.
+        let first = idx.filter("", "");
+        assert!(
+            !first.is_empty(),
+            "shallow scan should return immediate results on first call"
+        );
+        assert_eq!(first[0].rel_path, "hello.txt");
+
+        // Second call after full walk completes should still have results.
+        let second = filter_walk(&idx, "", "");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].rel_path, "hello.txt");
     }
 }
