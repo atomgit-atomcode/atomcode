@@ -146,6 +146,8 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
                 value={inputPath}
                 onInput={(e) => setInputPath((e.target as HTMLInputElement).value)}
                 onKeyDown={(e) => {
+                  // 忽略输入法组字阶段的回车（选词确认），避免误触发跳转。
+                  if (e.isComposing) return;
                   if (e.key === 'Enter') handleJump();
                 }}
                 placeholder="~/..."
