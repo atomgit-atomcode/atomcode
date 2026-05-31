@@ -424,6 +424,7 @@ export function Sidebar({
           <ModelGlyph />
           <span>{t('settings.menuModel')}</span>
         </button>
+        {/* 远程访问入口已移到顶栏右上角（见 app.tsx header-remote-btn）。 */}
       </div>
     ) : null;
 

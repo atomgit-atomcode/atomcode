@@ -7,6 +7,11 @@ function authHeaders(): Record<string, string> {
   return token ? { Authorization: 'Bearer ' + token } : {};
 }
 
+/** Current session token (from the page URL). */
+export function getToken(): string {
+  return token;
+}
+
 export type SSEEvent =
   | { type: 'text'; content: string }
   | { type: 'reasoning'; content: string }
@@ -278,6 +283,32 @@ export interface SkillInfo {
 
 export async function getSkills(): Promise<SkillInfo[]> {
   const resp = await fetch('/skills', { headers: authHeaders() });
+  return resp.json();
+}
+
+// --- Remote access (Tailscale) status ---
+
+export interface TailscaleInfo {
+  installed: boolean;
+  ipv4: string | null;
+  magic_dns: string | null;
+}
+
+export interface TunnelStatus {
+  bind_host: string;
+  port: number;
+  /** server bound to a non-loopback address (reachable by other devices) */
+  reachable: boolean;
+  tailscale: TailscaleInfo;
+  /** ready-to-use remote URL (tailscale ip + token); null when not usable */
+  remote_url: string | null;
+  /** SVG string of the QR code for remote_url; null when not usable */
+  qr_svg: string | null;
+}
+
+export async function getTunnelStatus(): Promise<TunnelStatus> {
+  const resp = await fetch('/tunnel/status', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`tunnel status failed: ${resp.status}`);
   return resp.json();
 }
 

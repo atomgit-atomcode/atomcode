@@ -38,6 +38,8 @@ uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
 regex = "1"
 tracing = "0.1"
+# 远程访问二维码（/tunnel/status 的 SVG）
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }

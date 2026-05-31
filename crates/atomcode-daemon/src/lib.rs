@@ -268,6 +268,9 @@ pub struct AppState {
     pub enforce_token: bool,
     /// webui 交互式权限：session_id -> decider response 发送端
     pub pending_permissions: permission_bridge::PermissionResponders,
+    /// server 绑定的地址 / 端口（供 /tunnel/status 报告远程可达性）。
+    pub bind_host: String,
+    pub bind_port: u16,
 }
 
 /// Cached MCP registry for a specific project directory.
@@ -441,9 +444,20 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             atomcode_core::conversation::message::MessageContent::ToolResultRef(r) => {
                 (r.summary.clone(), None, None, None)
             }
-            atomcode_core::conversation::message::MessageContent::MultiPart { text, .. } => {
-                // 文本原样返回；图片走下面的 images 字段渲染缩略图。
-                (text.clone().unwrap_or_default(), None, None, None)
+            atomcode_core::conversation::message::MessageContent::MultiPart { text, images } => {
+                // 图片走下面的 images 字段渲染缩略图；文本里若拼接了 VL 识别结果
+                // （[图片内容（由 … 识别）] / [图片识别失败]，仅用于喂给非视觉模型），
+                // 展示时剥离，只保留用户原始输入，避免历史里出现一大段识别文字。
+                let raw = text.clone().unwrap_or_default();
+                let display = if images.is_empty() {
+                    raw
+                } else {
+                    match raw.find("[图片内容（由").or_else(|| raw.find("[图片识别失败]")) {
+                        Some(i) => raw[..i].trim_end().to_string(),
+                        None => raw,
+                    }
+                };
+                (display, None, None, None)
             }
         };
 
@@ -2045,40 +2059,36 @@ async fn process_chat_request(
         if images.is_empty() {
             conv.add_user_message(&req.message);
         } else {
-            let (text, images) =
-                match maybe_preprocess(&config, &*provider, &req.message, &images).await {
-                    PreprocessOutcome::Skipped => (req.message.clone(), images),
-                    PreprocessOutcome::Replaced { text, vl_key } => {
-                        let merged = if req.message.trim().is_empty() {
-                            format!("[图片内容（由 {vl_key} 识别）]\n{text}")
-                        } else {
-                            format!("{}\n\n[图片内容（由 {vl_key} 识别）]\n{text}", req.message)
-                        };
-                        (merged, Vec::new())
+            // VL 文本只决定喂给模型的 `text`；原图始终保留在 MultiPart 里。
+            // 非视觉模型在 provider 层会把 MultiPart 降级为纯文本（VL 文本得以
+            // 送达），而会话/历史保留原图，用于在对话里渲染缩略图。
+            let text = match maybe_preprocess(&config, &*provider, &req.message, &images).await {
+                PreprocessOutcome::Skipped => req.message.clone(),
+                PreprocessOutcome::Replaced { text, vl_key } => {
+                    if req.message.trim().is_empty() {
+                        format!("[图片内容（由 {vl_key} 识别）]\n{text}")
+                    } else {
+                        format!("{}\n\n[图片内容（由 {vl_key} 识别）]\n{text}", req.message)
                     }
-                    PreprocessOutcome::Failed { .. } => {
-                        let merged = if req.message.trim().is_empty() {
-                            "[图片识别失败]".to_string()
-                        } else {
-                            format!("{}\n\n[图片识别失败]", req.message)
-                        };
-                        (merged, Vec::new())
+                }
+                PreprocessOutcome::Failed { .. } => {
+                    if req.message.trim().is_empty() {
+                        "[图片识别失败]".to_string()
+                    } else {
+                        format!("{}\n\n[图片识别失败]", req.message)
                     }
-                };
-            if images.is_empty() {
-                conv.add_user_message(&text);
-            } else {
-                let idx = conv.messages.len();
-                conv.messages.push(Message {
-                    role: Role::User,
-                    content: MessageContent::MultiPart {
-                        text: if text.is_empty() { None } else { Some(text) },
-                        images,
-                    },
-                    synthetic: false,
-                });
-                conv.turn_tracker.on_user_message(idx);
-            }
+                }
+            };
+            let idx = conv.messages.len();
+            conv.messages.push(Message {
+                role: Role::User,
+                content: MessageContent::MultiPart {
+                    text: if text.is_empty() { None } else { Some(text) },
+                    images,
+                },
+                synthetic: false,
+            });
+            conv.turn_tracker.on_user_message(idx);
         }
     }
     // Build tool registry and context — use real telemetry from AppState (R11.1, R11.2, R11.3)
@@ -3141,6 +3151,121 @@ pub fn stop_server() -> String {
 }
 
 // ============================================================================
+// GET /tunnel/status — 远程访问探测（Tailscale + 绑定可达性 + 二维码）
+// ============================================================================
+
+#[derive(serde::Serialize)]
+struct TailscaleInfo {
+    /// 本机是否装了 tailscale CLI。
+    installed: bool,
+    /// 本机的 tailnet IPv4（100.x），未登录/未运行时为 None。
+    ipv4: Option<String>,
+    /// MagicDNS 名（如 my-mac.tailnet.ts.net），可用时返回。
+    magic_dns: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct TunnelStatus {
+    /// server 绑定地址（127.0.0.1=仅本机；0.0.0.0/具体 IP=可被其它设备访问）。
+    bind_host: String,
+    port: u16,
+    /// 是否绑定到非回环地址（手机/其它设备可达的前提）。
+    reachable: bool,
+    tailscale: TailscaleInfo,
+    /// 推荐的远程访问 URL（Tailscale IP + 当前 token）；不可用时 None。
+    remote_url: Option<String>,
+    /// remote_url 的二维码（SVG 字符串）；不可用时 None。
+    qr_svg: Option<String>,
+}
+
+/// 探测本机 Tailscale 状态（同步阻塞，调用方用 spawn_blocking 包裹）。
+fn tailscale_probe() -> TailscaleInfo {
+    const CANDIDATES: &[&str] = &[
+        "tailscale",
+        "/usr/local/bin/tailscale",
+        "/opt/homebrew/bin/tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    ];
+    for bin in CANDIDATES {
+        let Ok(out) = std::process::Command::new(bin)
+            .args(["status", "--json"])
+            .output()
+        else {
+            continue; // 该候选不存在，试下一个
+        };
+        // 二进制存在即认为已安装；status 失败（未登录/未运行）则 ip 为空。
+        if !out.status.success() {
+            return TailscaleInfo { installed: true, ipv4: None, magic_dns: None };
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+            return TailscaleInfo { installed: true, ipv4: None, magic_dns: None };
+        };
+        let self_ = &v["Self"];
+        let ipv4 = self_["TailscaleIPs"]
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .find(|s| s.parse::<std::net::Ipv4Addr>().is_ok())
+            })
+            .map(|s| s.to_string());
+        let magic_dns = self_["DNSName"]
+            .as_str()
+            .map(|s| s.trim_end_matches('.').to_string())
+            .filter(|s| !s.is_empty());
+        return TailscaleInfo { installed: true, ipv4, magic_dns };
+    }
+    TailscaleInfo { installed: false, ipv4: None, magic_dns: None }
+}
+
+/// GET /tunnel/status - 远程访问探测：绑定地址、Tailscale 状态、远程 URL + 二维码。
+async fn get_tunnel_status(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let ts = tokio::task::spawn_blocking(tailscale_probe)
+        .await
+        .unwrap_or(TailscaleInfo { installed: false, ipv4: None, magic_dns: None });
+
+    let reachable = !is_loopback_authority(&state.bind_host);
+
+    // 仅当 server 实际绑在「能从 tailnet 访问的地址」上时，才给出远程 URL：
+    // 0.0.0.0/:: 覆盖所有网卡，或显式绑到了该 tailscale IP。
+    let ts_reachable = matches!(state.bind_host.as_str(), "0.0.0.0" | "::")
+        || ts.ipv4.as_deref() == Some(state.bind_host.as_str());
+
+    // 复用请求自带的 token（与当前页面同一 token）拼远程 URL。
+    let token = auth_token::token_from_header(
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok()),
+    );
+
+    let (remote_url, qr_svg) = match (&ts.ipv4, &token) {
+        (Some(ip), Some(tok)) if ts_reachable => {
+            let url = format!("http://{}:{}/?token={}", ip, state.bind_port, tok);
+            let qr = qrcode::QrCode::new(url.as_bytes()).ok().map(|code| {
+                code.render::<qrcode::render::svg::Color>()
+                    .min_dimensions(200, 200)
+                    .quiet_zone(true)
+                    .build()
+            });
+            (Some(url), qr)
+        }
+        _ => (None, None),
+    };
+
+    Json(TunnelStatus {
+        bind_host: state.bind_host.clone(),
+        port: state.bind_port,
+        reachable,
+        tailscale: ts,
+        remote_url,
+        qr_svg,
+    })
+}
+
+// ============================================================================
 // GET /skills — 列出 user-invocable 技能（webui 技能选择器）
 // ============================================================================
 
@@ -3375,6 +3500,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         enforce_token: webui_tokens.is_some(),
         webui_tokens: webui_tokens.unwrap_or_default(),
         pending_permissions: permission_bridge::PermissionResponders::new(),
+        bind_host: host.clone(),
+        bind_port: port,
     };
 
     // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。
@@ -3412,6 +3539,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
         .route("/chat/permission", post(chat_permission))
+        // 远程访问状态（Tailscale 探测 + 绑定可达性 + 二维码）
+        .route("/tunnel/status", get(get_tunnel_status))
         // Skills API
         .route("/skills", get(get_skills))
         // Filesystem API

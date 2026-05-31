@@ -4,7 +4,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
-import { ThemeDialog, LanguageDialog, ModelConfigDialog } from './components/SettingsDialogs';
+import { ThemeDialog, LanguageDialog, ModelConfigDialog, RemoteAccessDialog } from './components/SettingsDialogs';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
@@ -291,6 +291,18 @@ export function App() {
             )}
             <span class="cwd-chevron">▾</span>
           </button>
+
+          <button
+            class="ghost-btn header-remote-btn"
+            onClick={() => setSettingsSection('remote')}
+            aria-label={t('settings.menuRemote')}
+            title={t('settings.menuRemote')}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <rect x="4.5" y="1.5" width="7" height="13" rx="1.5" stroke="currentColor" stroke-width="1.2" />
+              <line x1="7" y1="12.3" x2="9" y2="12.3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+            </svg>
+          </button>
         </header>
 
         <div class="session-body app-sidebar">
@@ -320,6 +332,9 @@ export function App() {
       )}
       {settingsSection === 'model' && (
         <ModelConfigDialog onClose={() => setSettingsSection(null)} />
+      )}
+      {settingsSection === 'remote' && (
+        <RemoteAccessDialog onClose={() => setSettingsSection(null)} />
       )}
       {pending && <PermissionCard req={pending} onDone={() => setPending(null)} />}
       {headerDialog === 'rename' && activeSession && (

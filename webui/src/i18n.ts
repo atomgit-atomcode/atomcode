@@ -110,6 +110,20 @@ const zh = {
   'settings.menuTheme': '主题设置',
   'settings.menuLang': '语言设置',
   'settings.menuModel': '模型配置',
+  'settings.menuRemote': '远程访问',
+
+  // Remote access (Tailscale) dialog
+  'remote.title': '远程访问',
+  'remote.intro': '通过 Tailscale 私有网络，从手机等设备安全访问本机 webui（端到端加密、不暴露公网）。',
+  'remote.loading': '检测中…',
+  'remote.ready': '已就绪，用手机扫码或打开下面的地址（手机需登录同一 Tailscale 账号）：',
+  'remote.notReachable': '已检测到 Tailscale，但 webui 仅绑定了本机。请在 TUI 运行 /webui lan（或 /webui --host {ip}）后刷新本页。',
+  'remote.notInstalled': '未检测到 Tailscale。请在本机与手机都安装 Tailscale 并登录同一账号，然后回到这里。',
+  'remote.installLink': '下载 Tailscale',
+  'remote.copy': '复制链接',
+  'remote.copied': '已复制',
+  'remote.refresh': '重新检测',
+  'remote.warnToken': '该链接包含访问令牌，等同于密码，请勿外传。',
 
   // Provider add/delete
   'settings.addModel': '添加模型',
@@ -255,6 +269,19 @@ const en: Record<MsgKey, string> = {
   'settings.menuTheme': 'Theme settings',
   'settings.menuLang': 'Language settings',
   'settings.menuModel': 'Model configuration',
+  'settings.menuRemote': 'Remote access',
+
+  'remote.title': 'Remote access',
+  'remote.intro': 'Reach this webui from your phone or other devices over the Tailscale private network — end-to-end encrypted, nothing exposed publicly.',
+  'remote.loading': 'Checking…',
+  'remote.ready': 'Ready — scan the QR or open the URL below on your phone (it must be signed into the same Tailscale account):',
+  'remote.notReachable': 'Tailscale detected, but the webui is bound to localhost only. Run /webui lan (or /webui --host {ip}) in the TUI, then refresh this page.',
+  'remote.notInstalled': 'Tailscale not detected. Install Tailscale on both this machine and your phone, sign into the same account, then come back.',
+  'remote.installLink': 'Download Tailscale',
+  'remote.copy': 'Copy link',
+  'remote.copied': 'Copied',
+  'remote.refresh': 'Re-check',
+  'remote.warnToken': 'This link contains an access token — treat it like a password and do not share it.',
 
   // Provider add/delete
   'settings.addModel': 'Add model',

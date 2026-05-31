@@ -1214,6 +1214,35 @@ body {
 /* Provider list inside the settings model section. */
 .provider-list { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
 
+/* --- Remote access (Tailscale) dialog --- */
+.remote-access { gap: 12px; }
+.remote-state { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
+.remote-ready { align-items: center; text-align: center; }
+.remote-qr {
+  background: #ffffff;
+  padding: 8px;
+  border-radius: 8px;
+  width: 200px;
+  height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.remote-qr svg { width: 100%; height: 100%; display: block; }
+.remote-url {
+  font-family: var(--app-monospace-font-family);
+  font-size: 12px;
+  word-break: break-all;
+  background: var(--app-input-secondary-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  padding: 6px 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.remote-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.remote-warn { color: var(--app-warning-accent); }
+
 /* Directory browser */
 .dir-browser {
   border: 1px solid var(--app-input-border);
