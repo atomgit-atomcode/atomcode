@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,6 +24,40 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::CachedMcpRegistry;
+
+// ============================================================================
+// 进程内全局 LiveSession 持有者
+// ============================================================================
+
+/// 进程内单一活动 LiveSession（TUI 与进程内 webui 共享）。
+static LIVE: StdMutex<Option<Arc<atomcode_core::live::LiveSession>>> = StdMutex::new(None);
+
+/// 取当前活动 LiveSession（无则 None）。供 TUI（同进程）附着用。
+pub fn current_live_session() -> Option<Arc<atomcode_core::live::LiveSession>> {
+    LIVE.lock().unwrap().clone()
+}
+
+/// 取或建当前活动 LiveSession（webui /live 用）。阶段③ Task 3 会把 auto_approve 改交互式。
+pub(crate) fn ensure_live_session_global(
+    working_dir: std::path::PathBuf,
+    mcp_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>>,
+    telemetry: Arc<atomcode_telemetry::Telemetry>,
+) -> Arc<atomcode_core::live::LiveSession> {
+    let mut g = LIVE.lock().unwrap();
+    if let Some(s) = g.as_ref() {
+        return s.clone();
+    }
+    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(DaemonTurnExecutor {
+        working_dir,
+        provider_name: None,
+        mcp_cache,
+        telemetry,
+        auto_approve: true, // 交互式审批在 Task 3 接入
+    });
+    let session = atomcode_core::live::LiveSession::new(executor, Vec::new());
+    *g = Some(session.clone());
+    session
+}
 
 /// All components needed to run one agent turn.
 pub(crate) struct TurnParts {
@@ -324,7 +358,6 @@ use axum::{
 };
 use futures::stream::StreamExt;
 use serde::Serialize;
-use atomcode_core::live::LiveSession;
 use crate::AppState;
 
 // ============================================================================
@@ -387,7 +420,8 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
 // ============================================================================
 
 pub(crate) async fn live_stream(State(state): State<AppState>) -> impl IntoResponse {
-    let session = ensure_live_session(&state).await;
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    let session = ensure_live_session_global(working_dir, state.mcp_cache.clone(), state.telemetry.clone());
     let (snapshot, mut rx) = session.join().await;
 
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
@@ -419,7 +453,8 @@ pub(crate) struct LiveMessageReq {
 }
 
 pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<LiveMessageReq>) -> impl IntoResponse {
-    let session = ensure_live_session(&state).await;
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    let session = ensure_live_session_global(working_dir, state.mcp_cache.clone(), state.telemetry.clone());
     let ok = session.send_input(UserInput {
         text: req.message,
         images: req.images.into_iter().map(|i| ImagePart { media_type: i.media_type, data: i.data }).collect(),
@@ -427,23 +462,3 @@ pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<
     Json(serde_json::json!({ "accepted": ok }))
 }
 
-/// 取当前活动 LiveSession；无则用当前 project 的 working_dir 新建一个（阶段②自动批准）。
-pub(crate) async fn ensure_live_session(state: &AppState) -> Arc<LiveSession> {
-    {
-        let guard = state.live_session.lock().await;
-        if let Some(s) = guard.as_ref() {
-            return s.clone();
-        }
-    }
-    let working_dir = { state.project.read().await.working_dir.clone() };
-    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(DaemonTurnExecutor {
-        working_dir,
-        provider_name: None,
-        mcp_cache: state.mcp_cache.clone(),
-        telemetry: state.telemetry.clone(),
-        auto_approve: true,
-    });
-    let session = LiveSession::new(executor, Vec::new());
-    *state.live_session.lock().await = Some(session.clone());
-    session
-}
