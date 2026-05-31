@@ -6,14 +6,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use atomcode_core::config::Config;
+use atomcode_core::conversation::Conversation;
+use atomcode_core::live::{LiveEvent, TurnExecutor};
 use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::lsp::manager::build_lsp_manager;
+use atomcode_core::turn::event::{TurnEvent, TurnResult};
+use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode, PermissionDecider};
+use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::Telemetry;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::CachedMcpRegistry;
 
@@ -225,4 +232,83 @@ pub(crate) async fn build_turn_parts(
         system_prompt,
         hook_executor,
     })
+}
+
+/// 真实执行器：每个 turn 用 build_turn_parts 建 TurnRunner，跑 turn 循环，
+/// 把 TurnRunner 的 mpsc<TurnEvent> 桥接成 LiveEvent::Turn 广播。
+pub(crate) struct DaemonTurnExecutor {
+    pub working_dir: PathBuf,
+    pub provider_name: Option<String>,
+    pub mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
+    pub telemetry: Arc<Telemetry>,
+    /// 阶段②：自动批准（true=BypassAll），便于多 tab 验证；阶段③改交互式审批。
+    pub auto_approve: bool,
+}
+
+#[async_trait]
+impl TurnExecutor for DaemonTurnExecutor {
+    async fn run_turn(
+        &self,
+        conv: &Arc<Mutex<Conversation>>,
+        events: broadcast::Sender<LiveEvent>,
+        cancel: CancellationToken,
+    ) {
+        let parts = match build_turn_parts(
+            &self.working_dir,
+            self.provider_name.as_deref(),
+            &self.mcp_cache,
+            self.telemetry.clone(),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = events.send(LiveEvent::Turn(TurnEvent::Error(format!("构造 turn 失败：{e}"))));
+                return;
+            }
+        };
+
+        let permission: Box<dyn PermissionDecider> = Box::new(AutoPermissionDecider::new(
+            if self.auto_approve { AutoPermissionMode::BypassAll } else { AutoPermissionMode::DenyAll },
+        ));
+
+        let mut runner = TurnRunner {
+            provider: parts.provider,
+            tools: parts.tools,
+            context: parts.context,
+            config: parts.config,
+            ctx: parts.ctx,
+            permission,
+            recently_edited_files: Vec::new(),
+            hook_executor: parts.hook_executor,
+            loop_guard: Default::default(),
+        };
+
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
+        let ev2 = events.clone();
+        let forward = tokio::spawn(async move {
+            while let Some(te) = turn_rx.recv().await {
+                let _ = ev2.send(LiveEvent::Turn(te));
+            }
+        });
+
+        {
+            let mut c = conv.lock().await;
+            loop {
+                let result = runner
+                    .run(&mut c, &parts.system_prompt, &turn_tx, cancel.clone())
+                    .await;
+                match result {
+                    TurnResult::UsedTools { .. } => continue,
+                    TurnResult::Responded { .. } | TurnResult::Cancelled => break,
+                    TurnResult::Failed(e) => {
+                        let _ = turn_tx.send(TurnEvent::Error(e));
+                        break;
+                    }
+                }
+            }
+        }
+        drop(turn_tx);
+        let _ = forward.await;
+    }
 }
