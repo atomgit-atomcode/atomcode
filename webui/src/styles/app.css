@@ -1341,13 +1341,13 @@ body {
 }
 
 /* Add model form */
+/* 「添加模型」按钮（模型配置弹窗顶部） */
+.add-model-top { display: flex; justify-content: flex-end; margin-bottom: 10px; }
+
 .add-model-form {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--app-primary-border-color);
 }
 .add-model-field {
   display: flex;

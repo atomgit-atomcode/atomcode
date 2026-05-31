@@ -126,8 +126,8 @@ const zh = {
   'settings.addModel': '添加模型',
   'settings.providerName': '名称',
   'settings.providerType': '类型',
-  'settings.baseUrl': 'Base URL（可选）',
-  'settings.apiKeyInput': 'API Key（可选）',
+  'settings.baseUrl': 'Base URL',
+  'settings.apiKeyInput': 'API Key',
   'settings.setAsDefault': '设为默认',
   'settings.add': '添加',
   'settings.adding': '添加中…',
@@ -135,6 +135,7 @@ const zh = {
   'settings.deleteConfirm': '确定删除模型「{name}」？',
   'settings.addFailed': '添加失败',
   'settings.nameModelRequired': '名称和模型必填',
+  'settings.allRequired': '请填写所有字段',
 
   // CWD picker
   'cwd.title': '切换工作目录',
@@ -277,8 +278,8 @@ const en: Record<MsgKey, string> = {
   'settings.addModel': 'Add model',
   'settings.providerName': 'Name',
   'settings.providerType': 'Type',
-  'settings.baseUrl': 'Base URL (optional)',
-  'settings.apiKeyInput': 'API Key (optional)',
+  'settings.baseUrl': 'Base URL',
+  'settings.apiKeyInput': 'API Key',
   'settings.setAsDefault': 'Set as default',
   'settings.add': 'Add',
   'settings.adding': 'Adding…',
@@ -286,6 +287,7 @@ const en: Record<MsgKey, string> = {
   'settings.deleteConfirm': 'Delete model "{name}"?',
   'settings.addFailed': 'Add failed',
   'settings.nameModelRequired': 'Name and model are required',
+  'settings.allRequired': 'Please fill in all fields',
 
   'cwd.title': 'Switch working directory',
   'cwd.affectsSession': 'Affects current session only',

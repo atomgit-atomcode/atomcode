@@ -106,15 +106,8 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const [config, setConfig] = useState<ConfigInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // Add-model form state
-  const [formName, setFormName] = useState('');
-  const [formType, setFormType] = useState('openai');
-  const [formModel, setFormModel] = useState('');
-  const [formBaseUrl, setFormBaseUrl] = useState('');
-  const [formApiKey, setFormApiKey] = useState('');
-  const [formSetDefault, setFormSetDefault] = useState(false);
-  const [adding, setAdding] = useState(false);
-  const [addError, setAddError] = useState<string | null>(null);
+  // 添加模型改为独立弹窗
+  const [showAdd, setShowAdd] = useState(false);
 
   const reload = () =>
     getConfig()
@@ -133,37 +126,8 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     }
   };
 
-  const handleAdd = async () => {
-    if (!formName.trim() || !formModel.trim()) {
-      setAddError(t('settings.nameModelRequired'));
-      return;
-    }
-    setAdding(true);
-    setAddError(null);
-    try {
-      await createProvider({
-        name: formName.trim(),
-        type: formType,
-        model: formModel.trim(),
-        base_url: formBaseUrl.trim() || undefined,
-        api_key: formApiKey.trim() || undefined,
-        set_default: formSetDefault || undefined,
-      });
-      setFormName('');
-      setFormType('openai');
-      setFormModel('');
-      setFormBaseUrl('');
-      setFormApiKey('');
-      setFormSetDefault(false);
-      reload();
-    } catch (e: unknown) {
-      setAddError((e instanceof Error ? e.message : String(e)));
-    } finally {
-      setAdding(false);
-    }
-  };
-
   return (
+    <>
     <SettingsModal title={t('settings.menuModel')} wide onClose={onClose}>
       <div class="field-group">
         <span class="modal-label">{t('settings.modelConfig')}</span>
@@ -171,6 +135,15 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         {!config && !loadError && <div class="modal-loading">{t('settings.loading')}</div>}
         {config && (
           <>
+            <div class="add-model-top">
+              <button
+                class="btn btn-primary"
+                type="button"
+                onClick={() => setShowAdd(true)}
+              >
+                ＋ {t('settings.addModel')}
+              </button>
+            </div>
             <Row label={t('settings.defaultProvider')} value={config.default_provider} />
             {config.default_workdir && (
               <Row label={t('settings.defaultWorkdir')} value={config.default_workdir} mono />
@@ -225,88 +198,141 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                 </div>
               ))}
             </div>
-
-            {/* Add model form */}
-            <div class="add-model-form">
-              <span class="modal-label">{t('settings.addModel')}</span>
-              <div class="add-model-field">
-                <label class="add-model-label">{t('settings.providerName')}</label>
-                <input
-                  class="menu-input"
-                  type="text"
-                  placeholder="my-deepseek"
-                  value={formName}
-                  onInput={(e) => setFormName((e.target as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="add-model-field">
-                <label class="add-model-label">{t('settings.model')}</label>
-                <input
-                  class="menu-input"
-                  type="text"
-                  placeholder="deepseek-chat"
-                  value={formModel}
-                  onInput={(e) => setFormModel((e.target as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="add-model-row">
-                <div class="add-model-field add-model-field-type">
-                  <label class="add-model-label">{t('settings.providerType')}</label>
-                  <select
-                    class="menu-input"
-                    value={formType}
-                    onChange={(e) => setFormType((e.target as HTMLSelectElement).value)}
-                  >
-                    <option value="openai">openai</option>
-                    <option value="claude">claude</option>
-                    <option value="ollama">ollama</option>
-                  </select>
-                </div>
-                <div class="add-model-field add-model-field-default">
-                  <label class="add-model-checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={formSetDefault}
-                      onChange={(e) => setFormSetDefault((e.target as HTMLInputElement).checked)}
-                    />
-                    {t('settings.setAsDefault')}
-                  </label>
-                </div>
-              </div>
-              <div class="add-model-field">
-                <label class="add-model-label">{t('settings.baseUrl')}</label>
-                <input
-                  class="menu-input"
-                  type="text"
-                  placeholder="https://api.example.com/v1"
-                  value={formBaseUrl}
-                  onInput={(e) => setFormBaseUrl((e.target as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="add-model-field">
-                <label class="add-model-label">{t('settings.apiKeyInput')}</label>
-                <input
-                  class="menu-input"
-                  type="password"
-                  placeholder="sk-..."
-                  value={formApiKey}
-                  onInput={(e) => setFormApiKey((e.target as HTMLInputElement).value)}
-                />
-              </div>
-              {addError && <div class="modal-error">{t('settings.addFailed')}: {addError}</div>}
-              <div class="add-model-actions">
-                <button
-                  class="btn btn-primary"
-                  type="button"
-                  disabled={adding}
-                  onClick={handleAdd}
-                >
-                  {adding ? t('settings.adding') : t('settings.add')}
-                </button>
-              </div>
-            </div>
           </>
         )}
+      </div>
+    </SettingsModal>
+    {showAdd && (
+      <AddModelDialog
+        onClose={() => setShowAdd(false)}
+        onAdded={() => {
+          setShowAdd(false);
+          reload();
+        }}
+      />
+    )}
+    </>
+  );
+}
+
+/** 独立「添加模型」弹窗。base_url 与 api key 为必填。 */
+function AddModelDialog({
+  onClose,
+  onAdded,
+}: {
+  onClose: () => void;
+  onAdded: () => void;
+}) {
+  const { t } = useSettings();
+  const [name, setName] = useState('');
+  const [type, setType] = useState('openai');
+  const [model, setModel] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [setDefault, setSetDefault] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleAdd = async () => {
+    if (!name.trim() || !model.trim() || !baseUrl.trim() || !apiKey.trim()) {
+      setError(t('settings.allRequired'));
+      return;
+    }
+    setAdding(true);
+    setError(null);
+    try {
+      await createProvider({
+        name: name.trim(),
+        type,
+        model: model.trim(),
+        base_url: baseUrl.trim(),
+        api_key: apiKey.trim(),
+        set_default: setDefault || undefined,
+      });
+      onAdded();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  return (
+    <SettingsModal title={t('settings.addModel')} onClose={onClose}>
+      <div class="field-group add-model-form">
+        <div class="add-model-field">
+          <label class="add-model-label">{t('settings.providerName')}</label>
+          <input
+            class="menu-input"
+            type="text"
+            placeholder="my-deepseek"
+            value={name}
+            onInput={(e) => setName((e.target as HTMLInputElement).value)}
+          />
+        </div>
+        <div class="add-model-field">
+          <label class="add-model-label">{t('settings.model')}</label>
+          <input
+            class="menu-input"
+            type="text"
+            placeholder="deepseek-chat"
+            value={model}
+            onInput={(e) => setModel((e.target as HTMLInputElement).value)}
+          />
+        </div>
+        <div class="add-model-row">
+          <div class="add-model-field add-model-field-type">
+            <label class="add-model-label">{t('settings.providerType')}</label>
+            <select
+              class="menu-input"
+              value={type}
+              onChange={(e) => setType((e.target as HTMLSelectElement).value)}
+            >
+              <option value="openai">openai</option>
+              <option value="claude">claude</option>
+              <option value="ollama">ollama</option>
+            </select>
+          </div>
+          <div class="add-model-field add-model-field-default">
+            <label class="add-model-checkbox-label">
+              <input
+                type="checkbox"
+                checked={setDefault}
+                onChange={(e) => setSetDefault((e.target as HTMLInputElement).checked)}
+              />
+              {t('settings.setAsDefault')}
+            </label>
+          </div>
+        </div>
+        <div class="add-model-field">
+          <label class="add-model-label">{t('settings.baseUrl')}</label>
+          <input
+            class="menu-input"
+            type="text"
+            placeholder="https://api.example.com/v1"
+            value={baseUrl}
+            onInput={(e) => setBaseUrl((e.target as HTMLInputElement).value)}
+          />
+        </div>
+        <div class="add-model-field">
+          <label class="add-model-label">{t('settings.apiKeyInput')}</label>
+          <input
+            class="menu-input"
+            type="password"
+            placeholder="sk-..."
+            value={apiKey}
+            onInput={(e) => setApiKey((e.target as HTMLInputElement).value)}
+          />
+        </div>
+        {error && <div class="modal-error">{t('settings.addFailed')}: {error}</div>}
+        <div class="add-model-actions">
+          <button class="btn" type="button" onClick={onClose}>
+            {t('settings.close')}
+          </button>
+          <button class="btn btn-primary" type="button" disabled={adding} onClick={handleAdd}>
+            {adding ? t('settings.adding') : t('settings.add')}
+          </button>
+        </div>
       </div>
     </SettingsModal>
   );

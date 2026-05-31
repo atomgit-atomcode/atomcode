@@ -18,7 +18,7 @@ function cwdDisplay(cwd: string): { prefix: string; name: string } {
   return { prefix: clean.slice(0, idx + 1), name: clean.slice(idx + 1) };
 }
 
-// 从 URL (?session=<id>) 读取要打开的会话 id，用于刷新后恢复。
+// 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
 function readSessionIdFromUrl(): string | null {
   try {
     return new URLSearchParams(window.location.search).get('session');
@@ -27,9 +27,15 @@ function readSessionIdFromUrl(): string | null {
   }
 }
 
+// URL 里只放 UUID 前 8 位以缩短地址；刷新时按前缀在会话列表里还原成完整 id。
+function shortSessionId(id: string): string {
+  return id.slice(0, 8);
+}
+
 export function App() {
   const t = useT();
-  const [sessionId, setSessionId] = useState<string | null>(() => readSessionIdFromUrl());
+  // URL 里是短 id，不能直接当完整 id 用（后端需要完整 id）；先置空，挂载后再还原。
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
   const [cwd, setCwd] = useState('');
   const [pending, setPending] = useState<any | null>(null);
@@ -39,19 +45,32 @@ export function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sessionListVersion, setSessionListVersion] = useState(0);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  // 表头会话菜单改用 fixed 定位，避免被祖先 overflow/层叠裁剪；记录锚点坐标。
+  const [headerMenuPos, setHeaderMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [headerDialog, setHeaderDialog] = useState<'rename' | 'delete' | null>(null);
   const headerMenuRef = useRef<HTMLDivElement>(null);
+  // 挂载时 URL 里的（短）session id；用 ref 暂存，避免被 URL 同步 effect 清掉。
+  const urlSessionRef = useRef<string | null>(readSessionIdFromUrl());
+  // 跳过首次 URL 同步：此时可能正等待把短 id 还原成完整会话，别先清掉参数。
+  const firstUrlSync = useRef(true);
 
-  // Close the header session menu on outside click.
+  // 关闭表头会话菜单：外部点击 / 滚动 / 缩放（fixed 菜单不跟随锚点，故一并关闭）。
   useEffect(() => {
     if (!headerMenuOpen) return;
-    const h = (e: MouseEvent) => {
+    const close = () => setHeaderMenuOpen(false);
+    const onDown = (e: MouseEvent) => {
       if (headerMenuRef.current && !headerMenuRef.current.contains(e.target as Node)) {
         setHeaderMenuOpen(false);
       }
     };
-    document.addEventListener('mousedown', h);
-    return () => document.removeEventListener('mousedown', h);
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+    };
   }, [headerMenuOpen]);
 
   // Chat 完成首条消息后会回传它创建的 session id；若是新 id，刷新侧栏列表。
@@ -78,33 +97,43 @@ export function App() {
       });
   }, []);
 
-  // 把当前 session id 同步进 URL（?session=<id>），刷新后可恢复。
+  // 把当前 session id（取前 8 位）同步进 URL，刷新后可恢复。
   useEffect(() => {
+    // 跳过首次：挂载时若 URL 已带短 id 而 sessionId 尚未还原，别先把参数清掉。
+    if (firstUrlSync.current) {
+      firstUrlSync.current = false;
+      return;
+    }
     const url = new URL(window.location.href);
     if (sessionId) {
-      url.searchParams.set('session', sessionId);
+      url.searchParams.set('session', shortSessionId(sessionId));
     } else {
       url.searchParams.delete('session');
     }
     window.history.replaceState(null, '', url.pathname + url.search + url.hash);
   }, [sessionId]);
 
-  // 刷新后若 URL 带 session 但还没有会话元数据，去会话列表里找回完整元数据
-  // （project_hash + working_dir），Chat 才能据此加载历史。仅在挂载时执行一次。
+  // 刷新后用 URL 里的短 id 去会话列表按前缀还原成完整记录（完整 id + project_hash
+  // + working_dir），再交给 Chat 加载历史。仅在挂载时执行一次。
   useEffect(() => {
-    if (!sessionId || activeSession) return;
+    const urlSid = urlSessionRef.current;
+    if (!urlSid) return;
     let cancelled = false;
     listSessions()
       .then((list) => {
         if (cancelled) return;
-        const found = list.find((s) => s.id === sessionId);
+        // 兼容历史上写入的完整 id：优先精确匹配，否则按前缀匹配。
+        const found =
+          list.find((s) => s.id === urlSid) ??
+          list.find((s) => s.id.startsWith(urlSid));
         if (found) {
+          setSessionId(found.id);
           setActiveSession(found);
           if (found.working_dir) setCwd(found.working_dir);
         }
       })
       .catch(() => {
-        /* 找不到就维持现状：Chat 会显示「继续会话」提示 */
+        /* 找不到就维持现状（回到新建页） */
       });
     return () => {
       cancelled = true;
@@ -189,7 +218,15 @@ export function App() {
               <button
                 class="header-session-name"
                 title={activeSession.name}
-                onClick={() => setHeaderMenuOpen((o) => !o)}
+                onClick={(e) => {
+                  if (headerMenuOpen) {
+                    setHeaderMenuOpen(false);
+                    return;
+                  }
+                  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                  setHeaderMenuPos({ top: r.bottom + 4, left: r.left });
+                  setHeaderMenuOpen(true);
+                }}
               >
                 <span class="header-session-text">{activeSession.name}</span>
                 <svg
@@ -209,8 +246,11 @@ export function App() {
                   />
                 </svg>
               </button>
-              {headerMenuOpen && (
-                <div class="item-menu header-session-menu">
+              {headerMenuOpen && headerMenuPos && (
+                <div
+                  class="item-menu"
+                  style={{ top: `${headerMenuPos.top}px`, left: `${headerMenuPos.left}px` }}
+                >
                   <button
                     class="item-menu-row"
                     onClick={() => {
