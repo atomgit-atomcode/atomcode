@@ -2,7 +2,7 @@
 // Task 15 — sessionId + cwd lifted to App
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels } from '../api';
+import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData } from '../api';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { Suggestions } from './Suggestions';
@@ -23,6 +23,34 @@ interface Message {
   role: 'user' | 'assistant';
   text: string;
   tools: ToolRow[];
+  images?: ImageData[];
+}
+
+/** Max attached images per message and per-image byte cap (base64-decoded). */
+const MAX_IMAGES = 6;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/** Read a File into an ImageData (base64, no data-URL prefix). */
+function fileToImageData(file: File): Promise<ImageData | null> {
+  return new Promise((resolve) => {
+    if (!file.type.startsWith('image/') || file.size > MAX_IMAGE_BYTES) {
+      resolve(null);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      const comma = result.indexOf(',');
+      resolve(comma >= 0 ? { media_type: file.type, data: result.slice(comma + 1) } : null);
+    };
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Build a displayable data URL from an ImageData. */
+function imageDataUrl(img: ImageData): string {
+  return `data:${img.media_type};base64,${img.data}`;
 }
 
 interface TokenUsage {
@@ -72,6 +100,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   const [historyHint, setHistoryHint] = useState<string | null>(null);
   const [provider, setProvider] = useState<string | null>(null);
   const [showFilePicker, setShowFilePicker] = useState(false);
+  const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -122,7 +151,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         const loaded: Message[] = [];
         for (const msg of detail.messages) {
           if (msg.role === 'user') {
-            loaded.push({ role: 'user', text: msg.content ?? '', tools: [] });
+            loaded.push({
+              role: 'user',
+              text: msg.content ?? '',
+              tools: [],
+              images: msg.images && msg.images.length ? msg.images : undefined,
+            });
           } else if (msg.role === 'assistant') {
             const tools: ToolRow[] = (msg.tool_calls ?? []).map((tc) => ({
               id: tc.id,
@@ -302,9 +336,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
 
   async function sendMessage() {
     const text = input.trim();
-    if (!text || busy) return;
+    const images = pendingImages;
+    if ((!text && images.length === 0) || busy) return;
 
     setInput('');
+    setPendingImages([]);
     // 重置输入框高度：清空 value 不会复位之前 auto-resize 撑高的内联 height
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setHistoryHint(null);
@@ -313,7 +349,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     // Push user message + empty assistant placeholder
     setMessages((prev) => [
       ...prev,
-      { role: 'user', text, tools: [] },
+      { role: 'user', text, tools: [], images: images.length ? images : undefined },
       { role: 'assistant', text: '', tools: [] },
     ]);
 
@@ -326,6 +362,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         ...(sessionId ? { session_id: sessionId } : {}),
         ...(cwd ? { working_dir: cwd } : {}),
         ...(provider ? { provider } : {}),
+        ...(images.length ? { images } : {}),
       };
 
       await streamChat(body, handleEvent, controller.signal);
@@ -409,6 +446,38 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     insertAtCursor((needLead ? ' ' : '') + path + ' ');
   }
 
+  // 追加图片（上传或粘贴）：过滤非图片/超限，去除解析失败的，限制总数。
+  async function addImageFiles(files: File[] | FileList) {
+    const arr = Array.from(files).filter((f) => f.type.startsWith('image/'));
+    if (arr.length === 0) return;
+    const parsed = (await Promise.all(arr.map(fileToImageData))).filter(
+      (x): x is ImageData => x !== null,
+    );
+    if (parsed.length === 0) return;
+    setPendingImages((prev) => [...prev, ...parsed].slice(0, MAX_IMAGES));
+  }
+
+  function removePendingImage(idx: number) {
+    setPendingImages((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  // 粘贴图片：从剪贴板提取图片文件（有图才拦截默认行为，纯文本粘贴不受影响）。
+  function handlePaste(e: ClipboardEvent) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (const it of Array.from(items)) {
+      if (it.kind === 'file' && it.type.startsWith('image/')) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) {
+      e.preventDefault();
+      addImageFiles(files);
+    }
+  }
+
   const lastIdx = messages.length - 1;
 
   // 新对话落地态：无会话、无消息、无历史提示 → claude.ai 风格的居中落地页。
@@ -426,6 +495,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
   const inputBox = (
     <div class="input-box">
+      {pendingImages.length > 0 && (
+        <div class="input-thumbs">
+          {pendingImages.map((img, i) => (
+            <div key={i} class="input-thumb">
+              <img src={imageDataUrl(img)} alt="" />
+              <button
+                class="input-thumb-remove"
+                onClick={() => removePendingImage(i)}
+                title={t('attach.removeImage')}
+                aria-label={t('attach.removeImage')}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <textarea
         ref={textareaRef}
         class="message-input"
@@ -435,9 +521,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         disabled={busy}
         onInput={handleInput}
         onKeyDown={handleKeyDown}
+        onPaste={handlePaste}
       />
       <div class="input-footer">
-        <AttachMenu onInsert={insertAtCursor} onPickFile={() => setShowFilePicker(true)} />
+        <AttachMenu
+          onInsert={insertAtCursor}
+          onPickFile={() => setShowFilePicker(true)}
+          onAddImages={addImageFiles}
+        />
         <span class="footer-spacer" />
         {tokens && (
           <span class="footer-tokens">
@@ -453,7 +544,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
           <button
             class="btn-send"
             onClick={sendMessage}
-            disabled={!input.trim()}
+            disabled={!input.trim() && pendingImages.length === 0}
             title={t('chat.send')}
             aria-label={t('chat.send')}
           >
@@ -520,7 +611,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
           if (msg.role === 'user') {
             return (
               <div key={idx} class="user-message-wrapper">
-                <div class="user-message-bubble">{msg.text}</div>
+                <div class="user-message-bubble">
+                  {msg.images && msg.images.length > 0 && (
+                    <div class="msg-images">
+                      {msg.images.map((img, i) => (
+                        <img key={i} class="msg-image" src={imageDataUrl(img)} alt="" />
+                      ))}
+                    </div>
+                  )}
+                  {msg.text}
+                </div>
               </div>
             );
           }

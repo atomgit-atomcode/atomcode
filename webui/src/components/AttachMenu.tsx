@@ -12,6 +12,8 @@ interface AttachMenuProps {
   onInsert: (text: string) => void;
   /** Open the server-side file picker. */
   onPickFile: () => void;
+  /** Attach picked image files (native picker → base64 handled by parent). */
+  onAddImages: (files: FileList) => void;
 }
 
 function PlusIcon() {
@@ -50,12 +52,13 @@ function SkillIcon() {
   );
 }
 
-export function AttachMenu({ onInsert, onPickFile }: AttachMenuProps) {
+export function AttachMenu({ onInsert, onPickFile, onAddImages }: AttachMenuProps) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
   const [loading, setLoading] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Close on outside click.
   useEffect(() => {
@@ -96,12 +99,30 @@ export function AttachMenu({ onInsert, onPickFile }: AttachMenuProps) {
         <PlusIcon />
       </button>
 
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        style="display:none"
+        onChange={(e) => {
+          const input = e.target as HTMLInputElement;
+          if (input.files && input.files.length) onAddImages(input.files);
+          input.value = ''; // allow re-selecting the same file
+        }}
+      />
+
       {open && (
         <div class="attach-popover">
-          <button class="attach-row attach-row-disabled" disabled title={t('attach.imageSoon')}>
+          <button
+            class="attach-row"
+            onClick={() => {
+              setOpen(false);
+              fileInputRef.current?.click();
+            }}
+          >
             <ImageIcon />
             <span class="attach-row-label">{t('attach.image')}</span>
-            <span class="attach-row-hint">{t('attach.imageSoon')}</span>
           </button>
 
           <button

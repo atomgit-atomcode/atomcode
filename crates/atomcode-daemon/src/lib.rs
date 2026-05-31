@@ -370,6 +370,17 @@ pub struct MessageInfo {
     /// Artifacts detected in this message (code blocks, HTML files, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<Vec<ArtifactInfo>>,
+    /// Attached images (base64) for MultiPart user messages — lets the webui
+    /// re-render thumbnails when loading history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageData>>,
+}
+
+/// Serializable image payload returned in session history.
+#[derive(Debug, Serialize)]
+pub struct ImageData {
+    pub media_type: String,
+    pub data: String,
 }
 
 impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
@@ -433,14 +444,28 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             atomcode_core::conversation::message::MessageContent::ToolResultRef(r) => {
                 (r.summary.clone(), None, None, None)
             }
-            atomcode_core::conversation::message::MessageContent::MultiPart { text, images } => {
-                let desc = format!(
-                    "{}[{} image(s)]",
-                    text.as_deref().unwrap_or(""),
-                    images.len()
-                );
-                (desc, None, None, None)
+            atomcode_core::conversation::message::MessageContent::MultiPart { text, .. } => {
+                // 文本原样返回；图片走下面的 images 字段渲染缩略图。
+                (text.clone().unwrap_or_default(), None, None, None)
             }
+        };
+
+        // 提取 MultiPart 的图片，供 webui 历史渲染缩略图。
+        let images = match &msg.content {
+            atomcode_core::conversation::message::MessageContent::MultiPart { images, .. }
+                if !images.is_empty() =>
+            {
+                Some(
+                    images
+                        .iter()
+                        .map(|i| ImageData {
+                            media_type: i.media_type.clone(),
+                            data: i.data.clone(),
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
         };
 
         Self {
@@ -449,6 +474,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             tool_calls,
             tool_result,
             artifacts,
+            images,
         }
     }
 }
@@ -1502,6 +1528,20 @@ pub struct ChatRequest {
     /// Session ID to continue (optional, creates new if not provided)
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Attached images (base64). Empty = text-only. When the active model is
+    /// not vision-capable, these are routed through the configured VL model
+    /// (vision_preprocessor) and turned into text, mirroring the TUI.
+    #[serde(default)]
+    pub images: Vec<ImageInput>,
+}
+
+/// One attached image from the webui (base64-encoded), mapped to core `ImagePart`.
+#[derive(Debug, Deserialize)]
+pub struct ImageInput {
+    /// MIME type, e.g. "image/png".
+    pub media_type: String,
+    /// Base64-encoded image bytes (no data-URL prefix).
+    pub data: String,
 }
 
 /// SSE event types for streaming chat
@@ -1989,7 +2029,61 @@ async fn process_chat_request(
         conv.messages = session.messages.clone();
         conv
     }));
-    conversation.lock().await.add_user_message(&req.message);
+    // 构造用户消息：带图走 MultiPart（vision）；模型不支持视觉时经 vision_preprocessor
+    // 用 VL 模型把图片转文字（与 TUI/agent 行为一致）。无图则纯文本。
+    {
+        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+        use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+
+        let images: Vec<ImagePart> = req
+            .images
+            .iter()
+            .map(|i| ImagePart {
+                media_type: i.media_type.clone(),
+                data: i.data.clone(),
+            })
+            .collect();
+
+        let mut conv = conversation.lock().await;
+        if images.is_empty() {
+            conv.add_user_message(&req.message);
+        } else {
+            let (text, images) =
+                match maybe_preprocess(&config, &*provider, &req.message, &images).await {
+                    PreprocessOutcome::Skipped => (req.message.clone(), images),
+                    PreprocessOutcome::Replaced { text, vl_key } => {
+                        let merged = if req.message.trim().is_empty() {
+                            format!("[图片内容（由 {vl_key} 识别）]\n{text}")
+                        } else {
+                            format!("{}\n\n[图片内容（由 {vl_key} 识别）]\n{text}", req.message)
+                        };
+                        (merged, Vec::new())
+                    }
+                    PreprocessOutcome::Failed { .. } => {
+                        let merged = if req.message.trim().is_empty() {
+                            "[图片识别失败]".to_string()
+                        } else {
+                            format!("{}\n\n[图片识别失败]", req.message)
+                        };
+                        (merged, Vec::new())
+                    }
+                };
+            if images.is_empty() {
+                conv.add_user_message(&text);
+            } else {
+                let idx = conv.messages.len();
+                conv.messages.push(Message {
+                    role: Role::User,
+                    content: MessageContent::MultiPart {
+                        text: if text.is_empty() { None } else { Some(text) },
+                        images,
+                    },
+                    synthetic: false,
+                });
+                conv.turn_tracker.on_user_message(idx);
+            }
+        }
+    }
     // Build tool registry and context — use real telemetry from AppState (R11.1, R11.2, R11.3)
     let mut tool_context =
         ToolContext::with_telemetry(working_dir.clone(), req.session_id.as_deref().unwrap_or("default"), telemetry);

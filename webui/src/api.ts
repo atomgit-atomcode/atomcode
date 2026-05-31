@@ -31,11 +31,18 @@ export async function getModels(): Promise<ModelInfo[]> {
   return r.json();
 }
 
+/** A base64-encoded image attachment (no data-URL prefix). */
+export interface ImageData {
+  media_type: string;
+  data: string;
+}
+
 export interface StreamChatBody {
   message: string;
   session_id?: string;
   working_dir?: string;
   provider?: string;
+  images?: ImageData[];
 }
 
 export async function streamChat(
@@ -161,6 +168,7 @@ export interface SessionMessage {
   tool_calls?: ToolCallInfo[];
   tool_result?: ToolResultInfo;
   artifacts?: unknown;
+  images?: ImageData[];
 }
 
 export interface SessionDetail {
