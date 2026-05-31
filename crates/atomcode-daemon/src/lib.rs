@@ -3545,6 +3545,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/chat/permission", post(chat_permission))
         // 远程访问状态（Tailscale 探测 + 绑定可达性 + 二维码）
         .route("/tunnel/status", get(get_tunnel_status))
+        // Live session API (阶段②)
+        .route("/live", get(live_api::live_stream))
+        .route("/live/message", post(live_api::live_message))
         // Skills API
         .route("/skills", get(get_skills))
         // Filesystem API

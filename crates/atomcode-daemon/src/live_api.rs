@@ -9,7 +9,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::live::{LiveEvent, TurnExecutor};
+use atomcode_core::live::{LiveEvent, TurnExecutor, TurnState, UserInput};
+use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
@@ -313,8 +314,118 @@ impl TurnExecutor for DaemonTurnExecutor {
     }
 }
 
+use axum::{
+    extract::State,
+    response::{
+        sse::{Event, Sse, KeepAlive},
+        IntoResponse,
+        Json,
+    },
+};
+use futures::stream::StreamExt;
+use serde::Serialize;
 use atomcode_core::live::LiveSession;
 use crate::AppState;
+
+// ============================================================================
+// Wire DTO: LiveWireEvent + to_wire
+// ============================================================================
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum LiveWireEvent {
+    #[serde(rename = "snapshot")]
+    Snapshot { messages: Vec<crate::MessageInfo> },
+    #[serde(rename = "user")]
+    UserMessage { text: String, images: Vec<crate::ImageData> },
+    #[serde(rename = "text")]
+    TextDelta { content: String },
+    #[serde(rename = "reasoning")]
+    ReasoningDelta { content: String },
+    #[serde(rename = "tool_start")]
+    ToolStart { id: String, name: String, arguments: String },
+    #[serde(rename = "tool_output")]
+    ToolOutput { chunk: String },
+    #[serde(rename = "tool_result")]
+    ToolResult { id: String, name: String, output: String, success: bool, duration_ms: u64 },
+    #[serde(rename = "tokens")]
+    Tokens { prompt: usize, completion: usize, total: usize },
+    #[serde(rename = "state")]
+    State { running: bool },
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+
+/// Map one LiveEvent → 0/1 wire events (variants the frontend doesn't need → None).
+fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
+    use atomcode_core::turn::event::TurnEvent as TE;
+    Some(match ev {
+        LiveEvent::UserMessage { text, images } => LiveWireEvent::UserMessage {
+            text,
+            images: images.into_iter().map(|i| crate::ImageData { media_type: i.media_type, data: i.data }).collect(),
+        },
+        LiveEvent::StateChanged(s) => LiveWireEvent::State { running: matches!(s, TurnState::Running) },
+        LiveEvent::Turn(te) => match te {
+            TE::TextDelta(content) => LiveWireEvent::TextDelta { content },
+            TE::ReasoningDelta(content) => LiveWireEvent::ReasoningDelta { content },
+            TE::ToolCallStarted { id, name, arguments } => LiveWireEvent::ToolStart { id, name, arguments },
+            TE::ToolOutputChunk { call_id: _, chunk } => LiveWireEvent::ToolOutput { chunk },
+            TE::ToolCallResult { call_id, name, output, success, duration } =>
+                LiveWireEvent::ToolResult { id: call_id, name, output, success, duration_ms: duration.as_millis() as u64 },
+            TE::TokenUsage { prompt_tokens, completion_tokens, total_tokens, .. } =>
+                LiveWireEvent::Tokens { prompt: prompt_tokens, completion: completion_tokens, total: total_tokens },
+            TE::Error(message) => LiveWireEvent::Error { message },
+            TE::Warning(w) => LiveWireEvent::Error { message: format!("[warning] {w}") },
+            TE::ToolCallStreaming { .. } | TE::ToolBatchStarted { .. } | TE::ToolBatchCompleted { .. }
+            | TE::ContextStats { .. } | TE::WorkingDirChanged(_) | TE::ApprovalRequested { .. } => return None,
+        },
+    })
+}
+
+// ============================================================================
+// Handlers: GET /live (SSE) + POST /live/message
+// ============================================================================
+
+pub(crate) async fn live_stream(State(state): State<AppState>) -> impl IntoResponse {
+    let session = ensure_live_session(&state).await;
+    let (snapshot, mut rx) = session.join().await;
+
+    let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
+    let _ = tx.send(LiveWireEvent::Snapshot {
+        messages: snapshot.iter().map(crate::MessageInfo::from).collect(),
+    });
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => { if let Some(w) = to_wire(ev) { if tx.send(w).is_err() { break; } } }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
+        let json = serde_json::to_string(&w).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().data(json))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("ping"))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct LiveMessageReq {
+    pub message: String,
+    #[serde(default)]
+    pub images: Vec<crate::ImageInput>,
+}
+
+pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<LiveMessageReq>) -> impl IntoResponse {
+    let session = ensure_live_session(&state).await;
+    let ok = session.send_input(UserInput {
+        text: req.message,
+        images: req.images.into_iter().map(|i| ImagePart { media_type: i.media_type, data: i.data }).collect(),
+    });
+    Json(serde_json::json!({ "accepted": ok }))
+}
 
 /// 取当前活动 LiveSession；无则用当前 project 的 working_dir 新建一个（阶段②自动批准）。
 pub(crate) async fn ensure_live_session(state: &AppState) -> Arc<LiveSession> {
