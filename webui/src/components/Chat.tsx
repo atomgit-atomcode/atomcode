@@ -178,6 +178,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, tokens]);
 
+  // Abort the live (/live) stream if the component unmounts while sync is on.
+  useEffect(() => () => { liveAbortRef.current?.abort(); }, []);
+
   // ── Shared history → display conversion (reused by session load AND live snapshot) ──
   function sessionMessagesToDisplay(msgs: SessionMessage[]): Message[] {
     const loaded: Message[] = [];
@@ -417,6 +420,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     if (sync) {
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
+      setBusy(true);
       await postLiveMessage(text, images.length ? images : undefined);
       return;
     }
@@ -596,7 +600,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         <button
           class={'btn-sync' + (sync ? ' active' : '')}
           onClick={toggleSync}
-          title={t('sync.toggle')}
+          title={sync ? t('sync.on') : t('sync.off')}
           aria-label={t('sync.toggle')}
           aria-pressed={sync}
         >
