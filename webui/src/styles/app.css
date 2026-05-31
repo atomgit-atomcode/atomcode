@@ -1735,7 +1735,7 @@ body {
   display: flex;
   flex-direction: column;
 }
-.attach-note { padding: 7px 9px; font-size: 12px; color: var(--app-secondary-foreground); }
+.attach-note { padding: 8px 10px; font-size: 12px; line-height: 1.55; color: var(--app-secondary-foreground); word-break: break-word; }
 
 .attach-skill-row {
   display: flex;

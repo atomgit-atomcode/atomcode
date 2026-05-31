@@ -81,7 +81,7 @@ const zh = {
   'attach.file': '上传文件',
   'attach.skill': '选择技能',
   'attach.imageSoon': '即将支持',
-  'attach.skillsEmpty': '无可用技能',
+  'attach.skillsEmpty': '暂无可用技能。在项目 .atomcode/skills/<名称>/SKILL.md 添加技能，或放到 ~/.atomcode/skills/ 全局共享。',
   'attach.skillsLoading': '加载中…',
   // File picker
   'filepicker.title': '选择文件',
@@ -236,7 +236,7 @@ const en: Record<MsgKey, string> = {
   'attach.file': 'Upload file',
   'attach.skill': 'Choose skill',
   'attach.imageSoon': 'Coming soon',
-  'attach.skillsEmpty': 'No skills available',
+  'attach.skillsEmpty': 'No skills yet. Add one at .atomcode/skills/<name>/SKILL.md, or ~/.atomcode/skills/ to share globally.',
   'attach.skillsLoading': 'Loading…',
   'filepicker.title': 'Choose a file',
   'filepicker.empty': '(empty)',
