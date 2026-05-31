@@ -4,8 +4,8 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { listSessions, SessionMetaWithProject } from '../api';
-import { useT, SettingsSection } from '../settings';
-import { MsgKey } from '../i18n';
+import { useT, useSettings, SettingsSection, Theme } from '../settings';
+import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { LoginButton } from './LoginButton';
 
@@ -218,6 +218,7 @@ export function Sidebar({
   onSessionDeleted,
 }: SidebarProps) {
   const t = useT();
+  const { theme, setTheme, lang, setLang } = useSettings();
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
@@ -230,6 +231,7 @@ export function Sidebar({
   const [deleteTarget, setDeleteTarget] = useState<SessionMetaWithProject | null>(null);
   // Settings menu (3 entries → each opens its own dialog), fixed-anchored above the button.
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const [settingsSub, setSettingsSub] = useState<'theme' | 'language' | null>(null);
   const [settingsMenuPos, setSettingsMenuPos] = useState<{ left: number; bottom: number } | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const groupRef = useRef<HTMLDivElement | null>(null);
@@ -346,6 +348,7 @@ export function Sidebar({
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     // Anchor the menu's bottom just above the button (it opens upward).
     setSettingsMenuPos({ left: rect.left, bottom: window.innerHeight - rect.top + 4 });
+    setSettingsSub(null);
     setSettingsMenuOpen(true);
   }
 
@@ -364,14 +367,59 @@ export function Sidebar({
         style={{ left: `${settingsMenuPos.left}px`, bottom: `${settingsMenuPos.bottom}px` }}
       >
         <div class="group-by-menu-title">{t('sidebar.settings')}</div>
-        <button class="item-menu-row" onClick={() => chooseSettings('theme')}>
+
+        {/* 主题：选项少，直接内联展开二级菜单 */}
+        <button
+          class="item-menu-row"
+          onClick={() => setSettingsSub((s) => (s === 'theme' ? null : 'theme'))}
+        >
           <ThemeGlyph />
           <span>{t('settings.menuTheme')}</span>
+          <span class="submenu-caret">{settingsSub === 'theme' ? '▾' : '▸'}</span>
         </button>
-        <button class="item-menu-row" onClick={() => chooseSettings('language')}>
+        {settingsSub === 'theme' && (
+          <div class="settings-submenu">
+            {(
+              [
+                ['light', t('settings.theme.light')],
+                ['dark', t('settings.theme.dark')],
+                ['system', t('settings.theme.system')],
+              ] as [Theme, string][]
+            ).map(([v, label]) => (
+              <button key={v} class="item-menu-row sub" onClick={() => setTheme(v)}>
+                <span>{label}</span>
+                {theme === v && <CheckIcon />}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* 语言：同样内联展开 */}
+        <button
+          class="item-menu-row"
+          onClick={() => setSettingsSub((s) => (s === 'language' ? null : 'language'))}
+        >
           <LangGlyph />
           <span>{t('settings.menuLang')}</span>
+          <span class="submenu-caret">{settingsSub === 'language' ? '▾' : '▸'}</span>
         </button>
+        {settingsSub === 'language' && (
+          <div class="settings-submenu">
+            {(
+              [
+                ['zh', '中文'],
+                ['en', 'English'],
+              ] as [Lang, string][]
+            ).map(([v, label]) => (
+              <button key={v} class="item-menu-row sub" onClick={() => setLang(v)}>
+                <span>{label}</span>
+                {lang === v && <CheckIcon />}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* 模型配置：内容多，仍用弹窗 */}
         <button class="item-menu-row" onClick={() => chooseSettings('model')}>
           <ModelGlyph />
           <span>{t('settings.menuModel')}</span>

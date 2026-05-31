@@ -99,7 +99,9 @@ body {
   background-color: var(--app-header-background);
   user-select: none;
   flex-shrink: 0;
-  overflow: hidden;
+  /* 不裁剪：表头会话下拉菜单要能溢出到表头下方显示。
+     横向溢出由各子元素自身的 ellipsis + 外层 .main-column overflow:hidden 兜底。 */
+  overflow: visible;
 }
 
 .header-title {
@@ -887,6 +889,12 @@ body {
 .item-menu-row:hover { background: var(--app-list-hover-background); }
 .item-menu-row svg { flex-shrink: 0; }
 .item-menu-row.danger { color: var(--app-error-foreground); }
+
+/* 设置菜单：主题/语言的内联二级菜单 */
+.submenu-caret { margin-left: auto; font-size: 10px; color: var(--app-secondary-foreground); flex-shrink: 0; }
+.settings-submenu { display: flex; flex-direction: column; }
+.item-menu-row.sub { padding: 6px 10px 6px 34px; font-size: 12px; color: var(--app-secondary-foreground); }
+.item-menu-row.sub svg { margin-left: auto; color: var(--app-brand); }
 
 .session-empty { padding: 20px; text-align: center; color: var(--app-secondary-foreground); font-size: 12px; }
 

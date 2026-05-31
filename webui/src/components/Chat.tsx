@@ -75,77 +75,91 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   // 当前 Chat 正在显示的会话 id。用于区分「外部切换会话(需重置+加载历史)」
   // 与「本次新建会话首条消息完成后自己拿到的 id(不应重置)」。
   const activeIdRef = useRef<string | null>(null);
+  // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
+  // project_hash 迟到（刷新后由 App 异步回填）导致的重复加载 / 覆盖当前对话。
+  const loadedForRef = useRef<string | null>(null);
 
-  // When sessionId changes from outside (sidebar switch or new session), reset transcript
-  // and try to load session history
+  // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
+  // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
+  // 依赖变化重跑，再真正拉取历史。
   useEffect(() => {
-    // 若 sessionId 正是本 Chat 自己刚产生的（新建会话首条消息完成），不要重置——
-    // 那会清空用户刚看到的对话。仅外部切换/新建按钮才走重置+加载历史。
-    if (sessionId === activeIdRef.current) return;
-    activeIdRef.current = sessionId;
+    // 会话 id 变化（外部切换 / 新建按钮）才重置画布。本 Chat 自建会话首条消息完成后
+    // sessionId 变成自己的 id（activeIdRef 已同步），不重置，以免清空刚看到的对话。
+    if (sessionId !== activeIdRef.current) {
+      activeIdRef.current = sessionId;
+      loadedForRef.current = null;
+      abortRef.current?.abort();
+      setBusy(false);
+      setMessages([]);
+      setTokens(null);
+      setHistoryHint(null);
+    }
 
-    // Abort any in-flight chat
-    abortRef.current?.abort();
-    setBusy(false);
-    setMessages([]);
-    setTokens(null);
-    setHistoryHint(null);
+    if (!sessionId) return;
+    // 已为该会话加载过历史（或它是本 Chat 自建会话）→ 不重复加载、不覆盖。
+    if (loadedForRef.current === sessionId) return;
 
-    if (!sessionId) {
-      // New session — blank slate
+    const projectHash = activeSession?.project_hash;
+    if (!projectHash) {
+      // 还没拿到 project_hash：先给「继续会话」提示，等其到位再由本 effect 重跑加载。
+      setHistoryHint(t('chat.continueSession', { id: sessionId.slice(0, 8) }));
       return;
     }
 
-    // Try to load history via session-detail endpoint
-    if (activeSession?.project_hash) {
-      getSession(activeSession.project_hash, sessionId)
-        .then((detail) => {
-          // Convert loaded messages to display format. Assistant tool_calls become
-          // tool rows; tool-role messages fold their result into the matching row
-          // (by call_id). System messages are skipped.
-          const loaded: Message[] = [];
-          for (const msg of detail.messages) {
-            if (msg.role === 'user') {
-              loaded.push({ role: 'user', text: msg.content ?? '', tools: [] });
-            } else if (msg.role === 'assistant') {
-              const tools: ToolRow[] = (msg.tool_calls ?? []).map((tc) => ({
-                id: tc.id,
-                name: tc.name,
-                args: tc.arguments || tc.display || '',
-                status: 'done' as const,
-              }));
-              loaded.push({ role: 'assistant', text: msg.content ?? '', tools });
-            } else if (msg.role === 'tool' && msg.tool_result) {
-              // Fold the tool result into its originating tool row.
-              const result = msg.tool_result;
-              for (let i = loaded.length - 1; i >= 0; i--) {
-                const m = loaded[i];
-                if (m.role !== 'assistant') continue;
-                const row = m.tools.find((t) => t.id === result.call_id);
-                if (row) {
-                  row.output = result.summary;
-                  row.status = result.success ? 'done' : 'error';
-                  break;
-                }
+    // 标记已为该会话发起加载，避免并发/重复。
+    loadedForRef.current = sessionId;
+    const loadId = sessionId;
+    getSession(projectHash, loadId)
+      .then((detail) => {
+        // 加载期间用户可能已切走，确保结果仍对应当前会话。
+        if (activeIdRef.current !== loadId) return;
+        // Convert loaded messages to display format. Assistant tool_calls become
+        // tool rows; tool-role messages fold their result into the matching row
+        // (by call_id). System messages are skipped.
+        const loaded: Message[] = [];
+        for (const msg of detail.messages) {
+          if (msg.role === 'user') {
+            loaded.push({ role: 'user', text: msg.content ?? '', tools: [] });
+          } else if (msg.role === 'assistant') {
+            const tools: ToolRow[] = (msg.tool_calls ?? []).map((tc) => ({
+              id: tc.id,
+              name: tc.name,
+              args: tc.arguments || tc.display || '',
+              status: 'done' as const,
+            }));
+            loaded.push({ role: 'assistant', text: msg.content ?? '', tools });
+          } else if (msg.role === 'tool' && msg.tool_result) {
+            // Fold the tool result into its originating tool row.
+            const result = msg.tool_result;
+            for (let i = loaded.length - 1; i >= 0; i--) {
+              const m = loaded[i];
+              if (m.role !== 'assistant') continue;
+              const row = m.tools.find((t) => t.id === result.call_id);
+              if (row) {
+                row.output = result.summary;
+                row.status = result.success ? 'done' : 'error';
+                break;
               }
             }
-            // system messages: skip
           }
-          if (loaded.length > 0) {
-            setMessages(loaded);
-          } else {
-            setHistoryHint(t('chat.continueSession', { id: sessionId.slice(0, 8) }));
-          }
-        })
-        .catch(() => {
-          // Endpoint exists but failed — show hint
-          setHistoryHint(t('chat.continueSession', { id: sessionId.slice(0, 8) }));
-        });
-    } else {
-      setHistoryHint(t('chat.continueSession', { id: sessionId.slice(0, 8) }));
-    }
+          // system messages: skip
+        }
+        if (loaded.length > 0) {
+          setMessages(loaded);
+          setHistoryHint(null);
+        } else {
+          setHistoryHint(t('chat.continueSession', { id: loadId.slice(0, 8) }));
+        }
+      })
+      .catch(() => {
+        // 失败回退提示，并清掉标记以允许后续重试。
+        if (activeIdRef.current === loadId) {
+          loadedForRef.current = null;
+          setHistoryHint(t('chat.continueSession', { id: loadId.slice(0, 8) }));
+        }
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
+  }, [sessionId, activeSession?.project_hash]);
 
   // Initialize provider from default model
   useEffect(() => {
@@ -260,8 +274,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         break;
 
       case 'done':
-        // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空。
+        // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
+        // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
         activeIdRef.current = event.session_id;
+        loadedForRef.current = event.session_id;
         onSessionId(event.session_id);
         setBusy(false);
         break;
