@@ -272,6 +272,8 @@ pub struct AppState {
     /// server 绑定的地址 / 端口（供 /tunnel/status 报告远程可达性）。
     pub bind_host: String,
     pub bind_port: u16,
+    /// 当前活动 LiveSession（同步会话）。None = 尚未开启同步。
+    pub live_session: Arc<tokio::sync::Mutex<Option<Arc<atomcode_core::live::LiveSession>>>>,
 }
 
 /// Cached MCP registry for a specific project directory.
@@ -3503,6 +3505,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         pending_permissions: permission_bridge::PermissionResponders::new(),
         bind_host: host.clone(),
         bind_port: port,
+        live_session: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。

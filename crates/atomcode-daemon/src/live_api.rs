@@ -312,3 +312,27 @@ impl TurnExecutor for DaemonTurnExecutor {
         let _ = forward.await;
     }
 }
+
+use atomcode_core::live::LiveSession;
+use crate::AppState;
+
+/// 取当前活动 LiveSession；无则用当前 project 的 working_dir 新建一个（阶段②自动批准）。
+pub(crate) async fn ensure_live_session(state: &AppState) -> Arc<LiveSession> {
+    {
+        let guard = state.live_session.lock().await;
+        if let Some(s) = guard.as_ref() {
+            return s.clone();
+        }
+    }
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(DaemonTurnExecutor {
+        working_dir,
+        provider_name: None,
+        mcp_cache: state.mcp_cache.clone(),
+        telemetry: state.telemetry.clone(),
+        auto_approve: true,
+    });
+    let session = LiveSession::new(executor, Vec::new());
+    *state.live_session.lock().await = Some(session.clone());
+    session
+}
