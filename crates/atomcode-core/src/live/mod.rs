@@ -59,9 +59,8 @@ pub trait TurnExecutor: Send + Sync {
 
 /// 进程内活动会话总线。克隆廉价（内部全是 `Arc`）。
 pub struct LiveSession {
-    /// 单一数据源：turn 期间被执行器持锁修改。
-    #[allow(dead_code)]
-    conversation: Arc<Mutex<Conversation>>,
+    // 锁序：协调器始终先锁 `conversation`、再锁 `snapshot`；视图侧（join/snapshot）只锁 `snapshot`。
+    // 新增方法务必遵守此顺序以避免死锁。
     /// turn 边界更新的「已提交快照」，供 `join()` 不阻塞于运行中的 turn。
     snapshot: Arc<Mutex<Vec<Message>>>,
     events: broadcast::Sender<LiveEvent>,
@@ -83,7 +82,6 @@ impl LiveSession {
         let turn_state = Arc::new(Mutex::new(TurnState::Idle));
 
         let session = Arc::new(Self {
-            conversation: conversation.clone(),
             snapshot: snapshot.clone(),
             events: events.clone(),
             input_tx,
@@ -102,7 +100,8 @@ impl LiveSession {
         session
     }
 
-    /// 订阅实时事件（不含历史快照）。
+    /// 订阅实时事件（不含历史快照）。滞后丢事件（`RecvError::Lagged`）时改调
+    /// [`LiveSession::join`] 重取快照恢复，而非重新 `subscribe`。
     pub fn subscribe(&self) -> broadcast::Receiver<LiveEvent> {
         self.events.subscribe()
     }
@@ -193,8 +192,13 @@ async fn coordinator(
             let conv = conversation.lock().await;
             *snapshot.lock().await = conv.messages.clone();
         }
-        // 排空 turn 执行期间堆积的输入（运行中忽略语义：不排队）。
-        while input_rx.try_recv().is_ok() {}
+        // 排空 turn 执行期间堆积的输入（不排队，避免乱序）；逐条给出忽略提示，
+        // 与运行中守卫的反馈一致，避免静默丢弃。
+        while input_rx.try_recv().is_ok() {
+            let _ = events.send(LiveEvent::Turn(TurnEvent::Warning(
+                "对方正在对话，已忽略本次输入".to_string(),
+            )));
+        }
         *turn_state.lock().await = TurnState::Idle;
         let _ = events.send(LiveEvent::StateChanged(TurnState::Idle));
     }
@@ -288,17 +292,22 @@ mod tests {
         let session = LiveSession::new(exec, Vec::new());
         let mut rx = session.subscribe();
 
+        // 第一条：开始一个长 turn。
         assert!(session.send_input(UserInput { text: "first".into(), images: vec![] }));
         loop {
             if let Ok(LiveEvent::StateChanged(TurnState::Running)) = rx.recv().await {
                 break;
             }
         }
+        // 运行中投第二条：应被忽略（不排队、不作为新 turn 执行）。
         session.send_input(UserInput { text: "second".into(), images: vec![] });
+        let _ = drain_until_idle(&mut rx).await; // 第一条 turn 收尾
 
+        // 再投第三条合法输入并等其收尾：若 "second" 被正确丢弃，calls 应为 2（first+third）；
+        // 若 "second" 漏跑成了第二个 turn，calls 会是 3。事件驱动、无 sleep。
+        assert!(session.send_input(UserInput { text: "third".into(), images: vec![] }));
         let _ = drain_until_idle(&mut rx).await;
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "运行中投的第二条应被忽略");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "运行中投的第二条应被丢弃，仅 first+third 执行");
     }
 
     #[tokio::test]
