@@ -25,11 +25,11 @@
 :root[data-theme='light'] {
   --app-primary-foreground:#1f2328; --app-primary-background:#ffffff; --app-brand-text:#000000;
   --app-secondary-foreground:#57606a; --app-secondary-background:#f6f8fa;
-  --app-input-foreground:#1f2328; --app-input-background:#ffffff; --app-input-border:#d0d7de;
+  --app-input-foreground:#1f2328; --app-input-background:#ffffff; --app-input-border:#e8eaee;
   --app-input-placeholder-foreground:#8c959f; --app-input-secondary-background:#f6f8fa;
   --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f6f8fa; --app-header-background:#ffffff;
-  --app-primary-border-color:#d0d7de; --app-list-hover-background:#eef1f4; --app-list-active-background:#dce3ea;
-  --app-menu-background:#ffffff; --app-menu-border:#d0d7de; --app-menu-foreground:#1f2328; --app-menu-selection-background:#ddf4ff;
+  --app-primary-border-color:#e8eaee; --app-list-hover-background:#eef1f4; --app-list-active-background:#dce3ea;
+  --app-menu-background:#ffffff; --app-menu-border:#e8eaee; --app-menu-foreground:#1f2328; --app-menu-selection-background:#ddf4ff;
   --app-link-color:#0969da; --app-transparent-inner-border:#00000012;
   --app-spinner-foreground:var(--app-brand-button);
   --app-diff-deletion-foreground:#cf222e;
@@ -38,11 +38,11 @@
   :root:not([data-theme='dark']):not([data-theme='light']) {
     --app-primary-foreground:#1f2328; --app-primary-background:#ffffff; --app-brand-text:#000000;
     --app-secondary-foreground:#57606a; --app-secondary-background:#f6f8fa;
-    --app-input-foreground:#1f2328; --app-input-background:#ffffff; --app-input-border:#d0d7de;
+    --app-input-foreground:#1f2328; --app-input-background:#ffffff; --app-input-border:#e8eaee;
     --app-input-placeholder-foreground:#8c959f; --app-input-secondary-background:#f6f8fa;
     --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f6f8fa; --app-header-background:#ffffff;
-    --app-primary-border-color:#d0d7de; --app-list-hover-background:#eef1f4; --app-list-active-background:#dce3ea;
-    --app-menu-background:#ffffff; --app-menu-border:#d0d7de; --app-menu-foreground:#1f2328; --app-menu-selection-background:#ddf4ff;
+    --app-primary-border-color:#e8eaee; --app-list-hover-background:#eef1f4; --app-list-active-background:#dce3ea;
+    --app-menu-background:#ffffff; --app-menu-border:#e8eaee; --app-menu-foreground:#1f2328; --app-menu-selection-background:#ddf4ff;
     --app-link-color:#0969da; --app-transparent-inner-border:#00000012;
     --app-spinner-foreground:var(--app-brand-button);
     --app-diff-deletion-foreground:#cf222e;
