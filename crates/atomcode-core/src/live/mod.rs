@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::conversation::message::{ImagePart, Message, MessageContent, Role};
 use crate::conversation::Conversation;
+use crate::tool::PermissionDecision;
 use crate::turn::event::TurnEvent;
 
 /// 广播容量。视图滞后超过此值会丢最旧事件（视图可重新 `join()` 拉快照恢复）。
@@ -53,6 +54,7 @@ pub trait TurnExecutor: Send + Sync {
         &self,
         conv: &Arc<Mutex<Conversation>>,
         events: broadcast::Sender<LiveEvent>,
+        approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
         cancel: CancellationToken,
     );
 }
@@ -66,6 +68,9 @@ pub struct LiveSession {
     events: broadcast::Sender<LiveEvent>,
     input_tx: mpsc::UnboundedSender<UserInput>,
     turn_state: Arc<Mutex<TurnState>>,
+    /// 当前 turn 的审批响应通道。执行器在需要交互审批的 turn 开始时注册（经 run_turn
+    /// 的 approver 参数）；任一视图调用 `approve` 先到先得地投递决定。
+    approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
 }
 
 impl LiveSession {
@@ -80,12 +85,14 @@ impl LiveSession {
         let (events, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let turn_state = Arc::new(Mutex::new(TurnState::Idle));
+        let approver = Arc::new(Mutex::new(None));
 
         let session = Arc::new(Self {
             snapshot: snapshot.clone(),
             events: events.clone(),
             input_tx,
             turn_state: turn_state.clone(),
+            approver: approver.clone(),
         });
 
         tokio::spawn(coordinator(
@@ -95,6 +102,7 @@ impl LiveSession {
             events,
             input_rx,
             turn_state,
+            approver,
         ));
 
         session
@@ -129,6 +137,20 @@ impl LiveSession {
     pub fn send_input(&self, input: UserInput) -> bool {
         self.input_tx.send(input).is_ok()
     }
+
+    /// 执行器在需要交互审批时注册响应通道（也供测试直接用）。
+    pub async fn register_approver(&self, tx: mpsc::UnboundedSender<PermissionDecision>) {
+        *self.approver.lock().await = Some(tx);
+    }
+
+    /// 任一视图批准/拒绝。先到先得：取走通道并投递；已无通道返回 false。
+    pub async fn approve(&self, decision: PermissionDecision) -> bool {
+        if let Some(tx) = self.approver.lock().await.take() {
+            tx.send(decision).is_ok()
+        } else {
+            false
+        }
+    }
 }
 
 /// 协调器：单写者跑 turn。
@@ -139,6 +161,7 @@ async fn coordinator(
     events: broadcast::Sender<LiveEvent>,
     mut input_rx: mpsc::UnboundedReceiver<UserInput>,
     turn_state: Arc<Mutex<TurnState>>,
+    approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
 ) {
     while let Some(input) = input_rx.recv().await {
         // 单写者守卫：运行中直接忽略本次输入（不排队，避免乱序）。
@@ -184,8 +207,11 @@ async fn coordinator(
 
         // 跑一次 turn（执行器内部持 conv 锁修改并广播 Turn 事件）。
         executor
-            .run_turn(&conversation, events.clone(), CancellationToken::new())
+            .run_turn(&conversation, events.clone(), approver.clone(), CancellationToken::new())
             .await;
+
+        // turn 结束：清空审批槽（防止旧通道被下一个 turn 误用）。
+        *approver.lock().await = None;
 
         // turn 结束：刷新已提交快照、置 Idle。
         {
@@ -224,6 +250,7 @@ mod tests {
             &self,
             conv: &Arc<Mutex<Conversation>>,
             events: broadcast::Sender<LiveEvent>,
+            _approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
             _cancel: CancellationToken,
         ) {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -318,5 +345,20 @@ mod tests {
         let (snap, _rx) = session.join().await;
         assert_eq!(snap.len(), 1, "晚加入应拿到既有快照");
         assert_eq!(snap[0].text(), Some("seed"));
+    }
+
+    #[tokio::test]
+    async fn approval_first_come_first_served() {
+        use crate::tool::PermissionDecision;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = LiveSession::new(fake(calls), Vec::new());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PermissionDecision>();
+        session.register_approver(tx).await;
+
+        assert!(session.approve(PermissionDecision::Allow).await);   // first delivers
+        assert!(!session.approve(PermissionDecision::Deny).await);   // second: slot empty
+
+        assert!(matches!(rx.recv().await, Some(PermissionDecision::Allow)));
     }
 }

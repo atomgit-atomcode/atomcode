@@ -17,6 +17,7 @@ use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
+use atomcode_core::tool::PermissionDecision;
 use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode, PermissionDecider};
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::Telemetry;
@@ -286,6 +287,7 @@ impl TurnExecutor for DaemonTurnExecutor {
         &self,
         conv: &Arc<Mutex<Conversation>>,
         events: broadcast::Sender<LiveEvent>,
+        _approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
         cancel: CancellationToken,
     ) {
         let parts = match build_turn_parts(
