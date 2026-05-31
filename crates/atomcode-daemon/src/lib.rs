@@ -10,7 +10,6 @@ mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
-mod api_suggestions;
 mod telemetry_scope;
 pub mod auth_token;
 pub mod permission_bridge;
@@ -269,8 +268,6 @@ pub struct AppState {
     pub enforce_token: bool,
     /// webui 交互式权限：session_id -> decider response 发送端
     pub pending_permissions: permission_bridge::PermissionResponders,
-    /// 新对话落地页的动态项目建议缓存（按 working_dir）
-    pub suggestions_cache: api_suggestions::SuggestionsCache,
 }
 
 /// Cached MCP registry for a specific project directory.
@@ -3378,7 +3375,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         enforce_token: webui_tokens.is_some(),
         webui_tokens: webui_tokens.unwrap_or_default(),
         pending_permissions: permission_bridge::PermissionResponders::new(),
-        suggestions_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
 
     // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。
@@ -3400,10 +3396,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/sessions/search", get(search_sessions))
         // Current project state (working directory)
         .route("/project", get(get_project_state))
-        .route(
-            "/project/suggestions",
-            get(api_suggestions::get_project_suggestions),
-        )
         .route("/cd", post(change_dir))
         // Historical projects (from sessions directory)
         .route("/projects", get(get_projects))

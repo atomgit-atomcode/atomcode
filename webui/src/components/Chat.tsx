@@ -5,7 +5,6 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData } from '../api';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
-import { Suggestions } from './Suggestions';
 import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { useT } from '../settings';
@@ -401,20 +400,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
   }
 
-  // 落地页建议点击：把完整 prompt 填入输入框并聚焦（用户可编辑后再发送）。
-  function fillInput(prompt: string) {
-    setInput(prompt);
-    requestAnimationFrame(() => {
-      const ta = textareaRef.current;
-      if (!ta) return;
-      ta.focus();
-      ta.style.height = 'auto';
-      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
-      const len = ta.value.length;
-      ta.setSelectionRange(len, len);
-    });
-  }
-
   // 在 textarea 光标处插入文本（skill 命令 / 文件路径），并复位高度、聚焦。
   function insertAtCursor(text: string) {
     const ta = textareaRef.current;
@@ -577,7 +562,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
               </div>
             )}
             {inputBox}
-            <Suggestions cwd={cwd} onPick={fillInput} />
           </div>
         </div>
         {filePickerModal}

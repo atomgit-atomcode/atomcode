@@ -268,28 +268,6 @@ export async function getProject(): Promise<ProjectState> {
   return resp.json();
 }
 
-// --- New-chat landing suggestions ---
-
-export interface Suggestion {
-  /** Short button label (2-6 chars). */
-  label: string;
-  /** Full first message inserted into the input on click. */
-  prompt: string;
-}
-
-export interface SuggestionsResponse {
-  working_dir: string;
-  suggestions: Suggestion[];
-}
-
-/** Fetch dynamic project-based suggestions for the current working dir.
- *  `refresh` bypasses the server-side per-dir cache. */
-export async function getSuggestions(refresh = false): Promise<SuggestionsResponse> {
-  const resp = await fetch('/project/suggestions' + (refresh ? '?refresh=true' : ''), {
-    headers: authHeaders(),
-  });
-  return resp.json();
-}
 
 // --- User-invocable skills (for the input "+" attach menu) ---
 

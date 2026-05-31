@@ -63,18 +63,6 @@ const zh = {
   'chat.error': '[错误: {msg}]',
   'chat.connError': '[连接错误: {msg}]',
 
-  // New-chat landing
-  'landing.refresh': '刷新建议',
-  'landing.loading': '正在分析项目…',
-  'landing.fallback.readLabel': '读懂代码',
-  'landing.fallback.readPrompt': '带我快速了解这个项目的整体结构和核心模块。',
-  'landing.fallback.bugLabel': '修复 Bug',
-  'landing.fallback.bugPrompt': '帮我排查并修复一个 Bug，我先描述现象：',
-  'landing.fallback.testLabel': '补测试',
-  'landing.fallback.testPrompt': '为这个项目里我指定的模块补充单元测试。',
-  'landing.fallback.explainLabel': '解释项目',
-  'landing.fallback.explainPrompt': '解释这个项目是做什么的，技术栈和关键目录分别是什么。',
-
   // Input attach (+) menu
   'attach.menu': '添加',
   'attach.image': '上传图片',
@@ -223,18 +211,6 @@ const en: Record<MsgKey, string> = {
   'chat.send': 'Send',
   'chat.error': '[Error: {msg}]',
   'chat.connError': '[Connection error: {msg}]',
-
-  // New-chat landing
-  'landing.refresh': 'Refresh suggestions',
-  'landing.loading': 'Analyzing project…',
-  'landing.fallback.readLabel': 'Understand code',
-  'landing.fallback.readPrompt': 'Give me a quick tour of this project — its overall structure and core modules.',
-  'landing.fallback.bugLabel': 'Fix a bug',
-  'landing.fallback.bugPrompt': 'Help me track down and fix a bug. Here is what I am seeing: ',
-  'landing.fallback.testLabel': 'Add tests',
-  'landing.fallback.testPrompt': 'Add unit tests for a module I will point you to in this project.',
-  'landing.fallback.explainLabel': 'Explain project',
-  'landing.fallback.explainPrompt': 'Explain what this project does, its tech stack, and what the key directories are.',
 
   'attach.menu': 'Add',
   'attach.image': 'Upload image',
