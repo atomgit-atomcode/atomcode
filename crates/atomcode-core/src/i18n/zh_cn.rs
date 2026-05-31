@@ -684,7 +684,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),
 
         // ── 命令描述 ──
-        Msg::CmdDescWebui => "启动浏览器 webui".into(),
+        Msg::CmdDescWebui => "启动浏览器 webui（子命令：stop / lan / --host <地址>）".into(),
 Msg::CmdDescSetup =>
 "扫描项目、安装种子文件并运行 setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescResume => "恢复上次会话".into(),

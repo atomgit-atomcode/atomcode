@@ -258,6 +258,7 @@ name = "atomcode-daemon"
 version = "4.23.3"
 dependencies = [
  "anyhow",
+ "async-trait",
  "atomcode-core",
  "atomcode-telemetry",
  "axum",
