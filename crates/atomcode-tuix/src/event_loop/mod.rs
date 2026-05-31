@@ -16,6 +16,7 @@
 pub(crate) mod bg_runtime;
 pub(crate) mod commands;
 pub(crate) mod file_index;
+pub(crate) mod live_sync;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
@@ -6536,6 +6537,14 @@ fn handle_agent_event(
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone());
             }
+        }
+        AgentEvent::UserEcho(text) => {
+            // Live-sync: render the peer's user message as a user bubble.
+            renderer.render(UiLine::User(text));
+            renderer.flush();
+        }
+        AgentEvent::PeerBusy(_running) => {
+            // Live-sync: Task 5 will drive input-disable; no-op render for now.
         }
     }
 }
