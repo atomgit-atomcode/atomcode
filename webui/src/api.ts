@@ -414,7 +414,8 @@ export type LiveWireEvent =
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'state'; running: boolean }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string };
 
 export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,
@@ -447,4 +448,15 @@ export async function postLiveMessage(message: string, images?: ImageData[]): Pr
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ message, ...(images && images.length ? { images } : {}) }),
   });
+}
+
+export async function postLivePermission(
+  decision: 'allow' | 'deny' | 'always_allow',
+): Promise<{ accepted: boolean }> {
+  const resp = await fetch('/live/permission', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ decision }),
+  });
+  return resp.json();
 }

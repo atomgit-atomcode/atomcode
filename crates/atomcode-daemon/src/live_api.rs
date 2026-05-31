@@ -18,7 +18,10 @@ use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::tool::PermissionDecision;
-use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode, PermissionDecider};
+use atomcode_core::turn::permission::{
+    ApprovalRequest, AutoPermissionDecider, AutoPermissionMode,
+    InteractivePermissionDecider, PermissionDecider,
+};
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
@@ -53,7 +56,7 @@ pub(crate) fn ensure_live_session_global(
         provider_name: None,
         mcp_cache,
         telemetry,
-        auto_approve: true, // 交互式审批在 Task 3 接入
+        auto_approve: false,
     });
     let session = atomcode_core::live::LiveSession::new(executor, Vec::new());
     *g = Some(session.clone());
@@ -287,7 +290,7 @@ impl TurnExecutor for DaemonTurnExecutor {
         &self,
         conv: &Arc<Mutex<Conversation>>,
         events: broadcast::Sender<LiveEvent>,
-        _approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+        approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
         cancel: CancellationToken,
     ) {
         let parts = match build_turn_parts(
@@ -305,9 +308,38 @@ impl TurnExecutor for DaemonTurnExecutor {
             }
         };
 
-        let permission: Box<dyn PermissionDecider> = Box::new(AutoPermissionDecider::new(
-            if self.auto_approve { AutoPermissionMode::BypassAll } else { AutoPermissionMode::DenyAll },
-        ));
+        // Build the permission decider. When interactive, mirror process_chat_request:
+        // create two channels, register the response sender into the LiveSession approver
+        // slot (so any view calling LiveSession.approve() delivers the decision here),
+        // and keep the request receiver alive for the duration of the turn (the channel
+        // must stay open so InteractivePermissionDecider::decide() can send on it without
+        // erroring; TurnRunner also emits TurnEvent::ApprovalRequested which we broadcast).
+        let (permission, _perm_req_keep): (Box<dyn PermissionDecider>, Option<_>) =
+            if self.auto_approve {
+                (
+                    Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
+                    None,
+                )
+            } else {
+                let (perm_req_tx, perm_req_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+                let (perm_resp_tx, perm_resp_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<PermissionDecision>();
+                // Register the response sender into the LiveSession approver slot.
+                // LiveSession.approve(decision) will take this sender and deliver the decision.
+                *approver.lock().await = Some(perm_resp_tx);
+                let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
+                    atomcode_core::tool::PermissionStore::new(),
+                ));
+                (
+                    Box::new(InteractivePermissionDecider::new(
+                        perm_req_tx,
+                        perm_resp_rx,
+                        perm_store,
+                    )),
+                    Some(perm_req_rx),
+                )
+            };
 
         let mut runner = TurnRunner {
             provider: parts.provider,
@@ -389,6 +421,8 @@ pub(crate) enum LiveWireEvent {
     State { running: bool },
     #[serde(rename = "error")]
     Error { message: String },
+    #[serde(rename = "permission_request")]
+    PermissionRequest { tool_name: String, reason: String, call_id: String, arguments: String },
 }
 
 /// Map one LiveEvent → 0/1 wire events (variants the frontend doesn't need → None).
@@ -411,8 +445,15 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 LiveWireEvent::Tokens { prompt: prompt_tokens, completion: completion_tokens, total: total_tokens },
             TE::Error(message) => LiveWireEvent::Error { message },
             TE::Warning(w) => LiveWireEvent::Error { message: format!("[warning] {w}") },
+            TE::ApprovalRequested { tool_name, reason, call, .. } =>
+                LiveWireEvent::PermissionRequest {
+                    tool_name,
+                    reason,
+                    call_id: call.id,
+                    arguments: call.arguments,
+                },
             TE::ToolCallStreaming { .. } | TE::ToolBatchStarted { .. } | TE::ToolBatchCompleted { .. }
-            | TE::ContextStats { .. } | TE::WorkingDirChanged(_) | TE::ApprovalRequested { .. } => return None,
+            | TE::ContextStats { .. } | TE::WorkingDirChanged(_) => return None,
         },
     })
 }
@@ -461,6 +502,41 @@ pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<
         text: req.message,
         images: req.images.into_iter().map(|i| ImagePart { media_type: i.media_type, data: i.data }).collect(),
     });
+    Json(serde_json::json!({ "accepted": ok }))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct LivePermissionReq {
+    pub decision: String, // "allow" | "deny" | "always_allow"
+}
+
+/// POST /live/permission — Deliver a permission decision for a pending live-session tool-approval
+/// request. First-come-first-served via LiveSession.approve (takes the approver slot).
+///
+/// Decision mapping mirrors /chat/permission:
+///   "allow" | "always_allow" → PermissionDecision::Allow
+///   anything else            → PermissionDecision::Deny
+/// Note: PermissionDecision has no AlwaysAllow variant; always_allow is treated as Allow
+/// (same as /chat/permission Phase-1 behaviour).
+pub(crate) async fn live_permission(
+    State(state): State<AppState>,
+    Json(req): Json<LivePermissionReq>,
+) -> impl IntoResponse {
+    use atomcode_core::tool::PermissionDecision;
+    let decision = match req.decision.as_str() {
+        "allow" | "always_allow" => PermissionDecision::Allow,
+        _ => PermissionDecision::Deny,
+    };
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    let ok = match current_live_session() {
+        Some(s) => s.approve(decision).await,
+        None => {
+            // No live session — try to ensure one exists (idempotent) but there's nothing
+            // waiting; return accepted: false so the caller knows.
+            ensure_live_session_global(working_dir, state.mcp_cache.clone(), state.telemetry.clone());
+            false
+        }
+    };
     Json(serde_json::json!({ "accepted": ok }))
 }
 

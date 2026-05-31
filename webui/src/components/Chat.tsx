@@ -2,11 +2,12 @@
 // Task 15 — sessionId + cwd lifted to App
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, LiveWireEvent, SessionMessage } from '../api';
+import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, LiveWireEvent, SessionMessage } from '../api';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
+import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
 
 interface ToolRow {
@@ -101,6 +102,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const [sync, setSync] = useState(false);
+  // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
+  // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
+  const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -252,6 +256,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
       }
       case 'state': {
         setBusy(e.running);
+        break;
+      }
+      case 'permission_request': {
+        // Mark the tool row as waiting for approval (same as non-sync path)
+        updateToolInLastAssistant(e.call_id, { status: 'waiting_approval' });
+        // Show the PermissionCard for the live session (calls /live/permission via onDecide)
+        setLivePending({ tool_name: e.tool_name, reason: e.reason, call_id: e.call_id, arguments: e.arguments });
         break;
       }
       default: {
@@ -641,6 +652,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     />
   );
 
+  // Live-session PermissionCard: shown when in sync mode and a permission_request arrives.
+  // Uses onDecide to call /live/permission instead of /chat/permission.
+  const livePermissionCard = livePending && (
+    <PermissionCard
+      req={{ session_id: '', tool_name: livePending.tool_name, reason: livePending.reason, call_id: livePending.call_id, arguments: livePending.arguments }}
+      onDone={() => setLivePending(null)}
+      onDecide={async (decision) => { await postLivePermission(decision); }}
+    />
+  );
+
   if (landing) {
     return (
       <>
@@ -657,6 +678,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
           </div>
         </div>
         {filePickerModal}
+        {livePermissionCard}
       </>
     );
   }
@@ -753,6 +775,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
       {/* Floating input */}
       <div class="input-container">{inputBox}</div>
       {filePickerModal}
+      {livePermissionCard}
     </>
   );
 }

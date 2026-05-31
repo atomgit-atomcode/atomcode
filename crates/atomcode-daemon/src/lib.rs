@@ -3545,6 +3545,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Live session API (阶段②)
         .route("/live", get(live_api::live_stream))
         .route("/live/message", post(live_api::live_message))
+        .route("/live/permission", post(live_api::live_permission))
         // Skills API
         .route("/skills", get(get_skills))
         // Filesystem API

@@ -15,6 +15,10 @@ interface PermissionRequest {
 interface PermissionCardProps {
   req: PermissionRequest;
   onDone: () => void;
+  /** Optional override for the decision action. When provided, replaces the
+   *  default respondPermission call. Used by live-session approval (POST /live/permission)
+   *  so the non-sync /chat path is unchanged. */
+  onDecide?: (decision: 'allow' | 'deny' | 'always_allow') => Promise<void>;
 }
 
 function formatArgs(args: unknown): string {
@@ -34,7 +38,7 @@ function formatArgs(args: unknown): string {
   }
 }
 
-export function PermissionCard({ req, onDone }: PermissionCardProps) {
+export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
   const t = useT();
   const [loading, setLoading] = useState(false);
 
@@ -42,7 +46,11 @@ export function PermissionCard({ req, onDone }: PermissionCardProps) {
     if (loading) return;
     setLoading(true);
     try {
-      await respondPermission(req.session_id, decision);
+      if (onDecide) {
+        await onDecide(decision);
+      } else {
+        await respondPermission(req.session_id, decision);
+      }
     } catch {
       // Best-effort; proceed to dismiss regardless
     } finally {
