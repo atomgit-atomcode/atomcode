@@ -1,7 +1,7 @@
 // Task 15b — Working directory picker modal
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { listDir, getProjects, changeDir, ProjectInfo } from '../api';
+import { listDir, getProjects, changeDir, mkdir, ProjectInfo } from '../api';
 import { useT } from '../settings';
 
 interface CwdPickerProps {
@@ -54,6 +54,8 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [setAsDefault, setSetAsDefault] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [newFolder, setNewFolder] = useState('');
+  const [mkdirError, setMkdirError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Load directory listing when browsePath changes
@@ -98,6 +100,20 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
   function handleProjectClick(workingDir: string) {
     setBrowsePath(workingDir);
     setInputPath(workingDir);
+  }
+
+  async function handleCreateFolder() {
+    const name = newFolder.trim();
+    if (!name) return;
+    setMkdirError(null);
+    try {
+      const result = await mkdir(browsePath.replace(/\/+$/, '') + '/' + name);
+      setBrowsePath(result.path);
+      setInputPath(result.path);
+      setNewFolder('');
+    } catch (e: unknown) {
+      setMkdirError(t('cwd.createFailed'));
+    }
   }
 
   async function handleConfirm() {
@@ -191,6 +207,27 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
                   </button>
                 ))}
             </div>
+
+            <div class="cwd-newfolder">
+              <input
+                type="text"
+                class="menu-input"
+                placeholder={t('cwd.folderName')}
+                value={newFolder}
+                onInput={(e) => {
+                  setNewFolder((e.target as HTMLInputElement).value);
+                  setMkdirError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.isComposing) return;
+                  if (e.key === 'Enter') handleCreateFolder();
+                }}
+              />
+              <button class="btn btn-primary" onClick={handleCreateFolder}>
+                {t('cwd.create')}
+              </button>
+            </div>
+            {mkdirError && <div class="dir-note error">{mkdirError}</div>}
           </div>
 
           {/* Recent projects */}

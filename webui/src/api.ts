@@ -345,6 +345,18 @@ export async function listDir(path: string): Promise<FsListResult> {
   return resp.json();
 }
 
+// --- Create directory ---
+
+export async function mkdir(path: string): Promise<{ path: string }> {
+  const r = await fetch('/fs/mkdir', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ path }),
+  });
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
+  return r.json();
+}
+
 // --- Change working directory ---
 
 export interface CdResponse {

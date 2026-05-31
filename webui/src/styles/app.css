@@ -1253,6 +1253,15 @@ body {
 .dir-note { padding: 8px 12px; font-size: 11px; color: var(--app-secondary-foreground); }
 .dir-note.error { color: var(--app-error-foreground); }
 
+/* New-folder inline row inside the directory browser */
+.cwd-newfolder {
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px 4px;
+  align-items: center;
+}
+.cwd-newfolder .menu-input { flex: 1; min-width: 0; }
+
 /* Recent projects / list rows */
 .list-row {
   display: flex;

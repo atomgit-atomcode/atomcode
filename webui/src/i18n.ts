@@ -150,6 +150,10 @@ const zh = {
   'cwd.recentProjects': '最近项目',
   'cwd.current': '当前',
   'cwd.setDefault': '设为默认目录（重启后仍生效）',
+  'cwd.newFolder': '新建文件夹',
+  'cwd.folderName': '文件夹名称',
+  'cwd.create': '创建',
+  'cwd.createFailed': '创建失败',
   'cwd.cancel': '取消',
   'cwd.confirm': '确定',
 
@@ -302,6 +306,10 @@ const en: Record<MsgKey, string> = {
   'cwd.recentProjects': 'Recent projects',
   'cwd.current': 'Current',
   'cwd.setDefault': 'Set as default directory (persists across restarts)',
+  'cwd.newFolder': 'New folder',
+  'cwd.folderName': 'Folder name',
+  'cwd.create': 'Create',
+  'cwd.createFailed': 'Create failed',
   'cwd.cancel': 'Cancel',
   'cwd.confirm': 'Confirm',
 

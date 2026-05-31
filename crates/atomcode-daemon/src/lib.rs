@@ -3244,6 +3244,23 @@ async fn fs_list(
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct FsMkdirRequest { pub path: String }
+
+async fn fs_mkdir(
+    State(_state): State<AppState>,
+    Json(req): Json<FsMkdirRequest>,
+) -> impl IntoResponse {
+    let dir = normalize_dir_arg(&req.path);
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => {
+            let canon = dir.canonicalize().unwrap_or(dir);
+            Json(serde_json::json!({ "path": canon.to_string_lossy() })).into_response()
+        }
+        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
 /// Options controlling how [`run_server`] builds and runs the API server.
 ///
 /// Field types intentionally mirror the tuple returned by the binary's
@@ -3407,6 +3424,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/skills", get(get_skills))
         // Filesystem API
         .route("/fs/list", get(fs_list))
+        .route("/fs/mkdir", post(fs_mkdir))
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
