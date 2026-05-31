@@ -3,7 +3,7 @@
 
 import { ComponentChildren } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { getConfig, ConfigInfo } from '../api';
+import { getConfig, ConfigInfo, createProvider, deleteProvider } from '../api';
 import { useSettings, Theme } from '../settings';
 import { Lang } from '../i18n';
 
@@ -104,22 +104,71 @@ export function LanguageDialog({ onClose }: { onClose: () => void }) {
 export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const { t } = useSettings();
   const [config, setConfig] = useState<ConfigInfo | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  useEffect(() => {
+  // Add-model form state
+  const [formName, setFormName] = useState('');
+  const [formType, setFormType] = useState('openai');
+  const [formModel, setFormModel] = useState('');
+  const [formBaseUrl, setFormBaseUrl] = useState('');
+  const [formApiKey, setFormApiKey] = useState('');
+  const [formSetDefault, setFormSetDefault] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+
+  const reload = () =>
     getConfig()
       .then(setConfig)
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
+      .catch((e: unknown) => setLoadError(e instanceof Error ? e.message : String(e)));
+
+  useEffect(() => { reload(); }, []);
+
+  const handleDelete = async (name: string) => {
+    if (!window.confirm(t('settings.deleteConfirm').replace('{name}', name))) return;
+    try {
+      await deleteProvider(name);
+      reload();
+    } catch (e: unknown) {
+      alert(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleAdd = async () => {
+    if (!formName.trim() || !formModel.trim()) {
+      setAddError(t('settings.nameModelRequired'));
+      return;
+    }
+    setAdding(true);
+    setAddError(null);
+    try {
+      await createProvider({
+        name: formName.trim(),
+        type: formType,
+        model: formModel.trim(),
+        base_url: formBaseUrl.trim() || undefined,
+        api_key: formApiKey.trim() || undefined,
+        set_default: formSetDefault || undefined,
+      });
+      setFormName('');
+      setFormType('openai');
+      setFormModel('');
+      setFormBaseUrl('');
+      setFormApiKey('');
+      setFormSetDefault(false);
+      reload();
+    } catch (e: unknown) {
+      setAddError((e instanceof Error ? e.message : String(e)));
+    } finally {
+      setAdding(false);
+    }
+  };
 
   return (
     <SettingsModal title={t('settings.menuModel')} wide onClose={onClose}>
       <div class="field-group">
-        <span class="modal-label">
-          {t('settings.modelConfig')} <span class="modal-sub">{t('common.readonly')}</span>
-        </span>
-        {error && <div class="modal-error">{t('settings.loadFailed')}: {error}</div>}
-        {!config && !error && <div class="modal-loading">{t('settings.loading')}</div>}
+        <span class="modal-label">{t('settings.modelConfig')}</span>
+        {loadError && <div class="modal-error">{t('settings.loadFailed')}: {loadError}</div>}
+        {!config && !loadError && <div class="modal-loading">{t('settings.loading')}</div>}
         {config && (
           <>
             <Row label={t('settings.defaultProvider')} value={config.default_provider} />
@@ -140,6 +189,14 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                       <span class="provider-default-badge">{t('settings.default')}</span>
                     )}
                     <span class="provider-type">{p.type}</span>
+                    <button
+                      class="provider-delete-btn"
+                      type="button"
+                      onClick={() => handleDelete(p.name)}
+                      title={t('settings.delete')}
+                    >
+                      {t('settings.delete')}
+                    </button>
                   </div>
                   <div class="provider-card-body">
                     <div>
@@ -167,6 +224,86 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                   </div>
                 </div>
               ))}
+            </div>
+
+            {/* Add model form */}
+            <div class="add-model-form">
+              <span class="modal-label">{t('settings.addModel')}</span>
+              <div class="add-model-field">
+                <label class="add-model-label">{t('settings.providerName')}</label>
+                <input
+                  class="menu-input"
+                  type="text"
+                  placeholder="my-deepseek"
+                  value={formName}
+                  onInput={(e) => setFormName((e.target as HTMLInputElement).value)}
+                />
+              </div>
+              <div class="add-model-field">
+                <label class="add-model-label">{t('settings.model')}</label>
+                <input
+                  class="menu-input"
+                  type="text"
+                  placeholder="deepseek-chat"
+                  value={formModel}
+                  onInput={(e) => setFormModel((e.target as HTMLInputElement).value)}
+                />
+              </div>
+              <div class="add-model-row">
+                <div class="add-model-field add-model-field-type">
+                  <label class="add-model-label">{t('settings.providerType')}</label>
+                  <select
+                    class="menu-input"
+                    value={formType}
+                    onChange={(e) => setFormType((e.target as HTMLSelectElement).value)}
+                  >
+                    <option value="openai">openai</option>
+                    <option value="claude">claude</option>
+                    <option value="ollama">ollama</option>
+                  </select>
+                </div>
+                <div class="add-model-field add-model-field-default">
+                  <label class="add-model-checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={formSetDefault}
+                      onChange={(e) => setFormSetDefault((e.target as HTMLInputElement).checked)}
+                    />
+                    {t('settings.setAsDefault')}
+                  </label>
+                </div>
+              </div>
+              <div class="add-model-field">
+                <label class="add-model-label">{t('settings.baseUrl')}</label>
+                <input
+                  class="menu-input"
+                  type="text"
+                  placeholder="https://api.example.com/v1"
+                  value={formBaseUrl}
+                  onInput={(e) => setFormBaseUrl((e.target as HTMLInputElement).value)}
+                />
+              </div>
+              <div class="add-model-field">
+                <label class="add-model-label">{t('settings.apiKeyInput')}</label>
+                <input
+                  class="menu-input"
+                  type="password"
+                  placeholder="sk-..."
+                  value={formApiKey}
+                  onInput={(e) => setFormApiKey((e.target as HTMLInputElement).value)}
+                />
+              </div>
+              {addError && <div class="modal-error">{t('settings.addFailed')}: {addError}</div>}
+              <div class="add-model-actions">
+                <button
+                  class="btn btn-primary"
+                  type="button"
+                  disabled={adding}
+                  onClick={handleAdd}
+                >
+                  {adding ? t('settings.adding') : t('settings.add')}
+                </button>
+              </div>
             </div>
           </>
         )}

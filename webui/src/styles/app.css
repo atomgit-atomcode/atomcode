@@ -1320,6 +1320,70 @@ body {
 .modal-error { color: var(--app-error-foreground); font-size: 12px; }
 .modal-loading { color: var(--app-secondary-foreground); font-size: 12px; }
 
+/* Provider card delete button */
+.provider-delete-btn {
+  margin-left: auto;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  border-radius: var(--corner-radius-small);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+}
+.provider-delete-btn:hover {
+  border-color: var(--app-error-foreground);
+  color: var(--app-error-foreground);
+  background: color-mix(in srgb, var(--app-error-foreground) 10%, transparent);
+}
+
+/* Add model form */
+.add-model-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--app-primary-border-color);
+}
+.add-model-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.add-model-label {
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+}
+.add-model-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+}
+.add-model-field-type { flex: 1; min-width: 0; }
+.add-model-field-default {
+  display: flex;
+  align-items: flex-end;
+  padding-bottom: 4px;
+}
+.add-model-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--app-primary-foreground);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.add-model-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 2px;
+}
+
 /* === Model Selector === */
 .model-selector {
   position: relative;

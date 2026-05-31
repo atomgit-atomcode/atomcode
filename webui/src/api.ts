@@ -283,11 +283,51 @@ export async function getSuggestions(refresh = false): Promise<SuggestionsRespon
   return resp.json();
 }
 
+// --- User-invocable skills (for the input "+" attach menu) ---
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+}
+
+export async function getSkills(): Promise<SkillInfo[]> {
+  const resp = await fetch('/skills', { headers: authHeaders() });
+  return resp.json();
+}
+
+// --- Provider CRUD ---
+
+export interface CreateProviderBody {
+  name: string;
+  type: string;       // 'openai' | 'claude' | 'ollama'
+  model: string;
+  api_key?: string;
+  base_url?: string;
+  set_default?: boolean;
+}
+
+export async function createProvider(body: CreateProviderBody): Promise<unknown> {
+  const r = await fetch('/providers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
+  return r.json();
+}
+
+export async function deleteProvider(name: string): Promise<void> {
+  const r = await fetch(`/providers/${encodeURIComponent(name)}`, { method: 'DELETE', headers: authHeaders() });
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
+}
+
 // --- Filesystem browsing ---
 
 export interface FsListResult {
   path: string;
   dirs: string[];
+  /** Regular files in the directory (webui file picker). */
+  files?: string[];
 }
 
 export async function listDir(path: string): Promise<FsListResult> {

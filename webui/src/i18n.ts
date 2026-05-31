@@ -75,6 +75,20 @@ const zh = {
   'landing.fallback.explainLabel': '解释项目',
   'landing.fallback.explainPrompt': '解释这个项目是做什么的，技术栈和关键目录分别是什么。',
 
+  // Input attach (+) menu
+  'attach.menu': '添加',
+  'attach.image': '上传图片',
+  'attach.file': '上传文件',
+  'attach.skill': '选择技能',
+  'attach.imageSoon': '即将支持',
+  'attach.skillsEmpty': '无可用技能',
+  'attach.skillsLoading': '加载中…',
+  // File picker
+  'filepicker.title': '选择文件',
+  'filepicker.empty': '（空目录）',
+  'filepicker.loading': '加载中…',
+  'filepicker.noFiles': '（无文件）',
+
   // Tool rows
   'tool.waiting': '等待批准…',
   'tool.running': '运行中…',
@@ -107,6 +121,20 @@ const zh = {
   'settings.menuTheme': '主题设置',
   'settings.menuLang': '语言设置',
   'settings.menuModel': '模型配置',
+
+  // Provider add/delete
+  'settings.addModel': '添加模型',
+  'settings.providerName': '名称',
+  'settings.providerType': '类型',
+  'settings.baseUrl': 'Base URL（可选）',
+  'settings.apiKeyInput': 'API Key（可选）',
+  'settings.setAsDefault': '设为默认',
+  'settings.add': '添加',
+  'settings.adding': '添加中…',
+  'settings.delete': '删除',
+  'settings.deleteConfirm': '确定删除模型「{name}」？',
+  'settings.addFailed': '添加失败',
+  'settings.nameModelRequired': '名称和模型必填',
 
   // CWD picker
   'cwd.title': '切换工作目录',
@@ -202,6 +230,18 @@ const en: Record<MsgKey, string> = {
   'landing.fallback.explainLabel': 'Explain project',
   'landing.fallback.explainPrompt': 'Explain what this project does, its tech stack, and what the key directories are.',
 
+  'attach.menu': 'Add',
+  'attach.image': 'Upload image',
+  'attach.file': 'Upload file',
+  'attach.skill': 'Choose skill',
+  'attach.imageSoon': 'Coming soon',
+  'attach.skillsEmpty': 'No skills available',
+  'attach.skillsLoading': 'Loading…',
+  'filepicker.title': 'Choose a file',
+  'filepicker.empty': '(empty)',
+  'filepicker.loading': 'Loading…',
+  'filepicker.noFiles': '(no files)',
+
   'tool.waiting': 'Awaiting approval…',
   'tool.running': 'Running…',
   'tool.done': 'Done',
@@ -232,6 +272,20 @@ const en: Record<MsgKey, string> = {
   'settings.menuTheme': 'Theme settings',
   'settings.menuLang': 'Language settings',
   'settings.menuModel': 'Model configuration',
+
+  // Provider add/delete
+  'settings.addModel': 'Add model',
+  'settings.providerName': 'Name',
+  'settings.providerType': 'Type',
+  'settings.baseUrl': 'Base URL (optional)',
+  'settings.apiKeyInput': 'API Key (optional)',
+  'settings.setAsDefault': 'Set as default',
+  'settings.add': 'Add',
+  'settings.adding': 'Adding…',
+  'settings.delete': 'Delete',
+  'settings.deleteConfirm': 'Delete model "{name}"?',
+  'settings.addFailed': 'Add failed',
+  'settings.nameModelRequired': 'Name and model are required',
 
   'cwd.title': 'Switch working directory',
   'cwd.affectsSession': 'Affects current session only',
