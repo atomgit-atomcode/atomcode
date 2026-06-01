@@ -56,6 +56,8 @@ const zh = {
   // Chat
   'chat.startHint': '发送消息开始对话…',
   'chat.continueHint': '发送消息继续此会话',
+  'chat.skillExpand': '展开查看',
+  'chat.skillCollapse': '收起',
   'chat.continueSession': '继续会话 {id}（历史在 TUI/磁盘中）',
   'chat.inputPlaceholder': '输入消息，Enter 发送，Shift+Enter 换行…',
   'chat.stop': '停止',
@@ -70,6 +72,8 @@ const zh = {
   'attach.skill': '选择技能',
   'attach.imageSoon': '即将支持',
   'attach.removeImage': '移除图片',
+  'attach.tooLarge': '图片不能超过 {mb}M，已自动忽略超限图片。',
+  'attach.dismissError': '关闭提示',
   'attach.skillsEmpty': '暂无可用技能。在项目 .atomcode/skills/<名称>/SKILL.md 添加技能，或放到 ~/.atomcode/skills/ 全局共享。',
   'attach.skillsLoading': '加载中…',
   // File picker
@@ -224,6 +228,8 @@ const en: Record<MsgKey, string> = {
 
   'chat.startHint': 'Send a message to start a conversation…',
   'chat.continueHint': 'Send a message to continue this session',
+  'chat.skillExpand': 'Expand',
+  'chat.skillCollapse': 'Collapse',
   'chat.continueSession': 'Continue session {id} (history on TUI/disk)',
   'chat.inputPlaceholder': 'Type a message — Enter to send, Shift+Enter for newline…',
   'chat.stop': 'Stop',
@@ -237,6 +243,8 @@ const en: Record<MsgKey, string> = {
   'attach.skill': 'Choose skill',
   'attach.imageSoon': 'Coming soon',
   'attach.removeImage': 'Remove image',
+  'attach.tooLarge': 'Images must be under {mb}M; oversized images were skipped.',
+  'attach.dismissError': 'Dismiss',
   'attach.skillsEmpty': 'No skills yet. Add one at .atomcode/skills/<name>/SKILL.md, or ~/.atomcode/skills/ to share globally.',
   'attach.skillsLoading': 'Loading…',
   'filepicker.title': 'Choose a file',

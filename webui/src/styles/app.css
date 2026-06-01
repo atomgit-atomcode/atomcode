@@ -293,6 +293,48 @@ body {
   font-weight: 400;
 }
 
+/* 技能/文档型用户消息折叠徽章：把 TUI 注入的整段 SKILL.md 收起为一行 */
+.skill-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 7px 11px;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background-color: var(--app-input-background);
+  color: var(--app-primary-foreground);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+.skill-badge:hover { background: var(--app-ghost-button-hover-background); }
+.skill-badge-icon { flex: none; color: var(--app-brand); }
+.skill-badge-label {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.skill-badge-hint {
+  flex: none;
+  margin-left: auto;
+  padding-left: 10px;
+  opacity: 0.55;
+  font-size: 12px;
+}
+.skill-collapse {
+  display: block;
+  margin-bottom: 6px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--app-link-color);
+  font-size: 12px;
+  cursor: pointer;
+}
+.skill-collapse:hover { text-decoration: underline; }
+
 /* === Assistant Message === */
 .assistant-message-content {
   font-size: 13px;
@@ -1861,6 +1903,29 @@ body {
   padding: 0;
 }
 .input-thumb-remove:hover { background: #000000cc; }
+
+.input-attach-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 10px 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--app-error-bg, #fdecec);
+  color: var(--app-error-fg, #b3261e);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.input-attach-error span { flex: 1; }
+.input-attach-error-close {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
 
 .msg-images {
   display: flex;

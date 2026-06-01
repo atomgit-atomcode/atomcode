@@ -26,9 +26,10 @@ interface Message {
   images?: ImageData[];
 }
 
-/** Max attached images per message and per-image byte cap (base64-decoded). */
+/** Max attached images per message and per-image byte cap (raw file size). */
 const MAX_IMAGES = 6;
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGE_MB = 2;
+const MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024;
 
 /** Read a File into an ImageData (base64, no data-URL prefix). */
 function fileToImageData(file: File): Promise<ImageData | null> {
@@ -93,6 +94,18 @@ function abbreviateArgs(args: string, maxLen = 60): string {
   return args.slice(0, maxLen) + '…';
 }
 
+// 识别「技能/文档型」用户消息：首个非空字符是 markdown 标题、且内容较长。
+// TUI 调用 /skill 时会把整段 SKILL.md 模板塞进用户消息，webui 历史里会把它
+// 渲染成一大坨原文；命中则返回标题文本用作折叠徽章标签，否则返回 null（普通气泡）。
+const SKILL_COLLAPSE_MIN = 400;
+function detectSkillContent(text: string): string | null {
+  const trimmed = text.replace(/^\s+/, '');
+  if (!trimmed.startsWith('#') || text.length < SKILL_COLLAPSE_MIN) return null;
+  const firstLine = trimmed.split('\n', 1)[0];
+  const title = firstLine.replace(/^#{1,6}\s*/, '').trim();
+  return title || null;
+}
+
 export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession, restoring }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
@@ -103,6 +116,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
   const [provider, setProvider] = useState<string | null>(null);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const [sync, setSync] = useState<boolean>(() => {
     try { return new URLSearchParams(location.search).get('sync') === '1'; } catch { return false; }
   });
@@ -550,7 +564,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
   async function addImageFiles(files: File[] | FileList) {
     const arr = Array.from(files).filter((f) => f.type.startsWith('image/'));
     if (arr.length === 0) return;
-    const parsed = (await Promise.all(arr.map(fileToImageData))).filter(
+    // 严格拦截超过 2M 的图片，并提示用户（其余正常入列）。
+    const oversized = arr.filter((f) => f.size > MAX_IMAGE_BYTES);
+    if (oversized.length > 0) {
+      setAttachError(t('attach.tooLarge', { mb: String(MAX_IMAGE_MB) }));
+    } else {
+      setAttachError(null);
+    }
+    const allowed = arr.filter((f) => f.size <= MAX_IMAGE_BYTES);
+    if (allowed.length === 0) return;
+    const parsed = (await Promise.all(allowed.map(fileToImageData))).filter(
       (x): x is ImageData => x !== null,
     );
     if (parsed.length === 0) return;
@@ -596,6 +619,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
   const inputBox = (
     <div class="input-box">
+      {attachError && (
+        <div class="input-attach-error" role="alert">
+          <span>{attachError}</span>
+          <button
+            class="input-attach-error-close"
+            onClick={() => setAttachError(null)}
+            aria-label={t('attach.dismissError')}
+          >
+            ×
+          </button>
+        </div>
+      )}
       {pendingImages.length > 0 && (
         <div class="input-thumbs">
           {pendingImages.map((img, i) => (
@@ -729,20 +764,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
         {messages.map((msg, idx) => {
           const isLast = idx === lastIdx;
           if (msg.role === 'user') {
-            return (
-              <div key={idx} class="user-message-wrapper">
-                <div class="user-message-bubble">
-                  {msg.images && msg.images.length > 0 && (
-                    <div class="msg-images">
-                      {msg.images.map((img, i) => (
-                        <img key={i} class="msg-image" src={imageDataUrl(img)} alt="" />
-                      ))}
-                    </div>
-                  )}
-                  {msg.text}
-                </div>
-              </div>
-            );
+            return <UserMessageView key={idx} msg={msg} />;
           }
 
           const isError =
@@ -799,6 +821,52 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       {filePickerModal}
       {livePermissionCard}
     </>
+  );
+}
+
+function UserMessageView({ msg }: { msg: Message }) {
+  const t = useT();
+  // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
+  const skillTitle = detectSkillContent(msg.text);
+  const [expanded, setExpanded] = useState(false);
+
+  const images = msg.images && msg.images.length > 0 && (
+    <div class="msg-images">
+      {msg.images.map((img, i) => (
+        <img key={i} class="msg-image" src={imageDataUrl(img)} alt="" />
+      ))}
+    </div>
+  );
+
+  if (skillTitle && !expanded) {
+    return (
+      <div class="user-message-wrapper">
+        {images}
+        <button
+          class="skill-badge"
+          onClick={() => setExpanded(true)}
+          title={t('chat.skillExpand')}
+        >
+          <span class="skill-badge-icon" aria-hidden="true">⚡</span>
+          <span class="skill-badge-label">{skillTitle}</span>
+          <span class="skill-badge-hint">{t('chat.skillExpand')}</span>
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div class="user-message-wrapper">
+      <div class="user-message-bubble">
+        {images}
+        {skillTitle && (
+          <button class="skill-collapse" onClick={() => setExpanded(false)}>
+            {t('chat.skillCollapse')}
+          </button>
+        )}
+        {msg.text}
+      </div>
+    </div>
   );
 }
 
