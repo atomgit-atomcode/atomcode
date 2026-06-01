@@ -91,7 +91,7 @@ atomcode --continue
 atomcode --config ./custom.toml
 
 # 跳过所有权限确认,自动批准工具调用
-atomcode --skip
+atomcode -y
 atomcode --dangerously-skip-permissions</code></pre>
 
       <h2>CLI 参数总览</h2>
@@ -110,7 +110,7 @@ atomcode --dangerously-skip-permissions</code></pre>
           <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>非交互模式下把工具调用、token 用量等信息打到 stderr</td></tr>
           <tr><td><code>--max-turns N</code></td><td>—</td><td>强制限制 Agent 循环的最大轮数,防止无限跑下去</td></tr>
           <tr><td><code>--disable-tools LIST</code></td><td>—</td><td>逗号分隔,禁用某些工具。例如 <code>--disable-tools bash,web_fetch</code></td></tr>
-          <tr><td><code>--dangerously-skip-permissions</code></td><td><code>--skip</code></td><td>跳过所有权限确认,自动批准所有工具调用(bash、文件编辑、MCP 等)。TUI 模式下状态栏显示 ⚠ SKIP 徽章</td></tr>
+          <tr><td><code>--dangerously-skip-permissions</code></td><td><code>-y</code></td><td>跳过所有权限确认,自动批准所有工具调用(bash、文件编辑、MCP 等)。TUI 模式下状态栏显示 ⚠ BYPASS 徽章</td></tr>
         </tbody>
       </table>
 
@@ -121,7 +121,7 @@ atomcode --dangerously-skip-permissions</code></pre>
 
       <div class="callout callout-warning">
         <strong>Warning</strong>
-        <p><code>--skip</code> / <code>--dangerously-skip-permissions</code> 会跳过所有权限确认,包括 bash 命令执行、文件写入和 MCP 工具调用等。Agent 可以不经确认直接执行任意操作。请仅在以下场景使用:</p>
+        <p><code>-y</code> / <code>--dangerously-skip-permissions</code> 会跳过所有权限确认,包括 bash 命令执行、文件写入和 MCP 工具调用等。Agent 可以不经确认直接执行任意操作。请仅在以下场景使用:</p>
         <ul>
           <li>CI/CD 流水线等自动化环境</li>
           <li>沙箱或容器内的评测基准测试</li>
