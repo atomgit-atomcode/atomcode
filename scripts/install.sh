@@ -4,7 +4,7 @@
 #   curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.sh | sh
 #
 # Env overrides:
-#   ATOMCODE_VERSION   release tag to install (default: v4.23.3)
+#   ATOMCODE_VERSION   release tag to install (default: v4.24.0)
 #   ATOMCODE_PREFIX    install dir (absolute path; default: /usr/local/bin if writable,
 #                        else ~/.local/bin). On HarmonyOS as non-root, default is ~/.local/bin.
 # IMPORTANT: when changing install paths, the PATH-rc edit format, or filenames here,
