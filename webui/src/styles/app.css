@@ -1515,6 +1515,21 @@ body {
   white-space: nowrap;
 }
 
+/* Provider tag on the trigger — only shown when the selected model name is
+   ambiguous (same model served by multiple providers). */
+.model-selector-provider {
+  min-width: 0;
+  flex-shrink: 1;
+  color: var(--app-secondary-foreground);
+  font-size: 10px;
+  opacity: 0.85;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-selector-provider::before { content: '('; }
+.model-selector-provider::after { content: ')'; }
+
 .input-footer .model-selector {
   max-width: min(260px, 55%);
   flex-shrink: 1;
@@ -1561,8 +1576,9 @@ body {
 
 .model-item {
   display: flex;
-  align-items: center;
-  gap: 2px;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 5px;
   padding: 7px 10px;
   line-height: 1.4;
   border: none;
@@ -1577,21 +1593,24 @@ body {
 }
 
 .model-item-model {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex-shrink: 0;
   white-space: nowrap;
-  width: 100%;
 }
 
+/* Inline "(Provider)" tag — only rendered when the model name is ambiguous.
+   Takes the leftover width and ellipsis-truncates so the model name (left)
+   always stays fully visible. */
 .model-item-provider {
+  flex-shrink: 1;
+  min-width: 0;
   color: var(--app-secondary-foreground);
-  font-size: 10px;
+  font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  width: 100%;
 }
+.model-item-provider::before { content: '('; }
+.model-item-provider::after { content: ')'; }
 
 .model-item:hover { background: var(--app-list-hover-background); }
 
