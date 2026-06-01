@@ -858,7 +858,7 @@ fn is_loopback_authority(authority: &str) -> bool {
     let host = authority.split(':').next().unwrap_or(authority);
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
-fn hash_path(path: &std::path::Path) -> String {
+pub(crate) fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 

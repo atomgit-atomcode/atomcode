@@ -36,6 +36,9 @@ use crate::CachedMcpRegistry;
 /// 进程内单一活动 LiveSession（TUI 与进程内 webui 共享）。
 static LIVE: StdMutex<Option<Arc<atomcode_core::live::LiveSession>>> = StdMutex::new(None);
 
+/// 当前 LiveSession 的稳定 session_id（字符串），供 /live SSE 端点在 Snapshot 中暴露。
+static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
+
 /// 进程级共享 MCP 缓存（供 TUI 侧 ensure_live_session 使用，无需 AppState）。
 static LIVE_MCP_CACHE: OnceLock<Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>>> = OnceLock::new();
 
@@ -69,16 +72,25 @@ pub(crate) fn ensure_live_session_global(
     if let Some(s) = g.as_ref() {
         return s.clone();
     }
+    let session_id = atomcode_core::session::SessionId::new();
+    // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
+    *LIVE_SESSION_ID.lock().unwrap() = Some(session_id.to_string());
     let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(DaemonTurnExecutor {
         working_dir,
         provider_name: None,
         mcp_cache,
         telemetry,
         auto_approve: false,
+        session_id,
     });
     let session = atomcode_core::live::LiveSession::new(executor, Vec::new());
     *g = Some(session.clone());
     session
+}
+
+/// 取当前 LiveSession 的稳定 session_id 字符串（无则 None）。
+fn live_session_id() -> Option<String> {
+    LIVE_SESSION_ID.lock().unwrap().clone()
 }
 
 /// All components needed to run one agent turn.
@@ -300,6 +312,8 @@ pub(crate) struct DaemonTurnExecutor {
     pub telemetry: Arc<Telemetry>,
     /// 阶段②：自动批准（true=BypassAll），便于多 tab 验证；阶段③改交互式审批。
     pub auto_approve: bool,
+    /// 稳定的 session_id：进程内唯一，每轮落盘时覆盖同一文件（一会话=一条记录）。
+    pub session_id: atomcode_core::session::SessionId,
 }
 
 #[async_trait]
@@ -397,6 +411,20 @@ impl TurnExecutor for DaemonTurnExecutor {
         }
         drop(turn_tx);
         let _ = forward.await;
+
+        // 每轮结束后持久化会话（稳定 id → 覆盖同一文件，一会话=一条记录）。
+        {
+            use atomcode_core::session::{Session, SessionManager};
+            let conv_guard = conv.lock().await;
+            let mut session = Session::new(self.working_dir.clone());
+            session.id = self.session_id.clone();
+            session.messages = conv_guard.messages.clone();
+            session.auto_name_from_messages();
+            session.touch();
+            if let Err(e) = SessionManager::new(&self.working_dir).save(&session) {
+                eprintln!("Warning: failed to save live session: {e}");
+            }
+        }
     }
 }
 
@@ -420,7 +448,7 @@ use crate::AppState;
 #[serde(tag = "type")]
 pub(crate) enum LiveWireEvent {
     #[serde(rename = "snapshot")]
-    Snapshot { messages: Vec<crate::MessageInfo> },
+    Snapshot { messages: Vec<crate::MessageInfo>, session_id: String, project_hash: String },
     #[serde(rename = "user")]
     UserMessage { text: String, images: Vec<crate::ImageData> },
     #[serde(rename = "text")]
@@ -482,12 +510,15 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
 
 pub(crate) async fn live_stream(State(state): State<AppState>) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
+    let project_hash = crate::hash_path(&working_dir);
     let session = ensure_live_session(working_dir, state.telemetry.clone());
     let (snapshot, mut rx) = session.join().await;
 
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
     let _ = tx.send(LiveWireEvent::Snapshot {
         messages: snapshot.iter().map(crate::MessageInfo::from).collect(),
+        session_id: live_session_id().unwrap_or_default(),
+        project_hash,
     });
     tokio::spawn(async move {
         loop {
