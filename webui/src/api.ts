@@ -442,11 +442,19 @@ export async function streamLive(
   }
 }
 
-export async function postLiveMessage(message: string, images?: ImageData[]): Promise<void> {
+export async function postLiveMessage(
+  message: string,
+  images?: ImageData[],
+  provider?: string,
+): Promise<void> {
   await fetch('/live/message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ message, ...(images && images.length ? { images } : {}) }),
+    body: JSON.stringify({
+      message,
+      ...(images && images.length ? { images } : {}),
+      ...(provider ? { provider } : {}),
+    }),
   });
 }
 

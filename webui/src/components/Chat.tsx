@@ -485,7 +485,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
       setBusy(true);
-      await postLiveMessage(text, images.length ? images : undefined);
+      await postLiveMessage(text, images.length ? images : undefined, provider ?? undefined);
       return;
     }
 
