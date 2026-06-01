@@ -3,6 +3,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, LiveWireEvent, SessionMessage } from '../api';
+import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { AttachMenu } from './AttachMenu';
@@ -751,7 +752,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
   const livePermissionCard = livePending && (
     <PermissionCard
       req={{ session_id: '', tool_name: livePending.tool_name, reason: livePending.reason, call_id: livePending.call_id, arguments: livePending.arguments }}
-      onDone={() => setLivePending(null)}
+      onDone={() => setLivePending((cur) => resolvePendingAfterDecision(cur, livePending.call_id))}
       onDecide={async (decision) => { await postLivePermission(decision); }}
     />
   );

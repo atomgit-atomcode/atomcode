@@ -8,6 +8,7 @@ import { ThemeDialog, LanguageDialog, ModelConfigDialog, RemoteAccessDialog } fr
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
+import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { getProject, listSessions, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
 
@@ -344,7 +345,7 @@ export function App() {
       {settingsSection === 'remote' && (
         <RemoteAccessDialog onClose={() => setSettingsSection(null)} />
       )}
-      {pending && <PermissionCard req={pending} onDone={() => setPending(null)} />}
+      {pending && <PermissionCard req={pending} onDone={() => setPending((cur: any) => resolvePendingAfterDecision(cur, pending.call_id))} />}
       {headerDialog === 'rename' && activeSession && (
         <RenameDialog
           session={activeSession}
