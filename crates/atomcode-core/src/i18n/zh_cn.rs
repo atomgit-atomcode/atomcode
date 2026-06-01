@@ -143,6 +143,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::StatusCpUsage { usage, reset_at, duration } =>
             format!("  用量：{}  ·  重置于 {}（{} 后）\n", usage, reset_at, duration).into(),
+        Msg::StatusCpMonthlyExhausted { duration } =>
+            format!("  ⚠ 本月用量已耗尽，等 {} 后再使用\n", duration).into(),
         Msg::StatusCpWindowExhausted =>
             "  ⚠ 当前窗口配额已耗尽\n".into(),
         Msg::StatusCpWindowHint { hint } =>

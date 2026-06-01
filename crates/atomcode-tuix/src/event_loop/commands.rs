@@ -2216,13 +2216,33 @@ fn render_codingplan_status_for_status_cmd() -> String {
         remaining_days: plan.remaining_days,
         total_days: plan.total_days,
     }).into_owned();
-    // Mirror the precedence in `setup.rs`'s legacy backward-compat path:
-    // when `window_quota_exhausted` is set we suppress the usage line
-    // (which the server often reports as 0% for a freshly-reset short
-    // window even while the longer quota is exhausted). Showing both
-    // produced the visibly contradictory `用量 0% / ⚠额度已满` pair the
-    // user surfaced as the "v4.23.2 still displays it this way" report.
-    if status.window_quota_exhausted {
+    // Prefer the per-window `rate_limit_windows` schema when present, mirroring
+    // `/login` (setup.rs). When the monthly cap is exhausted the server flags it
+    // via `quota_exhausted` while hiding the window (`show_enable=0`) and leaving
+    // the 5h rolling window visible at a misleading 0% — so we detect exhaustion
+    // via `blocking_exhausted_window` and suppress the rolling-window usage line.
+    if !status.rate_limit_windows.is_empty() {
+        use atomcode_core::coding_plan::setup::{blocking_exhausted_window, format_duration_secs};
+        if let Some(w) = blocking_exhausted_window(&status.rate_limit_windows) {
+            out.push_str(&t(Msg::StatusCpMonthlyExhausted {
+                duration: &format_duration_secs(w.seconds_until_reset),
+            }));
+        } else {
+            for w in status.rate_limit_windows.iter().filter(|w| w.show_enable == 1) {
+                out.push_str(&t(Msg::StatusCpUsage {
+                    usage: &w.usage_status_desc,
+                    reset_at: &w.reset_at_display,
+                    duration: &format_duration_secs(w.seconds_until_reset),
+                }));
+            }
+        }
+    } else if status.window_quota_exhausted {
+        // Legacy backward-compat path (old server, no `rate_limit_windows`):
+        // when `window_quota_exhausted` is set we suppress the usage line
+        // (which the server often reports as 0% for a freshly-reset short
+        // window even while the longer quota is exhausted). Showing both
+        // produced the visibly contradictory `用量 0% / ⚠额度已满` pair the
+        // user surfaced as the "v4.23.2 still displays it this way" report.
         if let Some(hint) = &status.window_quota_hint {
             out.push_str(&t(Msg::StatusCpWindowHint { hint }));
         } else {
