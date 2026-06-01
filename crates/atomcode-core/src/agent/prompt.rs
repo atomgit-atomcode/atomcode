@@ -49,11 +49,21 @@ impl AgentLoop {
             .map(|p| p.model.as_str())
             .unwrap_or("unknown");
 
+        // AtomCode's own config home (~/.atomcode or $ATOMCODE_HOME). Injected
+        // so the model writes skills / commands / memory / hook rules HERE
+        // instead of defaulting to ~/.claude (which it learned from training
+        // and which belongs to a different product). See the CONFIG line below.
+        let config_dir = crate::config::Config::config_dir();
+
         // Assemble prompt: identity + env → rules LAST (recency effect).
         let mut prompt = format!(
-            "You are AtomCode. When asked who you are, say you are AtomCode (an AI coding agent by AtomGit) running the {} model. Never claim to be another product.\n\
-             Working directory: {wd}\nAll file paths in tool calls must be absolute, resolved under {wd}. Verify file existence before editing.\n{env_info}\n",
-            model_display, wd = wd.display(), env_info = env_info,
+            "You are AtomCode. When asked who you are, say you are AtomCode (an AI coding agent by AtomGit) running the {model} model. Never claim to be another product.\n\
+             Working directory: {wd}\n\
+             All file paths in tool calls must be absolute, resolved under {wd}. Verify file existence before editing.\n\
+             SCOPE: stay inside {wd}. Do not read, write, scan, or `cd` into directories outside it — sibling projects, parent directories, or anywhere else on the machine — unless the user explicitly names a path outside it. The lone exception is AtomCode's own config dir below. Reaching into neighbouring directories on your own initiative is almost never what the user wants.\n\
+             CONFIG: AtomCode's own config — skills, commands, memory, hook rules — lives in {config_dir} (global) and {wd}/.atomcode (project); read and write it there. NEVER create or edit files under ~/.claude: that directory belongs to a different product, not AtomCode.\n\
+             {env_info}\n",
+            model = model_display, wd = wd.display(), config_dir = config_dir.display(), env_info = env_info,
         );
 
         // Git commit attribution. Mirrors Claude Code's convention:
