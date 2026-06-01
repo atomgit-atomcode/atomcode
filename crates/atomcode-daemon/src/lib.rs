@@ -12,6 +12,7 @@ mod api_config;
 mod api_provider;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
+pub use live_api::ensure_live_session;
 mod telemetry_scope;
 pub mod auth_token;
 pub mod permission_bridge;
@@ -3042,7 +3043,7 @@ fn primary_lan_ipv4() -> Option<String> {
 /// 不再轮询等待绑定：先在本函数内同步绑定端口（亚毫秒级，且借此拿到真实端口、
 /// 支持动态端口），再把已绑定的 listener 交给后台 `run_server`。浏览器随即打开，
 /// 页面靠 SPA 自带 loading 态在 server bootstrap 完成前过渡。
-pub async fn ensure_server_and_open(host: &str, port: u16) -> String {
+pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String {
     // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
     //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
     let reuse = {
@@ -3104,7 +3105,8 @@ pub async fn ensure_server_and_open(host: &str, port: u16) -> String {
 
     let token = tokens.mint();
     // 本机始终用 127.0.0.1 打开浏览器（即便绑定 0.0.0.0，回环也在监听内）。
-    let local_url = format!("http://127.0.0.1:{}/?token={}", actual_port, token);
+    let sync_suffix = if sync { "&sync=1" } else { "" };
+    let local_url = format!("http://127.0.0.1:{}/?token={}{}", actual_port, token, sync_suffix);
     let opened = atomcode_core::auth::oauth::open_browser(&local_url).is_ok();
     let mut msg = if opened {
         format!("已在浏览器打开 webui：{local_url}")

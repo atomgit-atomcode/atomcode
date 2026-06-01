@@ -75,6 +75,8 @@ interface ChatProps {
   onPermission: (req: PermissionRequestEvent) => void;
   /** Metadata of the currently-active session (for loading history) */
   activeSession?: SessionMetaWithProject | null;
+  /** 刷新后正按 URL 短 id 还原会话；为 true 时抑制新建落地页，避免闪屏。 */
+  restoring?: boolean;
 }
 
 function formatArgs(args: unknown): string {
@@ -91,7 +93,7 @@ function abbreviateArgs(args: string, maxLen = 60): string {
   return args.slice(0, maxLen) + '…';
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession, restoring }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -101,7 +103,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   const [provider, setProvider] = useState<string | null>(null);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
-  const [sync, setSync] = useState(false);
+  const [sync, setSync] = useState<boolean>(() => {
+    try { return new URLSearchParams(location.search).get('sync') === '1'; } catch { return false; }
+  });
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
@@ -184,6 +188,31 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
 
   // Abort the live (/live) stream if the component unmounts while sync is on.
   useEffect(() => () => { liveAbortRef.current?.abort(); }, []);
+
+  // ── 共享的实时流启/停逻辑 ──
+  function startLiveStream() {
+    const controller = new AbortController();
+    liveAbortRef.current = controller;
+    streamLive(onLiveEvent, controller.signal).catch(() => {
+      // Stream ended or errored; turn sync back off
+      setSync(false);
+    });
+  }
+
+  function stopLiveStream() {
+    liveAbortRef.current?.abort();
+    liveAbortRef.current = null;
+  }
+
+  // 若 sync 初始值为 true（URL 带 sync=1），在挂载时自动连接实时流。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (sync) {
+      startLiveStream();
+    }
+    // 仅在挂载时执行一次；后续由 toggleSync 控制。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Shared history → display conversion (reused by session load AND live snapshot) ──
   function sessionMessagesToDisplay(msgs: SessionMessage[]): Message[] {
@@ -278,17 +307,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     setSync((prev) => {
       const next = !prev;
       if (next) {
-        // Start live stream
-        const controller = new AbortController();
-        liveAbortRef.current = controller;
-        streamLive(onLiveEvent, controller.signal).catch(() => {
-          // Stream ended or errored; turn sync back off
-          setSync(false);
-        });
+        startLiveStream();
       } else {
-        // Stop live stream
-        liveAbortRef.current?.abort();
-        liveAbortRef.current = null;
+        stopLiveStream();
       }
       return next;
     });
@@ -560,7 +581,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   const lastIdx = messages.length - 1;
 
   // 新对话落地态：无会话、无消息、无历史提示 → claude.ai 风格的居中落地页。
-  const landing = !sessionId && messages.length === 0 && !historyHint;
+  // restoring 期间（刷新后正还原 URL 会话）先不落地，避免闪过新建页再跳历史。
+  const landing = !sessionId && messages.length === 0 && !historyHint && !restoring;
 
   // 落地页副标题：项目名 + 缩写路径。
   const cleanCwd = cwd.replace(/\/+$/, '');
@@ -687,7 +709,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     <>
       {/* Message timeline */}
       <div class="messages-container">
-        {messages.length === 0 && !historyHint && (
+        {messages.length === 0 && !historyHint && !restoring && (
           <div class="messages-empty">
             <div>
               {t('chat.startHint')}

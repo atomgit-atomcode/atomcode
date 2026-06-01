@@ -974,7 +974,7 @@ async fn run() -> Result<i32> {
             }
             Commands::Webui { port, host } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let msg = atomcode_daemon::ensure_server_and_open(&host, port).await;
+                let msg = atomcode_daemon::ensure_server_and_open(&host, port, false).await;
                 eprintln!("{msg}");
                 // server 是后台 task；保持进程存活直到用户 Ctrl+C
                 let _ = tokio::signal::ctrl_c().await;

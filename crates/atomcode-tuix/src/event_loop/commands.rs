@@ -201,6 +201,76 @@ fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
     out
 }
 
+/// 把 TUI 附着到指定的 LiveSession（回放快照 + 启动转发器 + 渲染确认）。
+/// 供 `/webui` 自动附着和 `/sync` 手动附着共用，不重复逻辑。
+fn attach_live_session(
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    session: std::sync::Arc<atomcode_core::live::LiveSession>,
+) {
+    // 回放快照：渲染既有消息。
+    let snapshot: Vec<atomcode_core::conversation::message::Message> =
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(session.snapshot())
+        });
+    {
+        use atomcode_core::conversation::message::{MessageContent, Role};
+        renderer.render(UiLine::TurnSeparator {
+            label: "— 同步快照 —".to_string(),
+        });
+        for m in &snapshot {
+            match (&m.role, &m.content) {
+                (Role::User, MessageContent::Text(s)) => {
+                    renderer.render(UiLine::User(s.clone()));
+                }
+                (Role::Assistant, MessageContent::Text(s)) => {
+                    if !s.is_empty() {
+                        renderer.render(UiLine::AssistantText(s.clone()));
+                        renderer.render(UiLine::AssistantLineBreak);
+                    }
+                }
+                (
+                    Role::Assistant,
+                    MessageContent::AssistantWithToolCalls { text, tool_calls, .. },
+                ) => {
+                    if let Some(t) = text {
+                        if !t.is_empty() {
+                            renderer.render(UiLine::AssistantText(t.clone()));
+                            renderer.render(UiLine::AssistantLineBreak);
+                        }
+                    }
+                    for tc in tool_calls {
+                        renderer.render(UiLine::ToolCall {
+                            name: tc.name.clone(),
+                            detail: super::format_tool_detail(&tc.name, &tc.arguments),
+                        });
+                    }
+                }
+                (Role::Tool, MessageContent::ToolResult(r)) => {
+                    renderer.render(UiLine::ToolResult {
+                        success: r.success,
+                        summary: super::summarise(&r.output, r.success),
+                    });
+                }
+                _ => {}
+            }
+        }
+        renderer.render(UiLine::TurnSeparator {
+            label: "— 同步快照结束 —".to_string(),
+        });
+    }
+    let handle = super::live_sync::spawn_live_forwarder(
+        session.clone(),
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    );
+    ctx.sync_forwarder = Some(handle);
+    ctx.sync_session = Some(session);
+    renderer.render(UiLine::CommandOutput(
+        "已同步当前会话（与浏览器实时互通）".to_string(),
+    ));
+}
+
 pub(super) fn execute_slash_command(
     cmd: &str,
     arg: &str,
@@ -689,10 +759,17 @@ pub(super) fn execute_slash_command(
                     "127.0.0.1".to_string()
                 }
                 let host = parse_host(a);
-                tokio::task::block_in_place(|| {
+                let open_msg = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
-                        .block_on(atomcode_daemon::ensure_server_and_open(&host, 13456))
-                })
+                        .block_on(atomcode_daemon::ensure_server_and_open(&host, 13456, true))
+                });
+                // 自动附着：建立（或取得已有的）LiveSession，并把 TUI 接入同步。
+                let session = atomcode_daemon::ensure_live_session(
+                    ctx.working_dir.clone(),
+                    ctx.telemetry.clone(),
+                );
+                attach_live_session(ctx, renderer, session);
+                open_msg
             };
             renderer.render(UiLine::CommandOutput(msg));
             renderer.flush();
@@ -709,69 +786,7 @@ pub(super) fn execute_slash_command(
             } else {
                 match atomcode_daemon::current_live_session() {
                     Some(session) => {
-                        // 回放快照：渲染既有消息（复用 session_picker::replay_session 的渲染）。
-                        let snapshot: Vec<atomcode_core::conversation::message::Message> =
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current()
-                                    .block_on(session.snapshot())
-                            });
-                        // 用 replay_session 的渲染方式，构造一个临时 Session 值。
-                        {
-                            use atomcode_core::conversation::message::{MessageContent, Role};
-                            renderer.render(UiLine::TurnSeparator {
-                                label: "— 同步快照 —".to_string(),
-                            });
-                            for m in &snapshot {
-                                match (&m.role, &m.content) {
-                                    (Role::User, MessageContent::Text(s)) => {
-                                        renderer.render(UiLine::User(s.clone()));
-                                    }
-                                    (Role::Assistant, MessageContent::Text(s)) => {
-                                        if !s.is_empty() {
-                                            renderer.render(UiLine::AssistantText(s.clone()));
-                                            renderer.render(UiLine::AssistantLineBreak);
-                                        }
-                                    }
-                                    (
-                                        Role::Assistant,
-                                        MessageContent::AssistantWithToolCalls { text, tool_calls, .. },
-                                    ) => {
-                                        if let Some(t) = text {
-                                            if !t.is_empty() {
-                                                renderer.render(UiLine::AssistantText(t.clone()));
-                                                renderer.render(UiLine::AssistantLineBreak);
-                                            }
-                                        }
-                                        for tc in tool_calls {
-                                            renderer.render(UiLine::ToolCall {
-                                                name: tc.name.clone(),
-                                                detail: super::format_tool_detail(&tc.name, &tc.arguments),
-                                            });
-                                        }
-                                    }
-                                    (Role::Tool, MessageContent::ToolResult(r)) => {
-                                        renderer.render(UiLine::ToolResult {
-                                            success: r.success,
-                                            summary: super::summarise(&r.output, r.success),
-                                        });
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            renderer.render(UiLine::TurnSeparator {
-                                label: "— 同步快照结束 —".to_string(),
-                            });
-                        }
-                        let handle = super::live_sync::spawn_live_forwarder(
-                            session.clone(),
-                            ctx.foreground_runtime_id,
-                            ctx.runtime_event_tx.clone(),
-                        );
-                        ctx.sync_forwarder = Some(handle);
-                        ctx.sync_session = Some(session);
-                        renderer.render(UiLine::CommandOutput(
-                            "已同步当前会话（与浏览器实时互通）".to_string(),
-                        ));
+                        attach_live_session(ctx, renderer, session);
                     }
                     None => {
                         renderer.render(UiLine::CommandOutput(

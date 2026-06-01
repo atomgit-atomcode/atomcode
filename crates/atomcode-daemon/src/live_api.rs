@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -36,9 +36,27 @@ use crate::CachedMcpRegistry;
 /// 进程内单一活动 LiveSession（TUI 与进程内 webui 共享）。
 static LIVE: StdMutex<Option<Arc<atomcode_core::live::LiveSession>>> = StdMutex::new(None);
 
+/// 进程级共享 MCP 缓存（供 TUI 侧 ensure_live_session 使用，无需 AppState）。
+static LIVE_MCP_CACHE: OnceLock<Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>>> = OnceLock::new();
+
+fn live_mcp_cache() -> Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>> {
+    LIVE_MCP_CACHE
+        .get_or_init(|| Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))
+        .clone()
+}
+
 /// 取当前活动 LiveSession（无则 None）。供 TUI（同进程）附着用。
 pub fn current_live_session() -> Option<Arc<atomcode_core::live::LiveSession>> {
     LIVE.lock().unwrap().clone()
+}
+
+/// 取或建当前活动 LiveSession（TUI 与 /live 共用）。进程级单例。
+/// 不需要传入 AppState — 使用进程级共享 MCP 缓存。
+pub fn ensure_live_session(
+    working_dir: std::path::PathBuf,
+    telemetry: Arc<atomcode_telemetry::Telemetry>,
+) -> Arc<atomcode_core::live::LiveSession> {
+    ensure_live_session_global(working_dir, live_mcp_cache(), telemetry)
 }
 
 /// 取或建当前活动 LiveSession（webui /live 用）。阶段③ Task 3 会把 auto_approve 改交互式。
@@ -464,7 +482,7 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
 
 pub(crate) async fn live_stream(State(state): State<AppState>) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
-    let session = ensure_live_session_global(working_dir, state.mcp_cache.clone(), state.telemetry.clone());
+    let session = ensure_live_session(working_dir, state.telemetry.clone());
     let (snapshot, mut rx) = session.join().await;
 
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
@@ -497,7 +515,7 @@ pub(crate) struct LiveMessageReq {
 
 pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<LiveMessageReq>) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
-    let session = ensure_live_session_global(working_dir, state.mcp_cache.clone(), state.telemetry.clone());
+    let session = ensure_live_session(working_dir, state.telemetry.clone());
     let ok = session.send_input(UserInput {
         text: req.message,
         images: req.images.into_iter().map(|i| ImagePart { media_type: i.media_type, data: i.data }).collect(),
@@ -533,7 +551,7 @@ pub(crate) async fn live_permission(
         None => {
             // No live session — try to ensure one exists (idempotent) but there's nothing
             // waiting; return accepted: false so the caller knows.
-            ensure_live_session_global(working_dir, state.mcp_cache.clone(), state.telemetry.clone());
+            ensure_live_session(working_dir, state.telemetry.clone());
             false
         }
     };
