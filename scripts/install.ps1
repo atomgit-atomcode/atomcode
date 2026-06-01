@@ -3,7 +3,7 @@
 #   irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.ps1 | iex
 #
 # Env overrides:
-#   $env:ATOMCODE_VERSION   release tag to install (default: v4.23.3)
+#   $env:ATOMCODE_VERSION   release tag to install (default: v4.24.0)
 #   $env:ATOMCODE_PREFIX    install dir (default: %LOCALAPPDATA%\AtomCode)
 # IMPORTANT: when changing install paths, registry edits, or filenames here,
 # also update scripts/uninstall.ps1 AND
