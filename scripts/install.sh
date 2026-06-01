@@ -67,7 +67,7 @@ fi
 if [ -z "${ATOMCODE_VERSION:-}" ]; then
     VERSION=$($_fetch "$REPO_LATEST_API" | grep tag_name | awk '{print $2}')
 else
-    VERSION="${ATOMCODE_VERSION:-v4.23.3}"
+    VERSION="${ATOMCODE_VERSION:-v4.24.0}"
 fi
 
 BIN_NAME="atomcode-${VERSION}-${os}-${arch}"
