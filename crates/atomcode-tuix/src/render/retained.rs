@@ -702,43 +702,32 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let bytes = serialize_row(row);
                 let _ = self.out.write_all(&bytes);
             }
-            // Clear the physical terminal from (bottom+1, 1) down to the
-            // bottom of the screen. Without this, when the footer later
-            // grows around the inflight strip (slash menu opens, a wrap
-            // pushes the input box, etc.), the OLD inflight rows that
-            // are no longer body_bottom are still on the physical
-            // terminal — and the next `paint_frame`'s cell-diff against
-            // the BLANKED prev_cells (via `invalidate_rows_from` below)
-            // doesn't emit patches at columns where the new footer rows
-            // hold blank cells (blank-vs-blank is a no-patch). The old
-            // chars leak through wherever new content has spaces.
-            // Mirrors `emit_body_line_inner`'s ED 0 (`\x1b[0J`) after
-            // its CUP+content write — same hazard, same shape of fix.
-            // The screen height bounds `bottom` to <= h-1 (since
-            // footer_rows >= 1 always), so `bottom+1 <= h` and the
-            // CUP target is always on-screen.
-            let clear_below = format!("\x1b[{};1H\x1b[0J", bottom + 1);
-            let _ = self.out.write_all(clear_below.as_bytes());
-            // Mirror `emit_body_line_inner`'s prev_cells resync (see
-            // its comment for the canonical write-up of this contract).
-            // The CUP+EL above blanked the physical terminal in those
-            // rows, and `serialize_row` wrote new content directly to
-            // stdout — but `screen.prev_cells` still holds whatever
-            // the previous frame's diff committed there (typically
-            // stale icon / elapsed-suffix cells from the prior spinner
-            // tick, or body content that occupied this slot before
-            // the inflight series began). Without resyncing, the next
-            // `render_diff` can suppress a patch for a cell whose new
-            // value happens to match the stale prev — leaving the row
-            // inconsistent with what the in-place write produced. The
-            // visible bug is "tool-call name characters show up as
-            // blanks" intermittently, surfacing once an approval
-            // prompt or other footer-expanding event reshuffles the
-            // body geometry and the next paint_frame computes patches
-            // against the wrong baseline. Invalidating the touched
-            // rows forces a full repaint on the next tick — costs
-            // ~N extra patches per spinner tick but keeps the diff
-            // cache in lockstep with the physical terminal.
+            // DO NOT erase the footer here. This used to emit
+            // `\x1b[{bottom+1};1H\x1b[0J` (ED 0) to wipe everything below
+            // the inflight strip — i.e. the whole input box — on EVERY
+            // 100ms spinner tick while a tool runs (WebSearch, cargo,
+            // long bash). The repaint is deferred to the next ≤5ms
+            // `flush_deferred`, so the box was blanked-then-repainted at
+            // ~10Hz: the "执行 websearch 时输入框跳动" report. Same
+            // non-atomic erase→repaint defect as `emit_body_line_inner`,
+            // here on the inflight path.
+            //
+            // The erase was redundant. Its stated purpose (clear stale
+            // inflight chars that leak when the footer later grows around
+            // the strip) is now handled entirely by the cell-diff:
+            // `invalidate_rows_from` sentinels prev_cells from the strip
+            // top to the screen bottom, and `Cell::sentinel` forces a
+            // patch on EVERY cell including blanks (it is deliberately
+            // NOT `Cell::blank` — see `screen.rs`). So when a later
+            // footer-growth frame lays a blank over an old marker column,
+            // sentinel-vs-blank still emits a clearing patch — no leak,
+            // no physical ED 0 needed, and the box never blanks. The
+            // `retained_inflight_ghost_clears_when_footer_grows_around_it`
+            // test asserts the final visual, not the ED 0, and still
+            // passes. (The comment that previously lived here described
+            // pre-sentinel behaviour where invalidate blanked prev_cells
+            // and blank-vs-blank was a no-patch — stale since the
+            // sentinel switch.)
             let first_0idx = (first as usize).saturating_sub(1);
             self.screen.invalidate_rows_from(first_0idx);
             self.dirty = true;
@@ -1548,12 +1537,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // ghost glyph below the body — the unified formula keeps that
         // fix intact. See `retained_overflow_does_not_duplicate_last_body_row`.
         let target_1idx = (visible_len + 1) as u16;
-        // CUP to target → ED 0 (erases everything from target down,
-        // freeing the rows below for the new body line + the
-        // follow-up cell-diff's footer rewrite). Pre-format into one
-        // buffer so the write hits stdout as one call — the
-        // chunk-counting test harness asserts on chunk boundaries.
-        let seq = format!("\x1b[{};1H\x1b[0J", target_1idx);
+        // CUP to target → EL (`\x1b[K`, erase ONLY the target line),
+        // NOT ED 0 (`\x1b[0J`, which also erases every footer row below
+        // it). The footer is fully owned by the synchronized
+        // `render_diff` path: `invalidate_rows_from(footer_top_0idx)`
+        // below sentinels every row from here to the screen bottom, so
+        // the next `flush_deferred` repaints the whole footer region
+        // inside its DECSET 2026 envelope regardless of physical
+        // pre-state — the ED 0 erase was REDUNDANT with that repaint.
+        // Its only observable effect was a blank-input-box frame between
+        // this eager direct write and the ≤5ms deferred repaint: during
+        // streaming (a body line every few ms) the box strobes, very
+        // visible on low-latency GPU terminals (the wezterm "输入框一直
+        // 在闪动" report). Erasing just the target line keeps the new
+        // body row's slot clean (no ghost tail) while leaving the footer
+        // pixels untouched until the diff atomically repaints them. Same
+        // lesson as `pop_approval_prompt` (per-row EL, never ED, so the
+        // input box never vanishes). Pre-format into one buffer so the
+        // write hits stdout as one call — the chunk-counting test
+        // harness asserts on chunk boundaries.
+        let seq = format!("\x1b[{};1H\x1b[K", target_1idx);
         let _ = self.out.write_all(seq.as_bytes());
         // Write the body row at target, then LF. The LF advances cursor
         // within the screen (no scroll) because target is always
