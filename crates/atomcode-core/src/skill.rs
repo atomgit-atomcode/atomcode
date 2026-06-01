@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -379,14 +379,20 @@ fn make_name(base: &str, namespace: Option<&str>) -> String {
 // ---------------------------------------------------------------------------
 
 /// Registry of loaded skills, indexed by name.
+///
+/// `BTreeMap` (not `HashMap`) so iteration order is deterministic (sorted by
+/// name). The skill list is injected into the system prompt; a stable order
+/// keeps the prompt prefix byte-identical across process launches, which is
+/// required for provider-side prompt-prefix caching to hit. Same rationale as
+/// `ToolRegistry`. See `skill_iteration_is_deterministic_sorted_order`.
 pub struct SkillRegistry {
-    skills: HashMap<String, Skill>,
+    skills: BTreeMap<String, Skill>,
 }
 
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {
-            skills: HashMap::new(),
+            skills: BTreeMap::new(),
         }
     }
 
@@ -831,6 +837,56 @@ mod tests {
         );
         assert!(reg.get("plugin-a:verify").is_some());
         assert!(reg.get("plugin-b:verify").is_some());
+    }
+
+    fn named_skill(name: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: "d".into(),
+            template: "body".into(),
+            disable_model_invocation: false,
+            user_invocable: true,
+            argument_hint: None,
+            allowed_tools: vec![],
+            skill_dir: PathBuf::new(),
+            source_path: PathBuf::new(),
+        }
+    }
+
+    /// Prompt-cache stability guard. The skill list is injected verbatim into
+    /// the system prompt (agent/prompt.rs `=== AVAILABLE SKILLS ===`). If the
+    /// registry iterates in a per-process-random order (the old `HashMap`
+    /// behavior), the system prompt prefix differs byte-for-byte on every
+    /// launch, so provider-side prompt-prefix caching misses on every fresh
+    /// session — measured ~3% vs ~90%+ hit rate on a 78-skill setup. Iteration
+    /// MUST be deterministic (sorted by name), matching `ToolRegistry`'s
+    /// BTreeMap rationale.
+    #[test]
+    fn skill_iteration_is_deterministic_sorted_order() {
+        let mut reg = SkillRegistry::new();
+        // Insert in deliberately scrambled order.
+        for name in [
+            "superpowers:zeta",
+            "skills:alpha",
+            "plugin:mid",
+            "skills:beta",
+            "aaa:first",
+        ] {
+            reg.register(named_skill(name));
+        }
+
+        let got: Vec<&str> = reg.invocable_by_llm().map(|s| s.name.as_str()).collect();
+        let mut want = got.clone();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "invocable_by_llm must yield names in sorted order for prompt-cache stability"
+        );
+
+        let got_all: Vec<&str> = reg.all().map(|s| s.name.as_str()).collect();
+        let mut want_all = got_all.clone();
+        want_all.sort_unstable();
+        assert_eq!(got_all, want_all, "all() iteration must be deterministic too");
     }
 
     #[test]
