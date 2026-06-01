@@ -164,7 +164,12 @@ pub enum CodingplanResult {
 pub enum Event {
     /// Fired when AtomCode is launched (interactive CLI, oneshot, or TUI entry).
     /// Not fired for --version / --help / telemetry subcommands.
-    OpenAtomcode,
+    OpenAtomcode {
+        /// True when --dangerously-skip-permissions / -y was passed,
+        /// meaning all tool calls are auto-approved without prompting.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        dangerously_skip_permissions: bool,
+    },
 
     /// One LLM turn completed (success or failure).
     LlmChat {
@@ -343,13 +348,26 @@ mod tests {
     fn record_flattens_envelope_and_event() {
         let r = Record {
             envelope: sample_envelope(),
-            event: Event::OpenAtomcode,
+            event: Event::OpenAtomcode { dangerously_skip_permissions: false },
         };
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["event_id"], "open_atomcode");
         assert_eq!(v["schema_version"], 1);
         // Envelope flatten: device_id must be at the top level.
         assert!(v.get("device_id").is_some());
+        // dangerously_skip_permissions=false is skipped by skip_serializing_if.
+        assert!(v.get("dangerously_skip_permissions").is_none());
+    }
+
+    #[test]
+    fn open_atomcode_includes_dangerously_skip_permissions_when_true() {
+        let r = Record {
+            envelope: sample_envelope(),
+            event: Event::OpenAtomcode { dangerously_skip_permissions: true },
+        };
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["event_id"], "open_atomcode");
+        assert_eq!(v["dangerously_skip_permissions"], true);
     }
 
     #[test]
@@ -672,7 +690,7 @@ mod tests {
     #[test]
     fn all_variants_have_event_id_tag() {
         let cases = [
-            Event::OpenAtomcode,
+            Event::OpenAtomcode { dangerously_skip_permissions: false },
             Event::LlmChat {
                 duration_ms: 0,
                 tool_calls_count: 0,

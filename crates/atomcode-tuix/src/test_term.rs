@@ -49,6 +49,7 @@ use vte::{Params, Parser, Perform};
 pub struct GridCell {
     pub ch: char,
     pub bold: bool,
+    pub faint: bool,
     pub reverse: bool,
     pub fg: Option<Color>,
 }
@@ -58,6 +59,7 @@ impl Default for GridCell {
         Self {
             ch: ' ',
             bold: false,
+            faint: false,
             reverse: false,
             fg: None,
         }
@@ -67,6 +69,7 @@ impl Default for GridCell {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Style {
     bold: bool,
+    faint: bool,
     reverse: bool,
     fg: Option<Color>,
 }
@@ -75,6 +78,7 @@ impl Default for Style {
     fn default() -> Self {
         Self {
             bold: false,
+            faint: false,
             reverse: false,
             fg: None,
         }
@@ -273,6 +277,7 @@ impl VirtualTerminal {
             row[self.cursor_col as usize] = GridCell {
                 ch,
                 bold: self.style.bold,
+                faint: self.style.faint,
                 reverse: self.style.reverse,
                 fg: self.style.fg,
             };
@@ -304,7 +309,14 @@ impl VirtualTerminal {
             match code {
                 0 => self.style = Style::default(),
                 1 => self.style.bold = true,
-                22 => self.style.bold = false,
+                2 => self.style.faint = true,
+                // SGR 22 ("normal intensity") clears BOTH bold and faint —
+                // there is no per-attribute toggle for faint (matches the
+                // serializer in render/cell.rs).
+                22 => {
+                    self.style.bold = false;
+                    self.style.faint = false;
+                }
                 7 => self.style.reverse = true,
                 27 => self.style.reverse = false,
                 39 => self.style.fg = None,

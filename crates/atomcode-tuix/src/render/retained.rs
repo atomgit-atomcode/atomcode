@@ -399,6 +399,7 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// tool call (rendered via `render_inflight_tool`). Used to replace
     /// those lines on each spinner tick and to clean up on commit.
     inflight_tool_rows: usize,
+
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
     /// `UiLine::ToolGroupChildUpdate` events resolve `call_id` →
@@ -701,43 +702,32 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let bytes = serialize_row(row);
                 let _ = self.out.write_all(&bytes);
             }
-            // Clear the physical terminal from (bottom+1, 1) down to the
-            // bottom of the screen. Without this, when the footer later
-            // grows around the inflight strip (slash menu opens, a wrap
-            // pushes the input box, etc.), the OLD inflight rows that
-            // are no longer body_bottom are still on the physical
-            // terminal — and the next `paint_frame`'s cell-diff against
-            // the BLANKED prev_cells (via `invalidate_rows_from` below)
-            // doesn't emit patches at columns where the new footer rows
-            // hold blank cells (blank-vs-blank is a no-patch). The old
-            // chars leak through wherever new content has spaces.
-            // Mirrors `emit_body_line_inner`'s ED 0 (`\x1b[0J`) after
-            // its CUP+content write — same hazard, same shape of fix.
-            // The screen height bounds `bottom` to <= h-1 (since
-            // footer_rows >= 1 always), so `bottom+1 <= h` and the
-            // CUP target is always on-screen.
-            let clear_below = format!("\x1b[{};1H\x1b[0J", bottom + 1);
-            let _ = self.out.write_all(clear_below.as_bytes());
-            // Mirror `emit_body_line_inner`'s prev_cells resync (see
-            // its comment for the canonical write-up of this contract).
-            // The CUP+EL above blanked the physical terminal in those
-            // rows, and `serialize_row` wrote new content directly to
-            // stdout — but `screen.prev_cells` still holds whatever
-            // the previous frame's diff committed there (typically
-            // stale icon / elapsed-suffix cells from the prior spinner
-            // tick, or body content that occupied this slot before
-            // the inflight series began). Without resyncing, the next
-            // `render_diff` can suppress a patch for a cell whose new
-            // value happens to match the stale prev — leaving the row
-            // inconsistent with what the in-place write produced. The
-            // visible bug is "tool-call name characters show up as
-            // blanks" intermittently, surfacing once an approval
-            // prompt or other footer-expanding event reshuffles the
-            // body geometry and the next paint_frame computes patches
-            // against the wrong baseline. Invalidating the touched
-            // rows forces a full repaint on the next tick — costs
-            // ~N extra patches per spinner tick but keeps the diff
-            // cache in lockstep with the physical terminal.
+            // DO NOT erase the footer here. This used to emit
+            // `\x1b[{bottom+1};1H\x1b[0J` (ED 0) to wipe everything below
+            // the inflight strip — i.e. the whole input box — on EVERY
+            // 100ms spinner tick while a tool runs (WebSearch, cargo,
+            // long bash). The repaint is deferred to the next ≤5ms
+            // `flush_deferred`, so the box was blanked-then-repainted at
+            // ~10Hz: the "执行 websearch 时输入框跳动" report. Same
+            // non-atomic erase→repaint defect as `emit_body_line_inner`,
+            // here on the inflight path.
+            //
+            // The erase was redundant. Its stated purpose (clear stale
+            // inflight chars that leak when the footer later grows around
+            // the strip) is now handled entirely by the cell-diff:
+            // `invalidate_rows_from` sentinels prev_cells from the strip
+            // top to the screen bottom, and `Cell::sentinel` forces a
+            // patch on EVERY cell including blanks (it is deliberately
+            // NOT `Cell::blank` — see `screen.rs`). So when a later
+            // footer-growth frame lays a blank over an old marker column,
+            // sentinel-vs-blank still emits a clearing patch — no leak,
+            // no physical ED 0 needed, and the box never blanks. The
+            // `retained_inflight_ghost_clears_when_footer_grows_around_it`
+            // test asserts the final visual, not the ED 0, and still
+            // passes. (The comment that previously lived here described
+            // pre-sentinel behaviour where invalidate blanked prev_cells
+            // and blank-vs-blank was a no-patch — stale since the
+            // sentinel switch.)
             let first_0idx = (first as usize).saturating_sub(1);
             self.screen.invalidate_rows_from(first_0idx);
             self.dirty = true;
@@ -985,11 +975,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .map(|s| crate::width::display_width(s) + 1) // +1 for the trailing space separator
             .unwrap_or(0);
 
+        // Bypass indicator — right-aligned warning badge when
+        // --dangerously-skip-permissions / -y is active. Rendered in
+        // red (Role::Error) after the hint on the right side so
+        // it does not displace the PLAN mode indicator on the left.
+        let bypass_badge: Option<String> = status
+            .bypass_indicator
+            .as_ref()
+            .map(|s| scrub_controls(s));
+        let bypass_badge_w = bypass_badge
+            .as_ref()
+            .map(|s| crate::width::display_width(s) + 1) // +1 for the leading space separator
+            .unwrap_or(0);
+
         // Hint right-alignment math must reserve space for the mode badge
-        // so the badge never collides with the right-aligned hint when the
-        // status row is wide.
+        // and bypass badge so they never collide with the right-aligned
+        // hint when the status row is wide.
         let max = rule_width.max(1);
-        let left_max = max.saturating_sub(mode_badge_w);
+        let right_reserved = mode_badge_w + bypass_badge_w;
+        let left_max = max.saturating_sub(right_reserved);
 
         // Pre-truncate the cwd so that model + ctx_usage still get space
         // on narrow terminals.  Budget for cwd: subtract model width and
@@ -1048,6 +1052,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         };
 
+        // Helper: emit the bypass badge at the right edge of the row.
+        // Rendered in red (Role::Error) to draw the eye — the user
+        // must always see when tool calls are auto-approved.
+        let bypass_style = self.style_for(Role::Error);
+        let push_bypass = |row: &mut Vec<Cell>| {
+            if let Some(badge) = &bypass_badge {
+                push_str_cells(row, " ", &pad);
+                push_str_cells(row, badge, &bypass_style);
+            }
+        };
+
         if let Some((raw_hint, severity)) = status.hint.as_ref() {
             let hint = scrub_controls(raw_hint);
             let hint_w = crate::width::display_width(&hint);
@@ -1055,24 +1070,28 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 crate::render::HintSeverity::Warning => error,
                 crate::render::HintSeverity::Info => secondary.clone(),
             };
-            if hint_w + 1 < left_max {
-                let left_budget = left_max - hint_w - 1;
+            let right_w = hint_w + bypass_badge_w;
+            if right_w + 1 < left_max {
+                let left_budget = left_max - right_w - 1;
                 let left_truncated = crate::width::truncate_to_width(&left, left_budget);
                 let left_w = crate::width::display_width(&left_truncated);
-                let pad_w = max - mode_badge_w - left_w - hint_w;
+                let pad_w = max - right_reserved - left_w - hint_w;
                 push_badge(&mut row);
                 push_str_cells(&mut row, &left_truncated, &secondary);
                 push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
                 push_str_cells(&mut row, &hint, &hint_style);
+                push_bypass(&mut row);
             } else {
                 let truncated = crate::width::truncate_to_width(&left, left_max);
                 push_badge(&mut row);
                 push_str_cells(&mut row, &truncated, &secondary);
+                push_bypass(&mut row);
             }
         } else {
             let truncated = crate::width::truncate_to_width(&left, left_max);
             push_badge(&mut row);
             push_str_cells(&mut row, &truncated, &secondary);
+            push_bypass(&mut row);
         }
         row
     }
@@ -1518,12 +1537,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // ghost glyph below the body — the unified formula keeps that
         // fix intact. See `retained_overflow_does_not_duplicate_last_body_row`.
         let target_1idx = (visible_len + 1) as u16;
-        // CUP to target → ED 0 (erases everything from target down,
-        // freeing the rows below for the new body line + the
-        // follow-up cell-diff's footer rewrite). Pre-format into one
-        // buffer so the write hits stdout as one call — the
-        // chunk-counting test harness asserts on chunk boundaries.
-        let seq = format!("\x1b[{};1H\x1b[0J", target_1idx);
+        // CUP to target → EL (`\x1b[K`, erase ONLY the target line),
+        // NOT ED 0 (`\x1b[0J`, which also erases every footer row below
+        // it). The footer is fully owned by the synchronized
+        // `render_diff` path: `invalidate_rows_from(footer_top_0idx)`
+        // below sentinels every row from here to the screen bottom, so
+        // the next `flush_deferred` repaints the whole footer region
+        // inside its DECSET 2026 envelope regardless of physical
+        // pre-state — the ED 0 erase was REDUNDANT with that repaint.
+        // Its only observable effect was a blank-input-box frame between
+        // this eager direct write and the ≤5ms deferred repaint: during
+        // streaming (a body line every few ms) the box strobes, very
+        // visible on low-latency GPU terminals (the wezterm "输入框一直
+        // 在闪动" report). Erasing just the target line keeps the new
+        // body row's slot clean (no ghost tail) while leaving the footer
+        // pixels untouched until the diff atomically repaints them. Same
+        // lesson as `pop_approval_prompt` (per-row EL, never ED, so the
+        // input box never vanishes). Pre-format into one buffer so the
+        // write hits stdout as one call — the chunk-counting test
+        // harness asserts on chunk boundaries.
+        let seq = format!("\x1b[{};1H\x1b[K", target_1idx);
         let _ = self.out.write_all(seq.as_bytes());
         // Write the body row at target, then LF. The LF advances cursor
         // within the screen (no scroll) because target is always
@@ -2080,7 +2113,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     fn flush_frame(&mut self) {
-        let bytes = self.screen.render_diff();
+        let mut bytes = self.screen.render_diff();
+        if let Some((r, c)) = self.screen.peek_cursor() {
+            let cup = format!("\x1b[{};{}H", r, c);
+            bytes.extend_from_slice(cup.as_bytes());
+        }
         let _ = self.out.write_all(&bytes);
     }
 
@@ -2630,7 +2667,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // - children: muted (high-frequency rows, not anchors)
                 // - summary: same fix as header (see Summary arm below)
                 let header_style = self.style_bold(Role::Secondary);
-                let muted = self.style_for(Role::Muted);
+                // Children sit under the bold header. On dark themes
+                // `Role::Muted` is SGR 37 (near-white) — the same tier as the
+                // bold header — so the batch reads flat with no hierarchy.
+                // Render children FAINT on dark to dim them to gray, matching
+                // light theme (DarkGrey children under a black bold header) and
+                // the single tool-call `●` fix.
+                let muted = if crate::highlight::theme::is_light_for_render() {
+                    self.style_for(Role::Muted)
+                } else {
+                    self.style_faint(Role::Muted)
+                };
                 let screen_w = self.screen.width();
                 let header_row = build_one_row(&header, &header_style, screen_w);
                 self.push_body_row(header_row);
@@ -2689,7 +2736,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     None => return,
                 };
 
-                let muted = self.style_for(Role::Muted);
+                // Match the initial render: faint on dark for hierarchy.
+                let muted = if crate::highlight::theme::is_light_for_render() {
+                    self.style_for(Role::Muted)
+                } else {
+                    self.style_faint(Role::Muted)
+                };
                 let new_row = build_one_row(&new_text, &muted, self.screen.width());
 
                 // Update in-memory.
@@ -2741,7 +2793,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
-                let muted = self.style_for(Role::Muted);
+                // Same dark-theme color hierarchy as the `└` result line:
+                // on dark themes `Role::Muted` is SGR 37 (near-white), so the
+                // `●` anchor reads as the same tier as the bold command name
+                // beside it. Render it FAINT on dark to dim it to a gray,
+                // matching light theme (where `●` is DarkGrey against the
+                // black bold name). Light theme keeps the plain muted color.
+                let bullet_style = if crate::highlight::theme::is_light_for_render() {
+                    self.style_for(Role::Muted)
+                } else {
+                    self.style_faint(Role::Muted)
+                };
                 let tool_name_style = self.style_bold(Role::ToolName);
                 let safe_name = scrub_controls(&name);
                 let safe_detail = scrub_controls(&detail);
@@ -2753,10 +2815,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
                 // commands) from producing hundreds of terminal lines.
                 let body_str = truncate_body_str(&body_str, 500);
-                // only NAME is bolded; retained uses a uniform style
-                // for the tool-call line (acceptable in Phase 4,
-                // tightens in Phase 5/6).
-                let _ = muted;
                 // ● (U+25CF, Geometric Shapes block) replaces the
                 // earlier ▸ (U+25B8). ▸ ships in Cascadia Code / SF
                 // Mono but is missing from Consolas / NSimSun /
@@ -2770,7 +2828,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // model for tool-call entries.
                 self.push_body_prefixed(
                     "● ",
-                    &self.style_for(Role::Muted),
+                    &bullet_style,
                     &body_str,
                     &tool_name_style,
                 );
@@ -2817,7 +2875,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 //     failure body) stay readable.
                 //   * error_header / warn_header — line 0 of a failure
                 //     body, see B-discriminated logic below.
-                let summary_style = self.style_for(Role::Muted);
+                // Dark-theme color hierarchy: on dark themes `Role::Muted`
+                // resolves to SGR 37 (near-white), visually indistinct from
+                // the header's default-fg — so the `● ToolName` header and
+                // its `└` result line read as the same tier. Render the
+                // muted hint FAINT on dark so it dims to a gray, restoring
+                // the two-tier look light theme gets for free from
+                // `MUTED_LIGHT` (DarkGrey). Light theme keeps the plain
+                // muted color: DarkGrey is already a readable gray, and
+                // faint-on-DarkGrey would over-dim it.
+                let muted_hint = if crate::highlight::theme::is_light_for_render() {
+                    self.style_for(Role::Muted)
+                } else {
+                    self.style_faint(Role::Muted)
+                };
+                let summary_style = muted_hint.clone();
                 let continuation_style = self.style_for(Role::Secondary);
                 let error_header = self.style_bold(Role::Error);
                 let warn_header = self.style_bold(Role::Warning);
@@ -2845,8 +2917,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // Drawing block) ships in every monospace font.
                 let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 4);
                 // Muted (dim gray) for the result prefix — visually subordinate
-                // to the tool-call header above (● ToolName).
-                let prefix_style = self.style_for(Role::Muted);
+                // to the tool-call header above (● ToolName). Reuses the
+                // theme-aware `muted_hint` (faint on dark) computed above so
+                // the `└` glyph dims in lockstep with the summary text.
+                let prefix_style = muted_hint;
                 // `└` is a leaf marker for the whole result block, not
                 // a per-line bullet — emit it on the FIRST visual row
                 // only. Continuation rows (both wrap chunks of one
@@ -3277,6 +3351,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             self.dirty = false;
         }
         self.promote_visible_body_to_scrollback();
+        // Pop Kitty keyboard enhancement flags pushed at startup.
+        // Without this the terminal keeps sending CSI u sequences
+        // (e.g. `9;5:3u`) for every keypress after we exit, and
+        // the parent shell echoes them as literal gibberish.
+        if self.caps.tty {
+            let _ = execute!(self.out, PopKeyboardEnhancementFlags);
+        }
         // Be defensive: re-enable autowrap, release any DECSTBM, then
         // wipe the visible viewport and home the cursor. Without the
         // wipe, the welcome banner + input box survive as garbage that
@@ -3531,7 +3612,16 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 .unwrap_or(0);
             let buf_display_w = crate::width::display_width(&self.input_buf);
             self.paint_frame();
-            let bytes = self.screen.render_diff();
+            let mut bytes = self.screen.render_diff();
+            // Re-anchor cursor: `render_diff`'s trailing DECTCEM
+            // (\x1b[?25h) may obscure the preceding CUP on terminals
+            // like iTerm2 that treat the visibility toggle as a
+            // cursor-position side-effect. Append one extra CUP so it
+            // rides the same chunked write as the rest of the frame.
+            if let Some((r, c)) = self.screen.peek_cursor() {
+                let cup = format!("\x1b[{};{}H", r, c);
+                bytes.extend_from_slice(cup.as_bytes());
+            }
             let emit_len = bytes.len();
             // Chunked emit: Mac Terminal.app has been observed to drop
             // bytes mid-sequence when a single write carries ~1KB+ of
@@ -3730,13 +3820,16 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
     /// same bytes earlier on the graceful path, and the terminal
     /// accepts the duplicates as no-ops.
     fn drop(&mut self) {
-        // Mouse-mode disable + cursor show (DECTCEM) + autowrap on
-        // (DECAWM) + release any DECSTBM scroll region. The latter
-        // three mirror `shutdown()`'s force-restore so a panic mid-
-        // spinner doesn't leak DECTCEM-off into the parent shell.
+        // Mouse-mode disable + Kitty keyboard flag pop + cursor show
+        // (DECTCEM) + autowrap on (DECAWM) + release any DECSTBM
+        // scroll region. The latter three mirror `shutdown()`'s
+        // force-restore so a panic mid-spinner doesn't leak
+        // DECTCEM-off into the parent shell.
+        // \x1b[>1u pops one level of Kitty keyboard enhancement
+        // (same as crossterm's PopKeyboardEnhancementFlags).
         let _ = self
             .out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?7h\x1b[r");
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[>1u\x1b[?25h\x1b[?7h\x1b[r");
         #[cfg(windows)]
         if let Some(prior) = self.prior_console_in_mode.take() {
             crate::render::conhost::restore_conhost_console_in_mode(prior);
@@ -3967,6 +4060,7 @@ mod tests {
                 ctx_window: 0,
             hint: None,
             mode_indicator: None,
+            bypass_indicator: None,
             session_name: None,
         }
     }
@@ -3989,6 +4083,7 @@ mod tests {
                 ctx_window: 0,
             hint: None,
             mode_indicator: Some("PLAN".into()),
+            bypass_indicator: None,
             session_name: None,
         };
         let row = r.build_status_row(&status, 60);
@@ -4021,6 +4116,82 @@ mod tests {
         assert!(
             !visible.contains("PLAN"),
             "no mode indicator should produce no PLAN badge; got: {:?}",
+            visible
+        );
+    }
+
+    /// Bypass indicator (--dangerously-skip-permissions) renders on the
+    /// RIGHT side of the status row, after the model · cwd run. It must
+    /// NOT displace the left-aligned PLAN mode indicator.
+    #[test]
+    fn build_status_row_bypass_badge_on_right_side() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/proj".into(),
+            ctx_used: 0,
+            ctx_window: 0,
+            hint: None,
+            mode_indicator: Some("PLAN".into()),
+            bypass_indicator: Some("\u{26a0} BYPASS".into()),
+            session_name: None,
+        };
+        let row = r.build_status_row(&status, 60);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        let trimmed = visible.trim_start();
+        // PLAN badge still on the left.
+        assert!(
+            trimmed.starts_with("PLAN "),
+            "PLAN badge must still appear first on the left; got: {:?}",
+            visible
+        );
+        // BYPASS badge appears somewhere in the row (right side).
+        assert!(
+            visible.contains("BYPASS"),
+            "BYPASS badge must appear in the row; got: {:?}",
+            visible
+        );
+        // PLAN comes before BYPASS in the rendered row.
+        let plan_pos = visible.find("PLAN").expect("PLAN must be present");
+        let bypass_pos = visible.find("BYPASS").expect("BYPASS must be present");
+        assert!(
+            plan_pos < bypass_pos,
+            "PLAN ({}) must precede BYPASS ({}); got: {:?}",
+            plan_pos,
+            bypass_pos,
+            visible
+        );
+    }
+
+    /// Bypass indicator without a mode indicator (Build + BYPASS) — the
+    /// badge still appears on the right, and no PLAN badge leaks.
+    #[test]
+    fn build_status_row_bypass_without_mode_indicator() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/proj".into(),
+            ctx_used: 0,
+            ctx_window: 0,
+            hint: None,
+            mode_indicator: None,
+            bypass_indicator: Some("\u{26a0} BYPASS".into()),
+            session_name: None,
+        };
+        let row = r.build_status_row(&status, 60);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.contains("BYPASS"),
+            "BYPASS badge must appear; got: {:?}",
+            visible
+        );
+        assert!(
+            !visible.contains("PLAN"),
+            "no mode_indicator should produce no PLAN badge; got: {:?}",
             visible
         );
     }
@@ -5631,6 +5802,81 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
         let found = vterm.any_row(|row| row.contains("└") && row.contains("3 files changed"));
         assert!(found, "tool result missing\ndump:\n{}", vterm.dump());
+    }
+
+    /// Dark-theme color hierarchy: the `└` result line (leaf glyph +
+    /// summary metadata) renders FAINT so it reads as subordinate to
+    /// the bold tool-call header above it. On dark themes `Role::Muted`
+    /// resolves to SGR 37 (near-white) which is visually indistinct
+    /// from the header's default-fg; faint dims it to a gray, restoring
+    /// the same two-tier hierarchy light theme gets for free from
+    /// `MUTED_LIGHT` (DarkGrey). The header itself must stay bold and
+    /// NOT faint — it's the prominent tier.
+    #[test]
+    fn retained_tool_result_summary_is_faint_in_dark_theme() {
+        crate::highlight::theme::set_theme_mode(false); // dark
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::ToolCall {
+            name: "ListDirectory".into(),
+            detail: ".".into(),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "3 files changed".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Result line: the `└` glyph and the summary text must be faint.
+        let res_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("└") && vterm.row_text(i).contains("3 files"))
+            .unwrap_or_else(|| panic!("result row missing\ndump:\n{}", vterm.dump()));
+        let arrow_cell = vterm.cell_at(res_idx, 2);
+        assert_eq!(arrow_cell.ch, '└');
+        assert!(
+            arrow_cell.faint,
+            "`└` glyph must be faint in dark theme, got {:?}",
+            arrow_cell,
+        );
+        let summary_col = vterm.row_text(res_idx).find("3 files").unwrap();
+        let summary_cell = vterm.cell_at(res_idx, summary_col);
+        assert!(
+            summary_cell.faint,
+            "summary metadata must be faint in dark theme, got {:?}",
+            summary_cell,
+        );
+
+        // Header line: the `●` anchor must be faint (subordinate tier,
+        // in lockstep with the `└` line), while the tool name must be
+        // bold and NOT faint — the prominent tier.
+        let hdr_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("ListDirectory"))
+            .unwrap_or_else(|| panic!("header row missing\ndump:\n{}", vterm.dump()));
+        let bullet_col = vterm.row_text(hdr_idx).find('●').unwrap();
+        let bullet_cell = vterm.cell_at(hdr_idx, bullet_col);
+        assert!(
+            bullet_cell.faint,
+            "`●` bullet must be faint in dark theme, got {:?}",
+            bullet_cell,
+        );
+        let name_col = vterm.row_text(hdr_idx).find("ListDirectory").unwrap();
+        let name_cell = vterm.cell_at(hdr_idx, name_col);
+        assert!(name_cell.bold, "tool name must be bold, got {:?}", name_cell);
+        assert!(
+            !name_cell.faint,
+            "tool name must NOT be faint, got {:?}",
+            name_cell,
+        );
     }
 
     /// ToolResult `⎿` glyph sits at col 2 — directly under the tool

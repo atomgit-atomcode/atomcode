@@ -107,8 +107,8 @@ mod tests {
     fn sign_v1_is_deterministic() {
         let body = b"{\"hello\":\"world\"}";
         let nonce = [0x11u8; 16];
-        let h1 = sign_v1("POST", "/v1/chat/completions", body, "tok", "user-1", 1_700_000_000, &nonce, "4.23.1");
-        let h2 = sign_v1("POST", "/v1/chat/completions", body, "tok", "user-1", 1_700_000_000, &nonce, "4.23.1");
+        let h1 = sign_v1("POST", "/v1/chat/completions", body, "tok", "user-1", 1_700_000_000, &nonce, "4.23.0");
+        let h2 = sign_v1("POST", "/v1/chat/completions", body, "tok", "user-1", 1_700_000_000, &nonce, "4.23.0");
         assert_eq!(h1, h2);
     }
 
@@ -120,7 +120,7 @@ mod tests {
     fn sign_v1_emits_five_named_headers() {
         let body = b"{}";
         let nonce = [0u8; 16];
-        let h = sign_v1("POST", "/v1/chat/completions", body, "tok", "user-1", 1, &nonce, "4.23.1");
+        let h = sign_v1("POST", "/v1/chat/completions", body, "tok", "user-1", 1, &nonce, "4.23.0");
         let names: Vec<&str> = h.iter().map(|(n, _)| *n).collect();
         assert_eq!(
             names,
@@ -141,7 +141,7 @@ mod tests {
     fn sign_v1_sig_header_has_v1_hex_format() {
         let body = b"{}";
         let nonce = [0u8; 16];
-        let h = sign_v1("POST", "/v1/chat/completions", body, "tok", "user-1", 1, &nonce, "4.23.1");
+        let h = sign_v1("POST", "/v1/chat/completions", body, "tok", "user-1", 1, &nonce, "4.23.0");
         let sig = h.iter().find(|(n, _)| *n == "X-AtomCode-Sig").unwrap().1.as_str();
         assert!(sig.starts_with("v1:"), "expected v1: prefix, got {sig}");
         let hex = &sig[3..];
@@ -156,8 +156,8 @@ mod tests {
     #[test]
     fn sign_v1_changes_with_body() {
         let nonce = [0u8; 16];
-        let h_a = sign_v1("POST", "/v1/chat/completions", b"{\"a\":1}", "tok", "user-1", 1, &nonce, "4.23.1");
-        let h_b = sign_v1("POST", "/v1/chat/completions", b"{\"b\":2}", "tok", "user-1", 1, &nonce, "4.23.1");
+        let h_a = sign_v1("POST", "/v1/chat/completions", b"{\"a\":1}", "tok", "user-1", 1, &nonce, "4.23.0");
+        let h_b = sign_v1("POST", "/v1/chat/completions", b"{\"b\":2}", "tok", "user-1", 1, &nonce, "4.23.0");
         let sig_a = h_a.iter().find(|(n, _)| *n == "X-AtomCode-Sig").unwrap().1.as_str();
         let sig_b = h_b.iter().find(|(n, _)| *n == "X-AtomCode-Sig").unwrap().1.as_str();
         assert_ne!(sig_a, sig_b);

@@ -15,7 +15,8 @@ import {
 } from '../daemon/types';
 
 type WebviewMode = 'sidebar' | 'tab';
-type QueuedChatMessage = { text: string; contextPaths?: string[]; clientMessageId?: string };
+type ContextItem = { path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number };
+type QueuedChatMessage = { text: string; context?: ContextItem[]; clientMessageId?: string };
 
 interface SessionRuntime {
   abortController?: AbortController;
@@ -39,6 +40,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _focusedPanelId?: string;
   private _groupLocked = false;
   private _sessionRuntimes = new Map<string, SessionRuntime>();
+  private _pendingMessages = new Map<string, any[]>();
   private _loginId?: string;
   private _loginPoll?: ReturnType<typeof setInterval>;
   private _loginStartedFromCommand = false;
@@ -253,7 +255,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'send':
           await this._handleSend(
             msg.text,
-            msg.context?.map((c: { path: string }) => c.path),
+            msg.context,
             msg.clientMessageId,
             msg.sessionId,
           );
@@ -267,6 +269,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'ready':
           this._markPanelReady(webview);
           await this._sendInitialState(webview, mode);
+          // Flush any messages queued before the webview was ready
+          {
+            let sid: string | undefined;
+            for (const [s, panel] of this._panels) {
+              if (panel.webview === webview) { sid = s; break; }
+            }
+            if (sid) this._flushPendingMessages(sid);
+          }
           break;
         case 'selectModel':
           await this._setDefaultProvider(msg.provider || msg.model);
@@ -319,7 +329,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'openFile':
           if (msg.path) {
             const uri = vscode.Uri.file(msg.path);
-            vscode.window.showTextDocument(uri);
+            const opts: vscode.TextDocumentShowOptions = {
+              viewColumn: vscode.ViewColumn.Active,
+              preserveFocus: false,
+            };
+            if (msg.startLine) {
+              const start = msg.startLine - 1;
+              const end = msg.endLine ? msg.endLine - 1 : start;
+              opts.selection = new vscode.Range(start, 0, end, 0);
+            }
+            // Try to reveal in existing editor if already open
+            const existingEditor = vscode.window.visibleTextEditors.find(
+              (e) => e.document.uri.fsPath === msg.path
+            );
+            if (existingEditor) {
+              if (opts.selection) {
+                existingEditor.selection = new vscode.Selection(opts.selection.start, opts.selection.end);
+              }
+              vscode.window.showTextDocument(existingEditor.document, {
+                viewColumn: existingEditor.viewColumn,
+                selection: opts.selection,
+              });
+            } else {
+              vscode.window.showTextDocument(uri, opts);
+            }
           }
           break;
         case 'applyCode':
@@ -396,20 +429,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   public async sendEditorCommandMessage(text: string) {
     let sid = this._focusedPanelId;
+
     if (!sid) {
-      this.openInTab();
-      await new Promise(resolve => setTimeout(resolve, 500));
-      sid = this._focusedPanelId;
-    }
-    if (sid) {
+      // Create daemon session first, then open tab with sessionId
+      // so the panel is properly tracked for message routing.
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const session = await this._client.createSession(undefined, workspaceFolder);
+      sid = session.id;
+      this._getRuntime(sid).projectHash = session.project_hash;
+      this._panelSessions.set(sid, { sessionId: sid, projectHash: session.project_hash });
+      this.openInTab(sid);
+      await this._refreshSessions();
+    } else {
       const rt = this._sessionRuntimes.get(sid);
       if (rt?.isGenerating) {
         this.stopGeneration();
       }
+      await this._ensureSession(sid);
+      this._postMessageToPanel(sid, { type: 'clearChat' });
     }
-    await this._createEditorCommandSession();
-    this._postMessage({ type: 'userMessage', text });
+
+    this._postOrQueueToPanel(sid!, { type: 'userMessage', text });
     await this._handleSend(text);
+  }
+
+  /**
+   * Add selected code as a context reference in the chat input.
+   * Shows as a clickable file:line-range pill.
+   */
+  public async addToChat(file: { path: string; fileName: string; language?: string; selection?: string; startLine?: number; endLine?: number }) {
+    if (!file.selection) return;
+    let sid = this._focusedPanelId;
+
+    if (!sid) {
+      // Create daemon session first, then open tab with sessionId
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const session = await this._client.createSession(undefined, workspaceFolder);
+      sid = session.id;
+      this._getRuntime(sid).projectHash = session.project_hash;
+      this._panelSessions.set(sid, { sessionId: sid, projectHash: session.project_hash });
+      this.openInTab(sid);
+      await this._refreshSessions();
+    }
+
+    this._postOrQueueToPanel(sid, {
+      type: 'context',
+      filePath: file.path,
+      fileName: file.fileName,
+      language: file.language,
+      selection: file.selection,
+      startLine: file.startLine,
+      endLine: file.endLine,
+    });
+    this.focusInput();
   }
 
   public async newConversation() {
@@ -469,7 +541,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return rt;
   }
 
-  private async _handleSend(text: string, contextPaths?: string[], clientMessageId?: string, msgSessionId?: string) {
+  private async _handleSend(text: string, context?: Array<{ path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number }>, clientMessageId?: string, msgSessionId?: string) {
     const trimmed = text.trim();
     if (!trimmed) return;
 
@@ -481,7 +553,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const rt = this._getRuntime(sid);
 
     if (rt.isGenerating) {
-      rt.queuedMessages.push({ text: trimmed, contextPaths, clientMessageId });
+      rt.queuedMessages.push({ text: trimmed, context, clientMessageId });
       return;
     }
 
@@ -499,38 +571,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._postMessage({ type: 'generationStarted' });
 
     let fullMessage = trimmed;
-    if (contextPaths && contextPaths.length > 0) {
+    if (context && context.length > 0) {
       const parts: string[] = [];
-      const MAX_FILE_SIZE_BYTES = 512 * 1024; // 512 KB per file
-      const MAX_TOTAL_BYTES = 1024 * 1024;    // 1 MB total across all files
-      let totalBytes = 0;
 
-      for (const filePath of contextPaths) {
-        try {
-          const uri = vscode.Uri.file(filePath);
-          const content = await vscode.workspace.fs.readFile(uri);
+      for (const ctx of context) {
+        if (ctx.type === 'selection' && ctx.selection) {
+          // Use the selected code directly
+          const location = ctx.startLine && ctx.endLine
+            ? ` (lines ${ctx.startLine}-${ctx.endLine})`
+            : '';
+          parts.push(`File: ${ctx.fileName || path.basename(ctx.path)}${location}\n\`\`\`${ctx.language || ''}\n${ctx.selection}\n\`\`\``);
+        } else {
+          // Read entire file (with size limits)
+          try {
+            const uri = vscode.Uri.file(ctx.path);
+            const content = await vscode.workspace.fs.readFile(uri);
+            const MAX_FILE_SIZE_BYTES = 512 * 1024;
 
-          if (content.byteLength > MAX_FILE_SIZE_BYTES) {
-            parts.push(`File: ${path.basename(filePath)}\n[File too large to attach (${Math.round(content.byteLength / 1024)} KB). Use a specific selection instead.]`);
-            continue;
+            if (content.byteLength > MAX_FILE_SIZE_BYTES) {
+              parts.push(`File: ${ctx.fileName || path.basename(ctx.path)}\n[File too large to attach (${Math.round(content.byteLength / 1024)} KB). Use a specific selection instead.]`);
+              continue;
+            }
+
+            const decoded = Buffer.from(content).toString('utf-8');
+            const ext = path.extname(ctx.path).slice(1);
+            parts.push(`File: ${ctx.fileName || path.basename(ctx.path)}\n\`\`\`${ext}\n${decoded}\n\`\`\``);
+          } catch {
+            // Skip files that can't be read
           }
-
-          if (totalBytes + content.byteLength > MAX_TOTAL_BYTES) {
-            parts.push(`File: ${path.basename(filePath)}\n[Skipped: total context size limit reached.]`);
-            continue;
-          }
-
-          const decoded = Buffer.from(content).toString('utf-8');
-          const fileName = path.basename(filePath);
-          const ext = path.extname(filePath).slice(1);
-          parts.push(`File: ${fileName}\n\`\`\`${ext}\n${decoded}\n\`\`\``);
-          totalBytes += content.byteLength;
-        } catch {
-          // Skip files that can't be read
         }
       }
       if (parts.length > 0) {
-        fullMessage = 'The user has attached the following file(s) for context. The content is provided inline below — DO NOT use read_file to re-read them.\n\n'
+        fullMessage = 'The user has attached the following file(s)/selection(s) for context. The content is provided inline below — DO NOT use read_file to re-read them.\n\n'
           + parts.join('\n\n') + '\n\n' + 'User question: ' + trimmed;
       }
     }
@@ -635,7 +707,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!rt || rt.isGenerating) return;
     const next = rt.queuedMessages.shift();
     if (!next) return;
-    await this._handleSend(next.text, next.contextPaths, next.clientMessageId);
+    await this._handleSend(next.text, next.context, next.clientMessageId);
     const rt2 = this._sessionRuntimes.get(sid);
     if (rt2 && !rt2.isGenerating) {
       void this._sendNextQueuedMessage();
@@ -661,15 +733,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return session.id;
   }
 
-  private async _createEditorCommandSession() {
-    let sid = this._focusedPanelId;
-    if (!sid) {
-      this.openInTab();
-      return;
-    }
-    this._postMessageToPanel(sid, { type: 'clearChat' });
-    await this._ensureSession(sid);
-  }
 
   public sendEditorContext() {
     this._sendEditorContext();
@@ -970,15 +1033,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private _sendEditorContext(webview?: vscode.Webview) {
+    // Only send context when user has an active selection
     const editor = vscode.window.activeTextEditor;
-    if (editor) {
+    if (editor && !editor.selection.isEmpty) {
       const selection = editor.selection;
       this._postMessage({
         type: 'context',
         filePath: editor.document.uri.fsPath,
         fileName: path.basename(editor.document.uri.fsPath),
-        selection: !selection.isEmpty ? editor.document.getText(selection) : undefined,
+        selection: editor.document.getText(selection),
         language: editor.document.languageId,
+        startLine: selection.start.line + 1,
+        endLine: selection.end.line + 1,
       }, webview);
     }
   }
@@ -1394,6 +1460,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       selection: !selection.isEmpty ? editor.document.getText(selection) : undefined,
       language: editor.document.languageId,
     };
+  }
+
+  private _postOrQueueToPanel(sessionId: string, msg: any) {
+    if (this._panelReady.get(sessionId)) {
+      this._postMessageToPanel(sessionId, msg);
+      return;
+    }
+    // Panel not ready yet — queue the message until webview sends 'ready'
+    const queue = this._pendingMessages.get(sessionId) || [];
+    queue.push(msg);
+    this._pendingMessages.set(sessionId, queue);
+  }
+
+  private _flushPendingMessages(sessionId: string) {
+    const queue = this._pendingMessages.get(sessionId);
+    if (!queue || queue.length === 0) return;
+    this._pendingMessages.delete(sessionId);
+    for (const msg of queue) {
+      this._postMessageToPanel(sessionId, msg);
+    }
   }
 
   private _postMessage(msg: any, webview?: vscode.Webview) {

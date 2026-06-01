@@ -266,6 +266,98 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "guide" => {
+            if arg.is_empty() {
+                let mut menu = String::new();
+                menu.push_str(&t(Msg::GuideMenuHeader));
+                menu.push_str("\n\n  ");
+                menu.push_str(&t(Msg::GuideMenuTopics));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuGettingStarted));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuSwitchModel));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuMcp));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuSkills));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuMemory));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuBackground));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuContext));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuKeybindings));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuConfig));
+                menu.push_str(&t(Msg::GuideMenuTip));
+                menu.push('\n');
+                menu.push_str(&t(Msg::GuideMenuDocUrl));
+                renderer.render(UiLine::CommandOutput(menu));
+                renderer.flush();
+            } else {
+                // Try expanding the "ask" skill inline first (fast path).
+                if let Some(rendered) = expand_skill(ctx, "ask", arg) {
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: rendered,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                    state.on_submit();
+                } else {
+                    // "ask" skill is not installed — trigger async install
+                    // and stash the topic so handle_plugin_job_event can
+                    // auto-invoke once the install completes.
+                    let topic = arg.to_string();
+
+                    if ctx.pending_guide_topic.is_some() {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::CmdGuideInstalling).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+
+                    ctx.pending_guide_topic = Some(topic);
+
+                    let tx = ctx.plugin_job_tx.clone();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::CmdGuideAutoInstall).into_owned(),
+                    ));
+                    renderer.flush();
+
+                    tokio::task::spawn_blocking(move || {
+                        let ev = match atomcode_core::plugin::installer::ensure_plugin_installed(
+                            "atomcode",
+                            "atomcode-skills",
+                            "https://atomgit.com/atomgit_atomcode/atomcode-skills.git",
+                        ) {
+                            Ok(info) => {
+                                atomcode_core::plugin::PluginJobEvent::PluginInstalled(info)
+                            }
+                            Err(e) => {
+                                if let Some(_aie) = e.downcast_ref::<
+                                    atomcode_core::plugin::installer::AlreadyInstalledError,
+                                >() {
+                                    atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                        id: _aie.id.clone(),
+                                    }
+                                } else {
+                                    atomcode_core::plugin::PluginJobEvent::Failed {
+                                        op: "install".into(),
+                                        msg: format!("{:#}", e),
+                                    }
+                                }
+                            }
+                        };
+                        let _ = tx.send(ev);
+                    });
+                }
+            }
+        }
         "keys" => {
             // Dump the full keyboard-shortcut reference into scrollback.
             // i18n string owns column alignment so translators can adjust
@@ -1397,7 +1489,13 @@ pub(super) fn execute_slash_command(
             }
         }
         "plugin" => {
-            handle_plugin(arg, ctx, renderer);
+            // Bare `/plugin` opens the interactive manager; subcommands
+            // (`marketplace …`, `install x@mp`, …) keep their old behavior.
+            if arg.trim().is_empty() {
+                *active_modal = Some(Box::new(crate::modals::PluginManager::open()));
+            } else {
+                handle_plugin(arg, ctx, renderer);
+            }
         }
         "skills" => {
             // Gateway command. With no arg, list user-invocable skills
@@ -1616,7 +1714,7 @@ pub(super) fn execute_slash_command(
 /// Look up a user-invocable skill by name and expand it with the current
 /// session id. Returns the rendered prompt to send as a user message, or
 /// `None` if no matching skill exists.
-fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<String> {
+pub(super) fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<String> {
     let reg = ctx.skill_registry.read().ok()?;
     let skill = reg.get(name)?;
     if !skill.user_invocable {
@@ -1717,35 +1815,113 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 ),
             }
         }
-        "install" => match parse_plugin_at_marketplace(parts.next().unwrap_or("").trim()) {
-            Some((plugin, mp)) => {
-                // External-source plugins also clone, so dispatch async like
-                // the marketplace add path. Inline-source installs are fast
-                // (state-file edit only) but still go through the same
-                // codepath for consistency.
+        "install" => match parse_plugin_arg(parts.next().unwrap_or("").trim()) {
+            Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
+                // Explicit plugin@marketplace — install directly.
                 let tx = ctx.plugin_job_tx.clone();
                 ok(renderer, t(Msg::PluginInstalling { plugin: &plugin, marketplace: &mp }).into_owned());
                 tokio::task::spawn_blocking(move || {
                     let ev = match atomcode_core::plugin::installer::install(&plugin, &mp) {
                         Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
-                        Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
-                            op: "install".into(),
-                            msg: format!("{:#}", e),
-                        },
+                        Err(e) => {
+                            if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
+                                atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                    id: _aie.id.clone(),
+                                }
+                            } else {
+                                atomcode_core::plugin::PluginJobEvent::Failed {
+                                    op: "install".into(),
+                                    msg: format!("{:#}", e),
+                                }
+                            }
+                        }
                     };
                     let _ = tx.send(ev);
                 });
             }
+            Some(PluginArg::Bare { plugin }) => {
+                // Bare plugin name — resolve across all marketplaces.
+                match atomcode_core::plugin::installer::resolve_plugin_marketplace(&plugin) {
+                    Ok(matches) if matches.len() == 1 => {
+                        let m = &matches[0];
+                        let mp = m.marketplace.clone();
+                        let resolved_plugin = m.plugin.clone();
+                        let tx = ctx.plugin_job_tx.clone();
+                        ok(renderer, t(Msg::PluginInstallingByName { plugin: &plugin }).into_owned());
+                        tokio::task::spawn_blocking(move || {
+                            let ev = match atomcode_core::plugin::installer::install(&resolved_plugin, &mp) {
+                                Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                                Err(e) => {
+                                    if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
+                                        atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                            id: _aie.id.clone(),
+                                        }
+                                    } else {
+                                        atomcode_core::plugin::PluginJobEvent::Failed {
+                                            op: "install".into(),
+                                            msg: format!("{:#}", e),
+                                        }
+                                    }
+                                }
+                            };
+                            let _ = tx.send(ev);
+                        });
+                    }
+                    Ok(matches) if matches.len() > 1 => {
+                        // Multiple marketplaces contain this plugin — show a
+                        // disambiguation list with the install command to use.
+                        let mut msg = t(Msg::PluginInstallAmbiguous { plugin: &plugin }).into_owned();
+                        for m in &matches {
+                            msg.push_str(&format!("  /plugin install {}@{}\n", m.plugin, m.marketplace));
+                        }
+                        err(renderer, msg);
+                    }
+                    _ => {
+                        ok(renderer, t(Msg::PluginInstallNotFound { plugin: &plugin }).into_owned());
+                    }
+                }
+            }
             None => err(renderer, t(Msg::PluginInstallUsage).into_owned()),
         },
-        "uninstall" => match parse_plugin_at_marketplace(parts.next().unwrap_or("").trim()) {
-            Some((plugin, mp)) => match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
-                Ok(()) => {
-                    super::reload_plugins(ctx);
-                    ok(renderer, t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned());
+        "uninstall" => match parse_plugin_arg(parts.next().unwrap_or("").trim()) {
+            Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
+                match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
+                    Ok(()) => {
+                        super::reload_plugins(ctx);
+                        ok(renderer, t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned());
+                    }
+                    Err(e) => err(renderer, t(Msg::PluginUninstallFailed { error: &e.to_string() }).into_owned()),
                 }
-                Err(e) => err(renderer, t(Msg::PluginUninstallFailed { error: &e.to_string() }).into_owned()),
-            },
+            }
+            Some(PluginArg::Bare { plugin }) => {
+                // Look up which installed plugins match this name.
+                let installed = atomcode_core::plugin::installer::list_installed().unwrap_or_default();
+                let matches: Vec<_> = installed
+                    .into_iter()
+                    .filter(|p| p.plugin == plugin || p.plugin == atomcode_core::plugin::marketplace::sanitize_name(&plugin))
+                    .collect();
+                match matches.len() {
+                    0 => ok(renderer, t(Msg::PluginUninstallNotFound { plugin: &plugin }).into_owned()),
+                    1 => {
+                        let p = &matches[0];
+                        let (plug, mp) = (p.plugin.clone(), p.marketplace.clone());
+                        match atomcode_core::plugin::installer::uninstall(&plug, &mp) {
+                            Ok(()) => {
+                                super::reload_plugins(ctx);
+                                ok(renderer, t(Msg::PluginUninstalled { plugin: &plug, marketplace: &mp }).into_owned());
+                            }
+                            Err(e) => err(renderer, t(Msg::PluginUninstallFailed { error: &e.to_string() }).into_owned()),
+                        }
+                    }
+                    _ => {
+                        let mut msg = t(Msg::PluginUninstallAmbiguous { plugin: &plugin }).into_owned();
+                        for p in &matches {
+                            msg.push_str(&format!("  /plugin uninstall {}@{}\n", p.plugin, p.marketplace));
+                        }
+                        err(renderer, msg);
+                    }
+                }
+            }
             None => err(
                 renderer,
                 t(Msg::PluginUninstallUsage).into_owned(),
@@ -1788,12 +1964,32 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
     }
 }
 
-fn parse_plugin_at_marketplace(s: &str) -> Option<(String, String)> {
-    let (plugin, mp) = s.split_once('@')?;
-    if plugin.is_empty() || mp.is_empty() {
+/// Parsed argument for `/plugin install` / `/plugin uninstall`.
+/// Supports both `plugin@marketplace` (fully qualified) and bare
+/// `plugin` (resolved across all marketplaces).
+enum PluginArg {
+    /// Explicit `plugin@marketplace` — use as-is.
+    Qualified { plugin: String, marketplace: String },
+    /// Bare plugin name — needs marketplace resolution.
+    Bare { plugin: String },
+}
+
+fn parse_plugin_arg(s: &str) -> Option<PluginArg> {
+    let s = s.trim();
+    if s.is_empty() {
         return None;
     }
-    Some((plugin.to_string(), mp.to_string()))
+    if let Some((plugin, mp)) = s.split_once('@') {
+        if !plugin.is_empty() && !mp.is_empty() {
+            return Some(PluginArg::Qualified {
+                plugin: plugin.to_string(),
+                marketplace: mp.to_string(),
+            });
+        }
+    }
+    Some(PluginArg::Bare {
+        plugin: s.to_string(),
+    })
 }
 
 /// Handle `/worktree` subcommands: create, list, done, cleanup.
@@ -2080,13 +2276,33 @@ fn render_codingplan_status_for_status_cmd() -> String {
         remaining_days: plan.remaining_days,
         total_days: plan.total_days,
     }).into_owned();
-    // Mirror the precedence in `setup.rs`'s legacy backward-compat path:
-    // when `window_quota_exhausted` is set we suppress the usage line
-    // (which the server often reports as 0% for a freshly-reset short
-    // window even while the longer quota is exhausted). Showing both
-    // produced the visibly contradictory `用量 0% / ⚠额度已满` pair the
-    // user surfaced as the "v4.23.2 still displays it this way" report.
-    if status.window_quota_exhausted {
+    // Prefer the per-window `rate_limit_windows` schema when present, mirroring
+    // `/login` (setup.rs). When the monthly cap is exhausted the server flags it
+    // via `quota_exhausted` while hiding the window (`show_enable=0`) and leaving
+    // the 5h rolling window visible at a misleading 0% — so we detect exhaustion
+    // via `blocking_exhausted_window` and suppress the rolling-window usage line.
+    if !status.rate_limit_windows.is_empty() {
+        use atomcode_core::coding_plan::setup::{blocking_exhausted_window, format_duration_secs};
+        if let Some(w) = blocking_exhausted_window(&status.rate_limit_windows) {
+            out.push_str(&t(Msg::StatusCpMonthlyExhausted {
+                duration: &format_duration_secs(w.seconds_until_reset),
+            }));
+        } else {
+            for w in status.rate_limit_windows.iter().filter(|w| w.show_enable == 1) {
+                out.push_str(&t(Msg::StatusCpUsage {
+                    usage: &w.usage_status_desc,
+                    reset_at: &w.reset_at_display,
+                    duration: &format_duration_secs(w.seconds_until_reset),
+                }));
+            }
+        }
+    } else if status.window_quota_exhausted {
+        // Legacy backward-compat path (old server, no `rate_limit_windows`):
+        // when `window_quota_exhausted` is set we suppress the usage line
+        // (which the server often reports as 0% for a freshly-reset short
+        // window even while the longer quota is exhausted). Showing both
+        // produced the visibly contradictory `用量 0% / ⚠额度已满` pair the
+        // user surfaced as the "v4.23.2 still displays it this way" report.
         if let Some(hint) = &status.window_quota_hint {
             out.push_str(&t(Msg::StatusCpWindowHint { hint }));
         } else {

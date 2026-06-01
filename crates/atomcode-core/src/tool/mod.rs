@@ -568,6 +568,21 @@ fn is_sensitive_path(path: &Path) -> bool {
         })
 }
 
+/// Returns `true` when `path` is under a directory that AtomCode owns and
+/// populates itself (installed plugins, local skills, etc.).  Reads from
+/// those directories are trusted so they don't prompt for approval every
+/// time a skill loads its bundled documentation index.
+fn is_atomcode_owned_path(path: &Path) -> bool {
+    let Some(home) = real_home_dir() else { return false };
+    let trusted_roots: &[PathBuf] = &[
+        home.join(".atomcode").join("plugins"),
+        home.join(".atomcode").join("skills"),
+    ];
+    trusted_roots
+        .iter()
+        .any(|root| path == root.as_path() || path.starts_with(root))
+}
+
 pub fn approval_for_path(
     raw_path: &str,
     working_dir: &Path,
@@ -575,6 +590,11 @@ pub fn approval_for_path(
 ) -> Result<ApprovalRequirement> {
     let access = inspect_path_access(raw_path, working_dir)?;
     if access.within_workspace {
+        return Ok(ApprovalRequirement::AutoApprove);
+    }
+    // AtomCode-owned directories (plugins, skills) are trusted —
+    // reading from them shouldn't require interactive approval.
+    if action != ExternalPathAction::Write && is_atomcode_owned_path(&access.path) {
         return Ok(ApprovalRequirement::AutoApprove);
     }
 
@@ -855,6 +875,14 @@ impl ToolContext {
 
     /// Create an isolated copy: same working directory value, independent Arc.
     /// Shares the same graph (read-only for tools) but independent working_dir.
+    ///
+    /// Fields that are NOT copied from the original:
+    /// - `read_cache`: reset — subagent re-reads files (acceptable for isolation)
+    /// - `event_tx`: reset — subagent has its own event channel
+    /// - `tool_registry`: reset — subagent gets filtered tools
+    /// - `first_error_signatures`: reset — subagent has independent error state
+    /// - `ctx_budget_hint`: reset to MAX — subagent has its own budget
+    /// - `read_budget_tokens`: reset to MAX — subagent has own budget
     pub async fn isolate(&self) -> Self {
         let wd = self.working_dir.read().await.clone();
         let mut ctx = Self::new(wd);
@@ -873,7 +901,7 @@ impl ToolContext {
     pub async fn notify_lsp_file_changed(&self, path: &Path, content: &str) {
         if let Some(ref lsp) = self.lsp {
             if let Err(e) = lsp.notify_file_changed(path, content).await {
-                eprintln!(
+                tracing::warn!(
                     "[lsp] Failed to refresh diagnostics for {}: {}",
                     path.display(),
                     e

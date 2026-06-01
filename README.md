@@ -375,7 +375,7 @@ This is a Vue 3 + TypeScript project using Pinia for state management.
 - Run `npm run lint` after editing .vue/.ts files
 ```
 
-AtomCode reads this file automatically and includes it in the system prompt.
+AtomCode reads this file automatically and includes it in the system prompt. AtomCode also supports `AGENTS.md` (the [open standard](https://agents.md/) for AI coding agents) as an alternative — if both files exist, `.atomcode.md` takes priority.
 
 ## Development
 

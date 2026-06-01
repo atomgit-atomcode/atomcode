@@ -398,10 +398,14 @@ async fn multi_edit_string_line_numbers() {
     let ctx = test_context();
     let tool = atomcode_core::tool::edit::EditFileTool;
 
-    let args = format!(
-        r#"{{"file_path": "{}", "edits": [{{"start_line": "2", "end_line": "3", "new_string": "replaced"}}]}}"#,
-        path
-    );
+    let args = serde_json::json!({
+        "file_path": path,
+        "edits": [{
+            "start_line": "2",
+            "end_line": "3",
+            "new_string": "replaced"
+        }]
+    }).to_string();
 
     let result = tool.execute(&args, &ctx).await.unwrap();
     assert!(
