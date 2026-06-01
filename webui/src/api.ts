@@ -337,6 +337,35 @@ export async function deleteProvider(name: string): Promise<void> {
   if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
 }
 
+export interface UpdateProviderBody {
+  type?: string;
+  model?: string;
+  // 省略字段=保持不变；传字符串=覆盖。
+  api_key?: string;
+  base_url?: string;
+}
+
+/** PATCH /providers/:name —— 部分更新已有 provider（name 为主键，不可改）。 */
+export async function updateProvider(name: string, body: UpdateProviderBody): Promise<unknown> {
+  const r = await fetch(`/providers/${encodeURIComponent(name)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
+  return r.json();
+}
+
+/** POST /providers/:name/default —— 设为默认 provider。 */
+export async function setDefaultProvider(name: string): Promise<unknown> {
+  const r = await fetch(`/providers/${encodeURIComponent(name)}/default`, {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
+  return r.json();
+}
+
 // --- Filesystem browsing ---
 
 export interface FsListResult {

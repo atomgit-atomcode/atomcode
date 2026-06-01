@@ -1439,6 +1439,26 @@ body {
   background: color-mix(in srgb, var(--app-error-foreground) 10%, transparent);
 }
 
+/* Provider card edit button (sits left of delete; type already pushes the
+   group to the right via margin-left:auto). */
+.provider-edit-btn {
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  border-radius: var(--corner-radius-small);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+}
+.provider-edit-btn:hover {
+  border-color: var(--app-brand-button);
+  color: var(--app-primary-foreground);
+  background: color-mix(in srgb, var(--app-brand-button) 12%, transparent);
+}
+
 /* Add model form */
 /* 「添加模型」按钮（模型配置弹窗顶部） */
 .add-model-top { display: flex; justify-content: flex-end; margin-bottom: 10px; }

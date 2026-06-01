@@ -6,7 +6,10 @@ import { useEffect, useState } from 'preact/hooks';
 import {
   getConfig,
   ConfigInfo,
+  ProviderInfo,
   createProvider,
+  updateProvider,
+  setDefaultProvider,
   deleteProvider,
   getTunnelStatus,
   TunnelStatus,
@@ -14,16 +17,20 @@ import {
 } from '../api';
 import { useSettings, Theme } from '../settings';
 import { Lang } from '../i18n';
+import { ConfirmDialog } from './ConfirmDialog';
 
 /** Shared modal chrome for the settings dialogs. */
 function SettingsModal({
   title,
   wide,
+  hideFooter,
   onClose,
   children,
 }: {
   title: string;
   wide?: boolean;
+  // 弹窗自带底部操作（如「添加模型」的 关闭/添加）时隐藏这里的页脚关闭，避免重复。
+  hideFooter?: boolean;
   onClose: () => void;
   children: ComponentChildren;
 }) {
@@ -44,11 +51,13 @@ function SettingsModal({
           </button>
         </div>
         <div class="modal-body">{children}</div>
-        <div class="modal-footer">
-          <button class="btn" onClick={onClose}>
-            {t('settings.close')}
-          </button>
-        </div>
+        {!hideFooter && (
+          <div class="modal-footer">
+            <button class="btn" onClick={onClose}>
+              {t('settings.close')}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -116,6 +125,10 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
 
   // 添加模型改为独立弹窗
   const [showAdd, setShowAdd] = useState(false);
+  // 编辑已有 provider：选中的条目（null=未编辑）。
+  const [editTarget, setEditTarget] = useState<ProviderInfo | null>(null);
+  // 删除确认改用 webui 弹窗（ConfirmDialog），不再用系统 confirm/alert。
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
   const reload = () =>
     getConfig()
@@ -123,16 +136,6 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
       .catch((e: unknown) => setLoadError(e instanceof Error ? e.message : String(e)));
 
   useEffect(() => { reload(); }, []);
-
-  const handleDelete = async (name: string) => {
-    if (!window.confirm(t('settings.deleteConfirm').replace('{name}', name))) return;
-    try {
-      await deleteProvider(name);
-      reload();
-    } catch (e: unknown) {
-      alert(e instanceof Error ? e.message : String(e));
-    }
-  };
 
   return (
     <>
@@ -171,9 +174,17 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                     )}
                     <span class="provider-type">{p.type}</span>
                     <button
+                      class="provider-edit-btn"
+                      type="button"
+                      onClick={() => setEditTarget(p)}
+                      title={t('settings.edit')}
+                    >
+                      {t('settings.edit')}
+                    </button>
+                    <button
                       class="provider-delete-btn"
                       type="button"
-                      onClick={() => handleDelete(p.name)}
+                      onClick={() => setDeleteTarget(p.name)}
                       title={t('settings.delete')}
                     >
                       {t('settings.delete')}
@@ -213,62 +224,118 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
       </div>
     </SettingsModal>
     {showAdd && (
-      <AddModelDialog
+      <ProviderFormDialog
         onClose={() => setShowAdd(false)}
-        onAdded={() => {
+        onSaved={() => {
           setShowAdd(false);
           reload();
         }}
+      />
+    )}
+    {editTarget && (
+      <ProviderFormDialog
+        editing={editTarget}
+        onClose={() => setEditTarget(null)}
+        onSaved={() => {
+          setEditTarget(null);
+          reload();
+        }}
+      />
+    )}
+    {deleteTarget && (
+      <ConfirmDialog
+        title={t('settings.deleteTitle')}
+        body={t('settings.deleteConfirm', { name: deleteTarget })}
+        confirmLabel={t('settings.delete')}
+        cancelLabel={t('common.cancel')}
+        onConfirm={async () => {
+          await deleteProvider(deleteTarget);
+          reload();
+        }}
+        onClose={() => setDeleteTarget(null)}
       />
     )}
     </>
   );
 }
 
-/** 独立「添加模型」弹窗。base_url 与 api key 为必填。 */
-function AddModelDialog({
+/**
+ * 「添加 / 编辑模型」弹窗。
+ * - 添加模式（无 editing）：name/model/base_url/api_key 均必填。
+ * - 编辑模式（有 editing）：name 为主键不可改（只读）；api_key 留空表示保留现有，
+ *   仅在填写时才覆盖；走 PATCH。两种模式共用此表单避免重复。
+ */
+function ProviderFormDialog({
+  editing,
   onClose,
-  onAdded,
+  onSaved,
 }: {
+  editing?: ProviderInfo;
   onClose: () => void;
-  onAdded: () => void;
+  onSaved: () => void;
 }) {
   const { t } = useSettings();
-  const [name, setName] = useState('');
-  const [type, setType] = useState('openai');
-  const [model, setModel] = useState('');
-  const [baseUrl, setBaseUrl] = useState('');
+  const isEdit = !!editing;
+  const [name] = useState(editing?.name ?? '');
+  const [nameInput, setNameInput] = useState(editing?.name ?? '');
+  const [type, setType] = useState(editing?.type ?? 'openai');
+  const [model, setModel] = useState(editing?.model ?? '');
+  const [baseUrl, setBaseUrl] = useState(editing?.base_url ?? '');
   const [apiKey, setApiKey] = useState('');
-  const [setDefault, setSetDefault] = useState(false);
-  const [adding, setAdding] = useState(false);
+  const [setDefault, setSetDefault] = useState(editing?.is_default ?? false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleAdd = async () => {
-    if (!name.trim() || !model.trim() || !baseUrl.trim() || !apiKey.trim()) {
+  const handleSave = async () => {
+    if (isEdit) {
+      // 编辑：name 固定；api_key 留空=保留现有，故不计入必填。
+      if (!model.trim() || !baseUrl.trim()) {
+        setError(t('settings.allRequired'));
+        return;
+      }
+    } else if (!nameInput.trim() || !model.trim() || !baseUrl.trim() || !apiKey.trim()) {
       setError(t('settings.allRequired'));
       return;
     }
-    setAdding(true);
+    setSaving(true);
     setError(null);
     try {
-      await createProvider({
-        name: name.trim(),
-        type,
-        model: model.trim(),
-        base_url: baseUrl.trim(),
-        api_key: apiKey.trim(),
-        set_default: setDefault || undefined,
-      });
-      onAdded();
+      if (isEdit) {
+        await updateProvider(name, {
+          type,
+          model: model.trim(),
+          base_url: baseUrl.trim(),
+          // 仅在用户填写了新 key 时才覆盖；留空保留现有。
+          ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+        });
+        // PATCH 不处理默认项：若勾选且原本非默认，单独设默认。
+        if (setDefault && !editing?.is_default) {
+          await setDefaultProvider(name);
+        }
+      } else {
+        await createProvider({
+          name: nameInput.trim(),
+          type,
+          model: model.trim(),
+          base_url: baseUrl.trim(),
+          api_key: apiKey.trim(),
+          set_default: setDefault || undefined,
+        });
+      }
+      onSaved();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setAdding(false);
+      setSaving(false);
     }
   };
 
   return (
-    <SettingsModal title={t('settings.addModel')} onClose={onClose}>
+    <SettingsModal
+      title={isEdit ? t('settings.editModel') : t('settings.addModel')}
+      hideFooter
+      onClose={onClose}
+    >
       <div class="field-group add-model-form">
         <div class="add-model-field">
           <label class="add-model-label">{t('settings.providerName')}</label>
@@ -276,8 +343,9 @@ function AddModelDialog({
             class="menu-input"
             type="text"
             placeholder="my-deepseek"
-            value={name}
-            onInput={(e) => setName((e.target as HTMLInputElement).value)}
+            value={nameInput}
+            disabled={isEdit}
+            onInput={(e) => setNameInput((e.target as HTMLInputElement).value)}
           />
         </div>
         <div class="add-model-field">
@@ -308,6 +376,7 @@ function AddModelDialog({
               <input
                 type="checkbox"
                 checked={setDefault}
+                disabled={editing?.is_default}
                 onChange={(e) => setSetDefault((e.target as HTMLInputElement).checked)}
               />
               {t('settings.setAsDefault')}
@@ -329,18 +398,24 @@ function AddModelDialog({
           <input
             class="menu-input"
             type="password"
-            placeholder="sk-..."
+            placeholder={isEdit ? t('settings.apiKeyKeep') : 'sk-...'}
             value={apiKey}
             onInput={(e) => setApiKey((e.target as HTMLInputElement).value)}
           />
         </div>
-        {error && <div class="modal-error">{t('settings.addFailed')}: {error}</div>}
+        {error && (
+          <div class="modal-error">
+            {(isEdit ? t('settings.updateFailed') : t('settings.addFailed'))}: {error}
+          </div>
+        )}
         <div class="add-model-actions">
           <button class="btn" type="button" onClick={onClose}>
             {t('settings.close')}
           </button>
-          <button class="btn btn-primary" type="button" disabled={adding} onClick={handleAdd}>
-            {adding ? t('settings.adding') : t('settings.add')}
+          <button class="btn btn-primary" type="button" disabled={saving} onClick={handleSave}>
+            {isEdit
+              ? (saving ? t('settings.saving') : t('settings.save'))
+              : (saving ? t('settings.adding') : t('settings.add'))}
           </button>
         </div>
       </div>
