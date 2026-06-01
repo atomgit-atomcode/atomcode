@@ -208,6 +208,13 @@ fn attach_live_session(
     renderer: &mut dyn Renderer,
     session: std::sync::Arc<atomcode_core::live::LiveSession>,
 ) {
+    // 幂等附着：先终止已有的转发器，否则旧任务仍订阅同一广播、同样投进
+    // runtime_event_tx，导致每个 LiveEvent 被渲染两次（输入回显、文本增量、
+    // 工具调用全部重复）。tokio 里 drop JoinHandle 只会分离任务、不会取消，
+    // 所以必须显式 abort 后再 spawn 新转发器。
+    if let Some(h) = ctx.sync_forwarder.take() {
+        h.abort();
+    }
     // 回放快照：渲染既有消息。
     let snapshot: Vec<atomcode_core::conversation::message::Message> =
         tokio::task::block_in_place(|| {
