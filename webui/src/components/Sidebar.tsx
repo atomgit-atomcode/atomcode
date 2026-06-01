@@ -226,7 +226,12 @@ export function Sidebar({
   const [groupMenuOpen, setGroupMenuOpen] = useState(false);
   // Per-session kebab menu: which session, and where to anchor the fixed menu.
   const [menuFor, setMenuFor] = useState<string | null>(null);
-  const [menuPos, setMenuPos] = useState<{ top: number; right: number } | null>(null);
+  // top XOR bottom: `top` opens the menu downward below the kebab; `bottom`
+  // opens it upward above the kebab (used when there isn't room below, so the
+  // 2-row menu isn't clipped by the viewport edge).
+  const [menuPos, setMenuPos] = useState<
+    { top?: number; bottom?: number; right: number } | null
+  >(null);
   const [renameTarget, setRenameTarget] = useState<SessionMetaWithProject | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SessionMetaWithProject | null>(null);
   // Settings menu (3 entries → each opens its own dialog), fixed-anchored above the button.
@@ -303,7 +308,17 @@ export function Sidebar({
       setMenuFor(null);
       return;
     }
-    setMenuPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+    const right = window.innerWidth - rect.right;
+    // 2 rows (rename + delete); estimate generously so we flip up a touch
+    // early rather than let the last item clip off the bottom edge.
+    const MENU_EST_HEIGHT = 96;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    if (spaceBelow < MENU_EST_HEIGHT + 8) {
+      // Not enough room below → open upward, anchored above the kebab.
+      setMenuPos({ bottom: window.innerHeight - rect.top + 4, right });
+    } else {
+      setMenuPos({ top: rect.bottom + 4, right });
+    }
     setMenuFor(id);
   }
 
@@ -643,7 +658,11 @@ export function Sidebar({
         <div
           class="item-menu"
           ref={itemMenuRef}
-          style={{ top: `${menuPos.top}px`, right: `${menuPos.right}px` }}
+          style={{
+            top: menuPos.top != null ? `${menuPos.top}px` : undefined,
+            bottom: menuPos.bottom != null ? `${menuPos.bottom}px` : undefined,
+            right: `${menuPos.right}px`,
+          }}
         >
           <button
             class="item-menu-row"
