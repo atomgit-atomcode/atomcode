@@ -113,6 +113,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
   const [busy, setBusy] = useState(false);
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
+  // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
+  const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
@@ -148,6 +150,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       setMessages([]);
       setTokens(null);
       setHistoryHint(null);
+      // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
+      // 无 id（新建）则不加载、直接落地。
+      setLoading(sessionId != null);
     }
 
     if (!sessionId) return;
@@ -158,11 +163,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
     if (!projectHash) {
       // 还没拿到 project_hash：先给「继续会话」提示，等其到位再由本 effect 重跑加载。
       setHistoryHint(t('chat.continueSession', { id: sessionId.slice(0, 8) }));
+      setLoading(false);
       return;
     }
 
     // 标记已为该会话发起加载，避免并发/重复。
     loadedForRef.current = sessionId;
+    setLoading(true);
     const loadId = sessionId;
     getSession(projectHash, loadId)
       .then((detail) => {
@@ -174,8 +181,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
           setMessages(loaded);
           setHistoryHint(null);
         } else {
-          setHistoryHint(t('chat.continueSession', { id: loadId.slice(0, 8) }));
+          // 空会话：不再显示「继续会话」提示，交给落地页（landing）。
+          setHistoryHint(null);
         }
+        setLoading(false);
       })
       .catch(() => {
         // 失败回退提示，并清掉标记以允许后续重试。
@@ -183,6 +192,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
           loadedForRef.current = null;
           setHistoryHint(t('chat.continueSession', { id: loadId.slice(0, 8) }));
         }
+        setLoading(false);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, activeSession?.project_hash]);
@@ -611,9 +621,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
 
   const lastIdx = messages.length - 1;
 
-  // 新对话落地态：无会话、无消息、无历史提示 → claude.ai 风格的居中落地页。
-  // restoring 期间（刷新后正还原 URL 会话）先不落地，避免闪过新建页再跳历史。
-  const landing = !sessionId && messages.length === 0 && !historyHint && !restoring;
+  // 落地态：对话为空就用 claude.ai 风格的居中落地页（无论是否已有 session id —
+  // 新建会话、空的同步会话、空的历史会话都适用）。
+  // 抑制条件：正在拉历史（loading，避免切到有内容会话时闪屏）、restoring（刷新还原中）、
+  // 已有 historyHint（无法加载、提示去 TUI/磁盘续聊）。
+  const landing = messages.length === 0 && !historyHint && !restoring && !loading;
 
   // 落地页副标题：项目名 + 缩写路径。
   const cleanCwd = cwd.replace(/\/+$/, '');
@@ -752,7 +764,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
     <>
       {/* Message timeline */}
       <div class="messages-container">
-        {messages.length === 0 && !historyHint && !restoring && (
+        {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
             <div>
               {t('chat.startHint')}
