@@ -105,7 +105,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Code blocks** with language labels, line numbers, and `base16-ocean.dark` theme
 - **Multi-line input** with Shift+Enter (or `\` + Enter), auto-growing height, input history
 - **Text selection** with mouse drag, auto-scroll, and clipboard copy
-- **Slash commands** — `/model`, `/provider`, `/think`, `/effort`, `/resume`, `/bg`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
+- **Slash commands** — `/model`, `/provider`, `/resume`, `/bg`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
 - **File attachment** — paste file paths to attach content as context
 - **Bracketed paste** — long paste content collapsed to a compact indicator
 - **Skills** — user-defined commands loaded from your skill directory, invoked like any slash command
@@ -319,7 +319,7 @@ Then just type what you want:
 | `/config` | Edit config file |
 | `/status` | Show login status and model info |
 | `/logout` | Logout from AtomGit |
-| `/think` | Extended thinking control (on/off/budget N) |
+| `/think` | Control extended thinking (on/off/budget N) |
 | `/effort` | DeepSeek reasoning effort control (high / max / off) |
 | `/help` | Show commands & shortcuts |
 | `/quit` | Exit (or Ctrl+C ×2) |

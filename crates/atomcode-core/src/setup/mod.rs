@@ -62,7 +62,8 @@ pub fn run(opts: RunOptions) -> SetupResult<SetupReport> {
     let seeds_cache_root = crate::config::Config::config_dir();
     let cache_dir = ensure_seeds_extracted(&seeds_cache_root).map_err(SetupError::Other)?;
 
-    let mut txn = install::InstalledTxn::new(opts.project_root.clone()).map_err(SetupError::Io)?;
+    let mut txn =
+        install::InstalledTxn::new(opts.project_root.clone()).map_err(SetupError::Io)?;
     let mut summary = InstalledSummary::default();
 
     // Install directory-style skills (e.g., atomcode-automation-recommender/).
@@ -153,16 +154,12 @@ fn install_directory_skills_from_seeds(
             match copy_dir_recursive(&path, &dest) {
                 Ok(()) => {
                     write_seed_hash(&dest, &src_hash);
-                    summary
-                        .installed
-                        .push((RecId::new(RecKind::Skill, &name), dest));
+                    summary.installed.push((RecId::new(RecKind::Skill, &name), dest));
                     summary.reload_directives.insert(ReloadDirective::Skill);
                 }
                 Err(e) => {
                     tracing::warn!("failed to install directory skill {name}: {e}");
-                    summary
-                        .failed
-                        .push((RecId::new(RecKind::Skill, &name), e.to_string()));
+                    summary.failed.push((RecId::new(RecKind::Skill, &name), e.to_string()));
                 }
             }
         }
@@ -195,12 +192,7 @@ fn compute_dir_hash(dir: &std::path::Path) -> String {
     paths.sort();
     for p in &paths {
         if let Ok(content) = std::fs::read(p) {
-            h.update(
-                p.strip_prefix(dir)
-                    .unwrap_or(p)
-                    .to_string_lossy()
-                    .as_bytes(),
-            );
+            h.update(p.strip_prefix(dir).unwrap_or(p).to_string_lossy().as_bytes());
             h.update(b"\0");
             h.update(&content);
             h.update(b"\0");
@@ -308,4 +300,5 @@ mod tests {
         assert!(rendered.contains("/p/x.md"));
         assert!(rendered.contains("123ms"));
     }
+
 }

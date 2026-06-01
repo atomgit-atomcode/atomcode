@@ -43,7 +43,10 @@ pub fn set_locale(locale: Locale) {
 /// Determine the initial locale from (in priority order):
 /// CLI `--lang` flag, config file `language` field, environment
 /// variables `LC_ALL` / `LC_MESSAGES` / `LANG`.
-pub fn resolve_initial_locale(cli_lang: Option<&str>, config_lang: Option<Locale>) -> Locale {
+pub fn resolve_initial_locale(
+    cli_lang: Option<&str>,
+    config_lang: Option<Locale>,
+) -> Locale {
     resolve_initial_locale_with_env(cli_lang, config_lang, &|k| std::env::var(k).ok())
 }
 
@@ -201,13 +204,8 @@ mod tests {
 
     #[test]
     fn env_zh_cn_resolves_to_zh_cn() {
-        let env = |k: &str| {
-            if k == "LANG" {
-                Some("zh_CN.UTF-8".into())
-            } else {
-                None
-            }
-        };
+        let env =
+            |k: &str| if k == "LANG" { Some("zh_CN.UTF-8".into()) } else { None };
         assert_eq!(
             resolve_initial_locale_with_env(None, None, &env),
             Locale::ZhCn
@@ -216,13 +214,7 @@ mod tests {
 
     #[test]
     fn env_zh_tw_maps_to_zh_cn() {
-        let env = |k: &str| {
-            if k == "LANG" {
-                Some("zh_TW".into())
-            } else {
-                None
-            }
-        };
+        let env = |k: &str| if k == "LANG" { Some("zh_TW".into()) } else { None };
         assert_eq!(
             resolve_initial_locale_with_env(None, None, &env),
             Locale::ZhCn

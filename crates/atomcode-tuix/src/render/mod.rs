@@ -1,7 +1,7 @@
 // crates/atomcode-tuix/src/render/mod.rs
-pub mod cell;
 #[cfg(windows)]
 pub mod conhost;
+pub mod cell;
 pub mod plain;
 pub mod qr;
 pub mod retained;
@@ -367,9 +367,8 @@ pub struct StatusLine {
     /// auto-named / default sessions leave this `None` to keep the
     /// chrome quiet on fresh conversations.
     pub session_name: Option<String>,
-    /// Current reasoning_effort level for display in the status row.
-    /// None = not shown. Rendered as a dimmed suffix after the model
-    /// name (e.g. `deepseek-v4-pro :high`).
+    /// Current reasoning_effort for the active provider's model.
+    /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
 }
 

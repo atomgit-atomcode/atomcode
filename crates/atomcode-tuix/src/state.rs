@@ -257,7 +257,6 @@ pub struct UiState {
     /// together.
     pub call_id_to_batch: std::collections::HashMap<String, String>,
     /// Current reasoning_effort level for the active provider.
-    /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
 }
 
@@ -517,10 +516,7 @@ impl UiState {
     }
 
     fn refresh_sub_agent_label(&mut self) {
-        self.spinner_label = format!(
-            "Sub-agents {}/{}",
-            self.sub_agent_done, self.sub_agent_total
-        );
+        self.spinner_label = format!("Sub-agents {}/{}", self.sub_agent_done, self.sub_agent_total);
     }
 
     /// End the dispatch — clears descriptors so subsequent thinks/tools
@@ -603,15 +599,17 @@ impl UiState {
         self.toggle_tool_output();
     }
 
-    /// Cycle reasoning_effort through None → "high" → "max" → None.
-    /// Returns the new value for display feedback.
-    pub fn cycle_reasoning_effort(&mut self) -> Option<&str> {
-        self.reasoning_effort = match self.reasoning_effort.as_deref() {
-            None => Some("high".to_string()),
-            Some("high") => Some("max".to_string()),
-            _ => None,
+    /// Cycle through reasoning_effort values: None → "high" → "max" → None.
+    /// Returns the new value (None = use API default).
+    pub fn cycle_reasoning_effort(&mut self) -> Option<&'static str> {
+        let next: Option<&'static str> = match self.reasoning_effort.as_deref() {
+            None => Some("high"),
+            Some("high") => Some("max"),
+            Some("max") => None,
+            _ => Some("high"),
         };
-        self.reasoning_effort.as_deref()
+        self.reasoning_effort = next.map(|s| s.to_string());
+        next
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {
@@ -698,11 +696,10 @@ mod tests {
         // Turn 1: simulate paste sites' increment-then-push pattern.
         s.session_image_count += 1;
         let n1 = s.session_image_count;
-        s.pending_images
-            .push(atomcode_core::conversation::message::ImagePart {
-                media_type: "image/png".into(),
-                data: "AAAA".into(),
-            });
+        s.pending_images.push(atomcode_core::conversation::message::ImagePart {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        });
         s.pending_image_hashes.push(0xdead_beef);
         // Submit drains pending_images / hashes (mirrors event_loop logic).
         let _ = std::mem::take(&mut s.pending_images);
@@ -859,9 +856,7 @@ mod tests {
         s.on_submit();
         s.on_tool_call_started("read_file");
         assert!(s.spinner_label.contains("read_file"));
-        let tasks = (0..6)
-            .map(|i| task_info(&format!("a{}.rs", i), ""))
-            .collect();
+        let tasks = (0..6).map(|i| task_info(&format!("a{}.rs", i), "")).collect();
         s.on_sub_agent_dispatch_start(tasks);
         assert_eq!(s.spinner_label, "Sub-agents 0/6");
     }

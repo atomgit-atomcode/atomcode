@@ -738,10 +738,10 @@ impl Tool for ReadFileTool {
             // via the upstream `store_hit` branch — no model-visible
             // metadata in the result.
             if let Some(mtime) = disk_mtime {
-                ctx.read_cache
-                    .write()
-                    .await
-                    .insert(cache_key.clone(), (mtime, skeleton.clone(), 1));
+                ctx.read_cache.write().await.insert(
+                    cache_key.clone(),
+                    (mtime, skeleton.clone(), 1),
+                );
             }
             return Ok(ToolResult {
                 call_id: String::new(),
@@ -1079,13 +1079,17 @@ fn is_binary_sample(path: &std::path::Path, sample: &[u8]) -> bool {
         // jvm / .net / python compiled
         "class", "jar", "war", "pyc", "pyo",
         // office (binary or zip-based — handled via recovery_hint downstream)
-        "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", // images
+        "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp",
+        // images
         "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "ico", "heic", "heif", "avif",
         // audio / video
-        "mp3", "mp4", "wav", "flac", "ogg", "opus", "m4a", "aac", "avi", "mov", "mkv", "webm",
-        "wmv", "flv", "mpg", "mpeg", // raw binary blobs
-        "bin", "dat", "iso", "img", "dmg", // databases
-        "db", "sqlite", "sqlite3", // PDF (handled via recovery_hint)
+        "mp3", "mp4", "wav", "flac", "ogg", "opus", "m4a", "aac",
+        "avi", "mov", "mkv", "webm", "wmv", "flv", "mpg", "mpeg",
+        // raw binary blobs
+        "bin", "dat", "iso", "img", "dmg",
+        // databases
+        "db", "sqlite", "sqlite3",
+        // PDF (handled via recovery_hint)
         "pdf",
     ];
     if BINARY_EXTENSIONS.contains(&ext.as_str()) {
@@ -1845,14 +1849,8 @@ mod tests {
         let path = write_n_line_file(&dir, "big.rs", 200);
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let args1 = format!(r#"{{"file_path":"{}"}}"#, path.display());
-        let args2 = format!(
-            r#"{{"file_path":"{}","offset":50,"limit":10}}"#,
-            path.display()
-        );
-        let args3 = format!(
-            r#"{{"file_path":"{}","offset":100,"limit":10}}"#,
-            path.display()
-        );
+        let args2 = format!(r#"{{"file_path":"{}","offset":50,"limit":10}}"#, path.display());
+        let args3 = format!(r#"{{"file_path":"{}","offset":100,"limit":10}}"#, path.display());
         let r1 = ReadFileTool.execute(&args1, &ctx).await.unwrap();
         let r2 = ReadFileTool.execute(&args2, &ctx).await.unwrap();
         let r3 = ReadFileTool.execute(&args3, &ctx).await.unwrap();
@@ -1981,7 +1979,9 @@ mod tests {
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "a\nb\nc\n").unwrap();
 
-        let r = stream_slice_lines(&path, Some(1), Some(100)).await.unwrap();
+        let r = stream_slice_lines(&path, Some(1), Some(100))
+            .await
+            .unwrap();
         assert_eq!(r.lines, vec!["a", "b", "c"]);
         assert!(!r.more);
         assert_eq!(r.total_lines, Some(3));
@@ -2081,14 +2081,8 @@ mod tests {
             &r.output[..r.output.len().min(500)],
         );
         // Sanity: requested offset visible, beyond-limit line not.
-        assert!(
-            r.output.contains(" 100| line 000100"),
-            "offset line missing"
-        );
-        assert!(
-            r.output.contains(" 104| line 000104"),
-            "limit-1 line missing"
-        );
+        assert!(r.output.contains(" 100| line 000100"), "offset line missing");
+        assert!(r.output.contains(" 104| line 000104"), "limit-1 line missing");
         assert!(
             !r.output.contains(" 105| line 000105"),
             "limit must stop at 104, but 105 appeared",

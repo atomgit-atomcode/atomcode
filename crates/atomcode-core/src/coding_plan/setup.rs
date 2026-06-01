@@ -33,9 +33,9 @@ use anyhow::Result;
 use std::sync::Arc;
 
 use super::client::{is_auth_expired, Client};
+use super::types::{ModelEntry, PlanType, StatusResponse};
 #[cfg(test)]
 use super::types::RateLimitWindow;
-use super::types::{ModelEntry, PlanType, StatusResponse};
 use crate::auth;
 use crate::config::provider::ProviderConfig;
 use crate::config::Config;
@@ -292,9 +292,7 @@ impl SetupReport {
                 let locked: Vec<&ModelEntry> = info
                     .all_models
                     .iter()
-                    .filter(|m| {
-                        !m.plan_available && !registered.contains(m.display_model_name.as_str())
-                    })
+                    .filter(|m| !m.plan_available && !registered.contains(m.display_model_name.as_str()))
                     .collect();
                 for m in &locked {
                     out.push_str(&t(Msg::CpLocked {
@@ -352,9 +350,7 @@ impl SetupReport {
                         // fresh claim is still propagating. Don't render an
                         // empty date with `(0d / 0d remaining)` zeros — say
                         // "pending activation" so the user knows to wait.
-                        out.push_str(&t(Msg::CpPlanPending {
-                            plan: &plan.plan_name,
-                        }));
+                        out.push_str(&t(Msg::CpPlanPending { plan: &plan.plan_name }));
                     } else {
                         out.push_str(&t(Msg::CpPlanActive {
                             plan: &plan.plan_name,
@@ -587,13 +583,10 @@ pub fn run(
             t.track(atomcode_telemetry::Event::TakeCodingplan {
                 type_: atomcode_telemetry::CodingplanResult::Fail,
                 error_kind: Some(atomcode_telemetry::CodingplanErrorKind::AuthError),
-                error_data: Some(
-                    serde_json::json!({
-                        "step": "login",
-                        "message": "Not logged in",
-                    })
-                    .to_string(),
-                ),
+                error_data: Some(serde_json::json!({
+                    "step": "login",
+                    "message": "Not logged in",
+                }).to_string()),
             });
         }
         // Use the cascade sentinel so format() suppresses the three
@@ -650,13 +643,10 @@ pub fn run(
             t.track(atomcode_telemetry::Event::TakeCodingplan {
                 type_: atomcode_telemetry::CodingplanResult::Fail,
                 error_kind: Some(atomcode_telemetry::CodingplanErrorKind::NetworkError),
-                error_data: Some(
-                    serde_json::json!({
-                        "step": "models",
-                        "message": "Failed to fetch model list",
-                    })
-                    .to_string(),
-                ),
+                error_data: Some(serde_json::json!({
+                    "step": "models",
+                    "message": "Failed to fetch model list",
+                }).to_string()),
             });
         }
         // Same cascade pattern: the models-failure line above is the
@@ -682,12 +672,9 @@ pub fn run(
         t.track(atomcode_telemetry::Event::TakeCodingplan {
             type_: atomcode_telemetry::CodingplanResult::Success,
             error_kind: None,
-            error_data: Some(
-                serde_json::json!({
-                    "step": null,
-                })
-                .to_string(),
-            ),
+            error_data: Some(serde_json::json!({
+                "step": null,
+            }).to_string()),
         });
     }
 
@@ -1011,7 +998,10 @@ fn step_status() -> (StepResult<StatusResponse>, bool) {
         Ok(s) => (StepResult::Ok(s), false),
         Err(e) => {
             let auth_expired = is_auth_expired(&e);
-            (StepResult::Err(format!("status-v2: {:#}", e)), auth_expired)
+            (
+                StepResult::Err(format!("status-v2: {:#}", e)),
+                auth_expired,
+            )
         }
     }
 }
@@ -1049,26 +1039,14 @@ pub fn format_duration_secs(secs: i64) -> String {
     }
     let (m, sr) = (s / 60, s % 60);
     if m < 60 {
-        return if sr == 0 {
-            format!("{}m", m)
-        } else {
-            format!("{}m {}s", m, sr)
-        };
+        return if sr == 0 { format!("{}m", m) } else { format!("{}m {}s", m, sr) };
     }
     let (h, mr) = (m / 60, m % 60);
     if h < 24 {
-        return if mr == 0 {
-            format!("{}h", h)
-        } else {
-            format!("{}h {}m", h, mr)
-        };
+        return if mr == 0 { format!("{}h", h) } else { format!("{}h {}m", h, mr) };
     }
     let (d, hr) = (h / 24, h % 24);
-    if hr == 0 {
-        format!("{}d", d)
-    } else {
-        format!("{}d {}h", d, hr)
-    }
+    if hr == 0 { format!("{}d", d) } else { format!("{}d {}h", d, hr) }
 }
 
 /// Decide the config-key name for each model. Single model → bare
@@ -1574,11 +1552,7 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        assert!(
-            out.contains("Plan: CodingPlan Free"),
-            "plan name still shown: {}",
-            out
-        );
+        assert!(out.contains("Plan: CodingPlan Free"), "plan name still shown: {}", out);
         assert!(
             out.contains("pending activation"),
             "must surface pending state to user: {}",
@@ -1612,18 +1586,9 @@ mod tests {
         let out = report.render();
         assert!(out.contains("× Login failed"));
         // Cascade rows must NOT appear.
-        assert!(
-            !out.contains("CodingPlan claim"),
-            "no cascade claim row on login fail"
-        );
-        assert!(
-            !out.contains("Models step"),
-            "no cascade models row on login fail"
-        );
-        assert!(
-            !out.contains("Status fetch"),
-            "no cascade status row on login fail"
-        );
+        assert!(!out.contains("CodingPlan claim"), "no cascade claim row on login fail");
+        assert!(!out.contains("Models step"), "no cascade models row on login fail");
+        assert!(!out.contains("Status fetch"), "no cascade status row on login fail");
         // Login Err ⇒ should_persist_config = false (login.is_ok_or_skipped() is false).
         assert!(
             !report.should_persist_config(),
@@ -2031,18 +1996,9 @@ mod tests {
         assert!(out.contains("× CodingPlan tier setup failed"));
         assert!(out.contains("今日codingplan申请额度已满"));
         // The cascade rows must NOT appear.
-        assert!(
-            !out.contains("Models step skipped"),
-            "no cascade row for models"
-        );
-        assert!(
-            !out.contains("Status fetch skipped"),
-            "no cascade row for status"
-        );
-        assert!(
-            !out.contains("Added "),
-            "must not say 'Added N providers' on claim fail"
-        );
+        assert!(!out.contains("Models step skipped"), "no cascade row for models");
+        assert!(!out.contains("Status fetch skipped"), "no cascade row for status");
+        assert!(!out.contains("Added "), "must not say 'Added N providers' on claim fail");
         // The huge JSON body that used to leak through here must NOT appear.
         assert!(!out.contains("invalid type: null"));
         assert!(!out.contains("plan_name"));
@@ -2093,16 +2049,9 @@ mod tests {
         };
         let out = report.render();
         // Find the status line and check its length is bounded.
-        let line = out
-            .lines()
-            .find(|l| l.contains("Status fetch failed"))
-            .unwrap();
+        let line = out.lines().find(|l| l.contains("Status fetch failed")).unwrap();
         // 150 chars + ellipsis + prefix + leading spaces ⇒ comfortably under 250.
-        assert!(
-            line.chars().count() < 250,
-            "line still ~{} chars long",
-            line.chars().count()
-        );
+        assert!(line.chars().count() < 250, "line still ~{} chars long", line.chars().count());
         assert!(line.contains('…'), "truncation marker present");
     }
 
@@ -2174,10 +2123,7 @@ mod tests {
         for k in stale {
             config.providers.remove(&k);
         }
-        let names: Vec<String> = models
-            .iter()
-            .map(|m| m.display_model_name.clone())
-            .collect();
+        let names: Vec<String> = models.iter().map(|m| m.display_model_name.clone()).collect();
         let provider_names = provider_names_for(&names);
         let default_provider = provider_names
             .first()
@@ -2254,10 +2200,7 @@ mod tests {
         let mut config = blank_config();
         let models = vec![vl_model_entry("moonshotai/Kimi-K2-Instruct")];
         let info = run_register(&mut config, models);
-        assert_eq!(
-            info.vision_preprocessor,
-            VisionPreprocessorOutcome::UnchangedNone
-        );
+        assert_eq!(info.vision_preprocessor, VisionPreprocessorOutcome::UnchangedNone);
         assert_eq!(config.vision_preprocessor_provider, None);
     }
 
@@ -2327,11 +2270,7 @@ mod tests {
     fn render_includes_vision_preprocessor_auto_set_line() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Ok(ClaimInfo {
-                message: String::new(),
-                duplicate: false,
-                plan_type: PlanType::Max,
-            }),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec![
@@ -2363,11 +2302,7 @@ mod tests {
     fn render_includes_vision_preprocessor_cleared_line_when_stale_dropped() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Ok(ClaimInfo {
-                message: String::new(),
-                duplicate: false,
-                plan_type: PlanType::Max,
-            }),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["Kimi-K2-Instruct".into()],
@@ -2387,11 +2322,7 @@ mod tests {
     fn render_includes_vision_preprocessor_user_supplied_line() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Ok(ClaimInfo {
-                message: String::new(),
-                duplicate: false,
-                plan_type: PlanType::Max,
-            }),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec![
@@ -2420,11 +2351,7 @@ mod tests {
     fn render_omits_vision_preprocessor_line_when_unchanged_none() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Ok(ClaimInfo {
-                message: String::new(),
-                duplicate: false,
-                plan_type: PlanType::Max,
-            }),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["Kimi-K2-Instruct".into()],
@@ -2454,7 +2381,9 @@ mod tests {
         }
     }
 
-    fn status_only_report(s: crate::coding_plan::types::StatusResponse) -> SetupReport {
+    fn status_only_report(
+        s: crate::coding_plan::types::StatusResponse,
+    ) -> SetupReport {
         SetupReport {
             login: StepResult::Skipped("already logged in".into()),
             claim: StepResult::Skipped("already claimed".into()),
@@ -2469,29 +2398,27 @@ mod tests {
     fn render_uses_rate_limit_windows_when_present() {
         // rate_limit_windows populated → prefers new field over current_usage.
         let s = crate::coding_plan::types::StatusResponse {
-            rate_limit_windows: vec![RateLimitWindow {
-                rule_index: 0,
-                show_enable: 1,
-                window_size_seconds: 18000,
-                window_hours: 5,
-                call_limit: 1000,
-                calls_used: 20,
-                usage_percent: 2.0,
-                quota_exhausted: false,
-                reset_at: "2026-05-26T18:09:30".into(),
-                reset_at_display: "18:09".into(),
-                seconds_until_reset: 16080,
-                reset_label: String::new(),
-                usage_status_desc: "当前时间窗口用量约 2%".into(),
-            }],
+            rate_limit_windows: vec![
+                RateLimitWindow {
+                    rule_index: 0,
+                    show_enable: 1,
+                    window_size_seconds: 18000,
+                    window_hours: 5,
+                    call_limit: 1000,
+                    calls_used: 20,
+                    usage_percent: 2.0,
+                    quota_exhausted: false,
+                    reset_at: "2026-05-26T18:09:30".into(),
+                    reset_at_display: "18:09".into(),
+                    seconds_until_reset: 16080,
+                    reset_label: String::new(),
+                    usage_status_desc: "当前时间窗口用量约 2%".into(),
+                },
+            ],
             ..blank_status_response()
         };
         let out = status_only_report(s).render();
-        assert!(
-            out.contains("当前时间窗口用量约 2%"),
-            "usage_status_desc missing: {}",
-            out
-        );
+        assert!(out.contains("当前时间窗口用量约 2%"), "usage_status_desc missing: {}", out);
         assert!(out.contains("18:09"), "reset_at_display missing: {}", out);
     }
 
@@ -2630,11 +2557,7 @@ mod tests {
             ..blank_status_response()
         };
         let out = status_only_report(s).render();
-        assert!(
-            out.contains("当前时间窗口用量约 5%"),
-            "fallback usage missing: {}",
-            out
-        );
+        assert!(out.contains("当前时间窗口用量约 5%"), "fallback usage missing: {}", out);
         assert!(out.contains("18:09"), "reset_at_display missing: {}", out);
     }
 
@@ -2677,21 +2600,9 @@ mod tests {
             ..blank_status_response()
         };
         let out = status_only_report(s).render();
-        assert!(
-            out.contains("visible window"),
-            "show_enable=1 window missing: {}",
-            out
-        );
-        assert!(
-            !out.contains("hidden window"),
-            "show_enable=0 window must not render: {}",
-            out
-        );
-        assert!(
-            !out.contains("23:09"),
-            "hidden window reset_at must not appear: {}",
-            out
-        );
+        assert!(out.contains("visible window"), "show_enable=1 window missing: {}", out);
+        assert!(!out.contains("hidden window"), "show_enable=0 window must not render: {}", out);
+        assert!(!out.contains("23:09"), "hidden window reset_at must not appear: {}", out);
     }
 
     /// Locked models (plan_available=false on a higher tier) must
@@ -2752,10 +2663,7 @@ mod tests {
         };
         let out = report.render();
         // Plan tier appears next to claim line.
-        assert!(
-            out.contains("(CodingPlan Lite)"),
-            "claim row must show tier:\n{out}"
-        );
+        assert!(out.contains("(CodingPlan Lite)"), "claim row must show tier:\n{out}");
         // Available model: standard provider line.
         assert!(out.contains("AtomGit") && out.contains("lite/foo"));
         // Locked model: `×` prefix immediately before the name, plus
@@ -2799,4 +2707,5 @@ mod tests {
             "locked model must render BEFORE available providers (top-of-list upgrade prompt):\n{out}"
         );
     }
+
 }

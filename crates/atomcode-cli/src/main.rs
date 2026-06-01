@@ -951,7 +951,9 @@ async fn run() -> Result<i32> {
                         if let Some(ref c) = client {
                             cmd.arg("--client").arg(c);
                         }
-                        let status = cmd.status().context("Failed to start atomcode-daemon")?;
+                        let status = cmd
+                            .status()
+                            .context("Failed to start atomcode-daemon")?;
                         return Ok(if status.success() { 0 } else { 1 });
                     }
                     None => {
@@ -1021,7 +1023,7 @@ async fn run() -> Result<i32> {
                 vision_preprocessor_provider: None,
                 language: None,
                 ui: Default::default(),
-                plugin: Default::default(),
+            plugin: Default::default(),
             }
         })
     } else {
@@ -1045,7 +1047,10 @@ async fn run() -> Result<i32> {
     };
 
     // ── i18n locale ──
-    let locale = atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
+    let locale = atomcode_tuix::i18n::resolve_initial_locale(
+        cli.lang.as_deref(),
+        config.language,
+    );
     atomcode_tuix::i18n::set_locale(locale);
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
@@ -1528,7 +1533,10 @@ fn redirect_stderr_to_log_file() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let marker = format!("\n--- atomcode session start (unix={epoch_secs}) ---\n");
-    let _ = std::io::Write::write_all(&mut std::io::BufWriter::new(&file), marker.as_bytes());
+    let _ = std::io::Write::write_all(
+        &mut std::io::BufWriter::new(&file),
+        marker.as_bytes(),
+    );
     // SAFETY: dup2 swaps the file descriptor table entry for fd 2
     // to point at `file`'s underlying fd. This is a standard, safe
     // operation; the worst case (dup2 fails) is the redirect doesn't
@@ -1884,10 +1892,7 @@ async fn run_headless(
             // still see that VL ran. Char count helps spot degenerate
             // outputs.
             AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
-                eprintln!(
-                    "[vl-preprocess ok provider={} chars={}]",
-                    vl_key, char_count
-                );
+                eprintln!("[vl-preprocess ok provider={} chars={}]", vl_key, char_count);
             }
             AgentEvent::MessagesSync { .. } => {
                 // Only used by TUI for /bg session persistence; ignore in CLI.
@@ -2105,7 +2110,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
 
 /// Dispatch `atomcode plugin ...` subcommands. Each branch calls the same
 /// `atomcode_core::plugin::*` API the TUI's `/plugin` slash command uses, so
-/// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
+    /// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
 fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
     use atomcode_core::plugin::{installer, marketplace};
     match sub {
@@ -2406,15 +2411,12 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
             error_kind: Some("panic".to_string()),
-            error_data: Some(
-                serde_json::json!({
-                    "session_duration_secs": telemetry.uptime().as_secs() as u32,
-                    "turns_completed": null,
-                    "last_tool_name": null,
-                    "last_event": null,
-                })
-                .to_string(),
-            ),
+            error_data: Some(serde_json::json!({
+                "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                "turns_completed": null,
+                "last_tool_name": null,
+                "last_event": null,
+            }).to_string()),
         });
         default_hook(info);
     }));
@@ -2645,10 +2647,7 @@ mod tests {
         // Now a non-reasoning event arrives → close, then emit it.
         close_thinking_chunk(&mut buf, &mut open);
         buf.push_str("[tool→ read_file]\n");
-        assert_eq!(
-            buf,
-            "[thinking] I should check the file\n[tool→ read_file]\n"
-        );
+        assert_eq!(buf, "[thinking] I should check the file\n[tool→ read_file]\n");
     }
 
     // ── is_auth_gap_error ────────────────────────────────────────────

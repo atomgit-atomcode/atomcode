@@ -473,11 +473,7 @@ mod tests {
         // Re-open the queue — recover_stale_files should restore it.
         let q2 = Queue::open(d.path().to_path_buf()).unwrap();
         let ready = q2.ready_segments_sorted().unwrap();
-        assert_eq!(
-            ready.len(),
-            1,
-            "stale .sending file should be recovered as .ndjson"
-        );
+        assert_eq!(ready.len(), 1, "stale .sending file should be recovered as .ndjson");
         assert!(
             !claimed.exists(),
             "original .sending file should have been renamed away"

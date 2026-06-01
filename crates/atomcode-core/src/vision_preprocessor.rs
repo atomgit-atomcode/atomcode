@@ -82,7 +82,8 @@ pub async fn maybe_preprocess(
     };
 
     let prompt = if caption.trim().is_empty() {
-        "请详细描述这张图片的内容。如果是代码、报错截图或终端输出，请逐字转录文本。".to_string()
+        "请详细描述这张图片的内容。如果是代码、报错截图或终端输出，请逐字转录文本。"
+            .to_string()
     } else {
         format!(
             "用户的当前请求：{caption}\n\n请详细描述这张图片的内容。如果是代码、\
@@ -242,9 +243,7 @@ mod tests {
     #[tokio::test]
     async fn skipped_when_no_images() {
         let cfg = blank_config();
-        let provider = StubProvider {
-            model: "deepseek-v4-flash",
-        };
+        let provider = StubProvider { model: "deepseek-v4-flash" };
         let result = maybe_preprocess(&cfg, &provider, "any caption", &[]).await;
         assert!(matches!(result, PreprocessOutcome::Skipped));
     }
@@ -252,20 +251,18 @@ mod tests {
     #[tokio::test]
     async fn skipped_when_main_provider_accepts_images() {
         let cfg = blank_config();
-        let provider = StubProvider {
-            model: "claude-sonnet-4-5",
-        };
-        let result = maybe_preprocess(&cfg, &provider, "describe", &[sample_image()]).await;
+        let provider = StubProvider { model: "claude-sonnet-4-5" };
+        let result =
+            maybe_preprocess(&cfg, &provider, "describe", &[sample_image()]).await;
         assert!(matches!(result, PreprocessOutcome::Skipped));
     }
 
     #[tokio::test]
     async fn skipped_when_config_field_unset() {
         let cfg = blank_config();
-        let provider = StubProvider {
-            model: "deepseek-v4-flash",
-        };
-        let result = maybe_preprocess(&cfg, &provider, "describe", &[sample_image()]).await;
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result =
+            maybe_preprocess(&cfg, &provider, "describe", &[sample_image()]).await;
         assert!(matches!(result, PreprocessOutcome::Skipped));
     }
 
@@ -273,10 +270,9 @@ mod tests {
     async fn skipped_when_config_field_empty_string() {
         let mut cfg = blank_config();
         cfg.vision_preprocessor_provider = Some(String::new());
-        let provider = StubProvider {
-            model: "deepseek-v4-flash",
-        };
-        let result = maybe_preprocess(&cfg, &provider, "describe", &[sample_image()]).await;
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result =
+            maybe_preprocess(&cfg, &provider, "describe", &[sample_image()]).await;
         assert!(matches!(result, PreprocessOutcome::Skipped));
     }
 
@@ -284,10 +280,9 @@ mod tests {
     async fn failed_when_configured_key_missing_from_providers() {
         let mut cfg = blank_config();
         cfg.vision_preprocessor_provider = Some("AtomGit-NoSuchModel".into());
-        let provider = StubProvider {
-            model: "deepseek-v4-flash",
-        };
-        let result = maybe_preprocess(&cfg, &provider, "describe", &[sample_image()]).await;
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result =
+            maybe_preprocess(&cfg, &provider, "describe", &[sample_image()]).await;
         match result {
             PreprocessOutcome::Failed { reason } => {
                 assert!(
@@ -359,14 +354,15 @@ mod tests {
             .await;
 
         let mut cfg = blank_config();
-        cfg.providers
-            .insert("vl".into(), vl_provider_cfg(&server.uri()));
+        cfg.providers.insert(
+            "vl".into(),
+            vl_provider_cfg(&server.uri()),
+        );
         cfg.vision_preprocessor_provider = Some("vl".into());
 
-        let provider = StubProvider {
-            model: "deepseek-v4-flash",
-        };
-        let result = maybe_preprocess(&cfg, &provider, "explain this", &[sample_image()]).await;
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result =
+            maybe_preprocess(&cfg, &provider, "explain this", &[sample_image()]).await;
 
         match result {
             PreprocessOutcome::Replaced { text, vl_key } => {
@@ -392,14 +388,15 @@ mod tests {
             .await;
 
         let mut cfg = blank_config();
-        cfg.providers
-            .insert("vl".into(), vl_provider_cfg(&format!("{}/", server.uri())));
+        cfg.providers.insert(
+            "vl".into(),
+            vl_provider_cfg(&format!("{}/", server.uri())),
+        );
         cfg.vision_preprocessor_provider = Some("vl".into());
 
-        let provider = StubProvider {
-            model: "deepseek-v4-flash",
-        };
-        let result = maybe_preprocess(&cfg, &provider, "x", &[sample_image()]).await;
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result =
+            maybe_preprocess(&cfg, &provider, "x", &[sample_image()]).await;
 
         match result {
             PreprocessOutcome::Failed { reason } => {
@@ -426,14 +423,15 @@ mod tests {
             .await;
 
         let mut cfg = blank_config();
-        cfg.providers
-            .insert("vl".into(), vl_provider_cfg(&format!("{}/", server.uri())));
+        cfg.providers.insert(
+            "vl".into(),
+            vl_provider_cfg(&format!("{}/", server.uri())),
+        );
         cfg.vision_preprocessor_provider = Some("vl".into());
 
-        let provider = StubProvider {
-            model: "deepseek-v4-flash",
-        };
-        let result = maybe_preprocess(&cfg, &provider, "x", &[sample_image()]).await;
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result =
+            maybe_preprocess(&cfg, &provider, "x", &[sample_image()]).await;
 
         match result {
             PreprocessOutcome::Failed { reason } => {
@@ -481,14 +479,20 @@ mod tests {
             .await;
 
         let mut cfg = blank_config();
-        cfg.providers
-            .insert("vl".into(), vl_provider_cfg(&format!("{}/", server.uri())));
+        cfg.providers.insert(
+            "vl".into(),
+            vl_provider_cfg(&format!("{}/", server.uri())),
+        );
         cfg.vision_preprocessor_provider = Some("vl".into());
 
-        let provider = StubProvider {
-            model: "deepseek-v4-flash",
-        };
-        let result = maybe_preprocess(&cfg, &provider, "解释这段代码", &[sample_image()]).await;
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result = maybe_preprocess(
+            &cfg,
+            &provider,
+            "解释这段代码",
+            &[sample_image()],
+        )
+        .await;
 
         // Replaced confirms the body matched the caption pattern (otherwise
         // wiremock would reject the request and the call would fail).
@@ -513,13 +517,13 @@ mod tests {
             .await;
 
         let mut cfg = blank_config();
-        cfg.providers
-            .insert("vl".into(), vl_provider_cfg(&format!("{}/", server.uri())));
+        cfg.providers.insert(
+            "vl".into(),
+            vl_provider_cfg(&format!("{}/", server.uri())),
+        );
         cfg.vision_preprocessor_provider = Some("vl".into());
 
-        let provider = StubProvider {
-            model: "deepseek-v4-flash",
-        };
+        let provider = StubProvider { model: "deepseek-v4-flash" };
         let result = maybe_preprocess(&cfg, &provider, "  ", &[sample_image()]).await;
 
         assert!(matches!(result, PreprocessOutcome::Replaced { .. }));

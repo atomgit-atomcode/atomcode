@@ -101,8 +101,11 @@ pub fn diagnose_args(
              Re-issue: {example}"
         ));
     }
-    let value: serde_json::Value = serde_json::from_str(args)
-        .map_err(|_| format!("{tool} arguments are not valid JSON. Re-issue: {example}"))?;
+    let value: serde_json::Value = serde_json::from_str(args).map_err(|_| {
+        format!(
+            "{tool} arguments are not valid JSON. Re-issue: {example}"
+        )
+    })?;
     let obj = match value.as_object() {
         Some(o) => o,
         None => {
@@ -278,7 +281,11 @@ fn windows_rooted_path(path: &str) -> Option<&str> {
 
 fn strip_windows_drive_prefix(path: &str) -> Option<&str> {
     let bytes = path.as_bytes();
-    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || bytes[2] != b'\\'
+    {
         return None;
     }
 
@@ -312,7 +319,7 @@ pub fn real_home_dir() -> Option<PathBuf> {
             return Some(home);
         }
     }
-
+    
     // Fall back to the standard home directory
     dirs::home_dir()
 }
@@ -323,16 +330,16 @@ pub fn real_home_dir() -> Option<PathBuf> {
 fn get_user_home(username: &str) -> Option<PathBuf> {
     use std::ffi::CString;
     use std::ptr;
-
+    
     // SAFETY: We're calling getpwnam which is thread-safe on modern systems
     // when using getpwnam_r
     let username_c = CString::new(username).ok()?;
-
+    
     unsafe {
         let mut pwd: libc::passwd = std::mem::zeroed();
         let mut buf = vec![0u8; 4096]; // Buffer for string fields
         let mut result: *mut libc::passwd = ptr::null_mut();
-
+        
         let ret = libc::getpwnam_r(
             username_c.as_ptr(),
             &mut pwd,
@@ -340,7 +347,7 @@ fn get_user_home(username: &str) -> Option<PathBuf> {
             buf.len(),
             &mut result,
         );
-
+        
         if ret == 0 && !result.is_null() {
             let home = std::ffi::CStr::from_ptr(pwd.pw_dir)
                 .to_string_lossy()
@@ -348,7 +355,7 @@ fn get_user_home(username: &str) -> Option<PathBuf> {
             return Some(PathBuf::from(home));
         }
     }
-
+    
     None
 }
 
@@ -1006,11 +1013,7 @@ impl ToolRegistry {
     /// Iterate over all registered tools (async, acquires read lock).
     pub async fn iter(&self) -> impl Iterator<Item = (String, Arc<dyn Tool>)> {
         let tools = self.tools.read().await;
-        tools
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<Vec<_>>()
-            .into_iter()
+        tools.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>().into_iter()
     }
 
     /// Register a tool from an Arc (for building filtered registries from parent).
@@ -1026,9 +1029,7 @@ impl ToolRegistry {
     /// `recover_tool_args` falls back to its permissive branch).
     pub async fn expected_top_keys(&self, name: &str) -> Vec<String> {
         let tools = self.tools.read().await;
-        let Some(tool) = tools.get(name) else {
-            return Vec::new();
-        };
+        let Some(tool) = tools.get(name) else { return Vec::new() };
         let def = tool.definition();
         def.parameters
             .get("properties")
@@ -1054,6 +1055,7 @@ impl ToolRegistry {
         }
         n
     }
+
 }
 
 /// Wrapper key names atomgit's gateway has been observed to inject around
@@ -1154,9 +1156,7 @@ pub fn recover_tool_args(raw: &str, expected_top_keys: &[String]) -> Option<Stri
 }
 
 fn has_expected_key(v: &serde_json::Value, expected: &[String]) -> bool {
-    let Some(map) = v.as_object() else {
-        return false;
-    };
+    let Some(map) = v.as_object() else { return false };
     expected.iter().any(|k| map.contains_key(k.as_str()))
 }
 
@@ -1166,9 +1166,7 @@ fn has_expected_key(v: &serde_json::Value, expected: &[String]) -> bool {
 /// untouched, even if some of those keys happen to overlap with
 /// `ARGS_WRAPPER_KEYS` (e.g. `content` in write/todo).
 fn all_keys_in_expected(v: &serde_json::Value, expected: &[String]) -> bool {
-    let Some(map) = v.as_object() else {
-        return false;
-    };
+    let Some(map) = v.as_object() else { return false };
     if map.is_empty() {
         return false;
     }
@@ -1176,9 +1174,7 @@ fn all_keys_in_expected(v: &serde_json::Value, expected: &[String]) -> bool {
 }
 
 fn has_wrapper_shape(v: &serde_json::Value) -> bool {
-    let Some(map) = v.as_object() else {
-        return false;
-    };
+    let Some(map) = v.as_object() else { return false };
     ARGS_WRAPPER_KEYS.iter().any(|k| {
         map.get(*k).is_some_and(|inner| {
             // Wrapper if the wrapper key's value is itself an object, or is
@@ -1669,12 +1665,7 @@ mod tests {
         vec!["file_path".into(), "offset".into(), "limit".into()]
     }
     fn grep_keys() -> Vec<String> {
-        vec![
-            "pattern".into(),
-            "path".into(),
-            "max_results".into(),
-            "context".into(),
-        ]
+        vec!["pattern".into(), "path".into(), "max_results".into(), "context".into()]
     }
     fn write_keys() -> Vec<String> {
         vec!["file_path".into(), "content".into()]
@@ -1884,15 +1875,9 @@ mod tests {
     fn test_real_home_dir_returns_something() {
         // In normal conditions, real_home_dir should return a valid path
         let home = real_home_dir();
-        assert!(
-            home.is_some(),
-            "real_home_dir should return Some in normal conditions"
-        );
+        assert!(home.is_some(), "real_home_dir should return Some in normal conditions");
         let path = home.unwrap();
-        assert!(
-            path.is_absolute(),
-            "Home directory should be an absolute path"
-        );
+        assert!(path.is_absolute(), "Home directory should be an absolute path");
     }
 
     #[test]
@@ -1900,14 +1885,14 @@ mod tests {
         // Save original state
         let original_sudo_user = std::env::var("SUDO_USER").ok();
         let original_home = std::env::var("HOME").ok();
-
+        
         // Simulate sudo scenario: HOME=/root, SUDO_USER=<current_user>
         // We can't actually change to root, but we can verify the logic works
         #[cfg(unix)]
         {
             // Get current user's home from dirs::home_dir()
             let normal_home = dirs::home_dir();
-
+            
             // Set SUDO_USER to a user that exists (the current user)
             // This tests that get_user_home() works correctly
             if let Some(ref home) = normal_home {
@@ -1915,14 +1900,14 @@ mod tests {
                 assert!(home.is_absolute());
             }
         }
-
+        
         // Restore original state
         if let Some(orig) = original_sudo_user {
             std::env::set_var("SUDO_USER", orig);
         } else {
             std::env::remove_var("SUDO_USER");
         }
-
+        
         if let Some(orig) = original_home {
             std::env::set_var("HOME", orig);
         }
@@ -1934,11 +1919,11 @@ mod tests {
         let home = real_home_dir().unwrap();
         let expanded = expand_user_path("~/test");
         assert_eq!(expanded, home.join("test"));
-
+        
         // Test that ~ alone expands to home
         let expanded = expand_user_path("~");
         assert_eq!(expanded, home);
-
+        
         // Test that non-tilde paths are preserved
         let expanded = expand_user_path("/absolute/path");
         assert_eq!(expanded, PathBuf::from("/absolute/path"));

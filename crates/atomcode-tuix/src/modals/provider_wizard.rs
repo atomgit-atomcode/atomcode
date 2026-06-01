@@ -116,7 +116,8 @@ impl DraftProvider {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        }
+
+}
     }
 }
 
@@ -154,10 +155,7 @@ fn handle_key(
     if matches!(code, KeyCode::Esc) {
         buf.text.clear();
         buf.cursor = 0;
-        push(
-            renderer,
-            &crate::i18n::t(crate::i18n::Msg::ProviderWizardCancelled),
-        );
+        push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderWizardCancelled));
         return Ok(ModalAction::Close);
     }
 
@@ -203,10 +201,7 @@ fn handle_key(
                             *wizard = new;
                         }
                         "edit" | "delete" | "set-default" if providers.is_empty() => {
-                            push(
-                                renderer,
-                                &crate::i18n::t(crate::i18n::Msg::ProviderNoProviders),
-                            );
+                            push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderNoProviders));
                             return Ok(ModalAction::Close);
                         }
                         "edit" => {
@@ -301,10 +296,7 @@ fn handle_key(
                 }
                 KeyCode::Enter => {
                     let target = providers[selected].clone();
-                    push(
-                        renderer,
-                        &crate::i18n::t(crate::i18n::Msg::ProviderDeleteConfirm { name: &target }),
-                    );
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleteConfirm { name: &target }));
                     *wizard = ProviderWizard::DeleteConfirm { target };
                     redraw(buf, state, ctx, wizard, renderer);
                     return Ok(ModalAction::Continue);
@@ -337,10 +329,7 @@ fn handle_key(
                         ctx.model_name = p.model.clone();
                     }
                     save_and_reload(ctx, renderer);
-                    push(
-                        renderer,
-                        &crate::i18n::t(crate::i18n::Msg::ProviderDefaultSet { name: &chosen }),
-                    );
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDefaultSet { name: &chosen }));
                     return Ok(ModalAction::Close);
                 }
                 _ => {}
@@ -369,16 +358,10 @@ fn handle_key(
                             .unwrap_or_default();
                     }
                     save_and_reload(ctx, renderer);
-                    push(
-                        renderer,
-                        &crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: &target }),
-                    );
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: &target }));
                 }
                 _ => {
-                    push(
-                        renderer,
-                        &crate::i18n::t(crate::i18n::Msg::ProviderDeleteKept),
-                    );
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleteKept));
                 }
             }
             Ok(ModalAction::Close)
@@ -413,10 +396,7 @@ fn handle_key(
                         save_and_reload(ctx, renderer);
                         push(
                             renderer,
-                            &crate::i18n::t(crate::i18n::Msg::ProviderAdded {
-                                name: &name,
-                                model: &model,
-                            }),
+                            &crate::i18n::t(crate::i18n::Msg::ProviderAdded { name: &name, model: &model }),
                         );
                         return Ok(ModalAction::Close);
                     }
@@ -467,10 +447,7 @@ fn handle_key(
                             draft.apply_onto(existing);
                         }
                         save_and_reload(ctx, renderer);
-                        push(
-                            renderer,
-                            &crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &target }),
-                        );
+                        push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &target }));
                         return Ok(ModalAction::Close);
                     }
                 }
@@ -500,22 +477,14 @@ fn redraw(
     let menu = match wizard {
         ProviderWizard::MainMenu { selected } => Some(MenuPayload {
             items: vec![
-                (
-                    crate::i18n::t(crate::i18n::Msg::ProviderMenuAdd).into_owned(),
-                    crate::i18n::t(crate::i18n::Msg::ProviderMenuAddDesc).into_owned(),
-                ),
-                (
-                    crate::i18n::t(crate::i18n::Msg::ProviderMenuEdit).into_owned(),
-                    crate::i18n::t(crate::i18n::Msg::ProviderMenuEditDesc).into_owned(),
-                ),
-                (
-                    crate::i18n::t(crate::i18n::Msg::ProviderMenuDelete).into_owned(),
-                    crate::i18n::t(crate::i18n::Msg::ProviderMenuDeleteDesc).into_owned(),
-                ),
-                (
-                    crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefault).into_owned(),
-                    crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefaultDesc).into_owned(),
-                ),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuAdd).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuAddDesc).into_owned()),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuEdit).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuEditDesc).into_owned()),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuDelete).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuDeleteDesc).into_owned()),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefault).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefaultDesc).into_owned()),
             ],
             selected: *selected,
             kind: crate::render::MenuKind::SlashCommand,
@@ -547,7 +516,7 @@ fn redraw(
             Some(MenuPayload {
                 items,
                 selected: *selected,
-                kind: crate::render::MenuKind::SlashCommand,
+            kind: crate::render::MenuKind::SlashCommand,
             })
         }
         // Q&A steps: plain input box, no overlay menu.
@@ -580,10 +549,9 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
     match (step, existing) {
         (WizardStep::Name, _) => t(Msg::ProviderStepName).into_owned(),
         (WizardStep::ProviderType, None) => t(Msg::ProviderStepType).into_owned(),
-        (WizardStep::ProviderType, Some(p)) => t(Msg::ProviderStepTypeWithHint {
-            current: &p.provider_type,
-        })
-        .into_owned(),
+        (WizardStep::ProviderType, Some(p)) => {
+            t(Msg::ProviderStepTypeWithHint { current: &p.provider_type }).into_owned()
+        }
         (WizardStep::BaseUrl, None) => t(Msg::ProviderStepBaseUrl).into_owned(),
         (WizardStep::BaseUrl, Some(p)) => {
             let default_hint = t(Msg::ProviderDefaultHint);
@@ -600,9 +568,8 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
             t(Msg::ProviderStepApiKeyWithHint { hint: &hint }).into_owned()
         }
         (WizardStep::Model, None) => t(Msg::ProviderStepModel).into_owned(),
-        (WizardStep::Model, Some(p)) => {
-            t(Msg::ProviderStepModelWithHint { current: &p.model }).into_owned()
-        }
+        (WizardStep::Model, Some(p)) =>
+            t(Msg::ProviderStepModelWithHint { current: &p.model }).into_owned(),
     }
 }
 
@@ -632,10 +599,7 @@ fn advance_add(
     match step {
         WizardStep::Name => {
             if ans.is_empty() {
-                push(
-                    renderer,
-                    &crate::i18n::t(crate::i18n::Msg::ProviderNameEmpty),
-                );
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderNameEmpty));
                 return Some(WizardStep::Name);
             }
             draft.name = ans.to_string();
@@ -643,10 +607,7 @@ fn advance_add(
         }
         WizardStep::ProviderType => {
             if !["openai", "claude", "ollama"].contains(&ans) {
-                push(
-                    renderer,
-                    &crate::i18n::t(crate::i18n::Msg::ProviderUnknownType),
-                );
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUnknownType));
                 return Some(WizardStep::ProviderType);
             }
             draft.provider_type = ans.to_string();
@@ -662,10 +623,7 @@ fn advance_add(
         }
         WizardStep::Model => {
             if ans.is_empty() {
-                push(
-                    renderer,
-                    &crate::i18n::t(crate::i18n::Msg::ProviderModelEmpty),
-                );
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderModelEmpty));
                 return Some(WizardStep::Model);
             }
             draft.model = ans.to_string();
@@ -717,13 +675,7 @@ fn advance_edit(
 
 /// Route a keystroke into `Buffer::apply` so text-input wizard steps
 /// support the usual editing shortcuts (Backspace / Left / Right / etc).
-fn forward_to_buffer(
-    code: KeyCode,
-    modifiers: KeyModifiers,
-    buf: &mut Buffer,
-    state: &mut UiState,
-    ctx: &LoopCtx,
-) {
+fn forward_to_buffer(code: KeyCode, modifiers: KeyModifiers, buf: &mut Buffer, state: &mut UiState, ctx: &LoopCtx) {
     let action = classify(code, modifiers);
     let _ = buf.apply(action, ctx.history.entries(), &ctx.commands);
     crate::event_loop::sync_recalled_attachments(state, buf, ctx.history.entries());

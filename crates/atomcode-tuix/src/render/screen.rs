@@ -478,7 +478,7 @@ mod tests {
         let mut s = Screen::new(10, 3);
         s.invalidate();
         let _ = s.render_diff(); // consumes the cold-start cue
-                                 // Second frame: no invalidate, no cold start.
+        // Second frame: no invalidate, no cold start.
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
         assert!(

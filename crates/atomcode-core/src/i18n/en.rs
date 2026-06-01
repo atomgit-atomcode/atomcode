@@ -1,5 +1,5 @@
-use super::messages::Msg;
 use std::borrow::Cow;
+use super::messages::Msg;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
@@ -367,8 +367,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Unknown command: /{name}").into(),
         Msg::CmdLoginFailed { error } =>
             format!("login failed: {error}").into(),
-        Msg::LoginSignedInWithCpHint { name, username } =>
-            format!("  Signed in as {name} (@{username}). Use /codingplan to claim a free token quota.\n").into(),
         Msg::CmdLogoutDone =>
             "  Signed out of AtomGit. Permissions refreshed.\n".into(),
         Msg::CmdLogoutFailed { error } =>
@@ -727,6 +725,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
+
+        // ── reasoning effort ──
         Msg::ReasoningEffortNoEffect => "reasoning_effort has no effect on the current model (only DeepSeek V4 / reasoner)".into(),
 
         // ── config save failed ──

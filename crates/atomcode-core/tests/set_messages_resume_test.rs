@@ -45,7 +45,7 @@ fn build_multi_turn_conversation(n: usize) -> Conversation {
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
-            synthetic: false,
+                    synthetic: false,
         });
         conv.turn_tracker.on_message_added(msg_idx);
 
@@ -58,7 +58,7 @@ fn build_multi_turn_conversation(n: usize) -> Conversation {
                 output: format!("output {}", t),
                 success: true,
             }),
-            synthetic: false,
+                    synthetic: false,
         });
         conv.turn_tracker.on_message_added(msg_idx);
 
@@ -182,7 +182,8 @@ fn context_builds_with_turn_tracking_after_set_messages() {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
-    };
+
+};
     let ctx_builder = DefaultCtx::new(&provider_config);
 
     let (built_msgs, stats) =
@@ -257,7 +258,8 @@ fn context_uses_fallback_when_turn_tracker_is_empty() {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
-    };
+
+};
     let ctx_builder = DefaultCtx::new(&provider_config);
 
     let (built_msgs, _stats) =
@@ -349,7 +351,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
-            synthetic: false,
+                    synthetic: false,
         },
         Message {
             role: Role::Tool,
@@ -358,7 +360,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 output: "found foo".into(),
                 success: true,
             }),
-            synthetic: false,
+                    synthetic: false,
         },
         Message {
             role: Role::Tool,
@@ -367,7 +369,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 output: "file contents".into(),
                 success: true,
             }),
-            synthetic: false,
+                    synthetic: false,
         },
         Message::new(Role::Assistant, "Here's what I found..."),
         Message::new(Role::User, "now edit it"),
@@ -378,13 +380,12 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 tool_calls: vec![ToolCall {
                     id: "c3".into(),
                     name: "edit_file".into(),
-                    arguments: r#"{"file_path":"/tmp/x.rs","old_string":"foo","new_string":"bar"}"#
-                        .into(),
+                    arguments: r#"{"file_path":"/tmp/x.rs","old_string":"foo","new_string":"bar"}"#.into(),
                 }],
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
-            synthetic: false,
+                    synthetic: false,
         },
         Message {
             role: Role::Tool,
@@ -393,7 +394,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 output: "edit applied".into(),
                 success: true,
             }),
-            synthetic: false,
+                    synthetic: false,
         },
     ];
 
@@ -462,7 +463,8 @@ fn restored_context_contains_same_user_messages_as_original() {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
-    };
+
+};
     let ctx_builder = DefaultCtx::new(&provider_config);
     let system_prompt = "You are a helpful assistant.";
 
@@ -533,6 +535,7 @@ fn empty_turn_tracker_loses_windowing_precision() {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
+
     };
     let ctx_builder = DefaultCtx::new(&provider_config);
 
@@ -548,8 +551,8 @@ fn empty_turn_tracker_loses_windowing_precision() {
         turn_tracker: tracker,
         cold_summaries: Vec::new(),
     };
-    let (_, stats_with_tracker) =
-        ctx_builder.build_messages(&restored_conv, "You are a helpful assistant.", "");
+    let (_, stats_with_tracker) = ctx_builder
+        .build_messages(&restored_conv, "You are a helpful assistant.", "");
 
     // Without turn tracker (the old bug)
     let buggy_conv = Conversation {
@@ -559,8 +562,8 @@ fn empty_turn_tracker_loses_windowing_precision() {
         turn_tracker: TurnTracker::new(),
         cold_summaries: Vec::new(),
     };
-    let (_, stats_without_tracker) =
-        ctx_builder.build_messages(&buggy_conv, "You are a helpful assistant.", "");
+    let (_, stats_without_tracker) = ctx_builder
+        .build_messages(&buggy_conv, "You are a helpful assistant.", "");
 
     // With tracker: total_messages should be populated from turn-based windowing
     // Without tracker: total_messages may be 0 (default) from the fallback path

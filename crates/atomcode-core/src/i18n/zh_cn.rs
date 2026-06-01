@@ -1,5 +1,5 @@
-use super::messages::Msg;
 use std::borrow::Cow;
+use super::messages::Msg;
 
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
@@ -357,8 +357,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("未知命令：/{name}").into(),
         Msg::CmdLoginFailed { error } =>
             format!("登录失败：{error}").into(),
-        Msg::LoginSignedInWithCpHint { name, username } =>
-            format!("  已登录为 {name}（@{username}）。使用 /codingplan 领取免费额度。\n").into(),
         Msg::CmdLogoutDone =>
             "  已退出 AtomGit 登录。权限已刷新。\n".into(),
         Msg::CmdLogoutFailed { error } =>
@@ -715,6 +713,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
+
+        // ── reasoning effort ──
         Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 / reasoner 有效）".into(),
 
         // ── 配置保存失败 ──

@@ -286,7 +286,8 @@ fn test_config() -> Config {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        },
+
+},
     );
     Config {
         default_provider: "test".to_string(),
@@ -302,7 +303,7 @@ fn test_config() -> Config {
         vision_preprocessor_provider: None,
         language: None,
         ui: Default::default(),
-        plugin: Default::default(),
+            plugin: Default::default(),
     }
 }
 
@@ -334,7 +335,8 @@ fn make_runner(
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
-    };
+
+};
     let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =
         std::sync::Arc::new(crate::ctx::DefaultCtx::new(&test_provider));
 
@@ -346,7 +348,9 @@ fn make_runner(
         ctx: test_ctx,
         permission,
         recently_edited_files: Vec::new(),
-        hook_executor: std::sync::Arc::new(crate::hook::executor::HookExecutor::empty()),
+        hook_executor: std::sync::Arc::new(
+            crate::hook::executor::HookExecutor::empty()
+        ),
         loop_guard: Default::default(),
     }
 }
@@ -554,12 +558,7 @@ async fn test_turn_runner_loop_guard_blocks_third_identical_call() {
             results.push(r.output.clone());
         }
     }
-    assert_eq!(
-        results.len(),
-        3,
-        "expected 3 tool results, got {}",
-        results.len()
-    );
+    assert_eq!(results.len(), 3, "expected 3 tool results, got {}", results.len());
     assert!(
         results[0].contains("executed grep"),
         "1st call should run normally, got: {:?}",
@@ -1054,9 +1053,7 @@ async fn test_tool_result_content_in_llm_context() {
 async fn test_multiple_tool_calls_results_in_context() {
     let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
-    tools
-        .register(Box::new(EchoTool { name: "read_file" }))
-        .await;
+    tools.register(Box::new(EchoTool { name: "read_file" })).await;
 
     // Provider returns two tool calls in sequence
     let provider = MockProvider {
@@ -1242,17 +1239,11 @@ async fn test_empty_turn_reminder_is_noop() {
 async fn test_tool_registry_stable_order() {
     let registry = ToolRegistry::new();
     // Register in reverse alphabetical order
-    registry
-        .register(Box::new(EchoTool { name: "write_file" }))
-        .await;
+    registry.register(Box::new(EchoTool { name: "write_file" })).await;
     registry.register(Box::new(EchoTool { name: "bash" })).await;
-    registry
-        .register(Box::new(EchoTool { name: "read_file" }))
-        .await;
+    registry.register(Box::new(EchoTool { name: "read_file" })).await;
     registry.register(Box::new(EchoTool { name: "grep" })).await;
-    registry
-        .register(Box::new(EchoTool { name: "edit_file" }))
-        .await;
+    registry.register(Box::new(EchoTool { name: "edit_file" })).await;
 
     let defs = registry.get_definitions().await;
     let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
@@ -1421,14 +1412,12 @@ fn write_file_validate_args_catches_real_datalog_fixtures() {
     );
     // Empty args.
     assert!(tool.validate_args("").is_err());
-    assert!(
-        tool.validate_args("{}").is_err(),
-        "empty object must reject"
-    );
+    assert!(tool.validate_args("{}").is_err(), "empty object must reject");
     // Valid call passes.
-    assert!(tool
-        .validate_args(r#"{"file_path":"/tmp/x.rs","content":"hi"}"#)
-        .is_ok());
+    assert!(
+        tool.validate_args(r#"{"file_path":"/tmp/x.rs","content":"hi"}"#)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1441,9 +1430,12 @@ fn edit_file_validate_args_rejects_missing_fields() {
         tool.validate_args(r#"{"file_path":"/x.rs"}"#).is_err(),
         "missing old_string + new_string must reject"
     );
-    assert!(tool
-        .validate_args(r#"{"file_path":"/x.rs","old_string":"a","new_string":"b"}"#)
-        .is_ok());
+    assert!(
+        tool.validate_args(
+            r#"{"file_path":"/x.rs","old_string":"a","new_string":"b"}"#
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -1452,9 +1444,9 @@ fn search_replace_validate_args_rejects_missing_fields() {
     use crate::tool::Tool as _;
     let tool = SearchReplaceTool;
     assert!(tool.validate_args("{}").is_err());
-    assert!(tool
-        .validate_args(r#"{"search":"a","replace":"b"}"#)
-        .is_ok());
+    assert!(
+        tool.validate_args(r#"{"search":"a","replace":"b"}"#).is_ok()
+    );
 }
 
 // ===========================================================================
@@ -1497,7 +1489,8 @@ mod telemetry_tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: true,
-        };
+
+};
         let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =
             std::sync::Arc::new(crate::ctx::DefaultCtx::new(&test_provider_cfg));
 
@@ -1509,7 +1502,9 @@ mod telemetry_tests {
             ctx: test_ctx,
             permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
             recently_edited_files: Vec::new(),
-            hook_executor: std::sync::Arc::new(crate::hook::executor::HookExecutor::empty()),
+            hook_executor: std::sync::Arc::new(
+                crate::hook::executor::HookExecutor::empty()
+            ),
             loop_guard: Default::default(),
         };
         (runner, captured)
@@ -1708,44 +1703,20 @@ mod telemetry_tests {
             .filter(|r| matches!(r.event, Event::ToolCall { .. }))
             .collect();
 
-        assert_eq!(
-            tool_calls.len(),
-            1,
-            "expected one ToolCall event, got {}",
-            tool_calls.len()
-        );
+        assert_eq!(tool_calls.len(), 1, "expected one ToolCall event, got {}", tool_calls.len());
 
-        if let Event::ToolCall {
-            name,
-            success,
-            error_kind,
-            error_data,
-            ..
-        } = &tool_calls[0].event
-        {
+        if let Event::ToolCall { name, success, error_kind, error_data, .. } = &tool_calls[0].event {
             assert_eq!(name, "bash");
             assert!(!success, "ToolCall.success must be false for failing tool");
-            assert!(
-                error_kind.is_some(),
-                "error_kind must be Some for failing tool, got None"
-            );
-            assert_eq!(
-                error_kind.unwrap(),
-                ToolErrorKind::ExecutionFailed,
-                "error_kind must be ExecutionFailed for failing tool"
-            );
+            assert!(error_kind.is_some(), "error_kind must be Some for failing tool, got None");
+            assert_eq!(error_kind.unwrap(), ToolErrorKind::ExecutionFailed,
+                "error_kind must be ExecutionFailed for failing tool");
 
-            assert!(
-                error_data.is_some(),
-                "error_data must be Some for failing tool, got None"
-            );
+            assert!(error_data.is_some(), "error_data must be Some for failing tool, got None");
             let ed: serde_json::Value = serde_json::from_str(error_data.as_ref().unwrap()).unwrap();
             assert_eq!(ed["reason"], "Tool execution returned an error");
-            assert!(
-                ed["output_tail"].as_str().unwrap().contains("No such file"),
-                "error_data.output_tail must contain the stderr, got: {}",
-                ed["output_tail"]
-            );
+            assert!(ed["output_tail"].as_str().unwrap().contains("No such file"),
+                "error_data.output_tail must contain the stderr, got: {}", ed["output_tail"]);
         } else {
             panic!("Expected ToolCall event");
         }
@@ -1779,49 +1750,19 @@ mod telemetry_tests {
             .filter(|r| matches!(r.event, Event::ToolCall { .. }))
             .collect();
 
-        assert_eq!(
-            tool_calls.len(),
-            1,
-            "expected one ToolCall event, got {}",
-            tool_calls.len()
-        );
+        assert_eq!(tool_calls.len(), 1, "expected one ToolCall event, got {}", tool_calls.len());
 
-        if let Event::ToolCall {
-            name,
-            success,
-            error_kind,
-            error_data,
-            ..
-        } = &tool_calls[0].event
-        {
+        if let Event::ToolCall { name, success, error_kind, error_data, .. } = &tool_calls[0].event {
             assert_eq!(name, "bash");
-            assert!(
-                success,
-                "ToolCall.success must be true for warning tool (exit 0)"
-            );
-            assert!(
-                error_kind.is_some(),
-                "error_kind must be Some for warning tool, got None"
-            );
-            assert_eq!(
-                error_kind.unwrap(),
-                ToolErrorKind::Warning,
-                "error_kind must be Warning when exit 0 + stderr"
-            );
+            assert!(success, "ToolCall.success must be true for warning tool (exit 0)");
+            assert!(error_kind.is_some(), "error_kind must be Some for warning tool, got None");
+            assert_eq!(error_kind.unwrap(), ToolErrorKind::Warning,
+                "error_kind must be Warning when exit 0 + stderr");
 
-            assert!(
-                error_data.is_some(),
-                "error_data must be Some for warning tool, got None"
-            );
+            assert!(error_data.is_some(), "error_data must be Some for warning tool, got None");
             let ed: serde_json::Value = serde_json::from_str(error_data.as_ref().unwrap()).unwrap();
-            assert_eq!(
-                ed["reason"],
-                "Command succeeded (exit 0) but produced stderr output"
-            );
-            assert!(
-                ed.get("resolution").is_some(),
-                "warning error_data must contain resolution"
-            );
+            assert_eq!(ed["reason"], "Command succeeded (exit 0) but produced stderr output");
+            assert!(ed.get("resolution").is_some(), "warning error_data must contain resolution");
         } else {
             panic!("Expected ToolCall event");
         }
@@ -1855,31 +1796,13 @@ mod telemetry_tests {
             .filter(|r| matches!(r.event, Event::ToolCall { .. }))
             .collect();
 
-        assert_eq!(
-            tool_calls.len(),
-            1,
-            "expected one ToolCall event, got {}",
-            tool_calls.len()
-        );
+        assert_eq!(tool_calls.len(), 1, "expected one ToolCall event, got {}", tool_calls.len());
 
-        if let Event::ToolCall {
-            name,
-            success,
-            error_kind,
-            error_data,
-            ..
-        } = &tool_calls[0].event
-        {
+        if let Event::ToolCall { name, success, error_kind, error_data, .. } = &tool_calls[0].event {
             assert_eq!(name, "bash");
             assert!(success, "ToolCall.success must be true");
-            assert!(
-                error_kind.is_none(),
-                "error_kind must be None for successful tool without stderr, got Some"
-            );
-            assert!(
-                error_data.is_none(),
-                "error_data must be None for successful tool without stderr, got Some"
-            );
+            assert!(error_kind.is_none(), "error_kind must be None for successful tool without stderr, got Some");
+            assert!(error_data.is_none(), "error_data must be None for successful tool without stderr, got Some");
         } else {
             panic!("Expected ToolCall event");
         }
@@ -1911,12 +1834,8 @@ async fn sub_agent_normal_path_completes_one_turn() {
 
     let tools = {
         let mut tools = ToolRegistry::new();
-        tools
-            .register(Box::new(crate::tool::read::ReadFileTool))
-            .await;
-        tools
-            .register(Box::new(crate::tool::edit::EditFileTool))
-            .await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         Arc::new(tools)
     };
 
@@ -1938,17 +1857,9 @@ async fn sub_agent_normal_path_completes_one_turn() {
         )
         .await;
 
+    assert!(result.success, "expected success, got: {:?}", result.failures);
     assert!(
-        result.success,
-        "expected success, got: {:?}",
-        result.failures
-    );
-    assert!(
-        result
-            .diagnostic
-            .edited_files
-            .iter()
-            .any(|f| f.contains("test.rs")),
+        result.diagnostic.edited_files.iter().any(|f| f.contains("test.rs")),
         "expected edit recorded in diagnostic"
     );
 }
@@ -1974,12 +1885,8 @@ async fn sub_agent_hallucinating_mock_breaks_after_nudge_unheeded() {
 
     let tools = {
         let mut tools = ToolRegistry::new();
-        tools
-            .register(Box::new(crate::tool::read::ReadFileTool))
-            .await;
-        tools
-            .register(Box::new(crate::tool::edit::EditFileTool))
-            .await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         Arc::new(tools)
     };
 
@@ -2034,12 +1941,8 @@ async fn sub_agent_recovers_from_first_timeout_then_succeeds() {
 
     let tools = {
         let mut tools = ToolRegistry::new();
-        tools
-            .register(Box::new(crate::tool::edit::EditFileTool))
-            .await;
-        tools
-            .register(Box::new(crate::tool::read::ReadFileTool))
-            .await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
         Arc::new(tools)
     };
 
@@ -2055,11 +1958,7 @@ async fn sub_agent_recovers_from_first_timeout_then_succeeds() {
         .execute(provider, tools, &test_config(), tmp.path(), 12)
         .await;
 
-    assert!(
-        result.success,
-        "retry should recover; got failures: {:?}",
-        result.failures
-    );
+    assert!(result.success, "retry should recover; got failures: {:?}", result.failures);
     assert_eq!(result.diagnostic.timeouts, 1, "exactly one timeout retry");
 }
 
@@ -2075,14 +1974,12 @@ async fn sub_agent_provider_hard_error_breaks_immediately_no_retry() {
 
     let provider = Arc::new(SequencedMockProvider::new(vec![
         error_events("401 Unauthorized"),
-        text_only_events("would-be retry"), // never reached if no-retry works
+        text_only_events("would-be retry"),  // never reached if no-retry works
     ]));
 
     let tools = {
         let mut tools = ToolRegistry::new();
-        tools
-            .register(Box::new(crate::tool::edit::EditFileTool))
-            .await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         Arc::new(tools)
     };
 
@@ -2100,17 +1997,11 @@ async fn sub_agent_provider_hard_error_breaks_immediately_no_retry() {
 
     assert!(!result.success);
     assert!(
-        result
-            .failures
-            .iter()
-            .any(|f| matches!(f, SubAgentFailure::ProviderError(_))),
+        result.failures.iter().any(|f| matches!(f, SubAgentFailure::ProviderError(_))),
         "expected ProviderError, got: {:?}",
         result.failures
     );
-    assert_eq!(
-        result.diagnostic.timeouts, 0,
-        "non-timeout errors must not retry"
-    );
+    assert_eq!(result.diagnostic.timeouts, 0, "non-timeout errors must not retry");
 }
 
 #[tokio::test]
@@ -2138,12 +2029,8 @@ async fn sub_agent_blocked_tool_redirects_via_validate_args() {
 
     let tools = {
         let mut tools = ToolRegistry::new();
-        tools
-            .register(Box::new(crate::tool::read::ReadFileTool))
-            .await;
-        tools
-            .register(Box::new(crate::tool::edit::EditFileTool))
-            .await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         Arc::new(tools)
     };
 
@@ -2190,12 +2077,8 @@ async fn sub_agent_failed_edit_doesnt_burn_progress_signal() {
 
     let tools = {
         let mut tools = ToolRegistry::new();
-        tools
-            .register(Box::new(crate::tool::edit::EditFileTool))
-            .await;
-        tools
-            .register(Box::new(crate::tool::read::ReadFileTool))
-            .await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
         Arc::new(tools)
     };
 
@@ -2255,12 +2138,8 @@ async fn sub_agent_pool_one_failure_doesnt_affect_others() {
 
     let tools = {
         let mut tools = ToolRegistry::new();
-        tools
-            .register(Box::new(crate::tool::edit::EditFileTool))
-            .await;
-        tools
-            .register(Box::new(crate::tool::read::ReadFileTool))
-            .await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
         Arc::new(tools)
     };
 
@@ -2286,9 +2165,7 @@ async fn sub_agent_pool_one_failure_doesnt_affect_others() {
     };
 
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let results = pool
-        .execute_all(provider, tools, &test_config(), tmp.path(), &event_tx)
-        .await;
+    let results = pool.execute_all(provider, tools, &test_config(), tmp.path(), &event_tx).await;
 
     assert_eq!(results.len(), 2);
     let succeeded = results.iter().filter(|r| r.success).count();

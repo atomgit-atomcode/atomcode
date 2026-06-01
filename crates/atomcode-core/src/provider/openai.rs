@@ -62,8 +62,8 @@ fn build_codingplan_headers(
     let (user_id, oauth_token) = match override_auth {
         Some((uid, tok)) => (uid, tok),
         None => {
-            let auth =
-                get_stored_auth().ok_or_else(|| anyhow::anyhow!("{}", t(Msg::CpAuthRequired)))?;
+            let auth = get_stored_auth()
+                .ok_or_else(|| anyhow::anyhow!("{}", t(Msg::CpAuthRequired)))?;
             user_id_string = auth.user.id.clone();
             token_string = auth.access_token.clone();
             (user_id_string.as_str(), token_string.as_str())
@@ -104,7 +104,9 @@ fn build_codingplan_headers(
 
     match crypto::signer().sign(input) {
         Ok(out) => Ok(out.headers),
-        Err(SignError::Unavailable) => Err(anyhow::anyhow!("{}", t(Msg::CpOfficialBuildRequired))),
+        Err(SignError::Unavailable) => {
+            Err(anyhow::anyhow!("{}", t(Msg::CpOfficialBuildRequired)))
+        }
         Err(SignError::Derive(detail)) => Err(anyhow::anyhow!(
             "{} (signing-key derivation: {})",
             t(Msg::CpOfficialBuildRequired),
@@ -135,9 +137,7 @@ pub struct OpenAiProvider {
     /// `ProviderConfig::reasoning_history` at construction so bad values
     /// fail early at load time with a clear error, not silently mid-turn.
     reasoning_history_override: Option<ReasoningPolicy>,
-    /// DeepSeek V4 reasoning_effort control ("high" | "max"). Sent as a
-    /// top-level field in the request body when the provider API is
-    /// applicable. None = don't send the field.
+    /// DeepSeek V4 reasoning effort control (high / max / off).
     reasoning_effort: Option<String>,
     /// Whether the active model accepts image inputs. Drives `MultiPart`
     /// serialisation: vision-capable → OpenAI image_url schema, text-only
@@ -222,18 +222,11 @@ impl OpenAiProvider {
         ReasoningPolicy::Exclude
     }
 
-    /// True when the provider's base_url or model name indicates that
-    /// `reasoning_effort` is a valid request field. Gateways that
-    /// don't match will reject the unknown field with 400.
-    /// - Official DeepSeek API (`api.deepseek.com`) always accepts it.
-    /// - Third-party proxies: check model name for `deepseek-v4` or
-    ///   `deepseek-reasoner`.
-    pub fn reason_effort_applicable(model: &str, base_url: &str) -> bool {
+    /// Check whether the model supports DeepSeek's `reasoning_effort` field.
+    /// Only DeepSeek V4 (and later V4-derived) models accept this parameter.
+    pub fn reason_effort_applicable(model: &str, _base_url: &str) -> bool {
         let m = model.to_ascii_lowercase();
-        let u = base_url.to_ascii_lowercase();
-        u.contains("api.deepseek.com")
-            || m.contains("deepseek-v4")
-            || m.contains("deepseek-reasoner")
+        m.contains("deepseek-v4")
     }
 
     /// Build Kimi's `thinking` request-body object from the two flat
@@ -558,8 +551,6 @@ impl LlmProvider for OpenAiProvider {
         }
 
         // DeepSeek V4 reasoning_effort: only emitted when applicable
-        // (official API or model-name match) AND the user has set a
-        // value. None = don't send, API uses its own default.
         if let Some(ref effort) = self.reasoning_effort {
             if Self::reason_effort_applicable(&self.model, &self.base_url) {
                 body["reasoning_effort"] = json!(effort);
@@ -684,9 +675,12 @@ impl LlmProvider for OpenAiProvider {
                 let client_for_factory = client.clone();
                 let token_for_factory = current_token.clone();
                 let resign = move || -> reqwest::RequestBuilder {
-                    let extra_headers =
-                        build_codingplan_headers(&base_url_clone, &body_for_factory, None)
-                            .unwrap_or_default();
+                    let extra_headers = build_codingplan_headers(
+                        &base_url_clone,
+                        &body_for_factory,
+                        None,
+                    )
+                    .unwrap_or_default();
                     let mut req = client_for_factory
                         .post(&url_for_factory)
                         .header("Authorization", format!("Bearer {}", token_for_factory))
@@ -698,15 +692,17 @@ impl LlmProvider for OpenAiProvider {
                     req
                 };
 
-                let response =
-                    match crate::provider::retry::send_with_retry_resign(resign, &policy).await {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Ok(StreamEvent::Error(format!("Connection failed: {}", e))));
-                            return;
-                        }
-                    };
+                let response = match crate::provider::retry::send_with_retry_resign(resign, &policy).await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        let _ = tx.send(Ok(StreamEvent::Error(format!(
+                            "Connection failed: {}",
+                            e
+                        ))));
+                        return;
+                    }
+                };
 
                 if !response.status().is_success() {
                     let status = response.status();
@@ -746,8 +742,9 @@ impl LlmProvider for OpenAiProvider {
                         // Fall through to the friendly-error branch
                         // below; response is already consumed so build
                         // the error from `status` alone.
-                        let _ =
-                            tx.send(Ok(StreamEvent::Error(t(Msg::ChatAuthExpired).to_string())));
+                        let _ = tx.send(Ok(StreamEvent::Error(
+                            t(Msg::ChatAuthExpired).to_string(),
+                        )));
                         return;
                     }
 
@@ -844,307 +841,309 @@ impl LlmProvider for OpenAiProvider {
                 // and the truncation detector see real numbers.
                 let mut pending_finish: Option<crate::stream::StreamEvent> = None;
 
-                loop {
-                    // 120s idle timeout: if no data arrives for 2 minutes, treat as dead connection.
-                    let chunk = match tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
-                        byte_stream.next(),
-                    )
-                    .await
-                    {
-                        Ok(Some(chunk)) => chunk,
-                        Ok(None) => break, // stream ended
-                        Err(_) => {
-                            let _ = tx.send(Ok(StreamEvent::Error(
-                                "Stream timeout: no data received for 120 seconds".to_string(),
-                            )));
-                            return;
-                        }
-                    };
-
-                    match chunk {
-                        Ok(bytes) => {
-                            // TEMP wire-dump (response side): append raw
-                            // bytes as they arrive so we can inspect the
-                            // exact SSE stream litellm sent back.
-                            if let Some(ref p) = resp_dump_path {
-                                use std::io::Write;
-                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(p)
-                                {
-                                    let _ = f.write_all(&bytes);
-                                }
-                            }
-                            byte_buffer.extend_from_slice(&bytes);
-                        }
-                        Err(e) => {
-                            // Safe-to-retry condition: stream opened but no SSE
-                            // `data:` line was parsed yet. Common with
-                            // self-hosted endpoints that open the response,
-                            // immediately fail to start streaming, and reset
-                            // the chunked body — at this point nothing has
-                            // been committed downstream, so a fresh request
-                            // is equivalent to a first attempt.
-                            if !saw_data_line && attempt < MAX_STREAM_ATTEMPTS {
-                                continue 'retry;
-                            }
-                            let _ = tx.send(Ok(StreamEvent::Error(humanise_stream_error(&e))));
-                            return;
-                        }
+            loop {
+                // 120s idle timeout: if no data arrives for 2 minutes, treat as dead connection.
+                let chunk = match tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    byte_stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break, // stream ended
+                    Err(_) => {
+                        let _ = tx.send(Ok(StreamEvent::Error(
+                            "Stream timeout: no data received for 120 seconds".to_string(),
+                        )));
+                        return;
                     }
+                };
 
-                    // Convert bytes to string, keeping incomplete UTF-8 sequences for next chunk
-                    let text = match String::from_utf8(byte_buffer.clone()) {
-                        Ok(s) => {
-                            byte_buffer.clear();
-                            s
-                        }
-                        Err(e) => {
-                            let valid_len = e.utf8_error().valid_up_to();
-                            if valid_len == 0 {
-                                // No valid UTF-8 yet, wait for more bytes
-                                continue;
-                            }
-                            let valid =
-                                String::from_utf8_lossy(&byte_buffer[..valid_len]).to_string();
-                            byte_buffer = byte_buffer[valid_len..].to_vec();
-                            valid
-                        }
-                    };
-
-                    buffer.push_str(&text);
-
-                    while let Some(pos) = buffer.find('\n') {
-                        let line = buffer[..pos].trim().to_string();
-                        buffer = buffer[pos + 1..].to_string();
-
-                        if line.starts_with("data:") {
-                            saw_data_line = true;
-                            let data = line.strip_prefix("data:").unwrap().trim();
-                            if data == "[DONE]" {
-                                if let Some(usage) = last_usage.take() {
-                                    let _ = tx.send(Ok(StreamEvent::Usage(usage)));
-                                }
-                                // Emit the held-back Done from finish_reason if present;
-                                // otherwise default to a non-truncated Done (e.g. providers
-                                // that close the stream with [DONE] but never emit a
-                                // finish_reason field).
-                                let done = pending_finish
-                                    .take()
-                                    .unwrap_or(StreamEvent::Done { truncated: false });
-                                let _ = tx.send(Ok(done));
-                                return;
-                            }
-                            if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
-                                saw_valid_chunk = true;
-                                // Store usage — don't emit yet. Some providers send cumulative
-                                // usage in multiple chunks; we only want the final value.
-                                if let Some(usage) = &chunk.usage {
-                                    // Extract cached tokens from whichever field the provider uses
-                                    let cached = usage
-                                        .prompt_cache_hit_tokens
-                                        .or(usage.cached_tokens)
-                                        .or_else(|| {
-                                            usage
-                                                .prompt_tokens_details
-                                                .as_ref()
-                                                .and_then(|d| d.cached_tokens)
-                                        })
-                                        .unwrap_or(0);
-                                    let pt = usage.prompt_tokens.unwrap_or(0);
-                                    if !truncation_warned {
-                                        if let Some(ratio) =
-                                            check_truncation(body_content_chars, pt)
-                                        {
-                                            truncation_warned = true;
-                                            let msg = format!(
-                                                "Provider may be truncating input on \
-                                             model={}: {} content chars vs {} reported \
-                                             prompt_tokens (ratio {:.1} chars/token; \
-                                             normal mixed-content runs 2-4). If turns \
-                                             spiral, the proxy may be capping context.",
-                                                provider_label, body_content_chars, pt, ratio,
-                                            );
-                                            let _ = tx.send(Ok(StreamEvent::Warning(msg)));
-                                        }
-                                    }
-                                    last_usage = Some(crate::stream::TokenUsage {
-                                        prompt_tokens: pt,
-                                        completion_tokens: usage.completion_tokens.unwrap_or(0),
-                                        cached_tokens: cached,
-                                    });
-                                }
-                                for choice in chunk.choices {
-                                    if let Some(content) = choice.delta.content {
-                                        if !content.is_empty() {
-                                            content_chunks += 1;
-                                            accumulated_content.push_str(&content);
-                                            let _ = tx.send(Ok(StreamEvent::Delta(content)));
-                                        }
-                                    }
-                                    if let Some(reasoning) = choice.delta.reasoning_content {
-                                        if !reasoning.is_empty() {
-                                            let _ = tx.send(Ok(StreamEvent::Reasoning(reasoning)));
-                                        }
-                                    }
-                                    if let Some(delta_tcs) = &choice.delta.tool_calls {
-                                        for tc in delta_tcs {
-                                            let idx = tc.index.unwrap_or(0);
-                                            // Grow the vec if this is a new tool call index
-                                            while tool_calls.len() <= idx {
-                                                tool_calls.push((
-                                                    String::new(),
-                                                    String::new(),
-                                                    String::new(),
-                                                ));
-                                                tool_start_emitted.push(false);
-                                            }
-                                            let entry = &mut tool_calls[idx];
-                                            // 1) Capture id only when present + non-empty.
-                                            //    ModelScope sends empty-string id on
-                                            //    increment chunks — skipping keeps the
-                                            //    earlier non-empty value.
-                                            if let Some(id) = &tc.id {
-                                                if !id.is_empty() {
-                                                    entry.0 = id.clone();
-                                                }
-                                            }
-                                            // 2) Accumulate name + args INDEPENDENTLY of
-                                            //    id presence.
-                                            //    * GPT-5 family (confirmed via wire-dump):
-                                            //      repeats same non-empty id on EVERY chunk
-                                            //      but only sends function.name on chunk 1.
-                                            //      Old code did `entry.1 = func.name.clone()
-                                            //      .unwrap_or_default()` which clobbered the
-                                            //      captured "use_skill" with "" on every
-                                            //      subsequent chunk — final ToolCallDone had
-                                            //      empty name → dropped as malformed.
-                                            //    * Guard `!name.is_empty()` also protects
-                                            //      against any provider that ever sends
-                                            //      `name: ""` placeholder.
-                                            if let Some(func) = &tc.function {
-                                                if let Some(name) = &func.name {
-                                                    if !name.is_empty() {
-                                                        entry.1 = name.clone();
-                                                    }
-                                                }
-                                                if let Some(args) = &func.arguments {
-                                                    entry.2.push_str(args);
-                                                    let _ = tx.send(Ok(
-                                                        StreamEvent::ToolCallDelta(args.clone()),
-                                                    ));
-                                                }
-                                            }
-                                            // 3) Emit ToolCallStart EXACTLY ONCE per index
-                                            //    — as soon as both id AND name are known.
-                                            //    Old code emitted on every chunk where id
-                                            //    was non-empty (N events for an N-chunk
-                                            //    stream); downstream UI handles the
-                                            //    duplicates but it's wasted work + log
-                                            //    noise.
-                                            if !tool_start_emitted[idx]
-                                                && !entry.0.is_empty()
-                                                && !entry.1.is_empty()
-                                            {
-                                                tool_start_emitted[idx] = true;
-                                                let _ = tx.send(Ok(StreamEvent::ToolCallStart {
-                                                    id: entry.0.clone(),
-                                                    name: entry.1.clone(),
-                                                }));
-                                            }
-                                        }
-                                    }
-                                    if let Some(ref reason) = choice.finish_reason {
-                                        // Don't return here — flush tool_calls + remember the
-                                        // finish_reason, then keep parsing until [DONE]. Some
-                                        // gateways (GitCode litellm proxy on glm-5 confirmed
-                                        // 5/8) send `usage` in a chunk AFTER `finish_reason`,
-                                        // and a previous version of this code returned on
-                                        // finish_reason → usage chunk silently dropped → both
-                                        // the token counters and the truncation detector saw
-                                        // 0 prompt_tokens for entire sessions.
-                                        match reason.as_str() {
-                                            "tool_calls" => {
-                                                for (id, name, args) in &tool_calls {
-                                                    let _ = tx.send(Ok(StreamEvent::ToolCallDone(
-                                                        crate::tool::ToolCall {
-                                                            id: id.clone(),
-                                                            name: name.clone(),
-                                                            arguments: args.clone(),
-                                                        },
-                                                    )));
-                                                }
-                                                tool_calls.clear();
-                                                tool_start_emitted.clear();
-                                                pending_finish =
-                                                    Some(StreamEvent::Done { truncated: false });
-                                            }
-                                            "length" | "max_tokens" => {
-                                                // Model hit token limit — flush partial tool
-                                                // calls so downstream sees what the model was
-                                                // attempting. (Args may be malformed;
-                                                // `repair_tool_args` + write.rs friendly errors
-                                                // handle that.)
-                                                for (id, name, args) in &tool_calls {
-                                                    let _ = tx.send(Ok(StreamEvent::ToolCallDone(
-                                                        crate::tool::ToolCall {
-                                                            id: id.clone(),
-                                                            name: name.clone(),
-                                                            arguments: args.clone(),
-                                                        },
-                                                    )));
-                                                }
-                                                tool_calls.clear();
-                                                tool_start_emitted.clear();
-                                                pending_finish =
-                                                    Some(StreamEvent::Done { truncated: true });
-                                            }
-                                            "stop" | _ => {
-                                                pending_finish =
-                                                    Some(StreamEvent::Done { truncated: false });
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if invalid_chunk_samples.len() < 3 && !data.is_empty() {
-                                invalid_chunk_samples.push(sample_for_error(data));
+                match chunk {
+                    Ok(bytes) => {
+                        // TEMP wire-dump (response side): append raw
+                        // bytes as they arrive so we can inspect the
+                        // exact SSE stream litellm sent back.
+                        if let Some(ref p) = resp_dump_path {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(p)
+                            {
+                                let _ = f.write_all(&bytes);
                             }
                         }
+                        byte_buffer.extend_from_slice(&bytes);
                     }
-                }
-
-                let tail = buffer.trim();
-                if !tail.is_empty() {
-                    if let Some(events) = parse_nonstream_response(tail) {
-                        for event in events {
-                            let _ = tx.send(Ok(event));
+                    Err(e) => {
+                        // Safe-to-retry condition: stream opened but no SSE
+                        // `data:` line was parsed yet. Common with
+                        // self-hosted endpoints that open the response,
+                        // immediately fail to start streaming, and reset
+                        // the chunked body — at this point nothing has
+                        // been committed downstream, so a fresh request
+                        // is equivalent to a first attempt.
+                        if !saw_data_line && attempt < MAX_STREAM_ATTEMPTS {
+                            continue 'retry;
                         }
+                        let _ = tx.send(Ok(StreamEvent::Error(humanise_stream_error(&e))));
                         return;
                     }
                 }
 
-                if saw_data_line && !saw_valid_chunk {
-                    let detail = if invalid_chunk_samples.is_empty() {
-                        "no chunk could be parsed".to_string()
-                    } else {
-                        format!("samples: {}", invalid_chunk_samples.join(" | "))
-                    };
-                    let _ = tx.send(Ok(StreamEvent::Error(format!(
-                        "Provider returned an unparseable OpenAI-compatible stream ({})",
-                        detail
-                    ))));
-                    return;
-                }
+                // Convert bytes to string, keeping incomplete UTF-8 sequences for next chunk
+                let text = match String::from_utf8(byte_buffer.clone()) {
+                    Ok(s) => {
+                        byte_buffer.clear();
+                        s
+                    }
+                    Err(e) => {
+                        let valid_len = e.utf8_error().valid_up_to();
+                        if valid_len == 0 {
+                            // No valid UTF-8 yet, wait for more bytes
+                            continue;
+                        }
+                        let valid = String::from_utf8_lossy(&byte_buffer[..valid_len]).to_string();
+                        byte_buffer = byte_buffer[valid_len..].to_vec();
+                        valid
+                    }
+                };
 
-                if !tail.is_empty() {
-                    let _ = tx.send(Ok(StreamEvent::Error(format!(
-                        "Provider returned a non-SSE response AtomCode could not parse: {}",
-                        sample_for_error(tail)
-                    ))));
+                buffer.push_str(&text);
+
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim().to_string();
+                    buffer = buffer[pos + 1..].to_string();
+
+                    if line.starts_with("data:") {
+                        saw_data_line = true;
+                        let data = line.strip_prefix("data:").unwrap().trim();
+                        if data == "[DONE]" {
+                            if let Some(usage) = last_usage.take() {
+                                let _ = tx.send(Ok(StreamEvent::Usage(usage)));
+                            }
+                            // Emit the held-back Done from finish_reason if present;
+                            // otherwise default to a non-truncated Done (e.g. providers
+                            // that close the stream with [DONE] but never emit a
+                            // finish_reason field).
+                            let done = pending_finish
+                                .take()
+                                .unwrap_or(StreamEvent::Done { truncated: false });
+                            let _ = tx.send(Ok(done));
+                            return;
+                        }
+                        if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
+                            saw_valid_chunk = true;
+                            // Store usage — don't emit yet. Some providers send cumulative
+                            // usage in multiple chunks; we only want the final value.
+                            if let Some(usage) = &chunk.usage {
+                                // Extract cached tokens from whichever field the provider uses
+                                let cached = usage
+                                    .prompt_cache_hit_tokens
+                                    .or(usage.cached_tokens)
+                                    .or_else(|| {
+                                        usage
+                                            .prompt_tokens_details
+                                            .as_ref()
+                                            .and_then(|d| d.cached_tokens)
+                                    })
+                                    .unwrap_or(0);
+                                let pt = usage.prompt_tokens.unwrap_or(0);
+                                if !truncation_warned {
+                                    if let Some(ratio) =
+                                        check_truncation(body_content_chars, pt)
+                                    {
+                                        truncation_warned = true;
+                                        let msg = format!(
+                                            "Provider may be truncating input on \
+                                             model={}: {} content chars vs {} reported \
+                                             prompt_tokens (ratio {:.1} chars/token; \
+                                             normal mixed-content runs 2-4). If turns \
+                                             spiral, the proxy may be capping context.",
+                                            provider_label,
+                                            body_content_chars,
+                                            pt,
+                                            ratio,
+                                        );
+                                        let _ = tx.send(Ok(StreamEvent::Warning(msg)));
+                                    }
+                                }
+                                last_usage = Some(crate::stream::TokenUsage {
+                                    prompt_tokens: pt,
+                                    completion_tokens: usage.completion_tokens.unwrap_or(0),
+                                    cached_tokens: cached,
+                                });
+                            }
+                            for choice in chunk.choices {
+                                if let Some(content) = choice.delta.content {
+                                    if !content.is_empty() {
+                                        content_chunks += 1;
+                                        accumulated_content.push_str(&content);
+                                        let _ = tx.send(Ok(StreamEvent::Delta(content)));
+                                    }
+                                }
+                                if let Some(reasoning) = choice.delta.reasoning_content {
+                                    if !reasoning.is_empty() {
+                                        let _ = tx.send(Ok(StreamEvent::Reasoning(reasoning)));
+                                    }
+                                }
+                                if let Some(delta_tcs) = &choice.delta.tool_calls {
+                                    for tc in delta_tcs {
+                                        let idx = tc.index.unwrap_or(0);
+                                        // Grow the vec if this is a new tool call index
+                                        while tool_calls.len() <= idx {
+                                            tool_calls.push((
+                                                String::new(),
+                                                String::new(),
+                                                String::new(),
+                                            ));
+                                            tool_start_emitted.push(false);
+                                        }
+                                        let entry = &mut tool_calls[idx];
+                                        // 1) Capture id only when present + non-empty.
+                                        //    ModelScope sends empty-string id on
+                                        //    increment chunks — skipping keeps the
+                                        //    earlier non-empty value.
+                                        if let Some(id) = &tc.id {
+                                            if !id.is_empty() {
+                                                entry.0 = id.clone();
+                                            }
+                                        }
+                                        // 2) Accumulate name + args INDEPENDENTLY of
+                                        //    id presence.
+                                        //    * GPT-5 family (confirmed via wire-dump):
+                                        //      repeats same non-empty id on EVERY chunk
+                                        //      but only sends function.name on chunk 1.
+                                        //      Old code did `entry.1 = func.name.clone()
+                                        //      .unwrap_or_default()` which clobbered the
+                                        //      captured "use_skill" with "" on every
+                                        //      subsequent chunk — final ToolCallDone had
+                                        //      empty name → dropped as malformed.
+                                        //    * Guard `!name.is_empty()` also protects
+                                        //      against any provider that ever sends
+                                        //      `name: ""` placeholder.
+                                        if let Some(func) = &tc.function {
+                                            if let Some(name) = &func.name {
+                                                if !name.is_empty() {
+                                                    entry.1 = name.clone();
+                                                }
+                                            }
+                                            if let Some(args) = &func.arguments {
+                                                entry.2.push_str(args);
+                                                let _ = tx.send(Ok(StreamEvent::ToolCallDelta(
+                                                    args.clone(),
+                                                )));
+                                            }
+                                        }
+                                        // 3) Emit ToolCallStart EXACTLY ONCE per index
+                                        //    — as soon as both id AND name are known.
+                                        //    Old code emitted on every chunk where id
+                                        //    was non-empty (N events for an N-chunk
+                                        //    stream); downstream UI handles the
+                                        //    duplicates but it's wasted work + log
+                                        //    noise.
+                                        if !tool_start_emitted[idx]
+                                            && !entry.0.is_empty()
+                                            && !entry.1.is_empty()
+                                        {
+                                            tool_start_emitted[idx] = true;
+                                            let _ = tx.send(Ok(StreamEvent::ToolCallStart {
+                                                id: entry.0.clone(),
+                                                name: entry.1.clone(),
+                                            }));
+                                        }
+                                    }
+                                }
+                                if let Some(ref reason) = choice.finish_reason {
+                                    // Don't return here — flush tool_calls + remember the
+                                    // finish_reason, then keep parsing until [DONE]. Some
+                                    // gateways (GitCode litellm proxy on glm-5 confirmed
+                                    // 5/8) send `usage` in a chunk AFTER `finish_reason`,
+                                    // and a previous version of this code returned on
+                                    // finish_reason → usage chunk silently dropped → both
+                                    // the token counters and the truncation detector saw
+                                    // 0 prompt_tokens for entire sessions.
+                                    match reason.as_str() {
+                                        "tool_calls" => {
+                                            for (id, name, args) in &tool_calls {
+                                                let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                                                    crate::tool::ToolCall {
+                                                        id: id.clone(),
+                                                        name: name.clone(),
+                                                        arguments: args.clone(),
+                                                    },
+                                                )));
+                                            }
+                                            tool_calls.clear();
+                                            tool_start_emitted.clear();
+                                            pending_finish =
+                                                Some(StreamEvent::Done { truncated: false });
+                                        }
+                                        "length" | "max_tokens" => {
+                                            // Model hit token limit — flush partial tool
+                                            // calls so downstream sees what the model was
+                                            // attempting. (Args may be malformed;
+                                            // `repair_tool_args` + write.rs friendly errors
+                                            // handle that.)
+                                            for (id, name, args) in &tool_calls {
+                                                let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                                                    crate::tool::ToolCall {
+                                                        id: id.clone(),
+                                                        name: name.clone(),
+                                                        arguments: args.clone(),
+                                                    },
+                                                )));
+                                            }
+                                            tool_calls.clear();
+                                            tool_start_emitted.clear();
+                                            pending_finish =
+                                                Some(StreamEvent::Done { truncated: true });
+                                        }
+                                        "stop" | _ => {
+                                            pending_finish =
+                                                Some(StreamEvent::Done { truncated: false });
+                                        }
+                                    }
+                                }
+                            }
+                        } else if invalid_chunk_samples.len() < 3 && !data.is_empty() {
+                            invalid_chunk_samples.push(sample_for_error(data));
+                        }
+                    }
+                }
+            }
+
+            let tail = buffer.trim();
+            if !tail.is_empty() {
+                if let Some(events) = parse_nonstream_response(tail) {
+                    for event in events {
+                        let _ = tx.send(Ok(event));
+                    }
                     return;
                 }
+            }
+
+            if saw_data_line && !saw_valid_chunk {
+                let detail = if invalid_chunk_samples.is_empty() {
+                    "no chunk could be parsed".to_string()
+                } else {
+                    format!("samples: {}", invalid_chunk_samples.join(" | "))
+                };
+                let _ = tx.send(Ok(StreamEvent::Error(format!(
+                    "Provider returned an unparseable OpenAI-compatible stream ({})",
+                    detail
+                ))));
+                return;
+            }
+
+            if !tail.is_empty() {
+                let _ = tx.send(Ok(StreamEvent::Error(format!(
+                    "Provider returned a non-SSE response AtomCode could not parse: {}",
+                    sample_for_error(tail)
+                ))));
+                return;
+            }
 
                 // ── Stream ended without close marker ──
                 // Reaching here means we parsed valid SSE chunks but the
@@ -1236,11 +1235,13 @@ impl LlmProvider for OpenAiProvider {
                 }
 
                 for (id, name, args) in &tool_calls {
-                    let _ = tx.send(Ok(StreamEvent::ToolCallDone(crate::tool::ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments: args.clone(),
-                    })));
+                    let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                        crate::tool::ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: args.clone(),
+                        },
+                    )));
                 }
                 tool_calls.clear();
                 tool_start_emitted.clear();
@@ -1509,7 +1510,7 @@ mod tests {
                     data: "AAAA".to_string(),
                 }],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         assert_eq!(out.len(), 1, "one message in, one out");
@@ -1519,11 +1520,11 @@ mod tests {
         assert_eq!(content.len(), 2, "image + text = 2 blocks");
         // Block 0: image, must have exactly `type` and `image_url`.
         assert_eq!(content[0]["type"], "image_url");
-        assert_eq!(content[0]["image_url"]["url"], "data:image/png;base64,AAAA");
-        assert!(
-            content[0].get("text").is_none(),
-            "image block must not have text field"
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
         );
+        assert!(content[0].get("text").is_none(), "image block must not have text field");
         // Block 1: text, must use `type: text` + `text: <string>`.
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "describe this");
@@ -1538,29 +1539,17 @@ mod tests {
             content: MessageContent::MultiPart {
                 text: Some("compare".to_string()),
                 images: vec![
-                    ImagePart {
-                        media_type: "image/png".into(),
-                        data: "FIRST".into(),
-                    },
-                    ImagePart {
-                        media_type: "image/jpeg".into(),
-                        data: "SECOND".into(),
-                    },
+                    ImagePart { media_type: "image/png".into(), data: "FIRST".into() },
+                    ImagePart { media_type: "image/jpeg".into(), data: "SECOND".into() },
                 ],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         let content = out[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 3);
-        assert_eq!(
-            content[0]["image_url"]["url"],
-            "data:image/png;base64,FIRST"
-        );
-        assert_eq!(
-            content[1]["image_url"]["url"],
-            "data:image/jpeg;base64,SECOND"
-        );
+        assert_eq!(content[0]["image_url"]["url"], "data:image/png;base64,FIRST");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/jpeg;base64,SECOND");
         assert_eq!(content[2]["type"], "text");
         assert_eq!(content[2]["text"], "compare");
     }
@@ -1573,12 +1562,9 @@ mod tests {
             role: Role::User,
             content: MessageContent::MultiPart {
                 text: None,
-                images: vec![ImagePart {
-                    media_type: "image/png".into(),
-                    data: "X".into(),
-                }],
+                images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         let content = out[0]["content"].as_array().unwrap();
@@ -1603,12 +1589,9 @@ mod tests {
             role: Role::User,
             content: MessageContent::MultiPart {
                 text: Some("[Image #1] 这是什么图啊".into()),
-                images: vec![ImagePart {
-                    media_type: "image/png".into(),
-                    data: "AAAA".into(),
-                }],
+                images: vec![ImagePart { media_type: "image/png".into(), data: "AAAA".into() }],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
         assert_eq!(out.len(), 1);
@@ -1646,12 +1629,9 @@ mod tests {
             role: Role::User,
             content: MessageContent::MultiPart {
                 text: None,
-                images: vec![ImagePart {
-                    media_type: "image/png".into(),
-                    data: "X".into(),
-                }],
+                images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
         let content = out[0]["content"].as_str().expect("string content");
@@ -1771,7 +1751,8 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        };
+
+};
         let p = OpenAiProvider::new(&cfg).expect("provider builds");
         assert_eq!(p.reasoning_history_policy(), ReasoningPolicy::Exclude);
 
@@ -1810,7 +1791,8 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        };
+
+};
         let err = match OpenAiProvider::new(&cfg) {
             Err(e) => e,
             Ok(_) => panic!("bad reasoning_history value must reject"),
@@ -1915,7 +1897,7 @@ mod tests {
         let msgs = vec![Message {
             role: Role::Assistant,
             content: MessageContent::Text("当前系统时间是 …".into()),
-            synthetic: false,
+                    synthetic: false,
         }];
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
@@ -2173,7 +2155,7 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: MessageContent::Text("hi".into()),
-            synthetic: false,
+                    synthetic: false,
         };
         let mut stream = p.chat_stream(&[msg], None).expect("stream");
         let mut out = Vec::new();
@@ -2345,16 +2327,8 @@ mod chat_auth_expired_i18n_tests {
         // reference the hint becomes useless.
         let zh = t_with(Locale::ZhCn, Msg::ChatAuthExpired).to_string();
         let en = t_with(Locale::En, Msg::ChatAuthExpired).to_string();
-        assert!(
-            zh.contains("/login"),
-            "zh message must mention /login: {}",
-            zh
-        );
-        assert!(
-            en.contains("/login"),
-            "en message must mention /login: {}",
-            en
-        );
+        assert!(zh.contains("/login"), "zh message must mention /login: {}", zh);
+        assert!(en.contains("/login"), "en message must mention /login: {}", en);
     }
 }
 
@@ -2364,8 +2338,12 @@ mod codingplan_signing_tests {
 
     #[test]
     fn build_signed_headers_returns_empty_for_non_atomgit_host() {
-        let headers = build_codingplan_headers("https://api.openai.com/v1", b"{}", None)
-            .expect("non-atomgit host must not error");
+        let headers = build_codingplan_headers(
+            "https://api.openai.com/v1",
+            b"{}",
+            None,
+        )
+        .expect("non-atomgit host must not error");
         assert!(headers.is_empty(), "got unexpected headers: {:?}", headers);
     }
 
@@ -2388,8 +2366,12 @@ mod codingplan_signing_tests {
 
     #[test]
     fn build_signed_headers_errors_when_atomgit_host_with_empty_auth() {
-        let err = build_codingplan_headers("https://llm-api.atomgit.com/v1", b"{}", Some(("", "")))
-            .expect_err("empty auth must error");
+        let err = build_codingplan_headers(
+            "https://llm-api.atomgit.com/v1",
+            b"{}",
+            Some(("", "")),
+        )
+        .expect_err("empty auth must error");
         assert!(!format!("{:#}", err).is_empty());
     }
 

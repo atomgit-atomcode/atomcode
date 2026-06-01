@@ -976,7 +976,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // a brand-colored badge so the user sees at a glance that file
         // edits / shell are gated. Build (default) is None and adds
         // nothing.
-        let mode_badge: Option<String> = status.mode_indicator.as_ref().map(|s| scrub_controls(s));
+        let mode_badge: Option<String> = status
+            .mode_indicator
+            .as_ref()
+            .map(|s| scrub_controls(s));
         let mode_badge_w = mode_badge
             .as_ref()
             .map(|s| crate::width::display_width(s) + 1) // +1 for the trailing space separator
@@ -994,12 +997,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // would eat the entire row, `truncate_path` replaces leading
         // segments with ".../" and keeps only the last segment.
         let model_str = if !status.model.is_empty() {
-            let m = scrub_controls(&status.model);
-            if let Some(ref e) = status.reasoning_effort {
-                format!("{} :{}", m, e)
-            } else {
-                m
+            let mut s = scrub_controls(&status.model);
+            if let Some(ref effort) = status.reasoning_effort {
+                use std::fmt::Write;
+                let _ = write!(s, " [{}]", effort);
             }
+            s
         } else {
             String::new()
         };
@@ -1026,14 +1029,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         if !status.cwd.is_empty() {
             let cwd_full = scrub_controls(&status.cwd);
-            let cwd_display =
-                if cwd_budget > 0 && crate::width::display_width(&cwd_full) > cwd_budget {
-                    crate::width::truncate_path(&cwd_full, cwd_budget)
-                } else if cwd_budget == 0 {
-                    crate::width::truncate_path(&cwd_full, left_max)
-                } else {
-                    cwd_full
-                };
+            let cwd_display = if cwd_budget > 0 && crate::width::display_width(&cwd_full) > cwd_budget {
+                crate::width::truncate_path(&cwd_full, cwd_budget)
+            } else if cwd_budget == 0 {
+                crate::width::truncate_path(&cwd_full, left_max)
+            } else {
+                cwd_full
+            };
             parts.push(cwd_display);
         }
         if !ctx_str.is_empty() {
@@ -1177,8 +1179,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let footer_top = body_rows_on_screen;
 
         // Pre-build every row vector (immutable borrows of self).
-        let top_rule =
-            self.build_top_rule_with_badge(input_rule_width, self.status.session_name.as_deref());
+        let top_rule = self.build_top_rule_with_badge(
+            input_rule_width,
+            self.status.session_name.as_deref(),
+        );
         let middle_cells: Vec<Vec<Cell>> = lines
             .iter()
             .enumerate()
@@ -1191,7 +1195,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             None
         };
-        let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
+        let menu_kind = self
+            .menu
+            .as_ref()
+            .map(|m| m.kind)
+            .unwrap_or_default();
         let menu_cells: Vec<Vec<Cell>> = menu_items
             .iter()
             .enumerate()
@@ -1342,7 +1350,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // scrollback and must not be re-painted into the viewport,
         // otherwise the next overflow LF promotes it a second time
         // (see `scrolled_off` doc).
-        let start = total.saturating_sub(body_height).max(self.scrolled_off);
+        let start = total
+            .saturating_sub(body_height)
+            .max(self.scrolled_off);
         if start >= total {
             return;
         }
@@ -1670,8 +1680,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Called before any push in the render arm that starts a new message.
     fn mark_message(&mut self, kind: crate::render::MarkKind) {
         let line_idx = self.body_lines.len();
-        self.message_marks
-            .push(crate::render::MessageMark { line_idx, kind });
+        self.message_marks.push(crate::render::MessageMark {
+            line_idx,
+            kind,
+        });
     }
 
     /// Push or update the live spinner body row. On the first call of a
@@ -2346,6 +2358,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .splice(0..self.welcome_line_count, rows.into_iter());
         self.welcome_line_count = new_len;
     }
+
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -2949,8 +2962,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // inline (issue #454). Otherwise, emit chips on a
                 // separate line so they remain visible.
                 let safe_tool_label = crate::sanitize::scrub_controls(&tool_label);
-                let mut prefixed_rows =
-                    self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
+                let mut prefixed_rows = self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
                 let screen_w = self.screen.width() as usize;
                 let last_row_w: usize = prefixed_rows
                     .last()
@@ -3047,7 +3059,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                         let seq = format!("\x1b[{};1H\x1b[K", bottom);
                         let _ = self.out.write_all(seq.as_bytes());
                     }
-                    self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
+                    self.skip_body_scroll_count =
+                        self.skip_body_scroll_count.saturating_add(1);
                 }
                 let body = format!("└ [Image #{}]", n);
                 self.push_body_text(&body, &self.style_for(Role::Muted));
@@ -3703,6 +3716,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.last_painted_footer_rows = self.current_footer_rows();
         self.dirty = false;
     }
+
 }
 
 impl<W: Write + Send> Drop for RetainedRenderer<W> {
@@ -3955,7 +3969,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/project/atomcode".into(),
             ctx_used: 0,
-            ctx_window: 0,
+                ctx_window: 0,
             hint: None,
             mode_indicator: None,
             session_name: None,
@@ -3978,7 +3992,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             ctx_used: 0,
-            ctx_window: 0,
+                ctx_window: 0,
             hint: None,
             mode_indicator: Some("PLAN".into()),
             session_name: None,
@@ -4156,7 +4170,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                kind: crate::render::MenuKind::SlashCommand,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -4182,7 +4196,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                kind: crate::render::MenuKind::SlashCommand,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -4551,7 +4565,10 @@ mod tests {
         // First render: pushes scroll-style (prev_rows=0 → fallback path).
         r.render_inflight_tool("⠋", "bash", detail, "");
         let bytes_after_first = buf.lock().unwrap().len();
-        assert!(bytes_after_first > 0, "first render must emit some bytes");
+        assert!(
+            bytes_after_first > 0,
+            "first render must emit some bytes"
+        );
 
         // Drain so subsequent measurements are tick-only.
         buf.lock().unwrap().clear();
@@ -4977,7 +4994,12 @@ mod tests {
         let bot_rule_row = (0..24usize)
             .rev()
             .find(|&r| (0..40usize).all(|c| vterm.cell_at(r, c).ch == '─'))
-            .unwrap_or_else(|| panic!("no full-width rule row found; dump:\n{}", vterm.dump()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "no full-width rule row found; dump:\n{}",
+                    vterm.dump()
+                )
+            });
         for col in 0..40usize {
             let cell = vterm.cell_at(bot_rule_row, col);
             assert_eq!(
@@ -5079,7 +5101,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                kind: crate::render::MenuKind::SlashCommand,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -5715,20 +5737,16 @@ mod tests {
             drain_into_vterm(&buf, &mut vterm);
 
             let tool_row = (0..vterm.height() as usize)
-                .find(|&i| vterm.row_text(i).contains("●") && vterm.row_text(i).contains(tool_name))
+                .find(|&i| {
+                    vterm.row_text(i).contains("●") && vterm.row_text(i).contains(tool_name)
+                })
                 .unwrap_or_else(|| {
-                    panic!(
-                        "[{tool_name}] tool call row missing\ndump:\n{}",
-                        vterm.dump()
-                    )
+                    panic!("[{tool_name}] tool call row missing\ndump:\n{}", vterm.dump())
                 });
             let result_row = (0..vterm.height() as usize)
                 .find(|&i| vterm.row_text(i).contains("└"))
                 .unwrap_or_else(|| {
-                    panic!(
-                        "[{tool_name}] tool result row missing\ndump:\n{}",
-                        vterm.dump()
-                    )
+                    panic!("[{tool_name}] tool result row missing\ndump:\n{}", vterm.dump())
                 });
 
             let first_char = tool_name.chars().next().unwrap();
@@ -5749,8 +5767,7 @@ mod tests {
                     )
                 });
             assert_eq!(
-                arrow_col,
-                name_col,
+                arrow_col, name_col,
                 "[{tool_name}] result '└' col {} must match tool name {:?} col {} \
                  (tool row: {:?}, result row: {:?})",
                 arrow_col,
@@ -5835,7 +5852,8 @@ mod tests {
         let (mut r, buf) = new_capturing(40, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
         let status = status_basic();
-        let long_summary = "Created new file /tmp/atomcode-smoke-temp-check.txt (15 bytes, 1 line)";
+        let long_summary =
+            "Created new file /tmp/atomcode-smoke-temp-check.txt (15 bytes, 1 line)";
         r.render(UiLine::ToolResult {
             success: true,
             summary: long_summary.into(),
@@ -6094,9 +6112,7 @@ mod tests {
     fn retained_command_output_internal_newlines_split_into_rows() {
         let (mut r, _buf) = new_capturing(80, 24);
         let before = r.body_lines.len();
-        r.render(UiLine::CommandOutput(
-            "line one\nline two\nline three".into(),
-        ));
+        r.render(UiLine::CommandOutput("line one\nline two\nline three".into()));
         let pushed = r.body_lines.len() - before;
         assert_eq!(
             pushed, 3,
@@ -7211,7 +7227,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                kind: crate::render::MenuKind::SlashCommand,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -7240,8 +7256,7 @@ mod tests {
             .filter(|r| vterm.row_text(*r).contains("AtomCode"))
             .count();
         assert_eq!(
-            brand_rows,
-            1,
+            brand_rows, 1,
             "menu-close: welcome brand should appear exactly once \
              (got {}):\n{}",
             brand_rows,
@@ -7253,8 +7268,7 @@ mod tests {
             .filter(|r| vterm.row_text(*r).contains("∙ ~/project"))
             .count();
         assert_eq!(
-            cwd_rows,
-            1,
+            cwd_rows, 1,
             "menu-close: welcome cwd should appear exactly once \
              (got {}):\n{}",
             cwd_rows,
@@ -7822,8 +7836,7 @@ mod tests {
                         cell.style.fg,
                         Some(Color::DarkRed),
                         "cell '{}' in locked row must carry DarkRed fg, got {:?}",
-                        cell.ch,
-                        cell.style.fg,
+                        cell.ch, cell.style.fg,
                     );
                 }
                 found_red = true;
@@ -7924,26 +7937,18 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         // Debug: print body_lines around the tool and result rows.
-        let tool_idx = r
-            .body_lines
-            .iter()
-            .rposition(|row| {
-                let text: String = row.iter().map(|c| c.ch).collect();
-                text.contains("Bash") && text.contains("rm -f")
-            })
-            .expect("● Bash row should exist in body_lines");
+        let tool_idx = r.body_lines.iter().rposition(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("Bash") && text.contains("rm -f")
+        }).expect("● Bash row should exist in body_lines");
 
-        let result_idx = r
-            .body_lines
-            .iter()
-            .rposition(|row| {
-                let text: String = row.iter().map(|c| c.ch).collect();
-                text.contains("elapsed")
-            })
-            .expect("└ result row should exist in body_lines");
+        let result_idx = r.body_lines.iter().rposition(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("elapsed")
+        }).expect("└ result row should exist in body_lines");
 
         eprintln!("body_lines around tool row:");
-        for i in tool_idx.saturating_sub(2)..=result_idx + 2 {
+        for i in tool_idx.saturating_sub(2)..=result_idx+2 {
             if let Some(row) = r.body_lines.get(i) {
                 let text: String = row.iter().map(|c| c.ch).collect();
                 eprintln!("  [{}] {:?} (blank={})", i, text, row.is_empty());
@@ -7957,15 +7962,9 @@ mod tests {
             tool_idx + 1,
             "result row should be immediately after tool row, but found gap.\n\
              body_lines around tool row:\n  {:?}\n  {:?}\n  {:?}",
-            r.body_lines
-                .get(tool_idx)
-                .map(|row| row.iter().map(|c| c.ch).collect::<String>()),
-            r.body_lines
-                .get(tool_idx + 1)
-                .map(|row| row.iter().map(|c| c.ch).collect::<String>()),
-            r.body_lines
-                .get(tool_idx + 2)
-                .map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines.get(tool_idx).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines.get(tool_idx + 1).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines.get(tool_idx + 2).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
         );
 
         // Also check the virtual terminal: the ● Bash row and └ result row
@@ -8045,9 +8044,7 @@ mod tests {
 
         // Check body_lines: there should be exactly one row with "● Bash"
         // and NO row with a spinner glyph (⠙ or similar Braille pattern).
-        let bash_rows: Vec<_> = r
-            .body_lines
-            .iter()
+        let bash_rows: Vec<_> = r.body_lines.iter()
             .enumerate()
             .filter(|(_, row)| {
                 let text: String = row.iter().map(|c| c.ch).collect();
@@ -8060,10 +8057,7 @@ mod tests {
             1,
             "there should be exactly 1 Bash row in body_lines, found {}:\n{:?}",
             bash_rows.len(),
-            bash_rows
-                .iter()
-                .map(|(i, row)| (i, row.iter().map(|c| c.ch).collect::<String>()))
-                .collect::<Vec<_>>(),
+            bash_rows.iter().map(|(i, row)| (i, row.iter().map(|c| c.ch).collect::<String>())).collect::<Vec<_>>(),
         );
 
         // The committed row should start with ● (U+25CF), not a spinner glyph.
@@ -8159,12 +8153,7 @@ mod tests {
         for i in 0..5050 {
             r.render(UiLine::User(format!("line {}", i)));
         }
-        assert_eq!(
-            r.body_lines.len(),
-            5000,
-            "body_lines should cap at 5000, got {}",
-            r.body_lines.len()
-        );
+        assert_eq!(r.body_lines.len(), 5000, "body_lines should cap at 5000, got {}", r.body_lines.len());
     }
 
     #[test]
@@ -8187,10 +8176,7 @@ mod tests {
         }
         // 5010 / 2 = 2505 marks dropped; 5005 - 2505 = 2500 survive.
         assert_eq!(r.message_marks.len(), 2500);
-        assert_eq!(
-            r.message_marks[0].line_idx, 0,
-            "first surviving mark should point at body_lines[0] after drain"
-        );
+        assert_eq!(r.message_marks[0].line_idx, 0, "first surviving mark should point at body_lines[0] after drain");
     }
 
     #[test]
@@ -8244,16 +8230,8 @@ mod tests {
         r.suspend_for_external();
         let bytes = buf.lock().unwrap().clone();
         let s = String::from_utf8_lossy(&bytes);
-        assert!(
-            s.contains("\x1b[?1006l"),
-            "suspend must disable SGR: {:?}",
-            s
-        );
-        assert!(
-            s.contains("\x1b[?1002l"),
-            "suspend must disable button-event: {:?}",
-            s
-        );
+        assert!(s.contains("\x1b[?1006l"), "suspend must disable SGR: {:?}", s);
+        assert!(s.contains("\x1b[?1002l"), "suspend must disable button-event: {:?}", s);
     }
 
     #[test]
@@ -8293,16 +8271,8 @@ mod tests {
         r.shutdown();
         let bytes = buf.lock().unwrap().clone();
         let s = String::from_utf8_lossy(&bytes);
-        assert!(
-            s.contains("\x1b[?1002l"),
-            "shutdown must disable button-event: {:?}",
-            s
-        );
-        assert!(
-            s.contains("\x1b[?1006l"),
-            "shutdown must disable SGR coords: {:?}",
-            s
-        );
+        assert!(s.contains("\x1b[?1002l"), "shutdown must disable button-event: {:?}", s);
+        assert!(s.contains("\x1b[?1006l"), "shutdown must disable SGR coords: {:?}", s);
     }
 
     /// Pins the Issue-1 contract: when a mouse-wheel tick reaches
@@ -8342,8 +8312,7 @@ mod tests {
         r.scroll_body(1);
         let after = buf.lock().unwrap().len();
         assert_eq!(
-            before,
-            after,
+            before, after,
             "scroll_body must NOT write any bytes — wheel scroll belongs to the \
              terminal's native scrollback via Shift+wheel / Cmd+↑. Emitted {} \
              unexpected bytes.",
@@ -8541,7 +8510,10 @@ mod tests {
         let probe = "BULLET-FIRST-ZZZ";
         r.render(UiLine::AssistantText(format!("{}\n", probe)));
         for i in 0..(cap_small + 5) {
-            r.render(UiLine::AssistantText(format!("filler-bullet-{:03}\n", i)));
+            r.render(UiLine::AssistantText(format!(
+                "filler-bullet-{:03}\n",
+                i
+            )));
         }
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -8642,7 +8614,10 @@ mod tests {
         });
         // Push past the small cap to trigger several overflow LFs.
         for i in 0..(cap_small + 10) {
-            r.render(UiLine::AssistantText(format!("filler-bullet-{:03}\n", i)));
+            r.render(UiLine::AssistantText(format!(
+                "filler-bullet-{:03}\n",
+                i
+            )));
             if i % 3 == 0 {
                 r.render(UiLine::Spinner {
                     frame: "⠹".into(),
@@ -8960,18 +8935,9 @@ mod tests {
         //   "副本编辑成功、读回一致、删除 - PASS。\n\n步骤 7 - `search_replace`\n"
         // followed by a function-calling tool_call (no XML in text).
         let chunks = [
-            "副本",
-            "编辑",
-            "成功",
-            "、读回",
-            "一致",
-            "、删除 - ",
-            "PASS",
-            "。\n\n",
-            "步骤 7",
-            " - ",
-            "`search_replace`",
-            "\n",
+            "副本", "编辑", "成功", "、读回", "一致",
+            "、删除 - ", "PASS", "。\n\n",
+            "步骤 7", " - ", "`search_replace`", "\n",
         ];
         for (i, chunk) in chunks.iter().enumerate() {
             r.render(UiLine::AssistantText((*chunk).into()));
@@ -9223,7 +9189,8 @@ mod tests {
         // side; pick a payload that lands a unique trailing marker near
         // the right edge so we can spot it later).
         let long_marker = "ENDMARKER";
-        let long_payload = format!("write_file(/long/path/to/file.md) {}", long_marker);
+        let long_payload =
+            format!("write_file(/long/path/to/file.md) {}", long_marker);
         // Sanity: ensure the payload fits in a single body row so we
         // don't accidentally land the marker on a wrapped second row.
         assert!(
@@ -9389,8 +9356,7 @@ mod tests {
         );
         let right_edge = vterm.cell_at(long_screen_row, (w - 5) as usize);
         assert_eq!(
-            right_edge.ch,
-            ' ',
+            right_edge.ch, ' ',
             "right-edge cell at row {} col {} should be blank, got {:?}\ndump:\n{}",
             long_screen_row,
             w - 5,
@@ -9486,8 +9452,7 @@ mod tests {
         // Also: cells past the short row's content should be SPACE.
         let cell_at_right_edge = vterm.cell_at(long_screen_row, (w - 5) as usize);
         assert_eq!(
-            cell_at_right_edge.ch,
-            ' ',
+            cell_at_right_edge.ch, ' ',
             "right-edge cell at row {} col {} should be blank, got {:?}\ndump:\n{}",
             long_screen_row,
             w - 5,
@@ -9585,7 +9550,8 @@ mod tests {
         let row = &lines[0];
 
         // Find the Number-token cells (chars '4' and '2').
-        let number_cells: Vec<&Cell> = row.iter().filter(|c| c.ch == '4' || c.ch == '2').collect();
+        let number_cells: Vec<&Cell> =
+            row.iter().filter(|c| c.ch == '4' || c.ch == '2').collect();
         assert_eq!(
             number_cells.len(),
             2,
@@ -9696,8 +9662,7 @@ mod tests {
         let occ_para = count("ENDPARA_UNIQUE");
         let occ_label = count("DONE_LABEL_UNIQUE");
         assert_eq!(
-            occ_para,
-            1,
+            occ_para, 1,
             "ENDPARA_UNIQUE must appear EXACTLY once after end-of-turn \
              overflow burst (found {}). Pre-fix this was 2 — the \
              overflow direct-write landed at row cap+1 (one below the \
@@ -9708,8 +9673,7 @@ mod tests {
             vterm.dump()
         );
         assert_eq!(
-            occ_label,
-            1,
+            occ_label, 1,
             "DONE_LABEL_UNIQUE must appear EXACTLY once after end-of-turn \
              overflow burst (found {}). See ENDPARA_UNIQUE assertion \
              above for the mechanism.\ndump:\n{}",
@@ -9883,10 +9847,9 @@ mod tests {
         // Bonus check: the row that actually contains the reasoning
         // text should mark its content cells with `faint = true` so
         // the visual dim style still renders.
-        let has_faint_text = r
-            .body_lines
-            .iter()
-            .any(|row| row.iter().any(|c| c.style.faint && c.ch != ' '));
+        let has_faint_text = r.body_lines.iter().any(|row| {
+            row.iter().any(|c| c.style.faint && c.ch != ' ')
+        });
         assert!(
             has_faint_text,
             "no faint reasoning cells found — the dim style was lost \
@@ -10101,8 +10064,7 @@ mod tests {
             let total = scrollback_count + visible_count;
             // Two /whoami invocations × 1 occurrence per line = 2.
             assert_eq!(
-                total,
-                2,
+                total, 2,
                 "line {:?} should appear exactly once after /whoami \
                  (visible={}, scrollback={})\n\nvisible grid:\n{}\n\n\
                  scrollback tail:\n{}",
