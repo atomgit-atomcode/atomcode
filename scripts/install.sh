@@ -65,7 +65,7 @@ else
 fi
 
 if [ -z "${ATOMCODE_VERSION:-}" ]; then
-    VERSION=$($_fetch "$REPO_LATEST_API" | grep tag_name | awk '{print $2}')
+    VERSION=$($_fetch "$REPO_LATEST_API" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 else
     VERSION="${ATOMCODE_VERSION:-v4.24.0}"
 fi
