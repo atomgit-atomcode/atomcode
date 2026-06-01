@@ -54,6 +54,23 @@ function imageDataUrl(img: ImageData): string {
   return `data:${img.media_type};base64,${img.data}`;
 }
 
+/**
+ * 去掉 daemon 为「非视觉主模型」注入的图片识别（VL）标注块——它只是给盲文本模型读图的
+ * 内部上下文，不该显示在用户的输入气泡里（用户看到的应只是自己打的字 + 图片缩略图）。
+ * 标注块由 daemon 追加在原文之后，与 `live_api.rs::preprocess_live_caption` /
+ * `lib.rs::process_chat_request` 的格式耦合：`\n\n[图片内容（由 X 识别）]\n…` 或
+ * `\n\n[图片识别失败]`（原文为空时无前导换行）。仅影响显示；存储/喂给模型的文本不变。
+ */
+function stripVisionAnnotation(text: string): string {
+  const markers = ['\n\n[图片内容（由', '[图片内容（由', '\n\n[图片识别失败]', '[图片识别失败]'];
+  let cut = -1;
+  for (const m of markers) {
+    const idx = text.indexOf(m);
+    if (idx >= 0 && (cut < 0 || idx < cut)) cut = idx;
+  }
+  return cut >= 0 ? text.slice(0, cut).trimEnd() : text;
+}
+
 interface TokenUsage {
   prompt: number;
   completion: number;
@@ -245,7 +262,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       if (msg.role === 'user') {
         loaded.push({
           role: 'user',
-          text: msg.content ?? '',
+          text: stripVisionAnnotation(msg.content ?? ''),
           tools: [],
           images: msg.images && msg.images.length ? msg.images : undefined,
         });
