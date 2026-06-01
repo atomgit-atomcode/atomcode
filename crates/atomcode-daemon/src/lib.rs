@@ -3104,9 +3104,20 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
     };
 
     let token = tokens.mint();
-    // 本机始终用 127.0.0.1 打开浏览器（即便绑定 0.0.0.0，回环也在监听内）。
+    // 选择自动打开浏览器用的本机地址：
+    // - 回环（127.0.0.1/localhost/::1）或通配（0.0.0.0/::）绑定时，回环都在监听集合内，用 127.0.0.1；
+    // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在
+    //   监听集合内，用它打开会 ERR_CONNECTION_REFUSED。此时必须用真实绑定地址打开。
+    let open_host: &str = if is_loopback_authority(&bound_host)
+        || bound_host == "0.0.0.0"
+        || bound_host == "::"
+    {
+        "127.0.0.1"
+    } else {
+        bound_host.as_str()
+    };
     let sync_suffix = if sync { "&sync=1" } else { "" };
-    let local_url = format!("http://127.0.0.1:{}/?token={}{}", actual_port, token, sync_suffix);
+    let local_url = format!("http://{}:{}/?token={}{}", open_host, actual_port, token, sync_suffix);
     let opened = atomcode_core::auth::oauth::open_browser(&local_url).is_ok();
     let mut msg = if opened {
         format!("已在浏览器打开 webui：{local_url}")
@@ -3155,17 +3166,15 @@ pub fn stop_server() -> String {
 }
 
 // ============================================================================
-// GET /tunnel/status — 远程访问探测（Tailscale + 绑定可达性 + 二维码）
+// GET /tunnel/status — 远程访问探测（蒲公英 Oray PGY + 绑定可达性 + 二维码）
 // ============================================================================
 
 #[derive(serde::Serialize)]
-struct TailscaleInfo {
-    /// 本机是否装了 tailscale CLI。
+struct PgyInfo {
+    /// 本机是否装了蒲公英（应用 bundle 或 oray 守护进程存在）。
     installed: bool,
-    /// 本机的 tailnet IPv4（100.x），未登录/未运行时为 None。
+    /// 本机的蒲公英虚拟 IPv4；未连接/未分配时为 None。
     ipv4: Option<String>,
-    /// MagicDNS 名（如 my-mac.tailnet.ts.net），可用时返回。
-    magic_dns: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -3175,68 +3184,137 @@ struct TunnelStatus {
     port: u16,
     /// 是否绑定到非回环地址（手机/其它设备可达的前提）。
     reachable: bool,
-    tailscale: TailscaleInfo,
-    /// 推荐的远程访问 URL（Tailscale IP + 当前 token）；不可用时 None。
+    pgy: PgyInfo,
+    /// 推荐的远程访问 URL（蒲公英 IP + 当前 token）；不可用时 None。
     remote_url: Option<String>,
     /// remote_url 的二维码（SVG 字符串）；不可用时 None。
     qr_svg: Option<String>,
 }
 
-/// 探测本机 Tailscale 状态（同步阻塞，调用方用 spawn_blocking 包裹）。
-fn tailscale_probe() -> TailscaleInfo {
-    const CANDIDATES: &[&str] = &[
-        "tailscale",
-        "/usr/local/bin/tailscale",
-        "/opt/homebrew/bin/tailscale",
-        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-    ];
-    for bin in CANDIDATES {
-        let Ok(out) = std::process::Command::new(bin)
-            .args(["status", "--json"])
-            .output()
-        else {
-            continue; // 该候选不存在，试下一个
-        };
-        // 二进制存在即认为已安装；status 失败（未登录/未运行）则 ip 为空。
-        if !out.status.success() {
-            return TailscaleInfo { installed: true, ipv4: None, magic_dns: None };
+/// 从 ifconfig 文本抽出蒲公英候选虚拟 IP —— 纯函数，与系统解耦，可单测。
+///
+/// 蒲公英无 CLI、虚拟网段（默认 172.16/16）管理端可改，故不按具体网段匹配，
+/// 改用两个结构性特征:接口 flags 含 `POINTOPOINT`（VPN 隧道网卡）且 `inet`
+/// 属 RFC1918（`Ipv4Addr::is_private()`）。这天然排除 Tailscale 的 100.64/10
+/// （CGNAT，非 RFC1918）与物理 en*（BROADCAST，非 POINTOPOINT）。
+fn pgy_ipv4_candidates(ifconfig_output: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_p2p = false; // 当前接口块是否为 POINTOPOINT
+    for line in ifconfig_output.lines() {
+        // 接口块以非空白字符开头（如 `utun7: flags=...`）；缩进行是其属性。
+        let is_header = line.chars().next().map(|c| !c.is_whitespace()).unwrap_or(false);
+        if is_header {
+            in_p2p = line.contains("POINTOPOINT");
+            continue;
         }
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-            return TailscaleInfo { installed: true, ipv4: None, magic_dns: None };
-        };
-        let self_ = &v["Self"];
-        let ipv4 = self_["TailscaleIPs"]
-            .as_array()
-            .and_then(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str())
-                    .find(|s| s.parse::<std::net::Ipv4Addr>().is_ok())
-            })
-            .map(|s| s.to_string());
-        let magic_dns = self_["DNSName"]
-            .as_str()
-            .map(|s| s.trim_end_matches('.').to_string())
-            .filter(|s| !s.is_empty());
-        return TailscaleInfo { installed: true, ipv4, magic_dns };
+        if !in_p2p {
+            continue;
+        }
+        // 属性行示例:`\tinet 172.16.2.14 --> 172.16.2.14 netmask 0xfffffc00`
+        if let Some(rest) = line.trim_start().strip_prefix("inet ") {
+            if let Some(addr) = rest.split_whitespace().next() {
+                if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+                    if ip.is_private() {
+                        out.push(ip.to_string());
+                    }
+                }
+            }
+        }
     }
-    TailscaleInfo { installed: false, ipv4: None, magic_dns: None }
+    out
 }
 
-/// GET /tunnel/status - 远程访问探测：绑定地址、Tailscale 状态、远程 URL + 二维码。
+/// 从一行日志里抽 `ip=<ipv4>`（蒲公英自报）。仅用于多候选消歧，loose 匹配即可——
+/// 正确性最终由调用方 `candidates.contains(ip)` 兜底。
+fn extract_ip_eq(line: &str) -> Option<String> {
+    let idx = line.find("ip=")?;
+    let rest = &line[idx + 3..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    let cand = &rest[..end];
+    cand.parse::<std::net::Ipv4Addr>().ok().map(|_| cand.to_string())
+}
+
+/// 兜底:从蒲公英日志抓自报虚拟 IP（段无关、权威），取最后一条 `ip=`。
+fn pgy_ipv4_from_log() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let dir = std::path::Path::new(&home).join("Library/Logs/PgyVisitor");
+    let mut latest: Option<String> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("log") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            if let Some(ip) = extract_ip_eq(line) {
+                latest = Some(ip);
+            }
+        }
+    }
+    latest
+}
+
+/// 从候选网卡 IP + 日志自报 IP 决定最终虚拟 IP —— 纯函数，可单测。
+/// 单候选直接用；零候选视为未连接；多候选（多 VPN 共存）用日志 IP 消歧，
+/// 仍无法确定则 None（宁缺毋滥，不误报）。
+fn pgy_pick_ipv4(candidates: Vec<String>, log_ip: Option<String>) -> Option<String> {
+    match candidates.len() {
+        1 => candidates.into_iter().next(),
+        0 => None,
+        _ => log_ip.filter(|ip| candidates.contains(ip)),
+    }
+}
+
+/// 检测蒲公英是否安装（macOS）:应用 bundle 或 oray 守护进程 plist 存在。
+fn pgy_installed() -> bool {
+    if std::path::Path::new("/Applications/PgyVisitor_download.app").exists() {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir("/Library/LaunchDaemons") {
+        for e in entries.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                let n = name.to_ascii_lowercase();
+                if n.starts_with("com.oray.") && n.contains("pgy") && n.ends_with(".plist") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 探测本机蒲公英状态（同步阻塞，调用方用 spawn_blocking 包裹）。
+fn pgy_probe() -> PgyInfo {
+    let installed = pgy_installed();
+    let candidates = std::process::Command::new("ifconfig")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| pgy_ipv4_candidates(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default();
+    let ipv4 = pgy_pick_ipv4(candidates, pgy_ipv4_from_log());
+    PgyInfo { installed, ipv4 }
+}
+
+/// GET /tunnel/status - 远程访问探测：绑定地址、蒲公英状态、远程 URL + 二维码。
 async fn get_tunnel_status(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let ts = tokio::task::spawn_blocking(tailscale_probe)
+    let pgy = tokio::task::spawn_blocking(pgy_probe)
         .await
-        .unwrap_or(TailscaleInfo { installed: false, ipv4: None, magic_dns: None });
+        .unwrap_or(PgyInfo { installed: false, ipv4: None });
 
     let reachable = !is_loopback_authority(&state.bind_host);
 
-    // 仅当 server 实际绑在「能从 tailnet 访问的地址」上时，才给出远程 URL：
-    // 0.0.0.0/:: 覆盖所有网卡，或显式绑到了该 tailscale IP。
-    let ts_reachable = matches!(state.bind_host.as_str(), "0.0.0.0" | "::")
-        || ts.ipv4.as_deref() == Some(state.bind_host.as_str());
+    // 仅当 server 实际绑在「能从蒲公英网络访问的地址」上时，才给出远程 URL：
+    // 0.0.0.0/:: 覆盖所有网卡，或显式绑到了该蒲公英 IP。
+    let pgy_reachable = matches!(state.bind_host.as_str(), "0.0.0.0" | "::")
+        || pgy.ipv4.as_deref() == Some(state.bind_host.as_str());
 
     // 复用请求自带的 token（与当前页面同一 token）拼远程 URL。
     let token = auth_token::token_from_header(
@@ -3245,9 +3323,11 @@ async fn get_tunnel_status(
             .and_then(|h| h.to_str().ok()),
     );
 
-    let (remote_url, qr_svg) = match (&ts.ipv4, &token) {
-        (Some(ip), Some(tok)) if ts_reachable => {
-            let url = format!("http://{}:{}/?token={}", ip, state.bind_port, tok);
+    let (remote_url, qr_svg) = match (&pgy.ipv4, &token) {
+        (Some(ip), Some(tok)) if pgy_reachable => {
+            // sync=1：手机端扫码/打开后接入与 TUI 的实时同步会话（与本机
+            // 自动打开浏览器的 URL 一致）。二维码由该 url 生成，故一并带上。
+            let url = format!("http://{}:{}/?token={}&sync=1", ip, state.bind_port, tok);
             let qr = qrcode::QrCode::new(url.as_bytes()).ok().map(|code| {
                 code.render::<qrcode::render::svg::Color>()
                     .min_dimensions(200, 200)
@@ -3263,7 +3343,7 @@ async fn get_tunnel_status(
         bind_host: state.bind_host.clone(),
         port: state.bind_port,
         reachable,
-        tailscale: ts,
+        pgy,
         remote_url,
         qr_svg,
     })
@@ -3875,5 +3955,84 @@ mod tests {
         assert!(!origin_is_allowed("http://localhost.evil.example"));
         assert!(!origin_is_allowed("null"));
         assert!(!origin_is_allowed("file://local/index.html"));
+    }
+
+    // ---- 蒲公英(Oray PGY)远程访问探测 ----
+
+    /// 真实 macOS ifconfig 片段:物理 en0(BROADCAST)+ Tailscale utun6(100.x,
+    /// POINTOPOINT)+ 蒲公英 utun7(172.16.x,POINTOPOINT)。仅蒲公英那个应入选。
+    const IFCONFIG_SAMPLE: &str = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 172.20.23.187 netmask 0xfffffc00 broadcast 172.20.23.255
+utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+\tinet 100.117.29.83 --> 100.117.29.83 netmask 0xffffffff
+utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
+\tinet 172.16.2.14 --> 172.16.2.14 netmask 0xfffffc00
+";
+
+    #[test]
+    fn pgy_candidates_picks_only_p2p_rfc1918() {
+        // en0 排除(BROADCAST,非 POINTOPOINT);utun6 排除(100.64/10 CGNAT,
+        // 非 RFC1918);仅 utun7 的蒲公英 IP 入选。
+        assert_eq!(pgy_ipv4_candidates(IFCONFIG_SAMPLE), vec!["172.16.2.14"]);
+    }
+
+    #[test]
+    fn pgy_candidates_excludes_rfc1918_on_non_p2p() {
+        // 公司 LAN 走 172.16 但接口是 BROADCAST(非 POINTOPOINT)→ 不入选。
+        let s = "en5: flags=8863<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500\n\
+                 \tinet 172.16.5.9 netmask 0xffff0000 broadcast 172.16.255.255\n";
+        assert!(pgy_ipv4_candidates(s).is_empty());
+    }
+
+    #[test]
+    fn pgy_candidates_is_segment_agnostic() {
+        // 不依赖 172.16:10/8 与 192.168/16 的 POINTOPOINT 同样入选。
+        let s = "utun9: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300\n\
+                 \tinet 10.8.0.3 --> 10.8.0.3 netmask 0xffffff00\n\
+                 utun10: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300\n\
+                 \tinet 192.168.50.2 --> 192.168.50.2 netmask 0xffffff00\n";
+        assert_eq!(pgy_ipv4_candidates(s), vec!["10.8.0.3", "192.168.50.2"]);
+    }
+
+    #[test]
+    fn pgy_candidates_empty_when_none() {
+        let s = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\
+                 \tinet 127.0.0.1 netmask 0xff000000\n";
+        assert!(pgy_ipv4_candidates(s).is_empty());
+    }
+
+    #[test]
+    fn pgy_pick_single_candidate() {
+        assert_eq!(
+            pgy_pick_ipv4(vec!["172.16.2.14".into()], None),
+            Some("172.16.2.14".into())
+        );
+    }
+
+    #[test]
+    fn pgy_pick_zero_candidates_is_none() {
+        assert_eq!(pgy_pick_ipv4(vec![], Some("172.16.2.14".into())), None);
+    }
+
+    #[test]
+    fn pgy_pick_multi_disambiguates_via_log() {
+        // 两个 POINTOPOINT VPN:日志自报 IP 命中其一 → 选中;否则 None。
+        let cands = vec!["172.16.2.14".to_string(), "10.99.0.5".to_string()];
+        assert_eq!(
+            pgy_pick_ipv4(cands.clone(), Some("10.99.0.5".into())),
+            Some("10.99.0.5".into())
+        );
+        assert_eq!(pgy_pick_ipv4(cands.clone(), Some("172.31.9.9".into())), None);
+        assert_eq!(pgy_pick_ipv4(cands, None), None);
+    }
+
+    #[test]
+    fn extract_ip_eq_parses_log_line() {
+        assert_eq!(
+            extract_ip_eq("2026-06-01 worker connected ip=172.16.2.14 gw=172.16.0.159"),
+            Some("172.16.2.14".into())
+        );
+        assert_eq!(extract_ip_eq("no ip here"), None);
     }
 }

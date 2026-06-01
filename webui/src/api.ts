@@ -286,12 +286,11 @@ export async function getSkills(): Promise<SkillInfo[]> {
   return resp.json();
 }
 
-// --- Remote access (Tailscale) status ---
+// --- Remote access (蒲公英 / Oray PGY) status ---
 
-export interface TailscaleInfo {
+export interface PgyInfo {
   installed: boolean;
   ipv4: string | null;
-  magic_dns: string | null;
 }
 
 export interface TunnelStatus {
@@ -299,8 +298,8 @@ export interface TunnelStatus {
   port: number;
   /** server bound to a non-loopback address (reachable by other devices) */
   reachable: boolean;
-  tailscale: TailscaleInfo;
-  /** ready-to-use remote URL (tailscale ip + token); null when not usable */
+  pgy: PgyInfo;
+  /** ready-to-use remote URL (蒲公英 ip + token); null when not usable */
   remote_url: string | null;
   /** SVG string of the QR code for remote_url; null when not usable */
   qr_svg: string | null;

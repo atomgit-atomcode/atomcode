@@ -357,7 +357,7 @@ function Row({ label, value, mono }: { label: string; value: string; mono?: bool
   );
 }
 
-/** 远程访问（Tailscale）：检测状态，给出可扫码的私网 URL。 */
+/** 远程访问（蒲公英 / Oray PGY）：检测状态，给出可扫码的私网 URL。 */
 export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
   const { t } = useSettings();
   const [status, setStatus] = useState<TunnelStatus | null>(null);
@@ -373,11 +373,11 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
   };
   useEffect(() => { reload(); }, []);
 
-  const ts = status?.tailscale;
+  const pgy = status?.pgy;
   // 服务端未给 remote_url（绑回环）时，前端用本地 token 拼一个「示意」地址。
   const fallbackUrl =
-    ts?.ipv4 && status
-      ? `http://${ts.ipv4}:${status.port}/?token=${getToken()}`
+    pgy?.ipv4 && status
+      ? `http://${pgy.ipv4}:${status.port}/?token=${getToken()}&sync=1`
       : null;
 
   function copy() {
@@ -398,13 +398,13 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
 
         {!loading && status && (
           <>
-            {/* 1) 未装 / 未登录 Tailscale */}
-            {(!ts?.installed || !ts?.ipv4) && (
+            {/* 1) 未装 / 未连蒲公英 */}
+            {(!pgy?.installed || !pgy?.ipv4) && (
               <div class="remote-state">
-                <p>{t('remote.notInstalled')}</p>
+                <p>{pgy?.installed ? t('remote.notConnected') : t('remote.notInstalled')}</p>
                 <a
                   class="btn btn-primary"
-                  href="https://tailscale.com/download"
+                  href="https://pgy.oray.com"
                   target="_blank"
                   rel="noreferrer"
                 >
@@ -414,9 +414,9 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
             )}
 
             {/* 2) 已装+有 IP，但 server 仅绑回环 → 提示改绑 */}
-            {ts?.installed && ts?.ipv4 && !status.remote_url && (
+            {pgy?.installed && pgy?.ipv4 && !status.remote_url && (
               <div class="remote-state">
-                <p>{t('remote.notReachable', { ip: ts.ipv4 })}</p>
+                <p>{t('remote.notReachable', { ip: pgy.ipv4 })}</p>
                 {fallbackUrl && <code class="remote-url">{fallbackUrl}</code>}
               </div>
             )}
