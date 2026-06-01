@@ -643,9 +643,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMarketplaceUsage =>
             "用法：/plugin marketplace [add|remove|update|list] <参数>".into(),
         Msg::PluginInstallUsage =>
-            "用法：/plugin install <插件>@<市场>".into(),
+            "用法：/plugin install <插件名> 或 <插件>@<市场>".into(),
+        Msg::PluginInstallNotFound { plugin } =>
+            format!("未在任何市场中找到插件 `{plugin}`。使用 /plugin marketplace list 查看已注册的市场。").into(),
+        Msg::PluginInstallAmbiguous { plugin } =>
+            format!("插件 `{plugin}` 存在于多个市场中，请指定：").into(),
         Msg::PluginUninstallUsage =>
-            "用法：/plugin uninstall <插件>@<市场>".into(),
+            "用法：/plugin uninstall <插件名> 或 <插件>@<市场>".into(),
+        Msg::PluginUninstallNotFound { plugin } =>
+            format!("插件 `{plugin}` 未安装。使用 /plugin list 查看已安装插件。").into(),
+        Msg::PluginUninstallAmbiguous { plugin } =>
+            format!("插件 `{plugin}` 从多个市场安装，请指定卸载哪一个：\n").into(),
         Msg::PluginNoMarketplaces =>
             "未注册任何市场".into(),
         Msg::PluginMarketplacesHeader =>
@@ -666,6 +674,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出 marketplace 失败：{error}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
+        Msg::PluginInstallingByName { plugin } =>
+            format!("正在安装 `{plugin}`…").into(),
         Msg::PluginAlreadyInstalled { id } =>
             format!("  插件 `{id}` 已安装。\n  PS: 如需重新安装，请先执行 `/plugin uninstall {id}`，然后再执行 `/plugin install {id}`\n").into(),
         Msg::PluginMgrBrowse => "浏览并安装".into(),
@@ -678,6 +688,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrHintRemove => "⏎ 移除 · esc 返回".into(),
         Msg::PluginMgrHintUninstall => "⏎ 卸载 · esc 返回".into(),
         Msg::PluginMgrHintUrl => "输入/粘贴 git URL · ⏎ 添加 · esc 取消".into(),
+Msg::PluginMgrHintPending => "安装中，请稍候… · esc 返回".into(),
+Msg::PluginMgrInstallingLabel => "安装中…".into(),
         Msg::PluginMgrEmptyMarketplaces => "暂无市场，请选「添加市场…」".into(),
         Msg::PluginMgrEmptyPlugins => "该市场暂无插件。".into(),
         Msg::PluginMgrEmptyInstalled => "暂无已安装插件。".into(),

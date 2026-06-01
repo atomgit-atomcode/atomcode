@@ -8,7 +8,7 @@ use super::state::{load_marketplaces_file, save_marketplaces_file, MarketplaceEn
 use super::url::{infer_marketplace_name_from_url, validate_git_url};
 
 /// Sanitize a name into a path-safe segment (CC convention).
-pub(super) fn sanitize_name(name: &str) -> String {
+pub fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect()

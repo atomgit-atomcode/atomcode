@@ -1815,12 +1815,9 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 ),
             }
         }
-        "install" => match parse_plugin_at_marketplace(parts.next().unwrap_or("").trim()) {
-            Some((plugin, mp)) => {
-                // External-source plugins also clone, so dispatch async like
-                // the marketplace add path. Inline-source installs are fast
-                // (state-file edit only) but still go through the same
-                // codepath for consistency.
+        "install" => match parse_plugin_arg(parts.next().unwrap_or("").trim()) {
+            Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
+                // Explicit plugin@marketplace — install directly.
                 let tx = ctx.plugin_job_tx.clone();
                 ok(renderer, t(Msg::PluginInstalling { plugin: &plugin, marketplace: &mp }).into_owned());
                 tokio::task::spawn_blocking(move || {
@@ -1842,16 +1839,89 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                     let _ = tx.send(ev);
                 });
             }
+            Some(PluginArg::Bare { plugin }) => {
+                // Bare plugin name — resolve across all marketplaces.
+                match atomcode_core::plugin::installer::resolve_plugin_marketplace(&plugin) {
+                    Ok(matches) if matches.len() == 1 => {
+                        let m = &matches[0];
+                        let mp = m.marketplace.clone();
+                        let resolved_plugin = m.plugin.clone();
+                        let tx = ctx.plugin_job_tx.clone();
+                        ok(renderer, t(Msg::PluginInstallingByName { plugin: &plugin }).into_owned());
+                        tokio::task::spawn_blocking(move || {
+                            let ev = match atomcode_core::plugin::installer::install(&resolved_plugin, &mp) {
+                                Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                                Err(e) => {
+                                    if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
+                                        atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                            id: _aie.id.clone(),
+                                        }
+                                    } else {
+                                        atomcode_core::plugin::PluginJobEvent::Failed {
+                                            op: "install".into(),
+                                            msg: format!("{:#}", e),
+                                        }
+                                    }
+                                }
+                            };
+                            let _ = tx.send(ev);
+                        });
+                    }
+                    Ok(matches) if matches.len() > 1 => {
+                        // Multiple marketplaces contain this plugin — show a
+                        // disambiguation list with the install command to use.
+                        let mut msg = t(Msg::PluginInstallAmbiguous { plugin: &plugin }).into_owned();
+                        for m in &matches {
+                            msg.push_str(&format!("  /plugin install {}@{}\n", m.plugin, m.marketplace));
+                        }
+                        err(renderer, msg);
+                    }
+                    _ => {
+                        ok(renderer, t(Msg::PluginInstallNotFound { plugin: &plugin }).into_owned());
+                    }
+                }
+            }
             None => err(renderer, t(Msg::PluginInstallUsage).into_owned()),
         },
-        "uninstall" => match parse_plugin_at_marketplace(parts.next().unwrap_or("").trim()) {
-            Some((plugin, mp)) => match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
-                Ok(()) => {
-                    super::reload_plugins(ctx);
-                    ok(renderer, t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned());
+        "uninstall" => match parse_plugin_arg(parts.next().unwrap_or("").trim()) {
+            Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
+                match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
+                    Ok(()) => {
+                        super::reload_plugins(ctx);
+                        ok(renderer, t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned());
+                    }
+                    Err(e) => err(renderer, t(Msg::PluginUninstallFailed { error: &e.to_string() }).into_owned()),
                 }
-                Err(e) => err(renderer, t(Msg::PluginUninstallFailed { error: &e.to_string() }).into_owned()),
-            },
+            }
+            Some(PluginArg::Bare { plugin }) => {
+                // Look up which installed plugins match this name.
+                let installed = atomcode_core::plugin::installer::list_installed().unwrap_or_default();
+                let matches: Vec<_> = installed
+                    .into_iter()
+                    .filter(|p| p.plugin == plugin || p.plugin == atomcode_core::plugin::marketplace::sanitize_name(&plugin))
+                    .collect();
+                match matches.len() {
+                    0 => ok(renderer, t(Msg::PluginUninstallNotFound { plugin: &plugin }).into_owned()),
+                    1 => {
+                        let p = &matches[0];
+                        let (plug, mp) = (p.plugin.clone(), p.marketplace.clone());
+                        match atomcode_core::plugin::installer::uninstall(&plug, &mp) {
+                            Ok(()) => {
+                                super::reload_plugins(ctx);
+                                ok(renderer, t(Msg::PluginUninstalled { plugin: &plug, marketplace: &mp }).into_owned());
+                            }
+                            Err(e) => err(renderer, t(Msg::PluginUninstallFailed { error: &e.to_string() }).into_owned()),
+                        }
+                    }
+                    _ => {
+                        let mut msg = t(Msg::PluginUninstallAmbiguous { plugin: &plugin }).into_owned();
+                        for p in &matches {
+                            msg.push_str(&format!("  /plugin uninstall {}@{}\n", p.plugin, p.marketplace));
+                        }
+                        err(renderer, msg);
+                    }
+                }
+            }
             None => err(
                 renderer,
                 t(Msg::PluginUninstallUsage).into_owned(),
@@ -1894,12 +1964,32 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
     }
 }
 
-fn parse_plugin_at_marketplace(s: &str) -> Option<(String, String)> {
-    let (plugin, mp) = s.split_once('@')?;
-    if plugin.is_empty() || mp.is_empty() {
+/// Parsed argument for `/plugin install` / `/plugin uninstall`.
+/// Supports both `plugin@marketplace` (fully qualified) and bare
+/// `plugin` (resolved across all marketplaces).
+enum PluginArg {
+    /// Explicit `plugin@marketplace` — use as-is.
+    Qualified { plugin: String, marketplace: String },
+    /// Bare plugin name — needs marketplace resolution.
+    Bare { plugin: String },
+}
+
+fn parse_plugin_arg(s: &str) -> Option<PluginArg> {
+    let s = s.trim();
+    if s.is_empty() {
         return None;
     }
-    Some((plugin.to_string(), mp.to_string()))
+    if let Some((plugin, mp)) = s.split_once('@') {
+        if !plugin.is_empty() && !mp.is_empty() {
+            return Some(PluginArg::Qualified {
+                plugin: plugin.to_string(),
+                marketplace: mp.to_string(),
+            });
+        }
+    }
+    Some(PluginArg::Bare {
+        plugin: s.to_string(),
+    })
 }
 
 /// Handle `/worktree` subcommands: create, list, done, cleanup.

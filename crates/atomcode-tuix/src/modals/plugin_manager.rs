@@ -22,7 +22,7 @@ use atomcode_core::plugin::PluginJobEvent;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{build_status, Buffer, LoopCtx};
+use crate::event_loop::{build_status, reload_plugins, Buffer, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
@@ -47,6 +47,9 @@ pub struct PluginManager {
     /// Set while an async clone/install is in flight; shown as a status row
     /// and cleared by `on_plugin_event` when the job result arrives.
     pending: Option<String>,
+    /// The plugin name currently being installed (used to show ⏳ in the
+    /// list). Cleared together with `pending` in `on_plugin_event`.
+    installing_plugin: Option<String>,
 }
 
 /// Path-safe segment, mirroring `marketplace::sanitize_name` (which is crate
@@ -70,6 +73,7 @@ impl PluginManager {
             installed: Vec::new(),
             url_input: String::new(),
             pending: None,
+            installing_plugin: None,
         };
         m.reload();
         m
@@ -121,6 +125,7 @@ impl PluginManager {
 
     fn dispatch_install(&mut self, plugin: String, mp: String, ctx: &LoopCtx) {
         let tx = ctx.plugin_job_tx.clone();
+        self.installing_plugin = Some(plugin.clone());
         self.pending = Some(t(Msg::PluginMgrInstalling { plugin: &plugin }).into_owned());
         tokio::task::spawn_blocking(move || {
             let ev = match atomcode_core::plugin::installer::install(&plugin, &mp) {
@@ -173,7 +178,7 @@ impl PluginManager {
         }
     }
 
-    fn enter_plugins(&mut self, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    fn enter_plugins(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
         let Screen::Plugins { mp } = &self.screen else { return };
         let mp = mp.clone();
         let Some(plugin) = self.plugins_of(&mp).and_then(|p| p.get(self.selected)).cloned() else {
@@ -183,6 +188,7 @@ impl PluginManager {
             // Uninstall is fast — run inline and refresh.
             match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
                 Ok(()) => {
+                    reload_plugins(ctx);
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp })
                             .into_owned(),
@@ -199,11 +205,12 @@ impl PluginManager {
         }
     }
 
-    fn enter_remove(&mut self, renderer: &mut dyn Renderer) {
+    fn enter_remove(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
         let Some(m) = self.marketplaces.get(self.selected) else { return };
         let name = m.name.clone();
         match atomcode_core::plugin::marketplace::remove_marketplace(&name) {
             Ok(()) => {
+                reload_plugins(ctx);
                 renderer.render(UiLine::CommandOutput(
                     t(Msg::PluginMarketplaceRemoved { name: &name }).into_owned(),
                 ));
@@ -214,11 +221,12 @@ impl PluginManager {
         renderer.flush();
     }
 
-    fn enter_installed(&mut self, renderer: &mut dyn Renderer) {
+    fn enter_installed(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
         let Some(i) = self.installed.get(self.selected) else { return };
         let (plugin, mp) = (i.plugin.clone(), i.marketplace.clone());
         match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
             Ok(()) => {
+                reload_plugins(ctx);
                 renderer.render(UiLine::CommandOutput(
                     t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned(),
                 ));
@@ -261,13 +269,16 @@ impl PluginManager {
             }
             Screen::Plugins { mp } => {
                 let mark = t(Msg::PluginMgrInstalledMark).into_owned();
+                let installing_label = t(Msg::PluginMgrInstallingLabel).into_owned();
                 let rows: Vec<(String, String)> = self
                     .plugins_of(mp)
                     .map(|plugins| {
                         plugins
                             .iter()
                             .map(|p| {
-                                let desc = if self.is_installed(p, mp) {
+                                let desc = if self.installing_plugin.as_deref() == Some(p.as_str()) {
+                                    installing_label.clone()
+                                } else if self.is_installed(p, mp) {
                                     mark.clone()
                                 } else {
                                     String::new()
@@ -280,7 +291,13 @@ impl PluginManager {
                 if rows.is_empty() {
                     return (Vec::new(), t(Msg::PluginMgrEmptyPlugins).into_owned());
                 }
-                (rows, t(Msg::PluginMgrHintToggle).into_owned())
+                // Show installing hint when pending, otherwise normal toggle hint.
+                let hint = if self.pending.is_some() {
+                    t(Msg::PluginMgrHintPending).into_owned()
+                } else {
+                    t(Msg::PluginMgrHintToggle).into_owned()
+                };
+                (rows, hint)
             }
             Screen::RemoveMarketplace => {
                 if self.marketplaces.is_empty() {
@@ -362,14 +379,22 @@ impl Modal for PluginManager {
                 }
                 self.goto(Screen::Home);
             }
-            KeyCode::Enter => match &self.screen {
-                Screen::Home => self.enter_home(),
-                Screen::Browse => self.enter_browse(),
-                Screen::Plugins { .. } => self.enter_plugins(ctx, renderer),
-                Screen::RemoveMarketplace => self.enter_remove(renderer),
-                Screen::Installed => self.enter_installed(renderer),
-                Screen::AddUrl => {}
-            },
+            KeyCode::Enter => {
+                // Block Enter while an async install/clone is in flight
+                // to prevent duplicate triggers.
+                if self.pending.is_some() {
+                    // no-op: swallow the keystroke
+                } else {
+                    match &self.screen {
+                        Screen::Home => self.enter_home(),
+                        Screen::Browse => self.enter_browse(),
+                        Screen::Plugins { .. } => self.enter_plugins(ctx, renderer),
+                        Screen::RemoveMarketplace => self.enter_remove(ctx, renderer),
+                        Screen::Installed => self.enter_installed(ctx, renderer),
+                        Screen::AddUrl => {}
+                    }
+                }
+            }
             _ => {}
         }
         self.draw(buf, state, ctx, renderer);
@@ -432,6 +457,7 @@ impl Modal for PluginManager {
 
     fn on_plugin_event(&mut self, _ev: &PluginJobEvent) {
         self.pending = None;
+        self.installing_plugin = None;
         self.reload();
     }
 }
@@ -465,6 +491,7 @@ mod tests {
             installed: inst,
             url_input: String::new(),
             pending: None,
+            installing_plugin: None,
         }
     }
 

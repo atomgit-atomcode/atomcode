@@ -62,7 +62,16 @@ pub fn iter_installed_plugin_assets() -> Vec<InstalledPluginAssets> {
             if !abs.exists() {
                 return None;
             }
-            let manifest = load_plugin_manifest(&abs).unwrap_or_default();
+            let mut manifest = load_plugin_manifest(&abs).unwrap_or_default();
+            // Auto-detect: when no plugin.json was found (manifest is default)
+            // AND the plugin_dir itself contains a SKILL.md, the directory IS
+            // the skill (common with git-subdir installs from CC marketplaces
+            // like claude-plugins-official). Without this, skills_path()
+            // defaults to "skills" and the loader looks for <dir>/skills/ —
+            // which doesn't exist, so the installed skill is silently ignored.
+            if manifest.skills.is_none() && abs.join("SKILL.md").exists() {
+                manifest.skills = Some(super::manifest::PathOrList::One("./".into()));
+            }
             Some(InstalledPluginAssets {
                 plugin: e.plugin,
                 marketplace: e.marketplace,

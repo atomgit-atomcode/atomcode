@@ -166,13 +166,11 @@ pub struct PluginConfig {
     /// recreated. To force a re-bootstrap, delete the marker.
     #[serde(default = "default_true")]
     pub auto_install_default_skills: bool,
-    /// Self-update follow-up: when true (default), after
-    /// `apply_pending_upgrade` actually applies a new atomcode binary
-    /// (`ATOMCODE_UPGRADED_FROM` env var set on re-exec), the new
-    /// session runs `git pull --ff-only` on every installed marketplace
-    /// so skills stay in lockstep with the binary. Failures (no
-    /// network, fast-forward conflict from local edits) are warned
-    /// and ignored — never block startup.
+    /// Per-startup sync: when true (default), every startup runs
+    /// `git pull --ff-only` on all installed marketplaces so plugins
+    /// stay in sync with the remote. Failures (no network, fast-forward
+    /// conflict from local edits) are warned and ignored — never block
+    /// startup.
     #[serde(default = "default_true")]
     pub auto_update_marketplaces: bool,
 }

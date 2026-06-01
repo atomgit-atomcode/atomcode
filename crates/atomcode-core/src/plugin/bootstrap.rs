@@ -1,4 +1,4 @@
-//! First-startup install + post-upgrade refresh hooks for the plugin
+//! First-startup install + per-startup sync hooks for the plugin
 //! marketplace layer.
 //!
 //! Two distinct user journeys land here:
@@ -11,10 +11,11 @@
 //!    Failure (no network, no git on PATH, upstream down) is logged
 //!    and swallowed — startup proceeds without skills.
 //!
-//! 2. **Existing user, just upgraded** — `apply_pending_upgrade`
-//!    re-exec'd into the new binary and set `ATOMCODE_UPGRADED_FROM`.
-//!    We `git pull --ff-only` every installed marketplace so the
-//!    skills track the new binary. Same swallowed-failure semantics.
+//! 2. **Every startup** — we `git pull --ff-only` every installed
+//!    marketplace so the plugins stay in sync with the remote.
+//!    This runs on every launch (not just upgrades) so that new
+//!    plugins published to official marketplaces are discovered
+//!    promptly. Same swallowed-failure semantics.
 //!
 //! The marker file makes (1) a one-time event. If the user later runs
 //! `/plugin marketplace remove atomcode`, the marker stays and we
@@ -58,15 +59,8 @@ const DEFAULT_AUTO_INSTALL_URLS: &[&str] = &[
 /// introducing a future bootstrap step (e.g. a second default marketplace).
 const BOOTSTRAP_MARKER_FILENAME: &str = ".plugin_bootstrap_v2";
 
-/// Env var that the upgrade path (`self_update::apply_pending_upgrade`
-/// → `re_exec_self`) sets on the new binary so the new session knows
-/// it was launched as the result of a version upgrade. We read it
-/// non-destructively here — the TUIX event loop owns the eventual
-/// `remove_var` so the welcome-screen confirmation still fires.
-const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
-
 /// Entry point for both Plan A (auto-install default skills) and
-/// Plan B (auto-update marketplaces after upgrade). Call once at
+/// Plan B (sync marketplaces on every startup). Call once at
 /// startup AFTER `Config::load` and AFTER any pending self-upgrade has
 /// re-exec'd. Synchronous — runs `git` subprocesses inline; budget
 /// roughly 1-3 s on a warm path, longer on first install.
@@ -82,8 +76,7 @@ pub fn run_startup_hooks(config: &Config) -> Vec<PluginJobEvent> {
     if config.plugin.auto_install_default_skills {
         events.extend(maybe_install_default_skills());
     }
-    let upgraded = std::env::var(UPGRADED_FROM_ENV).is_ok();
-    if upgraded && config.plugin.auto_update_marketplaces {
+    if config.plugin.auto_update_marketplaces {
         events.extend(refresh_installed_marketplaces());
     }
     events
@@ -223,8 +216,9 @@ fn install_plugins_from_marketplace(
 }
 
 /// Plan B: best-effort `git pull --ff-only` on every installed
-/// marketplace. Only runs when called from a session that was launched
-/// by `apply_pending_upgrade` (caller gates on `ATOMCODE_UPGRADED_FROM`).
+/// marketplace. Runs on **every startup** (not just upgrades) so that
+/// new plugins published to official marketplaces are discovered
+/// promptly.
 ///
 /// Returns one `PluginJobEvent` per marketplace whose HEAD actually
 /// moved, plus one `Failed` event per pull error. No-op pulls (HEAD

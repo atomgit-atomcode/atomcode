@@ -376,6 +376,37 @@ fn validate_plugin_source(source: &str) -> Result<()> {
     Ok(())
 }
 
+/// Result of resolving a bare plugin name across all registered marketplaces.
+#[derive(Debug, Clone)]
+pub struct PluginMarketplaceMatch {
+    pub marketplace: String,
+    pub plugin: String,
+}
+
+/// Find all marketplaces that contain a plugin matching the given name.
+/// The name is compared against both the raw plugin name and its sanitized
+/// form (e.g. "my plugin" matches "my-plugin" in the marketplace's plugin
+/// list). Returns an empty Vec if the plugin is not found in any marketplace.
+pub fn resolve_plugin_marketplace(plugin_name: &str) -> Result<Vec<PluginMarketplaceMatch>> {
+    let mp_state = load_marketplaces_file(&paths::marketplaces_file().unwrap())?;
+    let sanitized = sanitize_name(plugin_name);
+    let mut matches: Vec<PluginMarketplaceMatch> = Vec::new();
+
+    for (mp_name, entry) in &mp_state.marketplaces {
+        for p in &entry.plugins {
+            if p == plugin_name || p == &sanitized {
+                matches.push(PluginMarketplaceMatch {
+                    marketplace: mp_name.clone(),
+                    plugin: p.clone(),
+                });
+                break; // one match per marketplace is enough
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
 pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
     let mp_state = load_marketplaces_file(&paths::marketplaces_file().unwrap())?;
     let entry = mp_state

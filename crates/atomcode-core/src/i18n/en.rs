@@ -655,9 +655,17 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMarketplaceUsage =>
             "usage: /plugin marketplace [add|remove|update|list] <args>".into(),
         Msg::PluginInstallUsage =>
-            "usage: /plugin install <plugin>@<marketplace>".into(),
+            "usage: /plugin install <plugin> or <plugin>@<marketplace>".into(),
+        Msg::PluginInstallNotFound { plugin } =>
+            format!("plugin `{plugin}` not found in any marketplace. Use /plugin marketplace list to see registered marketplaces.").into(),
+        Msg::PluginInstallAmbiguous { plugin } =>
+            format!("plugin `{plugin}` exists in multiple marketplaces, please specify one:").into(),
         Msg::PluginUninstallUsage =>
-            "usage: /plugin uninstall <plugin>@<marketplace>".into(),
+            "usage: /plugin uninstall <plugin> or <plugin>@<marketplace>".into(),
+        Msg::PluginUninstallNotFound { plugin } =>
+            format!("plugin `{plugin}` is not installed. Use /plugin list to see installed plugins.").into(),
+        Msg::PluginUninstallAmbiguous { plugin } =>
+            format!("plugin `{plugin}` is installed from multiple marketplaces, please specify:\n").into(),
         Msg::PluginNoMarketplaces =>
             "no marketplaces registered".into(),
         Msg::PluginMarketplacesHeader =>
@@ -678,6 +686,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list marketplaces: {error}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),
+        Msg::PluginInstallingByName { plugin } =>
+            format!("installing `{plugin}`…").into(),
         Msg::PluginAlreadyInstalled { id } =>
             format!("  plugin `{id}` is already installed.\n  PS: To reinstall, first run `/plugin uninstall {id}` then `/plugin install {id}`\n").into(),
         Msg::PluginMgrBrowse => "Browse & install".into(),
@@ -690,6 +700,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrHintRemove => "⏎ remove · esc back".into(),
         Msg::PluginMgrHintUninstall => "⏎ uninstall · esc back".into(),
         Msg::PluginMgrHintUrl => "type/paste git URL · ⏎ add · esc cancel".into(),
+Msg::PluginMgrHintPending => "Installing, please wait… · esc back".into(),
+Msg::PluginMgrInstallingLabel => "Installing…".into(),
         Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…”".into(),
         Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace.".into(),
         Msg::PluginMgrEmptyInstalled => "No plugins installed.".into(),
