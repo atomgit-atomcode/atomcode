@@ -53,6 +53,9 @@ export function App() {
   const urlSessionRef = useRef<string | null>(readSessionIdFromUrl());
   // 跳过首次 URL 同步：此时可能正等待把短 id 还原成完整会话，别先清掉参数。
   const firstUrlSync = useRef(true);
+  // 刷新时若 URL 带 session id，先进入「恢复中」态：在按短 id 还原出会话前，
+  // 抑制 Chat 的新建落地页，避免「先闪一下新建页再跳到历史」的体验。
+  const [restoring, setRestoring] = useState<boolean>(() => readSessionIdFromUrl() != null);
 
   // 关闭表头会话菜单：外部点击 / 滚动 / 缩放（fixed 菜单不跟随锚点，故一并关闭）。
   useEffect(() => {
@@ -134,6 +137,10 @@ export function App() {
       })
       .catch(() => {
         /* 找不到就维持现状（回到新建页） */
+      })
+      .finally(() => {
+        // 无论找没找到，恢复流程结束：解除抑制（找到→历史页，没找到→新建页）。
+        if (!cancelled) setRestoring(false);
       });
     return () => {
       cancelled = true;
@@ -312,6 +319,7 @@ export function App() {
             cwd={cwd}
             onPermission={setPending}
             activeSession={activeSession}
+            restoring={restoring}
           />
         </div>
       </div>
