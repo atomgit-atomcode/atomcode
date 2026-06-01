@@ -39,6 +39,18 @@ static LIVE: StdMutex<Option<Arc<atomcode_core::live::LiveSession>>> = StdMutex:
 /// 当前 LiveSession 的稳定 session_id（字符串），供 /live SSE 端点在 Snapshot 中暴露。
 static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
 
+/// 当前 LiveSession 选中的 provider（模型）。None=用 config.default_provider。
+/// webui 每次 /live/message 带上 provider 时更新；DaemonTurnExecutor::run_turn 每轮读取，
+/// 因此在 sync/live 模式下切换模型才能对下一轮生效（执行器是 Arc<dyn> 不可变，故用进程级覆盖）。
+static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
+
+/// 设置当前 LiveSession 选中的 provider（None 时不覆盖，保留既有选择）。
+fn set_live_provider(provider: Option<String>) {
+    if let Some(p) = provider {
+        *LIVE_PROVIDER.lock().unwrap() = Some(p);
+    }
+}
+
 /// 进程级共享 MCP 缓存（供 TUI 侧 ensure_live_session 使用，无需 AppState）。
 static LIVE_MCP_CACHE: OnceLock<Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>>> = OnceLock::new();
 
@@ -325,9 +337,12 @@ impl TurnExecutor for DaemonTurnExecutor {
         approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
         cancel: CancellationToken,
     ) {
+        // 优先用 webui 选中的 provider（LIVE_PROVIDER），回退到执行器默认（self.provider_name）。
+        let live_provider = LIVE_PROVIDER.lock().unwrap().clone();
+        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
         let parts = match build_turn_parts(
             &self.working_dir,
-            self.provider_name.as_deref(),
+            provider_name,
             &self.mcp_cache,
             self.telemetry.clone(),
         )
@@ -542,15 +557,69 @@ pub(crate) struct LiveMessageReq {
     pub message: String,
     #[serde(default)]
     pub images: Vec<crate::ImageInput>,
+    /// webui 选中的模型（provider 名）。Some 时更新 LIVE_PROVIDER，下一轮生效。
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+/// 对 live 输入做视觉预处理：主模型不支持视觉时，用 VL 模型把图片转文字拼进 caption
+/// （原图始终保留在 MultiPart 里用于缩略图渲染）。与 `/chat` 路径（lib.rs:process_chat_request）
+/// 行为一致——同步会话引入独立 live 路径后曾漏掉这一步，导致非视觉主模型（如
+/// deepseek-v4-flash）在 sync/live 下看不到图片。任何 config/provider 加载失败都降级为原文，
+/// 不阻断发送。
+async fn preprocess_live_caption(message: &str, images: &[ImagePart]) -> String {
+    use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+    if images.is_empty() {
+        return message.to_string();
+    }
+    // 解析本轮主 provider（与 build_turn_parts 一致：LIVE_PROVIDER 优先，回退默认），
+    // 仅用其模型名判定是否原生支持视觉；VL provider 由 maybe_preprocess 内部构造。
+    let config = match Config::load(&Config::default_path()) {
+        Ok(c) => c,
+        Err(_) => return message.to_string(),
+    };
+    let name = LIVE_PROVIDER
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| config.default_provider.clone());
+    let active = match config.providers.get(&name).map(provider::create_provider) {
+        Some(Ok(p)) => p,
+        _ => return message.to_string(),
+    };
+    match maybe_preprocess(&config, &*active, message, images).await {
+        PreprocessOutcome::Skipped => message.to_string(),
+        PreprocessOutcome::Replaced { text, vl_key } => {
+            if message.trim().is_empty() {
+                format!("[图片内容（由 {vl_key} 识别）]\n{text}")
+            } else {
+                format!("{message}\n\n[图片内容（由 {vl_key} 识别）]\n{text}")
+            }
+        }
+        PreprocessOutcome::Failed { .. } => {
+            if message.trim().is_empty() {
+                "[图片识别失败]".to_string()
+            } else {
+                format!("{message}\n\n[图片识别失败]")
+            }
+        }
+    }
 }
 
 pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<LiveMessageReq>) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
+    // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
+    // （必须先于 preprocess_live_caption，让视觉判定读到本轮真正生效的主 provider。）
+    set_live_provider(req.provider);
     let session = ensure_live_session(working_dir, state.telemetry.clone());
-    let ok = session.send_input(UserInput {
-        text: req.message,
-        images: req.images.into_iter().map(|i| ImagePart { media_type: i.media_type, data: i.data }).collect(),
-    });
+    let images: Vec<ImagePart> = req
+        .images
+        .into_iter()
+        .map(|i| ImagePart { media_type: i.media_type, data: i.data })
+        .collect();
+    // 非视觉主模型 + 有图：先经 VL 预处理把图转文字，再投递（原图随 UserInput 保留）。
+    let text = preprocess_live_caption(&req.message, &images).await;
+    let ok = session.send_input(UserInput { text, images });
     Json(serde_json::json!({ "accepted": ok }))
 }
 
@@ -589,3 +658,36 @@ pub(crate) async fn live_permission(
     Json(serde_json::json!({ "accepted": ok }))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 回归：webui sync/live 模式切换模型——/live/message 必须解析 provider 字段，
+    // 且 set_live_provider 把选择写入 LIVE_PROVIDER（None 不覆盖既有选择）。
+    #[test]
+    fn live_message_parses_provider_and_updates_override() {
+        // 带 provider 的请求体被解析。
+        let req: LiveMessageReq =
+            serde_json::from_str(r#"{"message":"hi","provider":"openai"}"#).unwrap();
+        assert_eq!(req.provider.as_deref(), Some("openai"));
+
+        // set_live_provider(Some) 写入覆盖。
+        set_live_provider(req.provider);
+        assert_eq!(LIVE_PROVIDER.lock().unwrap().as_deref(), Some("openai"));
+
+        // 不带 provider 的请求体默认 None，且 set_live_provider(None) 不覆盖既有选择。
+        let req2: LiveMessageReq = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
+        assert_eq!(req2.provider, None);
+        set_live_provider(req2.provider);
+        assert_eq!(LIVE_PROVIDER.lock().unwrap().as_deref(), Some("openai"));
+    }
+
+    // 回归：无图时视觉预处理是直通的——caption 原样返回，不触碰 config/网络。
+    // （有图的 VL 路径依赖真实 config/provider，覆盖在 vision_preprocessor 的单测里。）
+    #[tokio::test]
+    async fn preprocess_live_caption_is_passthrough_without_images() {
+        let out = preprocess_live_caption("看下这个图片", &[]).await;
+        assert_eq!(out, "看下这个图片");
+    }
+}
