@@ -330,6 +330,19 @@ pub(crate) struct DaemonTurnExecutor {
 
 #[async_trait]
 impl TurnExecutor for DaemonTurnExecutor {
+    /// 非视觉主模型 + 带图时经 VL 把图转文字（原图保留用于缩略图）。在 coordinator
+    /// 追加用户消息前调用，TUI / webui 共享。provider 解析与 `run_turn` 同源
+    /// （LIVE_PROVIDER 优先，回退执行器默认）。
+    async fn preprocess_input(&self, input: UserInput) -> UserInput {
+        if input.images.is_empty() {
+            return input;
+        }
+        let live_provider = LIVE_PROVIDER.lock().unwrap().clone();
+        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
+        let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
+        UserInput { text, images: input.images }
+    }
+
     async fn run_turn(
         &self,
         conv: &Arc<Mutex<Conversation>>,
@@ -564,24 +577,25 @@ pub(crate) struct LiveMessageReq {
 
 /// 对 live 输入做视觉预处理：主模型不支持视觉时，用 VL 模型把图片转文字拼进 caption
 /// （原图始终保留在 MultiPart 里用于缩略图渲染）。与 `/chat` 路径（lib.rs:process_chat_request）
-/// 行为一致——同步会话引入独立 live 路径后曾漏掉这一步，导致非视觉主模型（如
-/// deepseek-v4-flash）在 sync/live 下看不到图片。任何 config/provider 加载失败都降级为原文，
-/// 不阻断发送。
-async fn preprocess_live_caption(message: &str, images: &[ImagePart]) -> String {
+/// 行为一致——同步会话把 live 路径从 `Agent::run` 切到 coordinator 后曾漏掉这一步，导致
+/// 非视觉主模型（如 deepseek-v4-flash）在 sync/live 下看不到图片。任何 config/provider
+/// 加载失败都降级为原文，不阻断发送。`provider_name` 为本轮已解析的主 provider（与
+/// `DaemonTurnExecutor::run_turn` 同源），仅用其模型名判定是否原生支持视觉。
+async fn preprocess_live_caption(
+    message: &str,
+    images: &[ImagePart],
+    provider_name: Option<&str>,
+) -> String {
     use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
     if images.is_empty() {
         return message.to_string();
     }
-    // 解析本轮主 provider（与 build_turn_parts 一致：LIVE_PROVIDER 优先，回退默认），
-    // 仅用其模型名判定是否原生支持视觉；VL provider 由 maybe_preprocess 内部构造。
     let config = match Config::load(&Config::default_path()) {
         Ok(c) => c,
         Err(_) => return message.to_string(),
     };
-    let name = LIVE_PROVIDER
-        .lock()
-        .unwrap()
-        .clone()
+    let name = provider_name
+        .map(str::to_string)
         .unwrap_or_else(|| config.default_provider.clone());
     let active = match config.providers.get(&name).map(provider::create_provider) {
         Some(Ok(p)) => p,
@@ -609,17 +623,14 @@ async fn preprocess_live_caption(message: &str, images: &[ImagePart]) -> String 
 pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<LiveMessageReq>) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
     // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
-    // （必须先于 preprocess_live_caption，让视觉判定读到本轮真正生效的主 provider。）
     set_live_provider(req.provider);
     let session = ensure_live_session(working_dir, state.telemetry.clone());
-    let images: Vec<ImagePart> = req
-        .images
-        .into_iter()
-        .map(|i| ImagePart { media_type: i.media_type, data: i.data })
-        .collect();
-    // 非视觉主模型 + 有图：先经 VL 预处理把图转文字，再投递（原图随 UserInput 保留）。
-    let text = preprocess_live_caption(&req.message, &images).await;
-    let ok = session.send_input(UserInput { text, images });
+    // 视觉预处理在 coordinator 经 executor.preprocess_input 统一做（TUI / webui 共享），
+    // 此处只负责投递原始输入。
+    let ok = session.send_input(UserInput {
+        text: req.message,
+        images: req.images.into_iter().map(|i| ImagePart { media_type: i.media_type, data: i.data }).collect(),
+    });
     Json(serde_json::json!({ "accepted": ok }))
 }
 
@@ -687,7 +698,7 @@ mod tests {
     // （有图的 VL 路径依赖真实 config/provider，覆盖在 vision_preprocessor 的单测里。）
     #[tokio::test]
     async fn preprocess_live_caption_is_passthrough_without_images() {
-        let out = preprocess_live_caption("看下这个图片", &[]).await;
+        let out = preprocess_live_caption("看下这个图片", &[], None).await;
         assert_eq!(out, "看下这个图片");
     }
 }

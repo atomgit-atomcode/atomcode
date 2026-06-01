@@ -57,6 +57,14 @@ pub trait TurnExecutor: Send + Sync {
         approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
         cancel: CancellationToken,
     );
+
+    /// 投递前对用户输入做预处理。默认直通；需要视觉降级的执行器覆盖——主模型不支持
+    /// 视觉且带图时，用 VL 模型把图片转成文字拼进 `text`（原图保留）。在 coordinator
+    /// 追加用户消息前调用，故 TUI / webui 等所有入口共享同一套预处理（修复同步重构把
+    /// live 路径从 `Agent::run` 切到本协调器后漏掉 VL 预处理的回归）。
+    async fn preprocess_input(&self, input: UserInput) -> UserInput {
+        input
+    }
 }
 
 /// 进程内活动会话总线。克隆廉价（内部全是 `Arc`）。
@@ -176,6 +184,11 @@ async fn coordinator(
             *st = TurnState::Running;
         }
         let _ = events.send(LiveEvent::StateChanged(TurnState::Running));
+
+        // 投递前预处理：非视觉主模型 + 带图时由执行器把图转文字（VL）。所有入口
+        // （TUI / webui）共享此步——预处理可能较慢（VL 调用），期间 state=Running，
+        // 新输入按既有守卫被忽略，符合单写者语义。
+        let input = executor.preprocess_input(input).await;
 
         // 追加用户消息（持 conv 锁），并广播 UserMessage、刷新已提交快照。
         {
