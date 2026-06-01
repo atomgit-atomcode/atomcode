@@ -286,6 +286,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
         const loaded = sessionMessagesToDisplay(e.messages);
         setMessages(loaded.length > 0 ? loaded : []);
         setHistoryHint(null);
+        // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
+        // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
+        // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
+        if (e.session_id) {
+          activeIdRef.current = e.session_id;
+          loadedForRef.current = e.session_id;
+          onSessionId(e.session_id);
+        }
         break;
       }
       case 'user': {

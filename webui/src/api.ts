@@ -405,7 +405,7 @@ export async function getSession(
 // --- Live session (multi-tab real-time sync) ---
 
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[] }
+  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string }
   | { type: 'user'; text: string; images?: ImageData[] }
   | { type: 'text'; content: string }
   | { type: 'reasoning'; content: string }
