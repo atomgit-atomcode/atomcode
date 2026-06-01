@@ -75,11 +75,48 @@ where
     deserializer.deserialize_any(LenientU64)
 }
 
+/// Deserialize a bool that may arrive as a JSON string/number (weak models send
+/// `"true"`, `1`, etc. instead of a JSON boolean).
+fn deserialize_lenient_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct LenientBool;
+
+    impl<'de> de::Visitor<'de> for LenientBool {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a boolean")
+        }
+        fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<bool, E> {
+            Ok(matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        }
+    }
+
+    deserializer.deserialize_any(LenientBool)
+}
+
 #[derive(Deserialize)]
 struct BashArgs {
     command: String,
     #[serde(default, deserialize_with = "deserialize_lenient_u64")]
     timeout: Option<u64>,
+    /// When true, the command is launched detached (its own session via
+    /// setsid(2)) with output redirected to a log file; the tool returns
+    /// immediately instead of waiting, and the process survives this call.
+    #[serde(default, deserialize_with = "deserialize_lenient_bool")]
+    run_in_background: bool,
 }
 
 /// Build the `bash` tool description for the current platform.
@@ -95,7 +132,9 @@ struct BashArgs {
 fn shell_tool_description(is_windows: bool) -> String {
     let base = "Execute a shell command. Use for: build, test, git, install deps.\n\
         Do NOT use for: reading files (use read_file), searching (use grep), editing (use edit_file).\n\
-        Do NOT start servers or long-running processes — the user manages those.\n\
+        For a long-running process (dev server, watcher, tunnel), set run_in_background=true \
+        instead of backgrounding with `&`/nohup yourself: it detaches into its own session, \
+        returns immediately, and writes output to a log file you can read later with cat/read_file.\n\
         Default timeout: 60s. Destructive commands require user confirmation.";
     if is_windows {
         format!(
@@ -120,7 +159,8 @@ impl Tool for BashTool {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "The shell command to execute" },
-                    "timeout": { "type": "integer", "description": "Max wait seconds (default 60, max 300)" }
+                    "timeout": { "type": "integer", "description": "Max wait seconds (default 60, max 300)" },
+                    "run_in_background": { "type": "boolean", "description": "Launch detached (own session) for long-running processes; returns immediately with a pid + log-file path. Default false." }
                 },
                 "required": ["command"]
             }),
@@ -566,6 +606,118 @@ const SIGTERM: i32 = 15;
 #[cfg(not(target_os = "windows"))]
 const SIGKILL: i32 = 9;
 
+/// Generate a unique log path under `~/.atomcode/background/` (falling back to
+/// the system temp dir when no home is set) and ensure the directory exists.
+fn background_log_path() -> Result<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".atomcode")
+                .join("background")
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("atomcode-background"));
+    std::fs::create_dir_all(&dir)?;
+
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(dir.join(format!("bg-{millis}-{n}.log")))
+}
+
+/// Background launch path for `run_in_background`. Detaches the command into its
+/// own session via the `setsid(2)` syscall (the syscall — NOT the `setsid`
+/// binary, which is missing on some systems incl. OpenHarmony PC), redirects
+/// output to a log file, and returns immediately. The child is deliberately NOT
+/// wrapped in `PgroupChild` and uses `kill_on_drop(false)`, so it survives this
+/// tool call — and, being session-detached (no controlling tty), it gets no
+/// SIGHUP and is reparented to init if atomcode exits.
+async fn bash_execute_background(
+    command: &str,
+    wd: &std::path::Path,
+    start_instant: Instant,
+) -> Result<ToolResult> {
+    let log_path = background_log_path()?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)?;
+    let err_file = log_file.try_clone()?;
+
+    #[cfg(target_os = "windows")]
+    let mut child = {
+        // DETACHED_PROCESS (0x8) + CREATE_NEW_PROCESS_GROUP (0x200): no console,
+        // own process group, outlives the parent — the Windows analogue of setsid.
+        let mut cmd = Command::new("cmd.exe");
+        cmd.arg("/C");
+        cmd.as_std_mut().raw_arg(command);
+        cmd.as_std_mut().creation_flags(0x0000_0008 | 0x0000_0200);
+        cmd.current_dir(wd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(err_file))
+            .kill_on_drop(false);
+        cmd.spawn()?
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut child = {
+        #[cfg(not(target_env = "ohos"))]
+        let mut cmd = Command::new("bash");
+        #[cfg(target_env = "ohos")]
+        let mut cmd = Command::new("sh"); // bash is absent on ohos; use sh (mksh)
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(wd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(err_file))
+            // Must NOT kill on drop — the process is meant to outlive this call.
+            .kill_on_drop(false);
+        unsafe {
+            cmd.pre_exec(|| {
+                extern "C" {
+                    fn setsid() -> i32;
+                }
+                // New session + process group: escapes the foreground path's
+                // killpg cleanup and detaches from the controlling tty.
+                setsid();
+                Ok(())
+            });
+        }
+        cmd.spawn()?
+    };
+
+    let pid = child.id().map(|p| p as i32).unwrap_or(-1);
+
+    // Reap on exit so a finished background job doesn't linger as a zombie while
+    // atomcode runs. wait() only collects the exit status — it never kills — so
+    // this does not weaken the "survives" guarantee.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+
+    let elapsed = start_instant.elapsed().as_secs_f64();
+    let output = format!(
+        "[background] started — pid={pid}, log={log}\n\
+         [elapsed: {elapsed:.1}s] 读取输出: cat {log}（或用 read_file）；停止: kill {pid}",
+        pid = pid,
+        log = log_path.display(),
+        elapsed = elapsed,
+    );
+    Ok(ToolResult {
+        call_id: String::new(),
+        output,
+        success: true,
+    })
+}
+
 async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
     let parsed: BashArgs = serde_json::from_str(args)?;
     // Command runs verbatim — no stripping of trailing tail/head/etc.
@@ -579,6 +731,14 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
     let start_instant = Instant::now();
 
     let wd = ctx.working_dir.read().await.clone();
+
+    // Background mode: detach into a new session, redirect output to a log
+    // file, and return immediately. Deliberately bypasses the foreground
+    // wait/idle/timeout machinery AND the PgroupChild killpg cleanup below, so
+    // the process outlives this call (the whole point — dev servers, watchers).
+    if parsed.run_in_background {
+        return bash_execute_background(&parsed.command, &wd, start_instant).await;
+    }
 
     // Platform-aware shell: cmd.exe on Windows, bash on Unix
     #[cfg(target_os = "windows")]
@@ -3009,6 +3169,79 @@ mod exec_tests {
             "output must NOT leak the hardcoded 90s message, got: {}",
             result.output
         );
+    }
+
+    /// Background mode (`run_in_background: true`) must (1) return almost
+    /// immediately instead of blocking for the command's lifetime, (2) report
+    /// a pid + log path, (3) leave the process ALIVE after the tool returns —
+    /// proving it escaped the foreground path's killpg / kill_on_drop — and
+    /// (4) capture the command's stdout into the log file.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_run_in_background_returns_fast_and_survives() {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        fn alive(pid: i32) -> bool {
+            unsafe { kill(pid, 0) == 0 }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        // ~3s lifetime; a foreground run would block the tool for the full 3s.
+        let cmd = "for i in 1 2 3; do echo tick-$i; sleep 1; done";
+        let args = serde_json::json!({ "command": cmd, "run_in_background": true }).to_string();
+
+        let start = std::time::Instant::now();
+        let result = bash_execute(&args, &ctx).await.expect("bash_execute");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "background mode must return fast, took {:?}",
+            elapsed
+        );
+        assert!(
+            result.success,
+            "background launch should report success, got: {}",
+            result.output
+        );
+
+        // Parse pid + log path from the advertised output.
+        let pid: i32 = result
+            .output
+            .split("pid=")
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("output must advertise pid=, got: {}", result.output));
+        let log_path = result
+            .output
+            .lines()
+            .find_map(|l| l.split("log=").nth(1))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| panic!("output must advertise log=, got: {}", result.output));
+
+        assert!(
+            alive(pid),
+            "background process {} must still be alive right after the tool returns",
+            pid
+        );
+
+        // Output should land in the log within a moment.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("tick-1"),
+            "background log must capture stdout, got: {:?}",
+            log
+        );
+
+        // Cleanup: stop the background process and remove its log.
+        unsafe {
+            kill(pid, 9);
+        }
+        let _ = std::fs::remove_file(&log_path);
     }
 
     /// Silent fast-exit (`true`) — no stdout, quick success. Same bug
