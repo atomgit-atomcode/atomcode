@@ -836,7 +836,7 @@ pub struct LoopCtx {
     /// the existing "no provider configured" status hint.
     pub is_plain_renderer: bool,
     /// When true, the --dangerously-skip-permissions flag was passed.
-    /// Shown as a yellow "⚠ BYPASS" badge in the status line so the
+    /// Shown as a red "⚠ BYPASS" badge in the status line so the
     /// user is always aware that all tool calls are auto-approved.
     pub dangerously_skip_permissions: bool,
     /// When `/guide <topic>` triggers auto-install of the "ask" skill,

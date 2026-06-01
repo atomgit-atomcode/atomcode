@@ -977,7 +977,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         // Bypass indicator — right-aligned warning badge when
         // --dangerously-skip-permissions / -y is active. Rendered in
-        // yellow (Role::Warning) after the hint on the right side so
+        // red (Role::Error) after the hint on the right side so
         // it does not displace the PLAN mode indicator on the left.
         let bypass_badge: Option<String> = status
             .bypass_indicator
@@ -1053,13 +1053,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
 
         // Helper: emit the bypass badge at the right edge of the row.
-        // Rendered in yellow (Role::Warning) to draw the eye — the user
+        // Rendered in red (Role::Error) to draw the eye — the user
         // must always see when tool calls are auto-approved.
-        let warning_style = self.style_for(Role::Warning);
+        let bypass_style = self.style_for(Role::Error);
         let push_bypass = |row: &mut Vec<Cell>| {
             if let Some(badge) = &bypass_badge {
                 push_str_cells(row, " ", &pad);
-                push_str_cells(row, badge, &warning_style);
+                push_str_cells(row, badge, &bypass_style);
             }
         };
 
