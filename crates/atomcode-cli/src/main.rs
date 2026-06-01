@@ -497,10 +497,10 @@ struct Cli {
 
     /// Skip all permission prompts — auto-approve every tool call (bash,
     /// file edits, MCP, etc.). Equivalent to Claude Code's
-    /// --dangerously-skip-permissions. The TUI shows a yellow ⚠ SKIP
+    /// --dangerously-skip-permissions. The TUI shows a yellow ⚠ BYPASS
     /// badge while active. Use in CI/CD, eval harnesses, or when you
     /// trust the agent's built-in safety constraints.
-    #[arg(long = "dangerously-skip-permissions", visible_aliases = ["skip"], default_value_t = false)]
+    #[arg(long = "dangerously-skip-permissions", visible_aliases = ["y"], default_value_t = false)]
     pub dangerously_skip_permissions: bool,
 }
 

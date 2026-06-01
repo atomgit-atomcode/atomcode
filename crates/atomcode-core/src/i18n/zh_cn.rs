@@ -866,7 +866,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::BypassWarningHeadless =>
             "[headless] --dangerously-skip-permissions：所有工具调用将自动批准".into(),
         Msg::BypassBadge =>
-            "\u{26a0} SKIP".into(),
+            "\u{26a0} BYPASS".into(),
 
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
         Msg::HintMultiLineInput =>

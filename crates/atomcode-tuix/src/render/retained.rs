@@ -4135,7 +4135,7 @@ mod tests {
             ctx_window: 0,
             hint: None,
             mode_indicator: Some("PLAN".into()),
-            bypass_indicator: Some("\u{26a0} SKIP".into()),
+            bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
         };
         let row = r.build_status_row(&status, 60);
@@ -4147,25 +4147,25 @@ mod tests {
             "PLAN badge must still appear first on the left; got: {:?}",
             visible
         );
-        // SKIP badge appears somewhere in the row (right side).
+        // BYPASS badge appears somewhere in the row (right side).
         assert!(
-            visible.contains("SKIP"),
-            "SKIP badge must appear in the row; got: {:?}",
+            visible.contains("BYPASS"),
+            "BYPASS badge must appear in the row; got: {:?}",
             visible
         );
-        // PLAN comes before SKIP in the rendered row.
+        // PLAN comes before BYPASS in the rendered row.
         let plan_pos = visible.find("PLAN").expect("PLAN must be present");
-        let skip_pos = visible.find("SKIP").expect("SKIP must be present");
+        let bypass_pos = visible.find("BYPASS").expect("BYPASS must be present");
         assert!(
-            plan_pos < skip_pos,
-            "PLAN ({}) must precede SKIP ({}); got: {:?}",
+            plan_pos < bypass_pos,
+            "PLAN ({}) must precede BYPASS ({}); got: {:?}",
             plan_pos,
-            skip_pos,
+            bypass_pos,
             visible
         );
     }
 
-    /// Bypass indicator without a mode indicator (Build + SKIP) — the
+    /// Bypass indicator without a mode indicator (Build + BYPASS) — the
     /// badge still appears on the right, and no PLAN badge leaks.
     #[test]
     fn build_status_row_bypass_without_mode_indicator() {
@@ -4179,14 +4179,14 @@ mod tests {
             ctx_window: 0,
             hint: None,
             mode_indicator: None,
-            bypass_indicator: Some("\u{26a0} SKIP".into()),
+            bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
         assert!(
-            visible.contains("SKIP"),
-            "SKIP badge must appear; got: {:?}",
+            visible.contains("BYPASS"),
+            "BYPASS badge must appear; got: {:?}",
             visible
         );
         assert!(

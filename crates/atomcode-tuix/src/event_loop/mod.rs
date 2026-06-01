@@ -836,7 +836,7 @@ pub struct LoopCtx {
     /// the existing "no provider configured" status hint.
     pub is_plain_renderer: bool,
     /// When true, the --dangerously-skip-permissions flag was passed.
-    /// Shown as a yellow "⚠ SKIP" badge in the status line so the
+    /// Shown as a yellow "⚠ BYPASS" badge in the status line so the
     /// user is always aware that all tool calls are auto-approved.
     pub dangerously_skip_permissions: bool,
     /// When `/guide <topic>` triggers auto-install of the "ask" skill,
@@ -2684,7 +2684,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         ));
     }
     // Warn the user when --dangerously-skip-permissions / -y is active.
-    // The status bar shows a ⚠ SKIP badge, but a scrollback banner
+    // The status bar shows a ⚠ BYPASS badge, but a scrollback banner
     // is harder to miss and persists even if the user clears the status row.
     if ctx.dangerously_skip_permissions {
         renderer.render(UiLine::CommandOutput(

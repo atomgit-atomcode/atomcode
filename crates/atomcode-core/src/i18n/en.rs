@@ -882,7 +882,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::BypassWarningHeadless =>
             "[headless] --dangerously-skip-permissions: all tool calls are auto-approved".into(),
         Msg::BypassBadge =>
-            "\u{26a0} SKIP".into(),
+            "\u{26a0} BYPASS".into(),
 
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
         Msg::HintMultiLineInput =>
