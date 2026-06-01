@@ -185,12 +185,8 @@ async fn coordinator(
         }
         let _ = events.send(LiveEvent::StateChanged(TurnState::Running));
 
-        // 投递前预处理：非视觉主模型 + 带图时由执行器把图转文字（VL）。所有入口
-        // （TUI / webui）共享此步——预处理可能较慢（VL 调用），期间 state=Running，
-        // 新输入按既有守卫被忽略，符合单写者语义。
-        let input = executor.preprocess_input(input).await;
-
-        // 追加用户消息（持 conv 锁），并广播 UserMessage、刷新已提交快照。
+        // 先即时回显用户消息（原始文本 + 原图），让发送方立刻看到自己的输入，不被随后
+        // 可能较慢的 VL 预处理阻塞——否则带图发送会「发出后很久没反应」。
         {
             let mut conv = conversation.lock().await;
             if input.images.is_empty() {
@@ -214,9 +210,29 @@ async fn coordinator(
             *snapshot.lock().await = conv.messages.clone();
         }
         let _ = events.send(LiveEvent::UserMessage {
-            text: input.text,
-            images: input.images,
+            text: input.text.clone(),
+            images: input.images.clone(),
         });
+
+        // 回显之后再做（可能较慢的）VL 预处理：非视觉主模型 + 带图时由执行器把图转文字。
+        // 只改写刚追加的这条用户消息的文本（原图保留用于缩略图），显示侧已回显原文、不再
+        // 重播。所有入口（TUI / webui）共享此步；期间 state=Running，新输入按守卫被忽略。
+        if !input.images.is_empty() {
+            let processed = executor.preprocess_input(input.clone()).await;
+            if processed.text != input.text {
+                let mut conv = conversation.lock().await;
+                if let Some(last) = conv.messages.last_mut() {
+                    if let MessageContent::MultiPart { text, .. } = &mut last.content {
+                        *text = if processed.text.is_empty() {
+                            None
+                        } else {
+                            Some(processed.text)
+                        };
+                    }
+                }
+                *snapshot.lock().await = conv.messages.clone();
+            }
+        }
 
         // 跑一次 turn（执行器内部持 conv 锁修改并广播 Turn 事件）。
         executor
