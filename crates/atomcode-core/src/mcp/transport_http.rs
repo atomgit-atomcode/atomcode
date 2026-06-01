@@ -220,18 +220,12 @@ impl HttpClient {
 
         let mut req = self.client.post(&self.url).json(&request);
 
-        let user_has_accept = self
-            .headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("accept"));
+        let user_has_accept = self.headers.keys().any(|k| k.eq_ignore_ascii_case("accept"));
         if !user_has_accept {
             req = req.header("Accept", MCP_HTTP_ACCEPT);
         }
 
-        let user_has_authorization = self
-            .headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("authorization"));
+        let user_has_authorization = self.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
         for (key, value) in &self.headers {
             req = req.header(key, value);
         }

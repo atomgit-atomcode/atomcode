@@ -74,11 +74,7 @@ fn current_start_time_nanos() -> u128 {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let pid = Pid::from_u32(current_pid());
     let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        false,
-        ProcessRefreshKind::new(),
-    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), false, ProcessRefreshKind::new());
     sys.process(pid)
         .map(|p| (p.start_time() as u128) * 1_000_000_000)
         .unwrap_or(0)
@@ -96,11 +92,7 @@ fn process_alive_at(pid: u32, start_time_nanos: u128) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let target = Pid::from_u32(pid);
     let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[target]),
-        false,
-        ProcessRefreshKind::new(),
-    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[target]), false, ProcessRefreshKind::new());
     match sys.process(target) {
         Some(p) => (p.start_time() as u128) * 1_000_000_000 == start_time_nanos,
         None => false,
@@ -202,11 +194,7 @@ impl SetupLock {
         f.write_all(json.as_bytes())?;
         f.sync_all()?;
 
-        Ok(Self {
-            fd,
-            lock_path,
-            sentinel_path,
-        })
+        Ok(Self { fd, lock_path, sentinel_path })
     }
 }
 
@@ -262,11 +250,7 @@ mod tests {
         let err = SetupLock::acquire(dir.path(), true).unwrap_err();
         match err {
             LockError::Held { pid, .. } => {
-                assert_eq!(
-                    pid,
-                    std::process::id(),
-                    "Held should surface real holder pid, not 0"
-                );
+                assert_eq!(pid, std::process::id(), "Held should surface real holder pid, not 0");
             }
             other => panic!("expected Held, got {other:?}"),
         }

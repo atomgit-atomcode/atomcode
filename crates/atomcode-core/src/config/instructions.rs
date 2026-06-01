@@ -65,10 +65,8 @@ impl LayeredInstructions {
             .iter()
             .find_map(|name| Self::try_load(&project_root.join(name), InstructionLevel::Project));
 
-        let user = Self::try_load(
-            &project_root.join(".atomcode.user.md"),
-            InstructionLevel::User,
-        );
+        let user =
+            Self::try_load(&project_root.join(".atomcode.user.md"), InstructionLevel::User);
 
         Self {
             global,
@@ -237,9 +235,14 @@ mod tests {
         fs::write(tmp.path().join("ATOMCODE.md"), "uppercase loses").unwrap();
 
         // Simulate the load logic: .atomcode.md is checked first.
-        let project = [".atomcode.md", "ATOMCODE.md"].iter().find_map(|name| {
-            LayeredInstructions::try_load(&tmp.path().join(name), InstructionLevel::Project)
-        });
+        let project = [".atomcode.md", "ATOMCODE.md"]
+            .iter()
+            .find_map(|name| {
+                LayeredInstructions::try_load(
+                    &tmp.path().join(name),
+                    InstructionLevel::Project,
+                )
+            });
         assert!(project.is_some());
         assert!(project.unwrap().content.contains("lowercase wins"));
     }
@@ -293,8 +296,14 @@ mod tests {
         let global_pos = merged.find("GLOBAL_CONTENT").unwrap();
         let project_pos = merged.find("PROJECT_CONTENT").unwrap();
         let user_pos = merged.find("USER_CONTENT").unwrap();
-        assert!(global_pos < project_pos, "global must come before project");
-        assert!(project_pos < user_pos, "project must come before user");
+        assert!(
+            global_pos < project_pos,
+            "global must come before project"
+        );
+        assert!(
+            project_pos < user_pos,
+            "project must come before user"
+        );
     }
 
     #[test]
@@ -328,8 +337,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let big = "x".repeat(MAX_INSTRUCTION_SIZE + 100);
         fs::write(tmp.path().join("big.md"), &big).unwrap();
-        let loaded =
-            LayeredInstructions::try_load(&tmp.path().join("big.md"), InstructionLevel::Global);
+        let loaded = LayeredInstructions::try_load(
+            &tmp.path().join("big.md"),
+            InstructionLevel::Global,
+        );
         assert!(loaded.is_some());
         let f = loaded.unwrap();
         assert!(f.content.ends_with("[Truncated — file exceeds 1MB]"));

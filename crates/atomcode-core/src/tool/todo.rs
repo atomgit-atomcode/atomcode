@@ -106,9 +106,7 @@ impl Tool for TodoTool {
 
         match parsed.action.as_str() {
             "add" => {
-                let content = parsed
-                    .content
-                    .unwrap_or_else(|| "Untitled task".to_string());
+                let content = parsed.content.unwrap_or_else(|| "Untitled task".to_string());
                 let mut id_guard = self.next_id.lock().await;
                 let id = *id_guard;
                 *id_guard += 1;
@@ -128,9 +126,7 @@ impl Tool for TodoTool {
                 })
             }
             "update" => {
-                let id = parsed
-                    .id
-                    .ok_or_else(|| anyhow::anyhow!("'id' is required for update"))?;
+                let id = parsed.id.ok_or_else(|| anyhow::anyhow!("'id' is required for update"))?;
                 let status = parsed.status.unwrap_or_else(|| "in_progress".to_string());
 
                 let mut items = self.items.lock().await;
@@ -176,17 +172,11 @@ mod tests {
         let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
 
         // Add
-        let r = tool
-            .execute(r#"{"action":"add","content":"Write tests"}"#, &ctx)
-            .await
-            .unwrap();
+        let r = tool.execute(r#"{"action":"add","content":"Write tests"}"#, &ctx).await.unwrap();
         assert!(r.success);
         assert!(r.output.contains("#1"));
 
-        let r = tool
-            .execute(r#"{"action":"add","content":"Fix bug"}"#, &ctx)
-            .await
-            .unwrap();
+        let r = tool.execute(r#"{"action":"add","content":"Fix bug"}"#, &ctx).await.unwrap();
         assert!(r.output.contains("#2"));
 
         // List
@@ -201,14 +191,9 @@ mod tests {
         let tool = TodoTool::new();
         let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
 
-        tool.execute(r#"{"action":"add","content":"Task 1"}"#, &ctx)
-            .await
-            .unwrap();
+        tool.execute(r#"{"action":"add","content":"Task 1"}"#, &ctx).await.unwrap();
 
-        let r = tool
-            .execute(r#"{"action":"update","id":1,"status":"completed"}"#, &ctx)
-            .await
-            .unwrap();
+        let r = tool.execute(r#"{"action":"update","id":1,"status":"completed"}"#, &ctx).await.unwrap();
         assert!(r.success);
 
         let r = tool.execute(r#"{"action":"list"}"#, &ctx).await.unwrap();
@@ -220,10 +205,7 @@ mod tests {
         let tool = TodoTool::new();
         let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
 
-        let r = tool
-            .execute(r#"{"action":"update","id":99,"status":"completed"}"#, &ctx)
-            .await
-            .unwrap();
+        let r = tool.execute(r#"{"action":"update","id":99,"status":"completed"}"#, &ctx).await.unwrap();
         assert!(!r.success);
         assert!(r.output.contains("not found"));
     }

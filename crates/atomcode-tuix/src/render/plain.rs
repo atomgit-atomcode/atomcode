@@ -166,12 +166,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let _ = self.out.write_all(b"\n");
             }
-            UiLine::ToolCall { name, detail }
-            | UiLine::ToolCallInFlight {
-                id: _,
-                name,
-                detail,
-            } => {
+            UiLine::ToolCall { name, detail } | UiLine::ToolCallInFlight { id: _, name, detail } => {
                 // Plain mode has no in-place rewrite, so the in-flight
                 // variant degrades to the same single static line that
                 // the static `ToolCall` produces — the user just sees
@@ -188,18 +183,18 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 if detail.is_empty() {
                     let _ = writeln!(self.out, "{}● {}{}", arrow_color, name, reset);
                 } else {
-                    let _ = writeln!(self.out, "{}● {}{}({})", arrow_color, name, reset, detail);
+                    let _ = writeln!(
+                        self.out,
+                        "{}● {}{}({})",
+                        arrow_color, name, reset, detail
+                    );
                 }
             }
             UiLine::ToolCallCommit { call_id: _ } => {
                 // Plain mode never animated the row, so there is
                 // nothing to freeze. Skip silently.
             }
-            UiLine::ToolGroupRender {
-                batch_id: _,
-                header,
-                children,
-            } => {
+            UiLine::ToolGroupRender { batch_id: _, header, children } => {
                 // Plain mode lacks CUP-rewrite — print header + each
                 // child row plainly. Subsequent ToolGroupChildUpdate
                 // events also print plainly (see the ChildUpdate arm
@@ -212,11 +207,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     let _ = writeln!(self.out, "{}", c.text);
                 }
             }
-            UiLine::ToolGroupChildUpdate {
-                batch_id: _,
-                call_id: _,
-                new_text,
-            } => {
+            UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
                 self.drop_transient();
                 let _ = writeln!(self.out, "{}", new_text);
             }
@@ -228,11 +219,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let icon = if success { "✓" } else { "✗" };
                 let icon_color = if self.caps.colors {
-                    if success {
-                        SGR_GREEN
-                    } else {
-                        SGR_RED
-                    }
+                    if success { SGR_GREEN } else { SGR_RED }
                 } else {
                     ""
                 };
@@ -250,11 +237,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let sign = if added { "+" } else { "-" };
                 let color = if self.caps.colors {
-                    if added {
-                        SGR_GREEN
-                    } else {
-                        SGR_RED
-                    }
+                    if added { SGR_GREEN } else { SGR_RED }
                 } else {
                     ""
                 };
@@ -273,11 +256,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 for entry in entries {
                     let sign = if entry.added { "+" } else { "-" };
                     let color = if self.caps.colors {
-                        if entry.added {
-                            SGR_GREEN
-                        } else {
-                            SGR_RED
-                        }
+                        if entry.added { SGR_GREEN } else { SGR_RED }
                     } else {
                         ""
                     };
@@ -317,13 +296,15 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             }
             UiLine::Warning(msg) => {
                 self.drop_transient();
-                let color = if self.caps.colors {
-                    SGR_BOLD_YELLOW
-                } else {
-                    ""
-                };
+                let color = if self.caps.colors { SGR_BOLD_YELLOW } else { "" };
                 let reset = if self.caps.colors { SGR_RESET } else { "" };
-                let _ = writeln!(self.out, "{}! {}{}", color, scrub_controls(&msg), reset);
+                let _ = writeln!(
+                    self.out,
+                    "{}! {}{}",
+                    color,
+                    scrub_controls(&msg),
+                    reset
+                );
             }
             UiLine::TurnCancelled => {
                 self.drop_transient();
@@ -500,11 +481,7 @@ mod tests {
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(
-            !s.contains('\x1b'),
-            "dumb mode must emit zero SGR. got: {}",
-            s
-        );
+        assert!(!s.contains('\x1b'), "dumb mode must emit zero SGR. got: {}", s);
         assert!(s.contains("● read_file(x.rs)"));
         assert!(s.contains("✓ done"));
     }
@@ -521,16 +498,8 @@ mod tests {
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         // Red ✗ and red [Error: …] both present.
-        assert!(
-            s.contains("\x1b[31m"),
-            "expected red SGR for failure / error. got: {}",
-            s
-        );
-        assert!(
-            s.contains("\x1b[0m"),
-            "expected SGR reset after coloured spans. got: {}",
-            s
-        );
+        assert!(s.contains("\x1b[31m"), "expected red SGR for failure / error. got: {}", s);
+        assert!(s.contains("\x1b[0m"), "expected SGR reset after coloured spans. got: {}", s);
     }
 
     #[test]
@@ -551,25 +520,11 @@ mod tests {
         // the CR and the braille glyph, so we assert each piece exists
         // rather than that they're contiguous: CR (so the next frame
         // overwrites), the glyph itself, and EL after each frame.
-        assert!(
-            s.starts_with('\r'),
-            "spinner must start with CR. got: {:?}",
-            s
-        );
+        assert!(s.starts_with('\r'), "spinner must start with CR. got: {:?}", s);
         assert!(s.contains("⠋"), "first frame missing. got: {:?}", s);
         assert!(s.contains("⠙"), "second frame missing. got: {:?}", s);
-        assert_eq!(
-            s.matches('\r').count(),
-            2,
-            "expected exactly 2 CR (one per frame). got: {:?}",
-            s
-        );
-        assert_eq!(
-            s.matches("\x1b[K").count(),
-            2,
-            "expected EL per frame. got: {:?}",
-            s
-        );
+        assert_eq!(s.matches('\r').count(), 2, "expected exactly 2 CR (one per frame). got: {:?}", s);
+        assert_eq!(s.matches("\x1b[K").count(), 2, "expected EL per frame. got: {:?}", s);
     }
 
     #[test]
@@ -582,11 +537,7 @@ mod tests {
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(
-            s.is_empty(),
-            "no-spinner caps must produce no output. got: {:?}",
-            s
-        );
+        assert!(s.is_empty(), "no-spinner caps must produce no output. got: {:?}", s);
     }
 
     /// Spinner stays on screen until something else needs to write —
@@ -622,8 +573,11 @@ mod tests {
         // is covered by `input_prompt_suppressed_in_pipe_mode` below).
         // Unicode caps → `❯ ` (U+276F + space, two display columns).
         let mut buf = Vec::new();
-        let mut r =
-            PlainRenderer::with_writer_caps_and_interactive(&mut buf, caps_jediterm_ish(), true);
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_jediterm_ish(),
+            true,
+        );
         r.render(UiLine::InputPrompt {
             buf: "hi".into(),
             cursor_byte: 2,
@@ -633,11 +587,7 @@ mod tests {
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(
-            s.starts_with("\u{276f} "),
-            "unicode caps must use ❯ chevron. got: {:?}",
-            s
-        );
+        assert!(s.starts_with("\u{276f} "), "unicode caps must use ❯ chevron. got: {:?}", s);
 
         // Dumb caps → ASCII `> ` fallback.
         let mut buf = Vec::new();
@@ -651,11 +601,7 @@ mod tests {
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(
-            s.starts_with("> "),
-            "dumb caps must use ASCII chevron. got: {:?}",
-            s
-        );
+        assert!(s.starts_with("> "), "dumb caps must use ASCII chevron. got: {:?}", s);
     }
 
     /// Real-TTY force_plain (JediTerm / conhost / ATOMCODE_PLAIN=1):

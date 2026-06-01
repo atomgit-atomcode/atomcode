@@ -47,16 +47,12 @@ impl InstalledPluginAssets {
 /// missing or the plugin home is not configured. Skips entries whose
 /// plugin_dir does not exist on disk (keeps reload resilient to deletions).
 pub fn iter_installed_plugin_assets() -> Vec<InstalledPluginAssets> {
-    let Some(state_path) = paths::installed_plugins_file() else {
-        return vec![];
-    };
+    let Some(state_path) = paths::installed_plugins_file() else { return vec![]; };
     let state = match load_installed_plugins_file(&state_path) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    let Some(plugins_root) = paths::plugins_root() else {
-        return vec![];
-    };
+    let Some(plugins_root) = paths::plugins_root() else { return vec![]; };
 
     state
         .plugins
@@ -90,37 +86,17 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join(name);
         std::fs::create_dir_all(&repo).unwrap();
-        Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "t@t"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "t"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
+        Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["config", "user.name", "t"]).current_dir(&repo).status().unwrap();
         std::fs::create_dir_all(repo.join("skills/foo")).unwrap();
         std::fs::write(
             repo.join("skills/foo/SKILL.md"),
             "---\nname: foo\ndescription: f\n---\nbody",
         )
         .unwrap();
-        Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-q", "-m", "init"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
+        Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
         repo
     }
 

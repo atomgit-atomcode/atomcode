@@ -165,12 +165,12 @@ impl IssueWizard {
         self.prompt_shown = true;
         push(
             renderer,
-            &crate::i18n::t(crate::i18n::Msg::IssueNewOn {
-                owner: &self.owner,
-                repo: &self.repo,
-            }),
+            &crate::i18n::t(crate::i18n::Msg::IssueNewOn { owner: &self.owner, repo: &self.repo }),
         );
-        push(renderer, &crate::i18n::t(crate::i18n::Msg::IssueStep1));
+        push(
+            renderer,
+            &crate::i18n::t(crate::i18n::Msg::IssueStep1),
+        );
     }
 
     fn emit_description_prompt(&mut self, renderer: &mut dyn Renderer) {
@@ -181,11 +181,12 @@ impl IssueWizard {
         push(renderer, "");
         push(
             renderer,
-            &crate::i18n::t(crate::i18n::Msg::IssueTitleConfirmed {
-                title: &abbreviate(&self.title, 80),
-            }),
+            &crate::i18n::t(crate::i18n::Msg::IssueTitleConfirmed { title: &abbreviate(&self.title, 80) }),
         );
-        push(renderer, &crate::i18n::t(crate::i18n::Msg::IssueStep2));
+        push(
+            renderer,
+            &crate::i18n::t(crate::i18n::Msg::IssueStep2),
+        );
     }
 }
 

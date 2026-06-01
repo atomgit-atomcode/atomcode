@@ -236,11 +236,7 @@ fn find_frontmatter_close(after_open: &str) -> Option<(usize, usize)> {
         .find("\n---\n")
         .map(|p| (p, 5usize))
         .or_else(|| after_open.find("\n---\r\n").map(|p| (p, 6)))
-        .or_else(|| {
-            after_open
-                .strip_suffix("\n---")
-                .map(|_| (after_open.len() - 4, 4))
-        })
+        .or_else(|| after_open.strip_suffix("\n---").map(|_| (after_open.len() - 4, 4)))
         .or_else(|| {
             after_open
                 .strip_suffix("\n---\r")
@@ -429,47 +425,19 @@ impl SkillRegistry {
 
         // Load Claude Code compat paths from system home (always)
         if let Some(ref home) = system_home {
-            self.load_flat_commands(
-                &home.join(".claude").join("commands"),
-                LOOSE_NS,
-                &mut warnings,
-            );
-            self.load_skills_dir(
-                &home.join(".claude").join("skills"),
-                LOOSE_NS,
-                &mut warnings,
-            );
+            self.load_flat_commands(&home.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
+            self.load_skills_dir(&home.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
         }
 
         // Load atomcode native paths from the unified config dir.
-        self.load_flat_commands(
-            &atomcode_config_dir.join("commands"),
-            LOOSE_NS,
-            &mut warnings,
-        );
+        self.load_flat_commands(&atomcode_config_dir.join("commands"), LOOSE_NS, &mut warnings);
         self.load_skills_dir(&atomcode_config_dir.join("skills"), LOOSE_NS, &mut warnings);
 
         // Project-level skills (always from working dir)
-        self.load_flat_commands(
-            &working_dir.join(".claude").join("commands"),
-            LOOSE_NS,
-            &mut warnings,
-        );
-        self.load_flat_commands(
-            &working_dir.join(".atomcode").join("commands"),
-            LOOSE_NS,
-            &mut warnings,
-        );
-        self.load_skills_dir(
-            &working_dir.join(".claude").join("skills"),
-            LOOSE_NS,
-            &mut warnings,
-        );
-        self.load_skills_dir(
-            &working_dir.join(".atomcode").join("skills"),
-            LOOSE_NS,
-            &mut warnings,
-        );
+        self.load_flat_commands(&working_dir.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
+        self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), LOOSE_NS, &mut warnings);
+        self.load_skills_dir(&working_dir.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
+        self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), LOOSE_NS, &mut warnings);
 
         // Plugin layer — installed plugins contribute namespaced skills.
         for assets in crate::plugin::loader::iter_installed_plugin_assets() {
@@ -538,12 +506,7 @@ impl SkillRegistry {
     // -----------------------------------------------------------------------
 
     /// Load all `.md` files from a flat `commands/` directory.
-    fn load_flat_commands(
-        &mut self,
-        dir: &Path,
-        namespace: Option<&str>,
-        warnings: &mut Vec<String>,
-    ) {
+    fn load_flat_commands(&mut self, dir: &Path, namespace: Option<&str>, warnings: &mut Vec<String>) {
         if !dir.is_dir() {
             return;
         }
@@ -922,10 +885,7 @@ mod tests {
         let working = tempfile::tempdir().unwrap();
         let mut reg = SkillRegistry::new();
         reg.reload(working.path());
-        assert!(
-            reg.get("p:hello").is_some(),
-            "expected namespaced plugin skill"
-        );
+        assert!(reg.get("p:hello").is_some(), "expected namespaced plugin skill");
 
         std::env::remove_var("ATOMCODE_HOME");
     }
@@ -985,14 +945,8 @@ mod tests {
         let mut warnings = Vec::new();
         reg.load_skills_dir(tmp.path(), Some("test"), &mut warnings);
 
-        assert!(
-            reg.get("test:hybrid").is_some(),
-            "self SKILL.md should load"
-        );
-        assert!(
-            reg.get("test:sub-skill").is_some(),
-            "subdirectory SKILL.md should load"
-        );
+        assert!(reg.get("test:hybrid").is_some(), "self SKILL.md should load");
+        assert!(reg.get("test:sub-skill").is_some(), "subdirectory SKILL.md should load");
     }
 
     /// Regression test for the full plugin install path with CC-style
@@ -1031,8 +985,7 @@ mod tests {
         let mut reg = SkillRegistry::new();
         reg.reload(working.path());
         assert!(
-            reg.get("andrej-karpathy-skills:karpathy-guidelines")
-                .is_some(),
+            reg.get("andrej-karpathy-skills:karpathy-guidelines").is_some(),
             "CC array plugin: skill should be loaded from direct skill directory"
         );
 

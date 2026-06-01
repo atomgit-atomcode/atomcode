@@ -244,8 +244,8 @@ impl Tool for SearchReplaceTool {
                 // can be the un-resolved symlink form (e.g. macOS
                 // `/var/...` vs `/private/var/...`), which would
                 // miss the FileStore key inserted by read_file.
-                let canon =
-                    std::fs::canonicalize(file_path).unwrap_or_else(|_| file_path.to_path_buf());
+                let canon = std::fs::canonicalize(file_path)
+                    .unwrap_or_else(|_| file_path.to_path_buf());
                 // Notify LSP that file changed (if LSP is enabled).
                 ctx.notify_lsp_file_changed(&canon, &new_content).await;
                 // D3: drop any FileStore entry — peek_file against an

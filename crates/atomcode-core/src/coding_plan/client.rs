@@ -307,9 +307,10 @@ mod tests {
         let raw = anyhow::Error::new(AuthExpired { status: 401 });
         assert!(is_auth_expired(&raw));
 
-        let wrapped: anyhow::Error = Err::<(), _>(anyhow::Error::new(AuthExpired { status: 401 }))
-            .context("list models-v2")
-            .unwrap_err();
+        let wrapped: anyhow::Error =
+            Err::<(), _>(anyhow::Error::new(AuthExpired { status: 401 }))
+                .context("list models-v2")
+                .unwrap_err();
         assert!(is_auth_expired(&wrapped));
 
         let unrelated = anyhow!("some other failure");

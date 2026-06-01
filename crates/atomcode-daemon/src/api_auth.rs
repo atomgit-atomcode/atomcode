@@ -171,9 +171,7 @@ pub(crate) async fn auth_login_poll(
             })
             .into_response(),
             Ok(LoginPollStep::Authorized(user)) => {
-                state_inner
-                    .telemetry
-                    .set_account_id(Some(user.id.to_string()));
+                state_inner.telemetry.set_account_id(Some(user.id.to_string()));
                 state_inner.telemetry.track(Event::LoginSuccess);
                 Json(LoginPollResponse {
                     status: "authorized".to_string(),

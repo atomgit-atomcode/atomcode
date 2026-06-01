@@ -10,13 +10,7 @@ use super::url::{infer_marketplace_name_from_url, validate_git_url};
 /// Sanitize a name into a path-safe segment (CC convention).
 pub(super) fn sanitize_name(name: &str) -> String {
     name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect()
 }
 
@@ -43,10 +37,7 @@ pub fn add_marketplace(url: &str) -> Result<MarketplaceInfo> {
     // when manifest.name differs from the URL tail.
     let tmp_suffix: u128 = {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
     };
     let tmp_dir = mp_root.join(format!(".tmp-{}-{}", std::process::id(), tmp_suffix));
     if tmp_dir.exists() {
@@ -86,10 +77,7 @@ pub fn add_marketplace(url: &str) -> Result<MarketplaceInfo> {
     let mp_name = sanitize_name(&raw_mp_name);
     if mp_name.is_empty() {
         cleanup(&tmp_dir);
-        bail!(
-            "marketplace name `{}` sanitized to empty string",
-            raw_mp_name
-        );
+        bail!("marketplace name `{}` sanitized to empty string", raw_mp_name);
     }
 
     let target = mp_root.join(&mp_name);
@@ -110,18 +98,10 @@ pub fn add_marketplace(url: &str) -> Result<MarketplaceInfo> {
 
     if let Err(e) = std::fs::rename(&tmp_dir, &target) {
         cleanup(&tmp_dir);
-        return Err(anyhow!(
-            "rename {} -> {}: {}",
-            tmp_dir.display(),
-            target.display(),
-            e
-        ));
+        return Err(anyhow!("rename {} -> {}: {}", tmp_dir.display(), target.display(), e));
     }
 
-    let plugins_list = plugins
-        .iter()
-        .map(|p| sanitize_name(&p.name))
-        .collect::<Vec<_>>();
+    let plugins_list = plugins.iter().map(|p| sanitize_name(&p.name)).collect::<Vec<_>>();
 
     state.marketplaces.insert(
         mp_name.clone(),
@@ -181,10 +161,7 @@ fn git_rev_parse(repo: &Path) -> Result<String> {
         .output()
         .context("spawn git rev-parse")?;
     if !out.status.success() {
-        bail!(
-            "git rev-parse failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        bail!("git rev-parse failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -200,9 +177,14 @@ pub fn remove_marketplace(name: &str) -> Result<()> {
         bail!("marketplace `{}` not found", name);
     }
     // Refuse if any installed plugin still references this marketplace.
-    let installed =
-        super::state::load_installed_plugins_file(&paths::installed_plugins_file().unwrap())?;
-    if installed.plugins.values().any(|p| p.marketplace == name) {
+    let installed = super::state::load_installed_plugins_file(
+        &paths::installed_plugins_file().unwrap(),
+    )?;
+    if installed
+        .plugins
+        .values()
+        .any(|p| p.marketplace == name)
+    {
         bail!(
             "marketplace `{}` has installed plugins; uninstall them first",
             name
@@ -281,36 +263,16 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join(name);
         std::fs::create_dir_all(&repo).unwrap();
-        Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "t@t"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "t"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
+        Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["config", "user.name", "t"]).current_dir(&repo).status().unwrap();
         if let Some(m) = manifest {
             std::fs::create_dir_all(repo.join(".atomcode-plugin")).unwrap();
             std::fs::write(repo.join(".atomcode-plugin/marketplace.json"), m).unwrap();
         }
         std::fs::write(repo.join("README"), "x").unwrap();
-        Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-q", "-m", "init"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
+        Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
         repo
     }
 
@@ -320,9 +282,7 @@ mod tests {
         let _home = isolated_home();
         let repo = make_bare_repo_with_manifest(
             "ascend-model-agent-plugin",
-            Some(
-                r#"{"name":"ascend-model-agent-plugin","plugins":[{"name":"ascend-model-agent-plugin","source":"./"}]}"#,
-            ),
+            Some(r#"{"name":"ascend-model-agent-plugin","plugins":[{"name":"ascend-model-agent-plugin","source":"./"}]}"#),
         );
         let url = format!("file://{}", repo.display());
         let info = add_marketplace(&url).unwrap();
@@ -387,9 +347,7 @@ mod tests {
         // "canonical-name".
         let repo = make_bare_repo_with_manifest(
             "url-tail-name",
-            Some(
-                r#"{"name":"canonical-name","plugins":[{"name":"canonical-name","source":"./"}]}"#,
-            ),
+            Some(r#"{"name":"canonical-name","plugins":[{"name":"canonical-name","source":"./"}]}"#),
         );
         let url = format!("file://{}", repo.display());
         let info = add_marketplace(&url).unwrap();

@@ -215,9 +215,7 @@ mod tests {
     #[test]
     fn is_atomgit_gateway_matches_official_host() {
         assert!(is_atomgit_gateway("https://llm-api.atomgit.com/v1"));
-        assert!(is_atomgit_gateway(
-            "https://llm-api.atomgit.com/v1/chat/completions"
-        ));
+        assert!(is_atomgit_gateway("https://llm-api.atomgit.com/v1/chat/completions"));
     }
 
     #[test]
@@ -227,9 +225,7 @@ mod tests {
         // (legacy host plaintext until P3) — the inversion is the
         // contract change.
         assert!(is_atomgit_gateway("https://api-ai.gitcode.com/v1"));
-        assert!(is_atomgit_gateway(
-            "https://api-ai.gitcode.com/v1/chat/completions"
-        ));
+        assert!(is_atomgit_gateway("https://api-ai.gitcode.com/v1/chat/completions"));
     }
 
     #[test]
@@ -241,9 +237,7 @@ mod tests {
 
     #[test]
     fn is_atomgit_gateway_rejects_subdomains_and_lookalikes() {
-        assert!(!is_atomgit_gateway(
-            "https://llm-api.atomgit.com.evil.example"
-        ));
+        assert!(!is_atomgit_gateway("https://llm-api.atomgit.com.evil.example"));
         assert!(!is_atomgit_gateway("https://evil.llm-api.atomgit.com"));
         assert!(!is_atomgit_gateway("https://atomgit.com"));
     }

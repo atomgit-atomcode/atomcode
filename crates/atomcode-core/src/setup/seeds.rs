@@ -20,11 +20,9 @@ pub fn ensure_seeds_extracted(cache_root: &Path) -> Result<PathBuf> {
     let content_hash = format!("{:x}", h.finalize());
     let short_hash = &content_hash[..12]; // 12 hex chars = 48 bits, plenty for cache key
 
-    let cache_dir = cache_root.join("seeds-cache").join(format!(
-        "{}-{}",
-        env!("CARGO_PKG_VERSION"),
-        short_hash
-    ));
+    let cache_dir = cache_root
+        .join("seeds-cache")
+        .join(format!("{}-{}", env!("CARGO_PKG_VERSION"), short_hash));
     let sentinel = cache_dir.join(".extracted");
     if sentinel.exists() {
         return Ok(cache_dir);
@@ -32,7 +30,8 @@ pub fn ensure_seeds_extracted(cache_root: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("create_dir_all({})", cache_dir.display()))?;
 
-    let decoder = zstd::Decoder::new(SEEDS_TARZST).context("zstd decoder for embedded seeds")?;
+    let decoder = zstd::Decoder::new(SEEDS_TARZST)
+        .context("zstd decoder for embedded seeds")?;
     let mut archive = tar::Archive::new(decoder);
     archive
         .unpack(&cache_dir)
@@ -80,4 +79,5 @@ mod tests {
         let second = ensure_seeds_extracted(dir.path()).unwrap();
         assert_eq!(first, second);
     }
+
 }

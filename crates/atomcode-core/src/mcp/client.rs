@@ -3,7 +3,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::types::{CallToolResult, InitializeResult, ListToolsResult, ServerStatus};
+use super::types::{InitializeResult, ListToolsResult, CallToolResult, ServerStatus};
 
 /// Information about an MCP tool.
 #[derive(Debug, Clone)]
@@ -24,11 +24,7 @@ pub trait McpClient: Send + Sync {
     async fn list_tools(&self) -> Result<ListToolsResult>;
 
     /// Call a tool on the server.
-    async fn call_tool(
-        &self,
-        tool_name: &str,
-        arguments: serde_json::Value,
-    ) -> Result<CallToolResult>;
+    async fn call_tool(&self, tool_name: &str, arguments: serde_json::Value) -> Result<CallToolResult>;
 
     /// Get the server name.
     fn server_name(&self) -> &str;

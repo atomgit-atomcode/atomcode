@@ -41,4 +41,5 @@ mod tests {
         assert!(s.contains("macbook"));
         assert!(s.contains("--force"));
     }
+
 }

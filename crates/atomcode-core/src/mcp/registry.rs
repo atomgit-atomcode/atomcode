@@ -453,17 +453,9 @@ fn classify_mcp_error(error: &str) -> McpErrorKind {
     let e = error.to_lowercase();
     if e.contains("connection refused") || e.contains("dns") || e.contains("network") {
         McpErrorKind::NetworkError
-    } else if e.contains("401")
-        || e.contains("403")
-        || e.contains("unauthorized")
-        || e.contains("oauth")
-    {
+    } else if e.contains("401") || e.contains("403") || e.contains("unauthorized") || e.contains("oauth") {
         McpErrorKind::AuthError
-    } else if e.contains("not found")
-        || e.contains("no such")
-        || e.contains("path")
-        || e.contains("spawn")
-    {
+    } else if e.contains("not found") || e.contains("no such") || e.contains("path") || e.contains("spawn") {
         McpErrorKind::ExecutionFailed
     } else if e.contains("timeout") || e.contains("timed out") {
         McpErrorKind::Timeout

@@ -145,12 +145,7 @@ impl Tool for FindReferencesTool {
                 .unwrap_or(&matched.file)
                 .trim_start_matches('/');
 
-            let entry = format!(
-                "  {}:{}: {}",
-                short_file,
-                matched.line_no,
-                matched.content.trim()
-            );
+            let entry = format!("  {}:{}: {}", short_file, matched.line_no, matched.content.trim());
             if is_def {
                 definitions.push(entry);
             } else {

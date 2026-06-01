@@ -49,11 +49,7 @@ pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> 
 
     // Stage only the files that were actually edited.
     let mut add_cmd = Command::new("git");
-    add_cmd
-        .arg("add")
-        .arg("--")
-        .args(&file_paths)
-        .current_dir(working_dir);
+    add_cmd.arg("add").arg("--").args(&file_paths).current_dir(working_dir);
     crate::process_utils::suppress_console_window_sync(&mut add_cmd);
     let output = match add_cmd.output() {
         Ok(output) => output,
@@ -78,8 +74,7 @@ pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> 
 
     // Check if there are staged changes
     let mut diff_cmd = Command::new("git");
-    diff_cmd
-        .args(["diff", "--cached", "--quiet"])
+    diff_cmd.args(["diff", "--cached", "--quiet"])
         .current_dir(working_dir);
     crate::process_utils::suppress_console_window_sync(&mut diff_cmd);
     let diff_output = diff_cmd.status();
@@ -99,8 +94,7 @@ pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> 
     let message = generate_commit_message(edited_files);
 
     let mut commit_cmd = Command::new("git");
-    commit_cmd
-        .args(["commit", "-m", &message])
+    commit_cmd.args(["commit", "-m", &message])
         .current_dir(working_dir);
     crate::process_utils::suppress_console_window_sync(&mut commit_cmd);
     let output = match commit_cmd.output() {
@@ -120,8 +114,7 @@ pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> 
 
     // Extract commit SHA
     let mut rev_cmd = Command::new("git");
-    rev_cmd
-        .args(["rev-parse", "--short", "HEAD"])
+    rev_cmd.args(["rev-parse", "--short", "HEAD"])
         .current_dir(working_dir);
     crate::process_utils::suppress_console_window_sync(&mut rev_cmd);
     let sha_output = match rev_cmd.output() {
@@ -195,7 +188,9 @@ fn has_staged_changes(working_dir: &Path) -> bool {
     cmd.args(["diff", "--cached", "--quiet"])
         .current_dir(working_dir);
     crate::process_utils::suppress_console_window_sync(&mut cmd);
-    cmd.status().map(|status| !status.success()).unwrap_or(true)
+    cmd.status()
+        .map(|status| !status.success())
+        .unwrap_or(true)
 }
 
 #[cfg(test)]

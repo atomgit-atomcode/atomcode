@@ -17,8 +17,8 @@
 /// exactly which syscall returned what mask.
 pub fn enable_conhost_mouse_capture() -> Option<u32> {
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT,
-        ENABLE_QUICK_EDIT_MODE, ENABLE_WINDOW_INPUT, STD_INPUT_HANDLE,
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS,
+        ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_WINDOW_INPUT, STD_INPUT_HANDLE,
     };
     unsafe {
         let h = GetStdHandle(STD_INPUT_HANDLE);
@@ -35,9 +35,8 @@ pub fn enable_conhost_mouse_capture() -> Option<u32> {
             crate::tuix_trace!("REN", "conhost-mouse: GetConsoleMode failed: {}", err);
             return None;
         }
-        let new_mode =
-            (original | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
-                & !ENABLE_QUICK_EDIT_MODE;
+        let new_mode = (original | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
+            & !ENABLE_QUICK_EDIT_MODE;
         if SetConsoleMode(h, new_mode) == 0 {
             let err = std::io::Error::last_os_error();
             crate::tuix_trace!(

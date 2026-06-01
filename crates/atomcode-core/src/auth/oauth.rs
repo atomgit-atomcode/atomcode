@@ -42,36 +42,18 @@ fn platform_base_url() -> &'static str {
 }
 
 /// Platform server URLs (derived from `ATOMCODE_PLATFORM_SERVER`).
-pub fn platform_broker_url() -> String {
-    platform_base_url().to_string()
-}
-pub fn platform_login_url() -> String {
-    format!("{}/auth/login", platform_base_url())
-}
-pub fn platform_check_url() -> String {
-    format!("{}/auth/check", platform_base_url())
-}
-pub fn platform_token_url() -> String {
-    format!("{}/auth/token", platform_base_url())
-}
-pub fn platform_exchange_url() -> String {
-    format!("{}/oauth/exchange", platform_base_url())
-}
-pub fn platform_refresh_url() -> String {
-    format!("{}/oauth/refresh", platform_base_url())
-}
+pub fn platform_broker_url() -> String { platform_base_url().to_string() }
+pub fn platform_login_url() -> String { format!("{}/auth/login", platform_base_url()) }
+pub fn platform_check_url() -> String { format!("{}/auth/check", platform_base_url()) }
+pub fn platform_token_url() -> String { format!("{}/auth/token", platform_base_url()) }
+pub fn platform_exchange_url() -> String { format!("{}/oauth/exchange", platform_base_url()) }
+pub fn platform_refresh_url() -> String { format!("{}/oauth/refresh", platform_base_url()) }
 #[allow(dead_code)]
-pub fn authorize_url() -> String {
-    format!("{}/oauth/authorize", platform_base_url())
-}
+pub fn authorize_url() -> String { format!("{}/oauth/authorize", platform_base_url()) }
 #[allow(dead_code)]
-pub fn token_url() -> String {
-    format!("{}/oauth/token", platform_base_url())
-}
+pub fn token_url() -> String { format!("{}/oauth/token", platform_base_url()) }
 #[allow(dead_code)]
-pub fn user_url() -> String {
-    format!("{}/api/v5/user", platform_base_url())
-}
+pub fn user_url() -> String { format!("{}/api/v5/user", platform_base_url()) }
 
 /// Blocking HTTP client pre-configured with `ATOMCODE_USER_AGENT`. Every
 /// OAuth-side request must carry the token or AtomGit's gate rejects it.
@@ -1261,45 +1243,27 @@ mod tests {
 
     #[test]
     fn sanitize_preserves_http_scheme() {
-        assert_eq!(
-            sanitize_base_url("http://127.0.0.1:8765"),
-            "http://127.0.0.1:8765"
-        );
+        assert_eq!(sanitize_base_url("http://127.0.0.1:8765"), "http://127.0.0.1:8765");
     }
 
     #[test]
     fn sanitize_preserves_https_scheme() {
-        assert_eq!(
-            sanitize_base_url("https://acs.example.com"),
-            "https://acs.example.com"
-        );
+        assert_eq!(sanitize_base_url("https://acs.example.com"), "https://acs.example.com");
     }
 
     #[test]
     fn sanitize_strips_trailing_slash() {
-        assert_eq!(
-            sanitize_base_url("http://127.0.0.1:8765/"),
-            "http://127.0.0.1:8765"
-        );
-        assert_eq!(
-            sanitize_base_url("http://127.0.0.1:8765///"),
-            "http://127.0.0.1:8765"
-        );
+        assert_eq!(sanitize_base_url("http://127.0.0.1:8765/"), "http://127.0.0.1:8765");
+        assert_eq!(sanitize_base_url("http://127.0.0.1:8765///"), "http://127.0.0.1:8765");
     }
 
     #[test]
     fn sanitize_trims_whitespace() {
-        assert_eq!(
-            sanitize_base_url("  http://127.0.0.1:8765  "),
-            "http://127.0.0.1:8765"
-        );
+        assert_eq!(sanitize_base_url("  http://127.0.0.1:8765  "), "http://127.0.0.1:8765");
     }
 
     #[test]
     fn sanitize_no_scheme_with_trailing_slash() {
-        assert_eq!(
-            sanitize_base_url("127.0.0.1:8765/"),
-            "http://127.0.0.1:8765"
-        );
+        assert_eq!(sanitize_base_url("127.0.0.1:8765/"), "http://127.0.0.1:8765");
     }
 }

@@ -121,15 +121,9 @@ impl AgentLoop {
         // Persistent memory
         {
             use crate::config::memory::MemoryStore;
-            let wd = self
-                .turn_runner
-                .context
-                .working_dir
-                .try_read()
-                .map(|g| g.clone())
-                .unwrap_or_default();
-            let project_name = wd
-                .file_name()
+            let wd = self.turn_runner.context.working_dir.try_read()
+                .map(|g| g.clone()).unwrap_or_default();
+            let project_name = wd.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "project".to_string());
             let global = MemoryStore::global();

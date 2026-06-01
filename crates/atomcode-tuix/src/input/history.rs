@@ -65,24 +65,14 @@ impl History {
                             return e;
                         }
                         if let Ok(t) = serde_json::from_str::<String>(l) {
-                            return HistoryEntry {
-                                text: t,
-                                images: Vec::new(),
-                            };
+                            return HistoryEntry { text: t, images: Vec::new() };
                         }
-                        HistoryEntry {
-                            text: l.to_string(),
-                            images: Vec::new(),
-                        }
+                        HistoryEntry { text: l.to_string(), images: Vec::new() }
                     })
                     .collect()
             })
             .unwrap_or_default();
-        Self {
-            path,
-            entries,
-            cache_dir,
-        }
+        Self { path, entries, cache_dir }
     }
 
     /// Back-compat constructor used by tests and any caller that doesn't
@@ -130,15 +120,13 @@ impl History {
         let contents: String = self
             .entries
             .iter()
-            .map(|e| {
-                serde_json::to_string(e).unwrap_or_else(|_| {
-                    // Defensive fallback — HistoryEntry should always serialize
-                    // cleanly via serde, but if a future field broke that,
-                    // emit a JSON-string of the text so a malformed entry
-                    // doesn't poison the rest of the file.
-                    serde_json::to_string(&e.text).unwrap_or_else(|_| e.text.clone())
-                })
-            })
+            .map(|e| serde_json::to_string(e).unwrap_or_else(|_| {
+                // Defensive fallback — HistoryEntry should always serialize
+                // cleanly via serde, but if a future field broke that,
+                // emit a JSON-string of the text so a malformed entry
+                // doesn't poison the rest of the file.
+                serde_json::to_string(&e.text).unwrap_or_else(|_| e.text.clone())
+            }))
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(&self.path, contents)?;
@@ -192,14 +180,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hist");
         let mut h = History::load(&path);
-        h.push(HistoryEntry {
-            text: "one".into(),
-            images: Vec::new(),
-        });
-        h.push(HistoryEntry {
-            text: "two".into(),
-            images: Vec::new(),
-        });
+        h.push(HistoryEntry { text: "one".into(), images: Vec::new() });
+        h.push(HistoryEntry { text: "two".into(), images: Vec::new() });
         h.save().unwrap();
 
         let h2 = History::load(&path);
@@ -213,14 +195,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hist");
         let mut h = History::load(&path);
-        h.push(HistoryEntry {
-            text: "1\n2\n3".into(),
-            images: Vec::new(),
-        });
-        h.push(HistoryEntry {
-            text: "next".into(),
-            images: Vec::new(),
-        });
+        h.push(HistoryEntry { text: "1\n2\n3".into(), images: Vec::new() });
+        h.push(HistoryEntry { text: "next".into(), images: Vec::new() });
         h.save().unwrap();
 
         let h2 = History::load(&path);
@@ -248,18 +224,9 @@ mod tests {
     fn duplicate_consecutive_collapsed() {
         let dir = tempdir().unwrap();
         let mut h = History::load(dir.path().join("hist"));
-        h.push(HistoryEntry {
-            text: "x".into(),
-            images: Vec::new(),
-        });
-        h.push(HistoryEntry {
-            text: "x".into(),
-            images: Vec::new(),
-        });
-        h.push(HistoryEntry {
-            text: "y".into(),
-            images: Vec::new(),
-        });
+        h.push(HistoryEntry { text: "x".into(), images: Vec::new() });
+        h.push(HistoryEntry { text: "x".into(), images: Vec::new() });
+        h.push(HistoryEntry { text: "y".into(), images: Vec::new() });
         assert_eq!(h.entries().len(), 2);
         assert_eq!(h.entries()[0].text, "x");
         assert_eq!(h.entries()[1].text, "y");
@@ -270,10 +237,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut h = History::load(dir.path().join("hist"));
         for i in 0..2000 {
-            h.push(HistoryEntry {
-                text: format!("cmd{}", i),
-                images: Vec::new(),
-            });
+            h.push(HistoryEntry { text: format!("cmd{}", i), images: Vec::new() });
         }
         assert!(h.entries().len() <= HISTORY_MAX);
         assert!(!h.entries().iter().any(|e| e.text == "cmd0"));
@@ -283,18 +247,9 @@ mod tests {
     fn empty_entries_ignored() {
         let dir = tempdir().unwrap();
         let mut h = History::load(dir.path().join("hist"));
-        h.push(HistoryEntry {
-            text: "".into(),
-            images: Vec::new(),
-        });
-        h.push(HistoryEntry {
-            text: "  ".into(),
-            images: Vec::new(),
-        });
-        h.push(HistoryEntry {
-            text: "real".into(),
-            images: Vec::new(),
-        });
+        h.push(HistoryEntry { text: "".into(), images: Vec::new() });
+        h.push(HistoryEntry { text: "  ".into(), images: Vec::new() });
+        h.push(HistoryEntry { text: "real".into(), images: Vec::new() });
         assert_eq!(h.entries().len(), 1);
         assert_eq!(h.entries()[0].text, "real");
     }
@@ -320,16 +275,9 @@ mod tests {
 
     #[test]
     fn history_entry_text_only_serializes_without_images_field() {
-        let e = HistoryEntry {
-            text: "hi".to_string(),
-            images: vec![],
-        };
+        let e = HistoryEntry { text: "hi".to_string(), images: vec![] };
         let j = serde_json::to_string(&e).unwrap();
-        assert!(
-            !j.contains("images"),
-            "empty images vec must be skipped: {}",
-            j
-        );
+        assert!(!j.contains("images"), "empty images vec must be skipped: {}", j);
         assert_eq!(j, r#"{"text":"hi"}"#);
     }
 
@@ -395,10 +343,7 @@ mod tests {
         h.save().unwrap();
         assert!(cache.join("aaaaaaaaaaaaaaaa.png").exists());
         assert!(cache.join("bbbbbbbbbbbbbbbb.png").exists());
-        assert!(
-            !cache.join("cccccccccccccccc.png").exists(),
-            "orphan should be GC'd"
-        );
+        assert!(!cache.join("cccccccccccccccc.png").exists(), "orphan should be GC'd");
     }
 
     #[test]
@@ -417,12 +362,9 @@ mod tests {
     #[test]
     fn gc_skips_when_cache_dir_missing() {
         let dir = tempdir().unwrap();
-        let cache = dir.path().join("image-cache"); // does not exist
+        let cache = dir.path().join("image-cache");  // does not exist
         let mut h = History::load_with_cache(dir.path().join("hist"), cache);
-        h.push(HistoryEntry {
-            text: "x".into(),
-            images: vec![],
-        });
+        h.push(HistoryEntry { text: "x".into(), images: vec![] });
         // Must not error.
         h.save().unwrap();
     }

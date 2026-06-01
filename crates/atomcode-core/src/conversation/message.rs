@@ -227,7 +227,7 @@ impl Message {
                         output: summary,
                         success: r.success,
                     }),
-                    synthetic: false,
+                                    synthetic: false,
                 }
             }
             // ToolResultRef is already condensed (only holds a summary).
@@ -374,7 +374,7 @@ mod tests {
                 output: output.to_string(),
                 success: true,
             }),
-            synthetic: false,
+                    synthetic: false,
         }
     }
 
@@ -508,7 +508,7 @@ mod tests {
                 text: Some("hello".to_string()),
                 images: vec![],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         assert_eq!(msg.text(), Some("hello"));
     }
@@ -521,7 +521,7 @@ mod tests {
                 text: None,
                 images: vec![],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         assert_eq!(msg.text(), None);
     }
@@ -534,7 +534,7 @@ mod tests {
                 text: Some("short".to_string()),
                 images: vec![sample_image_part(), sample_image_part()],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         let tokens = msg.estimate_tokens();
         // 2 images * 1600 = 3200, plus text and message overhead.
@@ -553,20 +553,12 @@ mod tests {
                 text: Some("hello world".to_string()),
                 images: vec![],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         let tokens = msg.estimate_tokens();
         // No images: "hello world" = 11 chars -> 11/4 = 2 (max with 1) + 0*1600 + 4 = 6
-        assert!(
-            tokens < 100,
-            "no-image multipart should have small token count, got {}",
-            tokens
-        );
-        assert!(
-            tokens >= 5,
-            "should have at least text + overhead, got {}",
-            tokens
-        );
+        assert!(tokens < 100, "no-image multipart should have small token count, got {}", tokens);
+        assert!(tokens >= 5, "should have at least text + overhead, got {}", tokens);
     }
 
     #[test]
@@ -577,7 +569,7 @@ mod tests {
                 text: Some("look at this".to_string()),
                 images: vec![sample_image_part()],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         assert!(!msg.is_tool_result());
     }
@@ -590,7 +582,7 @@ mod tests {
                 text: Some("analyze this".to_string()),
                 images: vec![sample_image_part()],
             },
-            synthetic: false,
+                    synthetic: false,
         };
         let condensed = msg.condensed("");
         match (&msg.content, &condensed.content) {

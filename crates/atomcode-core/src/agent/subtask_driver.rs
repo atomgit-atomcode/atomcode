@@ -291,12 +291,7 @@ mod tests {
         driver.extract_from_plan(plan);
 
         assert!(driver.active);
-        assert_eq!(
-            driver.subtasks.len(),
-            4,
-            "expected 4 .rs files extracted, got: {:?}",
-            driver.subtasks
-        );
+        assert_eq!(driver.subtasks.len(), 4, "expected 4 .rs files extracted, got: {:?}", driver.subtasks);
         let names: Vec<&str> = driver.subtasks.iter().map(|s| s.file.as_str()).collect();
         assert!(names.contains(&"constants.rs"));
         assert!(names.contains(&"types.rs"));

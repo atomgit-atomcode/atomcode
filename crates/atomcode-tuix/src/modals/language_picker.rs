@@ -164,11 +164,7 @@ mod tests {
         assert!(msg.contains("✓"), "missing checkmark: {}", msg);
         assert!(msg.contains("English"), "missing label: {}", msg);
         assert!(msg.contains("(en)"), "missing locale code: {}", msg);
-        assert!(
-            msg.to_lowercase().contains("switched"),
-            "missing 'switched' verb: {}",
-            msg
-        );
+        assert!(msg.to_lowercase().contains("switched"), "missing 'switched' verb: {}", msg);
         assert!(msg.ends_with('\n'), "missing trailing newline: {:?}", msg);
     }
 }

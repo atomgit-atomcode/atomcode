@@ -22,10 +22,7 @@ pub struct RecId {
 
 impl RecId {
     pub fn new(kind: RecKind, slug: impl Into<String>) -> Self {
-        Self {
-            kind,
-            slug: slug.into(),
-        }
+        Self { kind, slug: slug.into() }
     }
 }
 

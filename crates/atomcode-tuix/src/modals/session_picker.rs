@@ -133,8 +133,7 @@ impl Modal for SessionPicker {
                                         crate::i18n::t(crate::i18n::Msg::SessionRenamed {
                                             old: &old_name,
                                             new: &new_name,
-                                        })
-                                        .into_owned(),
+                                        }).into_owned(),
                                     ));
                                     renderer.flush();
                                 }
@@ -241,8 +240,7 @@ impl Modal for SessionPicker {
                         state.on_turn_complete();
                         let msg = format!("{}", e);
                         renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &msg })
-                                .into_owned(),
+                            crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &msg }).into_owned(),
                         ));
                         renderer.flush();
                         Ok(ModalAction::Close)
@@ -291,17 +289,14 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
         .enumerate()
         .map(|(filter_idx, &session_idx)| {
             let s = &p.sessions[session_idx];
-            let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount {
-                count: s.message_count,
-            });
+            let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount { count: s.message_count });
             let desc = format!("{} · {}", msgs, humanize_age(s.updated_at));
             // If in rename editing mode and this is the selected item, show the editing buffer
             if p.rename_editing && filter_idx == p.selected {
                 (
                     crate::i18n::t(crate::i18n::Msg::SessionRenameEditing {
                         buffer: &p.rename_buffer,
-                    })
-                    .into_owned(),
+                    }).into_owned(),
                     desc,
                 )
             } else {
@@ -349,10 +344,7 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
     if reset {
         renderer.reset();
     }
-    let resumed = crate::i18n::t(crate::i18n::Msg::SessionResumedLabel {
-        name: &session.name,
-    })
-    .into_owned();
+    let resumed = crate::i18n::t(crate::i18n::Msg::SessionResumedLabel { name: &session.name }).into_owned();
     renderer.render(UiLine::TurnSeparator {
         label: resumed.clone(),
     });
@@ -402,7 +394,9 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
         }
     }
     renderer.render(UiLine::TurnComplete);
-    renderer.render(UiLine::TurnSeparator { label: resumed });
+    renderer.render(UiLine::TurnSeparator {
+        label: resumed,
+    });
     renderer.flush();
 }
 

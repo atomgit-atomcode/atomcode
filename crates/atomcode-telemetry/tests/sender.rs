@@ -179,18 +179,8 @@ async fn counters_increment_on_post() {
     let snap = counters.snapshot();
     assert_eq!(snap.segments_posted, 1);
     assert!(snap.bytes_sent > 0, "bytes_sent should be > 0");
-    assert!(
-        snap.last_post_unix_ms > 0,
-        "last_post_unix_ms should be > 0"
-    );
-    assert!(
-        !snap.last_post_iso.is_empty(),
-        "iso should be set when ms > 0"
-    );
-    assert!(
-        snap.last_post_iso.contains('T'),
-        "should be RFC 3339 format: {}",
-        snap.last_post_iso
-    );
+    assert!(snap.last_post_unix_ms > 0, "last_post_unix_ms should be > 0");
+    assert!(!snap.last_post_iso.is_empty(), "iso should be set when ms > 0");
+    assert!(snap.last_post_iso.contains('T'), "should be RFC 3339 format: {}", snap.last_post_iso);
     assert!(health_path.exists(), "health.json should be written");
 }

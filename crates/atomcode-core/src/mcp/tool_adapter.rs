@@ -44,7 +44,10 @@ impl Tool for McpToolAdapter {
                     self.info.server_name
                 )
             } else {
-                format!("[MCP:{}] {}", self.info.server_name, self.info.description)
+                format!(
+                    "[MCP:{}] {}",
+                    self.info.server_name, self.info.description
+                )
             },
             parameters: self.info.input_schema.clone(),
         }

@@ -143,17 +143,14 @@ impl LlmProvider for OllamaProvider {
         // Pass tool definitions to Ollama (supported since v0.3+)
         if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {
-                body["tools"] = json!(tool_defs
-                    .iter()
-                    .map(|td| json!({
-                        "type": "function",
-                        "function": {
-                            "name": td.name,
-                            "description": td.description,
-                            "parameters": td.parameters,
-                        }
-                    }))
-                    .collect::<Vec<_>>());
+                body["tools"] = json!(tool_defs.iter().map(|td| json!({
+                    "type": "function",
+                    "function": {
+                        "name": td.name,
+                        "description": td.description,
+                        "parameters": td.parameters,
+                    }
+                })).collect::<Vec<_>>());
             }
         }
 
@@ -250,7 +247,7 @@ impl LlmProvider for OllamaProvider {
                                             id: call_id,
                                             name: tc.function.name.clone(),
                                             arguments: args,
-                                        },
+                                        }
                                     )));
                                 }
                             }

@@ -28,10 +28,7 @@ static MODE: AtomicU8 = AtomicU8::new(MODE_DARK);
 /// Switch the palette. Idempotent. Call once during startup before the
 /// first markdown / highlight emission.
 pub fn set_theme_mode(light: bool) {
-    MODE.store(
-        if light { MODE_LIGHT } else { MODE_DARK },
-        Ordering::Relaxed,
-    );
+    MODE.store(if light { MODE_LIGHT } else { MODE_DARK }, Ordering::Relaxed);
 }
 
 #[inline]
@@ -71,11 +68,7 @@ pub const RESET: &str = "\x1b[0m";
 /// on white in most light-theme terminal profiles; blue still maps to a
 /// dark, readable variant on light profiles.
 pub fn md_heading_open() -> &'static str {
-    if is_light() {
-        "\x1b[1;34m"
-    } else {
-        "\x1b[1;96m"
-    }
+    if is_light() { "\x1b[1;34m" } else { "\x1b[1;96m" }
 }
 
 /// Close heading: bold off + fg default (SGR 22;39). Theme-invariant.
@@ -86,11 +79,7 @@ pub const MD_HEADING_CLOSE: &str = "\x1b[22;39m";
 /// `light`: bold + standard magenta (SGR 1;35) — distinct from headings,
 /// terminal profiles map 35 to a dark magenta that's readable on white.
 pub fn md_inline_code_open() -> &'static str {
-    if is_light() {
-        "\x1b[1;35m"
-    } else {
-        "\x1b[1;96m"
-    }
+    if is_light() { "\x1b[1;35m" } else { "\x1b[1;96m" }
 }
 
 /// Close inline code: bold off + fg default. Theme-invariant.

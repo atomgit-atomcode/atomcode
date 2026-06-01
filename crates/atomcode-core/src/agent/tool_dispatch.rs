@@ -125,11 +125,7 @@ impl AgentLoop {
                         }
                     }
                 }
-                if let Some(pos) = output
-                    .find("Wrote ")
-                    .or_else(|| output.find("Overwrote "))
-                    .or_else(|| output.find("Created new file "))
-                {
+                if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")).or_else(|| output.find("Created new file ")) {
                     let keyword_len = if output[pos..].starts_with("Overwrote ") {
                         10
                     } else if output[pos..].starts_with("Created new file ") {

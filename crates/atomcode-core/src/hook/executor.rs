@@ -46,7 +46,11 @@ impl HookExecutor {
     /// If any hook returns `Modify`, the last `Modify` wins.
     /// If a hook times out, crashes, or produces non-JSON output, it degrades
     /// to `Allow` (the tool call is not disrupted).
-    pub async fn run_pre_tool_use(&self, tool_name: &str, ctx: &HookContext) -> PreHookResult {
+    pub async fn run_pre_tool_use(
+        &self,
+        tool_name: &str,
+        ctx: &HookContext,
+    ) -> PreHookResult {
         let matched = matching_hooks(&self.hooks, HookEvent::PreToolUse, Some(tool_name));
         if matched.is_empty() {
             return PreHookResult::Allow;
@@ -260,7 +264,8 @@ impl HookExecutor {
         hook: &HookConfig,
         ctx: &HookContext,
     ) -> anyhow::Result<String> {
-        let ctx_json = serde_json::to_string(ctx).unwrap_or_else(|_| "{}".to_string());
+        let ctx_json =
+            serde_json::to_string(ctx).unwrap_or_else(|_| "{}".to_string());
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
@@ -384,7 +389,11 @@ mod tests {
 
     #[tokio::test]
     async fn hook_timeout_degrades_to_allow() {
-        let mut hook = make_hook(HookEvent::PreToolUse, Some("bash"), "sleep 10");
+        let mut hook = make_hook(
+            HookEvent::PreToolUse,
+            Some("bash"),
+            "sleep 10",
+        );
         hook.timeout_ms = 100; // 100 ms timeout
         let exec = HookExecutor::new(vec![hook]);
         let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
@@ -402,7 +411,11 @@ mod tests {
 
     #[tokio::test]
     async fn user_prompt_plain_stdout_injects_context() {
-        let hook = make_hook(HookEvent::UserPromptSubmit, None, "echo extra-info");
+        let hook = make_hook(
+            HookEvent::UserPromptSubmit,
+            None,
+            "echo extra-info",
+        );
         let exec = HookExecutor::new(vec![hook]);
         let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
         assert_eq!(r, UserPromptHookResult::Inject("extra-info".into()));
@@ -434,7 +447,11 @@ mod tests {
 
     #[tokio::test]
     async fn user_prompt_nonzero_exit_blocks_with_stderr() {
-        let hook = make_hook(HookEvent::UserPromptSubmit, None, "echo bad >&2; exit 1");
+        let hook = make_hook(
+            HookEvent::UserPromptSubmit,
+            None,
+            "echo bad >&2; exit 1",
+        );
         let exec = HookExecutor::new(vec![hook]);
         let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
         assert_eq!(r, UserPromptHookResult::Block("bad".into()));
@@ -493,7 +510,11 @@ mod tests {
 
     #[tokio::test]
     async fn hook_crash_degrades_to_allow() {
-        let hook = make_hook(HookEvent::PreToolUse, Some("bash"), "exit 1");
+        let hook = make_hook(
+            HookEvent::PreToolUse,
+            Some("bash"),
+            "exit 1",
+        );
         let exec = HookExecutor::new(vec![hook]);
         let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
         assert_eq!(result, PreHookResult::Allow);
@@ -503,7 +524,11 @@ mod tests {
 
     #[tokio::test]
     async fn post_tool_use_fire_and_forget() {
-        let hook = make_hook(HookEvent::PostToolUse, Some("bash"), "echo done");
+        let hook = make_hook(
+            HookEvent::PostToolUse,
+            Some("bash"),
+            "echo done",
+        );
         let exec = HookExecutor::new(vec![hook]);
         // Should not panic or propagate errors.
         exec.run_post_tool_use("bash", &test_ctx()).await;

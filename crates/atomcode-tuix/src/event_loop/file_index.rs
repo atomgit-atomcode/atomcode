@@ -26,7 +26,8 @@ use ignore::WalkBuilder;
 /// 4. Token = characters from `@`'s next byte to the next whitespace
 ///    (or EOF), including bytes after cursor.
 pub fn detect_at_mention(buf: &str, cursor: usize) -> Option<String> {
-    detect_at_mention_range(buf, cursor).map(|(at_pos, end)| buf[at_pos + 1..end].to_string())
+    detect_at_mention_range(buf, cursor)
+        .map(|(at_pos, end)| buf[at_pos + 1..end].to_string())
 }
 
 /// Companion to `detect_at_mention`. Returns the byte range
@@ -367,46 +368,14 @@ mod tests {
         FileIndex::from_entries(
             PathBuf::from("/tmp"),
             vec![
-                Entry {
-                    rel_path: "Cargo.toml".into(),
-                    is_dir: false,
-                    depth: 1,
-                },
-                Entry {
-                    rel_path: "crates/".into(),
-                    is_dir: true,
-                    depth: 1,
-                },
-                Entry {
-                    rel_path: "docker/".into(),
-                    is_dir: true,
-                    depth: 1,
-                },
-                Entry {
-                    rel_path: ".atomcode/".into(),
-                    is_dir: true,
-                    depth: 1,
-                },
-                Entry {
-                    rel_path: "crates/atomcode-cli/".into(),
-                    is_dir: true,
-                    depth: 2,
-                },
-                Entry {
-                    rel_path: "crates/atomcode-tuix/".into(),
-                    is_dir: true,
-                    depth: 2,
-                },
-                Entry {
-                    rel_path: "crates/atomcode-tuix/Cargo.toml".into(),
-                    is_dir: false,
-                    depth: 3,
-                },
-                Entry {
-                    rel_path: "docker/Dockerfile".into(),
-                    is_dir: false,
-                    depth: 2,
-                },
+                Entry { rel_path: "Cargo.toml".into(), is_dir: false, depth: 1 },
+                Entry { rel_path: "crates/".into(), is_dir: true, depth: 1 },
+                Entry { rel_path: "docker/".into(), is_dir: true, depth: 1 },
+                Entry { rel_path: ".atomcode/".into(), is_dir: true, depth: 1 },
+                Entry { rel_path: "crates/atomcode-cli/".into(), is_dir: true, depth: 2 },
+                Entry { rel_path: "crates/atomcode-tuix/".into(), is_dir: true, depth: 2 },
+                Entry { rel_path: "crates/atomcode-tuix/Cargo.toml".into(), is_dir: false, depth: 3 },
+                Entry { rel_path: "docker/Dockerfile".into(), is_dir: false, depth: 2 },
             ],
         )
     }
@@ -441,7 +410,11 @@ mod tests {
         let result = idx.filter("", "tuix");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         // Should include the depth-2 dir even though we filtered from root.
-        assert!(names.contains(&"crates/atomcode-tuix/"), "got: {:?}", names);
+        assert!(
+            names.contains(&"crates/atomcode-tuix/"),
+            "got: {:?}",
+            names
+        );
     }
 
     #[test]

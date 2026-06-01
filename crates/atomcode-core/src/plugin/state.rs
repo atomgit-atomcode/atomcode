@@ -12,10 +12,7 @@ pub struct MarketplacesFile {
 
 impl Default for MarketplacesFile {
     fn default() -> Self {
-        Self {
-            version: 1,
-            marketplaces: BTreeMap::new(),
-        }
+        Self { version: 1, marketplaces: BTreeMap::new() }
     }
 }
 
@@ -37,10 +34,7 @@ pub struct InstalledPluginsFile {
 
 impl Default for InstalledPluginsFile {
     fn default() -> Self {
-        Self {
-            version: 1,
-            plugins: BTreeMap::new(),
-        }
+        Self { version: 1, plugins: BTreeMap::new() }
     }
 }
 
@@ -57,9 +51,10 @@ pub fn load_marketplaces_file(path: &Path) -> Result<MarketplacesFile> {
     if !path.exists() {
         return Ok(MarketplacesFile::default());
     }
-    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let parsed: MarketplacesFile =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let parsed: MarketplacesFile = serde_json::from_str(&raw)
+        .with_context(|| format!("parse {}", path.display()))?;
     Ok(parsed)
 }
 
@@ -76,9 +71,10 @@ pub fn load_installed_plugins_file(path: &Path) -> Result<InstalledPluginsFile> 
     if !path.exists() {
         return Ok(InstalledPluginsFile::default());
     }
-    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let parsed: InstalledPluginsFile =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let parsed: InstalledPluginsFile = serde_json::from_str(&raw)
+        .with_context(|| format!("parse {}", path.display()))?;
     Ok(parsed)
 }
 
