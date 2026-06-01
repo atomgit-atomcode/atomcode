@@ -918,10 +918,9 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
   } else if (tool.status === 'pending') {
     annotation = { cls: 'pending', label: t('tool.running') };
   } else if (tool.status === 'done') {
-    annotation = {
-      cls: 'success',
-      label: tool.duration_ms != null ? `${(tool.duration_ms / 1000).toFixed(2)}s` : t('tool.done'),
-    };
+    // 统一用状态词「完成」，不再显示耗时——否则实时执行时右侧是耗时（0.00s），
+    // 刷新后历史快照不带 duration_ms 又变「完成」，两处不一致。
+    annotation = { cls: 'success', label: t('tool.done') };
   } else if (tool.status === 'error') {
     annotation = { cls: 'error', label: t('tool.failed') };
   }
