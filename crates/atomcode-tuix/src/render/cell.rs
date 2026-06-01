@@ -132,7 +132,13 @@ impl Cell {
 /// Fixed soft-tab width — `\t` expands to this many spaces when a
 /// caller pushes a string that slipped past higher-level tab-aware
 /// paths. Matches claude-code / CC-style tooling conventions.
-const SOFT_TAB_WIDTH: usize = 4;
+///
+/// `pub(crate)` so width-measurement code (`width::wrap_with_cursor`,
+/// the input-box cursor mapping) models a `\t` as exactly this many
+/// columns, matching how [`push_str_cells`] actually draws it. A
+/// mismatch here desyncs the input caret from the text on tab-indented
+/// (pasted) lines.
+pub(crate) const SOFT_TAB_WIDTH: usize = 4;
 
 /// Append each char of `s` as cells, all sharing `style`. Wide chars
 /// (CJK, emoji, etc.) expand to one real cell carrying the glyph +

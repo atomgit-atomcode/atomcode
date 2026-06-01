@@ -208,6 +208,19 @@ pub fn wrap_with_cursor(
     let mut cursor_col = 0usize;
     let mut cursor_set = false;
 
+    // Display width of one grapheme in the SAME model the renderer uses.
+    // A `\t` is drawn by `push_str_cells` as SOFT_TAB_WIDTH spaces, so it
+    // must be measured as that many columns here — otherwise the input
+    // caret renders SOFT_TAB_WIDTH cols left of the real insertion point
+    // on every tab-indented (pasted) line. `cluster_width('\t')` is 0.
+    let cell_w = |g: &str| -> usize {
+        if g == "\t" {
+            crate::render::cell::SOFT_TAB_WIDTH
+        } else {
+            cluster_width(g)
+        }
+    };
+
     // Walk grapheme-by-grapheme so emoji clusters / CJK don't get
     // split mid-cluster at the wrap point. Honours explicit `\n` (a
     // single-codepoint, single-grapheme entity) as a hard break.
@@ -219,7 +232,7 @@ pub fn wrap_with_cursor(
         // `max_cols` on the old row (which would overlap the right
         // border).
         if !is_newline {
-            let w = cluster_width(g);
+            let w = cell_w(g);
             if col + w > max_cols && !lines.last().unwrap().is_empty() {
                 lines.push(String::new());
                 col = 0;
@@ -234,7 +247,7 @@ pub fn wrap_with_cursor(
             lines.push(String::new());
             col = 0;
         } else {
-            let w = cluster_width(g);
+            let w = cell_w(g);
             lines.last_mut().unwrap().push_str(g);
             col += w;
         }
@@ -473,6 +486,23 @@ mod tests {
         // char 好 (w=2) would overflow 2+2=4>3, so wrap).
         let (lines, _, _) = wrap_with_cursor("你好", 3, 0);
         assert_eq!(lines, vec!["你".to_string(), "好".to_string()]);
+    }
+
+    #[test]
+    fn wrap_with_cursor_tab_counts_as_soft_tab_width() {
+        // Pasted, tab-indented code: a `\t` is DRAWN as SOFT_TAB_WIDTH (4)
+        // columns by `push_str_cells`, so the cursor-column model must agree.
+        // Regression: tabs were measured as 0 cols, so the caret rendered
+        // SOFT_TAB_WIDTH columns left of the real insertion point on every
+        // tab-indented line.
+        let tab_w = crate::render::cell::SOFT_TAB_WIDTH;
+        // Two physical lines; the 2nd is indented with two tabs then "cd".
+        let text = "ab\n\t\tcd";
+        let (lines, row, col) = wrap_with_cursor(text, 80, text.len());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(row, 1, "cursor on the 2nd line");
+        // end-of-line column = 2 tabs * tab_w + width("cd")
+        assert_eq!(col, tab_w * 2 + 2);
     }
 
     // --- truncate_path tests ---
