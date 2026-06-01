@@ -645,6 +645,18 @@ pub enum Msg<'a> {
         total_tokens: usize,
     },
 
+    /// Turn-end summary when the turn terminated in an error (the red
+    /// error line is rendered separately, just above this). Same stats
+    /// as `TurnSummary` but with a ✗ marker and a neutral "stopped"
+    /// label instead of a celebratory verb — otherwise an errored turn
+    /// reads as `✓ Nailed it` right under its own error message.
+    TurnSummaryError {
+        turn_count: usize,
+        tool_call_count: usize,
+        duration: &'a str,
+        total_tokens: usize,
+    },
+
     // ── OAuth login chrome (/login + /codingplan share these) ──
     /// Header above the QR block when scanning with WeChat is the
     /// expected flow. Includes the leading "  " indent and trailing

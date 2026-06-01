@@ -6206,16 +6206,30 @@ fn handle_agent_event(
             );
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
-            let done = state.next_done_label();
             let dur = crate::render::fmt_dur(duration);
-            let label = crate::i18n::t(crate::i18n::Msg::TurnSummary {
-                done,
-                turn_count,
-                tool_call_count,
-                duration: &dur,
-                total_tokens,
-            })
-            .into_owned();
+            // An errored turn already rendered a red Error line just above;
+            // showing a celebratory "✓ Nailed it" separator under it is
+            // contradictory. Use the ✗ "stopped" summary instead, and don't
+            // burn a DONE_LABELS rotation slot on a failure.
+            let label = if matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error) {
+                crate::i18n::t(crate::i18n::Msg::TurnSummaryError {
+                    turn_count,
+                    tool_call_count,
+                    duration: &dur,
+                    total_tokens,
+                })
+                .into_owned()
+            } else {
+                let done = state.next_done_label();
+                crate::i18n::t(crate::i18n::Msg::TurnSummary {
+                    done,
+                    turn_count,
+                    tool_call_count,
+                    duration: &dur,
+                    total_tokens,
+                })
+                .into_owned()
+            };
             renderer.render(UiLine::TurnSeparator { label });
             renderer.flush();
             state.on_turn_complete();
