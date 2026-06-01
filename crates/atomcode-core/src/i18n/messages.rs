@@ -267,6 +267,12 @@ pub enum Msg<'a> {
     IdleHintCodingplanSuffix,
     /// Complete plain-text version: "/codingplan  to claim a free token quota"
     IdleHintCodingplanFull,
+    /// "/webui" command label
+    IdleHintWebui,
+    /// "open a synced session in the browser" (text after /webui)
+    IdleHintWebuiSuffix,
+    /// Complete plain-text version: "/webui  open a synced session in the browser"
+    IdleHintWebuiFull,
 
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,

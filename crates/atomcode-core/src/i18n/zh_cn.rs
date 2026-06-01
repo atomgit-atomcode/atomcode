@@ -356,6 +356,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "领取免费 Token 额度".into(),
         Msg::IdleHintCodingplanFull =>
             "使用 /login 领取免费 Token 额度".into(),
+        Msg::IdleHintWebui => "/webui".into(),
+        Msg::IdleHintWebuiSuffix =>
+            "在浏览器中同步会话".into(),
+        Msg::IdleHintWebuiFull =>
+            "使用 /webui 在浏览器中同步会话".into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>

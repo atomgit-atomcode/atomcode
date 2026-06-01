@@ -366,6 +366,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "to claim a free token quota".into(),
         Msg::IdleHintCodingplanFull =>
             "/login  to claim a free token quota".into(),
+        Msg::IdleHintWebui => "/webui".into(),
+        Msg::IdleHintWebuiSuffix =>
+            "open a synced session in the browser".into(),
+        Msg::IdleHintWebuiFull =>
+            "/webui  open a synced session in the browser".into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>
