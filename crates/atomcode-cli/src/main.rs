@@ -500,7 +500,7 @@ struct Cli {
     /// --dangerously-skip-permissions. The TUI shows a red ⚠ BYPASS
     /// badge while active. Use in CI/CD, eval harnesses, or when you
     /// trust the agent's built-in safety constraints.
-    #[arg(long = "dangerously-skip-permissions", visible_aliases = ["y"], default_value_t = false)]
+    #[arg(short = 'y', long = "dangerously-skip-permissions", default_value_t = false)]
     pub dangerously_skip_permissions: bool,
 }
 
