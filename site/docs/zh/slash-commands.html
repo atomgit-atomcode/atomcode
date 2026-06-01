@@ -145,10 +145,12 @@
         <tbody>
           <tr><td><code>/setup</code></td><td>第一次执行时,把内置的 <code>atomcode-automation-recommender</code> skill 解压到 <code>~/.atomcode/skills/</code>,在项目 <code>.gitignore</code> 追加 <code>.atomcode/local/</code>,并写 <code>.atomcode/setup-state.json</code>(signals 哈希 + atomcode 版本 + 已安装列表),全程持项目级锁。然后自动调用 recommender skill — 它会扫描项目(语言、框架、已有 hook 等)、联网检索并推荐适合该代码库的其他 atomcode skill 安装。后续执行会跳过 seed 安装、直接重跑 skill。命令后跟的文字会作为 steering 传给 skill,例如 <code>/setup 重点关注测试</code>。CLI 形式 <code>atomcode setup --force</code> 会按内容哈希强制重装 seed 文件</td></tr>
           <tr><td><code>/skills</code></td><td>浏览当前已加载的 skills(项目级 + 用户级)。每个 skill 也会以独立的斜杠命令形式出现在补全菜单里,可以直接 <code>/&lt;skill-name&gt;</code> 触发</td></tr>
-          <tr><td><code>/plugin marketplace</code></td><td>打开插件市场浏览器,从已注册的 marketplace 中挑选并安装</td></tr>
+          <tr><td><code>/plugin</code></td><td>打开交互式插件管理器,可浏览 marketplace、安装/卸载插件、添加/移除 marketplace</td></tr>
+          <tr><td><code>/plugin marketplace add|remove|update|list</code></td><td>管理 marketplace 注册(add 克隆 git 仓库,remove 移除,update 拉最新,list 列出)</td></tr>
           <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>从指定 marketplace 安装插件</td></tr>
           <tr><td><code>/plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>卸载已安装的插件(保留 marketplace 注册)</td></tr>
           <tr><td><code>/plugin list</code></td><td>列出本地已安装的插件</td></tr>
+          <tr><td><code>/plugin reload</code></td><td>重新加载所有插件(扫描磁盘变更、刷新 skill/hook 注册)</td></tr>
         </tbody>
       </table>
       <p>详细配置与使用见 <a href="./skills.html">Skills 扩展</a> 和 <a href="./plugins.html">Plugin 系统</a>。</p>

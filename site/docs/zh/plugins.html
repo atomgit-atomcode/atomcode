@@ -80,9 +80,37 @@
         <li><strong>Skill / 命令 / Hook</strong> —— plugin 安装后会贡献的三类资产。skill 与命令带 <code>plugin-name:</code> 命名空间(避免冲突),hook 按事件触发。</li>
       </ul>
 
+      <h2>命令速查</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/plugin</code></td><td>打开<strong>交互式插件管理器</strong>(上/下选择,回车确认,Esc 返回),可在里面浏览 marketplace、安装/卸载插件、添加/移除 marketplace</td></tr>
+          <tr><td><code>/plugin marketplace add &lt;url&gt;</code></td><td>克隆一个 git 仓库并注册为 marketplace</td></tr>
+          <tr><td><code>/plugin marketplace remove &lt;name&gt;</code></td><td>移除已注册的 marketplace(若其下还有已装插件会拒绝)</td></tr>
+          <tr><td><code>/plugin marketplace update &lt;name&gt;</code></td><td>拉取该 marketplace 仓库的最新提交,刷新可用插件列表</td></tr>
+          <tr><td><code>/plugin marketplace list</code></td><td>列出所有已注册的 marketplace</td></tr>
+          <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>从指定 marketplace 安装一个插件</td></tr>
+          <tr><td><code>/plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>卸载已安装的插件(保留 marketplace 注册)</td></tr>
+          <tr><td><code>/plugin list</code></td><td>列出本地已安装的所有插件</td></tr>
+          <tr><td><code>/plugin reload</code></td><td>重新加载所有插件(扫描磁盘变更、刷新 skill/hook 注册)</td></tr>
+        </tbody>
+      </table>
+
       <h2>装一个 plugin</h2>
 
-      <h3>方式 1:TUI 内</h3>
+      <h3>方式 1:交互式管理器(推荐)</h3>
+      <p>在 TUI 中直接输入 <code>/plugin</code>(不带任何子命令),会打开一个全屏交互式管理器。通过方向键导航、回车确认:</p>
+      <pre><code>/plugin
+# → 打开管理器主菜单:
+#   Browse &amp; install    — 浏览 marketplace 中的插件,回车安装/卸载
+#   Add marketplace…   — 输入 git URL 添加新 marketplace
+#   Remove marketplace… — 选择并移除已注册的 marketplace
+#   Installed (N)      — 查看已安装插件列表,回车卸载</code></pre>
+      <p>安装插件时,已安装的会显示 ✓ 标记,回车即可切换安装/卸载。克隆和安装是异步的,操作期间底部会显示状态提示,完成后列表自动刷新。</p>
+
+      <h3>方式 2:命令行子命令</h3>
       <pre><code># 1. 注册 marketplace(克隆其 git 仓库到本地)
 /plugin marketplace add https://gitcode.com/gmq123/ascend-model-agent-plugin
 
@@ -92,7 +120,7 @@
 # 3. 列出已装
 /plugin list</code></pre>
 
-      <h3>方式 2:CLI</h3>
+      <h3>方式 3:CLI</h3>
       <pre><code>atomcode plugin marketplace add &lt;git-url&gt;
 atomcode plugin install &lt;plugin&gt;@&lt;marketplace&gt;
 atomcode plugin list
