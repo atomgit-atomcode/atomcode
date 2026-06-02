@@ -272,12 +272,21 @@ pub fn build_messages(
     // `HELLO_TEST_12345` bug where fixed-window stubbing could clip
     // the in-flight turn).
     //
-    // Threshold = min(budget × 70%, 100K chars). The 100K cap keeps
-    // long-session token savings (kicks in around ~25K tokens of
-    // history); the 70%-of-budget floor protects small-context models
-    // from compacting too eagerly.
-    let microcompact_threshold =
-        ((token_budget as u64 * 4 * 70 / 100) as usize).min(100_000);
+    // Threshold = budget × 70% (in chars, ≈ tokens × 4). Scales with the
+    // window so microcompact only fires when the conversation genuinely
+    // approaches the budget.
+    //
+    // This used to be `.min(100_000)` — a fixed 100K-char (~25K-token) cap
+    // that ignored the window. On a large (e.g. 1M) window it made
+    // microcompact stub old tool_results at just ~25K tokens, and because
+    // the "keep recent N turns" boundary slides as the conversation grows,
+    // it kept REWRITING already-sent history bytes — breaking the provider
+    // prompt-prefix cache mid-conversation (cache collapsed back to the
+    // system prompt; measured ~12% hit on the breaking turn). Scaling with
+    // the window keeps the rendered prefix append-only for the whole
+    // session on a roomy window. Same rationale as the budget-gated
+    // task-boundary compaction. See `microcompact_scales_with_window`.
+    let microcompact_threshold = (token_budget as u64 * 4 * 70 / 100) as usize;
     microcompact(&mut result, conv.messages.len(), microcompact_threshold);
 
     replace_stale_reads(&mut result);
@@ -2929,6 +2938,73 @@ mod tests {
             "low threshold (25K > 10K) must shrink tool_result bytes, before={} after={}",
             before_low_bytes,
             after_low_bytes
+        );
+    }
+
+    /// Regression for the prefix-break dive: the microcompact threshold
+    /// must scale with the window, not be capped at a fixed 100K chars.
+    /// On a large (1M) window a far-under-budget conversation must NOT get
+    /// its old tool_results stubbed — stubbing rewrites already-sent prefix
+    /// bytes and collapses the provider prompt-prefix cache mid-session
+    /// (observed ~12% hit on the breaking turn). A small window must still
+    /// microcompact so it doesn't blow its budget.
+    #[test]
+    fn microcompact_scales_with_window() {
+        use crate::conversation::message::MessageContent;
+        use crate::tool::{ToolCall, ToolResult};
+
+        // ~150K chars (~37K tokens) of `bash` output across 25 turns.
+        // `bash` (not `read_file`, which microcompact exempts) so stubbing
+        // is in scope.
+        let mut conv = Conversation::new();
+        for turn in 0..25 {
+            conv.add_user_message(&format!("task {}", turn));
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: format!("c{}", turn),
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", turn),
+                output: "x".repeat(6_000),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what?");
+
+        let tool_bytes = |msgs: &[Message]| -> usize {
+            msgs.iter()
+                .map(|m| match &m.content {
+                    MessageContent::ToolResult(r) => r.output.len(),
+                    _ => 0,
+                })
+                .sum()
+        };
+        let full = 25 * 6_000;
+
+        // 1M window: threshold ≈ 2.8M chars ≫ 150K → NO stubbing, prefix
+        // stays append-only. Under the old `.min(100_000)` cap this 150K
+        // conversation WOULD have been stubbed on a 1M window — the bug.
+        let (msgs_1m, _) = build_messages(&conv, "sys", 1_000_000, "");
+        assert_eq!(
+            tool_bytes(&msgs_1m),
+            full,
+            "1M window must not microcompact a far-under-budget conversation"
+        );
+
+        // Small window (50K): threshold ≈ 140K chars < 150K → microcompact
+        // still shrinks old tool_results. Drop path stays off (37K tokens <
+        // 80% of 50K = 40K), so the shrink is from stubbing, not dropping.
+        let (msgs_sm, _) = build_messages(&conv, "sys", 50_000, "");
+        assert!(
+            tool_bytes(&msgs_sm) < full,
+            "small window must still microcompact old tool_results (before={}, after={})",
+            full,
+            tool_bytes(&msgs_sm)
         );
     }
 
