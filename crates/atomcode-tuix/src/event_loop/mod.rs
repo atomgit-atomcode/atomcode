@@ -1762,6 +1762,59 @@ mod menu_tests {
         assert!(build_skill_menu_items(None, "").is_empty());
     }
 
+    #[test]
+    fn dollar_trigger_lists_all_user_invocable_skills() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        skills.register(skill_fixture("skills:hidden", "no", false));
+        let lock = std::sync::RwLock::new(skills);
+
+        let items = build_menu_items("$", 0, &reg, &custom, Some(&lock), None)
+            .expect("$ must list skills");
+        assert!(items.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "web-access"));
+        assert!(!items.iter().any(|(n, _)| n == "hidden"));
+        for (n, _) in &items {
+            assert!(!n.contains('/'), "row leaked slash syntax: {}", n);
+        }
+    }
+
+    #[test]
+    fn dollar_trigger_filters_and_parity_with_skills_submode() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        let bra = build_menu_items("$bra", 0, &reg, &custom, Some(&lock), None)
+            .expect("filter must match");
+        assert_eq!(bra.len(), 1);
+        assert_eq!(bra[0].0, "brainstorming");
+
+        let via_dollar = build_menu_items("$web", 0, &reg, &custom, Some(&lock), None);
+        let via_slash = build_menu_items("/skills web", 0, &reg, &custom, Some(&lock), None);
+        assert_eq!(via_dollar, via_slash);
+
+        assert!(build_menu_items("$zz", 0, &reg, &custom, Some(&lock), None).is_none());
+    }
+
+    #[test]
+    fn dollar_trigger_only_at_start_and_closes_on_space() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        assert!(build_menu_items("hi $bra", 0, &reg, &custom, Some(&lock), None).is_none());
+        assert!(build_menu_items("$brainstorming ", 0, &reg, &custom, Some(&lock), None).is_none());
+    }
+
     // Regression: HistoryPrev used to leave the cursor at end-of-text,
     // so a recalled `/session foo` from history would `is_in_history()`
     // true AND have the slash prefix — without the call-site gate, the
@@ -4367,6 +4420,19 @@ fn build_menu_items(
                 .map(|e| (e.rel_path, String::new()))
                 .collect(),
         );
+    }
+
+    // `$`-trigger skills picker. A fast shortcut to the `/skills` palette:
+    // `$` at the start of the buffer lists user-invocable skills under bare
+    // names; `$bra` filters. A space (user typing args) closes the menu, the
+    // same way `/skills <name> ` does. Shares `build_skill_menu_items` with
+    // the `/skills ` sub-mode so contents stay identical.
+    if let Some(after) = buf.strip_prefix('$') {
+        if after.contains(char::is_whitespace) {
+            return None;
+        }
+        let items = build_skill_menu_items(skill_registry, &after.to_ascii_lowercase());
+        return if items.is_empty() { None } else { Some(items) };
     }
 
     if !buf.starts_with('/') {
