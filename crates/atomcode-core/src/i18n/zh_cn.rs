@@ -703,6 +703,8 @@ Msg::PluginMgrInstallingLabel => "安装中…".into(),
             format!("列出插件失败：{error}").into(),
         Msg::PluginReloadDone { skills, warnings } =>
             format!("插件已重新加载：{skills} 个 skill，{warnings} 个警告").into(),
+        Msg::PluginGitNotFound =>
+            "💡 当前环境未安装 git 或 git 不在 PATH 中，插件市场自动安装和自动更新已禁用。请安装 git（macOS 可执行 `xcode-select --install`，Ubuntu 可执行 `sudo apt install git`）后重启 AtomCode。".into(),
         Msg::PluginMarketplaceAdded { name, commit, count } =>
             format!("✓ 已添加 marketplace `{name}`（commit {commit}，共 {count} 个插件）").into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
