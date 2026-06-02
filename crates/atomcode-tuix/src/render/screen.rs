@@ -232,9 +232,21 @@ impl Screen {
         // patch lands, hiding intermediate state entirely. Older
         // terminals ignore unknown DEC private modes per spec.
         let has_visible_work = cold_start || !patch_bytes.is_empty();
+        // Compute stale_vis before the first use (line 237's `?25l`).
+        let stale_vis = cold_start || Some(self.cursor_visible) != self.last_cursor_visible;
+        let stale_cursor = cold_start || self.cursor != self.last_cursor;
         let mut out = Vec::with_capacity(body.len() + 32);
         if has_visible_work {
-            out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+            out.extend_from_slice(b"\x1b[?2026h");
+            // Hide the cursor during the patch walk to prevent flicker.
+            // MUST pair with the stale_vis-guarded restore below; an
+            // unconditional hide with conditional restore leaves the
+            // cursor permanently invisible on non-DECSET-2026 terminals
+            // after the first frame (frame 2+ hide unconditionally but
+            // never restore because stale_vis=false).
+            if stale_vis {
+                out.extend_from_slice(b"\x1b[?25l");
+            }
         }
         out.extend_from_slice(&body);
         // Diff-suppressed CUP: only jump the physical cursor when the
@@ -246,7 +258,6 @@ impl Screen {
         // the cursor at the input box — without this guard every tick
         // emits CUP back to the same (row,col), causing a 10Hz refresh
         // storm on the input row even when nothing changed there.
-        let stale_cursor = cold_start || self.cursor != self.last_cursor;
         if stale_cursor {
             if let Some((r, c)) = self.cursor {
                 let _ = write!(&mut out, "\x1b[{};{}H", r, c);
@@ -259,7 +270,6 @@ impl Screen {
         // `paint_footer` and keeps it hidden — re-sending `?25l`
         // on every frame is harmless for compliant DEC terminals
         // but can trigger unnecessary repaint cycles on some hosts.
-        let stale_vis = cold_start || Some(self.cursor_visible) != self.last_cursor_visible;
         if stale_vis {
             if self.cursor_visible {
                 out.extend_from_slice(b"\x1b[?25h");
