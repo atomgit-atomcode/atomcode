@@ -129,6 +129,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  // AI 执行中输入的消息排队于此，待当前回合 done 后依次自动发送（对齐 VSCode 插件）。
+  const [queued, setQueued] = useState<{ id: number; text: string; images?: ImageData[] }[]>([]);
+  const queueIdRef = useRef(0);
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
@@ -514,11 +517,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
 
       case 'stopped':
         setBusy(false);
+        setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
         break;
 
       case 'error':
         appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
         setBusy(false);
+        setQueued([]); // 出错：丢弃排队消息
         break;
 
       default:
@@ -527,17 +532,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
     }
   }
 
-  async function sendMessage() {
-    const text = input.trim();
-    const images = pendingImages;
-    if ((!text && images.length === 0) || busy) return;
-
-    setInput('');
-    setPendingImages([]);
-    // 重置输入框高度：清空 value 不会复位之前 auto-resize 撑高的内联 height
-    if (textareaRef.current) textareaRef.current.style.height = 'auto';
-    setHistoryHint(null);
-
+  // 实际投递一条消息（同步 / 常规两条路径）；busy 由各自的事件流复位。
+  async function deliver(text: string, images: ImageData[]) {
     if (sync) {
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
@@ -546,7 +542,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       return;
     }
 
-    // ── Normal path (unchanged) ──
+    // ── Normal path ──
     setBusy(true);
 
     // Push user message + empty assistant placeholder
@@ -577,10 +573,45 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
         appendToLastAssistant('\n\n' + t('chat.connError', { msg }));
       }
       setBusy(false);
+      setQueued([]); // 连接错误：与 stopped/error 一致，丢弃排队消息
     } finally {
       abortRef.current = null;
     }
   }
+
+  function sendMessage() {
+    const text = input.trim();
+    const images = pendingImages;
+    if (!text && images.length === 0) return;
+
+    // 清空输入框（无论立即发送还是排队）。
+    setInput('');
+    setPendingImages([]);
+    // 重置输入框高度：清空 value 不会复位之前 auto-resize 撑高的内联 height
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    setHistoryHint(null);
+
+    // AI 执行中：排队，待当前回合 done 后由 drain effect 依次自动发送。
+    if (busy) {
+      setQueued((q) => [
+        ...q,
+        { id: queueIdRef.current++, text, images: images.length ? images : undefined },
+      ]);
+      return;
+    }
+
+    void deliver(text, images);
+  }
+
+  // 当前回合结束(done)后，依次发送排队消息；stopped/error/连接错误已清空队列。
+  useEffect(() => {
+    if (busy || queued.length === 0) return;
+    const next = queued[0];
+    setQueued((q) => q.slice(1));
+    void deliver(next.text, next.images ?? []);
+    // deliver 为组件内函数声明，闭包始终取最新渲染值；仅以 busy/queued 触发。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, queued]);
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.isComposing) return;
@@ -906,7 +937,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
         rows={2}
         placeholder={t('chat.inputPlaceholder')}
         value={input}
-        disabled={busy}
         onInput={handleInput}
         onKeyDown={handleKeyDown}
         onPaste={handlePaste}
@@ -934,9 +964,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
         )}
         <ModelSelector value={provider} onChange={setProvider} />
         {busy ? (
-          <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
-            <span class="stop-square" />
-          </button>
+          <>
+            {/* 执行中仍可发送：按下即排队，当前回合结束后自动发出。 */}
+            {(input.trim() || pendingImages.length > 0) && (
+              <button
+                class="btn-send"
+                onClick={sendMessage}
+                title={t('chat.queue')}
+                aria-label={t('chat.queue')}
+              >
+                ↑
+              </button>
+            )}
+            <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
+              <span class="stop-square" />
+            </button>
+          </>
         ) : (
           <button
             class="btn-send"
@@ -1064,6 +1107,33 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
             </div>
           );
         })}
+
+        {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，可点 × 撤回。 */}
+        {queued.map((q) => (
+          <div key={`q-${q.id}`} class="user-message-wrapper queued">
+            <div class="user-message-bubble">
+              {q.images && q.images.length > 0 && (
+                <div class="msg-images">
+                  {q.images.map((img, i) => (
+                    <img key={i} class="msg-image" src={imageDataUrl(img)} alt="" />
+                  ))}
+                </div>
+              )}
+              <div class="queued-head">
+                <span class="queued-tag">{t('chat.queued')}</span>
+                <button
+                  class="queued-remove"
+                  onClick={() => setQueued((arr) => arr.filter((x) => x.id !== q.id))}
+                  title={t('chat.removeQueued')}
+                  aria-label={t('chat.removeQueued')}
+                >
+                  ×
+                </button>
+              </div>
+              {q.text}
+            </div>
+          </div>
+        ))}
 
         <div ref={bottomRef} />
       </div>

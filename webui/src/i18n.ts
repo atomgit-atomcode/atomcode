@@ -62,6 +62,9 @@ const zh = {
   'chat.inputPlaceholder': '输入消息，Enter 发送，Shift+Enter 换行…',
   'chat.stop': '停止',
   'chat.send': '发送',
+  'chat.queue': '排队发送（当前回合结束后自动发送）',
+  'chat.queued': '排队中',
+  'chat.removeQueued': '移除',
   'chat.error': '[错误: {msg}]',
   'chat.connError': '[连接错误: {msg}]',
 
@@ -243,6 +246,9 @@ const en: Record<MsgKey, string> = {
   'chat.inputPlaceholder': 'Type a message — Enter to send, Shift+Enter for newline…',
   'chat.stop': 'Stop',
   'chat.send': 'Send',
+  'chat.queue': 'Queue message (sent after the current turn finishes)',
+  'chat.queued': 'Queued',
+  'chat.removeQueued': 'Remove',
   'chat.error': '[Error: {msg}]',
   'chat.connError': '[Connection error: {msg}]',
 

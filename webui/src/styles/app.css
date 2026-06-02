@@ -293,6 +293,38 @@ body {
   font-weight: 400;
 }
 
+/* 排队中的用户消息：弱化显示，附「排队中」标签与撤回按钮。 */
+.user-message-wrapper.queued .user-message-bubble {
+  opacity: 0.7;
+  border-style: dashed;
+}
+.queued-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.queued-tag {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-brand), transparent 82%);
+  color: var(--app-brand);
+}
+.queued-remove {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.queued-remove:hover { color: var(--app-primary-foreground); }
+
 /* 技能/文档型用户消息折叠徽章：把 TUI 注入的整段 SKILL.md 收起为一行 */
 .skill-badge {
   display: inline-flex;
