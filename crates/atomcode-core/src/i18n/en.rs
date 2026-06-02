@@ -133,6 +133,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Image in clipboard · ctrl+v to paste".into(),
         Msg::StatusClipboardImageHintSlash =>
             "Image in clipboard · /paste".into(),
+        Msg::StatusWebuiHint =>
+            "Tips: Use /webui to open AtomCode in your browser".into(),
 
         // ── /status command body ──
         Msg::StatusBody { model, dir, config, tokens } =>

@@ -134,6 +134,10 @@ pub enum Msg<'a> {
     /// user to fall back on the `/paste` slash command, which works
     /// in every terminal regardless of host keybinds.
     StatusClipboardImageHintSlash,
+    /// Lowest-priority status-row fallback: nudge the user toward the
+    /// `/webui` command (browser UI) when no higher-priority hint
+    /// (warnings / usage / upgrade) is competing for the slot.
+    StatusWebuiHint,
 
     // ── /status command body ──
     StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },

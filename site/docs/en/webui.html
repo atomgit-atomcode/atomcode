@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Remote Access · AtomCode Docs</title>
-<meta name="description" content="Reach the AtomCode webui from your phone over the 蒲公英 (Oray PGY) private network — install, bind the virtual IP, scan to connect, and security notes.">
+<title>Web UI · AtomCode Docs</title>
+<meta name="description" content="AtomCode's browser interface: launch with /webui, chat and manage sessions and model config in the browser, and mirror a session live across devices with /sync.">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <link rel="stylesheet" href="../docs.css">
 <script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
 </head>
-<body data-page="webui-remote-access">
+<body data-page="webui">
 
 <header class="dhdr" id="dhdr">
   <a class="dhdr-logo" href="../../index.html">
@@ -72,81 +72,58 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Remote Access</h1>
-      <p class="lede">By default the AtomCode webui only listens on loopback (<code>127.0.0.1</code>), so your phone and other devices can't reach it. With a virtual LAN built by <strong>蒲公英 (Oray PGY)</strong> you can open the webui from a phone or tablet securely — no public IP, nothing exposed to the internet. This page walks through the full connection flow and the security notes.</p>
+<h1>Web UI</h1>
+      <p class="lede">Besides the terminal TUI, AtomCode ships a built-in <strong>browser interface</strong>: type <code>/webui</code> in the TUI to launch it, then chat, browse session history, add/edit/delete model providers, and upload images in the browser — and use <code>/sync</code> to mirror one session <strong>live</strong> between the terminal and the browser. It reuses this machine's login, models, and session history, so there's nothing extra to configure.</p>
 
-      <h2>How it works</h2>
-      <p>蒲公英 is a remote-networking tool. Once it's installed on both this machine and your phone, signed into the <strong>same account</strong> and joined to the <strong>same network</strong>, the two devices sit on one virtual LAN and can talk over a <code>蒲公英 virtual IP</code>. As long as the webui is bound to that virtual IP, your phone can reach it. The whole link is a private peer-to-peer network — <strong>your machine is never exposed to the public internet</strong>.</p>
+      <h2>Start &amp; stop</h2>
+      <p>Run these in the AtomCode TUI input box:</p>
+      <pre><code># Launch the webui and open the browser (binds 127.0.0.1:13456 by default — local only)
+/webui
 
-      <div class="callout callout-warn">
-        <strong>Why not just open it to the internet</strong>
-        <p>The webui / daemon has no built-in authentication; whoever reaches it effectively gains execution rights for every tool on your machine (including <code>bash</code>, <code>write</code>, <code>edit</code>). So do <strong>not</strong> use <code>--host 0.0.0.0</code> to expose it to the public internet or an open LAN. The 蒲公英 virtual LAN plus a one-time access token is the safe remote path intended for regular users.</p>
-      </div>
-
-      <h2>Prerequisites</h2>
-      <ul>
-        <li>You can already launch the AtomCode webui on this machine.</li>
-        <li><strong>蒲公英</strong> is installed on both this machine and your phone: <a href="https://pgy.oray.com" target="_blank" rel="noopener">https://pgy.oray.com</a>.</li>
-        <li>Both devices are signed into the <strong>same 蒲公英 account</strong> and joined to the <strong>same network</strong>.</li>
-      </ul>
-
-      <h2>Steps</h2>
-
-      <h3>1. Connect 蒲公英 and get the virtual IP</h3>
-      <p>Sign in and join the network in the 蒲公英 client on this machine, then note the <strong>virtual IP</strong> assigned to it (looks like <code>10.x.x.x</code>). On the phone, just sign into the same account and join the same network — no IP to remember.</p>
-
-      <h3>2. Bind the webui to the virtual IP</h3>
-      <p>By default the webui binds loopback only, which your phone can't reach. In the AtomCode TUI, relaunch the webui with <code>--host</code> pointed at the 蒲公英 virtual IP:</p>
-      <pre><code>/webui --host 10.x.x.x</code></pre>
-      <p>Replace <code>10.x.x.x</code> with the virtual IP you noted above. Once bound, the webui is reachable from any device on the same virtual LAN.</p>
-
-      <h3>3. Scan to connect from the Remote Access panel</h3>
-      <p>Open the <strong>Remote Access</strong> panel (the phone icon) in the top-right of the webui. AtomCode detects the 蒲公英 status and produces:</p>
-      <ul>
-        <li>a ready-to-open <strong>remote URL</strong> (already carrying the access token);</li>
-        <li>a matching <strong>QR code</strong>.</li>
-      </ul>
-      <p>Scan the QR with your phone, or copy the URL into the phone's browser. The phone must be signed into the same 蒲公英 account and on the same network.</p>
+# Stop the webui server
+/webui stop</code></pre>
+      <p>On launch, AtomCode starts a local HTTP server and opens your browser to a URL like <code>http://127.0.0.1:13456/?token=&lt;one-time token&gt;</code>. The <code>token</code> in the URL is the credential — it's <strong>equivalent to a password</strong>, so don't share it. The current TUI session is also attached to live sync automatically (see <a href="#live-sync">Live sync across devices</a> below).</p>
 
       <div class="callout callout-warn">
-        <strong>The access token is a password</strong>
-        <p>The remote URL carries a one-time access token (<code>?token=…</code>) that is <strong>equivalent to a password</strong>: anyone who gets the full link can operate your machine. Don't post it in chats, screenshot it out, or paste it on a public page.</p>
+        <strong>Localhost only by default</strong>
+        <p>The webui binds <code>127.0.0.1</code>, reachable only from this machine. To open it from a phone, do <strong>not</strong> expose it with <code>--host 0.0.0.0</code>; use the 蒲公英 virtual-LAN approach instead — see <a href="./webui-remote-access.html">Remote Access</a>.</p>
       </div>
 
-      <h2>Troubleshooting</h2>
-      <p>The Remote Access panel shows different hints depending on what it detects. Map them as follows:</p>
+      <h2>What the interface offers</h2>
+      <p>The browser UI brings the terminal's capabilities into a graphical interface:</p>
       <table>
         <thead>
-          <tr><th>Panel hint</th><th>Meaning</th><th>What to do</th></tr>
+          <tr><th>Area</th><th>What you can do</th></tr>
         </thead>
         <tbody>
-          <tr>
-            <td>蒲公英 not detected</td>
-            <td>蒲公英 isn't installed, or the client isn't running.</td>
-            <td>Install and sign into 蒲公英 on both machine and phone, join the same network, then hit "Re-check".</td>
-          </tr>
-          <tr>
-            <td>No virtual IP yet</td>
-            <td>蒲公英 is installed but hasn't joined a network.</td>
-            <td>Connect / join the network in the 蒲公英 client, get a virtual IP, then "Re-check".</td>
-          </tr>
-          <tr>
-            <td>webui bound to localhost only</td>
-            <td>蒲公英 is detected, but the webui still listens on loopback.</td>
-            <td>Relaunch with <code>/webui --host &lt;virtual IP&gt;</code> as in step 2, then refresh this page.</td>
-          </tr>
-          <tr>
-            <td>Phone can't open it / hangs</td>
-            <td>The two ends aren't on the same network, or a firewall blocks it.</td>
-            <td>Confirm both devices share the same 蒲公英 account and network; check that the machine's firewall allows the webui port.</td>
-          </tr>
+          <tr><td>Sidebar</td><td>Session history grouped by project, search sessions, start a new chat, rename / delete sessions; collapses to an icon rail (a drawer on mobile).</td></tr>
+          <tr><td>Model selector</td><td>Switch provider / model right under the input box; same-named models are disambiguated with a provider tag.</td></tr>
+          <tr><td>Model config</td><td>Add / edit / delete providers in settings: name, type (openai / claude / ollama), model, Base URL, API key, context window, and set-as-default.</td></tr>
+          <tr><td>Settings</td><td>Theme (light / dark), language (中 / EN), model config, and the remote-access entry.</td></tr>
+          <tr><td>Image attachments</td><td>Paste or pick images to send with a message (2&nbsp;MB each); non-vision models fall back to VL; thumbnails show in history.</td></tr>
+          <tr><td>Tool execution</td><td>Tool calls show their arguments and output inline, expandable line by line, both live and in history.</td></tr>
+          <tr><td>Attach menu (+)</td><td>Upload an image, pick a file for context, or insert a Skill.</td></tr>
+          <tr><td>Working directory</td><td>Switch the working dir, browse folders, create a new folder, set a default working dir.</td></tr>
         </tbody>
       </table>
 
+      <h2 id="live-sync">Live sync across devices</h2>
+      <p>Behind the webui is a <strong>LiveSession</strong>: one session can be open in the terminal and multiple browser tabs at once, and every input, streamed AI reply, and tool result is <strong>broadcast live</strong> to all connected views — a viewer that joins late first receives a snapshot replay.</p>
+      <ul>
+        <li>When you run <code>/webui</code>, the current TUI session is <strong>attached automatically</strong> — messages you send in the terminal appear in the browser, and vice versa.</li>
+        <li>In <strong>another</strong> TUI, run <code>/sync</code> to attach to the running webui session (a <code>/webui</code> must already be running).</li>
+        <li><code>/sync off</code> — leave sync and return to a standalone session.</li>
+      </ul>
+      <p>This makes "start in the terminal, watch progress on a phone / tablet" — or several people watching the same agent session — possible.</p>
+
+      <h2>Remote access</h2>
+      <p>Want to open the webui from a phone without exposing it publicly? Use a 蒲公英 (Oray PGY) virtual LAN: bind the server to the virtual IP with <code>/webui --host &lt;virtual IP&gt;</code>, then scan the QR in the Remote Access panel. Full walkthrough in <a href="./webui-remote-access.html">Remote Access</a>.</p>
+
       <h2>Next</h2>
       <ul>
+        <li><a href="./webui-remote-access.html">Remote Access</a> — open the webui from a phone over 蒲公英, safely</li>
         <li><a href="./headless-daemon.html">Headless &amp; Daemon</a> — the daemon and HTTP/SSE API behind the webui</li>
-        <li><a href="./faq.html">FAQ</a> — common remote / login gotchas</li>
+        <li><a href="./slash-commands.html">Slash Commands</a> — quick reference for <code>/webui</code>, <code>/sync</code> and more</li>
       </ul>
 
     <footer class="dftr">
