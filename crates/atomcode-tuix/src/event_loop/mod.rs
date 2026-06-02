@@ -7270,21 +7270,21 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             crate::i18n::t(hint_msg).into_owned(),
             crate::render::HintSeverity::Info,
         ))
+    } else if let Some(v) = ctx.update_hint.lock().ok().and_then(|g| g.clone()) {
+        let text = if atomcode_core::self_update::is_package_managed() {
+            crate::i18n::t(crate::i18n::Msg::StatusUpgradeHintPm { version: &v }).into_owned()
+        } else {
+            crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v }).into_owned()
+        };
+        Some((text, crate::render::HintSeverity::Info))
     } else {
-        ctx.update_hint
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-            .map(|v| {
-                let text = if atomcode_core::self_update::is_package_managed() {
-                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHintPm { version: &v })
-                        .into_owned()
-                } else {
-                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v })
-                        .into_owned()
-                };
-                (text, crate::render::HintSeverity::Info)
-            })
+        // Lowest-priority fallback: surface the `/webui` browser-UI entry
+        // point, which is otherwise easy to miss. Yields the slot to every
+        // higher-priority hint above (warnings / usage / upgrade).
+        Some((
+            crate::i18n::t(crate::i18n::Msg::StatusWebuiHint).into_owned(),
+            crate::render::HintSeverity::Info,
+        ))
     };
     // Pre-configure, `ctx.model_name` is a dummy from the startup fallback
     // (empty string or "not-configured") — showing that raw in the status

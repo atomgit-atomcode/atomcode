@@ -125,6 +125,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "剪贴板有图片 · ctrl+v 粘贴".into(),
         Msg::StatusClipboardImageHintSlash =>
             "剪贴板有图片 · /paste 粘贴".into(),
+        Msg::StatusWebuiHint =>
+            "提示：使用 /webui 在浏览器中打开 AtomCode".into(),
 
         // ── /status 命令主体 ──
         Msg::StatusBody { model, dir, config, tokens } =>

@@ -2,7 +2,7 @@
 // Task 15 — sessionId + cwd lifted to App
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, FsListResult } from '../api';
+import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -270,8 +270,43 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
     return () => document.removeEventListener('mousedown', h);
   }, [atOpen]);
 
-  // 切换目录后清空 atItems 缓存，下次 @ 重新拉取
-  useEffect(() => { setAtItems([]); }, [cwd]);
+  // @ 文件菜单：把 @ 后文本拆成「目录段 + 过滤词」，以支持进入子目录 / 返回上级。
+  // 例如 "examples/fo" → 列 cwd/examples 的内容，并按前缀 "fo" 过滤。
+  const atSlash = atQuery.lastIndexOf('/');
+  const atDirPart = atSlash >= 0 ? atQuery.slice(0, atSlash + 1) : '';
+  const atFilter = atSlash >= 0 ? atQuery.slice(atSlash + 1) : atQuery;
+  const atTargetDir =
+    atDirPart === ''
+      ? cwd
+      : atDirPart.startsWith('/') || atDirPart.startsWith('~')
+        ? atDirPart
+        : cwd.replace(/\/+$/, '') + '/' + atDirPart;
+
+  // 目录变化（cwd 切换 / 进入子目录）时重新拉取；仅过滤词变化不触发。后端会 canonicalize `..`。
+  useEffect(() => {
+    if (!atOpen) return;
+    let cancelled = false;
+    setAtLoading(true);
+    listDir(atTargetDir)
+      .then((r) => {
+        if (cancelled) return;
+        const items: { name: string; is_dir: boolean }[] = [];
+        for (const d of r.dirs) items.push({ name: d, is_dir: true });
+        if (r.files) for (const f of r.files) items.push({ name: f, is_dir: false });
+        items.sort((a, b) => a.name.localeCompare(b.name));
+        setAtItems(items);
+      })
+      .catch(() => { if (!cancelled) setAtItems([]); })
+      .finally(() => { if (!cancelled) setAtLoading(false); });
+    return () => { cancelled = true; };
+  }, [atOpen, atTargetDir]);
+
+  // 菜单可见行：进入子目录后首行为「..」返回上级（仅无过滤词时展示）；其余按过滤词前缀匹配。
+  const atRows: { name: string; is_dir: boolean; up?: boolean }[] = [];
+  if (atDirPart && atFilter === '') atRows.push({ name: '..', is_dir: true, up: true });
+  for (const it of atItems) {
+    if (it.name.toLowerCase().startsWith(atFilter.toLowerCase())) atRows.push(it);
+  }
 
   // ── 共享的实时流启/停逻辑 ──
   function startLiveStream() {
@@ -642,10 +677,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
 
     // @ 菜单导航
     if (atOpen) {
-      const filtered = atItems.filter((item) => item.name.toLowerCase().startsWith(atQuery.toLowerCase()));
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setAtIndex((i) => Math.min(i + 1, filtered.length - 1));
+        setAtIndex((i) => Math.min(i + 1, atRows.length - 1));
         return;
       }
       if (e.key === 'ArrowUp') {
@@ -653,9 +687,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
         setAtIndex((i) => Math.max(i - 1, 0));
         return;
       }
-      if (e.key === 'Enter' && filtered.length > 0) {
+      // Enter/Tab：目录→进入，文件→选定。Tab 便于逐级深入。
+      if ((e.key === 'Enter' || e.key === 'Tab') && atRows.length > 0) {
         e.preventDefault();
-        insertAtPath(filtered[atIndex].name);
+        chooseAtRow(atRows[Math.min(atIndex, atRows.length - 1)]);
         return;
       }
       if (e.key === 'Escape') {
@@ -694,24 +729,45 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
     });
   }
 
-  // 从光标前的 @ 替换为选中的文件/目录路径。
-  function insertAtPath(path: string) {
+  // 把光标前的 @ 段替换为相对路径 rel。keepOpen=true 用于进入目录（保留菜单、继续浏览），
+  // false 用于最终选定文件（补空格、关闭菜单）。
+  function setAtMention(rel: string, keepOpen: boolean) {
     const ta = textareaRef.current;
     if (!ta) return;
     const pos = ta.selectionStart ?? ta.value.length;
     const before = ta.value.slice(0, pos);
     const after = ta.value.slice(pos);
     const atIdx = before.lastIndexOf('@');
-    const next = before.slice(0, atIdx) + `@${path} ` + after;
+    if (atIdx < 0) return;
+    const suffix = keepOpen ? '' : ' ';
+    const next = before.slice(0, atIdx) + `@${rel}${suffix}` + after;
     setInput(next);
-    setAtOpen(false);
+    if (keepOpen) {
+      setAtQuery(rel);
+      setAtIndex(0);
+    } else {
+      setAtOpen(false);
+    }
     requestAnimationFrame(() => {
       ta.focus();
-      const newPos = atIdx + path.length + 2;
+      const newPos = atIdx + 1 + rel.length + suffix.length;
       ta.setSelectionRange(newPos, newPos);
       ta.style.height = 'auto';
       ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
     });
+  }
+
+  // 选择 @ 菜单某一行：「..」→返回上级；目录→进入；文件→插入完整相对路径并关闭。
+  function chooseAtRow(row: { name: string; is_dir: boolean; up?: boolean }) {
+    if (row.up) {
+      const trimmed = atDirPart.replace(/\/+$/, '');
+      const idx = trimmed.lastIndexOf('/');
+      setAtMention(idx >= 0 ? trimmed.slice(0, idx + 1) : '', true);
+    } else if (row.is_dir) {
+      setAtMention(atDirPart + row.name + '/', true);
+    } else {
+      setAtMention(atDirPart + row.name, false);
+    }
   }
 
   // Auto-resize textarea + slash-command + @-mention detection
@@ -745,25 +801,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       }
     }
 
-    // 检测光标前是否有 @（行首 或 空格后）
+    // 检测光标前是否有 @（行首 或 空格后）。@ 后文本可含 "/" 以进入子目录；
+    // 实际列目录/过滤由派生的 atTargetDir + useEffect 处理（见上）。
     const atIdx = before.lastIndexOf('@');
     if (atIdx >= 0 && (atIdx === 0 || before[atIdx - 1] === ' ')) {
       const query = before.slice(atIdx + 1);
-      if (!query.includes(' ') && query.length <= 60) {
+      if (!query.includes(' ') && query.length <= 120) {
         setSlashOpen(false);
         setAtQuery(query);
         setAtIndex(0);
         setAtOpen(true);
-        if (!atLoading) {
-          setAtLoading(true);
-          listDir(cwd).then((r) => {
-            const items: { name: string; is_dir: boolean }[] = [];
-            for (const d of r.dirs) items.push({ name: d, is_dir: true });
-            if (r.files) for (const f of r.files) items.push({ name: f, is_dir: false });
-            items.sort((a, b) => a.name.localeCompare(b.name));
-            setAtItems(items);
-          }).catch(() => setAtItems([])).finally(() => setAtLoading(false));
-        }
         return;
       }
     }
@@ -896,20 +943,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       {atOpen && (
         <div class="at-popover" ref={atRef}>
           {atLoading && <div class="at-loading">Loading...</div>}
-          {!atLoading && atItems.filter((item) => item.name.toLowerCase().startsWith(atQuery.toLowerCase())).map((item, i) => (
+          {!atLoading && atRows.map((item, i) => (
             <button
-              key={item.name}
+              key={(item.up ? 'up:' : item.is_dir ? 'd:' : 'f:') + item.name}
               class={'at-row' + (i === atIndex ? ' active' : '')}
-              onMouseDown={(e) => { e.preventDefault(); insertAtPath(item.name); }}
+              onMouseDown={(e) => { e.preventDefault(); chooseAtRow(item); }}
               onMouseEnter={() => setAtIndex(i)}
               type="button"
-              title={item.name}
+              title={item.up ? '..' : atDirPart + item.name}
             >
-              <span class="at-icon">{item.is_dir ? '📁' : '📄'}</span>
-              <span class="at-name">{item.name}</span>
+              <span class="at-icon">{item.up ? '⬆' : item.is_dir ? '📁' : '📄'}</span>
+              <span class="at-name">{item.up ? '..' : item.name}</span>
             </button>
           ))}
-          {!atLoading && atItems.length === 0 && (
+          {!atLoading && atRows.length === 0 && (
             <div class="at-empty">No files found</div>
           )}
         </div>
@@ -1179,14 +1226,16 @@ function UserMessageView({ msg }: { msg: Message }) {
 
   return (
     <div class="user-message-wrapper">
-      <div class="user-message-bubble">
+      <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
         {images}
         {skillTitle && (
           <button class="skill-collapse" onClick={() => setExpanded(false)}>
             {t('chat.skillCollapse')}
           </button>
         )}
-        {msg.text}
+        {/* 技能/文档型内容本就是 markdown（注入的 SKILL.md），渲染它；
+            普通用户消息保持逐字纯文本（不把用户输入当 markdown 解析）。 */}
+        {skillTitle ? <Markdown content={msg.text} /> : msg.text}
       </div>
     </div>
   );
