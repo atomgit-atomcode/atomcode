@@ -2332,14 +2332,14 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
         }
         PluginCli::Install { spec } => {
             let (plugin, mp) = parse_plugin_spec(&spec)?;
-            let info = installer::install(&plugin, &mp)
+            let info = installer::install(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
                 .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
             println!("  installed `{}@{}`", info.plugin, info.marketplace);
             Ok(())
         }
         PluginCli::Uninstall { spec } => {
             let (plugin, mp) = parse_plugin_spec(&spec)?;
-            installer::uninstall(&plugin, &mp)
+            installer::uninstall(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
                 .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
             println!("  uninstalled `{}@{}`", plugin, mp);
             Ok(())

@@ -699,6 +699,13 @@ Msg::PluginMgrInstallingLabel => "安装中…".into(),
         Msg::PluginMgrEmptyInstalled => "暂无已安装插件。".into(),
         Msg::PluginMgrCloning => "正在克隆市场…".into(),
         Msg::PluginMgrInstalling { plugin } => format!("正在安装 {plugin}…").into(),
+Msg::PluginScopeUser => "为你安装（用户级）".into(),
+Msg::PluginScopeUserDesc => "~/.atomcode/plugins — 所有项目可见".into(),
+Msg::PluginScopeProject => "为所有协作者安装（项目级）".into(),
+Msg::PluginScopeProjectDesc => ".atomcode/plugins — 通过 git 共享".into(),
+Msg::PluginScopeLocal => "仅在本仓库为你安装（本地级）".into(),
+Msg::PluginScopeLocalDesc => ".atomcode/plugins/local — 不提交到 git".into(),
+Msg::PluginScopeHint => "↑↓ 选择范围 · Enter 确认 · Esc 返回".into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("已卸载 `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>

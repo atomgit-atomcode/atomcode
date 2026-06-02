@@ -18,6 +18,7 @@
 use anyhow::Result;
 use atomcode_core::plugin::installer::InstalledPluginInfo;
 use atomcode_core::plugin::marketplace::MarketplaceInfo;
+use atomcode_core::plugin::InstallScope;
 use atomcode_core::plugin::PluginJobEvent;
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -35,6 +36,8 @@ enum Screen {
     AddUrl,
     RemoveMarketplace,
     Installed,
+    /// Scope selection — shown before installing a plugin.
+    ScopeSelect { plugin: String, mp: String },
 }
 
 pub struct PluginManager {
@@ -99,6 +102,7 @@ impl PluginManager {
             Screen::Plugins { mp } => self.plugins_of(mp).map(|p| p.len()).unwrap_or(0),
             Screen::Installed => self.installed.len(),
             Screen::AddUrl => 0,
+            Screen::ScopeSelect { .. } => 3, // user / project / local
         }
     }
 
@@ -123,12 +127,12 @@ impl PluginManager {
 
     // ─── Async dispatch (clone-heavy ops) ───
 
-    fn dispatch_install(&mut self, plugin: String, mp: String, ctx: &LoopCtx) {
+    fn dispatch_install(&mut self, plugin: String, mp: String, scope: InstallScope, ctx: &LoopCtx) {
         let tx = ctx.plugin_job_tx.clone();
         self.installing_plugin = Some(plugin.clone());
         self.pending = Some(t(Msg::PluginMgrInstalling { plugin: &plugin }).into_owned());
         tokio::task::spawn_blocking(move || {
-            let ev = match atomcode_core::plugin::installer::install(&plugin, &mp) {
+            let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
                 Ok(info) => PluginJobEvent::PluginInstalled(info),
                 Err(e) => {
                     if let Some(aie) = e
@@ -186,7 +190,7 @@ impl PluginManager {
         };
         if self.is_installed(&plugin, &mp) {
             // Uninstall is fast — run inline and refresh.
-            match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
+            match atomcode_core::plugin::installer::uninstall(&plugin, &mp, InstallScope::User) {
                 Ok(()) => {
                     reload_plugins(ctx);
                     renderer.render(UiLine::CommandOutput(
@@ -201,8 +205,22 @@ impl PluginManager {
             }
             renderer.flush();
         } else {
-            self.dispatch_install(plugin, mp, ctx);
+            // Show scope selection instead of installing directly.
+            self.goto(Screen::ScopeSelect { plugin, mp });
         }
+    }
+
+    fn enter_scope_select(&mut self, ctx: &LoopCtx) {
+        let Screen::ScopeSelect { plugin, mp } = &self.screen else { return };
+        let (plugin, mp) = (plugin.clone(), mp.clone());
+        let scope = match self.selected {
+            0 => InstallScope::User,
+            1 => InstallScope::Project,
+            2 => InstallScope::Local,
+            _ => return,
+        };
+        self.dispatch_install(plugin, mp, scope, ctx);
+        self.goto(Screen::Home);
     }
 
     fn enter_remove(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
@@ -223,8 +241,8 @@ impl PluginManager {
 
     fn enter_installed(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
         let Some(i) = self.installed.get(self.selected) else { return };
-        let (plugin, mp) = (i.plugin.clone(), i.marketplace.clone());
-        match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
+        let (plugin, mp, scope) = (i.plugin.clone(), i.marketplace.clone(), i.scope.clone());
+        match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
             Ok(()) => {
                 reload_plugins(ctx);
                 renderer.render(UiLine::CommandOutput(
@@ -317,11 +335,26 @@ impl PluginManager {
                 let rows = self
                     .installed
                     .iter()
-                    .map(|i| (i.plugin.clone(), format!("@{}", i.marketplace)))
+                    .map(|i| {
+                        let scope_label = match i.scope {
+                            InstallScope::User => String::new(),
+                            InstallScope::Project => " [project]".into(),
+                            InstallScope::Local => " [local]".into(),
+                        };
+                        (format!("{}{}", i.plugin, scope_label), format!("@{}", i.marketplace))
+                    })
                     .collect();
                 (rows, t(Msg::PluginMgrHintUninstall).into_owned())
             }
             Screen::AddUrl => (Vec::new(), t(Msg::PluginMgrHintUrl).into_owned()),
+            Screen::ScopeSelect { .. } => {
+                let rows = vec![
+                    (t(Msg::PluginScopeUser).into_owned(), t(Msg::PluginScopeUserDesc).into_owned()),
+                    (t(Msg::PluginScopeProject).into_owned(), t(Msg::PluginScopeProjectDesc).into_owned()),
+                    (t(Msg::PluginScopeLocal).into_owned(), t(Msg::PluginScopeLocalDesc).into_owned()),
+                ];
+                (rows, t(Msg::PluginScopeHint).into_owned())
+            }
         }
     }
 }
@@ -377,7 +410,14 @@ impl Modal for PluginManager {
                 if matches!(self.screen, Screen::Home) {
                     return Ok(ModalAction::Close);
                 }
-                self.goto(Screen::Home);
+                // Scope select goes back to plugins list; others go to Home.
+                if matches!(self.screen, Screen::ScopeSelect { .. }) {
+                    // We need to figure out the mp name to go back to Plugins screen.
+                    // Since ScopeSelect holds plugin & mp, just go to Home for simplicity.
+                    self.goto(Screen::Home);
+                } else {
+                    self.goto(Screen::Home);
+                }
             }
             KeyCode::Enter => {
                 // Block Enter while an async install/clone is in flight
@@ -389,6 +429,7 @@ impl Modal for PluginManager {
                         Screen::Home => self.enter_home(),
                         Screen::Browse => self.enter_browse(),
                         Screen::Plugins { .. } => self.enter_plugins(ctx, renderer),
+                        Screen::ScopeSelect { .. } => self.enter_scope_select(ctx),
                         Screen::RemoveMarketplace => self.enter_remove(ctx, renderer),
                         Screen::Installed => self.enter_installed(ctx, renderer),
                         Screen::AddUrl => {}
@@ -480,6 +521,7 @@ mod tests {
             plugin: plugin.to_string(),
             marketplace: mp.to_string(),
             plugin_dir: format!("installed/{}/{}", mp, plugin),
+            scope: InstallScope::User,
         }
     }
 
@@ -555,5 +597,26 @@ mod tests {
         assert_eq!(m.url_input, "git");
         m.url_input.pop();
         assert_eq!(m.url_input, "gi");
+    }
+
+    #[test]
+    fn scope_select_has_three_rows() {
+        let m = manager(vec![], vec![]);
+        let mut m2 = m;
+        m2.goto(Screen::ScopeSelect { plugin: "test".into(), mp: "mp".into() });
+        assert_eq!(m2.current_len(), 3);
+    }
+
+    #[test]
+    fn scope_select_rows_have_labels() {
+        let mut m = manager(vec![], vec![]);
+        m.goto(Screen::ScopeSelect { plugin: "test".into(), mp: "mp".into() });
+        let (rows, _hint) = m.rows();
+        assert_eq!(rows.len(), 3);
+        // Each row should have a non-empty label and description.
+        for (label, desc) in &rows {
+            assert!(!label.is_empty());
+            assert!(!desc.is_empty());
+        }
     }
 }

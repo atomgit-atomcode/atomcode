@@ -1815,77 +1815,83 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 ),
             }
         }
-        "install" => match parse_plugin_arg(parts.next().unwrap_or("").trim()) {
-            Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
-                // Explicit plugin@marketplace — install directly.
-                let tx = ctx.plugin_job_tx.clone();
-                ok(renderer, t(Msg::PluginInstalling { plugin: &plugin, marketplace: &mp }).into_owned());
-                tokio::task::spawn_blocking(move || {
-                    let ev = match atomcode_core::plugin::installer::install(&plugin, &mp) {
-                        Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
-                        Err(e) => {
-                            if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
-                                atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
-                                    id: _aie.id.clone(),
-                                }
-                            } else {
-                                atomcode_core::plugin::PluginJobEvent::Failed {
-                                    op: "install".into(),
-                                    msg: format!("{:#}", e),
-                                }
-                            }
-                        }
-                    };
-                    let _ = tx.send(ev);
-                });
-            }
-            Some(PluginArg::Bare { plugin }) => {
-                // Bare plugin name — resolve across all marketplaces.
-                match atomcode_core::plugin::installer::resolve_plugin_marketplace(&plugin) {
-                    Ok(matches) if matches.len() == 1 => {
-                        let m = &matches[0];
-                        let mp = m.marketplace.clone();
-                        let resolved_plugin = m.plugin.clone();
-                        let tx = ctx.plugin_job_tx.clone();
-                        ok(renderer, t(Msg::PluginInstallingByName { plugin: &plugin }).into_owned());
-                        tokio::task::spawn_blocking(move || {
-                            let ev = match atomcode_core::plugin::installer::install(&resolved_plugin, &mp) {
-                                Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
-                                Err(e) => {
-                                    if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
-                                        atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
-                                            id: _aie.id.clone(),
-                                        }
-                                    } else {
-                                        atomcode_core::plugin::PluginJobEvent::Failed {
-                                            op: "install".into(),
-                                            msg: format!("{:#}", e),
-                                        }
+        "install" => {
+            // Parse: /plugin install <plugin>@<marketplace> [--scope user|project|local]
+            let rest = parts.next().unwrap_or("").trim();
+            let scope_arg = parts.next().unwrap_or("").trim();
+            let scope = parse_scope_arg(scope_arg);
+            match parse_plugin_arg(rest) {
+                Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
+                    // Explicit plugin@marketplace — install directly.
+                    let tx = ctx.plugin_job_tx.clone();
+                    ok(renderer, t(Msg::PluginInstalling { plugin: &plugin, marketplace: &mp }).into_owned());
+                    tokio::task::spawn_blocking(move || {
+                        let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
+                            Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                            Err(e) => {
+                                if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
+                                    atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                        id: _aie.id.clone(),
+                                    }
+                                } else {
+                                    atomcode_core::plugin::PluginJobEvent::Failed {
+                                        op: "install".into(),
+                                        msg: format!("{:#}", e),
                                     }
                                 }
-                            };
-                            let _ = tx.send(ev);
-                        });
-                    }
-                    Ok(matches) if matches.len() > 1 => {
-                        // Multiple marketplaces contain this plugin — show a
-                        // disambiguation list with the install command to use.
-                        let mut msg = t(Msg::PluginInstallAmbiguous { plugin: &plugin }).into_owned();
-                        for m in &matches {
-                            msg.push_str(&format!("  /plugin install {}@{}\n", m.plugin, m.marketplace));
+                            }
+                        };
+                        let _ = tx.send(ev);
+                    });
+                }
+                Some(PluginArg::Bare { plugin }) => {
+                    // Bare plugin name — resolve across all marketplaces.
+                    match atomcode_core::plugin::installer::resolve_plugin_marketplace(&plugin) {
+                        Ok(matches) if matches.len() == 1 => {
+                            let m = &matches[0];
+                            let mp = m.marketplace.clone();
+                            let resolved_plugin = m.plugin.clone();
+                            let tx = ctx.plugin_job_tx.clone();
+                            ok(renderer, t(Msg::PluginInstallingByName { plugin: &plugin }).into_owned());
+                            tokio::task::spawn_blocking(move || {
+                                let ev = match atomcode_core::plugin::installer::install(&resolved_plugin, &mp, scope) {
+                                    Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                                    Err(e) => {
+                                        if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
+                                            atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                                id: _aie.id.clone(),
+                                            }
+                                        } else {
+                                            atomcode_core::plugin::PluginJobEvent::Failed {
+                                                op: "install".into(),
+                                                msg: format!("{:#}", e),
+                                            }
+                                        }
+                                    }
+                                };
+                                let _ = tx.send(ev);
+                            });
                         }
-                        err(renderer, msg);
-                    }
-                    _ => {
-                        ok(renderer, t(Msg::PluginInstallNotFound { plugin: &plugin }).into_owned());
+                        Ok(matches) if matches.len() > 1 => {
+                            // Multiple marketplaces contain this plugin — show a
+                            // disambiguation list with the install command to use.
+                            let mut msg = t(Msg::PluginInstallAmbiguous { plugin: &plugin }).into_owned();
+                            for m in &matches {
+                                msg.push_str(&format!("  /plugin install {}@{}\n", m.plugin, m.marketplace));
+                            }
+                            err(renderer, msg);
+                        }
+                        _ => {
+                            ok(renderer, t(Msg::PluginInstallNotFound { plugin: &plugin }).into_owned());
+                        }
                     }
                 }
+                None => err(renderer, t(Msg::PluginInstallUsage).into_owned()),
             }
-            None => err(renderer, t(Msg::PluginInstallUsage).into_owned()),
         },
         "uninstall" => match parse_plugin_arg(parts.next().unwrap_or("").trim()) {
             Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
-                match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
+                match atomcode_core::plugin::installer::uninstall(&plugin, &mp, atomcode_core::plugin::InstallScope::User) {
                     Ok(()) => {
                         super::reload_plugins(ctx);
                         ok(renderer, t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned());
@@ -1904,8 +1910,8 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                     0 => ok(renderer, t(Msg::PluginUninstallNotFound { plugin: &plugin }).into_owned()),
                     1 => {
                         let p = &matches[0];
-                        let (plug, mp) = (p.plugin.clone(), p.marketplace.clone());
-                        match atomcode_core::plugin::installer::uninstall(&plug, &mp) {
+                        let (plug, mp, scope) = (p.plugin.clone(), p.marketplace.clone(), p.scope.clone());
+                        match atomcode_core::plugin::installer::uninstall(&plug, &mp, scope) {
                             Ok(()) => {
                                 super::reload_plugins(ctx);
                                 ok(renderer, t(Msg::PluginUninstalled { plugin: &plug, marketplace: &mp }).into_owned());
@@ -1990,6 +1996,18 @@ fn parse_plugin_arg(s: &str) -> Option<PluginArg> {
     Some(PluginArg::Bare {
         plugin: s.to_string(),
     })
+}
+
+/// Parse a `--scope user|project|local` argument.
+/// Defaults to `User` if missing or unrecognized.
+fn parse_scope_arg(s: &str) -> atomcode_core::plugin::InstallScope {
+    // Accept both `--scope user` and bare `user`.
+    let val = s.strip_prefix("--scope=").unwrap_or(s).trim();
+    match val.to_lowercase().as_str() {
+        "project" => atomcode_core::plugin::InstallScope::Project,
+        "local" => atomcode_core::plugin::InstallScope::Local,
+        _ => atomcode_core::plugin::InstallScope::User,
+    }
 }
 
 /// Handle `/worktree` subcommands: create, list, done, cleanup.
