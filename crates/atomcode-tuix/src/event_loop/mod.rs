@@ -2224,6 +2224,17 @@ mod menu_tests {
         assert_eq!(state.pending_image_markers, vec![1]);
         assert!(line.contains("[Image #1]"), "marker survives in line for the survival filter");
     }
+
+    #[test]
+    fn parse_dollar_line_splits_name_and_args() {
+        assert_eq!(parse_dollar_line("$brainstorming"), Some(("brainstorming".to_string(), String::new())));
+        assert_eq!(parse_dollar_line("$brainstorming why is X"), Some(("brainstorming".to_string(), "why is X".to_string())));
+        assert_eq!(parse_dollar_line("$brainstorming  spaced "), Some(("brainstorming".to_string(), "spaced".to_string())));
+        assert_eq!(parse_dollar_line("hello"), None);
+        assert_eq!(parse_dollar_line("/skills x"), None);
+        assert_eq!(parse_dollar_line("$"), None);
+        assert_eq!(parse_dollar_line("$   "), None);
+    }
 }
 
 #[cfg(test)]
@@ -4342,6 +4353,23 @@ pub use crate::modals::SessionPicker;
 // `crate::modals::provider_wizard`; re-exported at `crate::modals` for
 // existing call sites (execute_slash_command).
 pub use crate::modals::ProviderWizard;
+
+/// Parse a committed `$<name> [args]` line into `(name, args)`. Returns `None`
+/// when the line is not `$`-prefixed or carries no skill name. Mirrors
+/// `parse_slash_line` but for the `$` skills trigger.
+// wired up by the $ commit-dispatch task
+#[allow(dead_code)]
+fn parse_dollar_line(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix('$')?;
+    let trimmed = rest.trim_start();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("");
+    if name.is_empty() {
+        return None;
+    }
+    let args = parts.next().unwrap_or("").trim();
+    Some((name.to_string(), args.to_string()))
+}
 
 /// Build the second-level skills palette: user-invocable skills whose bare
 /// name or fully-qualified `<ns>:<name>` starts with `prefix_lower`. A bare
