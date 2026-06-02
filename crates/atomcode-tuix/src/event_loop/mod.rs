@@ -5097,6 +5097,8 @@ fn redraw_with_menu(
 ) {
     let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
         crate::render::MenuKind::AtMention
+    } else if buf.text.starts_with('$') {
+        crate::render::MenuKind::Skill
     } else {
         crate::render::MenuKind::SlashCommand
     };
@@ -7188,6 +7190,8 @@ fn draw_spinner_now(
         let selected = menu_selected.min(items.len().saturating_sub(1));
         let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
             crate::render::MenuKind::AtMention
+        } else if buf.text.starts_with('$') {
+            crate::render::MenuKind::Skill
         } else {
             crate::render::MenuKind::SlashCommand
         };
