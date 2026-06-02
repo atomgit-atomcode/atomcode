@@ -1741,6 +1741,27 @@ mod menu_tests {
         );
     }
 
+    #[test]
+    fn build_skill_menu_items_lists_unique_bare_names() {
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        skills.register(skill_fixture("skills:hidden", "no", false));
+        let lock = std::sync::RwLock::new(skills);
+
+        let all = build_skill_menu_items(Some(&lock), "");
+        assert!(all.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(all.iter().any(|(n, _)| n == "web-access"));
+        assert!(!all.iter().any(|(n, _)| n == "hidden"));
+
+        let filtered = build_skill_menu_items(Some(&lock), "bra");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "brainstorming");
+
+        assert!(build_skill_menu_items(Some(&lock), "zz").is_empty());
+        assert!(build_skill_menu_items(None, "").is_empty());
+    }
+
     // Regression: HistoryPrev used to leave the cursor at end-of-text,
     // so a recalled `/session foo` from history would `is_in_history()`
     // true AND have the slash prefix — without the call-site gate, the
@@ -4269,6 +4290,51 @@ pub use crate::modals::SessionPicker;
 // existing call sites (execute_slash_command).
 pub use crate::modals::ProviderWizard;
 
+/// Build the second-level skills palette: user-invocable skills whose bare
+/// name or fully-qualified `<ns>:<name>` starts with `prefix_lower`. A bare
+/// name is shown when it is unique across the registry; otherwise the
+/// qualified name is shown to disambiguate. Sorted for stable navigation.
+/// Shared by the `/skills ` sub-mode and the `$` trigger so both stay in lockstep.
+fn build_skill_menu_items(
+    skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    prefix_lower: &str,
+) -> Vec<(String, String)> {
+    let mut items: Vec<(String, String)> = Vec::new();
+    if let Some(reg) = skill_registry {
+        if let Ok(reg) = reg.read() {
+            let skills: Vec<_> = reg.user_invocable().collect();
+            for skill in &skills {
+                let bare = skill
+                    .name
+                    .split_once(':')
+                    .map(|(_, s)| s)
+                    .unwrap_or(skill.name.as_str());
+                let full_lower = skill.name.to_ascii_lowercase();
+                let bare_lower = bare.to_ascii_lowercase();
+                if bare_lower.starts_with(prefix_lower) || full_lower.starts_with(prefix_lower) {
+                    let bare_is_unique = skills.iter().all(|other| {
+                        other.name == skill.name
+                            || other
+                                .name
+                                .split_once(':')
+                                .map(|(_, s)| s)
+                                .unwrap_or(other.name.as_str())
+                                != bare
+                    });
+                    let display = if bare_is_unique {
+                        bare.to_string()
+                    } else {
+                        skill.name.clone()
+                    };
+                    items.push((display, skill.description.clone()));
+                }
+            }
+        }
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+}
+
 /// Filter the command registry by the buf's prefix after '/'. Returns the
 /// (name, desc) pairs matching, or None if menu shouldn't show (buf doesn't
 /// start with '/' or has whitespace, meaning the user has moved on to args).
@@ -4320,51 +4386,10 @@ fn build_menu_items(
     // to `/skills <name>` so the `skills` arm in execute_slash_command
     // looks up `skills:<name>` in the registry and dispatches.
     if let Some(after) = buf.strip_prefix("/skills ") {
-        // Beyond the skill name (user typing skill args) — close menu.
         if after.contains(char::is_whitespace) {
             return None;
         }
-        let prefix_lower = after.to_ascii_lowercase();
-        let mut items: Vec<(String, String)> = Vec::new();
-        if let Some(reg) = skill_registry {
-            if let Ok(reg) = reg.read() {
-                let skills: Vec<_> = reg.user_invocable().collect();
-                for skill in &skills {
-                    // Match against either the bare suffix (`adapter-check…`)
-                    // or the full qualified name (`ascend-model-agent-plugin:
-                    // adapter-check…`). Bare match keeps the shorthand UX;
-                    // full match lets users narrow by plugin (`/ascend-`).
-                    let bare = skill
-                        .name
-                        .split_once(':')
-                        .map(|(_, s)| s)
-                        .unwrap_or(skill.name.as_str());
-                    let full_lower = skill.name.to_ascii_lowercase();
-                    let bare_lower = bare.to_ascii_lowercase();
-                    if bare_lower.starts_with(&prefix_lower)
-                        || full_lower.starts_with(&prefix_lower)
-                    {
-                        let bare_is_unique = skills.iter().all(|other| {
-                            other.name == skill.name
-                                || other
-                                    .name
-                                    .split_once(':')
-                                    .map(|(_, s)| s)
-                                    .unwrap_or(other.name.as_str())
-                                    != bare
-                        });
-                        let display = if bare_is_unique {
-                            bare.to_string()
-                        } else {
-                            skill.name.clone()
-                        };
-                        items.push((display, skill.description.clone()));
-                    }
-                }
-            }
-        }
-        // Stable order so navigation feels predictable across runs.
-        items.sort_by(|a, b| a.0.cmp(&b.0));
+        let items = build_skill_menu_items(skill_registry, &after.to_ascii_lowercase());
         return if items.is_empty() { None } else { Some(items) };
     }
 
