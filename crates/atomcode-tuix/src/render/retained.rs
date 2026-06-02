@@ -3767,6 +3767,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if cols == self.screen.width() && rows == self.screen.height() {
             return;
         }
+        // Diagnostic (opt-in via ATOMCODE_TUIX_LOG): trace each resize phase
+        // BEFORE the corresponding console write, so a conhost fastfail during
+        // a window drag still leaves the killing phase as the last RSZ line.
+        // `legacy_conhost` here confirms whether the ED2-safe path is active.
+        crate::tuix_trace!(
+            "RSZ",
+            "enter old={}x{} new={}x{} legacy_conhost={}",
+            self.screen.width(),
+            self.screen.height(),
+            cols,
+            rows,
+            self.caps.legacy_conhost
+        );
         // Terminal-side wipe: resize leaves pre-resize chars at old
         // absolute positions. Use per-row CUP+EL instead of `\x1b[2J`
         // for the same reason as `reset()` — iTerm2 3.5+ has been
@@ -3788,6 +3801,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // under some states — conhost honors it, so it's the safe choice
             // on this host specifically.
             let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+            crate::tuix_trace!("RSZ", "wipe=ED2 done");
         } else {
             let mut seq = String::with_capacity((rows as usize) * 8 + 8);
             for row in 1..=(rows as usize) {
@@ -3795,8 +3809,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
             }
             seq.push_str("\x1b[H");
+            crate::tuix_trace!("RSZ", "wipe=perrow rows={} bytes={}", rows, seq.len());
             let _ = self.out.write_all(seq.as_bytes());
         }
+        crate::tuix_trace!("RSZ", "wipe written");
         self.screen.resize(cols, rows);
         // Rebuild the semantic welcome banner against the new width so
         // its right-aligned version/license pair stays adaptive after
@@ -3831,6 +3847,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // LF (which could nudge content into scrollback).
             let n = tail.len() as u16;
             let first_row = bottom.saturating_sub(n) + 1;
+            crate::tuix_trace!("RSZ", "body begin rows={} first_row={}", n, first_row);
             for (i, row) in tail.iter().enumerate() {
                 let seq = format!("\x1b[{};1H\x1b[K", first_row + i as u16);
                 let _ = self.out.write_all(seq.as_bytes());
@@ -3838,9 +3855,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let _ = self.out.write_all(&bytes);
             }
         }
+        crate::tuix_trace!("RSZ", "body done; paint begin");
         self.paint_frame();
         self.flush_frame();
         let _ = self.out.flush();
+        crate::tuix_trace!("RSZ", "done");
         self.last_painted_footer_rows = self.current_footer_rows();
         self.dirty = false;
     }
