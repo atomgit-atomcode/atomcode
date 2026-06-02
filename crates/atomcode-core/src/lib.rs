@@ -13,6 +13,7 @@ pub mod hook;
 pub mod i18n;
 pub mod init;
 pub mod input_history;
+pub mod live;
 pub mod locale;
 pub mod lsp;
 pub mod mcp;

@@ -2314,6 +2314,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let provider_suffix = t(Msg::IdleHintProviderSuffix);
         let codingplan_cmd = t(Msg::IdleHintCodingplan);
         let codingplan_suffix = t(Msg::IdleHintCodingplanSuffix);
+        let webui_cmd = t(Msg::IdleHintWebui);
+        let webui_suffix = t(Msg::IdleHintWebuiSuffix);
         let combined_width: usize = [
             idle_prefix.as_ref(),
             idle_slash.as_ref(),
@@ -2326,6 +2328,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             codingplan_cmd.as_ref(),
             "  ",
             codingplan_suffix.as_ref(),
+            "   ",
+            webui_cmd.as_ref(),
+            "  ",
+            webui_suffix.as_ref(),
         ]
         .iter()
         .map(|s| unicode_width::UnicodeWidthStr::width(*s))
@@ -2341,9 +2347,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     ("  ", hint_text.clone()),
                     (&provider_suffix, hint_text.clone()),
                     ("   ", hint_text.clone()),
-                    (&codingplan_cmd, accent_bold),
+                    (&codingplan_cmd, accent_bold.clone()),
                     ("  ", hint_text.clone()),
-                    (&codingplan_suffix, hint_text),
+                    (&codingplan_suffix, hint_text.clone()),
+                    ("   ", hint_text.clone()),
+                    (&webui_cmd, accent_bold),
+                    ("  ", hint_text.clone()),
+                    (&webui_suffix, hint_text),
                 ],
                 content_w,
             ));
@@ -2366,9 +2376,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             ));
             rows.extend(self.build_wrapped_text_rows(
                 &[
-                    (&codingplan_cmd, accent_bold),
+                    (&codingplan_cmd, accent_bold.clone()),
                     ("  ", hint_text.clone()),
-                    (&codingplan_suffix, hint_text),
+                    (&codingplan_suffix, hint_text.clone()),
+                ],
+                content_w,
+            ));
+            rows.extend(self.build_wrapped_text_rows(
+                &[
+                    (&webui_cmd, accent_bold),
+                    ("  ", hint_text.clone()),
+                    (&webui_suffix, hint_text),
                 ],
                 content_w,
             ));
@@ -5477,7 +5495,9 @@ mod tests {
 
     #[test]
     fn retained_resize_reflows_welcome_brand_row_when_shrinking() {
-        let (mut r, buf) = new_capturing(80, 18);
+        // Height 20 (not 18): the idle hints take one extra row since the
+        // /webui shortcut was added, so the welcome block is one row taller.
+        let (mut r, buf) = new_capturing(80, 20);
 
         r.render(UiLine::Welcome {
             model: "glm-5".into(),
@@ -5491,19 +5511,19 @@ mod tests {
             attachments: Vec::new(),
         });
         r.flush_deferred();
-        let mut pre = crate::test_term::VirtualTerminal::new(80, 18);
+        let mut pre = crate::test_term::VirtualTerminal::new(80, 20);
         drain_into_vterm(&buf, &mut pre);
 
-        r.on_resize(24, 18);
+        r.on_resize(24, 20);
         r.flush_deferred();
-        let mut post = crate::test_term::VirtualTerminal::new(24, 18);
+        let mut post = crate::test_term::VirtualTerminal::new(24, 20);
         drain_into_vterm(&buf, &mut post);
 
-        let brand_row = (0..18)
+        let brand_row = (0..20)
             .map(|row| post.row_text(row))
             .find(|row| row.contains("AtomCode"))
             .expect("brand row should remain visible after shrinking");
-        let version_row = (0..18)
+        let version_row = (0..20)
             .map(|row| post.row_text(row))
             .find(|row| row.contains(concat!("v", env!("CARGO_PKG_VERSION"))))
             .expect("version row should remain visible after shrinking");

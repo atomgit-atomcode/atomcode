@@ -358,6 +358,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "领取免费 Token 额度".into(),
         Msg::IdleHintCodingplanFull =>
             "使用 /login 领取免费 Token 额度".into(),
+        Msg::IdleHintWebui => "/webui".into(),
+        Msg::IdleHintWebuiSuffix =>
+            "在浏览器中同步会话".into(),
+        Msg::IdleHintWebuiFull =>
+            "使用 /webui 在浏览器中同步会话".into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>
@@ -719,6 +724,7 @@ Msg::PluginMgrInstallingLabel => "安装中…".into(),
             format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),
 
         // ── 命令描述 ──
+        Msg::CmdDescWebui => "启动浏览器 webui（子命令：stop / lan / --host <地址>）".into(),
 Msg::CmdDescSetup =>
 "扫描项目、安装种子文件并运行 setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescResume => "恢复上次会话".into(),

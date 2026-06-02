@@ -110,6 +110,12 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Bracketed paste** — long paste content collapsed to a compact indicator
 - **Skills** — user-defined commands loaded from your skill directory, invoked like any slash command
 
+### Web UI
+
+- **`/webui`** (in the TUI) or **`atomcode webui`** (CLI) launches a local browser UI as an alternative to the terminal interface — same agent, same sessions, rendered in your browser
+- **Loopback only** — the server binds to `127.0.0.1` and uses a one-time token; nothing is exposed to the network
+- **`/webui stop`** stops the in-process server (a later `/webui` restarts it)
+
 ### Safety
 
 - **Destructive command detection** — `rm -rf`, `git push --force`, `DROP TABLE`, etc. require explicit approval

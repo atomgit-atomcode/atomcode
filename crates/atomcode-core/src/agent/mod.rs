@@ -383,6 +383,10 @@ pub enum AgentEvent {
         /// `handle_send_message` fills this.
         system_prompt: String,
     },
+    /// 另一视图（webui/其他 TUI）发起的用户消息回显，用于同步模式下本端渲染用户气泡。
+    UserEcho(String),
+    /// 同步会话的对端正在进行 turn（true=进行中），用于禁用/恢复本端输入。
+    PeerBusy(bool),
 }
 
 /// The current phase of the agent (for UI display).

@@ -16,6 +16,7 @@ distro-pm = ["atomcode-core/distro-pm", "atomcode-tuix/distro-pm"]
 atomcode-core = { path = "../atomcode-core" }
 atomcode-tuix = { path = "../atomcode-tuix" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
+atomcode-daemon = { path = "../atomcode-daemon" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"

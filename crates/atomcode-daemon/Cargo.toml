@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "atomcode_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atomcode-daemon"
+path = "src/main.rs"
+
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
@@ -19,6 +27,13 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# WebUI static embedding
+rust-embed = { version = "8", features = ["mime-guess"] }
+mime_guess = "2"
+
+# Async trait support
+async-trait = "0.1"
+
 # Utils
 dirs = "5"
 anyhow = "1"
@@ -26,6 +41,8 @@ uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
 regex = "1"
 tracing = "0.1"
+# 远程访问二维码（/tunnel/status 的 SVG）
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
