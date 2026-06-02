@@ -4635,6 +4635,47 @@ fn handle_idle_key(
                 //     (once the arg is filled in) commits normally through
                 //     the regular BufferResult::Commit → execute_slash_command
                 //     path at the bottom of this function.
+
+                // `$`-mode: items carry bare skill names. Tab completes to
+                // `$name ` (review, then Enter); Enter invokes immediately.
+                if app.buf.text.starts_with('$') && !items.is_empty() {
+                    let name = items[app.menu.selected].0.clone();
+                    app.menu.selected = 0;
+                    if code == KeyCode::Tab {
+                        app.buf.text = format!("${} ", name);
+                        app.buf.cursor = app.buf.text.len();
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        return Ok(());
+                    }
+                    // Enter → invoke now via the shared skills arm.
+                    let committed = format!("${}", name);
+                    renderer.render(UiLine::ClearTransient);
+                    renderer.render(UiLine::User(committed.clone()));
+                    app.buf.text.clear();
+                    app.buf.cursor = 0;
+                    ctx.history.push(crate::input::history::HistoryEntry {
+                        text: committed.clone(),
+                        images: Vec::new(),
+                    });
+                    app.state.last_submitted_message = Some(committed.clone());
+                    execute_slash_command(
+                        "skills",
+                        &name,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        &mut app.active_modal,
+                        &mut app.fixissue_pending,
+                        &mut app.fixissue_buffer,
+                        &mut app.setup_pending,
+                    )?;
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        app.state.last_submitted_message = None;
+                        redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                    }
+                    return Ok(());
+                }
+
                 let name = items[app.menu.selected].0.clone();
                 let needs_args = ctx
                     .commands
