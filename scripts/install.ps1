@@ -80,23 +80,27 @@ if (-not (Test-Path $Prefix)) {
 
 # --- referral invite code handling ---
 if ($Invite) {
-  $AtomcodeDir = if ($env:ATOMCODE_HOME) {
-    $env:ATOMCODE_HOME
-  } else {
-    Join-Path $env:USERPROFILE ".atomcode"
-  }
+  if ($Invite -match '^[A-Za-z0-9]{8}$') {
+    $AtomcodeDir = if ($env:ATOMCODE_HOME) {
+      $env:ATOMCODE_HOME
+    } else {
+      Join-Path $env:USERPROFILE ".atomcode"
+    }
 
-  New-Item -ItemType Directory -Force -Path $AtomcodeDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $AtomcodeDir | Out-Null
 
-  $InstallUuid = [guid]::NewGuid().ToString()
+    $InstallUuid = [guid]::NewGuid().ToString()
 
-  $pendingInvite = @"
+    $pendingInvite = @"
 invite_code=$Invite
 install_uuid=$InstallUuid
 attempted_at=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
 "@
 
-  Set-Content -Path (Join-Path $AtomcodeDir "pending_invite") -Value $pendingInvite
+    Set-Content -Path (Join-Path $AtomcodeDir "pending_invite") -Value $pendingInvite
+  } else {
+    Write-Warning "Invalid invite code format, skipping referral"
+  }
 }
 # --- end referral handling ---
 
