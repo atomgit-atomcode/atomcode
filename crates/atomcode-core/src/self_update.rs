@@ -581,6 +581,20 @@ pub async fn run_upgrade(
 /// red error. Kept as a plain string to avoid an error-type refactor.
 pub const ALREADY_LATEST: &str = "ALREADY_LATEST";
 
+/// Sentinel embedded in the error returned by `run_upgrade` / `run_rollback`
+/// when this binary is a package-manager-managed build (HarmonyBrew).
+/// Callers special-case it to show "use `brew upgrade`" instead of a
+/// generic failure — mirrors the `ALREADY_LATEST` pattern.
+pub const PACKAGE_MANAGED: &str = "PACKAGE_MANAGED";
+
+/// True when this binary was compiled for package-manager distribution
+/// (the `distro-pm` feature, set by the HarmonyBrew formula). Such builds
+/// must never self-modify the binary — upgrades are the package manager's
+/// job.
+pub const fn is_package_managed() -> bool {
+    cfg!(feature = "distro-pm")
+}
+
 // ============================================================================
 // Deferred upgrade (download-in-session, apply-at-next-startup)
 // ============================================================================
@@ -1565,5 +1579,10 @@ mod tests {
             "error should mention HTTP 404, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn is_package_managed_tracks_feature() {
+        assert_eq!(super::is_package_managed(), cfg!(feature = "distro-pm"));
     }
 }

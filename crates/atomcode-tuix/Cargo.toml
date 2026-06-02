@@ -3,6 +3,10 @@ name = "atomcode-tuix"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+distro-pm = ["atomcode-core/distro-pm"]
+
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
