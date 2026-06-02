@@ -151,6 +151,7 @@ const zh = {
   'settings.addFailed': '添加失败',
   'settings.nameModelRequired': '名称和模型必填',
   'settings.allRequired': '请填写所有字段',
+  'settings.nameExists': '模型名称已存在，请使用其他名称',
 
   // CWD picker
   'cwd.title': '切换工作目录',
@@ -326,6 +327,7 @@ const en: Record<MsgKey, string> = {
   'settings.addFailed': 'Add failed',
   'settings.nameModelRequired': 'Name and model are required',
   'settings.allRequired': 'Please fill in all fields',
+  'settings.nameExists': 'Model name already exists, please use a different name',
 
   'cwd.title': 'Switch working directory',
   'cwd.affectsSession': 'Affects current session only',

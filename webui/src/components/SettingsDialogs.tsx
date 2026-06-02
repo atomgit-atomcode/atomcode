@@ -229,6 +229,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     </SettingsModal>
     {showAdd && (
       <ProviderFormDialog
+        existingNames={config?.providers.map((p) => p.name) ?? []}
         onClose={() => setShowAdd(false)}
         onSaved={() => {
           setShowAdd(false);
@@ -271,10 +272,13 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
  */
 function ProviderFormDialog({
   editing,
+  existingNames = [],
   onClose,
   onSaved,
 }: {
   editing?: ProviderInfo;
+  // 已有 provider 名称列表，用于添加模式下的重复名校验（编辑模式 name 不可改，无需传）。
+  existingNames?: string[];
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -299,6 +303,12 @@ function ProviderFormDialog({
       }
     } else if (!nameInput.trim() || !model.trim() || !baseUrl.trim() || !apiKey.trim()) {
       setError(t('settings.allRequired'));
+      return;
+    } else if (
+      // 添加模式：name 为主键，重复会静默覆盖已有配置，故提前拦截。
+      existingNames.some((n) => n.toLowerCase() === nameInput.trim().toLowerCase())
+    ) {
+      setError(t('settings.nameExists'));
       return;
     }
     setSaving(true);
