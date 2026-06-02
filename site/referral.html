@@ -31,8 +31,12 @@
   .hdr-nav a.nav-cp{color:var(--accent);position:relative;padding-left:14px;display:inline-flex;align-items:center;gap:8px}
   .hdr-nav a.nav-cp::before{content:"";position:absolute;left:4px;top:50%;width:5px;height:5px;border-radius:50%;background:var(--accent);transform:translateY(-50%);box-shadow:0 0 6px var(--accent);animation:dotPulse 2s ease-in-out infinite}
   .hdr-nav a.nav-cp .free-badge{padding:1px 6px;font-size:9px;font-weight:600;letter-spacing:1px;background:rgba(232,160,80,.18);color:var(--accent);border:1px solid rgba(232,160,80,.4);border-radius:3px;text-transform:uppercase}
+  .hdr-right{display:flex;gap:10px;align-items:center}
   .icon-btn{width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.75);transition:all .2s}
   .icon-btn:hover{color:#fff;border-color:#fff;background:rgba(255,255,255,.05)}
+  .btn-pill{height:32px;padding:0 13px;display:inline-flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.18);font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.72);transition:all .2s;white-space:nowrap}
+  .btn-pill:hover{color:#fff;border-color:#fff;background:rgba(255,255,255,.05)}
+  .theme-icon{display:inline-flex;width:14px;height:14px;align-items:center;justify-content:center}
   .period-arrow{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:1px solid var(--line);background:transparent;color:var(--muted);font-size:12px;cursor:pointer;transition:all .2s}
   .period-arrow:hover{color:#fff;border-color:rgba(255,255,255,.3)}
   @keyframes dotPulse{0%,50%{opacity:1}25%{opacity:.3}}
@@ -80,8 +84,17 @@
   .copy-btn.copied{background:var(--green);color:#000;border-color:var(--green)}
 
   .cmd-label{margin:0 0 10px;color:var(--muted);font-size:13px}
-  .cmd-box{position:relative;display:flex;align-items:center;gap:14px;min-height:56px;margin-bottom:22px;padding:14px 16px;background:#000;border:1px solid rgba(232,160,80,.20);border-radius:8px;box-shadow:0 0 0 1px rgba(122,166,255,.08),0 0 30px rgba(122,166,255,.10)}
-  .cmd-text{flex:1;min-width:0;font-family:var(--mono);font-size:13px;line-height:1.55;color:var(--green);white-space:pre-wrap;word-break:break-word}
+  .cmd-box{position:relative;margin-bottom:22px;background:#000;border:1px solid rgba(232,160,80,.20);border-radius:8px;box-shadow:0 0 0 1px rgba(122,166,255,.08),0 0 30px rgba(122,166,255,.10);overflow:hidden}
+  .install-cmd-list{display:flex;flex-direction:column;gap:12px;padding:14px 16px 16px}
+  .install-cmd-section{border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(255,255,255,.02);overflow:hidden}
+  .install-cmd-section .cp-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 10px 9px 14px;background:rgba(255,255,255,.025);border-bottom:1px solid var(--line)}
+  .install-cmd-section .cp-bar .label{min-width:0;font-family:var(--mono);font-size:12px;letter-spacing:1px;color:rgba(255,255,255,.52);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .cmd-text{display:block;margin:0;padding:16px 18px;min-height:76px;font-family:var(--mono);font-size:15px;line-height:1.55;color:#e8e8e8;white-space:pre-wrap;word-break:break-word;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.2) transparent}
+  .cmd-text::-webkit-scrollbar{height:6px}.cmd-text::-webkit-scrollbar-track{background:transparent}.cmd-text::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:3px}
+  .cmd-text .accent{color:var(--accent)}.cmd-text .str{color:#9ecbff}
+  .install-cmd-section .copy-btn{height:32px;border-radius:0;border-color:rgba(232,160,80,.28);color:rgba(232,160,80,.9);background:transparent}
+  .install-cmd-section .copy-btn:hover{background:var(--accent);color:#000;border-color:var(--accent)}
+  .cmd-footnote{padding:0 16px 16px;color:var(--faint);font-size:13px;letter-spacing:.5px}
 
   .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;padding-top:20px;border-top:1px solid var(--line)}
   .metric{min-width:0;padding:18px 16px;border:1px solid var(--line);border-radius:8px;background:rgba(0,0,0,.16)}
@@ -132,16 +145,43 @@
   .rules .red{color:#ff4f4f;font-weight:700}
   .error-msg{margin:16px 0 0;padding:14px 16px;border:1px solid rgba(255,110,110,.3);border-radius:8px;background:rgba(255,110,110,.1);color:var(--red);font-size:13px}
   .retry-btn{margin-top:14px;height:34px;padding:0 16px;border:1px solid var(--line);border-radius:6px;background:rgba(255,255,255,.08);color:#fff}
+  .toast{position:fixed;left:50%;bottom:28px;z-index:2000;transform:translate(-50%,12px);padding:10px 14px;border:1px solid rgba(232,160,80,.35);border-radius:8px;background:rgba(16,19,22,.96);color:#fff;font-size:13px;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;box-shadow:0 14px 36px rgba(0,0,0,.42)}
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+
+  html.light,html.light body{background:#f6f3ec;color:#0d0d0d}
+  html.light .hdr{background:rgba(246,243,236,.76);border-bottom-color:rgba(0,0,0,.10);color:#0d0d0d}
+  html.light .hdr-nav a{color:rgba(0,0,0,.55)}html.light .hdr-nav a:hover,html.light .hdr-nav a.active{color:#0d0d0d}
+  html.light .hdr-nav a.nav-cp{color:#c87618}html.light .hdr-nav a.nav-cp::before{background:#c87618;box-shadow:0 0 6px #c87618}
+  html.light .hdr-nav a.nav-cp .free-badge{background:rgba(200,118,24,.12);color:#c87618;border-color:rgba(200,118,24,.4)}
+  html.light .icon-btn,html.light .btn-pill{color:rgba(0,0,0,.72);border-color:rgba(0,0,0,.18)}html.light .icon-btn:hover,html.light .btn-pill:hover{color:#0d0d0d;border-color:#0d0d0d;background:rgba(0,0,0,.04)}
+  html.light .main::before{background:radial-gradient(ellipse 72% 46% at 50% 0%,rgba(232,160,80,.16),transparent 62%),repeating-linear-gradient(transparent 0,transparent 39px,rgba(0,0,0,.025) 40px)}
+  html.light h1{background:linear-gradient(180deg,#171717,#5d6470);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  html.light .sub,html.light .login-card p,html.light .cmd-label,html.light .section-hint,html.light .rules p,html.light .rules li{color:rgba(0,0,0,.58)}
+  html.light .panel,html.light .leaderboard,html.light .rules{border-color:rgba(0,0,0,.14);background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(255,255,255,.42));box-shadow:0 22px 60px rgba(0,0,0,.10)}
+  html.light .panel-head,html.light .rank-table th{background:rgba(0,0,0,.025);border-color:rgba(0,0,0,.10)}
+  html.light .panel-title,html.light .section-title,html.light .user-name,html.light .period b{color:#0d0d0d}
+  html.light .panel-meta,html.light .user-id,html.light .metric-label,html.light .metric-note,html.light .period,html.light .rank-table th{color:rgba(0,0,0,.48)}
+  html.light .cmd-box,html.light .install-cmd-section,html.light .rules code{background:#fff;border-color:rgba(0,0,0,.10)}
+  html.light .rules code{color:#0d0d0d;background:rgba(0,0,0,.035);border-color:rgba(0,0,0,.12)}
+  html.light .install-cmd-section .cp-bar,html.light .install-actions{background:rgba(0,0,0,.025);border-color:rgba(0,0,0,.08)}
+  html.light .install-cmd-section .cp-bar .label,html.light .cmd-footnote{color:rgba(0,0,0,.50)}
+  html.light .cmd-text{color:#171717}.cmd-text .accent{color:var(--accent)}html.light .cmd-text .str{color:#1f6fd1}
+  html.light .metric{background:rgba(255,255,255,.5);border-color:rgba(0,0,0,.12)}
+  html.light .metric-value{color:#0d0d0d}.metric-value.blue{color:#2f8cff}.metric-value.red{color:#ff4f4f}.metric-value.gold{color:var(--accent)}
+  html.light .rank-table td{color:rgba(0,0,0,.72);border-bottom-color:rgba(0,0,0,.08)}
+  html.light .rank-table tr.me td{background:rgba(47,140,255,.12)}html.light .rank-table tr.blocked td{background:rgba(255,110,110,.18)}
+  html.light .toast{background:rgba(255,255,255,.98);color:#0d0d0d;box-shadow:0 14px 36px rgba(0,0,0,.16)}
 
   @media (max-width:1024px){
-    .hdr{padding:0 18px}.hdr-nav{display:none}.main{padding:96px 18px 54px}
+    .hdr{padding:0 18px}.hdr-nav{display:none}.hdr-right .btn-pill{display:none}.main{padding:96px 18px 54px}
     h1{font-size:34px}.metrics{grid-template-columns:repeat(2,1fr)}
     .rank-wrap{overflow-x:auto}.rank-table{min-width:920px}
   }
   @media (max-width:640px){
     .panel-head,.section-bar{align-items:flex-start;flex-direction:column}
     .panel-body{padding:18px}.metrics{grid-template-columns:1fr}
-    .cmd-box{align-items:stretch;flex-direction:column}.cmd-box .copy-btn{align-self:flex-end}
+    .install-cmd-list{padding:12px;gap:10px}
+    .install-cmd-section .cp-bar{padding:8px 8px 8px 10px}.cmd-text{font-size:13px;padding:14px 12px}
     .invite-code{font-size:24px;max-width:100%;word-break:break-all}.sub{font-size:13px}
   }
 </style>
@@ -153,25 +193,29 @@
     <span>AtomCode</span><span class="ver" id="verBadge">v4.24.0</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
-    <a href="/index.html#features">功能</a>
-    <a href="/index.html#editor-plugins">插件</a>
-    <a href="/index.html#compare">对比</a>
-    <a href="/index.html#install">安装</a>
-    <a href="/docs/index.html" target="_blank" rel="noopener">文档</a>
-    <a class="active" href="/referral.html">邀请推荐</a>
-    <a class="nav-cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">CodingPlan<span class="free-badge">FREE</span></a>
+    <a href="/index.html#features" data-i18n="nav.features">功能</a>
+    <a href="/index.html#editor-plugins" data-i18n="nav.plugins">插件</a>
+    <a href="/index.html#compare" data-i18n="nav.compare">对比</a>
+    <a href="/index.html#install" data-i18n="nav.install">安装</a>
+    <a href="/docs/index.html" target="_blank" rel="noopener" data-i18n="nav.docs">文档</a>
+    <a class="active" href="/referral.html" data-i18n="nav.referral">邀请推荐</a>
+    <a class="nav-cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener"><span data-i18n="nav.codingplan">CodingPlan</span><span class="free-badge">FREE</span></a>
   </nav>
-  <button class="icon-btn" aria-label="主题" onclick="document.documentElement.classList.toggle('light')">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-  </button>
+  <div class="hdr-right">
+    <button class="icon-btn" id="themeBtn" aria-label="主题">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
+    <button class="icon-btn" id="langBtn" aria-label="语言">中</button>
+    <a class="btn-pill" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="btn.repo">开源仓库</a>
+  </div>
 </header>
 
 <main class="main">
   <div class="wrap">
     <section class="hero">
-      <div class="badge"><span class="dot"></span>长期进行中 · 每周一结算京东卡</div>
-      <h1>邀请有礼：AtomCode 裂变计划</h1>
-      <p class="sub">获取您的专属安装命令，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。</p>
+      <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">长期进行中 · 每周一结算京东卡</span></div>
+      <h1 data-i18n="hero.title">邀请有礼：AtomCode 裂变计划</h1>
+      <p class="sub" data-i18n="hero.sub">获取您的专属安装命令，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。</p>
     </section>
 
     <div id="loading-state" class="state active"><div class="spinner"></div></div>
@@ -181,13 +225,13 @@
         <div class="panel-head">
           <div class="panel-title">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
-            登录后领取专属邀请命令
+            <span data-i18n="panel.login.title">登录后领取专属邀请命令</span>
           </div>
-          <div class="panel-meta">数据更新时间：登录后可见</div>
+          <div class="panel-meta" data-i18n="panel.meta.login">数据更新时间：登录后可见</div>
         </div>
         <div class="login-card">
-          <p>使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。</p>
-          <button class="login-btn" onclick="login()">使用 AtomGit 账号登录</button>
+          <p data-i18n="login.desc">使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。</p>
+          <button class="login-btn" onclick="login()" data-i18n="login.btn">使用 AtomGit 账号登录</button>
         </div>
       </section>
       <div id="public-board"></div>
@@ -199,18 +243,18 @@
         <div class="panel-head">
           <div class="panel-title">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
-            我的专属邀请面板
+            <span data-i18n="panel.mine">我的专属邀请面板</span>
           </div>
-          <div class="panel-meta">数据更新时间：刚刚</div>
+          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span data-i18n="time.now">刚刚</span></div>
         </div>
         <div class="panel-body">
           <div class="user-strip">
             <img id="user-avatar-1" class="user-avatar" src="" referrerpolicy="no-referrer" alt="">
             <div><div class="user-name" id="user-name-1"></div><div class="user-id" id="user-id-1"></div></div>
-            <button class="logout-btn" onclick="logout()">退出</button>
+            <button class="logout-btn" onclick="logout()" data-i18n="logout">退出</button>
           </div>
-          <p class="cmd-label">你还没有邀请码，生成后即可复制专属安装命令分享给其他开发者。</p>
-          <button class="gen-btn" id="gen-btn" onclick="generateCode()">生成邀请码</button>
+          <p class="cmd-label" data-i18n="invite.none">你还没有邀请码，生成后即可复制专属安装命令分享给其他开发者。</p>
+          <button class="gen-btn" id="gen-btn" onclick="generateCode()" data-i18n="invite.generate">生成邀请码</button>
           <p id="gen-error" class="error-msg" style="display:none"></p>
         </div>
       </section>
@@ -223,26 +267,41 @@
         <div class="panel-head">
           <div class="panel-title">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
-            我的专属邀请面板
+            <span data-i18n="panel.mine">我的专属邀请面板</span>
           </div>
-          <div class="panel-meta">数据更新时间：<span id="updated-at">刚刚</span></div>
+          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span id="updated-at" data-i18n="time.now">刚刚</span></div>
         </div>
         <div class="panel-body">
           <div class="user-strip">
             <img id="user-avatar-2" class="user-avatar" src="" referrerpolicy="no-referrer" alt="">
             <div><div class="user-name" id="user-name-2"></div><div class="user-id" id="user-id-2"></div></div>
-            <button class="logout-btn" onclick="logout()">退出</button>
+            <button class="logout-btn" onclick="logout()" data-i18n="logout">退出</button>
           </div>
-          <p class="cmd-label">复制专属安装命令，分享给其他开发者（支持 Linux / macOS）</p>
+          <p class="cmd-label" data-i18n="cmd.label">复制专属安装命令，分享给其他开发者</p>
           <div class="cmd-box">
-            <span class="cmd-text" id="cmd-mac-text"></span>
-            <button class="copy-btn" id="copy-cmd-btn" onclick="copyCommand()">复制命令</button>
+            <div class="install-cmd-list">
+              <div class="install-cmd-section">
+                <div class="cp-bar">
+                  <span class="label">macOS / Linux / HarmonyOS PC</span>
+                  <button class="copy-btn" id="copy-unix-btn" onclick="copyInstallCommand('unix')" data-copy-label="short">📋 复制</button>
+                </div>
+                <pre class="cmd-text" id="cmd-unix-text"></pre>
+              </div>
+              <div class="install-cmd-section">
+                <div class="cp-bar">
+                  <span class="label">Windows · PowerShell</span>
+                  <button class="copy-btn" id="copy-win-btn" onclick="copyInstallCommand('win')" data-copy-label="short">📋 复制</button>
+                </div>
+                <pre class="cmd-text" id="cmd-win-text"></pre>
+              </div>
+            </div>
+            <div class="cmd-footnote" data-i18n="cmd.footnote">macOS / Linux / HarmonyOS PC + Windows · 自动选 PATH</div>
           </div>
           <div class="metrics">
-            <div class="metric"><div class="metric-label">本周新增设备安装</div><div class="metric-value"><span id="stat-devices">0</span><span class="unit">台</span></div></div>
-            <div class="metric"><div class="metric-label">本周新增账号活跃</div><div class="metric-value blue"><span id="stat-active">0</span><span class="unit">人</span></div></div>
-            <div class="metric warn" id="rate-card"><div class="metric-label">当前活跃转化率</div><div class="metric-value red"><span id="stat-rate">0.0%</span></div><div class="metric-note" id="rate-note">低于 25% 质量线，仅结算活跃拉新</div></div>
-            <div class="metric"><div class="metric-label">本周预计结算金额</div><div class="metric-value gold">￥<span id="stat-amount">0.00</span></div><div class="metric-note" id="amount-note">仅结算活跃</div></div>
+            <div class="metric"><div class="metric-label" data-i18n="metric.devices">本周新增设备安装</div><div class="metric-value"><span id="stat-devices">0</span><span class="unit" data-i18n="unit.devices">台</span></div></div>
+            <div class="metric"><div class="metric-label" data-i18n="metric.active">本周新增账号活跃</div><div class="metric-value blue"><span id="stat-active">0</span><span class="unit" data-i18n="unit.people">人</span></div></div>
+            <div class="metric warn" id="rate-card"><div class="metric-label" data-i18n="metric.rate">当前活跃转化率</div><div class="metric-value red"><span id="stat-rate">0.0%</span></div><div class="metric-note" id="rate-note">低于 25% 质量线，仅结算活跃拉新</div></div>
+            <div class="metric"><div class="metric-label" data-i18n="metric.amount">本周预计结算金额</div><div class="metric-value gold">￥<span id="stat-amount">0.00</span></div><div class="metric-note" id="amount-note">仅结算活跃</div></div>
           </div>
         </div>
       </section>
@@ -260,14 +319,132 @@
     </div>
   </div>
 </main>
+<div class="toast" id="toast"></div>
 
 <script>
-const API_BASE = window.location.hostname === 'localhost'
-  ? 'http://localhost:8765/api/v1/referral'
-  : 'https://acs.atomgit.com/api/v1/referral';
-const LOGIN_URL = window.location.hostname === 'localhost'
-  ? 'http://localhost:8765/auth/login?provider=atomgit&redirect_to=' + encodeURIComponent(window.location.origin + '/referral.html')
-  : 'https://acs.atomgit.com/auth/login?provider=atomgit&redirect_to=' + encodeURIComponent('https://atomcode.atomgit.com/referral.html');
+// env=local → local platform, env=test → test platform, default → production
+const ENV = new URLSearchParams(window.location.search).get('env') || '';
+const BASE_URL = ENV === 'local' ? 'http://localhost:8765'
+  : ENV === 'test' ? 'http://10.205.128.41:8765'
+  : 'https://acs.atomgit.com';
+const API_BASE = BASE_URL + '/api/v1/referral';
+const LOGIN_URL = BASE_URL + '/auth/login?provider=atomgit&redirect_to=' + encodeURIComponent(
+  ENV ? window.location.origin + '/referral.html?env=' + ENV
+      : 'https://atomcode.atomgit.com/referral.html'
+);
+
+let LANG = 'zh';
+try {
+  const savedLang = localStorage.getItem('atomcode_lang');
+  LANG = savedLang === 'zh' || savedLang === 'en'
+    ? savedLang
+    : ((navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en');
+} catch (e) {}
+
+const T = {
+  'nav.features': { zh: '功能', en: 'Features' },
+  'nav.plugins': { zh: '插件', en: 'Plugins' },
+  'nav.compare': { zh: '对比', en: 'Compare' },
+  'nav.install': { zh: '安装', en: 'Install' },
+  'nav.docs': { zh: '文档', en: 'Docs' },
+  'nav.referral': { zh: '邀请推荐', en: 'Referral' },
+  'nav.codingplan': { zh: 'CodingPlan', en: 'CodingPlan' },
+  'btn.repo': { zh: '开源仓库', en: 'Repository' },
+  'hero.badge': { zh: '长期进行中 · 每周一结算京东卡', en: 'Ongoing · settled every Monday' },
+  'hero.title': { zh: '邀请有礼：AtomCode 裂变计划', en: 'Referral Rewards: AtomCode Growth Program' },
+  'hero.sub': { zh: '获取您的专属安装命令，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。', en: 'Get your dedicated install command and invite developers to install and use AtomCode. High conversion earns bonus rewards, with weekly leaderboard updates.' },
+  'panel.login.title': { zh: '登录后领取专属邀请命令', en: 'Sign in to get your invite command' },
+  'panel.meta.login': { zh: '数据更新时间：登录后可见', en: 'Updated: visible after sign-in' },
+  'panel.mine': { zh: '我的专属邀请面板', en: 'My Referral Dashboard' },
+  'panel.meta.prefix': { zh: '数据更新时间：', en: 'Updated: ' },
+  'time.now': { zh: '刚刚', en: 'just now' },
+  'login.desc': { zh: '使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。', en: 'Sign in with AtomGit to generate your invite code and view this week’s installs, active users, and estimated settlement.' },
+  'login.btn': { zh: '使用 AtomGit 账号登录', en: 'Sign in with AtomGit' },
+  'logout': { zh: '退出', en: 'Log out' },
+  'invite.none': { zh: '你还没有邀请码，生成后即可复制专属安装命令分享给其他开发者。', en: 'You do not have an invite code yet. Generate one to copy and share your dedicated install command.' },
+  'invite.generate': { zh: '生成邀请码', en: 'Generate Invite Code' },
+  'invite.generating': { zh: '生成中...', en: 'Generating...' },
+  'cmd.label': { zh: '复制专属安装命令，分享给其他开发者', en: 'Copy your dedicated install command and share it with other developers' },
+  'cmd.copy': { zh: '📋 复制', en: '📋 Copy' },
+  'cmd.copied': { zh: '✓ 已复制', en: '✓ Copied' },
+  'cmd.footnote': { zh: 'macOS / Linux / HarmonyOS PC + Windows · 自动选 PATH', en: 'macOS / Linux / HarmonyOS PC + Windows · auto PATH' },
+  'metric.devices': { zh: '本周新增设备安装', en: 'New installs this week' },
+  'metric.active': { zh: '本周新增账号活跃', en: 'New active accounts this week' },
+  'metric.rate': { zh: '当前活跃转化率', en: 'Current active conversion' },
+  'metric.amount': { zh: '本周预计结算金额', en: 'Estimated settlement this week' },
+  'unit.devices': { zh: '台', en: '' },
+  'unit.people': { zh: '人', en: '' },
+  'note.healthy': { zh: '已达质量线，安装与活跃双项结算', en: 'Quality line reached; installs and active accounts both count' },
+  'note.unhealthy': { zh: '低于 25% 质量线，仅结算活跃拉新', en: 'Below the 25% quality line; only active referrals count' },
+  'note.amount.healthy': { zh: '安装奖励 + 活跃奖励', en: 'Install reward + active reward' },
+  'note.amount.unhealthy': { zh: '仅结算活跃', en: 'Active referrals only' },
+  'toast.theme.light': { zh: '☀ 已切换到 Light', en: '☀ Switched to Light' },
+  'toast.theme.dark': { zh: '☾ 已切换到 Dark', en: '☾ Switched to Dark' },
+  'toast.lang.zh': { zh: '已切换到 简体中文', en: 'Switched to 简体中文' },
+  'toast.lang.en': { zh: '已切换到 English', en: 'Switched to English' },
+  'board.empty': { zh: '本周排行榜暂无数据', en: 'No leaderboard data this week' },
+  'board.title': { zh: '每周邀请风云榜', en: 'Weekly Referral Leaderboard' },
+  'board.hint': { zh: '按“本周新增活跃设备数”降序排列。每周日 23:59 截榜，周一结算京东卡。', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59, with settlement on Monday.' },
+  'board.prev': { zh: '上一周', en: 'Previous week' },
+  'board.next': { zh: '下一周', en: 'Next week' },
+  'board.rank': { zh: '排名', en: 'Rank' },
+  'board.promoter': { zh: '推广者昵称', en: 'Promoter' },
+  'board.devices': { zh: '设备安装 (A)', en: 'Installs (A)' },
+  'board.active': { zh: '活跃设备 (B)', en: 'Active (B)' },
+  'board.rate': { zh: '转化率 (R)', en: 'Rate (R)' },
+  'board.amount': { zh: '结算金额', en: 'Amount' },
+  'board.status': { zh: '状态', en: 'Status' },
+  'board.reward': { zh: '榜单奖励', en: 'Reward' },
+  'board.me': { zh: '我', en: 'Me' },
+  'status.blocked': { zh: '触发熔断，仅结算活跃', en: 'Quality guard triggered; active only' },
+  'status.normal': { zh: '正常结算', en: 'Normal settlement' },
+  'reward.tip': { zh: '每周榜单 Top5 赠送 CodingPlan Pro 套餐 30 天，包含 GLM-5.1、Deepseek-v4 flash、Qwen3.6。', en: 'Weekly Top 5 receive 30 days of CodingPlan Pro, including GLM-5.1, Deepseek-v4 flash, and Qwen3.6.' },
+  'rules.title': { zh: '结算规则与防刷熔断说明', en: 'Settlement Rules and Quality Guard' },
+  'rules.desc': { zh: '为保障社区健康发展，系统自动计算安装与活跃的转化率（R = 活跃数/安装数）。', en: 'To keep the community healthy, the system calculates conversion automatically (R = active / installs).' },
+  'rules.good': { zh: '当 <b>R ≥ 25%</b> 时，视为优质推广，结算公式为：<code>安装数×2元 + 活跃数×5元</code>', en: 'When <b>R ≥ 25%</b>, it is counted as quality promotion: <code>installs×2 + active×5</code>.' },
+  'rules.bad': { zh: '当 <span class="red">R &lt; 25%</span> 时，触发质量防刷熔断，安装量清零，仅保留有效活跃结算：<code>活跃数×5元</code>', en: 'When <span class="red">R &lt; 25%</span>, the quality guard is triggered: installs are cleared and only active referrals count: <code>active×5</code>.' },
+  'rules.reward': { zh: '每周邀请风云榜 Top5 额外赠送 <code>CodingPlan Pro 30 天</code>，包含 GLM-5.1、Deepseek-v4 flash、Qwen3.6。', en: 'Weekly leaderboard Top 5 also receive <code>30 days of CodingPlan Pro</code>, including GLM-5.1, Deepseek-v4 flash, and Qwen3.6.' },
+  'rules.cash': { zh: '所有现金奖励统一折算为等额京东 E 卡，于每周一向邀请账号绑定的邮箱发放。', en: 'Cash rewards are converted to equivalent JD E-cards and sent every Monday to the email bound to the inviter account.' },
+};
+function t(key) { const item = T[key]; return item ? (item[LANG] || item.zh || key) : key; }
+function applyI18n() {
+  document.documentElement.lang = LANG === 'zh' ? 'zh-CN' : 'en';
+  document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
+  document.querySelectorAll('[data-copy-label="short"]').forEach(el => { el.textContent = t('cmd.copy'); });
+  const langBtn = document.getElementById('langBtn');
+  if (langBtn) {
+    langBtn.textContent = LANG === 'zh' ? 'EN' : '中';
+    langBtn.setAttribute('aria-label', LANG === 'zh' ? 'Switch to English' : '切换到中文');
+  }
+}
+function showToast(message) {
+  const toast = document.getElementById('toast');
+  if (!toast) return;
+  toast.textContent = message;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 1200);
+}
+
+// ── Install commands (auto-detect OS, invite code injected by updateInstallCommands) ──
+const VERSION = 'v4.24.0';
+const RELEASE_BASE = 'https://atomgit.com/atomgit_atomcode/atomcode/releases/download/' + VERSION;
+let OS_CMDS = {};  // populated by updateInstallCommands()
+function highlightCommand(text) {
+  const stash = [];
+  text = String(text || '').replace(/(https?:\/\/\S+)/g, m => {
+    stash.push(m);
+    return '\x00' + (stash.length - 1) + '\x00';
+  });
+  text = esc(text).replace(/\b(curl|irm|iex|sh|PowerShell|ATOMCODE_INVITE)\b/g, '<span class="accent">$1</span>');
+  return text.replace(/\x00(\d+)\x00/g, (_, i) => '<span class="str">' + esc(stash[i]) + '</span>');
+}
+
+function renderInstallCommands() {
+  const unixEl = document.getElementById('cmd-unix-text');
+  const winEl = document.getElementById('cmd-win-text');
+  if (unixEl) unixEl.innerHTML = highlightCommand(OS_CMDS.unix || '');
+  if (winEl) winEl.innerHTML = highlightCommand(OS_CMDS.win || '');
+}
 
 let currentSid = null;
 let currentCode = null;
@@ -282,7 +459,8 @@ function getSid() {
   sid = params.get('sid');
   if (sid) {
     sessionStorage.setItem('referral_sid', sid);
-    history.replaceState(null, '', window.location.pathname);
+    const envParam = ENV ? '?env=' + ENV : '';
+    history.replaceState(null, '', window.location.pathname + envParam);
     currentSid = sid;
   }
   return sid || null;
@@ -373,7 +551,7 @@ function fallbackAvatar() {
 async function generateCode() {
   const btn = document.getElementById('gen-btn');
   const errEl = document.getElementById('gen-error');
-  btn.disabled = true; btn.textContent = '生成中...'; errEl.style.display = 'none';
+  btn.disabled = true; btn.textContent = t('invite.generating'); errEl.style.display = 'none';
   try {
     await postInviteCode();
     renderAuthenticated(await fetchReferralMe());
@@ -381,21 +559,25 @@ async function generateCode() {
     errEl.textContent = '生成失败: ' + e.message;
     errEl.style.display = 'block';
   } finally {
-    btn.disabled = false; btn.textContent = '生成邀请码';
+    btn.disabled = false; btn.textContent = t('invite.generate');
   }
 }
 
 function updateInstallCommands(code) {
-  document.getElementById('cmd-mac-text').textContent =
-    'curl -fsSL "https://atomcode.com/install.sh?invite=' + code + '" | sh';
+  OS_CMDS = {
+    unix: 'curl -fsSL ' + RELEASE_BASE + '/install.sh | sh -s -- --invite=' + code,
+    win: '$env:ATOMCODE_INVITE=\'' + code + '\'; irm ' + RELEASE_BASE + '/install.ps1 | iex',
+  };
+  renderInstallCommands();
 }
 
-async function copyCommand() {
-  const el = document.getElementById('cmd-mac-text');
-  await navigator.clipboard.writeText(el.textContent);
-  const btn = document.getElementById('copy-cmd-btn');
-  btn.textContent = '已复制'; btn.classList.add('copied');
-  setTimeout(() => { btn.textContent = '复制命令'; btn.classList.remove('copied'); }, 1800);
+async function copyInstallCommand(kind) {
+  const cmd = OS_CMDS[kind] || '';
+  await navigator.clipboard.writeText(cmd);
+  const btn = document.getElementById(kind === 'win' ? 'copy-win-btn' : 'copy-unix-btn');
+  btn.textContent = t('cmd.copied');
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = t('cmd.copy'); btn.classList.remove('copied'); }, 1600);
 }
 
 async function loadSummary() {
@@ -424,9 +606,9 @@ function renderSummary(s) {
   document.getElementById('stat-amount').textContent = s.amount.toFixed(2);
   const healthy = s.rate >= .25;
   document.getElementById('rate-card').classList.toggle('warn', !healthy);
-  document.getElementById('rate-note').textContent = healthy ? '已达质量线，安装与活跃双项结算' : '低于 25% 质量线，仅结算活跃拉新';
-  document.getElementById('amount-note').textContent = healthy ? '安装奖励 + 活跃奖励' : '仅结算活跃 (' + s.active + '×5)';
-  document.getElementById('updated-at').textContent = '刚刚';
+  document.getElementById('rate-note').textContent = healthy ? t('note.healthy') : t('note.unhealthy');
+  document.getElementById('amount-note').textContent = healthy ? t('note.amount.healthy') : t('note.amount.unhealthy') + ' (' + s.active + '×5)';
+  document.getElementById('updated-at').textContent = t('time.now');
 }
 
 async function loadLeaderboard(weekStart, targetId = 'board-content', rulesId = 'rules-content') {
@@ -435,7 +617,7 @@ async function loadLeaderboard(weekStart, targetId = 'board-content', rulesId = 
     const items = normalizeBoardItems(data);
     renderBoard(targetId, {
       items: items,
-      weekLabel: data.week_label || currentWeekLabel(),
+      weekLabel: currentWeekLabel(),
       weekStart: data.week_start || weekStart || '',
     });
   } catch (e) {
@@ -492,35 +674,35 @@ function renderBoard(targetId, data) {
   const weekLabel = data.weekLabel || currentWeekLabel();
   target.dataset.weekStart = data.weekStart || '';
   const rulesTargetId = targetId === 'no-code-board' ? 'no-code-rules' : targetId === 'public-board' ? 'public-rules' : 'rules-content';
-  const prevControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(-1, \'' + escAttr(targetId) + '\', \'' + escAttr(rulesTargetId) + '\')" title="上一周">◂</button>';
-  const nextControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(1, \'' + escAttr(targetId) + '\', \'' + escAttr(rulesTargetId) + '\')" title="下一周">▸</button>';
+  const prevControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(-1, \'' + escAttr(targetId) + '\', \'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.prev')) + '">◂</button>';
+  const nextControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(1, \'' + escAttr(targetId) + '\', \'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.next')) + '">▸</button>';
   const body = rows.length
     ? rows.map(rowHtml).join('')
-    : '<tr><td colspan="8"><div class="empty">本周排行榜暂无数据</div></td></tr>';
+    : '<tr><td colspan="8"><div class="empty">' + esc(t('board.empty')) + '</div></td></tr>';
 
   const html = '<div class="section-bar">' +
-    '<div><div class="section-title"><span class="mark">▣</span>每周邀请风云榜</div><div class="section-hint">按“本周新增活跃设备数”降序排列。每周日 23:59 截榜，周一结算京东卡。</div></div>' +
+    '<div><div class="section-title"><span class="mark">▣</span>' + esc(t('board.title')) + '</div><div class="section-hint">' + esc(t('board.hint')) + '</div></div>' +
     '<div class="period">' +
       prevControl +
       '<b>' + esc(weekLabel) + '</b>' +
       nextControl +
     '</div></div>' +
     '<section class="leaderboard"><div class="rank-wrap"><table class="rank-table"><thead><tr>' +
-    '<th>排名</th><th>推广者昵称</th><th>设备安装 (A)</th><th>活跃设备 (B)</th><th>转化率 (R)</th><th>结算金额</th><th>状态</th><th>榜单奖励</th>' +
+    '<th>' + esc(t('board.rank')) + '</th><th>' + esc(t('board.promoter')) + '</th><th>' + esc(t('board.devices')) + '</th><th>' + esc(t('board.active')) + '</th><th>' + esc(t('board.rate')) + '</th><th>' + esc(t('board.amount')) + '</th><th>' + esc(t('board.status')) + '</th><th>' + esc(t('board.reward')) + '</th>' +
     '</tr></thead><tbody>' + body + '</tbody></table></div></section>';
   target.innerHTML = html;
 }
 function rowHtml(row) {
   const blocked = Number(row.rate) < .25;
   const rankClass = row.rank === 1 ? ' top1' : row.rank === 2 ? ' top2' : row.rank === 3 ? ' top3' : '';
-  const statusText = row.status || (blocked ? '触发熔断，仅结算活跃' : '正常结算 (' + row.devices + '×2 + ' + row.active + '×5)');
-  const rewardTip = '每周榜单 Top5 赠送 CodingPlan Pro 套餐 30 天，包含 GLM-5.1、Deepseek-v4 flash、Qwen3.6。';
+  const statusText = row.status || (blocked ? t('status.blocked') : t('status.normal') + ' (' + row.devices + '×2 + ' + row.active + '×5)');
+  const rewardTip = t('reward.tip');
   const rewardHtml = Number(row.rank) <= 5
     ? '<span class="coding-reward" data-tip="' + escAttr(rewardTip) + '" onmouseenter="showRewardTip(this)" onmouseleave="hideRewardTip()" onfocus="showRewardTip(this)" onblur="hideRewardTip()" tabindex="0" aria-label="' + escAttr(rewardTip) + '">C</span>'
     : '<span class="reward-empty">-</span>';
   return '<tr class="' + (row.me ? 'me ' : '') + (blocked ? 'blocked' : '') + '">' +
     '<td><span class="rank' + rankClass + '">' + row.rank + '</span></td>' +
-    '<td><b>' + esc(maskDisplayName(row.username)) + '</b>' + (row.me ? '<span class="me-badge">我</span>' : '') + '</td>' +
+    '<td><b>' + esc(maskDisplayName(row.username)) + '</b>' + (row.me ? '<span class="me-badge">' + esc(t('board.me')) + '</span>' : '') + '</td>' +
     '<td class="mono">' + row.devices + '</td>' +
     '<td class="mono num-blue">' + row.active + '</td>' +
     '<td>' + (blocked ? '<span class="rate-bad">' + pct(row.rate) + '</span>' : '<span class="num-green">' + pct(row.rate) + '</span>') + '</td>' +
@@ -567,12 +749,12 @@ function renderRules(targetId) {
   const target = document.getElementById(targetId);
   if (!target) return;
   target.innerHTML = '<section class="rules">' +
-    '<div class="rules-title"><span class="info">i</span>结算规则与防刷熔断说明</div>' +
-    '<p>为保障社区健康发展，系统自动计算安装与活跃的转化率（R = 活跃数/安装数）。</p>' +
-    '<ul><li>当 <b>R ≥ 25%</b> 时，视为优质推广，结算公式为：<code>安装数×2元 + 活跃数×5元</code></li>' +
-    '<li>当 <span class="red">R &lt; 25%</span> 时，触发质量防刷熔断，安装量清零，仅保留有效活跃结算：<code>活跃数×5元</code></li>' +
-    '<li>每周邀请风云榜 Top5 额外赠送 <code>CodingPlan Pro 30 天</code>，包含 GLM-5.1、Deepseek-v4 flash、Qwen3.6。</li>' +
-    '<li>所有现金奖励统一折算为等额京东 E 卡，于每周一向邀请账号绑定的邮箱发放。</li></ul></section>';
+    '<div class="rules-title"><span class="info">i</span>' + esc(t('rules.title')) + '</div>' +
+    '<p>' + esc(t('rules.desc')) + '</p>' +
+    '<ul><li>' + t('rules.good') + '</li>' +
+    '<li>' + t('rules.bad') + '</li>' +
+    '<li>' + t('rules.reward') + '</li>' +
+    '<li>' + t('rules.cash') + '</li></ul></section>';
 }
 
 function pct(v) { return (v * 100).toFixed(2) + '%'; }
@@ -620,6 +802,58 @@ function formatLocalDate(date) {
   return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
 }
 
+function initThemeToggle() {
+  const btn = document.getElementById('themeBtn');
+  if (!btn) return;
+  const html = document.documentElement;
+  const sun = '<svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
+  const moon = '<svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+  function apply(theme, announce) {
+    const light = theme === 'light';
+    html.classList.toggle('light', light);
+    btn.innerHTML = light ? sun : moon;
+    btn.setAttribute('aria-label', light ? 'Switch to dark' : 'Switch to light');
+    try { localStorage.setItem('atomcode_theme', theme); } catch (e) {}
+    if (announce) showToast(t(light ? 'toast.theme.light' : 'toast.theme.dark'));
+  }
+  let saved = 'dark';
+  try {
+    saved = localStorage.getItem('atomcode_theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  } catch (e) {}
+  apply(saved, false);
+  btn.addEventListener('click', () => apply(html.classList.contains('light') ? 'dark' : 'light', true));
+}
+
+function initLangToggle() {
+  const btn = document.getElementById('langBtn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    LANG = LANG === 'zh' ? 'en' : 'zh';
+    try { localStorage.setItem('atomcode_lang', LANG); } catch (e) {}
+    applyI18n();
+    renderInstallCommands();
+    renderSummary(currentSummary);
+    reloadVisibleLeaderboard();
+    showToast(t('toast.lang.' + LANG));
+  });
+}
+
+function reloadVisibleLeaderboard() {
+  if (document.getElementById('auth-code-state').classList.contains('active')) {
+    const start = document.getElementById('board-content').dataset.weekStart || formatLocalDate(getMonday());
+    loadLeaderboard(start, 'board-content', 'rules-content');
+  } else if (document.getElementById('auth-no-code-state').classList.contains('active')) {
+    const start = document.getElementById('no-code-board').dataset.weekStart || formatLocalDate(getMonday());
+    loadLeaderboard(start, 'no-code-board', 'no-code-rules');
+  } else {
+    const start = document.getElementById('public-board').dataset.weekStart || formatLocalDate(getMonday());
+    loadLeaderboard(start, 'public-board', 'public-rules');
+  }
+}
+
+applyI18n();
+initThemeToggle();
+initLangToggle();
 initPage();
 </script>
 </body>
