@@ -1233,9 +1233,12 @@ impl AgentLoop {
                         crate::conversation::turn::TurnTracker::rebuild(&messages);
                     self.conversation.messages = messages;
                     self.conversation.turn_tracker = turn_tracker;
-                    // Resuming a different saved conversation is a new session
-                    // boundary for prefix-cache affinity.
-                    self.reset_session_id();
+                    // NOTE: deliberately do NOT regenerate session_id here.
+                    // SetMessages also fires on `-c`/`--continue` auto-restore
+                    // and `/resume` of the current session — those CONTINUE an
+                    // existing conversation, so a new id would fragment one
+                    // logical session into two on the gateway. Only an explicit
+                    // fresh start (ClearConversation: /session, /clear) resets.
                 }
                 AgentCommand::SetPlanMode(enabled) => {
                     self.plan_mode = enabled;
