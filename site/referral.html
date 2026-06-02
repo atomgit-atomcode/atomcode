@@ -6,26 +6,41 @@
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <title>邀请有礼 · AtomCode</title>
 <meta name="description" content="邀请开发者安装并使用 AtomCode，按周结算安装与活跃奖励。">
-<link rel="icon" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <style>
   *,*::before,*::after{box-sizing:border-box}
   html,body{margin:0;padding:0;background:#0a0a0a;color:#fff;font-family:"PingFang SC","Microsoft YaHei",Inter,sans-serif;-webkit-font-smoothing:antialiased;overflow-x:hidden}
   a{color:inherit;text-decoration:none}
-  button{cursor:pointer;font-family:inherit;border:none;outline:none;color:inherit;background:none;padding:0}
+  button,input,textarea,select{font-family:inherit;border:none;outline:none;color:inherit;background:none}
+  button{cursor:pointer;padding:0}
   :root{
-    --bg:#0a0a0a;--panel:#111;--panel-2:#15191d;--paper:#f6f3ec;
-    --line:rgba(255,255,255,.10);--line-strong:rgba(255,255,255,.16);
+    --bg:#0a0a0a;--panel:#111;--paper:#f6f3ec;
+    --line:rgba(255,255,255,.10);
     --muted:rgba(255,255,255,.55);--faint:rgba(255,255,255,.38);
     --accent:#e8a050;--accent-2:#ffd194;--blue:#7aa6ff;--green:#69d28a;--red:#ff6e6e;
     --mono:Menlo,Monaco,Consolas,"Courier New",monospace;
   }
 
-  .hdr{position:fixed;top:0;left:0;right:0;z-index:1000;height:60px;padding:0 30px;display:flex;align-items:center;justify-content:space-between;background:rgba(10,10,10,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+  /* ---------- shared ---------- */
+  .progress-track{position:fixed;top:0;left:0;right:0;height:2px;z-index:1001;background:rgba(255,255,255,.04);pointer-events:none}
+  .progress-bar{height:100%;width:0;background:linear-gradient(90deg,#e8a050,#f6f3ec 60%,#e8a050);background-size:200% 100%;box-shadow:0 0 10px rgba(232,160,80,.55);animation:shineFlow 3s linear infinite;transition:width .12s linear}
+  @keyframes shineFlow{0%{background-position:0 0}100%{background-position:200% 0}}
+  .aurora{position:fixed;inset:0;z-index:9000;pointer-events:none;background:radial-gradient(circle 360px at var(--mx,-200px) var(--my,-200px),rgba(232,160,80,.18) 0%,rgba(232,160,80,.06) 30%,rgba(232,160,80,0) 60%);mix-blend-mode:screen}
+  .ripple{position:fixed;left:0;top:0;width:8px;height:8px;border-radius:50%;pointer-events:none;z-index:9100;background:rgba(232,160,80,.55);transform:translate(-50%,-50%);animation:rip .65s cubic-bezier(.22,1,.36,1) forwards}
+  @keyframes rip{0%{width:6px;height:6px;background:rgba(232,160,80,.85)}100%{width:160px;height:160px;background:rgba(232,160,80,0)}}
+  .toast{position:fixed;bottom:40px;left:50%;transform:translateX(-50%);z-index:2000;padding:12px 24px;font-size:13px;letter-spacing:1px;background:#000;color:#f6f3ec;border:1px solid var(--accent);border-radius:6px;font-family:var(--mono);opacity:0;transition:opacity .2s,transform .2s;white-space:nowrap}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(-6px)}
+  [data-magnetic]{transition:transform .35s cubic-bezier(.22,1,.36,1);will-change:transform}
+
+  /* ---------- header ---------- */
+  .hdr{position:fixed;top:0;left:0;right:0;z-index:1000;height:60px;padding:0 30px;display:flex;align-items:center;justify-content:space-between;background:rgba(10,10,10,.55);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line);transition:background .25s}
+  .hdr.scrolled{background:rgba(10,10,10,.92)}
   .hdr-logo{display:flex;align-items:center;gap:10px;font-family:Inter,sans-serif;font-weight:600;font-size:15px;letter-spacing:.5px}
   .hdr-logo img{width:24px;height:24px;border-radius:6px;flex-shrink:0}
-  .ver{display:inline-flex;align-items:center;padding:2px 7px;margin-left:6px;font-family:var(--mono);font-size:10px;letter-spacing:.5px;color:var(--accent);border:1px solid rgba(232,160,80,.4);border-radius:3px;font-weight:500;background:rgba(232,160,80,.08)}
-  .hdr-nav{display:flex;gap:22px;font-family:var(--mono);font-size:12px;letter-spacing:1.5px;text-transform:uppercase}
-  .hdr-nav a{position:relative;padding:6px 2px;color:rgba(255,255,255,.65);transition:color .2s}
+  .ver{display:inline-flex;align-items:center;padding:2px 7px;margin-left:6px;font-family:var(--mono);font-size:10px;letter-spacing:.5px;color:var(--accent);border:1px solid rgba(232,160,80,.4);border-radius:3px;font-weight:500;background:rgba(232,160,80,.08);transition:all .25s}
+  .ver:hover{background:var(--accent);color:#000;border-color:var(--accent)}
+  .hdr-nav{display:flex;align-items:center;gap:22px;font-family:var(--mono);font-size:12px;letter-spacing:1.5px;text-transform:uppercase}
+  .hdr-nav a{position:relative;padding:6px 2px;line-height:1;color:rgba(255,255,255,.65);transition:color .2s}
   .hdr-nav a::after{content:"";position:absolute;bottom:0;left:0;right:0;height:1px;background:var(--accent);transform:scaleX(0);transform-origin:left;transition:transform .25s}
   .hdr-nav a:hover,.hdr-nav a.active{color:#fff}
   .hdr-nav a.active::after{transform:scaleX(1)}
@@ -33,15 +48,25 @@
   .hdr-nav a.nav-cp::before{content:"";position:absolute;left:4px;top:50%;width:5px;height:5px;border-radius:50%;background:var(--accent);transform:translateY(-50%);box-shadow:0 0 6px var(--accent);animation:dotPulse 2s ease-in-out infinite}
   .hdr-nav a.nav-cp .free-badge{padding:1px 6px;font-size:9px;font-weight:600;letter-spacing:1px;background:rgba(232,160,80,.18);color:var(--accent);border:1px solid rgba(232,160,80,.4);border-radius:3px;text-transform:uppercase}
   .hdr-right{display:flex;gap:10px;align-items:center}
+  .btn-pill{height:32px;padding:0 14px;display:inline-flex;align-items:center;gap:6px;border:1px solid rgba(255,255,255,.25);font-size:11px;letter-spacing:1.5px;color:#fff;font-family:var(--mono);transition:background .2s,color .2s,border-color .2s}
+  .btn-pill:hover{background:#fff;color:#000;border-color:#fff}
+  .btn-pill.primary{background:var(--accent);color:#000;border-color:var(--accent)}
+  .btn-pill.primary:hover{background:#fff;color:#000;border-color:#fff}
   .icon-btn{width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.75);transition:all .2s}
   .icon-btn:hover{color:#fff;border-color:#fff;background:rgba(255,255,255,.05)}
-  .btn-pill{height:32px;padding:0 13px;display:inline-flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.18);font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.72);transition:all .2s;white-space:nowrap}
-  .btn-pill:hover{color:#fff;border-color:#fff;background:rgba(255,255,255,.05)}
   .theme-icon{display:inline-flex;width:14px;height:14px;align-items:center;justify-content:center}
-  .period-arrow{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:1px solid var(--line);background:transparent;color:var(--muted);font-size:12px;cursor:pointer;transition:all .2s}
-  .period-arrow:hover{color:#fff;border-color:rgba(255,255,255,.3)}
+  .mb-toggle{display:none}
   @keyframes dotPulse{0%,50%{opacity:1}25%{opacity:.3}}
 
+  /* ---------- mobile drawer ---------- */
+  .mb-drawer{position:fixed;top:60px;left:0;right:0;bottom:0;z-index:999;background:rgba(10,10,10,.97);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);display:flex;flex-direction:column;padding:20px 30px;gap:4px;transform:translateX(100%);transition:transform .3s cubic-bezier(.22,1,.36,1)}
+  .mb-drawer.open{transform:translateX(0)}
+  .mb-drawer a{display:block;padding:14px 0;font-family:var(--mono);font-size:13px;letter-spacing:2px;color:rgba(255,255,255,.72);border-bottom:1px solid var(--line);transition:color .2s}
+  .mb-drawer a:hover,.mb-drawer a.active{color:#fff}
+  .mb-drawer a.cp{color:var(--accent)}
+  .mb-drawer a.cta{margin-top:12px;padding:12px 0;text-align:center;background:var(--accent);color:#000;border:none;font-weight:600;letter-spacing:2px}
+
+  /* ---------- main ---------- */
   .main{position:relative;padding:112px 30px 72px;min-height:100vh}
   .main::before{content:"";position:absolute;inset:0;background:
     radial-gradient(ellipse 72% 46% at 50% 0%,rgba(232,160,80,.12),transparent 62%),
@@ -58,7 +83,7 @@
   .spinner{width:32px;height:32px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:70px auto}
   @keyframes spin{to{transform:rotate(360deg)}}
 
-  .panel,.leaderboard,.rules{border:1px solid var(--line-strong);background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.02));border-radius:12px;box-shadow:0 22px 60px rgba(0,0,0,.34);overflow:hidden}
+  .panel,.leaderboard,.rules{border:1px solid rgba(255,255,255,.16);background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.02));border-radius:12px;box-shadow:0 22px 60px rgba(0,0,0,.34);overflow:hidden}
   .panel{margin-bottom:34px}
   .panel-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:17px 24px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.025)}
   .panel-title{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:700;color:#fff}
@@ -85,17 +110,6 @@
   .copy-btn.copied{background:var(--green);color:#000;border-color:var(--green)}
 
   .cmd-label{margin:0 0 10px;color:var(--muted);font-size:13px}
-  .cmd-box{position:relative;margin-bottom:22px;background:#000;border:1px solid rgba(232,160,80,.20);border-radius:8px;box-shadow:0 0 0 1px rgba(122,166,255,.08),0 0 30px rgba(122,166,255,.10);overflow:hidden}
-  .install-cmd-list{display:flex;flex-direction:column;gap:12px;padding:14px 16px 16px}
-  .install-cmd-section{border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(255,255,255,.02);overflow:hidden}
-  .install-cmd-section .cp-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 10px 9px 14px;background:rgba(255,255,255,.025);border-bottom:1px solid var(--line)}
-  .install-cmd-section .cp-bar .label{min-width:0;font-family:var(--mono);font-size:12px;letter-spacing:1px;color:rgba(255,255,255,.52);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .cmd-text{display:block;margin:0;padding:16px 18px;min-height:76px;font-family:var(--mono);font-size:15px;line-height:1.55;color:#e8e8e8;white-space:pre-wrap;word-break:break-word;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.2) transparent}
-  .cmd-text::-webkit-scrollbar{height:6px}.cmd-text::-webkit-scrollbar-track{background:transparent}.cmd-text::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:3px}
-  .cmd-text .accent{color:var(--accent)}.cmd-text .str{color:#9ecbff}
-  .install-cmd-section .copy-btn{height:32px;border-radius:0;border-color:rgba(232,160,80,.28);color:rgba(232,160,80,.9);background:transparent}
-  .install-cmd-section .copy-btn:hover{background:var(--accent);color:#000;border-color:var(--accent)}
-  .cmd-footnote{padding:0 16px 16px;color:var(--faint);font-size:13px;letter-spacing:.5px}
   .invite-link-box{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:22px;padding:16px 18px;background:#000;border:1px solid rgba(232,160,80,.20);border-radius:8px;box-shadow:0 0 0 1px rgba(122,166,255,.08),0 0 30px rgba(122,166,255,.10)}
   .invite-url{min-width:0;font-family:var(--mono);font-size:16px;line-height:1.45;color:#9ecbff;word-break:break-all}
   .invite-link-box .copy-btn{flex-shrink:0}
@@ -116,6 +130,8 @@
   .section-hint{margin-top:6px;color:var(--faint);font-size:12px}
   .period{padding:8px 13px;border:1px solid var(--line);border-radius:7px;background:rgba(255,255,255,.03);font-size:12px;color:var(--muted);white-space:nowrap}
   .period b{color:#fff}
+  .period-arrow{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:1px solid var(--line);background:transparent;color:var(--muted);font-size:12px;cursor:pointer;transition:all .2s}
+  .period-arrow:hover{color:#fff;border-color:rgba(255,255,255,.3)}
 
   .leaderboard{margin-bottom:20px}
   .rank-table{width:100%;border-collapse:collapse;font-size:13px}
@@ -137,6 +153,7 @@
   .reward-popover{position:fixed;z-index:5000;width:min(310px,calc(100vw - 28px));padding:10px 12px;border:1px solid rgba(232,160,80,.38);border-radius:8px;background:#101316;color:rgba(255,255,255,.88);font-size:12px;font-weight:500;line-height:1.6;text-align:left;box-shadow:0 18px 42px rgba(0,0,0,.55);pointer-events:none}
   .reward-popover::after{content:"";position:absolute;left:var(--arrow-x,50%);bottom:-5px;width:9px;height:9px;background:#101316;border-right:1px solid rgba(232,160,80,.38);border-bottom:1px solid rgba(232,160,80,.38);transform:translateX(-50%) rotate(45deg)}
   .reward-empty{color:var(--faint);font-family:var(--mono)}
+  .sep-dots{text-align:center;padding:6px 0;color:var(--faint);font-size:16px;letter-spacing:6px}
   .empty{padding:30px;text-align:center;color:var(--muted);font-size:13px}
 
   .rules{padding:18px 22px;margin-top:18px}
@@ -149,15 +166,16 @@
   .rules .red{color:#ff4f4f;font-weight:700}
   .error-msg{margin:16px 0 0;padding:14px 16px;border:1px solid rgba(255,110,110,.3);border-radius:8px;background:rgba(255,110,110,.1);color:var(--red);font-size:13px}
   .retry-btn{margin-top:14px;height:34px;padding:0 16px;border:1px solid var(--line);border-radius:6px;background:rgba(255,255,255,.08);color:#fff}
-  .toast{position:fixed;left:50%;bottom:28px;z-index:2000;transform:translate(-50%,12px);padding:10px 14px;border:1px solid rgba(232,160,80,.35);border-radius:8px;background:rgba(16,19,22,.96);color:#fff;font-size:13px;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;box-shadow:0 14px 36px rgba(0,0,0,.42)}
-  .toast.show{opacity:1;transform:translate(-50%,0)}
 
+  /* ---------- light mode ---------- */
   html.light,html.light body{background:#f6f3ec;color:#0d0d0d}
   html.light .hdr{background:rgba(246,243,236,.76);border-bottom-color:rgba(0,0,0,.10);color:#0d0d0d}
+  html.light .hdr.scrolled{background:rgba(246,243,236,.96)}
   html.light .hdr-nav a{color:rgba(0,0,0,.55)}html.light .hdr-nav a:hover,html.light .hdr-nav a.active{color:#0d0d0d}
   html.light .hdr-nav a.nav-cp{color:#c87618}html.light .hdr-nav a.nav-cp::before{background:#c87618;box-shadow:0 0 6px #c87618}
   html.light .hdr-nav a.nav-cp .free-badge{background:rgba(200,118,24,.12);color:#c87618;border-color:rgba(200,118,24,.4)}
   html.light .icon-btn,html.light .btn-pill{color:rgba(0,0,0,.72);border-color:rgba(0,0,0,.18)}html.light .icon-btn:hover,html.light .btn-pill:hover{color:#0d0d0d;border-color:#0d0d0d;background:rgba(0,0,0,.04)}
+  html.light .btn-pill.primary{background:var(--accent);color:#000;border-color:var(--accent)}html.light .btn-pill.primary:hover{background:#0d0d0d;color:#f6f3ec;border-color:#0d0d0d}
   html.light .main::before{background:radial-gradient(ellipse 72% 46% at 50% 0%,rgba(232,160,80,.16),transparent 62%),repeating-linear-gradient(transparent 0,transparent 39px,rgba(0,0,0,.025) 40px)}
   html.light h1{background:linear-gradient(180deg,#171717,#5d6470);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
   html.light .sub,html.light .login-card p,html.light .cmd-label,html.light .section-hint,html.light .rules p,html.light .rules li{color:rgba(0,0,0,.58)}
@@ -165,51 +183,57 @@
   html.light .panel-head,html.light .rank-table th{background:rgba(0,0,0,.025);border-color:rgba(0,0,0,.10)}
   html.light .panel-title,html.light .section-title,html.light .user-name,html.light .period b{color:#0d0d0d}
   html.light .panel-meta,html.light .user-id,html.light .metric-label,html.light .metric-note,html.light .period,html.light .rank-table th{color:rgba(0,0,0,.48)}
-  html.light .cmd-box,html.light .install-cmd-section,html.light .rules code{background:#fff;border-color:rgba(0,0,0,.10)}
   html.light .invite-link-box{background:#fff;border-color:rgba(0,0,0,.10)}
   html.light .invite-url{color:#1f6fd1}
   html.light .invite-link-box .copy-btn{background:rgba(200,118,24,.10);border-color:rgba(200,118,24,.34);color:#9b5d14}
   html.light .invite-link-box .copy-btn:hover{background:#c87618;border-color:#c87618;color:#fff}
   html.light .invite-link-box .copy-btn.copied{background:var(--green);border-color:var(--green);color:#000}
   html.light .rules code{color:#0d0d0d;background:rgba(0,0,0,.035);border-color:rgba(0,0,0,.12)}
-  html.light .install-cmd-section .cp-bar,html.light .install-actions{background:rgba(0,0,0,.025);border-color:rgba(0,0,0,.08)}
-  html.light .install-cmd-section .cp-bar .label,html.light .cmd-footnote{color:rgba(0,0,0,.50)}
-  html.light .cmd-text{color:#171717}.cmd-text .accent{color:var(--accent)}html.light .cmd-text .str{color:#1f6fd1}
   html.light .metric{background:rgba(255,255,255,.5);border-color:rgba(0,0,0,.12)}
   html.light .metric-value{color:#0d0d0d}.metric-value.blue{color:#2f8cff}.metric-value.red{color:#ff4f4f}.metric-value.gold{color:var(--accent)}
   html.light .rank-table td{color:rgba(0,0,0,.72);border-bottom-color:rgba(0,0,0,.08)}
   html.light .rank-table tr.me td{background:rgba(47,140,255,.12)}html.light .rank-table tr.blocked td{background:rgba(255,110,110,.18)}
   html.light .coding-reward{color:#805210;border-color:rgba(160,100,20,.65);background:rgba(160,100,20,.24);box-shadow:0 0 14px rgba(160,100,20,.18)}
-  html.light .toast{background:rgba(255,255,255,.98);color:#0d0d0d;box-shadow:0 14px 36px rgba(0,0,0,.16)}
+  html.light .toast{background:rgba(255,255,255,.98);color:#0d0d0d;border-color:#c87618;box-shadow:0 14px 36px rgba(0,0,0,.16)}
+  html.light .mb-drawer{background:rgba(246,243,236,.97)}html.light .mb-drawer a{color:rgba(0,0,0,.72);border-color:rgba(0,0,0,.08)}html.light .mb-drawer a:hover{color:#0d0d0d}
+  html.light .mb-drawer a.cp{color:#c87618}html.light .mb-drawer a.cta{background:#c87618;color:#fff}
 
   @media (max-width:1024px){
-    .hdr{padding:0 18px}.hdr-nav{display:none}.hdr-right .btn-pill{display:none}.main{padding:96px 18px 54px}
+    .hdr-nav{display:none}.hdr-right .btn-pill{display:none}.mb-toggle{display:inline-flex}
+    .hdr{padding:0 18px}.main{padding:96px 18px 54px}
     h1{font-size:34px}.metrics{grid-template-columns:repeat(2,1fr)}
     .rank-wrap{overflow-x:auto}.rank-table{min-width:920px}
   }
   @media (max-width:640px){
     .panel-head,.section-bar{align-items:flex-start;flex-direction:column}
     .panel-body{padding:18px}.metrics{grid-template-columns:1fr}
-    .install-cmd-list{padding:12px;gap:10px}
-    .install-cmd-section .cp-bar{padding:8px 8px 8px 10px}.cmd-text{font-size:13px;padding:14px 12px}
+    .invite-link-box{padding:12px 14px}.invite-url{font-size:13px}
     .invite-code{font-size:24px;max-width:100%;word-break:break-all}.sub{font-size:13px}
   }
 </style>
 </head>
 <body>
+
+<div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+<div class="aurora" id="aurora"></div>
+
+<!-- header -->
 <header class="hdr" id="hdr">
   <a class="hdr-logo" href="/index.html">
-    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode" onerror="this.style.display='none'">
-    <span>AtomCode</span><span class="ver" id="verBadge">v4.24.0</span>
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="ver" id="verBadge" title="当前版本">v4.24.0</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="/index.html#features" data-i18n="nav.features">功能</a>
-    <a href="/index.html#editor-plugins" data-i18n="nav.plugins">插件</a>
-    <a href="/index.html#compare" data-i18n="nav.compare">对比</a>
+    <a href="/index.html#editor-plugins" data-i18n="nav.plugins">编辑器插件</a>
     <a href="/index.html#install" data-i18n="nav.install">安装</a>
     <a href="/docs/index.html" target="_blank" rel="noopener" data-i18n="nav.docs">文档</a>
     <a class="active" href="/referral.html" data-i18n="nav.referral">邀请推荐</a>
-    <a class="nav-cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener"><span data-i18n="nav.codingplan">CodingPlan</span><span class="free-badge">FREE</span></a>
+    <a class="nav-cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">
+      <span data-i18n="nav.codingplan">Coding Plan</span>
+      <span class="free-badge">FREE</span>
+    </a>
   </nav>
   <div class="hdr-right">
     <button class="icon-btn" id="themeBtn" aria-label="主题">
@@ -217,8 +241,23 @@
     </button>
     <button class="icon-btn" id="langBtn" aria-label="语言">中</button>
     <a class="btn-pill" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="btn.repo">开源仓库</a>
+    <button class="icon-btn mb-toggle" id="mbToggle" aria-label="菜单" aria-expanded="false">☰</button>
   </div>
 </header>
+
+<!-- mobile drawer -->
+<nav class="mb-drawer" id="mbDrawer" aria-label="移动端导航">
+  <a href="/index.html#features" data-i18n="nav.features">功能</a>
+  <a href="/index.html#editor-plugins" data-i18n="nav.plugins">编辑器插件</a>
+  <a href="/index.html#install" data-i18n="nav.install">安装</a>
+  <a href="/docs/index.html" target="_blank" rel="noopener" data-i18n="nav.docs">文档</a>
+  <a class="active" href="/referral.html" data-i18n="nav.referral">邀请推荐</a>
+  <a class="cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">
+    <span data-i18n="nav.codingplan">Coding Plan</span>
+    <span class="free-badge">FREE</span>
+  </a>
+  <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="btn.repo">开源仓库</a>
+</nav>
 
 <main class="main">
   <div class="wrap">
@@ -241,7 +280,7 @@
         </div>
         <div class="login-card">
           <p data-i18n="login.desc">使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。</p>
-          <button class="login-btn" onclick="login()" data-i18n="login.btn">使用 AtomGit 账号登录</button>
+          <button class="login-btn" onclick="login()" data-magnetic data-i18n="login.btn">使用 AtomGit 账号登录</button>
         </div>
       </section>
       <div id="public-board"></div>
@@ -264,7 +303,7 @@
             <button class="logout-btn" onclick="logout()" data-i18n="logout">退出</button>
           </div>
           <p class="cmd-label" data-i18n="invite.none">你还没有邀请码，生成后即可复制官网邀请链接分享给其他开发者。</p>
-          <button class="gen-btn" id="gen-btn" onclick="generateCode()" data-i18n="invite.generate">生成邀请码</button>
+          <button class="gen-btn" id="gen-btn" onclick="generateCode()" data-magnetic data-i18n="invite.generate">生成邀请码</button>
           <p id="gen-error" class="error-msg" style="display:none"></p>
         </div>
       </section>
@@ -289,8 +328,8 @@
           </div>
           <p class="cmd-label" data-i18n="cmd.label">复制官网邀请链接，分享给其他开发者</p>
           <div class="invite-link-box">
-            <div class="invite-url" id="invite-url-text"></div>
-            <button class="copy-btn" id="copy-link-btn" onclick="copyInviteLink()" data-copy-label="short">📋 复制</button>
+            <span class="invite-url" id="invite-url-text"></span>
+            <button class="copy-btn" id="copy-link-btn" onclick="copyInviteLink()" data-magnetic data-copy-label="short">📋 复制</button>
           </div>
           <div class="metrics">
             <div class="metric"><div class="metric-label" data-i18n="metric.devices">本周新增设备安装</div><div class="metric-value"><span id="stat-devices">0</span><span class="unit" data-i18n="unit.devices">台</span></div></div>
@@ -338,12 +377,11 @@ try {
 
 const T = {
   'nav.features': { zh: '功能', en: 'Features' },
-  'nav.plugins': { zh: '插件', en: 'Plugins' },
-  'nav.compare': { zh: '对比', en: 'Compare' },
+  'nav.plugins': { zh: '编辑器插件', en: 'Editor Plugins' },
   'nav.install': { zh: '安装', en: 'Install' },
   'nav.docs': { zh: '文档', en: 'Docs' },
   'nav.referral': { zh: '邀请推荐', en: 'Referral' },
-  'nav.codingplan': { zh: 'CodingPlan', en: 'CodingPlan' },
+  'nav.codingplan': { zh: 'Coding Plan', en: 'Coding Plan' },
   'btn.repo': { zh: '开源仓库', en: 'Repository' },
   'hero.badge': { zh: '长期进行中 · 每周一结算现金打款', en: 'Ongoing · settled every Monday' },
   'hero.title': { zh: '邀请有礼：AtomCode 裂变计划', en: 'Referral Rewards: AtomCode Growth Program' },
@@ -353,7 +391,7 @@ const T = {
   'panel.mine': { zh: '我的专属邀请面板', en: 'My Referral Dashboard' },
   'panel.meta.prefix': { zh: '数据更新时间：', en: 'Updated: ' },
   'time.now': { zh: '刚刚', en: 'just now' },
-  'login.desc': { zh: '使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。', en: 'Sign in with AtomGit to generate your invite code and view this week’s installs, active users, and estimated settlement.' },
+  'login.desc': { zh: '使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。', en: 'Sign in with AtomGit to generate your invite code and view this week\'s installs, active users, and estimated settlement.' },
   'login.btn': { zh: '使用 AtomGit 账号登录', en: 'Sign in with AtomGit' },
   'logout': { zh: '退出', en: 'Log out' },
   'invite.none': { zh: '你还没有邀请码，生成后即可复制官网邀请链接分享给其他开发者。', en: 'You do not have an invite code yet. Generate one to copy and share your official invite link.' },
@@ -377,9 +415,10 @@ const T = {
   'toast.theme.dark': { zh: '☾ 已切换到 Dark', en: '☾ Switched to Dark' },
   'toast.lang.zh': { zh: '已切换到 简体中文', en: 'Switched to 简体中文' },
   'toast.lang.en': { zh: '已切换到 English', en: 'Switched to English' },
+  'toast.copied': { zh: '✓ 已复制 · 粘贴到终端运行', en: '✓ Copied · paste into your terminal' },
   'board.empty': { zh: '本周排行榜暂无数据', en: 'No leaderboard data this week' },
   'board.title': { zh: '每周邀请风云榜', en: 'Weekly Referral Leaderboard' },
-  'board.hint': { zh: '按“本周新增活跃设备数”降序排列。每周日 23:59 截榜，周一结算现金打款。', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59, with settlement on Monday.' },
+  'board.hint': { zh: '按"本周新增活跃设备数"降序排列。每周日 23:59 截榜，周一结算现金打款。', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59, with settlement on Monday.' },
   'board.prev': { zh: '上一周', en: 'Previous week' },
   'board.next': { zh: '下一周', en: 'Next week' },
   'board.rank': { zh: '排名', en: 'Rank' },
@@ -414,18 +453,44 @@ function applyI18n() {
   const langBtn = document.getElementById('langBtn');
   if (langBtn) {
     langBtn.textContent = LANG === 'zh' ? 'EN' : '中';
-    langBtn.setAttribute('aria-label', LANG === 'zh' ? 'Switch to English' : '切换到中文');
+    langBtn.setAttribute('aria-label', LANG === 'zh' ? 'Switch to English' : '切换到 中文');
   }
 }
+
+/* ========== clipboard ========== */
+function legacyCopy(text){
+  try{
+    const ta=document.createElement('textarea');
+    ta.value=text;
+    ta.setAttribute('readonly','');
+    ta.style.position='fixed';
+    ta.style.left='-9999px';
+    ta.style.top='0';
+    document.body.appendChild(ta);
+    ta.focus();ta.select();
+    try{ta.setSelectionRange(0,text.length);}catch(e){}
+    const ok=document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  }catch(e){return false;}
+}
+function copyText(text){
+  if(navigator.clipboard&&window.isSecureContext){
+    return navigator.clipboard.writeText(text).catch(()=>legacyCopy(text));
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+
+/* ========== toast ========== */
 function showToast(message) {
   const toast = document.getElementById('toast');
   if (!toast) return;
   toast.textContent = message;
   toast.classList.add('show');
-  setTimeout(() => toast.classList.remove('show'), 1200);
+  setTimeout(() => toast.classList.remove('show'), 1600);
 }
 
-// ── Invite link (the index page turns ?invite=CODE into install commands) ──
+// ── Invite link ──
 const PUBLIC_SITE_BASE = 'https://atomcode.atomgit.com';
 let inviteLink = '';
 function currentSiteBase() {
@@ -446,7 +511,7 @@ function renderInviteLink() {
 let currentSid = null;
 let currentCode = null;
 let currentUser = null;
-let currentSummary = { devices: 0, active: 0, attributions: 0 };
+let currentSummary = { devices: 0, active: 0, attributions: 0, rate: 0, amount: 0 };
 
 function getSid() {
   if (currentSid) return currentSid;
@@ -470,7 +535,7 @@ async function login() {
     const data = await resp.json();
     window.location.href = data.login_url;
   } catch (e) {
-    alert('登录初始化失败: ' + e.message);
+    alert('login failed: ' + e.message);
   }
 }
 function logout() { clearSid(); currentCode = null; currentUser = null; showState('unauth'); renderStaticSections('public'); }
@@ -538,7 +603,7 @@ function renderAuthenticated(data) {
 
 function fillUser(suffix, user) {
   document.getElementById('user-avatar-' + suffix).src = user.avatar_url || fallbackAvatar();
-  document.getElementById('user-name-' + suffix).textContent = user.username || 'AtomCode 用户';
+  document.getElementById('user-name-' + suffix).textContent = user.username || 'AtomCode User';
   document.getElementById('user-id-' + suffix).textContent = user.id ? 'ID: ' + user.id : 'AtomGit';
 }
 function fallbackAvatar() {
@@ -553,7 +618,7 @@ async function generateCode() {
     await postInviteCode();
     renderAuthenticated(await fetchReferralMe());
   } catch (e) {
-    errEl.textContent = '生成失败: ' + e.message;
+    errEl.textContent = 'Failed: ' + e.message;
     errEl.style.display = 'block';
   } finally {
     btn.disabled = false; btn.textContent = t('invite.generate');
@@ -565,36 +630,12 @@ function updateInviteLink(code) {
   renderInviteLink();
 }
 
-function legacyCopy(text) {
-  try {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.setAttribute('readonly', '');
-    ta.style.position = 'fixed';
-    ta.style.left = '-9999px';
-    ta.style.top = '0';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    try { ta.setSelectionRange(0, text.length); } catch (e) {}
-    const ok = document.execCommand('copy');
-    document.body.removeChild(ta);
-    return ok;
-  } catch (e) {
-    return false;
-  }
-}
-function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    return navigator.clipboard.writeText(text).catch(() => legacyCopy(text));
-  }
-  return Promise.resolve(legacyCopy(text));
-}
 async function copyInviteLink() {
   await copyText(inviteLink);
   const btn = document.getElementById('copy-link-btn');
   btn.textContent = t('cmd.copied');
   btn.classList.add('copied');
+  showToast(t('toast.copied'));
   setTimeout(() => { btn.textContent = t('cmd.copy'); btn.classList.remove('copied'); }, 1600);
 }
 
@@ -625,27 +666,33 @@ function renderSummary(s) {
   const healthy = s.rate >= .25;
   document.getElementById('rate-card').classList.toggle('warn', !healthy);
   document.getElementById('rate-note').textContent = healthy ? t('note.healthy') : t('note.unhealthy');
-  document.getElementById('amount-note').textContent = healthy ? t('note.amount.healthy') : t('note.amount.unhealthy') + ' (' + s.active + '×5)';
+  document.getElementById('amount-note').textContent = healthy ? t('note.amount.healthy') : t('note.amount.unhealthy') + ' (' + s.active + '\xd75)';
   document.getElementById('updated-at').textContent = t('time.now');
 }
 
-async function loadLeaderboard(weekStart, targetId = 'board-content', rulesId = 'rules-content') {
+async function loadLeaderboard(weekStart, targetId, rulesId) {
+  targetId = targetId || 'board-content';
+  rulesId = rulesId || 'rules-content';
   try {
     const data = await fetchLeaderboard(weekStart);
     const items = normalizeBoardItems(data);
+    const meRow = data.me ? normalizeBoardItem(data.me, 0) : null;
     renderBoard(targetId, {
       items: items,
+      meRow: meRow,
       weekLabel: currentWeekLabel(),
       weekStart: data.week_start || weekStart || '',
     });
   } catch (e) {
     console.error('Failed to load leaderboard', e);
-    renderBoard(targetId, { items: [], weekLabel: currentWeekLabel(), weekStart: weekStart || '' });
+    renderBoard(targetId, { items: [], meRow: null, weekLabel: currentWeekLabel(), weekStart: weekStart || '' });
   }
   renderRules(rulesId);
 }
 
-function changeWeek(delta, targetId = 'board-content', rulesId = 'rules-content') {
+function changeWeek(delta, targetId, rulesId) {
+  targetId = targetId || 'board-content';
+  rulesId = rulesId || 'rules-content';
   const target = document.getElementById(targetId);
   if (!target) return;
   const current = target.dataset.weekStart || '';
@@ -664,47 +711,46 @@ function renderStaticSections(prefix) {
   loadLeaderboard(formatLocalDate(getMonday()), boardId, rulesId);
 }
 
+function normalizeBoardItem(item, i) {
+  const devices = parseNumber(item.devices ?? item.installs ?? item.install_count ?? item.device_count);
+  const active = parseNumber(item.active ?? item.qualified ?? item.active_count ?? item.qualified_count);
+  const rate = normalizeRate(item.rate ?? item.conversion_rate, devices, active);
+  const fallbackAmount = rate >= .25 ? devices * 2 + active * 5 : active * 5;
+  const amount = parseNumber(item.amount ?? item.settlement_amount ?? item.reward_amount, fallbackAmount);
+  return {
+    rank: item.rank ?? (i + 1),
+    username: maskDisplayName(item.username ?? item.nickname ?? item.name ?? item.promoter_name ?? 'Dev***er'),
+    devices, active, rate, amount,
+    me: !!(item.me ?? item.is_me ?? item.current_user),
+    status: item.status_text ?? item.status ?? '',
+  };
+}
 function normalizeBoardItems(data) {
   const items = Array.isArray(data.items) ? data.items : Array.isArray(data.leaderboard) ? data.leaderboard : [];
-  return items.map((item, i) => {
-    const devices = parseNumber(item.devices ?? item.installs ?? item.install_count ?? item.device_count);
-    const active = parseNumber(item.active ?? item.qualified ?? item.active_count ?? item.qualified_count);
-    const rate = normalizeRate(item.rate ?? item.conversion_rate, devices, active);
-    const fallbackAmount = rate >= .25 ? devices * 2 + active * 5 : active * 5;
-    const amount = parseNumber(item.amount ?? item.settlement_amount ?? item.reward_amount, fallbackAmount);
-    return {
-      rank: item.rank ?? i + 1,
-      username: maskDisplayName(item.username ?? item.nickname ?? item.name ?? item.promoter_name ?? 'Dev***er'),
-      devices,
-      active,
-      rate,
-      amount,
-      me: !!(item.me ?? item.is_me ?? item.current_user),
-      status: item.status_text ?? item.status ?? '',
-    };
-  });
+  return items.map((item, i) => normalizeBoardItem(item, i));
 }
 
 function renderBoard(targetId, data) {
   const target = document.getElementById(targetId);
   if (!target) return;
   const rows = data.items || [];
+  const meRow = data.meRow || null;
   const weekLabel = data.weekLabel || currentWeekLabel();
   target.dataset.weekStart = data.weekStart || '';
   const rulesTargetId = targetId === 'no-code-board' ? 'no-code-rules' : targetId === 'public-board' ? 'public-rules' : 'rules-content';
-  const prevControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(-1, \'' + escAttr(targetId) + '\', \'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.prev')) + '">◂</button>';
-  const nextControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(1, \'' + escAttr(targetId) + '\', \'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.next')) + '">▸</button>';
-  const body = rows.length
+  const prevControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(-1,\'' + escAttr(targetId) + '\',\'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.prev')) + '">◂</button>';
+  const nextControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(1,\'' + escAttr(targetId) + '\',\'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.next')) + '">▸</button>';
+  var body = rows.length
     ? rows.map(rowHtml).join('')
     : '<tr><td colspan="8"><div class="empty">' + esc(t('board.empty')) + '</div></td></tr>';
+  if (meRow) {
+    body += '<tr class="sep"><td colspan="8"><div class="sep-dots">···</div></td></tr>';
+    body += rowHtml(meRow);
+  }
 
   const html = '<div class="section-bar">' +
     '<div><div class="section-title"><span class="mark">▣</span>' + esc(t('board.title')) + '</div><div class="section-hint">' + esc(t('board.hint')) + '</div></div>' +
-    '<div class="period">' +
-      prevControl +
-      '<b>' + esc(weekLabel) + '</b>' +
-      nextControl +
-    '</div></div>' +
+    '<div class="period">' + prevControl + '<b>' + esc(weekLabel) + '</b>' + nextControl + '</div></div>' +
     '<section class="leaderboard"><div class="rank-wrap"><table class="rank-table"><thead><tr>' +
     '<th>' + esc(t('board.rank')) + '</th><th>' + esc(t('board.promoter')) + '</th><th>' + esc(t('board.devices')) + '</th><th>' + esc(t('board.active')) + '</th><th>' + esc(t('board.rate')) + '</th><th>' + esc(t('board.amount')) + '</th><th>' + esc(t('board.status')) + '</th><th>' + esc(t('board.reward')) + '</th>' +
     '</tr></thead><tbody>' + body + '</tbody></table></div></section>';
@@ -713,13 +759,13 @@ function renderBoard(targetId, data) {
 function rowHtml(row) {
   const blocked = Number(row.rate) < .25;
   const rankClass = row.rank === 1 ? ' top1' : row.rank === 2 ? ' top2' : row.rank === 3 ? ' top3' : '';
-  const statusText = row.status || (blocked ? t('status.blocked') : t('status.normal') + ' (' + row.devices + '×2 + ' + row.active + '×5)');
+  const statusText = row.status || (blocked ? t('status.blocked') : t('status.normal') + ' (' + row.devices + '\xd72 + ' + row.active + '\xd75)');
   const rewardTip = t('reward.tip');
   const rewardHtml = Number(row.rank) <= 5
     ? '<span class="coding-reward" data-tip="' + escAttr(rewardTip) + '" onmouseenter="showRewardTip(this)" onmouseleave="hideRewardTip()" onfocus="showRewardTip(this)" onblur="hideRewardTip()" tabindex="0" aria-label="' + escAttr(rewardTip) + '">C</span>'
     : '<span class="reward-empty">-</span>';
   return '<tr class="' + (row.me ? 'me ' : '') + (blocked ? 'blocked' : '') + '">' +
-    '<td><span class="rank' + rankClass + '">' + row.rank + '</span></td>' +
+    '<td><span class="rank' + rankClass + '">' + esc(row.rank) + '</span></td>' +
     '<td><b>' + esc(maskDisplayName(row.username)) + '</b>' + (row.me ? '<span class="me-badge">' + esc(t('board.me')) + '</span>' : '') + '</td>' +
     '<td class="mono">' + row.devices + '</td>' +
     '<td class="mono num-blue">' + row.active + '</td>' +
@@ -737,7 +783,6 @@ function showRewardTip(anchor) {
   tip.className = 'reward-popover';
   tip.textContent = text;
   document.body.appendChild(tip);
-
   const gap = 10;
   const rect = anchor.getBoundingClientRect();
   const tipRect = tip.getBoundingClientRect();
@@ -752,14 +797,9 @@ function showRewardTip(anchor) {
   tip.style.setProperty('--arrow-x', arrowX + 'px');
   window.__rewardTip = tip;
 }
-
 function hideRewardTip() {
-  if (window.__rewardTip) {
-    window.__rewardTip.remove();
-    window.__rewardTip = null;
-  }
+  if (window.__rewardTip) { window.__rewardTip.remove(); window.__rewardTip = null; }
 }
-
 window.addEventListener('scroll', hideRewardTip, true);
 window.addEventListener('resize', hideRewardTip);
 
@@ -783,7 +823,8 @@ function renderRules(targetId) {
 function pct(v) { return (v * 100).toFixed(2) + '%'; }
 function esc(str) { return String(str || '-').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function escAttr(str) { return String(str || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
-function parseNumber(value, fallback = 0) {
+function parseNumber(value, fallback) {
+  fallback = fallback || 0;
   if (value === null || value === undefined || value === '') return fallback;
   const num = Number(String(value).replace(/[^\d.-]/g, ''));
   return Number.isFinite(num) ? num : fallback;
@@ -825,42 +866,6 @@ function formatLocalDate(date) {
   return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
 }
 
-function initThemeToggle() {
-  const btn = document.getElementById('themeBtn');
-  if (!btn) return;
-  const html = document.documentElement;
-  const sun = '<svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
-  const moon = '<svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
-  function apply(theme, announce) {
-    const light = theme === 'light';
-    html.classList.toggle('light', light);
-    btn.innerHTML = light ? sun : moon;
-    btn.setAttribute('aria-label', light ? 'Switch to dark' : 'Switch to light');
-    try { localStorage.setItem('atomcode_theme', theme); } catch (e) {}
-    if (announce) showToast(t(light ? 'toast.theme.light' : 'toast.theme.dark'));
-  }
-  let saved = 'dark';
-  try {
-    saved = localStorage.getItem('atomcode_theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
-  } catch (e) {}
-  apply(saved, false);
-  btn.addEventListener('click', () => apply(html.classList.contains('light') ? 'dark' : 'light', true));
-}
-
-function initLangToggle() {
-  const btn = document.getElementById('langBtn');
-  if (!btn) return;
-  btn.addEventListener('click', () => {
-    LANG = LANG === 'zh' ? 'en' : 'zh';
-    try { localStorage.setItem('atomcode_lang', LANG); } catch (e) {}
-    applyI18n();
-    renderInviteLink();
-    renderSummary(currentSummary);
-    reloadVisibleLeaderboard();
-    showToast(t('toast.lang.' + LANG));
-  });
-}
-
 function reloadVisibleLeaderboard() {
   if (document.getElementById('auth-code-state').classList.contains('active')) {
     const start = document.getElementById('board-content').dataset.weekStart || formatLocalDate(getMonday());
@@ -874,9 +879,106 @@ function reloadVisibleLeaderboard() {
   }
 }
 
-applyI18n();
-initThemeToggle();
-initLangToggle();
+/* ========== aurora + ripple ========== */
+(function(){
+  const aurora=document.getElementById('aurora');
+  let tx=-300,ty=-300,x=tx,y=ty;
+  addEventListener('mousemove',e=>{tx=e.clientX;ty=e.clientY});
+  (function tick(){x+=(tx-x)*.18;y+=(ty-y)*.18;aurora.style.setProperty('--mx',x+'px');aurora.style.setProperty('--my',y+'px');requestAnimationFrame(tick);})();
+  addEventListener('click',e=>{
+    if(e.target.closest('input,textarea,select')) return;
+    const r=document.createElement('div');r.className='ripple';
+    r.style.left=e.clientX+'px';r.style.top=e.clientY+'px';
+    document.body.appendChild(r);setTimeout(()=>r.remove(),700);
+  });
+})();
+
+/* ========== magnetic ========== */
+(function(){
+  const els=Array.from(document.querySelectorAll('[data-magnetic]')).map(el=>({el,tx:0,ty:0,x:0,y:0}));
+  let mx=-9999,my=-9999;
+  addEventListener('mousemove',e=>{mx=e.clientX;my=e.clientY});
+  function loop(){
+    for(const it of els){
+      const r=it.el.getBoundingClientRect();
+      if(r.bottom<0||r.top>innerHeight){it.tx=it.ty=0}
+      else{
+        const cx=r.left+r.width/2,cy=r.top+r.height/2;
+        const dx=mx-cx,dy=my-cy,d=Math.hypot(dx,dy);
+        const R=Math.max(r.width,r.height)*1.3+30;
+        if(d<R){const k=(1-d/R)*.3;it.tx=dx*k;it.ty=dy*k}else{it.tx=0;it.ty=0}
+      }
+      it.x+=(it.tx-it.x)*.22;it.y+=(it.ty-it.y)*.22;
+      it.el.style.transform=(Math.abs(it.x)<.1&&Math.abs(it.y)<.1)?'':`translate(${it.x.toFixed(1)}px,${it.y.toFixed(1)}px)`;
+    }
+    requestAnimationFrame(loop);
+  }
+  loop();
+})();
+
+/* ========== scroll progress + header scrolled ========== */
+(function(){
+  const bar=document.getElementById('progressBar'),hdr=document.getElementById('hdr');
+  function tick(){
+    const max=Math.max(1,document.documentElement.scrollHeight-innerHeight);
+    bar.style.width=(scrollY/max*100).toFixed(2)+'%';
+    hdr.classList.toggle('scrolled',scrollY>40);
+  }
+  tick();addEventListener('scroll',tick,{passive:true});
+})();
+
+/* ========== mobile drawer ========== */
+(function(){
+  const toggle=document.getElementById('mbToggle'),drawer=document.getElementById('mbDrawer');
+  if(!toggle||!drawer)return;
+  toggle.addEventListener('click',()=>{
+    const open=drawer.classList.toggle('open');
+    toggle.textContent=open?'✕':'☰';
+    toggle.setAttribute('aria-expanded',String(open));
+  });
+  drawer.querySelectorAll('a').forEach(a=>{a.addEventListener('click',()=>{drawer.classList.remove('open');toggle.textContent='☰';toggle.setAttribute('aria-expanded','false')})});
+})();
+
+/* ========== theme toggle ========== */
+(function(){
+  const btn=document.getElementById('themeBtn');
+  const html=document.documentElement;
+  const SUN='<svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
+  const MOON='<svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+  function apply(theme,announce){
+    const light=theme==='light';
+    html.classList.toggle('light',light);
+    btn.innerHTML=light?SUN:MOON;
+    btn.setAttribute('aria-label',light?'Switch to dark':'Switch to light');
+    try{localStorage.setItem('atomcode_theme',theme)}catch(e){}
+    if(announce) showToast(t(light?'toast.theme.light':'toast.theme.dark'));
+  }
+  let saved='dark';
+  try{saved=localStorage.getItem('atomcode_theme')||(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark')}catch(e){}
+  apply(saved,false);
+  btn.addEventListener('click',()=>{apply(html.classList.contains('light')?'dark':'light',true);});
+})();
+
+/* ========== language toggle ========== */
+(function(){
+  const btn=document.getElementById('langBtn');
+  function syncBtn(){btn.textContent=LANG==='zh'?'EN':'中';btn.setAttribute('aria-label',LANG==='zh'?'Switch to English':'切换到 中文');}
+  function applyAll(){
+    applyI18n();
+    syncBtn();
+    renderInviteLink();
+    renderSummary(currentSummary);
+    reloadVisibleLeaderboard();
+  }
+  applyAll();
+  btn.addEventListener('click',()=>{
+    LANG=LANG==='zh'?'en':'zh';
+    try{localStorage.setItem('atomcode_lang',LANG)}catch(e){}
+    applyAll();
+    showToast(t('toast.lang.'+LANG));
+  });
+})();
+
 initPage();
 </script>
 </body>
