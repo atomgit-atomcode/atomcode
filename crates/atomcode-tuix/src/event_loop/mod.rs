@@ -687,6 +687,11 @@ pub struct LoopCtx {
     /// when `/codingplan` persists a fresh config (re-sync resets the
     /// hint state).
     pub monitor_warning: std::sync::Arc<std::sync::Mutex<Option<monitor::CodingPlanWarning>>>,
+    /// Hook execution failure hint for the status bar. Written by the
+    /// `AgentEvent::HookWarningHint` handler; read by `build_status` on
+    /// each redraw. Takes precedence over `usage_hint` so a broken hook
+    /// is immediately visible. Cleared at the start of each new turn.
+    pub hook_warning_hint: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Last time a monitor check was fired this session. Pre-turn
     /// triggers respect `monitor::CHECK_COOLDOWN` (15 min) against this
     /// timestamp; startup + `/model` switch bypass the cooldown.
@@ -830,6 +835,14 @@ pub struct LoopCtx {
     /// run interactive multi-step flows, so first-run falls through to
     /// the existing "no provider configured" status hint.
     pub is_plain_renderer: bool,
+    /// When true, the --dangerously-skip-permissions flag was passed.
+    /// Shown as a red "⚠ BYPASS" badge in the status line so the
+    /// user is always aware that all tool calls are auto-approved.
+    pub dangerously_skip_permissions: bool,
+    /// When `/guide <topic>` triggers auto-install of the "ask" skill,
+    /// the topic is stashed here so `handle_plugin_job_event` can
+    /// auto-invoke the skill once installation completes.
+    pub pending_guide_topic: Option<String>,
     /// Current reasoning_effort for the active provider's model.
     /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
@@ -896,6 +909,11 @@ pub struct Buffer {
     pub text: String,
     pub cursor: usize,
     history_idx: Option<usize>,
+    /// One-shot: suppress the slash-command menu for text placed into the
+    /// buffer programmatically (a cancelled message restored on Esc). Without
+    /// this, restoring `/skills foo` would immediately re-pop the command
+    /// list. Cleared on the next key in `apply`, so editing reopens the menu.
+    menu_suppressed: bool,
     stash: String,
     /// Placeholder index → original pasted text. Index 0 = paste #1.
     pastes: Vec<String>,
@@ -921,9 +939,26 @@ impl Buffer {
             text: String::new(),
             cursor: 0,
             history_idx: None,
+            menu_suppressed: false,
             stash: String::new(),
             pastes: Vec::new(),
         }
+    }
+
+    /// Whether the slash-command menu should stay closed for the current
+    /// buffer contents (set by `set_restored_text`, cleared on the next key).
+    pub fn menu_suppressed(&self) -> bool {
+        self.menu_suppressed
+    }
+
+    /// Place `text` into the buffer programmatically (cancelled message
+    /// restored on Esc): cursor at the end, and suppress the slash menu for
+    /// one frame so a restored `/command` doesn't immediately re-pop the list.
+    pub fn set_restored_text(&mut self, text: String) {
+        self.cursor = text.len();
+        self.text = text;
+        self.history_idx = None;
+        self.menu_suppressed = true;
     }
 
     /// True while the user is scrolling input history (Up/Down on an
@@ -1030,12 +1065,24 @@ impl Buffer {
         self.pastes.clear();
     }
 
+    /// Current buffer text with every `[Pasted #N …]` placeholder expanded
+    /// back to its original contents. Modals that consume `text` directly
+    /// (instead of going through the Submit/Commit path, which expands at
+    /// the event loop) use this so a folded paste is seen in full.
+    pub fn expanded_text(&self) -> String {
+        self.expand_pastes(&self.text)
+    }
+
     pub(crate) fn apply(
         &mut self,
         action: Action,
         history: &[crate::input::history::HistoryEntry],
         commands: &CommandRegistry,
     ) -> BufferResult {
+        // Any interaction lifts the one-shot menu suppression set by a
+        // restore, so editing / navigating a restored `/command` reopens the
+        // command list as usual.
+        self.menu_suppressed = false;
         match action {
             Action::Insert(c) => {
                 self.text.insert(self.cursor, c);
@@ -1057,7 +1104,15 @@ impl Buffer {
                     self.history_idx = None;
                     return BufferResult::Redraw;
                 }
-                let line = self.text.trim().to_string();
+                let mut line = self.text.trim();
+                // Strip leading shell prompt characters (❯, $, >, #, %, λ)
+                // that users accidentally paste from terminal output.
+                while let Some(rest) = line.strip_prefix(|c: char| {
+                    matches!(c, '❯' | '$' | '>' | '#' | '%' | 'λ')
+                }) {
+                    line = rest.trim_start();
+                }
+                let line = line.to_string();
                 if line.is_empty() {
                     return BufferResult::Redraw;
                 }
@@ -1329,6 +1384,19 @@ mod buffer_tests {
     }
 
     #[test]
+    fn expanded_text_recovers_folded_paste() {
+        // Modals (e.g. the provider Template step) read `expanded_text()`
+        // instead of `text`, so a folded multi-line paste is seen in full
+        // rather than as the literal `[Pasted #N +M lines]` placeholder.
+        let mut b = Buffer::new();
+        let body = "line\n".repeat(30);
+        b.insert_paste(body.clone());
+        assert!(b.text.contains("[Pasted #"), "should fold to placeholder");
+        assert!(!b.expanded_text().contains("[Pasted #"));
+        assert_eq!(b.expanded_text(), body);
+    }
+
+    #[test]
     fn paste_with_cr_separators_folds_correctly() {
         // Bracketed-paste often uses \r between lines (esp. macOS
         // Terminal.app). Without normalising, str::lines() sees one
@@ -1419,6 +1487,28 @@ mod buffer_tests {
         assert!(matches!(r, BufferResult::Redraw));
         assert_eq!(b.text, "hello\n");
         assert_eq!(b.cursor, b.text.len());
+    }
+
+    #[test]
+    fn set_restored_text_cursor_at_end_and_suppresses_menu() {
+        let mut b = Buffer::new();
+        b.set_restored_text("/provider".to_string());
+        assert_eq!(b.text, "/provider");
+        assert_eq!(b.cursor, "/provider".len(), "cursor at end for edit-and-resend");
+        assert!(b.menu_suppressed(), "restored /command must not pop the menu");
+    }
+
+    #[test]
+    fn restored_menu_suppression_lifts_on_next_key() {
+        let reg = CommandRegistry::builtin();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
+        let mut b = Buffer::new();
+        b.set_restored_text("/provider".to_string());
+        assert!(b.menu_suppressed());
+        // Any interaction (here: a Backspace edit) lifts the suppression so
+        // the command list reopens as the user edits.
+        b.apply(Action::Backspace, &history, &reg);
+        assert!(!b.menu_suppressed(), "editing reopens the menu");
     }
 
     #[test]
@@ -2233,6 +2323,34 @@ mod tool_format_tests {
         );
     }
 
+    #[test]
+    fn format_tool_detail_parallel_edit_files_shows_basenames() {
+        let args = r#"{"files":[{"path":"/src/server/api.rs","instruction":"add log"},{"path":"/src/client/mod.rs","instruction":"add log"},{"path":"/src/config/mod.rs","instruction":"add log"}],"contract":"use tracing"}"#;
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "api.rs, mod.rs, mod.rs");
+    }
+
+    #[test]
+    fn format_tool_detail_parallel_edit_files_two_files() {
+        let args = r#"{"files":[{"path":"a.rs","instruction":"add X"},{"path":"b.rs","instruction":"wire X"}]}"#;
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "a.rs, b.rs");
+    }
+
+    #[test]
+    fn format_tool_detail_parallel_edit_files_empty_files_array() {
+        let args = r#"{"files":[]}"#;
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn format_tool_detail_parallel_edit_files_missing_files_key() {
+        let args = r#"{"contract":"use tracing"}"#;
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "");
+    }
+
     // ── disambiguate_batch_details tests (issue #437) ──
 
     #[test]
@@ -2577,6 +2695,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             crate::i18n::t(crate::i18n::Msg::UpgradeSuccess { from: &prev, to: &current }).into_owned(),
         ));
     }
+    // Warn the user when --dangerously-skip-permissions / -y is active.
+    // The status bar shows a ⚠ BYPASS badge, but a scrollback banner
+    // is harder to miss and persists even if the user clears the status row.
+    if ctx.dangerously_skip_permissions {
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::BypassWarningBanner).into_owned(),
+        ));
+    }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
     // printing to stdout, so the user sees the ✓/✗ lines in the chat
@@ -2800,11 +2926,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     deferred_render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     deferred_render_tick.tick().await; // consume the immediate fire
 
-    // Last-draw timestamp — consulted by the post-event pump so we
-    // don't redraw more often than every 100ms even when handlers
-    // fire back-to-back.
-    let mut last_spinner_draw = std::time::Instant::now();
-
     // Last emitted integer percent for the /upgrade download line.
     // Gate on change so we don't spam the renderer with a progress
     // line for every chunk (a 10 MB binary at 64 KiB chunks would be
@@ -2866,7 +2987,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                last_spinner_draw = std::time::Instant::now();
             }
 
             // ── Terminal input ──
@@ -3109,8 +3229,18 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
             // ── /plugin async job result ──
             Some(ev) = ctx.plugin_job_rx.recv() => {
-                handle_plugin_job_event(ev, &mut ctx, &app.state, renderer);
-                if matches!(app.state.phase, UiPhase::Idle) {
+                // Let an open modal (the interactive /plugin manager) refresh
+                // its cached lists from this job's result first.
+                if let Some(m) = app.active_modal.as_mut() {
+                    m.on_plugin_event(&ev);
+                }
+                handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
+                // The job result rendered to scrollback above; restore the
+                // bottom prompt. Redraw the modal if one is open (else
+                // redraw_idle_plain would paint over it), otherwise the idle box.
+                if let Some(m) = app.active_modal.as_ref() {
+                    m.draw(&app.buf, &app.state, &ctx, renderer);
+                } else if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -3132,10 +3262,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
                     if matches!(app.state.phase, UiPhase::Streaming)
-                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                        last_spinner_draw = std::time::Instant::now();
                     }
                     if matches!(app.state.phase, UiPhase::Idle) {
                         // Turn just ended — drain the type-ahead queue.
@@ -3185,7 +3313,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 match app.state.phase {
                     UiPhase::Streaming => {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                        last_spinner_draw = std::time::Instant::now();
                     }
                     _ => {
                         redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
@@ -3238,7 +3365,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                last_spinner_draw = std::time::Instant::now();
             }
 
             // ── Terminal input ──
@@ -3476,8 +3602,18 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
             // ── /plugin async job result ──
             Some(ev) = ctx.plugin_job_rx.recv() => {
-                handle_plugin_job_event(ev, &mut ctx, &app.state, renderer);
-                if matches!(app.state.phase, UiPhase::Idle) {
+                // Let an open modal (the interactive /plugin manager) refresh
+                // its cached lists from this job's result first.
+                if let Some(m) = app.active_modal.as_mut() {
+                    m.on_plugin_event(&ev);
+                }
+                handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
+                // The job result rendered to scrollback above; restore the
+                // bottom prompt. Redraw the modal if one is open (else
+                // redraw_idle_plain would paint over it), otherwise the idle box.
+                if let Some(m) = app.active_modal.as_ref() {
+                    m.draw(&app.buf, &app.state, &ctx, renderer);
+                } else if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -3499,10 +3635,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
                     if matches!(app.state.phase, UiPhase::Streaming)
-                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                        last_spinner_draw = std::time::Instant::now();
                     }
                     if matches!(app.state.phase, UiPhase::Idle) {
                         if let Some(queued) = app.message_queue.pop_front() {
@@ -4280,6 +4414,25 @@ fn build_menu_items(
     }
 }
 
+/// Build the slash / @-mention menu for the current buffer, honoring the
+/// buffer's suppression state: `is_in_history()` (a recalled `/session foo`)
+/// and `menu_suppressed()` (a `/command` restored into the box on Esc-cancel).
+/// All display paths go through this so the menu never pops for text the user
+/// didn't type, regardless of which redraw fires.
+fn menu_for_display(buf: &Buffer, ctx: &LoopCtx) -> Option<Vec<(String, String)>> {
+    if buf.is_in_history() || buf.menu_suppressed() {
+        return None;
+    }
+    build_menu_items(
+        &buf.text,
+        buf.cursor,
+        &ctx.commands,
+        &ctx.custom_commands,
+        Some(&ctx.skill_registry),
+        Some(&ctx.file_index),
+    )
+}
+
 fn handle_idle_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -4288,13 +4441,9 @@ fn handle_idle_key(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     // If the menu is active (buf starts with '/'), intercept navigation keys.
-    // Suppress while scrolling history — otherwise a recalled `/se…` from
-    // history immediately re-pops the menu and traps Up inside it.
-    let menu_items = if app.buf.is_in_history() {
-        None
-    } else {
-        build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index))
-    };
+    // Suppress while scrolling history / right after a restore (see
+    // `menu_for_display`) — otherwise a recalled `/se…` immediately re-pops.
+    let menu_items = menu_for_display(&app.buf, ctx);
     if let Some(items) = &menu_items {
         // Clamp selection in range.
         if app.menu.selected >= items.len() {
@@ -4638,6 +4787,7 @@ fn handle_idle_key(
     }
 
     let action = classify(code, modifiers);
+
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     crate::tuix_trace!(
@@ -4661,14 +4811,9 @@ fn handle_idle_key(
     match result {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
-            // Rebuild menu after buf change. Same is_in_history gate
-            // as above so a HistoryPrev that just landed on `/se…`
-            // doesn't immediately re-show the slash menu.
-            let items = if app.buf.is_in_history() {
-                None
-            } else {
-                build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index))
-            };
+            // Rebuild menu after buf change. Same suppression gate as above
+            // (history recall / restored command) via `menu_for_display`.
+            let items = menu_for_display(&app.buf, ctx);
             if let Some(items) = items {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
@@ -4727,6 +4872,11 @@ fn handle_idle_key(
                     text: line.clone(),
                     images: Vec::new(),
                 });
+                // Stash for Esc-restore, same as regular messages. Most slash
+                // commands run synchronously (cleared in the Idle branch
+                // below); the streaming ones (e.g. `/skills <name>` running a
+                // subagent) keep it so cancelling restores the command line.
+                app.state.last_submitted_message = Some(line.clone());
                 if cmd.eq_ignore_ascii_case("paste") {
                     // See `handle_paste_command` — short-circuited
                     // here because the dispatcher signature can't
@@ -4746,6 +4896,9 @@ fn handle_idle_key(
                     )?;
                 }
                 if matches!(app.state.phase, UiPhase::Idle) {
+                    // Finished synchronously — nothing running to cancel, so
+                    // drop the restore stash (avoid a stale command lingering).
+                    app.state.last_submitted_message = None;
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 } else if matches!(app.state.phase, UiPhase::Approval) {
                     // After /bg <N> resume into an approval-waiting session,
@@ -4826,6 +4979,10 @@ fn handle_idle_key(
                     text: line.clone(),
                     images: kept_refs,
                 });
+                // Clear stale hook warning at the start of each turn.
+                if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
+                    *slot = None;
+                }
                 ctx.agent
                     .cmd_tx
                     .send(AgentCommand::SendMessage {
@@ -4857,9 +5014,6 @@ fn handle_idle_key(
             }
         }
         BufferResult::Exit => {
-            // Two-press confirmation: first Ctrl+C on an empty buffer arms
-            // the exit; a second Ctrl+C within the window actually exits.
-            // Any other keystroke (handled above) resets the arming.
             let now = std::time::Instant::now();
             let armed = app
                 .exit_pending
@@ -5105,8 +5259,9 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
 fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, ctx: &LoopCtx) {
     app.message_queue.clear();
     if let Some(msg) = app.state.last_submitted_message.take() {
-        app.buf.text = msg;
-        app.buf.cursor = app.buf.text.len();
+        // Cursor at the end (edit-and-resend), but suppress the slash menu
+        // for one frame so a restored `/command` doesn't re-pop the list.
+        app.buf.set_restored_text(msg);
         app.menu.selected = 0;
         // Force an immediate StreamingBox repaint so the restored
         // text shows in the input box on this frame, not the next
@@ -5187,7 +5342,7 @@ fn handle_streaming_key(
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
-    let menu_items = build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index));
+    let menu_items = menu_for_display(&app.buf, ctx);
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
@@ -5281,7 +5436,7 @@ fn handle_streaming_key(
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
             // now points past the (possibly shorter) list.
-            if let Some(items) = build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index)) {
+            if let Some(items) = menu_for_display(&app.buf, ctx) {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
                 }
@@ -5480,7 +5635,7 @@ fn handle_approval_key(
 pub(super) fn handle_plugin_job_event(
     ev: atomcode_core::plugin::PluginJobEvent,
     ctx: &mut LoopCtx,
-    state: &crate::state::UiState,
+    state: &mut crate::state::UiState,
     renderer: &mut dyn Renderer,
 ) {
     use atomcode_core::plugin::PluginJobEvent;
@@ -5539,9 +5694,73 @@ pub(super) fn handle_plugin_job_event(
                 })
                 .into_owned(),
             ));
+
+            // If `/guide <topic>` was waiting for this install, auto-invoke
+            // the "ask" skill with the stashed topic.
+            if let Some(topic) = ctx.pending_guide_topic.take() {
+                if let Some(rendered) = commands::expand_skill(ctx, "ask", &topic) {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke {
+                            topic: &topic,
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    state.on_submit();
+                    ctx.agent
+                        .cmd_tx
+                        .send(atomcode_core::agent::AgentCommand::SendMessage {
+                            text: rendered,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                } else {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdGuideSkillNotFound).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+            }
         }
         PluginJobEvent::Failed { op, msg } => {
+            // Clean up pending guide topic so future /guide commands work.
+            if ctx.pending_guide_topic.take().is_some() {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::CmdGuideInstallFailed { error: &msg })
+                        .into_owned(),
+                ));
+                renderer.flush();
+            }
             renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
+        }
+        PluginJobEvent::PluginAlreadyInstalled { id } => {
+            // Stale install? Try reload + expand so the user still
+            // gets an answer if the plugin was installed but not loaded.
+            if let Some(topic) = ctx.pending_guide_topic.take() {
+                let _ = reload_plugins(ctx);
+                if let Some(rendered) = commands::expand_skill(ctx, "ask", &topic) {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke {
+                            topic: &topic,
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    state.on_submit();
+                    ctx.agent
+                        .cmd_tx
+                        .send(atomcode_core::agent::AgentCommand::SendMessage {
+                            text: rendered,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                }
+            }
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::PluginAlreadyInstalled { id: &id }).into_owned(),
+            ));
         }
     }
     renderer.flush();
@@ -6024,16 +6243,30 @@ fn handle_agent_event(
             );
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
-            let done = state.next_done_label();
             let dur = crate::render::fmt_dur(duration);
-            let label = crate::i18n::t(crate::i18n::Msg::TurnSummary {
-                done,
-                turn_count,
-                tool_call_count,
-                duration: &dur,
-                total_tokens,
-            })
-            .into_owned();
+            // An errored turn already rendered a red Error line just above;
+            // showing a celebratory "✓ Nailed it" separator under it is
+            // contradictory. Use the ✗ "stopped" summary instead, and don't
+            // burn a DONE_LABELS rotation slot on a failure.
+            let label = if matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error) {
+                crate::i18n::t(crate::i18n::Msg::TurnSummaryError {
+                    turn_count,
+                    tool_call_count,
+                    duration: &dur,
+                    total_tokens,
+                })
+                .into_owned()
+            } else {
+                let done = state.next_done_label();
+                crate::i18n::t(crate::i18n::Msg::TurnSummary {
+                    done,
+                    turn_count,
+                    tool_call_count,
+                    duration: &dur,
+                    total_tokens,
+                })
+                .into_owned()
+            };
             renderer.render(UiLine::TurnSeparator { label });
             renderer.flush();
             state.on_turn_complete();
@@ -6191,6 +6424,11 @@ fn handle_agent_event(
             // is implausibly low for the body we sent).
             renderer.render(UiLine::Warning(w));
             renderer.flush();
+        }
+        AgentEvent::HookWarningHint(msg) => {
+            if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
+                *slot = Some(msg);
+            }
         }
         AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
             // Format here (not in agent) so we can localize / restyle
@@ -6767,6 +7005,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         ))
     } else if let Some(warning) = ctx.monitor_warning.lock().ok().and_then(|g| g.clone()) {
         Some((warning.display_text(), crate::render::HintSeverity::Warning))
+    } else if let Some(hook_msg) = ctx.hook_warning_hint.lock().ok().and_then(|g| g.clone()) {
+        Some((hook_msg, crate::render::HintSeverity::Warning))
     } else if let Some(usage) =
         usage_monitor::build_usage_hint(&ctx.usage_slot, &ctx.config.default_provider)
     {
@@ -6827,6 +7067,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         crate::state::AgentMode::Plan => Some("PLAN".to_string()),
         crate::state::AgentMode::Build => None,
     };
+    // Bypass indicator: right-aligned warning badge when
+    // --dangerously-skip-permissions / -y is active. Placed on the
+    // right side of the status row so it does not displace the PLAN
+    // mode indicator on the left.
+    let bypass_indicator = if ctx.dangerously_skip_permissions {
+        Some(crate::i18n::t(crate::i18n::Msg::BypassBadge).into_owned())
+    } else {
+        None
+    };
     // Pull current ctx usage from the last ContextStats emission. Pre-
     // first-turn `last_context` is None — render shows nothing then.
     // Using `sent_tokens` (what was actually sent to the model on the
@@ -6858,6 +7107,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         ctx_window,
         hint,
         mode_indicator,
+        bypass_indicator,
         reasoning_effort: if reasoning_effort_applicable_on_provider(ctx) {
             ctx.reasoning_effort.clone()
         } else {
@@ -6885,7 +7135,7 @@ fn draw_spinner_now(
     let frame = state.tick_spinner();
     let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
-    let menu = build_menu_items(&buf.text, buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index)).map(|items| {
+    let menu = menu_for_display(buf, ctx).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
         let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
             crate::render::MenuKind::AtMention
@@ -7049,6 +7299,26 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 (None, Some(r)) => crate::width::truncate_with_ellipsis(r, 100),
                 (Some(s), None) => crate::width::truncate_with_ellipsis(s, 100),
                 _ => String::new(),
+            }
+        }
+        "parallel_edit_files" => {
+            // Show the list of target file basenames so the user can see
+            // WHAT will be edited at a glance in the approval prompt —
+            // mirroring how Bash(rm -rf /path) tells the user exactly
+            // which command needs approval. Without this, the approval
+            // prompt just shows "ParallelEditFiles:" with no detail,
+            // leaving the user blind to the scope of the dispatch.
+            if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
+                let names: Vec<String> = files
+                    .iter()
+                    .filter_map(|entry| {
+                        entry.get("path").and_then(|p| p.as_str()).map(|s| basename(s))
+                    })
+                    .collect();
+                let detail = names.join(", ");
+                crate::width::truncate_with_ellipsis(&detail, 200)
+            } else {
+                String::new()
             }
         }
         "use_skill" => get_str("name").unwrap_or_default(),

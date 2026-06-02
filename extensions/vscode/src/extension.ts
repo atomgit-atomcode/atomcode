@@ -109,6 +109,19 @@ export async function activate(context: vscode.ExtensionContext) {
       const prompt = buildContextualPrompt('Please optimize this code for better performance and readability.', ctx);
       await runCommand('optimize the selected code', () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
+
+    vscode.commands.registerCommand('atomcode.addToChat', async () => {
+      const ctx = getEditorContext();
+      if (!ctx.selection || !ctx.filePath) return;
+      await runCommand('add selection to chat', () => extensionState.chatProvider.addToChat({
+        path: ctx.filePath!,
+        fileName: ctx.fileName!,
+        language: ctx.language,
+        selection: ctx.selection,
+        startLine: ctx.startLine,
+        endLine: ctx.endLine,
+      }));
+    }),
   ];
   context.subscriptions.push(...cmds);
 
@@ -138,12 +151,9 @@ export async function activate(context: vscode.ExtensionContext) {
     extensionState.statusBar.update(true, model);
   };
 
-  // 9. Listen for active editor changes → send context to webview
+  // 9. Listen for active editor changes → send context to webview (only on editor switch, not selection changes)
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor(() => {
-      extensionState.chatProvider.sendEditorContext();
-    }),
-    vscode.window.onDidChangeTextEditorSelection(() => {
       extensionState.chatProvider.sendEditorContext();
     })
   );

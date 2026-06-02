@@ -45,13 +45,13 @@ use crate::config::Config;
 /// only inside [`codingplan_llm_base_url`] — call that, not this.
 ///
 /// The new signed gateway. `coding_plan::crypto::is_atomgit_gateway`
-/// **only** matches `llm-api.atomgit.com` (see the host whitelist at
+/// **only** matches `pre-llm-api-cce.atomgit.com` (see the host whitelist at
 /// `crypto.rs:129`), so this is the URL where codingplan request
 /// signing actually engages. The previous default (the legacy
 /// `api-ai.gitcode.com` host) silently routed new installs to a
 /// plaintext path that bypassed signing — and surfaced in users'
 /// error logs as "my requests go to a URL I never configured."
-const DEFAULT_CODINGPLAN_LLM_BASE_URL: &str = "https://llm-api.atomgit.com/v1";
+const DEFAULT_CODINGPLAN_LLM_BASE_URL: &str = "https://pre-llm-api-cce.atomgit.com/v1";
 
 /// Resolve the LLM gateway base URL for CodingPlan-managed providers.
 ///
@@ -361,24 +361,18 @@ impl SetupReport {
                     }
                 }
                 if !s.rate_limit_windows.is_empty() {
-                    // A visible long window (>5h, typically the 30d monthly
+                    // An exhausted long window (>5h, typically the 30d monthly
                     // quota) means the user has hit the longer-period limit.
                     // In that state the short 5h rolling window is moot —
                     // even if it reads `0% · 重置于 2h 后`, the request
                     // path is still gated by the monthly cap, so the user
                     // can't actually issue calls until the long window
-                    // resets. Showing both produces the misleading "你还
-                    // 有 2h 短窗，但 12d 后才能用" pair the user reported
-                    // (the 0%-short-window line gave false hope). Resolve
-                    // by picking the longest exhausted window and rendering
-                    // only its line; otherwise iterate visible short
-                    // windows normally.
-                    let longest_exhausted = s
-                        .rate_limit_windows
-                        .iter()
-                        .filter(|w| w.show_enable == 1 && w.window_size_seconds / 3600 > 5)
-                        .max_by_key(|w| w.window_size_seconds);
-                    if let Some(w) = longest_exhausted {
+                    // resets. The server hides that monthly window via
+                    // `show_enable=0` while still flagging `quota_exhausted`,
+                    // so we detect exhaustion by that flag (see
+                    // `blocking_exhausted_window`) and render only its line;
+                    // otherwise iterate visible short windows normally.
+                    if let Some(w) = blocking_exhausted_window(&s.rate_limit_windows) {
                         out.push_str(&t(Msg::CpMonthlyQuotaExhausted {
                             duration: &format_duration_secs(w.seconds_until_reset),
                         }));
@@ -1024,6 +1018,29 @@ fn truncate_inline(msg: &str, max: usize) -> String {
 /// was unreadable for anything past a minute (e.g. "in 86340s" instead
 /// of "in 23h 59m").
 ///
+/// Pick the rate-limit window that is *actually blocking* the user, if any.
+///
+/// The server reports an exhausted longer-period quota (e.g. the 30d monthly
+/// cap) with `quota_exhausted=true`, but it sets that window's `show_enable=0`
+/// (it hides the raw "本月 100%" line) while leaving the short 5h rolling
+/// window visible at a misleading `0%`. So exhaustion MUST be detected via
+/// `quota_exhausted`, never via `show_enable` (the old filter keyed on
+/// `show_enable==1` and missed the hidden monthly window entirely — surfacing
+/// the rolling window's false "用量约 0%" instead of "本月已耗尽").
+///
+/// Restricted to windows longer than 5h so the caller's "monthly" wording
+/// stays accurate. Returns the longest such window when several are exhausted.
+///
+/// `pub` so `/login` (here) and `/status` (atomcode-tuix) share one rule.
+pub fn blocking_exhausted_window(
+    windows: &[crate::coding_plan::types::RateLimitWindow],
+) -> Option<&crate::coding_plan::types::RateLimitWindow> {
+    windows
+        .iter()
+        .filter(|w| w.quota_exhausted && w.window_size_seconds / 3600 > 5)
+        .max_by_key(|w| w.window_size_seconds)
+}
+
 /// `pub` so the `/status` rendering in atomcode-tuix can share the same
 /// formatter — keeps the `用量 重置于 ...（2h 后）` line consistent
 /// between `/login`'s CodingPlan setup output and `/status`'s
@@ -1275,7 +1292,7 @@ mod tests {
         // Lock in the default. If `ATOMCODE_CODINGPLAN_LLM_BASE_URL` is
         // set in the test environment (CI / staging override / dev box
         // with a stray export), honour it — otherwise the default must
-        // be the modern `llm-api.atomgit.com` host. Anything else (most
+        // be the modern `pre-llm-api-cce.atomgit.com` host. Anything else (most
         // notably the legacy `api-ai.gitcode.com`) silently disables
         // codingplan request signing because `is_atomgit_gateway` in
         // `coding_plan::crypto` only whitelists the new host.
@@ -1294,7 +1311,7 @@ mod tests {
             assert_eq!(actual, want, "env override must win when set");
         } else {
             assert_eq!(
-                actual, "https://llm-api.atomgit.com/v1",
+                actual, "https://pre-llm-api-cce.atomgit.com/v1",
                 "default must point at the new signed gateway (NOT legacy api-ai.gitcode.com); \
                  otherwise codingplan signing never engages"
             );
@@ -2490,10 +2507,12 @@ mod tests {
                     reset_label: String::new(),
                     usage_status_desc: "当前时间窗口用量约 0%".into(),
                 },
-                // 30d monthly, exhausted.
+                // 30d monthly, exhausted. The real server HIDES this window
+                // (show_enable=0) while still flagging quota_exhausted=true —
+                // exhaustion must be detected via the flag, not show_enable.
                 RateLimitWindow {
                     rule_index: 1,
-                    show_enable: 1,
+                    show_enable: 0,
                     window_size_seconds: 2592000,
                     window_hours: 720,
                     call_limit: 16000,
@@ -2535,6 +2554,54 @@ mod tests {
             "monthly 12d duration missing: {}",
             out
         );
+    }
+
+    #[test]
+    fn blocking_exhausted_window_detects_hidden_monthly() {
+        // Exact shape the server returns once the 30d monthly quota is spent:
+        // the 5h rolling window is visible at 0%, the exhausted monthly is
+        // HIDDEN (show_enable=0) but flagged quota_exhausted=true.
+        let windows = vec![
+            RateLimitWindow {
+                rule_index: 0,
+                show_enable: 1,
+                window_size_seconds: 18000,
+                window_hours: 5,
+                call_limit: 500,
+                calls_used: 0,
+                usage_percent: 0.0,
+                quota_exhausted: false,
+                reset_at: "2026-06-01T17:58:32".into(),
+                reset_at_display: "17:58".into(),
+                seconds_until_reset: 14716,
+                reset_label: String::new(),
+                usage_status_desc: "当前时间窗口用量约 0%".into(),
+            },
+            RateLimitWindow {
+                rule_index: 1,
+                show_enable: 0,
+                window_size_seconds: 2592000,
+                window_hours: 720,
+                call_limit: 8000,
+                calls_used: 8000,
+                usage_percent: 100.0,
+                quota_exhausted: true,
+                reset_at: "2026-06-26T07:58:32".into(),
+                reset_at_display: "07:58".into(),
+                seconds_until_reset: 2138716,
+                reset_label: String::new(),
+                usage_status_desc: "当前时间窗口用量约 100%".into(),
+            },
+        ];
+        // Despite show_enable=0, the exhausted monthly window is detected.
+        let blocking = super::blocking_exhausted_window(&windows);
+        assert!(blocking.is_some(), "hidden exhausted monthly must be detected");
+        assert_eq!(blocking.unwrap().rule_index, 1);
+
+        // No exhaustion → None (so the rolling usage line renders normally).
+        let mut fresh = windows.clone();
+        fresh[1].quota_exhausted = false;
+        assert!(super::blocking_exhausted_window(&fresh).is_none());
     }
 
     #[test]

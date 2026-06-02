@@ -126,7 +126,9 @@ See [references/skills-reference.md](references/skills-reference.md) for built-i
 
 | Codebase Signal | Skill | Install Command | Invocation |
 |-----------------|-------|-----------------|------------|
-| Any project (AtomCode Q&A) | **ask** | `/plugin marketplace add https://atomgit.com/atomgit_atomcode/atomcode-skills` then `/plugin install atomcode@atomcode-skills` | Both |
+| Any project (AtomCode Q&A) | **/guide** | Built in — no install. Run `/guide <question>` (also auto-dispatches). | Both |
+
+> The official plugin marketplace (`/plugin marketplace add https://atomgit.com/atomgit_atomcode/atomcode-plugins-official`) ships workflow plugins like `atomcode-workflows`, `commit-craft`, and `git-worktree`. AtomCode usage Q&A is now the built-in `/guide` subagent, so it no longer needs a plugin install.
 
 **Custom skills to suggest creating:**
 

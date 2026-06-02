@@ -144,6 +144,7 @@ pub enum Msg<'a> {
         total_days: i32,
     },
     StatusCpUsage { usage: &'a str, reset_at: &'a str, duration: &'a str },
+    StatusCpMonthlyExhausted { duration: &'a str },
     StatusCpWindowExhausted,
     StatusCpWindowHint { hint: &'a str },
     StatusInstructionFilesHeader,
@@ -169,6 +170,9 @@ pub enum Msg<'a> {
     ProviderMenuDeleteDesc,
     ProviderMenuSetDefault,
     ProviderMenuSetDefaultDesc,
+    ProviderImportPrompt,
+    ProviderImportParsed { base_url: &'a str, type_name: &'a str, model: &'a str },
+    ProviderImportFailed,
     ProviderNoProviders,
     ProviderDeleteConfirm { name: &'a str },
     ProviderDeleted { name: &'a str },
@@ -189,10 +193,14 @@ pub enum Msg<'a> {
     ProviderStepModel,
     ProviderStepModelWithHint { current: &'a str },
     ProviderNameEmpty,
+    ProviderBaseUrlEmpty,
     ProviderUnknownType,
     ProviderUnknownTypeEdit,
     ProviderModelEmpty,
     ProviderEditKeep,
+    ProviderTypeInferred { type_name: &'a str },
+    ProviderStepNameDefault { default: &'a str },
+    ProviderStepProgress { current: usize, total: usize },
 
     // ── Model picker ──
     ModelSwitched { provider: &'a str, model: &'a str },
@@ -446,7 +454,11 @@ pub enum Msg<'a> {
     PluginUsage,
     PluginMarketplaceUsage,
     PluginInstallUsage,
+    PluginInstallNotFound { plugin: &'a str },
+    PluginInstallAmbiguous { plugin: &'a str },
     PluginUninstallUsage,
+    PluginUninstallNotFound { plugin: &'a str },
+    PluginUninstallAmbiguous { plugin: &'a str },
     PluginNoMarketplaces,
     PluginMarketplacesHeader,
     PluginNoInstalled,
@@ -457,6 +469,26 @@ pub enum Msg<'a> {
     PluginMarketplaceUpdating { name: &'a str },
     PluginMarketplaceListFailed { error: &'a str },
     PluginInstalling { plugin: &'a str, marketplace: &'a str },
+    PluginInstallingByName { plugin: &'a str },
+    PluginAlreadyInstalled { id: &'a str },
+    // Interactive `/plugin` manager modal.
+    PluginMgrBrowse,
+    PluginMgrAdd,
+    PluginMgrRemove,
+    PluginMgrInstalled { count: usize },
+    PluginMgrInstalledMark,
+    PluginMgrHintNav,
+    PluginMgrHintToggle,
+    PluginMgrHintRemove,
+    PluginMgrHintUninstall,
+    PluginMgrHintUrl,
+    PluginMgrHintPending,
+    PluginMgrInstallingLabel,
+    PluginMgrEmptyMarketplaces,
+    PluginMgrEmptyPlugins,
+    PluginMgrEmptyInstalled,
+    PluginMgrCloning,
+    PluginMgrInstalling { plugin: &'a str },
     PluginUninstalled { plugin: &'a str, marketplace: &'a str },
     PluginUninstallFailed { error: &'a str },
     PluginListFailed { error: &'a str },
@@ -528,6 +560,44 @@ pub enum Msg<'a> {
     /// users whose Ctrl+V is swallowed by Windows Terminal / conhost
     /// before reaching the app, but works on every platform.
     CmdDescPaste,
+    /// Description for the `/guide` slash command — asks atomcode-guide a question.
+    CmdDescGuide,
+    /// `/guide` menu header: "📖 AtomCode Guide — type /guide <question>"
+    GuideMenuHeader,
+    /// `/guide` menu: "Common topics:" section label
+    GuideMenuTopics,
+    /// `/guide` menu topic: getting started
+    GuideMenuGettingStarted,
+    /// `/guide` menu topic: switching models
+    GuideMenuSwitchModel,
+    /// `/guide` menu topic: using MCP
+    GuideMenuMcp,
+    /// `/guide` menu topic: skills and plugins
+    GuideMenuSkills,
+    /// `/guide` menu topic: memory feature
+    GuideMenuMemory,
+    /// `/guide` menu topic: background tasks
+    GuideMenuBackground,
+    /// `/guide` menu topic: context management
+    GuideMenuContext,
+    /// `/guide` menu topic: keyboard shortcuts
+    GuideMenuKeybindings,
+    /// `/guide` menu topic: configuration
+    GuideMenuConfig,
+    /// /guide menu tip: hint for users to type a question
+    GuideMenuTip,
+    /// /guide menu: documentation URL
+    GuideMenuDocUrl,
+    /// `/guide`: ask skill install already in progress, please wait
+    CmdGuideInstalling,
+    /// `/guide`: ask skill not installed, triggering auto-install
+    CmdGuideAutoInstall,
+    /// `/guide`: auto-invoke completed, now answering
+    CmdGuideAutoInvoke { topic: &'a str },
+    /// `/guide`: install succeeded but ask skill still not found
+    CmdGuideSkillNotFound,
+    /// `/guide`: install failed, suggest manual install
+    CmdGuideInstallFailed { error: &'a str },
     /// `/paste` failed because the clipboard holds no image. Shown
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.
@@ -589,6 +659,18 @@ pub enum Msg<'a> {
         total_tokens: usize,
     },
 
+    /// Turn-end summary when the turn terminated in an error (the red
+    /// error line is rendered separately, just above this). Same stats
+    /// as `TurnSummary` but with a ✗ marker and a neutral "stopped"
+    /// label instead of a celebratory verb — otherwise an errored turn
+    /// reads as `✓ Nailed it` right under its own error message.
+    TurnSummaryError {
+        turn_count: usize,
+        tool_call_count: usize,
+        duration: &'a str,
+        total_tokens: usize,
+    },
+
     // ── OAuth login chrome (/login + /codingplan share these) ──
     /// Header above the QR block when scanning with WeChat is the
     /// expected flow. Includes the leading "  " indent and trailing
@@ -635,6 +717,16 @@ pub enum Msg<'a> {
     /// model can't accept images AND no `vision_preprocessor_provider`
     /// is configured. `model` is the current model identifier.
     ModelNoImageSupport { model: &'a str },
+
+    // ── --dangerously-skip-permissions / -y ──
+    /// Scrollback warning banner when --dangerously-skip-permissions is active
+    /// in TUI mode. Includes leading "⚠ " and trailing "\n".
+    BypassWarningBanner,
+    /// Headless-mode stderr warning when --dangerously-skip-permissions is active.
+    BypassWarningHeadless,
+    /// Status-bar badge text shown when --dangerously-skip-permissions is
+    /// active. Typically "⚠ BYPASS" — kept short for the status row.
+    BypassBadge,
 
     /// Confirmation hint after the first Ctrl+C on an empty buffer.
     /// "  (press Ctrl+C again to exit)\n" — leading indent + trailing

@@ -24,6 +24,7 @@ use crate::tool::{
 use super::event::{TurnEvent, TurnResult};
 use super::permission::{AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider};
 use super::runner::TurnRunner;
+use crate::hook::HookEngine;
 
 // ---------------------------------------------------------------------------
 // Test helpers: Mock LlmProvider
@@ -347,11 +348,10 @@ fn make_runner(
         config: test_config(),
         ctx: test_ctx,
         permission,
+        hook_engine: std::sync::Arc::new(crate::hook::HookEngine::new()),
         recently_edited_files: Vec::new(),
-        hook_executor: std::sync::Arc::new(
-            crate::hook::executor::HookExecutor::empty()
-        ),
         loop_guard: Default::default(),
+        current_turn_number: 0,
     }
 }
 
@@ -1501,11 +1501,10 @@ mod telemetry_tests {
             config: test_config(),
             ctx: test_ctx,
             permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
+            hook_engine: std::sync::Arc::new(HookEngine::new()),
             recently_edited_files: Vec::new(),
-            hook_executor: std::sync::Arc::new(
-                crate::hook::executor::HookExecutor::empty()
-            ),
             loop_guard: Default::default(),
+            current_turn_number: 0,
         };
         (runner, captured)
     }
@@ -1815,7 +1814,7 @@ mod telemetry_tests {
 
 #[tokio::test]
 async fn sub_agent_normal_path_completes_one_turn() {
-    use crate::agent::sub_agent::SubAgentTask;
+    use crate::agent::parallel_edit::SubAgentTask;
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1866,7 +1865,7 @@ async fn sub_agent_normal_path_completes_one_turn() {
 
 #[tokio::test]
 async fn sub_agent_hallucinating_mock_breaks_after_nudge_unheeded() {
-    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use crate::agent::parallel_edit::{SubAgentFailure, SubAgentTask};
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1921,7 +1920,7 @@ async fn sub_agent_hallucinating_mock_breaks_after_nudge_unheeded() {
 
 #[tokio::test]
 async fn sub_agent_recovers_from_first_timeout_then_succeeds() {
-    use crate::agent::sub_agent::SubAgentTask;
+    use crate::agent::parallel_edit::SubAgentTask;
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1964,7 +1963,7 @@ async fn sub_agent_recovers_from_first_timeout_then_succeeds() {
 
 #[tokio::test]
 async fn sub_agent_provider_hard_error_breaks_immediately_no_retry() {
-    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use crate::agent::parallel_edit::{SubAgentFailure, SubAgentTask};
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2006,7 +2005,7 @@ async fn sub_agent_provider_hard_error_breaks_immediately_no_retry() {
 
 #[tokio::test]
 async fn sub_agent_blocked_tool_redirects_via_validate_args() {
-    use crate::agent::sub_agent::SubAgentTask;
+    use crate::agent::parallel_edit::SubAgentTask;
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2054,7 +2053,7 @@ async fn sub_agent_blocked_tool_redirects_via_validate_args() {
 
 #[tokio::test]
 async fn sub_agent_failed_edit_doesnt_burn_progress_signal() {
-    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use crate::agent::parallel_edit::{SubAgentFailure, SubAgentTask};
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2111,7 +2110,7 @@ async fn sub_agent_failed_edit_doesnt_burn_progress_signal() {
 
 #[tokio::test]
 async fn sub_agent_pool_one_failure_doesnt_affect_others() {
-    use crate::agent::sub_agent::{SubAgentPool, SubAgentTask};
+    use crate::agent::parallel_edit::{SubAgentPool, SubAgentTask};
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();

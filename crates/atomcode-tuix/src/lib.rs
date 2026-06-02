@@ -177,6 +177,7 @@ pub async fn run(
     mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
     lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    dangerously_skip_permissions: bool,
 ) -> Result<()> {
     let mut caps = TerminalCaps::probe();
 
@@ -481,7 +482,7 @@ pub async fn run(
     // resulting `PluginJobEvent` through `plugin_job_tx` so the event
     // loop's existing `handle_plugin_job_event` renders the same toast
     // the synchronous `/plugin install` path would emit (e.g.
-    // "marketplace `atomcode-skills` added at abc1234 (12 plugins)").
+    // "marketplace `atomcode` added at abc1234 (3 plugins)" ).
     // The user sees the install land as a regular body row instead of
     // a silent file-system mutation. Worst case the user types `/`
     // before the install settles — they see an empty / partial menu
@@ -546,6 +547,7 @@ pub async fn run(
         current_session,
         update_hint,
         monitor_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        hook_warning_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
         monitor_last_check_at: None,
         usage_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
         usage_last_check_at: None,
@@ -581,6 +583,8 @@ pub async fn run(
             crate::event_loop::ClipboardCheckState::default(),
         )),
         is_plain_renderer,
+        dangerously_skip_permissions,
+        pending_guide_topic: None,
         reasoning_effort: None,
         transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };

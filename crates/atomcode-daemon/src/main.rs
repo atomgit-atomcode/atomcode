@@ -35,11 +35,11 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_core::config::Config;
+use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::conversation::Conversation;
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
-use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
@@ -2083,11 +2083,10 @@ async fn process_chat_request(
         config: config.clone(),
         ctx: daemon_ctx,
         permission,
+        hook_engine: std::sync::Arc::new(atomcode_core::hook::HookEngine::new()), // Daemon mode doesn't use hooks for now
         recently_edited_files: Vec::new(),
-        hook_executor: std::sync::Arc::new(atomcode_core::hook::executor::HookExecutor::new(
-            atomcode_core::hook::json_config::load_hooks_config(&working_dir),
-        )),
         loop_guard: Default::default(),
+        current_turn_number: 0,
     };
 
     // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
@@ -3030,7 +3029,7 @@ async fn main() {
                     ..CurrentContext::default()
                 },
                 || async {
-                    telemetry.track(Event::OpenAtomcode);
+                    telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
                 },
             )
             .await;
@@ -3048,7 +3047,7 @@ async fn main() {
             ..CurrentContext::default()
         },
         || async {
-            telemetry.track(Event::OpenAtomcode);
+            telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
         },
     )
     .await;

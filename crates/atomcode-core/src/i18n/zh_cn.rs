@@ -143,6 +143,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::StatusCpUsage { usage, reset_at, duration } =>
             format!("  用量：{}  ·  重置于 {}（{} 后）\n", usage, reset_at, duration).into(),
+        Msg::StatusCpMonthlyExhausted { duration } =>
+            format!("  ⚠ 本月用量已耗尽，等 {} 后再使用\n", duration).into(),
         Msg::StatusCpWindowExhausted =>
             "  ⚠ 当前窗口配额已耗尽\n".into(),
         Msg::StatusCpWindowHint { hint } =>
@@ -222,6 +224,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderMenuDeleteDesc => "移除 Provider".into(),
         Msg::ProviderMenuSetDefault => "设为默认".into(),
         Msg::ProviderMenuSetDefaultDesc => "切换默认 Provider".into(),
+        Msg::ProviderImportPrompt =>
+            "粘贴模板自动识别（curl / JSON / TOML），或直接回车手动填写：".into(),
+        Msg::ProviderImportParsed { base_url, type_name, model } =>
+            format!("已识别：{base_url} · {type_name} · {model}").into(),
+        Msg::ProviderImportFailed =>
+            "未能识别为模板，请重贴 curl / JSON / TOML，或留空回车手动填写。".into(),
         Msg::ProviderNoProviders =>
             "尚未配置任何 Provider。".into(),
         Msg::ProviderDeleteConfirm { name } =>
@@ -240,7 +248,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepTypeWithHint { current } =>
             format!("类型？[{current}]（openai / claude / ollama，留空保持不变）").into(),
         Msg::ProviderStepBaseUrl =>
-            "Base URL？（留空使用默认值）".into(),
+            "Base URL？（例：https://api.deepseek.com/v1）".into(),
         Msg::ProviderStepBaseUrlWithHint { current } =>
             format!("Base URL？[{current}]（留空保持不变）").into(),
         Msg::ProviderDefaultHint => "Provider 默认值".into(),
@@ -254,12 +262,19 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepModelWithHint { current } =>
             format!("模型？[{current}]（留空保持不变）").into(),
         Msg::ProviderNameEmpty => "名称不能为空。".into(),
+        Msg::ProviderBaseUrlEmpty => "Base URL 不能为空。".into(),
         Msg::ProviderUnknownType =>
             "未知类型。请选择 openai / claude / ollama。".into(),
         Msg::ProviderUnknownTypeEdit =>
             "未知类型。请选择 openai / claude / ollama 或留空。".into(),
         Msg::ProviderModelEmpty => "模型不能为空。".into(),
         Msg::ProviderEditKeep => "（保持不变）".into(),
+        Msg::ProviderTypeInferred { type_name } =>
+            format!("已识别类型：{type_name}").into(),
+        Msg::ProviderStepNameDefault { default } =>
+            format!("Provider 名称？[{default}]（留空使用此名）").into(),
+        Msg::ProviderStepProgress { current, total } =>
+            format!("（{current}/{total}）").into(),
 
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
@@ -628,9 +643,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMarketplaceUsage =>
             "用法：/plugin marketplace [add|remove|update|list] <参数>".into(),
         Msg::PluginInstallUsage =>
-            "用法：/plugin install <插件>@<市场>".into(),
+            "用法：/plugin install <插件名> 或 <插件>@<市场>".into(),
+        Msg::PluginInstallNotFound { plugin } =>
+            format!("未在任何市场中找到插件 `{plugin}`。使用 /plugin marketplace list 查看已注册的市场。").into(),
+        Msg::PluginInstallAmbiguous { plugin } =>
+            format!("插件 `{plugin}` 存在于多个市场中，请指定：").into(),
         Msg::PluginUninstallUsage =>
-            "用法：/plugin uninstall <插件>@<市场>".into(),
+            "用法：/plugin uninstall <插件名> 或 <插件>@<市场>".into(),
+        Msg::PluginUninstallNotFound { plugin } =>
+            format!("插件 `{plugin}` 未安装。使用 /plugin list 查看已安装插件。").into(),
+        Msg::PluginUninstallAmbiguous { plugin } =>
+            format!("插件 `{plugin}` 从多个市场安装，请指定卸载哪一个：\n").into(),
         Msg::PluginNoMarketplaces =>
             "未注册任何市场".into(),
         Msg::PluginMarketplacesHeader =>
@@ -651,6 +674,27 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出 marketplace 失败：{error}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
+        Msg::PluginInstallingByName { plugin } =>
+            format!("正在安装 `{plugin}`…").into(),
+        Msg::PluginAlreadyInstalled { id } =>
+            format!("  插件 `{id}` 已安装。\n  PS: 如需重新安装，请先执行 `/plugin uninstall {id}`，然后再执行 `/plugin install {id}`\n").into(),
+        Msg::PluginMgrBrowse => "浏览并安装".into(),
+        Msg::PluginMgrAdd => "添加市场…".into(),
+        Msg::PluginMgrRemove => "移除市场…".into(),
+        Msg::PluginMgrInstalled { count } => format!("已安装 ({count})").into(),
+        Msg::PluginMgrInstalledMark => "✓ 已安装".into(),
+        Msg::PluginMgrHintNav => "↑/↓ 选择 · ⏎ 进入 · esc 返回".into(),
+        Msg::PluginMgrHintToggle => "⏎ 安装/卸载 · esc 返回".into(),
+        Msg::PluginMgrHintRemove => "⏎ 移除 · esc 返回".into(),
+        Msg::PluginMgrHintUninstall => "⏎ 卸载 · esc 返回".into(),
+        Msg::PluginMgrHintUrl => "输入/粘贴 git URL · ⏎ 添加 · esc 取消".into(),
+Msg::PluginMgrHintPending => "安装中，请稍候… · esc 返回".into(),
+Msg::PluginMgrInstallingLabel => "安装中…".into(),
+        Msg::PluginMgrEmptyMarketplaces => "暂无市场，请选「添加市场…」".into(),
+        Msg::PluginMgrEmptyPlugins => "该市场暂无插件。".into(),
+        Msg::PluginMgrEmptyInstalled => "暂无已安装插件。".into(),
+        Msg::PluginMgrCloning => "正在克隆市场…".into(),
+        Msg::PluginMgrInstalling { plugin } => format!("正在安装 {plugin}…").into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("已卸载 `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
@@ -712,6 +756,31 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescSkills => "浏览已加载的技能".into(),
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
+        Msg::CmdDescGuide => "向 atomcode-guide 提问使用方法".into(),
+        Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
+        Msg::GuideMenuTopics => "常用话题：".into(),
+        Msg::GuideMenuGettingStarted => "怎么开始使用          首次安装、登录、配置".into(),
+        Msg::GuideMenuSwitchModel => "怎么切换模型          /model /provider 操作".into(),
+        Msg::GuideMenuMcp => "怎么用 MCP            MCP 服务器配置与管理".into(),
+        Msg::GuideMenuSkills => "怎么用技能和插件       /skills /plugin 使用".into(),
+        Msg::GuideMenuMemory => "怎么用记忆功能         /remember /forget /memory".into(),
+        Msg::GuideMenuBackground => "怎么用后台任务         /bg 后台执行".into(),
+        Msg::GuideMenuContext => "怎么管理上下文         /compact /context /cost".into(),
+        Msg::GuideMenuKeybindings => "快捷键有哪些           键盘快捷键参考".into(),
+        Msg::GuideMenuConfig => "怎么配置               config.toml 配置说明".into(),
+        Msg::GuideMenuTip => "
+  提示：输入 /guide <你的问题> 获取具体回答。
+  例如：/guide 怎么切换模型
+".into(),
+        Msg::GuideMenuDocUrl => "  完整文档：https://atomcode.atomgit.com/docs/zh/".into(),
+        Msg::CmdGuideInstalling => "正在安装 ask skill，请稍候...".into(),
+        Msg::CmdGuideAutoInstall => "ask skill 未安装，正在自动安装 atomcode@atomcode-skills...".into(),
+        Msg::CmdGuideAutoInvoke { topic } =>
+            format!("ask skill 安装完成，正在回答: {}", topic).into(),
+        Msg::CmdGuideSkillNotFound =>
+            "安装完成但未找到 ask skill，请运行 /plugin reload 后重试".into(),
+        Msg::CmdGuideInstallFailed { error } =>
+            format!("安装 ask skill 失败: {}. 请手动运行 /plugin install atomcode@atomcode-skills", error).into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
 
         // ── reasoning effort ──
@@ -756,6 +825,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("✓ VL 识别图片成功，返回 {char_count} chars").into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
             format!("✓ {done} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {total_tokens} tokens").into(),
+        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
+            format!("✗ 已中断 · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {total_tokens} tokens").into(),
         Msg::LoginQrHeader =>
             "  登录 AtomGit — 使用微信扫描下方二维码：\n\n".into(),
         Msg::LoginUrlAfterQr =>
@@ -793,6 +864,14 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             model
         )
         .into(),
+        // ── --dangerously-skip-permissions / -y ──
+        Msg::BypassWarningBanner =>
+            "\u{26a0} --dangerously-skip-permissions 已启用：所有工具调用将自动批准（无权限提示）\n".into(),
+        Msg::BypassWarningHeadless =>
+            "[headless] --dangerously-skip-permissions：所有工具调用将自动批准".into(),
+        Msg::BypassBadge =>
+            "\u{26a0} BYPASS".into(),
+
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} 多行输入：在行尾加 `\\` 再按 Enter。\n    \

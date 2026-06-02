@@ -50,10 +50,17 @@
   color: var(--app-primary-foreground);
   white-space: nowrap;
   flex-shrink: 0;
-  max-width: 180px;
+  max-width: 200px;
+  height: 24px;
+  position: relative;
+}
+
+.attached-file-pill .pill-name {
   overflow: hidden;
   text-overflow: ellipsis;
-  height: 24px;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
 }
 
 .attached-file-pill .pill-close {
@@ -69,6 +76,15 @@
 }
 
 .attached-file-pill .pill-close:hover { opacity: 1; }
+
+.attached-file-pill.clickable {
+  cursor: pointer;
+  color: var(--app-link-foreground, var(--vscode-textLink-foreground, #3794ff));
+}
+
+.attached-file-pill.clickable:hover {
+  background: var(--app-input-hover-background, var(--vscode-list-hoverBackground));
+}
 
 .message-input {
   background: transparent;

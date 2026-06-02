@@ -29,7 +29,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
-use crate::agent::sub_agent;
+use crate::agent::parallel_edit;
 use crate::agent::AgentEvent;
 use crate::config::Config;
 use crate::provider::LlmProvider;
@@ -265,7 +265,7 @@ impl Tool for ParallelEditTool {
                     sib_content.lines().take(30).collect::<Vec<_>>().join("\n");
                 siblings.push_str(&format!("### {}\n```\n{}\n```\n\n", short, skeleton));
             }
-            tasks.push(sub_agent::SubAgentTask {
+            tasks.push(parallel_edit::SubAgentTask {
                 file_path: all_file_contents[i].0.clone(),
                 file_content: all_file_contents[i].1.clone(),
                 task_instruction: parsed.files[i].instruction.clone(),
@@ -285,7 +285,7 @@ impl Tool for ParallelEditTool {
             .event_tx
             .send(AgentEvent::SubAgentDispatchStart { tasks: task_infos });
 
-        let pool = sub_agent::SubAgentPool {
+        let pool = parallel_edit::SubAgentPool {
             tasks,
             max_concurrent: self.config.subagent.max_concurrent,
             timeout_secs: self.config.subagent.timeout_secs,
@@ -344,8 +344,16 @@ impl Tool for ParallelEditTool {
 
         // Build verification — best-effort, structural detector (probes
         // for build-system markers, not model intent). On miss the table
-        // is the final answer.
-        if let Some((cmd, build_dir)) = find_build_command(&working_dir) {
+        // is the final answer. The marker probe does blocking `read_dir`,
+        // so run it on the blocking pool to keep cancellation responsive.
+        let build_detect = {
+            let working_dir = working_dir.clone();
+            tokio::task::spawn_blocking(move || find_build_command(&working_dir))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some((cmd, build_dir)) = build_detect {
             let mut build_cmd = tokio::process::Command::new("sh");
             build_cmd.args(["-c", &cmd])
                 .current_dir(&build_dir);

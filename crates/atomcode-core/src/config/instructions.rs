@@ -3,8 +3,9 @@
 // Three-tier layered instruction system: global → project → user.
 //
 // 1. Global:  ~/.atomcode/ATOMCODE.md — personal preferences across all projects
-// 2. Project: <project>/.atomcode.md, ATOMCODE.md, CLAUDE.md, or claude.md
-//             (first match wins; CLAUDE.md/claude.md are accepted for
+// 2. Project: <project>/.atomcode.md, ATOMCODE.md, AGENTS.md, CLAUDE.md,
+//             or claude.md (first match wins; AGENTS.md is the open standard
+//             for AI coding agents; CLAUDE.md/claude.md are accepted for
 //             compatibility with projects migrating from Claude Code)
 // 3. User:    <project>/.atomcode.user.md — personal per-project, in .gitignore
 
@@ -53,15 +54,16 @@ impl LayeredInstructions {
     /// Load all three instruction tiers from disk.
     ///
     /// - Global:  `~/.atomcode/ATOMCODE.md`
-    /// - Project: `<project_root>/.atomcode.md`, `ATOMCODE.md`, `CLAUDE.md`,
-    ///   or `claude.md` (first match wins, in that order)
+    /// - Project: `<project_root>/.atomcode.md`, `ATOMCODE.md`, `AGENTS.md`,
+    ///   `CLAUDE.md`, or `claude.md` (first match wins, in that order)
     /// - User:    `<project_root>/.atomcode.user.md`
     pub fn load(project_root: &Path) -> Self {
         let config_dir = crate::config::Config::config_dir();
         let global = Self::try_load(&config_dir.join("ATOMCODE.md"), InstructionLevel::Global);
 
-        // Lookup order: native names first, then Claude Code names for compatibility.
-        let project = [".atomcode.md", "ATOMCODE.md", "CLAUDE.md", "claude.md"]
+        // Lookup order: native names first, then AGENTS.md (open standard),
+        // then Claude Code names for compatibility.
+        let project = [".atomcode.md", "ATOMCODE.md", "AGENTS.md", "CLAUDE.md", "claude.md"]
             .iter()
             .find_map(|name| Self::try_load(&project_root.join(name), InstructionLevel::Project));
 
@@ -185,6 +187,19 @@ mod tests {
     }
 
     #[test]
+    fn agents_md_used_as_project_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "from AGENTS.md open standard").unwrap();
+        let instructions = LayeredInstructions::load(tmp.path());
+        let project = instructions
+            .project
+            .expect("AGENTS.md should be loaded as project tier");
+        assert_eq!(project.level, InstructionLevel::Project);
+        assert!(project.content.contains("from AGENTS.md open standard"));
+        assert!(project.path.ends_with("AGENTS.md"));
+    }
+
+    #[test]
     fn claude_md_used_as_project_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("CLAUDE.md"), "from Claude Code").unwrap();
@@ -209,6 +224,16 @@ mod tests {
     }
 
     #[test]
+    fn atomcode_md_preferred_over_agents_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".atomcode.md"), "atomcode wins").unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "agents loses").unwrap();
+        let instructions = LayeredInstructions::load(tmp.path());
+        let project = instructions.project.expect("project tier should load");
+        assert!(project.content.contains("atomcode wins"));
+    }
+
+    #[test]
     fn atomcode_md_preferred_over_claude_md() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join(".atomcode.md"), "atomcode wins").unwrap();
@@ -216,6 +241,16 @@ mod tests {
         let instructions = LayeredInstructions::load(tmp.path());
         let project = instructions.project.expect("project tier should load");
         assert!(project.content.contains("atomcode wins"));
+    }
+
+    #[test]
+    fn agents_md_preferred_over_claude_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "agents wins").unwrap();
+        fs::write(tmp.path().join("CLAUDE.md"), "claude loses").unwrap();
+        let instructions = LayeredInstructions::load(tmp.path());
+        let project = instructions.project.expect("project tier should load");
+        assert!(project.content.contains("agents wins"));
     }
 
     #[test]
@@ -233,18 +268,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join(".atomcode.md"), "lowercase wins").unwrap();
         fs::write(tmp.path().join("ATOMCODE.md"), "uppercase loses").unwrap();
-
-        // Simulate the load logic: .atomcode.md is checked first.
-        let project = [".atomcode.md", "ATOMCODE.md"]
-            .iter()
-            .find_map(|name| {
-                LayeredInstructions::try_load(
-                    &tmp.path().join(name),
-                    InstructionLevel::Project,
-                )
-            });
-        assert!(project.is_some());
-        assert!(project.unwrap().content.contains("lowercase wins"));
+        let instructions = LayeredInstructions::load(tmp.path());
+        let project = instructions.project.expect("project tier should load");
+        assert!(project.content.contains("lowercase wins"));
+        assert!(project.path.ends_with(".atomcode.md"));
     }
 
     #[test]

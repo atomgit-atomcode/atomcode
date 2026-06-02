@@ -83,6 +83,10 @@ pub struct ApprovalRequest {
 /// Interactive permission decider (used by AgentLoop).
 /// Checks PermissionStore first (session grants, overrides),
 /// then falls back to sending approval request via channel.
+///
+/// When `dangerously_skip_permissions` is true, all tool calls are
+/// auto-approved without prompting the user — equivalent to Claude
+/// Code's `--dangerously-skip-permissions` mode.
 pub struct InteractivePermissionDecider {
     request_tx: mpsc::UnboundedSender<ApprovalRequest>,
     response_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<PermissionDecision>>,
@@ -90,6 +94,9 @@ pub struct InteractivePermissionDecider {
     /// AgentLoop writes to this (grant_session on ApproveToolAlways),
     /// TurnRunner reads from it (check before prompting user).
     permission_store: std::sync::Arc<std::sync::RwLock<crate::tool::PermissionStore>>,
+    /// When true, auto-approve every tool call without prompting.
+    /// Set via the `--dangerously-skip-permissions` CLI flag.
+    dangerously_skip_permissions: bool,
 }
 
 impl InteractivePermissionDecider {
@@ -102,6 +109,24 @@ impl InteractivePermissionDecider {
             request_tx,
             response_rx: tokio::sync::Mutex::new(response_rx),
             permission_store,
+            dangerously_skip_permissions: false,
+        }
+    }
+
+    /// Create with the dangerously-skip-permissions flag.
+    /// When `skip` is true, `decide()` always returns `Allow` and
+    /// `will_auto_approve()` always returns `true`.
+    pub fn new_with_skip_permissions(
+        request_tx: mpsc::UnboundedSender<ApprovalRequest>,
+        response_rx: mpsc::UnboundedReceiver<PermissionDecision>,
+        permission_store: std::sync::Arc<std::sync::RwLock<crate::tool::PermissionStore>>,
+        skip: bool,
+    ) -> Self {
+        Self {
+            request_tx,
+            response_rx: tokio::sync::Mutex::new(response_rx),
+            permission_store,
+            dangerously_skip_permissions: skip,
         }
     }
 }
@@ -109,6 +134,11 @@ impl InteractivePermissionDecider {
 #[async_trait]
 impl PermissionDecider for InteractivePermissionDecider {
     async fn decide(&self, call: &ToolCall, approval: &ApprovalRequirement) -> PermissionDecision {
+        // --dangerously-skip-permissions: auto-approve everything.
+        if self.dangerously_skip_permissions {
+            return PermissionDecision::Allow;
+        }
+
         // Check PermissionStore first — session grants and overrides
         // take effect without prompting the user again. The full
         // `ApprovalRequirement` (including `RequireApprovalAlways`) is
@@ -141,6 +171,11 @@ impl PermissionDecider for InteractivePermissionDecider {
     }
 
     fn will_auto_approve(&self, call: &ToolCall, approval: &ApprovalRequirement) -> bool {
+        // --dangerously-skip-permissions: everything is auto-approved.
+        if self.dangerously_skip_permissions {
+            return true;
+        }
+
         // Mirror the PermissionStore check that `decide()` performs
         // before falling through to the interactive channel. The full
         // variant is forwarded so `RequireApprovalAlways` continues to
@@ -413,5 +448,194 @@ mod tests {
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
         let call = make_call("mcp__zouwu-mcp-server__query_requirements");
         assert!(d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("mcp tool".into())));
+    }
+
+    // ── dangerously-skip-permissions tests ──
+
+    /// Helper: create an InteractivePermissionDecider with skip_permissions=true.
+    fn make_skip_decider() -> InteractivePermissionDecider {
+        let (req_tx, _req_rx) = mpsc::unbounded_channel();
+        let (_resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let store =
+            std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        InteractivePermissionDecider::new_with_skip_permissions(req_tx, resp_rx, store, true)
+    }
+
+    /// Helper: create an InteractivePermissionDecider with skip_permissions=false.
+    fn make_normal_decider() -> InteractivePermissionDecider {
+        let (req_tx, _req_rx) = mpsc::unbounded_channel();
+        let (_resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let store =
+            std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        InteractivePermissionDecider::new(req_tx, resp_rx, store)
+    }
+
+    // ── decide() tests ──
+
+    #[tokio::test]
+    async fn test_skip_permissions_auto_approves_require_approval() {
+        let d = make_skip_decider();
+        let call = make_call("bash");
+        let decision = d
+            .decide(&call, &ApprovalRequirement::RequireApproval("needs approval".into()))
+            .await;
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "skip_permissions should auto-approve RequireApproval"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skip_permissions_auto_approves_require_approval_always() {
+        // This is the critical safety test: --dangerously-skip-permissions
+        // even bypasses RequireApprovalAlways (e.g. rm -rf, git push --force).
+        let d = make_skip_decider();
+        let call = make_call("bash");
+        let decision = d
+            .decide(&call, &ApprovalRequirement::RequireApprovalAlways("sensitive".into()))
+            .await;
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "skip_permissions should auto-approve even RequireApprovalAlways"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skip_permissions_auto_approves_auto_approve() {
+        let d = make_skip_decider();
+        let call = make_call("read_file");
+        let decision = d
+            .decide(&call, &ApprovalRequirement::AutoApprove)
+            .await;
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "skip_permissions should auto-approve AutoApprove"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skip_permissions_auto_approves_mcp_tool() {
+        let d = make_skip_decider();
+        let call = make_call("mcp__zouwu__query");
+        let decision = d
+            .decide(&call, &ApprovalRequirement::RequireApproval("mcp tool".into()))
+            .await;
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "skip_permissions should auto-approve MCP tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_normal_mode_still_prompts_require_approval() {
+        // Regression: ensure normal mode (skip=false) still requires approval.
+        // We can't fully test the interactive channel here (would block),
+        // but we can verify that it does NOT return Allow immediately.
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let store =
+            std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
+
+        let call = make_call("bash");
+        let approval = ApprovalRequirement::RequireApproval("dangerous".into());
+        let fut = d.decide(&call, &approval);
+
+        // Normal mode should send a request on the channel (not auto-approve).
+        tokio::spawn(async move {
+            let req = req_rx.recv().await.expect("should receive approval request");
+            assert_eq!(req.call.name, "bash");
+            resp_tx.send(PermissionDecision::Deny).unwrap();
+        });
+
+        assert!(
+            matches!(fut.await, PermissionDecision::Deny),
+            "normal mode should not auto-approve RequireApproval"
+        );
+    }
+
+    // ── will_auto_approve() tests ──
+
+    #[test]
+    fn test_will_auto_approve_skip_permissions_require_approval() {
+        let d = make_skip_decider();
+        let call = make_call("bash");
+        assert!(
+            d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("dangerous".into())),
+            "skip_permissions: will_auto_approve should return true for RequireApproval"
+        );
+    }
+
+    #[test]
+    fn test_will_auto_approve_skip_permissions_require_approval_always() {
+        let d = make_skip_decider();
+        let call = make_call("bash");
+        assert!(
+            d.will_auto_approve(&call, &ApprovalRequirement::RequireApprovalAlways("sensitive".into())),
+            "skip_permissions: will_auto_approve should return true even for RequireApprovalAlways"
+        );
+    }
+
+    #[test]
+    fn test_will_auto_approve_skip_permissions_auto_approve() {
+        let d = make_skip_decider();
+        let call = make_call("read_file");
+        assert!(
+            d.will_auto_approve(&call, &ApprovalRequirement::AutoApprove),
+            "skip_permissions: will_auto_approve should return true for AutoApprove"
+        );
+    }
+
+    #[test]
+    fn test_will_auto_approve_skip_permissions_mcp_tool() {
+        let d = make_skip_decider();
+        let call = make_call("mcp__custom__query");
+        assert!(
+            d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("mcp".into())),
+            "skip_permissions: will_auto_approve should return true for MCP tools"
+        );
+    }
+
+    #[test]
+    fn test_will_auto_approve_normal_mode_require_approval_is_false() {
+        let d = make_normal_decider();
+        let call = make_call("bash");
+        assert!(
+            !d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("dangerous".into())),
+            "normal mode: will_auto_approve should return false for RequireApproval without session grant"
+        );
+    }
+
+    #[test]
+    fn test_will_auto_approve_normal_mode_require_approval_always_is_false() {
+        let d = make_normal_decider();
+        let call = make_call("bash");
+        assert!(
+            !d.will_auto_approve(&call, &ApprovalRequirement::RequireApprovalAlways("sensitive".into())),
+            "normal mode: will_auto_approve should return false for RequireApprovalAlways"
+        );
+    }
+
+    // ── constructor tests ──
+
+    #[test]
+    fn test_new_defaults_to_skip_false() {
+        let d = make_normal_decider();
+        let call = make_call("bash");
+        // If skip_permissions were true, this would return true even without session grant.
+        assert!(
+            !d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("test".into())),
+            "new() should default to skip_permissions=false"
+        );
+    }
+
+    #[test]
+    fn test_new_with_skip_permissions_true() {
+        let d = make_skip_decider();
+        let call = make_call("bash");
+        assert!(
+            d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("test".into())),
+            "new_with_skip_permissions(true) should set skip_permissions=true"
+        );
     }
 }

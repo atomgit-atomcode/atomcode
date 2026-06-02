@@ -5,7 +5,7 @@
 pub mod background;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
-pub mod sub_agent;
+pub mod parallel_edit;
 pub mod subtask_driver;
 
 mod diagnose;
@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::hook::HookEngine;
 use crate::provider::LlmProvider;
 use crate::skill::SkillRegistry;
 use crate::tool::use_skill::UseSkillTool;
@@ -276,6 +277,11 @@ pub enum AgentEvent {
     /// Currently sourced from the OpenAI provider's truncation detector
     /// when the proxy reports implausibly few prompt_tokens.
     Warning(String),
+    /// A UserPromptSubmit hook failed due to an environment issue (missing
+    /// dependency, crash, etc.) rather than an explicit block. The turn
+    /// continues but the status-bar hint should surface the error so the
+    /// user can fix their hook configuration.
+    HookWarningHint(String),
     /// VL preprocessing failed; the agent is returning the user's pending
     /// images so the TUI can re-attach them to the input state. Lets the
     /// user retry the same image without re-pasting from clipboard. Hashes
@@ -448,6 +454,10 @@ pub struct AgentLoop {
     pub total_tokens: usize,
     pub turn_start: Option<Instant>,
 
+    /// Session identifier for hook context.
+    /// Generated once at construction and survives ReloadConfig.
+    pub session_id: String,
+
     // Per-turn counters
     tool_call_count: usize,
     /// LLM round-trip count (standard "turn" metric).
@@ -549,14 +559,16 @@ pub struct AgentLoop {
     // Skill registry — provides descriptions for system prompt and powers use_skill tool
     skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 
-    /// Hook executor for lifecycle events.
-    hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
-
     // Code graph background indexer channel
     reindex_tx: Option<mpsc::UnboundedSender<PathBuf>>,
 
     // Datalog writer — writes per-turn markdown logs to datalog/ directory.
     datalog: crate::turn::datalog::DatalogWriter,
+
+    /// SystemPrompt hook extensions cached before each turn.
+    /// Populated by `refresh_hook_extensions` before calling `build_system_prompt`.
+    /// Vec<String> — empty means no extensions. Reset at session start and on reload.
+    cached_system_prompt_extensions: Vec<String>,
 
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
@@ -701,14 +713,36 @@ impl AgentRuntimeFactory {
     }
 }
 
+
 impl AgentLoop {
     /// Create a new agent loop and its corresponding UI handle.
     pub fn new(
         config: Config,
         provider: Box<dyn LlmProvider>,
+        tool_registry: ToolRegistry,
+        tool_context: ToolContext,
+        conversation: Conversation,
+    ) -> (Self, AgentHandle) {
+        Self::new_with_skip_permissions(
+            config,
+            provider,
+            tool_registry,
+            tool_context,
+            conversation,
+            false,
+        )
+    }
+
+    /// Create a new agent loop with an optional `--dangerously-skip-permissions`
+    /// flag. When `skip_permissions` is true, all tool calls are auto-approved
+    /// without prompting the user.
+    pub fn new_with_skip_permissions(
+        config: Config,
+        provider: Box<dyn LlmProvider>,
         mut tool_registry: ToolRegistry,
         tool_context: ToolContext,
         conversation: Conversation,
+        skip_permissions: bool,
     ) -> (Self, AgentHandle) {
         // Load skills from disk and register the use_skill tool.
         let working_dir = tool_context
@@ -779,6 +813,7 @@ impl AgentLoop {
             None,
             tool_context,
             conversation,
+            skip_permissions,
         )
     }
 
@@ -802,6 +837,7 @@ impl AgentLoop {
             runtime_label,
             tool_context,
             conversation,
+            false,
         )
     }
 
@@ -814,6 +850,7 @@ impl AgentLoop {
         runtime_label: Option<String>,
         mut tool_context: ToolContext,
         conversation: Conversation,
+        skip_permissions: bool,
     ) -> (Self, AgentHandle) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -837,10 +874,11 @@ impl AgentLoop {
         let permission_store = std::sync::Arc::new(std::sync::RwLock::new(PermissionStore::new()));
 
         let interactive_permission =
-            Box::new(crate::turn::permission::InteractivePermissionDecider::new(
+            Box::new(crate::turn::permission::InteractivePermissionDecider::new_with_skip_permissions(
                 approval_req_tx,
                 approval_resp_rx,
                 permission_store.clone(),
+                skip_permissions,
             ));
 
         // Hand the registry handle to ToolContext so active-dispatch tools
@@ -891,8 +929,10 @@ impl AgentLoop {
 }),
             };
 
-        let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
-        let hook_executor = std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
+        // Initialize unified HookEngine
+        let mut hook_engine = HookEngine::new();
+        hook_engine.load_all(&working_dir);
+        let hook_engine = std::sync::Arc::new(hook_engine);
 
         let turn_runner = TurnRunner {
             provider,
@@ -901,9 +941,10 @@ impl AgentLoop {
             config: config.clone(),
             ctx: ctx.clone(),
             permission: interactive_permission,
+            hook_engine: hook_engine.clone(),
             recently_edited_files: Vec::new(),
-            hook_executor: hook_executor.clone(),
             loop_guard: Default::default(),
+            current_turn_number: 0,
         };
 
         // Capture session-start env snapshot (git status, branch, HEAD).
@@ -924,6 +965,7 @@ impl AgentLoop {
             turn_tokens: 0,
             total_tokens: 0,
             turn_start: None,
+            session_id: uuid::Uuid::new_v4().to_string(),
             tool_call_count: 0,
             turn_count: 0,
             max_turns: None,
@@ -952,9 +994,9 @@ impl AgentLoop {
             plan_text: None,
             session_files: std::collections::HashMap::new(),
             skill_registry,
-            hook_executor,
             reindex_tx: None,
             datalog,
+            cached_system_prompt_extensions: Vec::new(),
             cmd_rx,
             event_tx,
         };
@@ -1024,26 +1066,25 @@ impl AgentLoop {
         }
 
         // --- SessionStart Hook ---
-        if self.hook_executor.has_hooks() {
-            let wd = self
+        let session_ctx = crate::hook::SessionContext {
+            session_id: self.session_id.clone(),
+            working_dir: self
                 .turn_runner
                 .context
                 .working_dir
                 .try_read()
-                .map(|g| g.display().to_string())
-                .unwrap_or_default();
-            let ctx = crate::hook::HookContext {
-                event: "session_start".into(),
-                tool_name: None,
-                tool_args: None,
-                tool_result: None,
-                tool_success: None,
-                session_id: String::new(),
-                working_dir: wd,
-            };
-            self.hook_executor
-                .run_session_event(crate::hook::HookEvent::SessionStart, &ctx)
-                .await;
+                .map(|g| g.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            model_name: self.turn_runner.provider.model_name().to_string(),
+            provider_name: self.config.default_provider.clone(),
+        };
+        let session_msgs = self.turn_runner.hook_engine.trigger_session_start(&session_ctx).await;
+        if !session_msgs.is_empty() {
+            // SessionStart hook Modified(msg) are collected and merged into the
+            // cached system-prompt extensions so the LLM sees them.  Unlike
+            // SystemPromptHook (which runs every turn), these are injected once
+            // at session start and persist for the session lifetime.
+            self.cached_system_prompt_extensions.extend(session_msgs);
         }
 
         while let Some(cmd) = self.cmd_rx.recv().await {
@@ -1081,7 +1122,7 @@ impl AgentLoop {
                         .get(&old_provider_name)
                         .map(|p| p.provider_type.clone());
                     self.config = new_config;
-                    // Rebuild hook executor from JSON config files.
+                    // Rebuild hook engine from config files.
                     let wd = self
                         .turn_runner
                         .context
@@ -1089,10 +1130,9 @@ impl AgentLoop {
                         .try_read()
                         .map(|g| g.clone())
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
-                    self.hook_executor =
-                        std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
-                    self.turn_runner.hook_executor = self.hook_executor.clone();
+                    let mut new_engine = HookEngine::new();
+                    new_engine.load_all(&wd);
+                    self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
                     let new_provider_name = self.config.default_provider.clone();
                     let new_type = self
                         .config
@@ -1384,10 +1424,9 @@ impl AgentLoop {
                         .try_read()
                         .map(|g| g.clone())
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
-                    self.hook_executor =
-                        std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
-                    self.turn_runner.hook_executor = self.hook_executor.clone();
+                    let mut new_engine = HookEngine::new();
+                    new_engine.load_all(&wd);
+                    self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
                 }
                 AgentCommand::SyncMessages => {
                     let messages = self.conversation.messages.clone();
@@ -1395,27 +1434,19 @@ impl AgentLoop {
                 }
                 AgentCommand::Shutdown => {
                     // --- SessionEnd Hook ---
-                    if self.hook_executor.has_hooks() {
-                        let wd = self
+                    let session_ctx = crate::hook::SessionContext {
+                        session_id: self.session_id.clone(),
+                        working_dir: self
                             .turn_runner
                             .context
                             .working_dir
                             .try_read()
-                            .map(|g| g.display().to_string())
-                            .unwrap_or_default();
-                        let ctx = crate::hook::HookContext {
-                            event: "session_end".into(),
-                            tool_name: None,
-                            tool_args: None,
-                            tool_result: None,
-                            tool_success: None,
-                            session_id: String::new(),
-                            working_dir: wd,
-                        };
-                        self.hook_executor
-                            .run_session_event(crate::hook::HookEvent::SessionEnd, &ctx)
-                            .await;
-                    }
+                            .map(|g| g.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        model_name: self.turn_runner.provider.model_name().to_string(),
+                        provider_name: self.config.default_provider.clone(),
+                    };
+                    self.turn_runner.hook_engine.trigger_session_end(&session_ctx).await;
                     break;
                 }
             }
@@ -1448,38 +1479,42 @@ impl AgentLoop {
         // input. A hook can either block the turn (CC `decision: "block"`
         // or non-zero exit) or inject extra context that we splice into
         // the user message before the LLM sees it.
-        if self.hook_executor.has_hooks() {
-            let cwd = self
-                .turn_runner
-                .context
-                .working_dir
-                .try_read()
-                .map(|g| g.display().to_string())
-                .unwrap_or_default();
-            match self
-                .hook_executor
-                .run_user_prompt_submit(&content, "", &cwd)
-                .await
-            {
-                crate::hook::UserPromptHookResult::Continue => {}
-                crate::hook::UserPromptHookResult::Inject(extra) => {
-                    // Append rather than prepend so the user's wording stays
-                    // at the top of the message — the hook context reads as
-                    // supplementary, not as a rewrite.
-                    content.push_str("\n\n");
-                    content.push_str(&extra);
-                }
-                crate::hook::UserPromptHookResult::Block(reason) => {
-                    let _ = self.event_tx.send(AgentEvent::Error {
-                        error: format!("hook blocked: {}", reason),
-                        messages: self.conversation.messages.clone(),
-                    });
-                    self.finish_turn(TurnStopReason::Error);
-                    return;
-                }
+        let cwd = self
+            .turn_runner
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.display().to_string())
+            .unwrap_or_default();
+        match self
+            .turn_runner
+            .hook_engine
+            .trigger_user_prompt_submit(&content, &self.session_id, &cwd)
+            .await
+        {
+            crate::hook::UserPromptHookResult::Continue => {}
+            crate::hook::UserPromptHookResult::Inject(extra) => {
+                content.push_str("\n\n");
+                content.push_str(&extra);
+            }
+            crate::hook::UserPromptHookResult::Block(reason) => {
+                let _ = self.event_tx.send(AgentEvent::Error {
+                    error: format!("hook blocked: {}", reason),
+                    messages: self.conversation.messages.clone(),
+                });
+                self.finish_turn(TurnStopReason::Error);
+                return;
+            }
+            crate::hook::UserPromptHookResult::Warning(msg) => {
+                // Non-fatal: show inline warning + status-bar hint, continue turn.
+                let _ = self.event_tx.send(AgentEvent::Warning(
+                    format!("Hook 执行异常，已跳过：{}", msg),
+                ));
+                let _ = self.event_tx.send(AgentEvent::HookWarningHint(
+                    format!("Hook 异常: {}", msg),
+                ));
             }
         }
-
         // Detect negative feedback — user is unhappy with previous turn's work.
         let lower = content.to_lowercase();
         let negative_keywords = [
@@ -1553,18 +1588,25 @@ impl AgentLoop {
         };
 
         // ── Task boundary cleanup ──
-        // New user message = new task. If there's old context from the
-        // previous task (>12 messages), compress it unconditionally.
-        // This prevents dirty-start degradation where 20K+ of stale
-        // conversation dilutes the batch prompt for the new task.
-        // Unlike maybe_compress_history (which checks the 50% threshold),
-        // this fires at every task boundary regardless of token count.
-        if self.conversation.messages.len() > 12 {
+        // New user message = new task. Compress stale context from the
+        // previous task ONLY under real budget pressure — gauged by the
+        // same threshold as auto-compaction (`needs_compression`), which
+        // tracks `ctx_window()`.
+        //
+        // This used to fire unconditionally whenever messages exceeded
+        // KEEP_MESSAGES, ignoring the window. On a large (e.g. 1M) window
+        // that has ample room, every follow-up message then rewrote the
+        // prompt prefix — collapsing provider prompt-prefix cache to ~10%
+        // on the first request of each follow-up — and discarded context
+        // the model could still use. Gating on budget keeps the prefix
+        // byte-stable across follow-ups when there's room to spare.
+        let system_prompt = self.build_system_prompt();
+        let sys_tokens = system_prompt.len() / 4 + 4;
+        if self.ctx.needs_compression(&self.conversation, sys_tokens) {
             // Task-boundary compression goes through the active ctx strategy.
             // No LLM call — the compressed content is already
             // one-line-per-round summaries (DefaultCtx) compact enough
             // for cold zone.
-            let system_prompt = self.build_system_prompt();
             let keep_ceiling = self.compaction_keep_ceiling(&system_prompt).await;
             if let Some((content, n_msgs)) =
                 self.ctx.compression_plan(&self.conversation, keep_ceiling)
@@ -1746,6 +1788,25 @@ impl AgentLoop {
             }
             self.turn_count += 1;
 
+            // --- 统一 TurnStart Hook (fire-and-forget) ---
+            {
+                let wd = self
+                    .turn_runner
+                    .context
+                    .working_dir
+                    .try_read()
+                    .map(|g| g.display().to_string())
+                    .unwrap_or_default();
+                let turn_ctx = crate::hook::TurnStartContext {
+                    turn_number: self.turn_count as u32,
+                    session_id: Some(self.session_id.clone()),
+                    working_dir: wd,
+                    phase: format!("{:?}", self.phase).to_lowercase(),
+                    has_file_context: !self.files_edited_this_turn.is_empty(),
+                };
+                self.turn_runner.hook_engine.trigger_on_turn_start(&turn_ctx).await;
+            }
+
             // Decrement diagnosis read-only counter each turn.
             if self.diagnosis_read_only_turns > 0 {
                 self.diagnosis_read_only_turns -= 1;
@@ -1776,6 +1837,13 @@ impl AgentLoop {
             // no edits), preventing it from stopping. The warning was interpreted
             // as "keep working" by the model. Stagnation detection was harmful —
             // the prompt guides the model to work efficiently.
+
+            // Refresh hook system-prompt extensions before building the prompt.
+            self.cached_system_prompt_extensions = self
+                .turn_runner
+                .hook_engine
+                .collect_system_prompt_extensions()
+                .await;
 
             let system_prompt = self.build_system_prompt();
             // Per-turn reminder removed: verbatim task now rides on the cadence
@@ -1884,6 +1952,10 @@ impl AgentLoop {
                 } else {
                     None // Full tool access — model can read, edit, bash, search_replace
                 };
+                // Sync current turn number to TurnRunner so ToolCallStartContext
+                // gets the correct turn index (not a 0 placeholder).
+                runner.current_turn_number = self.turn_count as u32;
+
                 let turn_fut = runner.run_with_filter(
                     &mut conv,
                     &system_prompt,
@@ -2225,6 +2297,24 @@ impl AgentLoop {
                     tokens,
                     truncated,
                 } => {
+                    // Trigger model response hooks (fire-and-forget)
+                    {
+                        let wd = self
+                            .turn_runner
+                            .context
+                            .working_dir
+                            .try_read()
+                            .map(|g| g.display().to_string())
+                            .unwrap_or_default();
+                        let mctx = crate::hook::TurnStartContext {
+                            turn_number: self.turn_count as u32,
+                            session_id: Some(self.session_id.clone()),
+                            working_dir: wd,
+                            phase: format!("{:?}", self.phase).to_lowercase(),
+                            has_file_context: !self.files_edited_this_turn.is_empty(),
+                        };
+                        self.turn_runner.hook_engine.trigger_on_model_response(text, &mctx).await;
+                    }
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
                     // Log the final assistant text to datalog (TUI used to do this —
@@ -2423,6 +2513,7 @@ impl AgentLoop {
 
                     if is_official_build_required {
                         self.datalog.log_error(&e);
+                        self.report_error("codingplan_unavailable", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -2469,6 +2560,7 @@ impl AgentLoop {
                         continue;
                     } else if is_auth_error {
                         self.datalog.log_error(&e);
+                        self.report_error("auth_error", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -2487,6 +2579,7 @@ impl AgentLoop {
                         continue;
                     } else {
                         self.datalog.log_error(&e);
+                        self.report_error("api_error", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -2994,6 +3087,27 @@ impl AgentLoop {
         let duration = self.turn_start.map(|t| t.elapsed()).unwrap_or_default();
         self.turn_start = None;
         self.phase = AgentPhase::Idle;
+
+        // --- 统一 TurnComplete Hook (fire-and-forget) ---
+        {
+            let stop_str = format!("{:?}", stop_reason).to_lowercase();
+            let turn_complete_ctx = crate::hook::TurnCompleteContext {
+                turn_number: self.turn_count as u32,
+                result_type: stop_str,
+                tokens_used: self.turn_tokens,
+                tool_calls: self.tool_call_count,
+                duration_ms: duration.as_millis() as u64,
+                truncated: false,
+                edited_files: self.files_edited_this_turn.clone(),
+            };
+            // fire-and-forget: spawn to avoid blocking the sync finish_turn
+            let engine = self.turn_runner.hook_engine.clone();
+            let ctx = turn_complete_ctx.clone();
+            tokio::spawn(async move {
+                engine.trigger_on_turn_complete(&ctx).await;
+            });
+        }
+
         let _ = self.event_tx.send(AgentEvent::TurnComplete {
             duration,
             total_tokens: self.turn_tokens,
@@ -3020,6 +3134,19 @@ impl AgentLoop {
     // intent-keywords across two iterations of failed gate logic, and
     // an entire class of mis-fire failures (read-only turns dispatching
     // 6 fork sub-agents that fake edits or no-op).
+
+    /// Fire-and-forget error reporting through the unified hook engine.
+    /// Consolidates ErrorContext construction for terminal error paths
+    /// (auth, api, codingplan_unavailable) to avoid duplication.
+    async fn report_error(&self, error_type: &str, error_message: &str) {
+        let ctx = crate::hook::ErrorContext {
+            error_type: error_type.into(),
+            error_message: error_message.into(),
+            phase: format!("{:?}", self.phase).to_lowercase(),
+            turn_number: Some(self.turn_count as u32),
+        };
+        self.turn_runner.hook_engine.trigger_on_error(&ctx).await;
+    }
 }
 
 

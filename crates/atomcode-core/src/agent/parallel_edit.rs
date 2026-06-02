@@ -501,7 +501,6 @@ impl SubAgentTask {
         let sandboxed_tools =
             Arc::new(filter_tools_for_subagent(&tools, &self.file_path).await);
 
-        let hooks = crate::hook::json_config::load_hooks_config(working_dir);
         let mut runner = TurnRunner {
             provider,
             tools: sandboxed_tools,
@@ -509,11 +508,10 @@ impl SubAgentTask {
             config: config.clone(),
             ctx: build_ctx,
             permission,
+            hook_engine: std::sync::Arc::new(crate::hook::HookEngine::new()), // Sub-agents don't use hooks for now
             recently_edited_files: Vec::new(),
-            hook_executor: std::sync::Arc::new(
-                crate::hook::executor::HookExecutor::new(hooks)
-            ),
             loop_guard: Default::default(),
+            current_turn_number: 0,
         };
 
         // 4. Event channel (we drain but don't forward — sub-agent is silent)
