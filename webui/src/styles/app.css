@@ -682,7 +682,9 @@ body {
 
 /* === Sidebar / session list === */
 .session-list {
-  width: 240px;
+  /* 侧栏随视口适度放宽：≤~1600px 维持 240px 不变，大屏逐步放宽至 340px，
+     避免在 2560px 等大屏上侧栏显得过窄、与主区比例失衡。 */
+  width: clamp(240px, 15vw, 340px);
   background: var(--app-primary-background);
   border-right: 1px solid var(--app-primary-border-color);
   display: flex;
