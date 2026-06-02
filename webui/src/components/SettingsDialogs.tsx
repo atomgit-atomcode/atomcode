@@ -188,14 +188,17 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                       <span class="provider-default-badge">{t('settings.default')}</span>
                     )}
                     <span class="provider-type">{p.type}</span>
-                    <button
-                      class="provider-edit-btn"
-                      type="button"
-                      onClick={() => setEditTarget(p)}
-                      title={t('settings.edit')}
-                    >
-                      {t('settings.edit')}
-                    </button>
+                    {/* AtomGit 托管 provider 由平台固定，禁止编辑（仅保留删除）。 */}
+                    {p.base_url !== ATOMGIT_BASE_URL && (
+                      <button
+                        class="provider-edit-btn"
+                        type="button"
+                        onClick={() => setEditTarget(p)}
+                        title={t('settings.edit')}
+                      >
+                        {t('settings.edit')}
+                      </button>
+                    )}
                     <button
                       class="provider-delete-btn"
                       type="button"
