@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Documentation · AtomCode</title>
-<meta name="description" content="AtomCode documentation — an open-source AI coding agent that lives in your terminal.">
+<title>远程访问指南 · AtomCode 文档</title>
+<meta name="description" content="通过蒲公英虚拟局域网，从手机等设备安全访问本机 AtomCode webui —— 安装、绑定虚拟 IP、扫码连接与安全须知。">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <link rel="stylesheet" href="../docs.css">
 <script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
 </head>
-<body data-page="index">
+<body data-page="webui-remote-access">
 
 <header class="dhdr" id="dhdr">
   <a class="dhdr-logo" href="../../index.html">
@@ -71,93 +71,81 @@
   </aside>
 
   <main class="dmain prose-docs">
-<div class="doc-hero">
-      <div class="eyebrow"><span class="dot"></span><span data-i18n="hero.eyebrow">AtomCode · 开源终端 AI 编码助手</span></div>
-      <h1>AtomCode Documentation</h1>
-      <p class="lede">An AI coding agent that lives in your terminal. Hand it a natural-language task and it will autonomously read, edit, run, and self-verify. These docs walk you from a fresh install to every feature AtomCode offers.</p>
-      <div class="tags">
-        <span class="tag accent">v4.24.0</span>
-        <span class="tag" data-i18n="hero.tag.license">许可证 MIT</span>
-        <span class="tag" data-i18n="hero.tag.lang">语言 Rust 1.88+</span>
-        <span class="tag" data-i18n="hero.tag.platforms">平台 macOS · Linux · HarmonyOS PC · Windows</span>
-        <span class="tag" data-i18n="hero.tag.ai">100% AI 生成</span>
-      </div>
-    </div>
+<h1>远程访问指南</h1>
+      <p class="lede">AtomCode 的 webui 默认只监听本机回环地址（<code>127.0.0.1</code>），手机等其他设备访问不到。借助<strong>蒲公英（Oray PGY）</strong>组建的虚拟局域网，你可以在不暴露公网、无需公网 IP 的前提下，从手机/平板安全地打开本机 webui。本页讲解完整的连接流程与安全须知。</p>
 
-      <h2>Three steps to start</h2>
-      <ol>
-        <li><strong>Install</strong> — one curl command or build from source. See <a href="./getting-started.html">Quickstart</a>.</li>
-        <li><strong>Log in or configure a model</strong> — AtomGit OAuth is the easiest path; any OpenAI-compatible API key also works. See <a href="./login.html">Login Methods</a> and <a href="./configuration.html">Configuration</a>.</li>
-        <li><strong>Ask away</strong> — run <code>atomcode</code> inside any project directory and describe your task in natural language.</li>
-      </ol>
+      <h2>工作原理</h2>
+      <p>蒲公英是一个异地组网工具：在本机和手机上安装并登录<strong>同一账号</strong>、加入<strong>同一网络</strong>后，两台设备就处在同一个虚拟局域网里，彼此可以用一个 <code>蒲公英虚拟 IP</code> 直接通信。webui 只要绑定到这个虚拟 IP，手机就能通过它访问。整个链路是点对点的私有网络，<strong>不会把你的本机暴露到公网</strong>。</p>
 
-      <div class="callout callout-tip">
-        <strong>Tip</strong>
-        <p>For a quick taste, run a single command: <code>atomcode -p "give me a brief overview of this repo"</code> — one-shot execution with the result piped to stdout.</p>
+      <div class="callout callout-warn">
+        <strong>为什么不直接开放公网</strong>
+        <p>webui / daemon 没有内置鉴权，访问者相当于拿到本机所有工具的执行权（包括 <code>bash</code>、<code>write</code>、<code>edit</code>）。所以请<strong>不要</strong>用 <code>--host 0.0.0.0</code> 把它直接暴露到公网或开放局域网。蒲公英虚拟局域网 + 一次性访问令牌（token），是为普通用户准备的安全远程方案。</p>
       </div>
 
-      <h2>Documentation map</h2>
-      <div class="doc-grid">
-        <a class="doc-card" href="./getting-started.html">
-          <h3>Quickstart</h3>
-          <p>Install paths, the 3-step first-run wizard, your first task, and the <code>atomcode uninstall</code> flow.</p>
-        </a>
-        <a class="doc-card" href="./configuration.html">
-          <h3>Configuration</h3>
-          <p>Every <code>~/.atomcode/config.toml</code> field, per-provider examples, plus the vision preprocessor (so non-vision models can still answer about images).</p>
-        </a>
-        <a class="doc-card" href="./login.html">
-          <h3>Login Methods</h3>
-          <p>AtomGit OAuth one-click login (auto-persisted) versus API key setup, side by side.</p>
-        </a>
-        <a class="doc-card" href="./basic-usage.html">
-          <h3>Basic Usage</h3>
-          <p>How to phrase tasks, common CLI flags, file references, multiline input, and image attachments / screenshots (Ctrl+V / drag-and-drop).</p>
-        </a>
-        <a class="doc-card" href="./slash-commands.html">
-          <h3>Slash Commands</h3>
-          <p>Reference table for the 30+ built-in slash commands: sessions, models, undo, issues, conversation modes, and the extension ecosystem.</p>
-        </a>
-        <a class="doc-card" href="./keybindings.html">
-          <h3>Keybindings</h3>
-          <p>Every TUI keybinding: input, navigation, selection, copy, and more.</p>
-        </a>
-        <a class="doc-card" href="./tools.html">
-          <h3>Built-in Tools</h3>
-          <p>All 21 built-in tools categorised: filesystem/shell, code graph, web, and automation.</p>
-        </a>
-        <a class="doc-card" href="./sessions.html">
-          <h3>Sessions &amp; Undo</h3>
-          <p>Persistent session restore, <code>/undo</code> rollback, and clearing or compacting context.</p>
-        </a>
-        <a class="doc-card" href="./project-instructions.html">
-          <h3>Project Instructions</h3>
-          <p>Use <code>.atomcode.md</code> to give AtomCode project-level conventions to follow.</p>
-        </a>
-        <a class="doc-card" href="./skills.html">
-          <h3>Skills</h3>
-          <p>Write your own skills to extend the slash-command ecosystem.</p>
-        </a>
-        <a class="doc-card" href="./plugins.html">
-          <h3>Plugin System</h3>
-          <p>One-click install other people's skill / command / hook packs from any git repo — Claude Code ecosystem compatible.</p>
-        </a>
-        <a class="doc-card" href="./mcp.html">
-          <h3>MCP Integration</h3>
-          <p>Plug external MCP servers in via <code>.mcp.json</code> — expose GitHub, databases, Playwright, and more to your model.</p>
-        </a>
-        <a class="doc-card" href="./faq.html">
-          <h3>FAQ</h3>
-          <p>Install issues, model connectivity, permission prompts, context overflows, and other common questions.</p>
-        </a>
-      </div>
-
-      <h2>Feedback &amp; contributing</h2>
-      <p>AtomCode is open source — issues and pull requests welcome:</p>
+      <h2>前置条件</h2>
       <ul>
-        <li>Repository: <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">https://atomgit.com/atomgit_atomcode/atomcode</a></li>
-        <li>Issues: run <code>/issue</code> from inside AtomCode to file one quickly</li>
-        <li>License: MIT</li>
+        <li>本机已经能正常启动 AtomCode 的 webui。</li>
+        <li>本机与手机都安装了<strong>蒲公英</strong>客户端：<a href="https://pgy.oray.com" target="_blank" rel="noopener">https://pgy.oray.com</a>。</li>
+        <li>两台设备登录<strong>同一蒲公英账号</strong>，并加入<strong>同一网络</strong>。</li>
+      </ul>
+
+      <h2>操作步骤</h2>
+
+      <h3>1. 连接蒲公英，拿到虚拟 IP</h3>
+      <p>在本机的蒲公英客户端里完成登录与组网，记下分配给本机的<strong>虚拟 IP</strong>（形如 <code>10.x.x.x</code>）。手机端同样登录同一账号、加入同一网络即可，无需记 IP。</p>
+
+      <h3>2. 让 webui 绑定到虚拟 IP</h3>
+      <p>默认 webui 只绑回环地址，手机访问不到。在 AtomCode 的 TUI 里用 <code>--host</code> 指定蒲公英虚拟 IP 重新启动 webui：</p>
+      <pre><code>/webui --host 10.x.x.x</code></pre>
+      <p>把 <code>10.x.x.x</code> 换成上一步记下的本机虚拟 IP。绑定成功后，webui 就会在这个地址上对同一虚拟局域网内的设备开放。</p>
+
+      <h3>3. 在「远程访问」面板扫码连接</h3>
+      <p>打开 webui 右上角的<strong>远程访问</strong>（手机图标）面板，AtomCode 会自动检测蒲公英状态并生成：</p>
+      <ul>
+        <li>一个可直接打开的<strong>远程地址</strong>（已带上访问令牌）；</li>
+        <li>对应的<strong>二维码</strong>。</li>
+      </ul>
+      <p>用手机扫码，或把地址复制到手机浏览器打开即可。手机需登录同一蒲公英账号、处于同一网络。</p>
+
+      <div class="callout callout-warn">
+        <strong>访问令牌 = 密码</strong>
+        <p>远程地址中带有一次性访问令牌（<code>?token=…</code>），<strong>等同于密码</strong>：任何拿到这条完整链接的人都能操作你的本机。请勿把它发到群里、截图外传或贴到公开页面。</p>
+      </div>
+
+      <h2>排错</h2>
+      <p>「远程访问」面板会根据检测结果给出不同提示，对应处理如下：</p>
+      <table>
+        <thead>
+          <tr><th>面板提示</th><th>含义</th><th>怎么办</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>未检测到蒲公英</td>
+            <td>本机没装蒲公英，或客户端未运行。</td>
+            <td>在本机与手机都安装并登录蒲公英，加入同一网络后回到面板「重新检测」。</td>
+          </tr>
+          <tr>
+            <td>本机还没分配虚拟 IP</td>
+            <td>装了蒲公英但还没组网成功。</td>
+            <td>在蒲公英客户端里连接 / 加入网络，拿到虚拟 IP 后再「重新检测」。</td>
+          </tr>
+          <tr>
+            <td>webui 仅绑定了本机</td>
+            <td>检测到蒲公英，但 webui 还监听在回环地址。</td>
+            <td>按步骤 2 用 <code>/webui --host &lt;虚拟 IP&gt;</code> 重启 webui，再刷新本页。</td>
+          </tr>
+          <tr>
+            <td>手机打不开 / 一直转圈</td>
+            <td>两端不在同一网络，或防火墙拦截。</td>
+            <td>确认手机与本机登录同一蒲公英账号、加入同一网络；检查本机防火墙是否放行 webui 端口。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./headless-daemon.html">Headless 与 Daemon</a> —— 了解 webui 背后的 daemon 与 HTTP/SSE 接口</li>
+        <li><a href="./faq.html">常见问题</a> —— 远程 / 登录相关的常见坑</li>
       </ul>
 
     <footer class="dftr">

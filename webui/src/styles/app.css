@@ -1217,6 +1217,10 @@ body {
 
 /* Buttons */
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
   height: 30px;
   padding: 0 14px;
   border-radius: var(--corner-radius-small);
@@ -1227,6 +1231,7 @@ body {
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
+  text-decoration: none;
 }
 .btn:hover { background: var(--app-ghost-button-hover-background); }
 .btn:disabled { opacity: 0.5; cursor: default; }

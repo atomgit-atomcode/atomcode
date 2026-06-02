@@ -491,7 +491,7 @@ function Row({ label, value, mono }: { label: string; value: string; mono?: bool
 
 /** 远程访问（蒲公英 / Oray PGY）：检测状态，给出可扫码的私网 URL。 */
 export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
-  const { t } = useSettings();
+  const { t, lang } = useSettings();
   const [status, setStatus] = useState<TunnelStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
@@ -580,6 +580,15 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
           <button class="btn" onClick={reload} disabled={loading}>
             {t('remote.refresh')}
           </button>
+          {/* 使用引导：跳官网对应语言的说明页，新标签打开。 */}
+          <a
+            class="btn"
+            href={`https://atomcode.atomgit.com/docs/${lang}/webui-remote-access.html`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            {t('remote.guide')}
+          </a>
         </div>
       </div>
     </SettingsModal>
