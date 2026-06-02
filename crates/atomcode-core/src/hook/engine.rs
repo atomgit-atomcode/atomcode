@@ -553,10 +553,19 @@ impl ShellCommandHook {
             "{}".to_string()
         });
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&self.command)
-            .env("ATOMCODE_HOOK_EVENT", &ctx.event)
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/C").arg(&self.command);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&self.command);
+            c
+        };
+        cmd.env("ATOMCODE_HOOK_EVENT", &ctx.event)
             .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
             .kill_on_drop(true);
 
@@ -589,10 +598,19 @@ impl ShellCommandHook {
         &self,
         payload_json: &str,
     ) -> anyhow::Result<(bool, String, String)> {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&self.command)
-            .stdin(Stdio::piped())
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/C").arg(&self.command);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&self.command);
+            c
+        };
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
