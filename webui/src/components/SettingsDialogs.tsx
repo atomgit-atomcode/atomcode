@@ -240,6 +240,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     {editTarget && (
       <ProviderFormDialog
         editing={editTarget}
+        existingNames={config?.providers.map((p) => p.name) ?? []}
         onClose={() => setEditTarget(null)}
         onSaved={() => {
           setEditTarget(null);
@@ -267,8 +268,8 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
 /**
  * 「添加 / 编辑模型」弹窗。
  * - 添加模式（无 editing）：name/model/base_url/api_key 均必填。
- * - 编辑模式（有 editing）：name 为主键不可改（只读）；api_key 留空表示保留现有，
- *   仅在填写时才覆盖；走 PATCH。两种模式共用此表单避免重复。
+ * - 编辑模式（有 editing）：name 可改（后端按 key 迁移并修正默认项）；api_key 留空表示
+ *   保留现有，仅在填写时才覆盖；走 PATCH。两种模式共用此表单避免重复。
  */
 function ProviderFormDialog({
   editing,
@@ -277,7 +278,7 @@ function ProviderFormDialog({
   onSaved,
 }: {
   editing?: ProviderInfo;
-  // 已有 provider 名称列表，用于添加模式下的重复名校验（编辑模式 name 不可改，无需传）。
+  // 已有 provider 名称列表，用于重复名校验（编辑模式会排除自身原名）。
   existingNames?: string[];
   onClose: () => void;
   onSaved: () => void;
@@ -295,18 +296,22 @@ function ProviderFormDialog({
   const [error, setError] = useState<string | null>(null);
 
   const handleSave = async () => {
+    const newName = nameInput.trim();
     if (isEdit) {
-      // 编辑：name 固定；api_key 留空=保留现有，故不计入必填。
-      if (!model.trim() || !baseUrl.trim()) {
+      // 编辑：name 必填且可改；api_key 留空=保留现有，故不计入必填。
+      if (!newName || !model.trim() || !baseUrl.trim()) {
         setError(t('settings.allRequired'));
         return;
       }
-    } else if (!nameInput.trim() || !model.trim() || !baseUrl.trim() || !apiKey.trim()) {
+    } else if (!newName || !model.trim() || !baseUrl.trim() || !apiKey.trim()) {
       setError(t('settings.allRequired'));
       return;
-    } else if (
-      // 添加模式：name 为主键，重复会静默覆盖已有配置，故提前拦截。
-      existingNames.some((n) => n.toLowerCase() === nameInput.trim().toLowerCase())
+    }
+    // name 为主键，重复会静默覆盖/冲突，故提前拦截。编辑模式排除自身原名。
+    if (
+      existingNames.some(
+        (n) => n.toLowerCase() !== name.toLowerCase() && n.toLowerCase() === newName.toLowerCase(),
+      )
     ) {
       setError(t('settings.nameExists'));
       return;
@@ -316,19 +321,21 @@ function ProviderFormDialog({
     try {
       if (isEdit) {
         await updateProvider(name, {
+          // 仅在改名时才传 name，避免无谓的 key 迁移。
+          ...(newName !== name ? { name: newName } : {}),
           type,
           model: model.trim(),
           base_url: baseUrl.trim(),
           // 仅在用户填写了新 key 时才覆盖；留空保留现有。
           ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
         });
-        // PATCH 不处理默认项：若勾选且原本非默认，单独设默认。
+        // PATCH 不处理默认项：若勾选且原本非默认，单独设默认（用新名，改名后旧 key 已不存在）。
         if (setDefault && !editing?.is_default) {
-          await setDefaultProvider(name);
+          await setDefaultProvider(newName);
         }
       } else {
         await createProvider({
-          name: nameInput.trim(),
+          name: newName,
           type,
           model: model.trim(),
           base_url: baseUrl.trim(),
@@ -358,7 +365,6 @@ function ProviderFormDialog({
             type="text"
             placeholder="my-deepseek"
             value={nameInput}
-            disabled={isEdit}
             onInput={(e) => setNameInput((e.target as HTMLInputElement).value)}
           />
         </div>

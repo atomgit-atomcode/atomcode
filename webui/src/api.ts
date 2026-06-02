@@ -338,6 +338,8 @@ export async function deleteProvider(name: string): Promise<void> {
 }
 
 export interface UpdateProviderBody {
+  // 重命名：传新 name 即把该 provider 改名（后端按 key 迁移并修正默认项）；省略=保持原名。
+  name?: string;
   type?: string;
   model?: string;
   // 省略字段=保持不变；传字符串=覆盖。
@@ -345,7 +347,7 @@ export interface UpdateProviderBody {
   base_url?: string;
 }
 
-/** PATCH /providers/:name —— 部分更新已有 provider（name 为主键，不可改）。 */
+/** PATCH /providers/:name —— 部分更新已有 provider（可改名：body.name 传新名）。 */
 export async function updateProvider(name: string, body: UpdateProviderBody): Promise<unknown> {
   const r = await fetch(`/providers/${encodeURIComponent(name)}`, {
     method: 'PATCH',
