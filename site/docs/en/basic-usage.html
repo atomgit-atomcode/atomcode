@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.3</span>
+    <span class="dhdr-ver">v4.24.0</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -91,7 +91,7 @@ atomcode --continue
 atomcode --config ./custom.toml
 
 # Skip all permission prompts, auto-approve every tool call
-atomcode --skip
+atomcode -y
 atomcode --dangerously-skip-permissions</code></pre>
 
       <h2>CLI flag reference</h2>
@@ -110,7 +110,7 @@ atomcode --dangerously-skip-permissions</code></pre>
           <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>In non-interactive mode, print tool calls and token usage to stderr</td></tr>
           <tr><td><code>--max-turns N</code></td><td>—</td><td>Cap the number of agent loop iterations; prevents runaway loops</td></tr>
           <tr><td><code>--disable-tools LIST</code></td><td>—</td><td>Comma-separated tools to disable, e.g. <code>--disable-tools bash,web_fetch</code></td></tr>
-          <tr><td><code>--dangerously-skip-permissions</code></td><td><code>--skip</code></td><td>Skip all permission prompts — auto-approve every tool call (bash, file edits, MCP, etc.). A ⚠ SKIP badge is shown in the TUI status bar while active</td></tr>
+          <tr><td><code>--dangerously-skip-permissions</code></td><td><code>-y</code></td><td>Skip all permission prompts — auto-approve every tool call (bash, file edits, MCP, etc.). A ⚠ BYPASS badge is shown in the TUI status bar while active</td></tr>
         </tbody>
       </table>
 
@@ -121,7 +121,7 @@ atomcode --dangerously-skip-permissions</code></pre>
 
       <div class="callout callout-warning">
         <strong>Warning</strong>
-        <p><code>--skip</code> / <code>--dangerously-skip-permissions</code> bypasses all permission prompts, including bash execution, file writes, and MCP tool calls. The agent can execute arbitrary actions without confirmation. Only use this flag when:</p>
+        <p><code>-y</code> / <code>--dangerously-skip-permissions</code> bypasses all permission prompts, including bash execution, file writes, and MCP tool calls. The agent can execute arbitrary actions without confirmation. Only use this flag when:</p>
         <ul>
           <li>Running in CI/CD pipelines or other automated environments</li>
           <li>Executing benchmarks inside a sandbox or container</li>

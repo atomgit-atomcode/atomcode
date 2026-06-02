@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.3</span>
+    <span class="dhdr-ver">v4.24.0</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -80,9 +80,37 @@
         <li><strong>Skill / Command / Hook</strong> — the three asset types a plugin contributes. Skills and commands are namespaced with <code>plugin-name:</code> (to avoid collisions); hooks fire on events.</li>
       </ul>
 
+      <h2>Command reference</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/plugin</code></td><td>Open the <strong>interactive plugin manager</strong> (↑/↓ to select, Enter to confirm, Esc to go back). Browse marketplaces, install/uninstall plugins, add/remove marketplaces — all from one screen</td></tr>
+          <tr><td><code>/plugin marketplace add &lt;url&gt;</code></td><td>Clone a git repo and register it as a marketplace</td></tr>
+          <tr><td><code>/plugin marketplace remove &lt;name&gt;</code></td><td>Remove a registered marketplace (refuses if any of its plugins are still installed)</td></tr>
+          <tr><td><code>/plugin marketplace update &lt;name&gt;</code></td><td>Pull the latest commit for a marketplace repo, refreshing its plugin list</td></tr>
+          <tr><td><code>/plugin marketplace list</code></td><td>List all registered marketplaces</td></tr>
+          <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>Install a plugin from the named marketplace</td></tr>
+          <tr><td><code>/plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>Uninstall an installed plugin (the marketplace registration is kept)</td></tr>
+          <tr><td><code>/plugin list</code></td><td>List all locally installed plugins</td></tr>
+          <tr><td><code>/plugin reload</code></td><td>Reload all plugins (re-scan disk, refresh skill/hook registration)</td></tr>
+        </tbody>
+      </table>
+
       <h2>Install a plugin</h2>
 
-      <h3>Method 1: in the TUI</h3>
+      <h3>Method 1: interactive manager (recommended)</h3>
+      <p>Type <code>/plugin</code> in the TUI (no subcommand) to open a full-screen interactive manager. Navigate with arrow keys, confirm with Enter:</p>
+      <pre><code>/plugin
+# → Opens the manager home screen:
+#   Browse &amp; install    — Browse a marketplace's plugins, Enter to install/uninstall
+#   Add marketplace…   — Type/paste a git URL to add a new marketplace
+#   Remove marketplace… — Pick a marketplace to remove
+#   Installed (N)      — View installed plugins, Enter to uninstall</code></pre>
+      <p>Installed plugins show a ✓ mark; pressing Enter toggles install/uninstall. Cloning and installing are async — a status line appears at the bottom during the operation and the list refreshes automatically when done.</p>
+
+      <h3>Method 2: slash-command subcommands</h3>
       <pre><code># 1. Register the marketplace (clones its git repo locally)
 /plugin marketplace add https://gitcode.com/gmq123/ascend-model-agent-plugin
 
@@ -92,7 +120,7 @@
 # 3. List installed plugins
 /plugin list</code></pre>
 
-      <h3>Method 2: CLI</h3>
+      <h3>Method 3: CLI</h3>
       <pre><code>atomcode plugin marketplace add &lt;git-url&gt;
 atomcode plugin install &lt;plugin&gt;@&lt;marketplace&gt;
 atomcode plugin list

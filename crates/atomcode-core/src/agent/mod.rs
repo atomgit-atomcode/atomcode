@@ -1587,18 +1587,25 @@ impl AgentLoop {
         };
 
         // ── Task boundary cleanup ──
-        // New user message = new task. If there's old context from the
-        // previous task, compress it unconditionally.
-        // This prevents dirty-start degradation where stale
-        // conversation dilutes the batch prompt for the new task.
-        // Unlike maybe_compress_history (which checks the 50% threshold),
-        // this fires at every task boundary when messages exceed KEEP_MESSAGES.
-        if self.conversation.messages.len() > crate::conversation::KEEP_MESSAGES {
+        // New user message = new task. Compress stale context from the
+        // previous task ONLY under real budget pressure — gauged by the
+        // same threshold as auto-compaction (`needs_compression`), which
+        // tracks `ctx_window()`.
+        //
+        // This used to fire unconditionally whenever messages exceeded
+        // KEEP_MESSAGES, ignoring the window. On a large (e.g. 1M) window
+        // that has ample room, every follow-up message then rewrote the
+        // prompt prefix — collapsing provider prompt-prefix cache to ~10%
+        // on the first request of each follow-up — and discarded context
+        // the model could still use. Gating on budget keeps the prefix
+        // byte-stable across follow-ups when there's room to spare.
+        let system_prompt = self.build_system_prompt();
+        let sys_tokens = system_prompt.len() / 4 + 4;
+        if self.ctx.needs_compression(&self.conversation, sys_tokens) {
             // Task-boundary compression goes through the active ctx strategy.
             // No LLM call — the compressed content is already
             // one-line-per-round summaries (DefaultCtx) compact enough
             // for cold zone.
-            let system_prompt = self.build_system_prompt();
             let keep_ceiling = self.compaction_keep_ceiling(&system_prompt).await;
             if let Some((content, n_msgs)) =
                 self.ctx.compression_plan(&self.conversation, keep_ceiling)

@@ -366,7 +366,7 @@ pub struct StatusLine {
     /// `--dangerously-skip-permissions / -y` is active, rendering a
     /// yellow warning badge so the user is always aware that all tool
     /// calls are auto-approved. Kept separate from `mode_indicator`
-    /// (left-aligned PLAN/Build badge) so SKIP does not displace
+    /// (left-aligned PLAN/Build badge) so BYPASS does not displace
     /// the mode indicator.
     pub bypass_indicator: Option<String>,
     /// Current session display name, shown as a right-aligned cyan

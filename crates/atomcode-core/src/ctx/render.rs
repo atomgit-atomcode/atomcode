@@ -1306,6 +1306,46 @@ mod tests {
     }
 
     #[test]
+    fn large_window_ignores_message_count_for_compaction() {
+        // Regression guard for the task-boundary compaction fix
+        // (agent/mod.rs handle path). Task-boundary compaction is now gated
+        // SOLELY on this budget check — the old `messages.len() >
+        // KEEP_MESSAGES` trigger was removed. A long conversation (well past
+        // KEEP_MESSAGES=20) that is far under a large (1M) window must NOT
+        // need compression: otherwise every follow-up message rewrites the
+        // prompt prefix and collapses provider prompt-prefix cache (~10% hit
+        // on the first request after each follow-up — observed on the 1M
+        // setup). The SAME conversation on a 128K window does need it.
+        let mut conv = Conversation::new();
+        // 30 messages (>20), ~150K tokens total (≈ bytes / 4).
+        for _ in 0..15 {
+            conv.messages
+                .push(Message::new(Role::User, "x".repeat(20_000)));
+            conv.messages
+                .push(Message::new(Role::Assistant, "y".repeat(20_000)));
+        }
+        let total: usize = conv.messages.iter().map(|m| m.estimate_tokens()).sum();
+        assert_eq!(conv.messages.len(), 30, "fixture exceeds KEEP_MESSAGES=20");
+        assert!(
+            (120_000..400_000).contains(&total),
+            "fixture should be ~150K tokens, got {}",
+            total
+        );
+
+        // 1M window: ~150K is ~15% of budget — ample room, must NOT compress
+        // despite 30 messages. This is the bug the fix addresses.
+        assert!(
+            !needs_compression(&conv, 0, 1_000_000),
+            "large window must not compress a far-under-budget conversation regardless of message count"
+        );
+        // 128K window: ~150K exceeds the ~115K threshold — must still compress.
+        assert!(
+            needs_compression(&conv, 0, 128_000),
+            "small window over threshold must still compress"
+        );
+    }
+
+    #[test]
     fn tool_result_ref_token_estimate_uses_summary_not_byte_size() {
         // Pre-fix bug: ToolResultRef estimated from the full original
         // content size (could be 50K+ for a large file read), but at

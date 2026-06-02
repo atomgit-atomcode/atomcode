@@ -719,7 +719,7 @@ pub enum Msg<'a> {
     /// Headless-mode stderr warning when --dangerously-skip-permissions is active.
     BypassWarningHeadless,
     /// Status-bar badge text shown when --dangerously-skip-permissions is
-    /// active. Typically "⚠ SKIP" — kept short for the status row.
+    /// active. Typically "⚠ BYPASS" — kept short for the status row.
     BypassBadge,
 
     /// Confirmation hint after the first Ctrl+C on an empty buffer.
