@@ -560,10 +560,30 @@ pub fn install(plugin: &str, marketplace: &str, scope: InstallScope) -> Result<I
             let dest_rel = format!("installed/{}/{}", marketplace, plugin_key);
             let dest_abs = project_root.join(&dest_rel);
             if dest_abs.exists() {
-                bail!(
-                    "plugin already installed in project at {}",
-                    dest_abs.display()
-                );
+                // The directory already exists — same residual-detect logic
+                // as install_external: if the plugin is NOT recorded in the
+                // project-level installed_plugins.json, treat the directory
+                // as a stale leftover from a cancelled / failed install and
+                // remove it.  Otherwise, bail out.
+                let state_path = paths::project_installed_plugins_file(&working_dir, &scope)
+                    .ok_or_else(|| anyhow!("no project state file for scope {:?}", scope))?;
+                let id = plugin_id(&plugin_key, marketplace);
+                let is_registered = load_installed_plugins_file(&state_path)
+                    .map(|f| f.plugins.contains_key(&id))
+                    .unwrap_or(false);
+                if is_registered {
+                    bail!(
+                        "plugin already installed in project at {}",
+                        dest_abs.display()
+                    );
+                }
+                // Stale leftover — remove and continue.
+                std::fs::remove_dir_all(&dest_abs).with_context(|| {
+                    format!(
+                        "failed to remove stale project install dir {}",
+                        dest_abs.display()
+                    )
+                })?;
             }
             if let Some(parent) = dest_abs.parent() {
                 std::fs::create_dir_all(parent).ok();

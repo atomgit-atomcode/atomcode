@@ -15,6 +15,8 @@
 // when they finish so the modal can refresh its lists. Fast ops (uninstall,
 // remove marketplace) run inline and refresh immediately.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use atomcode_core::plugin::installer::InstalledPluginInfo;
 use atomcode_core::plugin::marketplace::MarketplaceInfo;
@@ -56,6 +58,13 @@ pub struct PluginManager {
     /// The plugin name currently being installed (used to show ⏳ in the
     /// list). Cleared together with `pending` in `on_plugin_event`.
     installing_plugin: Option<String>,
+    /// Canonical plugin ids (`plugin@marketplace`) for installs that were
+    /// cancelled by the user pressing Esc while on the `Installing` screen.
+    /// When the background install job completes, `on_plugin_event` checks
+    /// this set: if the plugin id is present, the install is rolled back
+    /// (uninstalled) automatically so the filesystem is not left in an
+    /// inconsistent state.
+    cancelled_installs: HashSet<String>,
 }
 
 /// Path-safe segment, mirroring `marketplace::sanitize_name` (which is crate
@@ -80,6 +89,7 @@ impl PluginManager {
             url_input: String::new(),
             pending: None,
             installing_plugin: None,
+            cancelled_installs: HashSet::new(),
         };
         m.reload();
         m
@@ -194,7 +204,18 @@ impl PluginManager {
         };
         if self.is_installed(&plugin, &mp) {
             // Uninstall is fast — run inline and refresh.
-            match atomcode_core::plugin::installer::uninstall(&plugin, &mp, InstallScope::User) {
+            // Look up the actual scope of the installed plugin so we
+            // uninstall from the right location (User / Project / Local).
+            let key = sanitize(&plugin);
+            let scope = self
+                .installed
+                .iter()
+                .find(|i| {
+                    i.marketplace == mp && (i.plugin == plugin || i.plugin == key)
+                })
+                .map(|i| i.scope.clone())
+                .unwrap_or(InstallScope::User);
+            match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
                 Ok(()) => {
                     reload_plugins(ctx);
                     renderer.render(UiLine::CommandOutput(
@@ -431,8 +452,12 @@ impl Modal for PluginManager {
                         let mp = mp.clone();
                         self.goto(Screen::Plugins { mp });
                     }
-                    Screen::Installing { plugin: _, mp } => {
-                        // Cancel the in-flight install and go back to Plugins list.
+                    Screen::Installing { plugin, mp } => {
+                        // Mark the install as cancelled so that when the
+                        // background job completes, on_plugin_event rolls
+                        // it back automatically.
+                        let id = format!("{}@{}", sanitize(plugin), mp);
+                        self.cancelled_installs.insert(id);
                         self.pending = None;
                         self.installing_plugin = None;
                         let mp = mp.clone();
@@ -523,9 +548,30 @@ impl Modal for PluginManager {
         Ok(ModalAction::Continue)
     }
 
-    fn on_plugin_event(&mut self, _ev: &PluginJobEvent) {
+    fn on_plugin_event(&mut self, ev: &PluginJobEvent) {
         self.pending = None;
         self.installing_plugin = None;
+
+        // If a cancelled install completed successfully, roll it back
+        // (uninstall) so the filesystem is not left in an inconsistent
+        // state.  This handles the race where the user presses Esc while
+        // a git clone is still in flight: the clone finishes and updates
+        // installed_plugins.json, but the user already expressed intent to
+        // cancel.
+        if let PluginJobEvent::PluginInstalled(info) = ev {
+            let id = format!("{}@{}", info.plugin, info.marketplace);
+            if self.cancelled_installs.take(&id).is_some() {
+                // Best-effort rollback — if this fails the stale dir
+                // cleanup logic in install_external will handle it on
+                // the next install attempt.
+                let _ = atomcode_core::plugin::installer::uninstall(
+                    &info.plugin,
+                    &info.marketplace,
+                    info.scope.clone(),
+                );
+            }
+        }
+
         self.reload();
         // If we were on the Installing screen, navigate back to the
         // Plugins list so the user sees the updated installed state.
@@ -567,6 +613,7 @@ mod tests {
             url_input: String::new(),
             pending: None,
             installing_plugin: None,
+            cancelled_installs: HashSet::new(),
         }
     }
 
