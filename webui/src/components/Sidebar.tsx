@@ -3,6 +3,7 @@
 // collapses to an icon rail).
 
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { listSessions, SessionMetaWithProject } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
@@ -372,10 +373,15 @@ export function Sidebar({
     onOpenSettings(section);
   }
 
-  // The settings popup (3 entries). Fixed-positioned so the sidebar overflow
-  // can't clip it; rendered inside both the rail and expanded layouts.
+  // The settings popup (3 entries). Fixed-positioned, but portaled to <body>:
+  // on mobile the sidebar becomes a `transform`ed off-canvas drawer, which
+  // would make it the containing block for `position: fixed` descendants and
+  // clip them with its `overflow: hidden`. Portaling escapes the drawer so the
+  // menu is positioned against the viewport (its getBoundingClientRect coords)
+  // and never clipped. Rendered inside both the rail and expanded layouts.
   const renderSettingsMenu = () =>
-    settingsMenuOpen && settingsMenuPos ? (
+    settingsMenuOpen && settingsMenuPos
+      ? createPortal(
       <div
         class="item-menu settings-menu"
         ref={settingsMenuRef}
@@ -440,8 +446,10 @@ export function Sidebar({
           <span>{t('settings.menuModel')}</span>
         </button>
         {/* 远程访问入口已移到顶栏右上角（见 app.tsx header-remote-btn）。 */}
-      </div>
-    ) : null;
+      </div>,
+          document.body,
+        )
+      : null;
 
   // 先按当前工作目录收窄，再按搜索词过滤。
   const normDir = (p: string) => (p || '').replace(/\/+$/, '');
@@ -653,8 +661,9 @@ export function Sidebar({
       </div>
       {renderSettingsMenu()}
 
-      {/* Per-session actions menu (fixed, so the scroll container can't clip it). */}
-      {menuSession && menuPos && (
+      {/* Per-session actions menu. Fixed + portaled to <body> so neither the
+          scroll container nor the mobile drawer's transform/overflow clips it. */}
+      {menuSession && menuPos && createPortal(
         <div
           class="item-menu"
           ref={itemMenuRef}
@@ -684,22 +693,25 @@ export function Sidebar({
             <TrashIcon />
             <span>{t('sidebar.delete')}</span>
           </button>
-        </div>
+        </div>,
+        document.body,
       )}
 
-      {renameTarget && (
+      {renameTarget && createPortal(
         <RenameDialog
           session={renameTarget}
           onClose={() => setRenameTarget(null)}
           onDone={(name) => handleRenamed(renameTarget.id, name)}
-        />
+        />,
+        document.body,
       )}
-      {deleteTarget && (
+      {deleteTarget && createPortal(
         <DeleteDialog
           session={deleteTarget}
           onClose={() => setDeleteTarget(null)}
           onDone={() => handleDeleted(deleteTarget.id)}
-        />
+        />,
+        document.body,
       )}
     </aside>
   );
