@@ -500,6 +500,9 @@ pub async fn run_upgrade(
     force: bool,
     tx: mpsc::UnboundedSender<UpgradeEvent>,
 ) -> Result<UpgradeSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
     let current_version = current_version.as_str();
     let target = detect_target().ok_or_else(|| {
         anyhow!(
@@ -809,6 +812,9 @@ pub async fn prepare_deferred_upgrade(
 /// could have touched the file between sessions. Verification is cheap
 /// compared to installing a corrupted binary.
 pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
+    if is_package_managed() {
+        return Ok(None);
+    }
     let mut pending = match read_pending() {
         Ok(Some(p)) => p,
         Ok(None) => return Ok(None),
@@ -965,6 +971,9 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
 /// row returns you to the original state — intentional, so users can
 /// toggle between last-two versions without redownloading.
 pub fn run_rollback() -> Result<RollbackSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
     let exe = current_exe_path()?;
     let backup = backup_path(&exe);
     if !backup.exists() {
@@ -1584,5 +1593,28 @@ mod tests {
     #[test]
     fn is_package_managed_tracks_feature() {
         assert_eq!(super::is_package_managed(), cfg!(feature = "distro-pm"));
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[tokio::test]
+    async fn run_upgrade_blocked_when_package_managed() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = super::run_upgrade("v1.0.0".to_string(), true, tx)
+            .await
+            .expect_err("package-managed build must refuse self-upgrade");
+        assert!(err.to_string().contains(super::PACKAGE_MANAGED));
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[test]
+    fn run_rollback_blocked_when_package_managed() {
+        let err = super::run_rollback().expect_err("package-managed build must refuse rollback");
+        assert!(err.to_string().contains(super::PACKAGE_MANAGED));
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[test]
+    fn apply_pending_upgrade_noop_when_package_managed() {
+        assert!(super::apply_pending_upgrade().unwrap().is_none());
     }
 }
