@@ -1,9 +1,10 @@
 # AtomCode installer for Windows — PowerShell
 #
-#   irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.ps1 | iex
+#   irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/install.ps1 | iex
 #
 # Env overrides:
-#   $env:ATOMCODE_VERSION   release tag to install (default: v4.24.0)
+#   $env:ATOMCODE_VERSION   release tag to install (default: latest release,
+#                             auto-detected from the AtomGit API)
 #   $env:ATOMCODE_PREFIX    install dir (default: %LOCALAPPDATA%\AtomCode)
 # IMPORTANT: when changing install paths, registry edits, or filenames here,
 # also update scripts/uninstall.ps1 AND
@@ -21,8 +22,10 @@ if (-not $Invite) {
   $Invite = $env:ATOMCODE_INVITE
 }
 
-$Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.24.0" }
+# Fallback version used only when $env:ATOMCODE_VERSION is unset and the API lookup fails.
+$DefaultVersion = "v4.24.0"
 $RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
+$RepoLatestApi = "https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
 
 # --- detect arch ---
 # Prefer PROCESSOR_ARCHITEW6432 (set only when a 32-bit process runs on a 64-bit
@@ -41,6 +44,24 @@ switch ($RealArch) {
         Write-Host "Unsupported architecture: $RealArch (supported: AMD64, ARM64)" -ForegroundColor Red
         exit 1
     }
+}
+
+# --- resolve version ---
+# Honor $env:ATOMCODE_VERSION if set; otherwise auto-detect the latest release
+# tag from the API, falling back to $DefaultVersion if the lookup yields nothing.
+if ($env:ATOMCODE_VERSION) {
+    $Version = $env:ATOMCODE_VERSION
+} else {
+    Write-Host "==> Detecting latest version"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
+        $Latest = Invoke-RestMethod -Uri $RepoLatestApi -UseBasicParsing -TimeoutSec 10
+        $Version = $Latest.tag_name
+    } catch {
+        $Version = $null
+    }
+    if (-not $Version) { $Version = $DefaultVersion }
 }
 
 $BinName = "atomcode-$Version-windows-$ArchTag.exe"

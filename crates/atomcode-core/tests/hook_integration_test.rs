@@ -23,7 +23,7 @@ use atomcode_core::stream::StreamEvent;
 use atomcode_core::tool::{
     ApprovalRequirement, Tool, ToolCall, ToolContext, ToolDef, ToolRegistry, ToolResult,
 };
-use atomcode_core::turn::event::{TurnEvent, TurnResult};
+use atomcode_core::turn::event::TurnResult;
 use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_core::hook::{Hook, HookCtx, HookEngine, HookResult, PreToolExecutionHook, PostToolExecutionHook, ToolResultContext};
@@ -208,12 +208,12 @@ fn test_context() -> ToolContext {
     ToolContext::new(PathBuf::from("/tmp/test"))
 }
 
-fn create_test_runner(
+async fn create_test_runner(
     provider: MockProvider,
     hook_engine: std::sync::Arc<atomcode_core::hook::HookEngine>,
 ) -> TurnRunner {
-    let mut registry = ToolRegistry::new();
-    registry.register(Box::new(MockEchoTool));
+    let registry = ToolRegistry::new();
+    registry.register(Box::new(MockEchoTool)).await;
     TurnRunner {
         provider: std::sync::Arc::new(provider),
         tools: std::sync::Arc::new(registry),
@@ -254,7 +254,7 @@ async fn test_hooks_fire_during_turn() {
         "echo",
         r#"{"message": "hello hooks"}"#,
     );
-    let mut runner = create_test_runner(provider, std::sync::Arc::new(hooks));
+    let mut runner = create_test_runner(provider, std::sync::Arc::new(hooks)).await;
     
     let mut conv = Conversation::new();
     conv.add_user_message("Test the echo tool");

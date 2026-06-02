@@ -37,6 +37,7 @@ pub fn log_llm_request(
     model: &str,
     context_window: usize,
     step: usize,
+    session_id: &str,
     enabled: bool,
 ) -> Option<PathBuf> {
     if !enabled {
@@ -65,6 +66,7 @@ pub fn log_llm_request(
 
     let log = serde_json::json!({
         "timestamp": ts,
+        "session_id": session_id,
         "model": model,
         "context_window": context_window,
         "step": step,
@@ -253,7 +255,8 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        let pending = log_llm_request(tmp.path(), &messages, &tools, "test-model", 16000, 3, true);
+        let pending =
+            log_llm_request(tmp.path(), &messages, &tools, "test-model", 16000, 3, "sess-test", true);
         assert!(pending.is_some(), "request log should return its path");
         log_llm_response(
             tmp.path(),
@@ -287,6 +290,7 @@ mod tests {
         let content = std::fs::read_to_string(&json_files[0]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["model"], "test-model");
+        assert_eq!(v["session_id"], "sess-test");
         assert_eq!(v["request"]["message_count"], 2);
         assert_eq!(v["request"]["tool_count"], 1);
         assert_eq!(v["response"]["duration_ms"], 123);
@@ -348,8 +352,10 @@ mod tests {
 
         // Interleaved: A-req, B-req, A-resp, B-resp — the exact pattern
         // that would corrupt results under the old static-Mutex design.
-        let pending_a = log_llm_request(tmp_a.path(), &msgs_a, &[], "model-a", 16000, 0, true);
-        let pending_b = log_llm_request(tmp_b.path(), &msgs_b, &[], "model-b", 16000, 0, true);
+        let pending_a =
+            log_llm_request(tmp_a.path(), &msgs_a, &[], "model-a", 16000, 0, "sess-a", true);
+        let pending_b =
+            log_llm_request(tmp_b.path(), &msgs_b, &[], "model-b", 16000, 0, "sess-b", true);
         log_llm_response(
             tmp_a.path(),
             pending_a,

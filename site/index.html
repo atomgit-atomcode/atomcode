@@ -1302,16 +1302,19 @@ function applyI18n(){
 
 /* ========== data ========== */
 const RELEASE_BASE='https://atomgit.com/atomgit_atomcode/atomcode/releases/download/'+VERSION;
+// Install scripts are served version-free from the repo (raw host); the scripts
+// auto-detect the latest release themselves, so no version is pinned in the URL.
+const SCRIPT_BASE='https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts';
 const OS_CMDS={
-  mac:`curl -fsSL ${RELEASE_BASE}/install.sh | sh`,
-  linux:`curl -fsSL ${RELEASE_BASE}/install.sh | sh`,
-  win:`irm ${RELEASE_BASE}/install.ps1 | iex`,
-  harmony:`curl -fsSL ${RELEASE_BASE}/install.sh | sh`,
+  mac:`curl -fsSL ${SCRIPT_BASE}/install.sh | sh`,
+  linux:`curl -fsSL ${SCRIPT_BASE}/install.sh | sh`,
+  win:`irm ${SCRIPT_BASE}/install.ps1 | iex`,
+  harmony:`curl -fsSL ${SCRIPT_BASE}/install.sh | sh`,
 };
 function osHint(os){return t('os.'+os);}
 const METHOD_CMDS={
-  oneclick:{zh:`# macOS / Linux / HarmonyOS PC\ncurl -fsSL ${RELEASE_BASE}/install.sh | sh\n\n# Windows · PowerShell\nirm ${RELEASE_BASE}/install.ps1 | iex`,
-            en:`# macOS / Linux / HarmonyOS PC\ncurl -fsSL ${RELEASE_BASE}/install.sh | sh\n\n# Windows · PowerShell\nirm ${RELEASE_BASE}/install.ps1 | iex`},
+  oneclick:{zh:`# macOS / Linux / HarmonyOS PC\ncurl -fsSL ${SCRIPT_BASE}/install.sh | sh\n\n# Windows · PowerShell\nirm ${SCRIPT_BASE}/install.ps1 | iex`,
+            en:`# macOS / Linux / HarmonyOS PC\ncurl -fsSL ${SCRIPT_BASE}/install.sh | sh\n\n# Windows · PowerShell\nirm ${SCRIPT_BASE}/install.ps1 | iex`},
   source:{zh:`# 需要 Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # 验证安装`,
           en:`# Requires Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # verify install`},
   binary:{zh:`# 从 Releases 页面下载\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# 或直接 curl 取对应平台\ncurl -L -o atomcode \\\n  ${RELEASE_BASE}/atomcode-${VERSION}-darwin-arm64\nchmod +x atomcode && mv atomcode /usr/local/bin/`,

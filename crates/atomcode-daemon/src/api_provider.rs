@@ -39,6 +39,8 @@ pub(crate) struct CreateProviderRequest {
 /// PATCH /providers/:name - Partially update a provider.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PatchProviderRequest {
+    /// New name to rename this provider to. Omitted = keep current name.
+    pub name: Option<String>,
     #[serde(rename = "type")]
     pub provider_type: Option<String>,
     pub model: Option<String>,
@@ -260,13 +262,39 @@ pub(crate) async fn patch_provider(
         existing.skip_tls_verify = stv;
     }
 
+    // Rename: name is the map key, so re-key the entry and fix up
+    // default_provider if it pointed at the old name. `existing`'s borrow has
+    // ended above, so we can mutate the map directly.
+    let final_name = match req.name {
+        Some(new_name) if new_name.trim() != name => {
+            let new_name = new_name.trim().to_string();
+            if let Err(e) = validate_provider_name(&new_name) {
+                return json_error(StatusCode::BAD_REQUEST, e).into_response();
+            }
+            if config.providers.contains_key(&new_name) {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    format!("Provider '{}' already exists", new_name),
+                )
+                .into_response();
+            }
+            let provider = config.providers.remove(&name).unwrap();
+            config.providers.insert(new_name.clone(), provider);
+            if config.default_provider == name {
+                config.default_provider = new_name.clone();
+            }
+            new_name
+        }
+        _ => name.clone(),
+    };
+
     let default_provider = config.default_provider.clone();
     if let Err(e) = save_config(&config) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    let p = config.providers.get(&name).unwrap();
-    Json(provider_info(&name, p, &default_provider)).into_response()
+    let p = config.providers.get(&final_name).unwrap();
+    Json(provider_info(&final_name, p, &default_provider)).into_response()
 }
 
 /// DELETE /providers/:name - Delete a provider.

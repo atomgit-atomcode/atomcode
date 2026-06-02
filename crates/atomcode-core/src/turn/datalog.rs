@@ -52,6 +52,11 @@ pub struct DatalogWriter {
     file_path: Option<PathBuf>,
     /// Optional suffix inserted into the markdown filename before `.md`.
     filename_tag: Option<String>,
+    /// Current conversation's session id — the same id that rides the
+    /// `x-atomcode-session-id` header and telemetry. Recorded in each turn's
+    /// header so logs are attributable to a session and track /session and
+    /// /resume switches. Empty until `set_session_id` is called.
+    session_id: Option<String>,
 }
 
 impl DatalogWriter {
@@ -83,7 +88,19 @@ impl DatalogWriter {
             step: 0,
             file_path: None,
             filename_tag: filename_tag.filter(|s| !s.is_empty()),
+            session_id: None,
         }
+    }
+
+    /// Bind the conversation's session id so each turn's log records it.
+    /// Called from the agent's SetSessionId handler, keeping the datalog,
+    /// the request header, and telemetry on the same id.
+    pub fn set_session_id(&mut self, session_id: &str) {
+        self.session_id = if session_id.is_empty() {
+            None
+        } else {
+            Some(session_id.to_string())
+        };
     }
 
     /// Update the working directory (e.g. after `/cd`). Absolute / `~/`
@@ -177,9 +194,10 @@ impl DatalogWriter {
         let _ = writeln!(&mut self.buf, "# Turn {} [build:{}]", timestamp, build_id);
         let _ = writeln!(
             &mut self.buf,
-            "**env:** model={}, ctx_window={}, cwd={}",
+            "**env:** model={}, ctx_window={}, session={}, cwd={}",
             model_name,
             context_window,
+            self.session_id.as_deref().unwrap_or("-"),
             self.base_dir.display()
         );
         let _ = writeln!(&mut self.buf);
@@ -297,6 +315,7 @@ impl DatalogWriter {
             let total_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
             let dump = serde_json::json!({
                 "step": self.step,
+                "session_id": self.session_id.as_deref().unwrap_or(""),
                 "model": model,
                 "context_window": context_window,
                 "message_count": messages.len(),

@@ -69,6 +69,13 @@ pub enum AgentCommand {
     ClearConversation,
     /// Set messages from a resumed session.
     SetMessages(Vec<crate::conversation::message::Message>),
+    /// Bind the per-conversation session id (the session file's id) so the
+    /// `x-atomcode-session-id` header tracks the persistent conversation
+    /// identity. Sent by the UI whenever the current session is established
+    /// or switched (startup, /session, /resume, -c continue), so resuming a
+    /// saved session reuses its original id for gateway prefix-cache
+    /// affinity.
+    SetSessionId(String),
     /// Set plan mode (read-only exploration, no edits).
     SetPlanMode(bool),
     /// Manually compact conversation history. `prompt` is accepted for
@@ -383,6 +390,10 @@ pub enum AgentEvent {
         /// `handle_send_message` fills this.
         system_prompt: String,
     },
+    /// 另一视图（webui/其他 TUI）发起的用户消息回显，用于同步模式下本端渲染用户气泡。
+    UserEcho(String),
+    /// 同步会话的对端正在进行 turn（true=进行中），用于禁用/恢复本端输入。
+    PeerBusy(bool),
 }
 
 /// The current phase of the agent (for UI display).
@@ -889,7 +900,7 @@ impl AgentLoop {
         let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::from(provider);
 
         // Build the datalog writer before `config` is moved into the agent below.
-        let datalog = match runtime_label.as_deref() {
+        let mut datalog = match runtime_label.as_deref() {
             Some(label) => crate::turn::datalog::DatalogWriter::new_with_filename_tag(
                 &working_dir,
                 &config.datalog,
@@ -952,6 +963,23 @@ impl AgentLoop {
         // before the first turn's system prompt is assembled.
         let env_snapshot = crate::ctx::EnvSnapshot::capture(&working_dir);
 
+        // Bootstrap session id. Reuses the single id generator
+        // (`SessionId::new`, the same one Session/telemetry use) rather than
+        // minting a second raw uuid here. This is only the value used before
+        // the UI sends `SetSessionId` with the actual session-file id (the
+        // agent is constructed before the Session exists); from then on every
+        // consumer — header, datalog, telemetry, hooks — shares that id.
+        let session_id = crate::session::SessionId::new().as_str().to_string();
+        turn_runner.provider.set_session_id(&session_id);
+        // Bootstrap the datalog + telemetry with the same id (UI's
+        // SetSessionId updates all three once the real session is
+        // established). This is what keeps header / datalog / event-reporting
+        // on ONE id even in headless, where there's no UI bind.
+        datalog.set_session_id(&session_id);
+        if let Ok(uuid) = uuid::Uuid::parse_str(&session_id) {
+            turn_runner.context.telemetry.set_session_id(uuid);
+        }
+
         let agent = Self {
             conversation,
             tool_registry: shared_tools.clone(),
@@ -964,7 +992,7 @@ impl AgentLoop {
             turn_tokens: 0,
             total_tokens: 0,
             turn_start: None,
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id,
             tool_call_count: 0,
             turn_count: 0,
             max_turns: None,
@@ -1213,6 +1241,19 @@ impl AgentLoop {
                     // Clear the conversation history in the agent loop.
                     self.conversation = Conversation::new();
                     self.datalog.clear();
+                    // session_id is NOT reset here: /session pairs this with
+                    // a SetSessionId carrying the new session file's id, and
+                    // that's the single source of truth for the header.
+                }
+                AgentCommand::SetSessionId(id) => {
+                    self.session_id = id;
+                    self.turn_runner
+                        .provider
+                        .set_session_id(&self.session_id);
+                    self.datalog.set_session_id(&self.session_id);
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&self.session_id) {
+                        self.turn_runner.context.telemetry.set_session_id(uuid);
+                    }
                 }
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.
@@ -1222,6 +1263,12 @@ impl AgentLoop {
                         crate::conversation::turn::TurnTracker::rebuild(&messages);
                     self.conversation.messages = messages;
                     self.conversation.turn_tracker = turn_tracker;
+                    // NOTE: deliberately do NOT regenerate session_id here.
+                    // SetMessages also fires on `-c`/`--continue` auto-restore
+                    // and `/resume` of the current session — those CONTINUE an
+                    // existing conversation, so a new id would fragment one
+                    // logical session into two on the gateway. Only an explicit
+                    // fresh start (ClearConversation: /session, /clear) resets.
                 }
                 AgentCommand::SetPlanMode(enabled) => {
                     self.plan_mode = enabled;

@@ -79,6 +79,21 @@ pub trait LlmProvider: Send + Sync {
     fn reasoning_history_policy(&self) -> ReasoningPolicy {
         ReasoningPolicy::Exclude
     }
+
+    /// Attach a stable per-session id so the provider can tag every request
+    /// of this conversation with it (e.g. the `x-atomcode-session-id`
+    /// header). A forwarding gateway (LiteLLM) can then pin a conversation
+    /// to one upstream account/replica, keeping that backend's prefix cache
+    /// warm across the conversation's requests. Default: no-op (providers
+    /// that don't sit behind such a gateway ignore it).
+    fn set_session_id(&self, _session_id: &str) {}
+
+    /// The currently-attached session id, or empty if none. Lets callers
+    /// (e.g. the datalog writer) tag log entries with the same session id
+    /// that rides the request header. Default: empty.
+    fn session_id(&self) -> String {
+        String::new()
+    }
 }
 
 /// Shared HTTP client with common timeouts and User-Agent.

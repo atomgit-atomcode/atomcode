@@ -121,6 +121,9 @@ pub enum Msg<'a> {
     /// have to type a message to discover the dead-end.
     StatusOfficialBuildRequired,
     StatusUpgradeHint { version: &'a str },
+    /// Right-aligned status-row hint, HarmonyBrew variant: a newer version
+    /// exists, upgrade via the package manager rather than `/upgrade`.
+    StatusUpgradeHintPm { version: &'a str },
     StatusModelNotConfigured,
     /// macOS / Linux variant: "Image in clipboard · ctrl+v to paste".
     /// Ctrl+V is intercepted by Windows Terminal / conhost before
@@ -267,6 +270,12 @@ pub enum Msg<'a> {
     IdleHintCodingplanSuffix,
     /// Complete plain-text version: "/codingplan  to claim a free token quota"
     IdleHintCodingplanFull,
+    /// "/webui" command label
+    IdleHintWebui,
+    /// "open a synced session in the browser" (text after /webui)
+    IdleHintWebuiSuffix,
+    /// Complete plain-text version: "/webui  open a synced session in the browser"
+    IdleHintWebuiFull,
 
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,
@@ -358,6 +367,9 @@ pub enum Msg<'a> {
     DiffFailed { error: &'a str },
 
     // ── /upgrade ──
+    /// Shown when `/upgrade` (or rollback) is invoked in a HarmonyBrew-managed
+    /// build: self-update is disabled, point the user at `brew upgrade`.
+    UpgradePackageManaged,
     UpgradeUnknownArg { arg: &'a str },
 
     // ── /skills ──
@@ -493,6 +505,9 @@ pub enum Msg<'a> {
     PluginUninstallFailed { error: &'a str },
     PluginListFailed { error: &'a str },
     PluginReloadDone { skills: usize, warnings: usize },
+    /// Git not found on the system — marketplace auto-install and auto-update
+    /// are disabled. Shown as a friendly hint (not an error) at startup.
+    PluginGitNotFound,
     /// Marketplace `add` completion toast. Emitted by `handle_plugin_job_event`
     /// for both manual `/plugin marketplace add` and the detached
     /// startup-bootstrap auto-install. `count` is the number of plugins the
@@ -516,6 +531,7 @@ pub enum Msg<'a> {
     SetupAutoReloaded { skills: usize, warnings: usize },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
+    CmdDescWebui,
     CmdDescSetup,
     CmdDescResume,
     CmdDescRename,

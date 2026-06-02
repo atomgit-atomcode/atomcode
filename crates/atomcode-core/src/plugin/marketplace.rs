@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::manifest::{load_marketplace_manifest, MarketplaceManifest, PluginSource};
@@ -8,6 +8,94 @@ use super::state::{load_marketplaces_file, save_marketplaces_file, MarketplaceEn
 use super::url::{infer_marketplace_name_from_url, validate_git_url};
 
 /// Sanitize a name into a path-safe segment (CC convention).
+/// Locate the `git` executable on the system.
+///
+/// Tries the default PATH resolution first, then falls back to a set of
+/// well-known installation paths that may not appear in the PATH of a
+/// GUI-launched process (macOS apps launched from Dock/Launchpad do not
+/// inherit the user's shell profile, so Homebrew/Xcode git is often
+/// invisible to them).
+///
+/// Returns the resolved path on success, or an error with a friendly
+/// message explaining that git is required.
+pub fn find_git() -> Result<PathBuf> {
+    // Test hook: set ATOMCODE_GIT_PATH to a non-existent path to simulate
+    // git being unavailable (useful for QA without needing to uninstall git).
+    //   ATOMCODE_GIT_PATH=/dev/null atomcode
+    if let Ok(custom) = std::env::var("ATOMCODE_GIT_PATH") {
+        let p = PathBuf::from(&custom);
+        if p.exists() {
+            return Ok(p);
+        }
+        bail!(
+            "git is not installed or not on PATH. \
+             AtomCode requires git to manage plugin marketplaces. \
+             Please install git (e.g. `xcode-select --install` on macOS, \
+             `sudo apt install git` on Ubuntu) and restart AtomCode."
+        );
+    }
+
+    // 1. Default PATH resolution — works on most Linux systems and in
+    //    terminal-launched sessions where git is already on PATH.
+    if let Ok(path) = which_git("git") {
+        return Ok(path);
+    }
+
+    // 2. Fallback: probe common installation directories that are
+    //    frequently missing from the PATH of GUI-launched processes.
+    let candidates: &[&str] = &[
+        "/usr/bin/git",               // macOS system (Xcode CLI tools)
+        "/usr/local/bin/git",          // macOS Intel Homebrew
+        "/opt/homebrew/bin/git",       // macOS Apple Silicon Homebrew
+        "/opt/local/bin/git",          // MacPorts
+        "/snap/bin/git",               // Ubuntu snap
+        "/app/bin/git",                // NixOS / some containers
+    ];
+    for candidate in candidates {
+        let p = PathBuf::from(candidate);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    bail!(
+        "git is not installed or not on PATH. \
+         AtomCode requires git to manage plugin marketplaces. \
+         Please install git (e.g. `xcode-select --install` on macOS, \
+         `sudo apt install git` on Ubuntu) and restart AtomCode."
+    )
+}
+
+/// Simple `which`-like resolution for an executable name.
+fn which_git(name: &str) -> Result<PathBuf> {
+    let out = Command::new(name)
+        .arg("--version")
+        .output()
+        .context("spawn git")?;
+    if !out.status.success() {
+        bail!("`{} --version` exited with error", name);
+    }
+    // The command ran, so the executable is reachable.  On Unix we can
+    // ask `which` for the absolute path; on failure we fall back to the
+    // bare name (which still works for Command::new).
+    #[cfg(unix)]
+    {
+        let which_out = Command::new("which")
+            .arg(name)
+            .output()
+            .ok();
+        if let Some(w) = which_out {
+            if w.status.success() {
+                let path = String::from_utf8_lossy(&w.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Ok(PathBuf::from(path));
+                }
+            }
+        }
+    }
+    Ok(PathBuf::from(name))
+}
+
 pub fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
@@ -143,7 +231,8 @@ pub(super) fn resolve_marketplace_identity(
 }
 
 pub(super) fn git_clone(url: &str, target: &Path) -> Result<()> {
-    let out = Command::new("git")
+    let git = find_git()?;
+    let out = Command::new(&git)
         .args(["clone", "--depth", "1", url])
         .arg(target)
         .output()
@@ -155,7 +244,8 @@ pub(super) fn git_clone(url: &str, target: &Path) -> Result<()> {
 }
 
 fn git_rev_parse(repo: &Path) -> Result<String> {
-    let out = Command::new("git")
+    let git = find_git()?;
+    let out = Command::new(&git)
         .args(["rev-parse", "HEAD"])
         .current_dir(repo)
         .output()
@@ -208,13 +298,23 @@ pub fn update_marketplace(name: &str) -> Result<MarketplaceInfo> {
         .ok_or_else(|| anyhow!("marketplace `{}` not found", name))?
         .clone();
     let target = paths::marketplaces_root().unwrap().join(name);
-    let out = Command::new("git")
-        .args(["pull", "--ff-only"])
-        .current_dir(&target)
-        .output()
-        .context("spawn git pull")?;
-    if !out.status.success() {
-        bail!("git pull failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // If the clone directory is missing (e.g. deleted manually or a prior
+    // clone failed), re-clone from the registered source URL instead of
+    // failing with "No such file or directory" on `current_dir`.
+    if !target.exists() {
+        git_clone(&entry.source, &target)
+            .with_context(|| format!("re-clone marketplace `{}`", name))?;
+    } else {
+        let git = find_git()?;
+        let out = Command::new(&git)
+            .args(["pull", "--ff-only"])
+            .current_dir(&target)
+            .output()
+            .context("spawn git pull")?;
+        if !out.status.success() {
+            bail!("git pull failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
     }
     let commit = git_rev_parse(&target)?;
     let manifest = load_marketplace_manifest(&target)?;

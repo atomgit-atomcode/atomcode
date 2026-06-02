@@ -545,6 +545,15 @@ enum Commands {
         #[arg(long)]
         client: Option<String>,
     },
+    /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
+    Webui {
+        /// 端口（默认 13456）
+        #[arg(long, default_value = "13456")]
+        port: u16,
+        /// 绑定地址（默认 127.0.0.1；用 0.0.0.0 暴露到局域网/外网，注意仅 token 保护、无 TLS）
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
     /// Telemetry controls
     Telemetry {
         #[command(subcommand)]
@@ -991,6 +1000,14 @@ async fn run() -> Result<i32> {
                     }
                 }
             }
+            Commands::Webui { port, host } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let msg = atomcode_daemon::ensure_server_and_open(&host, port, false).await;
+                eprintln!("{msg}");
+                // server 是后台 task；保持进程存活直到用户 Ctrl+C
+                let _ = tokio::signal::ctrl_c().await;
+                return Ok(0);
+            }
             Commands::Telemetry { action } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 let config_file_path = Config::default_path();
@@ -1406,12 +1423,22 @@ async fn run() -> Result<i32> {
     } else {
         SessionMode::Tui
     };
-    // Bind telemetry session_id to the AtomCode session's UUID (if a session is available).
-    // This means events from this process run are correlated to the actual session file.
-    // If no session exists yet, session_id stays as launch_id (the default).
+    // Bind telemetry to the continued session's id (if any). A fresh run needs
+    // nothing here: the agent bootstraps telemetry + header + datalog from its
+    // own session id. The TUI manages its own binding via
+    // `bind_telemetry_to_session`.
     if let Some(ref s) = session_to_continue {
         if let Ok(uuid) = uuid::Uuid::parse_str(s.id.as_str()) {
             telemetry.set_session_id(uuid);
+        }
+        // Headless `-c`: the TUI rebinds itself, so only push to the agent
+        // here, so the continued session's id reaches the header + datalog.
+        if effective_prompt.is_some() {
+            agent_handle
+                .client
+                .cmd_tx
+                .send(AgentCommand::SetSessionId(s.id.as_str().to_string()))
+                .ok();
         }
     }
     let scope_ctx = CurrentContext {
@@ -1485,7 +1512,14 @@ async fn run() -> Result<i32> {
             // the user hasn't opted out via `auto_update = false` AND we're not
             // running as `atomcode.bak` (backup should stay pinned; see the
             // `is_running_as_backup` guard up top).
-            if config.auto_update && !is_running_as_backup() && !cli.dev {
+            // In distro-pm (HarmonyBrew) builds the package manager owns
+            // upgrades, so skip spawning the detached prep process entirely —
+            // `prepare_deferred_upgrade` would no-op anyway.
+            if config.auto_update
+                && !is_running_as_backup()
+                && !cli.dev
+                && !atomcode_core::self_update::is_package_managed()
+            {
                 spawn_detached_upgrade_prep();
             }
 
@@ -1949,6 +1983,9 @@ async fn run_headless(
             AgentEvent::MessagesSync { .. } => {
                 // Only used by TUI for /bg session persistence; ignore in CLI.
             }
+            AgentEvent::UserEcho(_) | AgentEvent::PeerBusy(_) => {
+                // Live-sync only — not applicable in headless CLI.
+            }
         }
     }
 
@@ -2054,6 +2091,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Daemon { .. } => {
             unreachable!("Daemon is handled inline in run() before handle_command")
+        }
+        Commands::Webui { .. } => {
+            unreachable!("Webui is handled inline in run() before handle_command")
         }
         Commands::Setup { .. } => {
             unreachable!("Setup is handled inline in run() before handle_command")
@@ -2439,7 +2479,16 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
             // (not a Failed event) — these arms exist only to keep the
             // match exhaustive if the TUI path ever reuses this code.
             UpgradeEvent::Failed(msg) => {
-                eprintln!("\nupgrade failed: {}", msg);
+                if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                    println!(
+                        "\n{}",
+                        atomcode_core::i18n::t(
+                            atomcode_core::i18n::Msg::UpgradePackageManaged
+                        )
+                    );
+                } else {
+                    eprintln!("\nupgrade failed: {}", msg);
+                }
             }
             UpgradeEvent::RolledBack { exe, backup } => {
                 println!(
@@ -2455,7 +2504,13 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
         Ok(Ok(_summary)) => Ok(()),
         Ok(Err(e)) => {
             let msg = format!("{:#}", e);
-            if msg.contains(ALREADY_LATEST) {
+            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                println!(
+                    "{}",
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                );
+                Ok(())
+            } else if msg.contains(ALREADY_LATEST) {
                 // Friendly path — not an error, just "nothing to do".
                 println!("  {}", msg.replace(&format!("{}: ", ALREADY_LATEST), ""));
                 Ok(())
@@ -2468,7 +2523,20 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
 }
 
 fn run_rollback_cli() -> Result<()> {
-    let summary = atomcode_core::self_update::run_rollback()?;
+    let summary = match atomcode_core::self_update::run_rollback() {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                println!(
+                    "{}",
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                );
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
     println!(
         "✓ Rolled back. Previous binary is now at {}, other version saved at {}",
         summary.exe.display(),

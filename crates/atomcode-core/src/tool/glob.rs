@@ -351,7 +351,7 @@ fn derive_name_pattern(pattern: &str) -> String {
 mod tests {
     use super::*;
     use crate::tool::ToolContext;
-    use std::path::{Path, PathBuf};
+    
     use tempfile::TempDir;
 
     /// P0 #4: when a glob's search dir doesn't exist, workspace-walk for dirs

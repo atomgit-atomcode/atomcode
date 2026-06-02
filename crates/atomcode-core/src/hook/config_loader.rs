@@ -336,6 +336,7 @@ script = "report.sh"
         }
     }
 
+    #[allow(dead_code)]
     fn assert_engine_stats(engine: &HookEngine, expected_has: bool) {
         // HookEngine doesn't expose per-slot counts, but we can check has_any()
         assert_eq!(engine.has_any(), expected_has, "has_any mismatch");

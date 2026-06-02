@@ -142,7 +142,7 @@ mod tests {
                         if is_dir && has_skill_md {
                             let content = std::fs::read_to_string(p.join("SKILL.md")).unwrap();
                             eprintln!("        SKILL.md first 100 chars: {:?}", &content.chars().take(100).collect::<String>());
-                            let result = crate::skill::SkillRegistry::new();
+                            let _result = crate::skill::SkillRegistry::new();
                             // Try parsing just this one skill
                             let mut tmp_reg = crate::skill::SkillRegistry::new();
                             let mut warnings = Vec::new();
