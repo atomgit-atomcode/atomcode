@@ -11,11 +11,13 @@ export function Select<T extends string>({
   options,
   onChange,
   class: className,
+  disabled,
 }: {
   value: T;
   options: SelectOption<T>[];
   onChange: (v: T) => void;
   class?: string;
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -38,7 +40,8 @@ export function Select<T extends string>({
       <button
         type="button"
         class={'custom-select-trigger' + (open ? ' open' : '')}
-        onClick={() => setOpen(!open)}
+        disabled={disabled}
+        onClick={() => !disabled && setOpen(!open)}
       >
         <span class="custom-select-value">{selected?.label ?? value}</span>
         <svg class="custom-select-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none"

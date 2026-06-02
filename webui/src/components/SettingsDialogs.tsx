@@ -20,6 +20,17 @@ import { Lang } from '../i18n';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Select } from './Select';
 
+// AtomGit 托管 provider 的 LLM 网关地址；其上下文窗口由平台固定，前端禁止修改。
+const ATOMGIT_BASE_URL = 'https://llm-api.atomgit.com/v1';
+
+// 上下文窗口预设（数值与配置一致，显示时按 /1000 换算为「k tokens」）。
+const CONTEXT_WINDOW_PRESETS = [32000, 64000, 128000, 256000, 512000, 1000000];
+
+/** 把 context_window 数值格式化为下拉标签：1000000 → "1M"，其余 → "<n>K"。 */
+function fmtContextWindow(v: number): string {
+  return v >= 1000000 ? `${v / 1000000}M` : `${Math.round(v / 1000)}K`;
+}
+
 /** Shared modal chrome for the settings dialogs. */
 function SettingsModal({
   title,
@@ -211,7 +222,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                         <span>{(p.context_window / 1000).toFixed(0)}k tokens</span>
                       </div>
                     )}
-                    {p.base_url !== 'https://llm-api.atomgit.com/v1' && (
+                    {p.base_url !== ATOMGIT_BASE_URL && (
                       <div>
                         <span class="pk">{t('settings.apiKey')}: </span>
                         <span class={p.has_api_key ? 'ok' : 'nok'}>
@@ -291,9 +302,17 @@ function ProviderFormDialog({
   const [model, setModel] = useState(editing?.model ?? '');
   const [baseUrl, setBaseUrl] = useState(editing?.base_url ?? '');
   const [apiKey, setApiKey] = useState('');
+  const [contextWindow, setContextWindow] = useState<number>(editing?.context_window ?? 128000);
   const [setDefault, setSetDefault] = useState(editing?.is_default ?? false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // AtomGit 托管 provider 上下文窗口由平台固定，禁止用户改动。
+  const isAtomGit = editing?.base_url === ATOMGIT_BASE_URL;
+  // 当前值若非预设（如旧配置），并入选项首位，避免静默改写。
+  const cwOptions = CONTEXT_WINDOW_PRESETS.includes(contextWindow)
+    ? CONTEXT_WINDOW_PRESETS
+    : [contextWindow, ...CONTEXT_WINDOW_PRESETS];
 
   const handleSave = async () => {
     const newName = nameInput.trim();
@@ -328,6 +347,8 @@ function ProviderFormDialog({
           base_url: baseUrl.trim(),
           // 仅在用户填写了新 key 时才覆盖；留空保留现有。
           ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+          // AtomGit 上下文窗口由平台锁定，不下发该字段。
+          ...(isAtomGit ? {} : { context_window: contextWindow }),
         });
         // PATCH 不处理默认项：若勾选且原本非默认，单独设默认（用新名，改名后旧 key 已不存在）。
         if (setDefault && !editing?.is_default) {
@@ -340,6 +361,7 @@ function ProviderFormDialog({
           model: model.trim(),
           base_url: baseUrl.trim(),
           api_key: apiKey.trim(),
+          context_window: contextWindow,
           set_default: setDefault || undefined,
         });
       }
@@ -402,6 +424,21 @@ function ProviderFormDialog({
               {t('settings.setAsDefault')}
             </label>
           </div>
+        </div>
+        <div class="add-model-field">
+          <label class="add-model-label">{t('settings.contextWindow')}</label>
+          <Select
+            value={String(contextWindow)}
+            disabled={isAtomGit}
+            options={cwOptions.map((v) => ({
+              value: String(v),
+              label: `${fmtContextWindow(v)} tokens`,
+            }))}
+            onChange={(v) => setContextWindow(Number(v))}
+          />
+          {isAtomGit && (
+            <span class="field-hint">{t('settings.contextWindowLocked')}</span>
+          )}
         </div>
         <div class="add-model-field">
           <label class="add-model-label">{t('settings.baseUrl')}</label>

@@ -319,6 +319,7 @@ export interface CreateProviderBody {
   model: string;
   api_key?: string;
   base_url?: string;
+  context_window?: number;
   set_default?: boolean;
 }
 
@@ -345,6 +346,7 @@ export interface UpdateProviderBody {
   // 省略字段=保持不变；传字符串=覆盖。
   api_key?: string;
   base_url?: string;
+  context_window?: number;
 }
 
 /** PATCH /providers/:name —— 部分更新已有 provider（可改名：body.name 传新名）。 */
