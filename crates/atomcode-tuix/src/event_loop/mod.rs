@@ -2843,6 +2843,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // universal `\<Enter>` block above (kbd_hint_set arm), which is
     // one line and terminal-agnostic.
 
+    // Bind the initial session's persistent id onto the agent (and
+    // telemetry) so even a brand-new session uses its session-file id for
+    // the x-atomcode-session-id header — not Agent::new's transient uuid.
+    // This is what makes a later /resume of this session reuse the SAME id.
+    // The -c replay block below rebinds to the continued session if present.
+    if let Ok(uuid) = uuid::Uuid::parse_str(ctx.current_session.id.as_str()) {
+        ctx.telemetry.set_session_id(uuid);
+    }
+    ctx.agent
+        .cmd_tx
+        .send(AgentCommand::SetSessionId(
+            ctx.current_session.id.as_str().to_string(),
+        ))
+        .ok();
+
     // Auto-continue: if the CLI loaded the most recent session for this
     // working dir (via `atomcode -c` / `--continue`), replay its messages
     // into scrollback AND restore the agent's model context so follow-up
@@ -2861,6 +2876,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
                 ctx.telemetry.set_session_id(uuid);
             }
+            // Header session id = this continued session's persistent id, so
+            // `-c` reuses the saved session's id (not a fresh per-process one).
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SetSessionId(session.id.as_str().to_string()))
+                .ok();
             ctx.current_session = session;
             app.state.on_turn_complete();
         }

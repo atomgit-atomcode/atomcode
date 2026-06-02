@@ -227,6 +227,13 @@ impl Modal for SessionPicker {
                         if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
                             ctx.telemetry.set_session_id(uuid);
                         }
+                        // Header session id = the resumed session's persistent
+                        // id, so /resume reuses its original id (gateway can
+                        // route back to the upstream that has its prefix warm).
+                        ctx.agent
+                            .cmd_tx
+                            .send(AgentCommand::SetSessionId(session.id.as_str().to_string()))
+                            .ok();
                         ctx.current_session = session;
                         ctx.bg_manager
                             .set_foreground_session(ctx.current_session.clone());

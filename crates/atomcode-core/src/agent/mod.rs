@@ -69,6 +69,13 @@ pub enum AgentCommand {
     ClearConversation,
     /// Set messages from a resumed session.
     SetMessages(Vec<crate::conversation::message::Message>),
+    /// Bind the per-conversation session id (the session file's id) so the
+    /// `x-atomcode-session-id` header tracks the persistent conversation
+    /// identity. Sent by the UI whenever the current session is established
+    /// or switched (startup, /session, /resume, -c continue), so resuming a
+    /// saved session reuses its original id for gateway prefix-cache
+    /// affinity.
+    SetSessionId(String),
     /// Set plan mode (read-only exploration, no edits).
     SetPlanMode(bool),
     /// Manually compact conversation history. `prompt` is accepted for
@@ -1224,10 +1231,15 @@ impl AgentLoop {
                     // Clear the conversation history in the agent loop.
                     self.conversation = Conversation::new();
                     self.datalog.clear();
-                    // New conversation → new session id (e.g. /session,
-                    // /clear). Keeps the x-atomcode-session-id header aligned
-                    // with the logical conversation, not the process lifetime.
-                    self.reset_session_id();
+                    // session_id is NOT reset here: /session pairs this with
+                    // a SetSessionId carrying the new session file's id, and
+                    // that's the single source of truth for the header.
+                }
+                AgentCommand::SetSessionId(id) => {
+                    self.session_id = id;
+                    self.turn_runner
+                        .provider
+                        .set_session_id(&self.session_id);
                 }
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.
@@ -2698,17 +2710,6 @@ impl AgentLoop {
             .saturating_sub(cold_zone_tokens)
             .saturating_sub(output_reserve)
             .max(window / 4) // defensive floor: tail never below 25% of window
-    }
-
-    /// Regenerate the per-conversation session id and propagate it to the
-    /// provider so the `x-atomcode-session-id` header tracks the logical
-    /// conversation. Called when the conversation is replaced (`/clear`,
-    /// `/session`, resume) — without this the id would persist for the
-    /// whole process and lump distinct conversations under one session on
-    /// the gateway.
-    fn reset_session_id(&mut self) {
-        self.session_id = uuid::Uuid::new_v4().to_string();
-        self.turn_runner.provider.set_session_id(&self.session_id);
     }
 
     async fn maybe_compress_history(&mut self, system_prompt: &str) {

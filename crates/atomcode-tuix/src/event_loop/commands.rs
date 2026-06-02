@@ -51,6 +51,14 @@ fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
     if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
         ctx.telemetry.set_session_id(uuid);
     }
+    // Mirror the session's persistent id onto the agent so the
+    // `x-atomcode-session-id` header tracks the conversation identity —
+    // resuming a saved session reuses its original id for gateway prefix-
+    // cache affinity, instead of minting a fresh per-process uuid.
+    ctx.agent
+        .cmd_tx
+        .send(AgentCommand::SetSessionId(session.id.as_str().to_string()))
+        .ok();
 }
 
 /// Scan session messages for a pending tool approval — an
@@ -564,10 +572,10 @@ pub(super) fn execute_slash_command(
                 atomcode_core::session::Session::default_session(ctx.working_dir.clone());
             ctx.bg_manager
                 .set_foreground_session(ctx.current_session.clone());
-            // Bind telemetry session_id to the new session's UUID.
-            if let Ok(uuid) = uuid::Uuid::parse_str(ctx.current_session.id.as_str()) {
-                ctx.telemetry.set_session_id(uuid);
-            }
+            // Bind telemetry + agent session id to the new session's UUID
+            // (the ClearConversation above intentionally leaves the id alone;
+            // this is the single source of truth).
+            bind_telemetry_to_session(ctx, &ctx.current_session);
             // `reset()` wipes the terminal AND the renderer's cached
             // footer/stream state, so the next Welcome renders against
             // a known (row 1, col 1) anchor. This is what makes
