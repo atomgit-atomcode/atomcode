@@ -3749,7 +3749,6 @@ mod detect_cd_target_tests {
 #[cfg(all(test, not(target_os = "windows")))]
 mod pgroup_child_tests {
     use super::{PgroupChild, SIGKILL};
-    use std::os::unix::process::CommandExt as _;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;

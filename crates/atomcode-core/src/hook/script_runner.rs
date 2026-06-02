@@ -444,6 +444,6 @@ mod tests {
     #[test]
     fn script_hook_impl_hook_trait() {
         fn require_hook<T: Hook>() {}
-        require_hook::<ScriptHook>;
+        require_hook::<ScriptHook>();
     }
 }
