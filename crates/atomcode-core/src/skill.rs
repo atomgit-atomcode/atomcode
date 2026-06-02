@@ -568,7 +568,12 @@ impl SkillRegistry {
     /// Both layouts can coexist: if `dir/SKILL.md` exists it is loaded first,
     /// then any `dir/*/SKILL.md` subdirectory skills are loaded after (and win
     /// on name collision, matching the higher-priority-wins convention).
-    fn load_skills_dir(&mut self, dir: &Path, namespace: Option<&str>, warnings: &mut Vec<String>) {
+    pub(crate) fn load_skills_dir(
+        &mut self,
+        dir: &Path,
+        namespace: Option<&str>,
+        warnings: &mut Vec<String>,
+    ) {
         if !dir.is_dir() {
             return;
         }

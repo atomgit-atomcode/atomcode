@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.24.0</span>
+    <span class="dhdr-ver">v4.24.1</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -61,6 +61,8 @@
     <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
     <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
     <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
   </div>
 
   <div class="dside-group">
@@ -94,6 +96,16 @@
       <div class="callout callout-info">
         <strong>Sensitive paths</strong>
         <p>Writes to paths like <code>/etc</code>, <code>~/.ssh</code>, and shell rc files always trigger the permission dialog — "always allow" cannot skip them. Likewise, <code>rm</code> on source files always needs explicit confirmation.</p>
+      </div>
+
+      <div class="callout callout-info">
+        <strong>Background long-running tasks</strong>
+        <p>Pass <code>run_in_background: true</code> to <code>bash</code> and the command launches as a detached process and <strong>returns immediately</strong> with a PID and a log-file path; the process survives across conversation turns — ideal for dev servers, file watchers, and tunnels, without blocking the session.</p>
+      </div>
+
+      <div class="callout callout-warn">
+        <strong>Destructive-command guard</strong>
+        <p>High-risk commands like <code>rm -rf</code>, <code>dd</code>, <code>mkfs</code>, and <code>sudo</code>, plus schema-destroying database migrations (e.g. <code>migrate:fresh</code>, <code>db:reset</code>), always force a permission prompt. This confirmation <strong>always</strong> fires — even a prior "always allow" on <code>bash</code> cannot skip it.</p>
       </div>
 
       <h2>Code graph (8)</h2>

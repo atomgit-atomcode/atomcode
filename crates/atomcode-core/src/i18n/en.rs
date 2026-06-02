@@ -125,12 +125,16 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "CodingPlan needs the official build".into(),
         Msg::StatusUpgradeHint { version } =>
             format!("↑ {version} available · /upgrade").into(),
+        Msg::StatusUpgradeHintPm { version } =>
+            format!("↑ {version} available · brew upgrade atomcode").into(),
         Msg::StatusModelNotConfigured =>
             "(not configured)".into(),
         Msg::StatusClipboardImageHint =>
             "Image in clipboard · ctrl+v to paste".into(),
         Msg::StatusClipboardImageHintSlash =>
             "Image in clipboard · /paste".into(),
+        Msg::StatusWebuiHint =>
+            "Tips: Use /webui to open AtomCode in your browser".into(),
 
         // ── /status command body ──
         Msg::StatusBody { model, dir, config, tokens } =>
@@ -366,6 +370,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "to claim a free token quota".into(),
         Msg::IdleHintCodingplanFull =>
             "/login  to claim a free token quota".into(),
+        Msg::IdleHintWebui => "/webui".into(),
+        Msg::IdleHintWebuiSuffix =>
+            "open a synced session in the browser".into(),
+        Msg::IdleHintWebuiFull =>
+            "/webui  open a synced session in the browser".into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>
@@ -511,6 +520,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("git diff failed: {}", error).into(),
 
         // ── /upgrade ──
+        Msg::UpgradePackageManaged =>
+            "This build is managed by HarmonyBrew. Run `brew upgrade atomcode` to upgrade.".into(),
         Msg::UpgradeUnknownArg { arg } =>
             format!("unknown /upgrade argument: {}\n  usage: /upgrade [rollback|--force]", arg).into(),
 
@@ -715,6 +726,8 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             format!("list plugins: {error}").into(),
         Msg::PluginReloadDone { skills, warnings } =>
             format!("Plugins reloaded: {skills} skill(s), {warnings} warning(s)").into(),
+        Msg::PluginGitNotFound =>
+            "💡 git is not installed or not on PATH. Plugin marketplace auto-install and auto-update are disabled. Install git (e.g. `xcode-select --install` on macOS, `sudo apt install git` on Ubuntu) and restart AtomCode.".into(),
         Msg::PluginMarketplaceAdded { name, commit, count } =>
             format!("✓ marketplace `{name}` added at {commit} ({count} plugins)").into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
@@ -727,6 +740,7 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),
 
         // ── Command descriptions ──
+        Msg::CmdDescWebui => "Launch the browser webui (subcommands: stop, lan, --host <addr>)".into(),
 Msg::CmdDescSetup =>
 "Scan project, install seeds, and run setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescResume => "Resume a previous session".into(),

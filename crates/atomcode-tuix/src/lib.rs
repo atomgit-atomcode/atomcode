@@ -585,6 +585,8 @@ pub async fn run(
         is_plain_renderer,
         dangerously_skip_permissions,
         pending_guide_topic: None,
+        sync_session: None,
+        sync_forwarder: None,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

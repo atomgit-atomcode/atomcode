@@ -82,12 +82,12 @@ impl CurrentContext {
 /// In-process atomic counters for observability. Shared between `Telemetry` and `SenderRuntime`.
 #[derive(Default)]
 pub struct Counters {
-    pub events_tracked: AtomicU64,       // successful try_send
-    pub events_dropped_mpsc: AtomicU64,  // try_send failed (channel full)
-    pub events_dropped_disk: AtomicU64,  // FIFO evicted from disk queue (cap exceeded)
+    pub events_tracked: AtomicU64,      // successful try_send
+    pub events_dropped_mpsc: AtomicU64, // try_send failed (channel full)
+    pub events_dropped_disk: AtomicU64, // FIFO evicted from disk queue (cap exceeded)
     pub segments_posted: AtomicU64,
-    pub bytes_sent: AtomicU64,           // gzipped body bytes
-    pub last_post_unix_ms: AtomicI64,    // 0 = never
+    pub bytes_sent: AtomicU64,        // gzipped body bytes
+    pub last_post_unix_ms: AtomicI64, // 0 = never
 }
 
 impl Counters {
@@ -207,12 +207,7 @@ impl Telemetry {
         let http = HttpSender::new(cfg.endpoint.clone(), app_version.clone());
         let counters = Arc::new(Counters::default());
         let health_path = cfg.atomcode_dir.join("telemetry/health.json");
-        let rt = SenderRuntime::new(
-            queue.clone(),
-            http,
-            counters.clone(),
-            health_path.clone(),
-        );
+        let rt = SenderRuntime::new(queue.clone(), http, counters.clone(), health_path.clone());
         let queue_task = queue.clone();
         let handle = tokio::spawn(async move {
             run_sender(rx, rt, queue_task, shutdown_rx).await;
@@ -253,7 +248,8 @@ impl Telemetry {
             device_id: self.device_id,
             launch_id: self.launch_id,
             account_id: self.account_id.read().ok().and_then(|g| g.clone()),
-            session_id: ctx.session_id
+            session_id: ctx
+                .session_id
                 .or_else(|| self.session_id.read().ok().map(|g| *g))
                 .unwrap_or(self.launch_id),
             turn_id: ctx.turn_id,
@@ -274,9 +270,7 @@ impl Telemetry {
             event,
         }) {
             Ok(()) => {
-                self.counters
-                    .events_tracked
-                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.events_tracked.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("telemetry event queued");
             }
             Err(_) => {
@@ -284,6 +278,36 @@ impl Telemetry {
                     .events_dropped_mpsc
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("telemetry mpsc full, event dropped");
+            }
+        }
+    }
+
+    /// Read `pending_invite` and emit `InstallCompleted` once per install.
+    ///
+    /// Call after telemetry init and device_id load, before any business logic.
+    /// Idempotent: writes `referral_state.json` to prevent duplicate emission.
+    pub fn maybe_emit_install_completed(&self, atomcode_dir: &std::path::Path) {
+        if !self.enabled {
+            return;
+        }
+        let state_path = atomcode_dir.join("referral_state.json");
+        if state_path.exists() {
+            return;
+        }
+        if let Some(invite) = crate::pending_invite::load(atomcode_dir) {
+            self.track(Event::InstallCompleted {
+                invite_code: invite.invite_code,
+                install_uuid: invite.install_uuid,
+            });
+            let state = serde_json::json!({
+                "install_completed_install_uuid": invite.install_uuid.to_string(),
+                "install_completed_at": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            });
+            if let Ok(json) = serde_json::to_string(&state) {
+                let _ = std::fs::write(&state_path, json);
             }
         }
     }
@@ -526,16 +550,28 @@ mod resolve_host_tests {
     fn drops_port_path_userinfo() {
         // Port and path are stripped — only the bare host remains.
         assert_eq!(
-            resolve_provider_host("openai", Some("https://user:pass@api.example.com:8443/v1/foo?bar=baz")),
+            resolve_provider_host(
+                "openai",
+                Some("https://user:pass@api.example.com:8443/v1/foo?bar=baz")
+            ),
             Some("api.example.com".into())
         );
     }
 
     #[test]
     fn falls_back_to_vendor_default_when_url_missing() {
-        assert_eq!(resolve_provider_host("claude", None), Some("api.anthropic.com".into()));
-        assert_eq!(resolve_provider_host("openai", None), Some("api.openai.com".into()));
-        assert_eq!(resolve_provider_host("ollama", None), Some("localhost".into()));
+        assert_eq!(
+            resolve_provider_host("claude", None),
+            Some("api.anthropic.com".into())
+        );
+        assert_eq!(
+            resolve_provider_host("openai", None),
+            Some("api.openai.com".into())
+        );
+        assert_eq!(
+            resolve_provider_host("ollama", None),
+            Some("localhost".into())
+        );
     }
 
     #[test]
@@ -581,7 +617,9 @@ mod session_id_tests {
                 ..Default::default()
             },
             || async {
-                tel.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
+                tel.track(Event::OpenAtomcode {
+                    dangerously_skip_permissions: false,
+                });
             },
         )
         .await;

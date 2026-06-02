@@ -6,7 +6,7 @@ use atomcode_core::coding_plan;
 use atomcode_telemetry::{CodingplanErrorKind, CodingplanResult, Event};
 
 use crate::{
-    api_auth::{poll_login_session, LoginPollStep},
+    api_auth::{pending_invite_for_login, poll_login_session, LoginPollStep},
     api_config::{cleanup_expired_sessions, config_response, load_config, save_config},
     daemon_scope, json_error, AppState,
 };
@@ -105,7 +105,11 @@ pub(crate) async fn codingplan_setup(
                             state
                                 .telemetry
                                 .set_account_id(Some(user.id.clone()));
-                            state.telemetry.track(Event::LoginSuccess);
+                            let (invite_code, install_uuid) = pending_invite_for_login();
+                            state.telemetry.track(Event::LoginSuccess {
+                                invite_code,
+                                install_uuid,
+                            });
                         }
                         Err((status, message)) => {
                             state.telemetry.track(Event::TakeCodingplan {

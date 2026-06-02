@@ -219,14 +219,12 @@ impl Modal for SessionPicker {
                             .cmd_tx
                             .send(AgentCommand::SetMessages(session.messages.clone()))
                             .ok();
-                        // Continue accumulating into the same session
-                        // file — future TurnComplete saves overwrite it
-                        // instead of leaving the old snapshot + creating
-                        // a new one beside it.
-                        // Bind telemetry session_id to the resumed session's UUID.
-                        if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
-                            ctx.telemetry.set_session_id(uuid);
-                        }
+                        // Continue accumulating into the same session file —
+                        // future TurnComplete saves overwrite it. Bind
+                        // telemetry + agent (header/datalog) to the resumed
+                        // session's persistent id so /resume reuses its
+                        // original id (gateway routes back to the warm upstream).
+                        crate::event_loop::commands::bind_telemetry_to_session(ctx, &session);
                         ctx.current_session = session;
                         ctx.bg_manager
                             .set_foreground_session(ctx.current_session.clone());

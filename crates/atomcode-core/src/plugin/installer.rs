@@ -72,21 +72,22 @@ fn install_external(
         std::fs::create_dir_all(parent).ok();
     }
 
+    let git = super::marketplace::find_git()?;
     match ext {
         ExternalSource::Url { url, pin } | ExternalSource::Git { url, pin } => {
             validate_git_url(url)?;
-            git_clone_with_pin(url, &target_abs, pin)
+            git_clone_with_pin(&git, url, &target_abs, pin)
                 .with_context(|| format!("clone {}", url))?;
         }
         ExternalSource::Github { repo, pin } => {
             let url = expand_github_repo(repo)?;
-            git_clone_with_pin(&url, &target_abs, pin)
+            git_clone_with_pin(&git, &url, &target_abs, pin)
                 .with_context(|| format!("clone {}", url))?;
         }
         ExternalSource::GitSubdir { url, path, pin } => {
             // The recorded plugin_dir points INTO the subtree, so return early
             // with the subdir-qualified path rather than the clone root.
-            return git_subdir_clone(url, path, pin, &target_abs)
+            return git_subdir_clone(&git, url, path, pin, &target_abs)
                 .map(|_| format!("{}/{}", target_rel, normalize_rel_subdir(path)))
                 .with_context(|| format!("git-subdir clone {} ({})", url, path));
         }
@@ -109,7 +110,7 @@ fn normalize_rel_subdir(path: &str) -> String {
 /// Realise a `git-subdir` source: sparse + partial clone of just `path` from
 /// `url` into `target`. `url` may be an `owner/repo` shorthand (expanded as a
 /// GitHub repo) or a full git URL.
-fn git_subdir_clone(url: &str, path: &str, pin: &GitPin, target: &Path) -> Result<()> {
+fn git_subdir_clone(git: &Path, url: &str, path: &str, pin: &GitPin, target: &Path) -> Result<()> {
     validate_plugin_source(path)?;
     let sub = normalize_rel_subdir(path);
     if sub.is_empty() {
@@ -119,7 +120,7 @@ fn git_subdir_clone(url: &str, path: &str, pin: &GitPin, target: &Path) -> Resul
 
     // Partial clone (no blobs) + no checkout, so we can scope the working tree
     // to just `sub` before materialising any files.
-    let mut clone = Command::new("git");
+    let mut clone = Command::new(git);
     clone.args(["clone", "--filter=blob:none", "--no-checkout", "--depth", "1"]);
     // git-subdir pins are branch names in practice (the schema's `ref`); a
     // commit `sha` would need full history, but the catalog carries none.
@@ -132,7 +133,7 @@ fn git_subdir_clone(url: &str, path: &str, pin: &GitPin, target: &Path) -> Resul
     if !out.status.success() {
         // Fall back to a plain shallow clone for git versions without
         // partial-clone support; we still scope via sparse-checkout below.
-        let mut plain = Command::new("git");
+        let mut plain = Command::new(git);
         plain.args(["clone", "--no-checkout", "--depth", "1"]);
         if let Some(b) = branch {
             plain.args(["--branch", b]);
@@ -149,7 +150,7 @@ fn git_subdir_clone(url: &str, path: &str, pin: &GitPin, target: &Path) -> Resul
 
     // Scope the working tree to the subdir, then check it out. `--no-cone` +
     // `--` keep an exotic path from being read as a cone pattern or a flag.
-    let sparse = Command::new("git")
+    let sparse = Command::new(git)
         .args(["sparse-checkout", "set", "--no-cone", "--", &sub])
         .current_dir(target)
         .output()
@@ -160,7 +161,7 @@ fn git_subdir_clone(url: &str, path: &str, pin: &GitPin, target: &Path) -> Resul
             String::from_utf8_lossy(&sparse.stderr)
         );
     }
-    let checkout = Command::new("git")
+    let checkout = Command::new(git)
         .args(["checkout"])
         .current_dir(target)
         .output()
@@ -275,8 +276,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn git_clone_with_pin(url: &str, target: &Path, pin: &GitPin) -> Result<()> {
-    let mut cmd = Command::new("git");
+fn git_clone_with_pin(git: &Path, url: &str, target: &Path, pin: &GitPin) -> Result<()> {
+    let mut cmd = Command::new(git);
     cmd.arg("clone");
     let needs_full_history = pin.commit.is_some() || pin.tag.is_some() || pin.git_ref.is_some();
     if !needs_full_history {
@@ -298,7 +299,7 @@ fn git_clone_with_pin(url: &str, target: &Path, pin: &GitPin) -> Result<()> {
         .or(pin.tag.as_deref())
         .or(pin.git_ref.as_deref());
     if let Some(rev) = pin_ref {
-        let out = Command::new("git")
+        let out = Command::new(git)
             .args(["checkout", "--detach", rev])
             .current_dir(target)
             .output()

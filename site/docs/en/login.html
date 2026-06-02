@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.24.0</span>
+    <span class="dhdr-ver">v4.24.1</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -61,6 +61,8 @@
     <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
     <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
     <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
   </div>
 
   <div class="dside-group">
@@ -83,7 +85,7 @@
           <tr><td>API key</td><td><code>/provider</code> or hand-edit config</td><td>Users with their own OpenAI / Claude / DeepSeek key</td></tr>
         </tbody>
       </table>
-      <p class="callout"><em>As of v4.24.0 <code>/codingplan</code> has been folded into <code>/login</code>; the previous "OAuth-only without claiming tokens" entry has been removed.</em></p>
+      <p class="callout"><em>As of v4.24.1 <code>/codingplan</code> has been folded into <code>/login</code>; the previous "OAuth-only without claiming tokens" entry has been removed.</em></p>
 
       <h2>AtomGit CodingPlan (recommended)</h2>
       <p>AtomGit is the open-source code-hosting platform run by CSDN / OpenAtom Open Source Foundation, and AtomCode natively integrates its OAuth and CodingPlan. <code>/login</code> is the lowest-friction entry point for new users: a single action logs you in → claims free token quota → auto-generates a provider config from the granted model list. After that one command you can start chatting immediately. Re-running it after you're already signed in idempotently re-syncs the model list — no double-claim.</p>

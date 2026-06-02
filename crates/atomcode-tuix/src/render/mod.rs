@@ -308,6 +308,9 @@ pub enum MenuKind {
     /// `@`-mention popup: rows shown as `+ <path>`, no slash prefix.
     /// Selected row uses reverse-video only (no extra arrow).
     AtMention,
+    /// `$`-trigger skills picker. Rows show the bare skill name + description,
+    /// no `/`, `/skills`, or `$` prefix; selection marked with `▸`.
+    Skill,
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.

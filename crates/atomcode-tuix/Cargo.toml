@@ -3,8 +3,13 @@ name = "atomcode-tuix"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+distro-pm = ["atomcode-core/distro-pm"]
+
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
+atomcode-daemon = { path = "../atomcode-daemon" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }

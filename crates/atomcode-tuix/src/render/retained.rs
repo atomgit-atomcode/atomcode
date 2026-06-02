@@ -913,6 +913,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("+ {}  {}", name, desc)
                 }
             }
+            super::MenuKind::Skill => {
+                // Bare `<name>  <desc>` — no command prefix. Selection arrow
+                // only. Pad by display width so CJK names align (same logic
+                // as SlashCommand).
+                let name_width = unicode_width::UnicodeWidthStr::width(name);
+                let pad = 12usize.saturating_sub(name_width);
+                let padded = format!("{}{}", name, " ".repeat(pad));
+                if selected {
+                    format!("▸ {}  {}", padded, desc)
+                } else {
+                    format!("  {}  {}", padded, desc)
+                }
+            }
         };
 
         let style = if selected {
@@ -2301,6 +2314,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let provider_suffix = t(Msg::IdleHintProviderSuffix);
         let codingplan_cmd = t(Msg::IdleHintCodingplan);
         let codingplan_suffix = t(Msg::IdleHintCodingplanSuffix);
+        let webui_cmd = t(Msg::IdleHintWebui);
+        let webui_suffix = t(Msg::IdleHintWebuiSuffix);
         let combined_width: usize = [
             idle_prefix.as_ref(),
             idle_slash.as_ref(),
@@ -2313,6 +2328,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             codingplan_cmd.as_ref(),
             "  ",
             codingplan_suffix.as_ref(),
+            "   ",
+            webui_cmd.as_ref(),
+            "  ",
+            webui_suffix.as_ref(),
         ]
         .iter()
         .map(|s| unicode_width::UnicodeWidthStr::width(*s))
@@ -2328,9 +2347,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     ("  ", hint_text.clone()),
                     (&provider_suffix, hint_text.clone()),
                     ("   ", hint_text.clone()),
-                    (&codingplan_cmd, accent_bold),
+                    (&codingplan_cmd, accent_bold.clone()),
                     ("  ", hint_text.clone()),
-                    (&codingplan_suffix, hint_text),
+                    (&codingplan_suffix, hint_text.clone()),
+                    ("   ", hint_text.clone()),
+                    (&webui_cmd, accent_bold),
+                    ("  ", hint_text.clone()),
+                    (&webui_suffix, hint_text),
                 ],
                 content_w,
             ));
@@ -2353,9 +2376,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             ));
             rows.extend(self.build_wrapped_text_rows(
                 &[
-                    (&codingplan_cmd, accent_bold),
+                    (&codingplan_cmd, accent_bold.clone()),
                     ("  ", hint_text.clone()),
-                    (&codingplan_suffix, hint_text),
+                    (&codingplan_suffix, hint_text.clone()),
+                ],
+                content_w,
+            ));
+            rows.extend(self.build_wrapped_text_rows(
+                &[
+                    (&webui_cmd, accent_bold),
+                    ("  ", hint_text.clone()),
+                    (&webui_suffix, hint_text),
                 ],
                 content_w,
             ));
@@ -3736,6 +3767,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if cols == self.screen.width() && rows == self.screen.height() {
             return;
         }
+        // Diagnostic (opt-in via ATOMCODE_TUIX_LOG): trace each resize phase
+        // BEFORE the corresponding console write, so a conhost fastfail during
+        // a window drag still leaves the killing phase as the last RSZ line.
+        // `legacy_conhost` here confirms whether the ED2-safe path is active.
+        crate::tuix_trace!(
+            "RSZ",
+            "enter old={}x{} new={}x{} legacy_conhost={}",
+            self.screen.width(),
+            self.screen.height(),
+            cols,
+            rows,
+            self.caps.legacy_conhost
+        );
         // Terminal-side wipe: resize leaves pre-resize chars at old
         // absolute positions. Use per-row CUP+EL instead of `\x1b[2J`
         // for the same reason as `reset()` — iTerm2 3.5+ has been
@@ -3747,13 +3791,28 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Release DECSTBM first so EL isn't constrained by the
         // stale (pre-resize) scroll region.
         let _ = self.out.write_all(b"\x1b[r");
-        let mut seq = String::with_capacity((rows as usize) * 8 + 8);
-        for row in 1..=(rows as usize) {
-            use std::fmt::Write;
-            let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+        if self.caps.legacy_conhost {
+            // Classic Windows conhost (10.0.19041) fastfails (0xc0000409 —
+            // "整个终端窗口直接消失") when it receives the per-row CUP+EL wipe
+            // burst below while its console buffer is mid-resize (window drag).
+            // A single ED2 (erase whole display) + home is ONE sequence conhost
+            // handles cleanly, so it sidesteps the crash. We avoid ED2 on other
+            // terminals (see note below) only because iTerm2 3.5+ ignores it
+            // under some states — conhost honors it, so it's the safe choice
+            // on this host specifically.
+            let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+            crate::tuix_trace!("RSZ", "wipe=ED2 done");
+        } else {
+            let mut seq = String::with_capacity((rows as usize) * 8 + 8);
+            for row in 1..=(rows as usize) {
+                use std::fmt::Write;
+                let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+            }
+            seq.push_str("\x1b[H");
+            crate::tuix_trace!("RSZ", "wipe=perrow rows={} bytes={}", rows, seq.len());
+            let _ = self.out.write_all(seq.as_bytes());
         }
-        seq.push_str("\x1b[H");
-        let _ = self.out.write_all(seq.as_bytes());
+        crate::tuix_trace!("RSZ", "wipe written");
         self.screen.resize(cols, rows);
         // Rebuild the semantic welcome banner against the new width so
         // its right-aligned version/license pair stays adaptive after
@@ -3788,6 +3847,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // LF (which could nudge content into scrollback).
             let n = tail.len() as u16;
             let first_row = bottom.saturating_sub(n) + 1;
+            crate::tuix_trace!("RSZ", "body begin rows={} first_row={}", n, first_row);
             for (i, row) in tail.iter().enumerate() {
                 let seq = format!("\x1b[{};1H\x1b[K", first_row + i as u16);
                 let _ = self.out.write_all(seq.as_bytes());
@@ -3795,9 +3855,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let _ = self.out.write_all(&bytes);
             }
         }
+        crate::tuix_trace!("RSZ", "body done; paint begin");
         self.paint_frame();
         self.flush_frame();
         let _ = self.out.flush();
+        crate::tuix_trace!("RSZ", "done");
         self.last_painted_footer_rows = self.current_footer_rows();
         self.dirty = false;
     }
@@ -5464,7 +5526,9 @@ mod tests {
 
     #[test]
     fn retained_resize_reflows_welcome_brand_row_when_shrinking() {
-        let (mut r, buf) = new_capturing(80, 18);
+        // Height 20 (not 18): the idle hints take one extra row since the
+        // /webui shortcut was added, so the welcome block is one row taller.
+        let (mut r, buf) = new_capturing(80, 20);
 
         r.render(UiLine::Welcome {
             model: "glm-5".into(),
@@ -5478,19 +5542,19 @@ mod tests {
             attachments: Vec::new(),
         });
         r.flush_deferred();
-        let mut pre = crate::test_term::VirtualTerminal::new(80, 18);
+        let mut pre = crate::test_term::VirtualTerminal::new(80, 20);
         drain_into_vterm(&buf, &mut pre);
 
-        r.on_resize(24, 18);
+        r.on_resize(24, 20);
         r.flush_deferred();
-        let mut post = crate::test_term::VirtualTerminal::new(24, 18);
+        let mut post = crate::test_term::VirtualTerminal::new(24, 20);
         drain_into_vterm(&buf, &mut post);
 
-        let brand_row = (0..18)
+        let brand_row = (0..20)
             .map(|row| post.row_text(row))
             .find(|row| row.contains("AtomCode"))
             .expect("brand row should remain visible after shrinking");
-        let version_row = (0..18)
+        let version_row = (0..20)
             .map(|row| post.row_text(row))
             .find(|row| row.contains(concat!("v", env!("CARGO_PKG_VERSION"))))
             .expect("version row should remain visible after shrinking");

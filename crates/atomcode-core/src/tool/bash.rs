@@ -1464,6 +1464,41 @@ fn check_destructive_command(command: &str) -> Option<String> {
         }
     }
 
+    // --- ORM / migration schema-reset detection ---
+    // Tools like sea-orm, Laravel, Rails expose subcommands (`fresh`, `refresh`,
+    // `reset`) that drop every table and recreate the schema. The destruction
+    // happens inside the app binary at runtime, so the command line never holds
+    // `rm`/`drop` — pure pattern lists miss it. We match token-aware so safe
+    // verbs (`up`, `status`) and look-alikes (`refresh-cache`) stay allowed.
+    {
+        let tokens: Vec<&str> = cmd.split_whitespace().collect();
+        // verb token preceded by a migration/db trigger token
+        let reset_verbs = ["fresh", "refresh", "reset"];
+        let triggers = ["--", "migrate", "migration", "db", "database"];
+        for window in tokens.windows(2) {
+            let prev = window[0].trim_matches(|c: char| c == '"' || c == '\'' || c == ';');
+            let cur = window[1].trim_matches(|c: char| c == '"' || c == '\'' || c == ';');
+            if reset_verbs.contains(&cur) && triggers.contains(&prev) {
+                return Some(format!(
+                    "Schema reset (drops all tables): migration `{cur}`. Command: {command}"
+                ));
+            }
+        }
+        // colon-joined subcommands, e.g. `migrate:fresh`, `db:reset`
+        for token in &tokens {
+            let token = token.trim_matches(|c: char| c == '"' || c == '\'' || c == ';');
+            if let Some((left, right)) = token.split_once(':') {
+                if matches!(left, "migrate" | "migration" | "db" | "database")
+                    && reset_verbs.contains(&right)
+                {
+                    return Some(format!(
+                        "Schema reset (drops all tables): migration `{token}`. Command: {command}"
+                    ));
+                }
+            }
+        }
+    }
+
     // --- Original pattern matching for other destructive commands ---
     let patterns: &[(&str, &str)] = &[
         ("rmdir ", "Directory removal"),
@@ -2672,6 +2707,43 @@ mod sanitize_tests {
         assert!(check_destructive_command(r#"cmd /c dir C:\temp"#).is_none());
     }
 
+    // --- ORM / migration schema-reset detection ---
+    // The destructive action (drop all tables, recreate) happens inside the
+    // application binary at runtime, so the shell command line never contains
+    // `rm`/`drop`. A real incident: `cargo run -- fresh` (sea-orm migration)
+    // wiped a database after a prior session grant on `bash`. These commands
+    // must be flagged so they hit RequireApprovalAlways regardless of grants.
+    #[test]
+    fn destructive_check_catches_orm_migration_reset() {
+        // sea-orm via cargo run -- <subcommand>
+        assert!(check_destructive_command("cargo run -- fresh").is_some());
+        assert!(check_destructive_command("cargo run -- refresh").is_some());
+        assert!(check_destructive_command("cargo run -- reset").is_some());
+        // sea-orm-cli / generic "migrate <verb>" and "migration <verb>"
+        assert!(check_destructive_command("sea-orm-cli migrate fresh").is_some());
+        assert!(check_destructive_command("cargo run -- migrate refresh").is_some());
+        assert!(check_destructive_command("alembic ... migration reset").is_some());
+        // Laravel-style colon subcommands
+        assert!(check_destructive_command("php artisan migrate:fresh").is_some());
+        assert!(check_destructive_command("php artisan migrate:refresh").is_some());
+        // Rails / generic db reset
+        assert!(check_destructive_command("rails db:reset").is_some());
+        assert!(check_destructive_command("npm run database reset").is_some());
+    }
+
+    #[test]
+    fn destructive_check_allows_safe_migration_subcommands() {
+        // The safe path must NOT be flagged — otherwise every `up`/`status`
+        // run prompts and trains users to confirm blindly.
+        assert!(check_destructive_command("cargo run -- up").is_none());
+        assert!(check_destructive_command("cargo run -- status").is_none());
+        assert!(check_destructive_command("sea-orm-cli migrate up").is_none());
+        // A bare `reset`/`fresh` token unrelated to migrations stays allowed:
+        // narrow patterns only, no catch-all on the words themselves.
+        assert!(check_destructive_command("git stash").is_none());
+        assert!(check_destructive_command("npm run refresh-cache").is_none());
+    }
+
     // --- Vulnerability bypass tests (CVE-style: rm -rf detection bypass) ---
     // These tests verify that the reported bypass vectors are caught.
 
@@ -3677,7 +3749,6 @@ mod detect_cd_target_tests {
 #[cfg(all(test, not(target_os = "windows")))]
 mod pgroup_child_tests {
     use super::{PgroupChild, SIGKILL};
-    use std::os::unix::process::CommandExt as _;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;

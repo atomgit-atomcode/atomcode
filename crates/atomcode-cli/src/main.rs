@@ -545,6 +545,15 @@ enum Commands {
         #[arg(long)]
         client: Option<String>,
     },
+    /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
+    Webui {
+        /// 端口（默认 13456）
+        #[arg(long, default_value = "13456")]
+        port: u16,
+        /// 绑定地址（默认 127.0.0.1；用 0.0.0.0 暴露到局域网/外网，注意仅 token 保护、无 TLS）
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
     /// Telemetry controls
     Telemetry {
         #[command(subcommand)]
@@ -811,6 +820,7 @@ async fn main() {
 
     // Set a minimal pre-telemetry panic hook (replaced after telemetry init in run()).
     std::panic::set_hook(Box::new(|info| {
+        write_crash_log(info);
         restore_terminal_if_tui();
         eprintln!("\nAtomCode crashed: {}", info);
         if let Some(location) = info.location() {
@@ -867,8 +877,11 @@ async fn run() -> Result<i32> {
         }
     }
 
-    let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
+    let telemetry = Telemetry::init(resolved.clone(), env!("CARGO_PKG_VERSION").into());
     install_panic_hook(telemetry.clone());
+
+    // Emit install_completed if this is the first launch after a referral install
+    telemetry.maybe_emit_install_completed(&resolved.atomcode_dir);
     // ── End telemetry init ────────────────────────────────────────────────────
 
     // Handle subcommands. Most are self-contained (`handle_command` runs
@@ -909,7 +922,9 @@ async fn run() -> Result<i32> {
                     ..CurrentContext::current()
                 };
                 let outcome = CurrentContext::scope(scope_ctx, || async {
-                    telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: cli.dangerously_skip_permissions });
+                    telemetry.track(Event::OpenAtomcode {
+                        dangerously_skip_permissions: cli.dangerously_skip_permissions,
+                    });
                     run_codingplan_core(Some(&telemetry))
                 })
                 .await;
@@ -976,9 +991,7 @@ async fn run() -> Result<i32> {
                         if let Some(ref c) = client {
                             cmd.arg("--client").arg(c);
                         }
-                        let status = cmd
-                            .status()
-                            .context("Failed to start atomcode-daemon")?;
+                        let status = cmd.status().context("Failed to start atomcode-daemon")?;
                         return Ok(if status.success() { 0 } else { 1 });
                     }
                     None => {
@@ -987,6 +1000,14 @@ async fn run() -> Result<i32> {
                         return Ok(1);
                     }
                 }
+            }
+            Commands::Webui { port, host } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let msg = atomcode_daemon::ensure_server_and_open(&host, port, false).await;
+                eprintln!("{msg}");
+                // server 是后台 task；保持进程存活直到用户 Ctrl+C
+                let _ = tokio::signal::ctrl_c().await;
+                return Ok(0);
             }
             Commands::Telemetry { action } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -1048,7 +1069,7 @@ async fn run() -> Result<i32> {
                 vision_preprocessor_provider: None,
                 language: None,
                 ui: Default::default(),
-            plugin: Default::default(),
+                plugin: Default::default(),
             }
         })
     } else {
@@ -1072,10 +1093,7 @@ async fn run() -> Result<i32> {
     };
 
     // ── i18n locale ──
-    let locale = atomcode_tuix::i18n::resolve_initial_locale(
-        cli.lang.as_deref(),
-        config.language,
-    );
+    let locale = atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
     atomcode_tuix::i18n::set_locale(locale);
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
@@ -1406,12 +1424,22 @@ async fn run() -> Result<i32> {
     } else {
         SessionMode::Tui
     };
-    // Bind telemetry session_id to the AtomCode session's UUID (if a session is available).
-    // This means events from this process run are correlated to the actual session file.
-    // If no session exists yet, session_id stays as launch_id (the default).
+    // Bind telemetry to the continued session's id (if any). A fresh run needs
+    // nothing here: the agent bootstraps telemetry + header + datalog from its
+    // own session id. The TUI manages its own binding via
+    // `bind_telemetry_to_session`.
     if let Some(ref s) = session_to_continue {
         if let Ok(uuid) = uuid::Uuid::parse_str(s.id.as_str()) {
             telemetry.set_session_id(uuid);
+        }
+        // Headless `-c`: the TUI rebinds itself, so only push to the agent
+        // here, so the continued session's id reaches the header + datalog.
+        if effective_prompt.is_some() {
+            agent_handle
+                .client
+                .cmd_tx
+                .send(AgentCommand::SetSessionId(s.id.as_str().to_string()))
+                .ok();
         }
     }
     let scope_ctx = CurrentContext {
@@ -1485,7 +1513,14 @@ async fn run() -> Result<i32> {
             // the user hasn't opted out via `auto_update = false` AND we're not
             // running as `atomcode.bak` (backup should stay pinned; see the
             // `is_running_as_backup` guard up top).
-            if config.auto_update && !is_running_as_backup() && !cli.dev {
+            // In distro-pm (HarmonyBrew) builds the package manager owns
+            // upgrades, so skip spawning the detached prep process entirely —
+            // `prepare_deferred_upgrade` would no-op anyway.
+            if config.auto_update
+                && !is_running_as_backup()
+                && !cli.dev
+                && !atomcode_core::self_update::is_package_managed()
+            {
                 spawn_detached_upgrade_prep();
             }
 
@@ -1559,10 +1594,7 @@ fn redirect_stderr_to_log_file() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let marker = format!("\n--- atomcode session start (unix={epoch_secs}) ---\n");
-    let _ = std::io::Write::write_all(
-        &mut std::io::BufWriter::new(&file),
-        marker.as_bytes(),
-    );
+    let _ = std::io::Write::write_all(&mut std::io::BufWriter::new(&file), marker.as_bytes());
     // SAFETY: dup2 swaps the file descriptor table entry for fd 2
     // to point at `file`'s underlying fd. This is a standard, safe
     // operation; the worst case (dup2 fails) is the redirect doesn't
@@ -1616,7 +1648,10 @@ async fn run_headless(
     // should never reach this loop — but the log line gives the user a
     // clear signal that the flag is in effect.
     if skip_permissions {
-        eprintln!("{}", atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless));
+        eprintln!(
+            "{}",
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless)
+        );
     }
 
     let notifications = agent_loop.config.notifications.clone();
@@ -1941,10 +1976,16 @@ async fn run_headless(
             // still see that VL ran. Char count helps spot degenerate
             // outputs.
             AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
-                eprintln!("[vl-preprocess ok provider={} chars={}]", vl_key, char_count);
+                eprintln!(
+                    "[vl-preprocess ok provider={} chars={}]",
+                    vl_key, char_count
+                );
             }
             AgentEvent::MessagesSync { .. } => {
                 // Only used by TUI for /bg session persistence; ignore in CLI.
+            }
+            AgentEvent::UserEcho(_) | AgentEvent::PeerBusy(_) => {
+                // Live-sync only — not applicable in headless CLI.
             }
         }
     }
@@ -2051,6 +2092,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Daemon { .. } => {
             unreachable!("Daemon is handled inline in run() before handle_command")
+        }
+        Commands::Webui { .. } => {
+            unreachable!("Webui is handled inline in run() before handle_command")
         }
         Commands::Setup { .. } => {
             unreachable!("Setup is handled inline in run() before handle_command")
@@ -2195,16 +2239,25 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                     println!("  {:<30} {:>5}", "PostToolExecution", stats.post_tool_hooks);
                 }
                 if stats.on_tool_call_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnToolCallStart", stats.on_tool_call_start_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnToolCallStart", stats.on_tool_call_start_hooks
+                    );
                 }
                 if stats.post_turn_hooks > 0 {
                     println!("  {:<30} {:>5}", "PostTurn (legacy)", stats.post_turn_hooks);
                 }
                 if stats.on_model_response_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnModelResponse", stats.on_model_response_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnModelResponse", stats.on_model_response_hooks
+                    );
                 }
                 if stats.on_session_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnSessionStart", stats.on_session_start_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnSessionStart", stats.on_session_start_hooks
+                    );
                 }
                 if stats.on_session_end_hooks > 0 {
                     println!("  {:<30} {:>5}", "OnSessionEnd", stats.on_session_end_hooks);
@@ -2257,7 +2310,11 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
             if let Ok(cwd) = std::env::current_dir() {
                 let project_config = cwd.join(".atomcode").join("hooks").join("hooks.toml");
-                let exists = if project_config.exists() { "✓" } else { "✗" };
+                let exists = if project_config.exists() {
+                    "✓"
+                } else {
+                    "✗"
+                };
                 println!("  {} Project config:  {}", exists, project_config.display());
             }
 
@@ -2275,7 +2332,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
 /// Dispatch `atomcode plugin ...` subcommands. Each branch calls the same
 /// `atomcode_core::plugin::*` API the TUI's `/plugin` slash command uses, so
-    /// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
+/// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
 fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
     use atomcode_core::plugin::{installer, marketplace};
     match sub {
@@ -2423,7 +2480,16 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
             // (not a Failed event) — these arms exist only to keep the
             // match exhaustive if the TUI path ever reuses this code.
             UpgradeEvent::Failed(msg) => {
-                eprintln!("\nupgrade failed: {}", msg);
+                if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                    println!(
+                        "\n{}",
+                        atomcode_core::i18n::t(
+                            atomcode_core::i18n::Msg::UpgradePackageManaged
+                        )
+                    );
+                } else {
+                    eprintln!("\nupgrade failed: {}", msg);
+                }
             }
             UpgradeEvent::RolledBack { exe, backup } => {
                 println!(
@@ -2439,7 +2505,13 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
         Ok(Ok(_summary)) => Ok(()),
         Ok(Err(e)) => {
             let msg = format!("{:#}", e);
-            if msg.contains(ALREADY_LATEST) {
+            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                println!(
+                    "{}",
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                );
+                Ok(())
+            } else if msg.contains(ALREADY_LATEST) {
                 // Friendly path — not an error, just "nothing to do".
                 println!("  {}", msg.replace(&format!("{}: ", ALREADY_LATEST), ""));
                 Ok(())
@@ -2452,7 +2524,20 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
 }
 
 fn run_rollback_cli() -> Result<()> {
-    let summary = atomcode_core::self_update::run_rollback()?;
+    let summary = match atomcode_core::self_update::run_rollback() {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                println!(
+                    "{}",
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                );
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
     println!(
         "✓ Rolled back. Previous binary is now at {}, other version saved at {}",
         summary.exe.display(),
@@ -2542,12 +2627,73 @@ fn run_codingplan_core(
     Ok(report.render())
 }
 
+/// Guard so the two-link panic-hook chain (pre-telemetry hook + telemetry-aware
+/// hook that chains to it) writes the crash log exactly once.
+static CRASH_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Synchronously append a panic's location + message + backtrace to
+/// `~/.atomcode/logs/panic.log`, then `flush` + `sync_all` so the bytes are
+/// durable **before** the hook returns and the runtime calls `abort()`
+/// (`panic = "abort"` in the release profile).
+///
+/// Why this exists: with `abort`, neither of the existing report paths
+/// survives a crash — stderr is lost when the terminal window closes (Windows
+/// resize crash), and `Telemetry::track` is async (mpsc → background tokio
+/// writer), so abort kills the writer mid-segment and the `.partial` queue file
+/// is discarded. A blocking, fsync'd file write is the only sink that survives.
+/// Best-effort: every step swallows errors so the hook never re-panics.
+fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    if CRASH_LOGGED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(home) = atomcode_core::tool::real_home_dir() else {
+        return;
+    };
+    let dir = home.join(".atomcode").join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("panic.log"))
+    else {
+        return;
+    };
+    let loc = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| "unknown".into());
+    let msg = info
+        .payload()
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    let thread = std::thread::current().name().unwrap_or("unknown").to_string();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // `force_capture` ignores RUST_BACKTRACE and always resolves frames.
+    let bt = std::backtrace::Backtrace::force_capture();
+    let _ = writeln!(f, "\n==== AtomCode panic @ unix:{ts} thread:{thread} ====");
+    let _ = writeln!(f, "location: {loc}");
+    let _ = writeln!(f, "message : {msg}");
+    let _ = writeln!(f, "backtrace:\n{bt}");
+    let _ = f.flush();
+    let _ = f.sync_all();
+}
+
 /// Install the telemetry-aware panic hook. Replaces the minimal pre-init hook
 /// set in `main()` so panics are both reported cleanly to the terminal AND
 /// sent as a `Panic` telemetry event before the process exits.
 fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Durable crash log FIRST — before restore_terminal / async telemetry /
+        // abort, any of which can lose the panic on Windows (see write_crash_log).
+        write_crash_log(info);
         restore_terminal_if_tui();
         let home = atomcode_core::tool::real_home_dir();
         let cwd = std::env::current_dir().ok();
@@ -2576,12 +2722,15 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
             error_kind: Some("panic".to_string()),
-            error_data: Some(serde_json::json!({
-                "session_duration_secs": telemetry.uptime().as_secs() as u32,
-                "turns_completed": null,
-                "last_tool_name": null,
-                "last_event": null,
-            }).to_string()),
+            error_data: Some(
+                serde_json::json!({
+                    "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                    "turns_completed": null,
+                    "last_tool_name": null,
+                    "last_event": null,
+                })
+                .to_string(),
+            ),
         });
         default_hook(info);
     }));
@@ -2812,7 +2961,10 @@ mod tests {
         // Now a non-reasoning event arrives → close, then emit it.
         close_thinking_chunk(&mut buf, &mut open);
         buf.push_str("[tool→ read_file]\n");
-        assert_eq!(buf, "[thinking] I should check the file\n[tool→ read_file]\n");
+        assert_eq!(
+            buf,
+            "[thinking] I should check the file\n[tool→ read_file]\n"
+        );
     }
 
     // ── is_auth_gap_error ────────────────────────────────────────────

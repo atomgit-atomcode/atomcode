@@ -49,6 +49,15 @@ mkdir -p "$DIST"
 echo "=== AtomCode Release ${VERSION} ==="
 echo ""
 
+# Build the embedded webui frontend so the binary embeds the latest UI.
+if [ -d webui ] && command -v npm >/dev/null 2>&1; then
+  echo "Building webui frontend..."
+  (cd webui && npm ci && npm run build)
+else
+  echo "warning: skipping webui build (npm not found or webui/ missing); using committed webui/dist" >&2
+fi
+echo ""
+
 # Default to CLI-only builds. Daemon is internal/CI-facing (see sign-macos.sh
 # header) and shipping it in releases bloats artifacts + signing surface.
 # Set ATOMCODE_INCLUDE_DAEMON=1 to also build and package atomcode-daemon.

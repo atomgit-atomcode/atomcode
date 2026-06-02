@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>远程访问指南 · AtomCode 文档</title>
+<meta name="description" content="通过蒲公英虚拟局域网，从手机等设备安全访问本机 AtomCode webui —— 安装、绑定虚拟 IP、扫码连接与安全须知。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="webui-remote-access">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.24.1</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>远程访问指南</h1>
+      <p class="lede">AtomCode 的 webui 默认只监听本机回环地址（<code>127.0.0.1</code>），手机等其他设备访问不到。借助<strong>蒲公英（Oray PGY）</strong>组建的虚拟局域网，你可以在不暴露公网、无需公网 IP 的前提下，从手机/平板安全地打开本机 webui。本页讲解完整的连接流程与安全须知。</p>
+
+      <h2>工作原理</h2>
+      <p>蒲公英是一个异地组网工具：在本机和手机上安装并登录<strong>同一账号</strong>、加入<strong>同一网络</strong>后，两台设备就处在同一个虚拟局域网里，彼此可以用一个 <code>蒲公英虚拟 IP</code> 直接通信。webui 只要绑定到这个虚拟 IP，手机就能通过它访问。整个链路是点对点的私有网络，<strong>不会把你的本机暴露到公网</strong>。</p>
+
+      <div class="callout callout-warn">
+        <strong>为什么不直接开放公网</strong>
+        <p>webui / daemon 没有内置鉴权，访问者相当于拿到本机所有工具的执行权（包括 <code>bash</code>、<code>write</code>、<code>edit</code>）。所以请<strong>不要</strong>用 <code>--host 0.0.0.0</code> 把它直接暴露到公网或开放局域网。蒲公英虚拟局域网 + 一次性访问令牌（token），是为普通用户准备的安全远程方案。</p>
+      </div>
+
+      <h2>前置条件</h2>
+      <ul>
+        <li>本机已经能正常启动 AtomCode 的 webui。</li>
+        <li>本机与手机都安装了<strong>蒲公英</strong>客户端：<a href="https://pgy.oray.com" target="_blank" rel="noopener">https://pgy.oray.com</a>。</li>
+        <li>两台设备登录<strong>同一蒲公英账号</strong>，并加入<strong>同一网络</strong>。</li>
+      </ul>
+
+      <h2>操作步骤</h2>
+
+      <h3>1. 连接蒲公英，拿到虚拟 IP</h3>
+      <p>在本机的蒲公英客户端里完成登录与组网，记下分配给本机的<strong>虚拟 IP</strong>（形如 <code>10.x.x.x</code>）。手机端同样登录同一账号、加入同一网络即可，无需记 IP。</p>
+
+      <h3>2. 让 webui 绑定到虚拟 IP</h3>
+      <p>默认 webui 只绑回环地址，手机访问不到。在 AtomCode 的 TUI 里用 <code>--host</code> 指定蒲公英虚拟 IP 重新启动 webui：</p>
+      <pre><code>/webui --host 10.x.x.x</code></pre>
+      <p>把 <code>10.x.x.x</code> 换成上一步记下的本机虚拟 IP。绑定成功后，webui 就会在这个地址上对同一虚拟局域网内的设备开放。</p>
+
+      <h3>3. 在「远程访问」面板扫码连接</h3>
+      <p>打开 webui 右上角的<strong>远程访问</strong>（手机图标）面板，AtomCode 会自动检测蒲公英状态并生成：</p>
+      <ul>
+        <li>一个可直接打开的<strong>远程地址</strong>（已带上访问令牌）；</li>
+        <li>对应的<strong>二维码</strong>。</li>
+      </ul>
+      <p>用手机扫码，或把地址复制到手机浏览器打开即可。手机需登录同一蒲公英账号、处于同一网络。</p>
+
+      <div class="callout callout-warn">
+        <strong>访问令牌 = 密码</strong>
+        <p>远程地址中带有一次性访问令牌（<code>?token=…</code>），<strong>等同于密码</strong>：任何拿到这条完整链接的人都能操作你的本机。请勿把它发到群里、截图外传或贴到公开页面。</p>
+      </div>
+
+      <h2>排错</h2>
+      <p>「远程访问」面板会根据检测结果给出不同提示，对应处理如下：</p>
+      <table>
+        <thead>
+          <tr><th>面板提示</th><th>含义</th><th>怎么办</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>未检测到蒲公英</td>
+            <td>本机没装蒲公英，或客户端未运行。</td>
+            <td>在本机与手机都安装并登录蒲公英，加入同一网络后回到面板「重新检测」。</td>
+          </tr>
+          <tr>
+            <td>本机还没分配虚拟 IP</td>
+            <td>装了蒲公英但还没组网成功。</td>
+            <td>在蒲公英客户端里连接 / 加入网络，拿到虚拟 IP 后再「重新检测」。</td>
+          </tr>
+          <tr>
+            <td>webui 仅绑定了本机</td>
+            <td>检测到蒲公英，但 webui 还监听在回环地址。</td>
+            <td>按步骤 2 用 <code>/webui --host &lt;虚拟 IP&gt;</code> 重启 webui，再刷新本页。</td>
+          </tr>
+          <tr>
+            <td>手机打不开 / 一直转圈</td>
+            <td>两端不在同一网络，或防火墙拦截。</td>
+            <td>确认手机与本机登录同一蒲公英账号、加入同一网络；检查本机防火墙是否放行 webui 端口。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./headless-daemon.html">Headless 与 Daemon</a> —— 了解 webui 背后的 daemon 与 HTTP/SSE 接口</li>
+        <li><a href="./faq.html">常见问题</a> —— 远程 / 登录相关的常见坑</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

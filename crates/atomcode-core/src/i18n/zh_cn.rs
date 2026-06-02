@@ -117,12 +117,16 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "CodingPlan 需要官方构建".into(),
         Msg::StatusUpgradeHint { version } =>
             format!("↑ {version} 可用 · 使用 /upgrade 升级").into(),
+        Msg::StatusUpgradeHintPm { version } =>
+            format!("↑ {version} 可用 · 运行 brew upgrade atomcode 升级").into(),
         Msg::StatusModelNotConfigured =>
             "（未配置）".into(),
         Msg::StatusClipboardImageHint =>
             "剪贴板有图片 · ctrl+v 粘贴".into(),
         Msg::StatusClipboardImageHintSlash =>
             "剪贴板有图片 · /paste 粘贴".into(),
+        Msg::StatusWebuiHint =>
+            "提示：使用 /webui 在浏览器中打开 AtomCode".into(),
 
         // ── /status 命令主体 ──
         Msg::StatusBody { model, dir, config, tokens } =>
@@ -356,6 +360,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "领取免费 Token 额度".into(),
         Msg::IdleHintCodingplanFull =>
             "使用 /login 领取免费 Token 额度".into(),
+        Msg::IdleHintWebui => "/webui".into(),
+        Msg::IdleHintWebuiSuffix =>
+            "在浏览器中同步会话".into(),
+        Msg::IdleHintWebuiFull =>
+            "使用 /webui 在浏览器中同步会话".into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>
@@ -499,6 +508,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("git diff 失败：{}", error).into(),
 
         // ── /upgrade ──
+        Msg::UpgradePackageManaged =>
+            "本版本由 HarmonyBrew 管理，请运行 `brew upgrade atomcode` 升级".into(),
         Msg::UpgradeUnknownArg { arg } =>
             format!("未知的 /upgrade 参数：{}\n  用法：/upgrade [rollback|--force]", arg).into(),
 
@@ -703,6 +714,8 @@ Msg::PluginMgrInstallingLabel => "安装中…".into(),
             format!("列出插件失败：{error}").into(),
         Msg::PluginReloadDone { skills, warnings } =>
             format!("插件已重新加载：{skills} 个 skill，{warnings} 个警告").into(),
+        Msg::PluginGitNotFound =>
+            "💡 当前环境未安装 git 或 git 不在 PATH 中，插件市场自动安装和自动更新已禁用。请安装 git（macOS 可执行 `xcode-select --install`，Ubuntu 可执行 `sudo apt install git`）后重启 AtomCode。".into(),
         Msg::PluginMarketplaceAdded { name, commit, count } =>
             format!("✓ 已添加 marketplace `{name}`（commit {commit}，共 {count} 个插件）").into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
@@ -715,6 +728,7 @@ Msg::PluginMgrInstallingLabel => "安装中…".into(),
             format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),
 
         // ── 命令描述 ──
+        Msg::CmdDescWebui => "启动浏览器 webui（子命令：stop / lan / --host <地址>）".into(),
 Msg::CmdDescSetup =>
 "扫描项目、安装种子文件并运行 setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescResume => "恢复上次会话".into(),

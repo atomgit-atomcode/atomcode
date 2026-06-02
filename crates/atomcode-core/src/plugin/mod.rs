@@ -34,4 +34,8 @@ pub enum PluginJobEvent {
     /// Generic failure: `op` is one of "add" / "update" / "install" so the
     /// renderer can produce the same human message as the prior sync path.
     Failed { op: String, msg: String },
+    /// Git is not installed or not on PATH. This is a pre-check failure,
+    /// not an operational error — the renderer should show a friendly hint
+    /// (not an error) to guide the user to install git.
+    GitNotFound,
 }

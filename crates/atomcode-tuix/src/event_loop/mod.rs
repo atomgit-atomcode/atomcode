@@ -16,6 +16,7 @@
 pub(crate) mod bg_runtime;
 pub(crate) mod commands;
 pub(crate) mod file_index;
+pub(crate) mod live_sync;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
@@ -830,6 +831,10 @@ pub struct LoopCtx {
     /// stays current without thrashing the system clipboard on every
     /// redraw. Refreshed lazily inside `build_status`.
     pub clipboard_check: std::sync::Arc<std::sync::Mutex<ClipboardCheckState>>,
+    /// 同步模式：Some 时输入投 LiveSession、渲染来自 live_sync 转发任务。None=独立（默认）。
+    pub sync_session: Option<std::sync::Arc<atomcode_core::live::LiveSession>>,
+    /// live 转发任务句柄（分离同步时 abort）。
+    pub sync_forwarder: Option<tokio::task::JoinHandle<()>>,
     /// `true` when the TUI was launched with `PlainRenderer` (CI / pipe
     /// / non-TTY). The onboarding wizard checks this — plain mode can't
     /// run interactive multi-step flows, so first-run falls through to
@@ -1741,6 +1746,80 @@ mod menu_tests {
         );
     }
 
+    #[test]
+    fn build_skill_menu_items_lists_unique_bare_names() {
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        skills.register(skill_fixture("skills:hidden", "no", false));
+        let lock = std::sync::RwLock::new(skills);
+
+        let all = build_skill_menu_items(Some(&lock), "");
+        assert!(all.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(all.iter().any(|(n, _)| n == "web-access"));
+        assert!(!all.iter().any(|(n, _)| n == "hidden"));
+
+        let filtered = build_skill_menu_items(Some(&lock), "bra");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "brainstorming");
+
+        assert!(build_skill_menu_items(Some(&lock), "zz").is_empty());
+        assert!(build_skill_menu_items(None, "").is_empty());
+    }
+
+    #[test]
+    fn dollar_trigger_lists_all_user_invocable_skills() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        skills.register(skill_fixture("skills:hidden", "no", false));
+        let lock = std::sync::RwLock::new(skills);
+
+        let items = build_menu_items("$", 0, &reg, &custom, Some(&lock), None)
+            .expect("$ must list skills");
+        assert!(items.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "web-access"));
+        assert!(!items.iter().any(|(n, _)| n == "hidden"));
+        for (n, _) in &items {
+            assert!(!n.contains('/'), "row leaked slash syntax: {}", n);
+        }
+    }
+
+    #[test]
+    fn dollar_trigger_filters_and_parity_with_skills_submode() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        let bra = build_menu_items("$bra", 0, &reg, &custom, Some(&lock), None)
+            .expect("filter must match");
+        assert_eq!(bra.len(), 1);
+        assert_eq!(bra[0].0, "brainstorming");
+
+        let via_dollar = build_menu_items("$web", 0, &reg, &custom, Some(&lock), None);
+        let via_slash = build_menu_items("/skills web", 0, &reg, &custom, Some(&lock), None);
+        assert_eq!(via_dollar, via_slash);
+
+        assert!(build_menu_items("$zz", 0, &reg, &custom, Some(&lock), None).is_none());
+    }
+
+    #[test]
+    fn dollar_trigger_only_at_start_and_closes_on_space() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        assert!(build_menu_items("hi $bra", 0, &reg, &custom, Some(&lock), None).is_none());
+        assert!(build_menu_items("$brainstorming ", 0, &reg, &custom, Some(&lock), None).is_none());
+    }
+
     // Regression: HistoryPrev used to leave the cursor at end-of-text,
     // so a recalled `/session foo` from history would `is_in_history()`
     // true AND have the slash prefix — without the call-site gate, the
@@ -2149,6 +2228,17 @@ mod menu_tests {
         assert_eq!(line, "describe [Image #1]"); // first paste this session
         assert_eq!(state.pending_image_markers, vec![1]);
         assert!(line.contains("[Image #1]"), "marker survives in line for the survival filter");
+    }
+
+    #[test]
+    fn parse_dollar_line_splits_name_and_args() {
+        assert_eq!(parse_dollar_line("$brainstorming"), Some(("brainstorming".to_string(), String::new())));
+        assert_eq!(parse_dollar_line("$brainstorming why is X"), Some(("brainstorming".to_string(), "why is X".to_string())));
+        assert_eq!(parse_dollar_line("$brainstorming  spaced "), Some(("brainstorming".to_string(), "spaced".to_string())));
+        assert_eq!(parse_dollar_line("hello"), None);
+        assert_eq!(parse_dollar_line("/skills x"), None);
+        assert_eq!(parse_dollar_line("$"), None);
+        assert_eq!(parse_dollar_line("$   "), None);
     }
 }
 
@@ -2753,6 +2843,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // universal `\<Enter>` block above (kbd_hint_set arm), which is
     // one line and terminal-agnostic.
 
+    // Bind the initial session's persistent id onto the agent + telemetry so
+    // even a brand-new session uses its session-file id for the
+    // x-atomcode-session-id header (not Agent::new's bootstrap). Makes a later
+    // /resume reuse the SAME id. The -c replay block below rebinds if present.
+    commands::bind_telemetry_to_session(&ctx, &ctx.current_session);
+
     // Auto-continue: if the CLI loaded the most recent session for this
     // working dir (via `atomcode -c` / `--continue`), replay its messages
     // into scrollback AND restore the agent's model context so follow-up
@@ -2768,9 +2864,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 .ok();
             // Continue accumulating into the same session file — future
             // TurnComplete saves overwrite it instead of creating a new one.
-            if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
-                ctx.telemetry.set_session_id(uuid);
-            }
+            // Header + telemetry = this continued session's persistent id, so
+            // `-c` reuses the saved session's id (not a fresh per-process one).
+            commands::bind_telemetry_to_session(&ctx, &session);
             ctx.current_session = session;
             app.state.on_turn_complete();
         }
@@ -3259,14 +3355,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // fire in order on subsequent completions.
                         if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                            renderer.render(UiLine::User(queued.text.clone()));
-                            renderer.flush();
-                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                                text: queued.text,
-                                images: queued.images,
-                                image_markers: queued.image_markers,
-                            }).ok();
-                            app.state.on_submit();
+                            if let Some(live) = &ctx.sync_session {
+                                // 同步模式：投 LiveSession，不本地渲染用户行。
+                                use atomcode_core::live::UserInput;
+                                live.send_input(UserInput { text: queued.text, images: queued.images });
+                                app.state.on_submit();
+                            } else {
+                                // —— 原有逻辑，原样保留 ——
+                                renderer.render(UiLine::User(queued.text.clone()));
+                                renderer.flush();
+                                ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                                    text: queued.text,
+                                    images: queued.images,
+                                    image_markers: queued.image_markers,
+                                }).ok();
+                                app.state.on_submit();
+                            }
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
@@ -3627,14 +3731,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if matches!(app.state.phase, UiPhase::Idle) {
                         if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                            renderer.render(UiLine::User(queued.text.clone()));
-                            renderer.flush();
-                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                                text: queued.text,
-                                images: queued.images,
-                                image_markers: queued.image_markers,
-                            }).ok();
-                            app.state.on_submit();
+                            if let Some(live) = &ctx.sync_session {
+                                // 同步模式：投 LiveSession，不本地渲染用户行。
+                                use atomcode_core::live::UserInput;
+                                live.send_input(UserInput { text: queued.text, images: queued.images });
+                                app.state.on_submit();
+                            } else {
+                                // —— 原有逻辑，原样保留 ——
+                                renderer.render(UiLine::User(queued.text.clone()));
+                                renderer.flush();
+                                ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                                    text: queued.text,
+                                    images: queued.images,
+                                    image_markers: queued.image_markers,
+                                }).ok();
+                                app.state.on_submit();
+                            }
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
@@ -4269,6 +4381,66 @@ pub use crate::modals::SessionPicker;
 // existing call sites (execute_slash_command).
 pub use crate::modals::ProviderWizard;
 
+/// Parse a committed `$<name> [args]` line into `(name, args)`. Returns `None`
+/// when the line is not `$`-prefixed or carries no skill name. Mirrors
+/// `parse_slash_line` but for the `$` skills trigger.
+fn parse_dollar_line(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix('$')?;
+    let trimmed = rest.trim_start();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("");
+    if name.is_empty() {
+        return None;
+    }
+    let args = parts.next().unwrap_or("").trim();
+    Some((name.to_string(), args.to_string()))
+}
+
+/// Build the second-level skills palette: user-invocable skills whose bare
+/// name or fully-qualified `<ns>:<name>` starts with `prefix_lower`. A bare
+/// name is shown when it is unique across the registry; otherwise the
+/// qualified name is shown to disambiguate. Sorted for stable navigation.
+/// Shared by the `/skills ` sub-mode and the `$` trigger so both stay in lockstep.
+fn build_skill_menu_items(
+    skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    prefix_lower: &str,
+) -> Vec<(String, String)> {
+    let mut items: Vec<(String, String)> = Vec::new();
+    if let Some(reg) = skill_registry {
+        if let Ok(reg) = reg.read() {
+            let skills: Vec<_> = reg.user_invocable().collect();
+            for skill in &skills {
+                let bare = skill
+                    .name
+                    .split_once(':')
+                    .map(|(_, s)| s)
+                    .unwrap_or(skill.name.as_str());
+                let full_lower = skill.name.to_ascii_lowercase();
+                let bare_lower = bare.to_ascii_lowercase();
+                if bare_lower.starts_with(prefix_lower) || full_lower.starts_with(prefix_lower) {
+                    let bare_is_unique = skills.iter().all(|other| {
+                        other.name == skill.name
+                            || other
+                                .name
+                                .split_once(':')
+                                .map(|(_, s)| s)
+                                .unwrap_or(other.name.as_str())
+                                != bare
+                    });
+                    let display = if bare_is_unique {
+                        bare.to_string()
+                    } else {
+                        skill.name.clone()
+                    };
+                    items.push((display, skill.description.clone()));
+                }
+            }
+        }
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+}
+
 /// Filter the command registry by the buf's prefix after '/'. Returns the
 /// (name, desc) pairs matching, or None if menu shouldn't show (buf doesn't
 /// start with '/' or has whitespace, meaning the user has moved on to args).
@@ -4303,6 +4475,19 @@ fn build_menu_items(
         );
     }
 
+    // `$`-trigger skills picker. A fast shortcut to the `/skills` palette:
+    // `$` at the start of the buffer lists user-invocable skills under bare
+    // names; `$bra` filters. A space (user typing args) closes the menu, the
+    // same way `/skills <name> ` does. Shares `build_skill_menu_items` with
+    // the `/skills ` sub-mode so contents stay identical.
+    if let Some(after) = buf.strip_prefix('$') {
+        if after.contains(char::is_whitespace) {
+            return None;
+        }
+        let items = build_skill_menu_items(skill_registry, &after.to_ascii_lowercase());
+        return if items.is_empty() { None } else { Some(items) };
+    }
+
     if !buf.starts_with('/') {
         return None;
     }
@@ -4320,51 +4505,10 @@ fn build_menu_items(
     // to `/skills <name>` so the `skills` arm in execute_slash_command
     // looks up `skills:<name>` in the registry and dispatches.
     if let Some(after) = buf.strip_prefix("/skills ") {
-        // Beyond the skill name (user typing skill args) — close menu.
         if after.contains(char::is_whitespace) {
             return None;
         }
-        let prefix_lower = after.to_ascii_lowercase();
-        let mut items: Vec<(String, String)> = Vec::new();
-        if let Some(reg) = skill_registry {
-            if let Ok(reg) = reg.read() {
-                let skills: Vec<_> = reg.user_invocable().collect();
-                for skill in &skills {
-                    // Match against either the bare suffix (`adapter-check…`)
-                    // or the full qualified name (`ascend-model-agent-plugin:
-                    // adapter-check…`). Bare match keeps the shorthand UX;
-                    // full match lets users narrow by plugin (`/ascend-`).
-                    let bare = skill
-                        .name
-                        .split_once(':')
-                        .map(|(_, s)| s)
-                        .unwrap_or(skill.name.as_str());
-                    let full_lower = skill.name.to_ascii_lowercase();
-                    let bare_lower = bare.to_ascii_lowercase();
-                    if bare_lower.starts_with(&prefix_lower)
-                        || full_lower.starts_with(&prefix_lower)
-                    {
-                        let bare_is_unique = skills.iter().all(|other| {
-                            other.name == skill.name
-                                || other
-                                    .name
-                                    .split_once(':')
-                                    .map(|(_, s)| s)
-                                    .unwrap_or(other.name.as_str())
-                                    != bare
-                        });
-                        let display = if bare_is_unique {
-                            bare.to_string()
-                        } else {
-                            skill.name.clone()
-                        };
-                        items.push((display, skill.description.clone()));
-                    }
-                }
-            }
-        }
-        // Stable order so navigation feels predictable across runs.
-        items.sort_by(|a, b| a.0.cmp(&b.0));
+        let items = build_skill_menu_items(skill_registry, &after.to_ascii_lowercase());
         return if items.is_empty() { None } else { Some(items) };
     }
 
@@ -4518,6 +4662,47 @@ fn handle_idle_key(
                 //     (once the arg is filled in) commits normally through
                 //     the regular BufferResult::Commit → execute_slash_command
                 //     path at the bottom of this function.
+
+                // `$`-mode: items carry bare skill names. Tab completes to
+                // `$name ` (review, then Enter); Enter invokes immediately.
+                if app.buf.text.starts_with('$') && !items.is_empty() {
+                    let name = items[app.menu.selected].0.clone();
+                    app.menu.selected = 0;
+                    if code == KeyCode::Tab {
+                        app.buf.text = format!("${} ", name);
+                        app.buf.cursor = app.buf.text.len();
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        return Ok(());
+                    }
+                    // Enter → invoke now via the shared skills arm.
+                    let committed = format!("${}", name);
+                    renderer.render(UiLine::ClearTransient);
+                    renderer.render(UiLine::User(committed.clone()));
+                    app.buf.text.clear();
+                    app.buf.cursor = 0;
+                    ctx.history.push(crate::input::history::HistoryEntry {
+                        text: committed.clone(),
+                        images: Vec::new(),
+                    });
+                    app.state.last_submitted_message = Some(committed.clone());
+                    execute_slash_command(
+                        "skills",
+                        &name,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        &mut app.active_modal,
+                        &mut app.fixissue_pending,
+                        &mut app.fixissue_buffer,
+                        &mut app.setup_pending,
+                    )?;
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        app.state.last_submitted_message = None;
+                        redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                    }
+                    return Ok(());
+                }
+
                 let name = items[app.menu.selected].0.clone();
                 let needs_args = ctx
                     .commands
@@ -4807,6 +4992,50 @@ fn handle_idle_key(
             // content". Mirrors the queue branch below which already
             // clears AFTER expansion.
             app.menu.selected = 0;
+            // `$<name> [args]` committed (Tab-parked then Enter, or typed in
+            // full). Resolve to a user-invocable skill and dispatch through the
+            // same `skills` arm as `/skills <name> <args>`; the user-visible
+            // echo stays `$name` so `/skills` never appears.
+            if let Some((skill_name, skill_args)) = parse_dollar_line(&line) {
+                let is_user_skill = ctx
+                    .skill_registry
+                    .read()
+                    .ok()
+                    .and_then(|r| r.get(&skill_name).map(|s| s.user_invocable))
+                    .unwrap_or(false);
+                if is_user_skill {
+                    renderer.render(UiLine::User(line.clone()));
+                    ctx.history.push(crate::input::history::HistoryEntry {
+                        text: line.clone(),
+                        images: Vec::new(),
+                    });
+                    app.state.last_submitted_message = Some(line.clone());
+                    let arg = if skill_args.is_empty() {
+                        skill_name.clone()
+                    } else {
+                        format!("{} {}", skill_name, skill_args)
+                    };
+                    execute_slash_command(
+                        "skills",
+                        &arg,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        &mut app.active_modal,
+                        &mut app.fixissue_pending,
+                        &mut app.fixissue_buffer,
+                        &mut app.setup_pending,
+                    )?;
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        app.state.last_submitted_message = None;
+                        redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                    }
+                    app.buf.clear_pastes();
+                    return Ok(());
+                }
+                // Not a known skill: fall through so `$foo` is sent as a
+                // normal message (e.g. "$5 budget" keeps working).
+            }
             // Only treat `/name …` as a slash command when `name` is
             // actually registered. Unrecognised `/foo …` (e.g. the user
             // typed `/test 文件下有哪些文件` meaning to *ask about*
@@ -4892,7 +5121,11 @@ fn handle_idle_key(
                 for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir) {
                     renderer.render(UiLine::Warning(n));
                 }
-                renderer.render(UiLine::User(line.clone()));
+                // 同步模式：不在本地渲染用户行；等 LiveEvent::UserMessage →
+                // AgentEvent::UserEcho 回灌，保证两端一致。非同步模式原样渲染。
+                if ctx.sync_session.is_none() {
+                    renderer.render(UiLine::User(line.clone()));
+                }
                 let expanded = app.buf.expand_pastes(&line);
                 // Pastes have now been substituted into `expanded`;
                 // safe to drop the registry. Doing it any earlier
@@ -4946,32 +5179,40 @@ fn handle_idle_key(
                 if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                     *slot = None;
                 }
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::SendMessage {
-                        text: expanded,
-                        images,
-                        image_markers: kept_markers,
-                    })
-                    .ok();
-                app.state.on_submit();
-                // CodingPlan drift check — fire before every turn sent
-                // to a CodingPlan-managed provider, gated by a 15-min
-                // cooldown so rapid-fire messages don't spam the API.
-                // Non-CodingPlan users skip entirely (zero network).
-                if monitor::is_codingplan_provider(&ctx.config.default_provider) {
-                    let cooled = ctx
-                        .monitor_last_check_at
-                        .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
-                        .unwrap_or(true);
-                    if cooled {
-                        ctx.monitor_last_check_at = Some(std::time::Instant::now());
-                        monitor::spawn_check(
-                            ctx.config.clone(),
-                            ctx.model_name.clone(),
-                            ctx.monitor_warning.clone(),
-                            ctx.wake_tx.clone(),
-                        );
+                if let Some(live) = &ctx.sync_session {
+                    // 同步模式：投递到 LiveSession。
+                    use atomcode_core::live::UserInput;
+                    live.send_input(UserInput { text: expanded, images });
+                    app.state.on_submit();
+                } else {
+                    // —— 原有逻辑，原样保留 ——
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: expanded,
+                            images,
+                            image_markers: kept_markers,
+                        })
+                        .ok();
+                    app.state.on_submit();
+                    // CodingPlan drift check — fire before every turn sent
+                    // to a CodingPlan-managed provider, gated by a 15-min
+                    // cooldown so rapid-fire messages don't spam the API.
+                    // Non-CodingPlan users skip entirely (zero network).
+                    if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                        let cooled = ctx
+                            .monitor_last_check_at
+                            .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
+                            .unwrap_or(true);
+                        if cooled {
+                            ctx.monitor_last_check_at = Some(std::time::Instant::now());
+                            monitor::spawn_check(
+                                ctx.config.clone(),
+                                ctx.model_name.clone(),
+                                ctx.monitor_warning.clone(),
+                                ctx.wake_tx.clone(),
+                            );
+                        }
                     }
                 }
             }
@@ -5006,6 +5247,8 @@ fn redraw_with_menu(
 ) {
     let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
         crate::render::MenuKind::AtMention
+    } else if buf.text.starts_with('$') {
+        crate::render::MenuKind::Skill
     } else {
         crate::render::MenuKind::SlashCommand
     };
@@ -5697,6 +5940,13 @@ pub(super) fn handle_plugin_job_event(
             }
             renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
         }
+        PluginJobEvent::GitNotFound => {
+            // Not an error — a friendly hint to guide the user to install git.
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::PluginGitNotFound).into_owned(),
+            ));
+            renderer.flush();
+        }
         PluginJobEvent::PluginAlreadyInstalled { id } => {
             // Stale install? Try reload + expand so the user still
             // gets an answer if the plugin was installed but not loaded.
@@ -5792,7 +6042,13 @@ pub(super) fn handle_upgrade_event(
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         UpgradeEvent::Failed(msg) => {
-            if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
+            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                // HarmonyBrew-managed build: self-update is intentionally
+                // disabled. Not an error — render as command output.
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::UpgradePackageManaged).into_owned(),
+                ));
+            } else if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
                 // Friendly path — not an error, just "nothing to do".
                 // self_update.rs's anyhow!() error is fixed-format
                 // English: "already on {current} (latest is {latest}).
@@ -6754,6 +7010,20 @@ fn handle_agent_event(
                     .set_foreground_session(ctx.current_session.clone());
             }
         }
+        AgentEvent::UserEcho(text) => {
+            // Live-sync: render the peer's user message as a user bubble.
+            renderer.render(UiLine::User(text));
+            renderer.flush();
+        }
+        AgentEvent::PeerBusy(running) => {
+            // Live-sync: mirror the peer's busy state so TUI input is
+            // visually disabled while the other side's turn is running.
+            if running {
+                state.on_submit();
+            } else {
+                state.on_turn_complete();
+            }
+        }
     }
 }
 
@@ -6966,7 +7236,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
-    } else if let Some(warning) = ctx.monitor_warning.lock().ok().and_then(|g| g.clone()) {
+    } else if let Some(warning) = monitor::is_codingplan_provider(&ctx.config.default_provider)
+        .then(|| ctx.monitor_warning.lock().ok().and_then(|g| g.clone()))
+        .flatten()
+    {
+        // Only surface the CodingPlan drift warning while a CodingPlan-managed
+        // (AtomGit*) provider is active. A warning set on an AtomGit provider
+        // must not linger after the user switches to a custom provider via a
+        // path that doesn't clear the slot (e.g. `/provider`) — the hint is
+        // meaningless for non-CodingPlan models.
         Some((warning.display_text(), crate::render::HintSeverity::Warning))
     } else if let Some(hook_msg) = ctx.hook_warning_hint.lock().ok().and_then(|g| g.clone()) {
         Some((hook_msg, crate::render::HintSeverity::Warning))
@@ -7000,17 +7278,21 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             crate::i18n::t(hint_msg).into_owned(),
             crate::render::HintSeverity::Info,
         ))
+    } else if let Some(v) = ctx.update_hint.lock().ok().and_then(|g| g.clone()) {
+        let text = if atomcode_core::self_update::is_package_managed() {
+            crate::i18n::t(crate::i18n::Msg::StatusUpgradeHintPm { version: &v }).into_owned()
+        } else {
+            crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v }).into_owned()
+        };
+        Some((text, crate::render::HintSeverity::Info))
     } else {
-        ctx.update_hint
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-            .map(|v| {
-                (
-                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v }).into_owned(),
-                    crate::render::HintSeverity::Info,
-                )
-            })
+        // Lowest-priority fallback: surface the `/webui` browser-UI entry
+        // point, which is otherwise easy to miss. Yields the slot to every
+        // higher-priority hint above (warnings / usage / upgrade).
+        Some((
+            crate::i18n::t(crate::i18n::Msg::StatusWebuiHint).into_owned(),
+            crate::render::HintSeverity::Info,
+        ))
     };
     // Pre-configure, `ctx.model_name` is a dummy from the startup fallback
     // (empty string or "not-configured") — showing that raw in the status
@@ -7097,6 +7379,8 @@ fn draw_spinner_now(
         let selected = menu_selected.min(items.len().saturating_sub(1));
         let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
             crate::render::MenuKind::AtMention
+        } else if buf.text.starts_with('$') {
+            crate::render::MenuKind::Skill
         } else {
             crate::render::MenuKind::SlashCommand
         };

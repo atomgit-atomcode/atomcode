@@ -1,19 +1,31 @@
 # AtomCode installer for Windows — PowerShell
 #
-#   irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.ps1 | iex
+#   irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/install.ps1 | iex
 #
 # Env overrides:
-#   $env:ATOMCODE_VERSION   release tag to install (default: v4.24.0)
+#   $env:ATOMCODE_VERSION   release tag to install (default: latest release,
+#                             auto-detected from the AtomGit API)
 #   $env:ATOMCODE_PREFIX    install dir (default: %LOCALAPPDATA%\AtomCode)
 # IMPORTANT: when changing install paths, registry edits, or filenames here,
 # also update scripts/uninstall.ps1 AND
 # crates/atomcode-core/src/uninstall/paths.rs. The CI parity test guards
 # the manifest, but binary path / PATH edit are not checked.
 
+param(
+  [string]$Invite = ""
+)
+
 $ErrorActionPreference = "Stop"
 
-$Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.24.0" }
+# --- referral invite argument fallback ---
+if (-not $Invite) {
+  $Invite = $env:ATOMCODE_INVITE
+}
+
+# Fallback version used only when $env:ATOMCODE_VERSION is unset and the API lookup fails.
+$DefaultVersion = "v4.24.1"
 $RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
+$RepoLatestApi = "https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
 
 # --- detect arch ---
 # Prefer PROCESSOR_ARCHITEW6432 (set only when a 32-bit process runs on a 64-bit
@@ -34,6 +46,24 @@ switch ($RealArch) {
     }
 }
 
+# --- resolve version ---
+# Honor $env:ATOMCODE_VERSION if set; otherwise auto-detect the latest release
+# tag from the API, falling back to $DefaultVersion if the lookup yields nothing.
+if ($env:ATOMCODE_VERSION) {
+    $Version = $env:ATOMCODE_VERSION
+} else {
+    Write-Host "==> Detecting latest version"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
+        $Latest = Invoke-RestMethod -Uri $RepoLatestApi -UseBasicParsing -TimeoutSec 10
+        $Version = $Latest.tag_name
+    } catch {
+        $Version = $null
+    }
+    if (-not $Version) { $Version = $DefaultVersion }
+}
+
 $BinName = "atomcode-$Version-windows-$ArchTag.exe"
 $Url = "$RepoBase/$Version/$BinName"
 
@@ -47,6 +77,32 @@ $Prefix = if ($env:ATOMCODE_PREFIX) {
 if (-not (Test-Path $Prefix)) {
     New-Item -ItemType Directory -Path $Prefix -Force | Out-Null
 }
+
+# --- referral invite code handling ---
+if ($Invite) {
+  if ($Invite -match '^[A-Za-z0-9]{8}$') {
+    $AtomcodeDir = if ($env:ATOMCODE_HOME) {
+      $env:ATOMCODE_HOME
+    } else {
+      Join-Path $env:USERPROFILE ".atomcode"
+    }
+
+    New-Item -ItemType Directory -Force -Path $AtomcodeDir | Out-Null
+
+    $InstallUuid = [guid]::NewGuid().ToString()
+
+    $pendingInvite = @"
+invite_code=$Invite
+install_uuid=$InstallUuid
+attempted_at=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+"@
+
+    Set-Content -Path (Join-Path $AtomcodeDir "pending_invite") -Value $pendingInvite
+  } else {
+    Write-Warning "Invalid invite code format, skipping referral"
+  }
+}
+# --- end referral handling ---
 
 # --- download ---
 $Dest = Join-Path $Prefix "atomcode.exe"

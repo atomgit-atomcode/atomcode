@@ -21,7 +21,7 @@ const GROUPS = [
   { name: '概览',   slugs: ['index'] },
   { name: '开始',   slugs: ['getting-started', 'login', 'configuration'] },
   { name: '使用',   slugs: ['basic-usage', 'slash-commands', 'keybindings', 'sessions'] },
-  { name: '进阶',   slugs: ['tools', 'skills', 'mcp', 'plugins', 'memory', 'project-instructions'] },
+  { name: '进阶',   slugs: ['tools', 'skills', 'mcp', 'plugins', 'memory', 'project-instructions', 'webui', 'webui-remote-access'] },
   { name: '运维',   slugs: ['faq'] },
 ];
 
