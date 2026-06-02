@@ -913,6 +913,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("+ {}  {}", name, desc)
                 }
             }
+            super::MenuKind::Skill => {
+                // Bare `<name>  <desc>` — no command prefix. Selection arrow
+                // only. Pad by display width so CJK names align (same logic
+                // as SlashCommand).
+                let name_width = unicode_width::UnicodeWidthStr::width(name);
+                let pad = 12usize.saturating_sub(name_width);
+                let padded = format!("{}{}", name, " ".repeat(pad));
+                if selected {
+                    format!("▸ {}  {}", padded, desc)
+                } else {
+                    format!("  {}  {}", padded, desc)
+                }
+            }
         };
 
         let style = if selected {

@@ -1741,6 +1741,80 @@ mod menu_tests {
         );
     }
 
+    #[test]
+    fn build_skill_menu_items_lists_unique_bare_names() {
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        skills.register(skill_fixture("skills:hidden", "no", false));
+        let lock = std::sync::RwLock::new(skills);
+
+        let all = build_skill_menu_items(Some(&lock), "");
+        assert!(all.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(all.iter().any(|(n, _)| n == "web-access"));
+        assert!(!all.iter().any(|(n, _)| n == "hidden"));
+
+        let filtered = build_skill_menu_items(Some(&lock), "bra");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "brainstorming");
+
+        assert!(build_skill_menu_items(Some(&lock), "zz").is_empty());
+        assert!(build_skill_menu_items(None, "").is_empty());
+    }
+
+    #[test]
+    fn dollar_trigger_lists_all_user_invocable_skills() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        skills.register(skill_fixture("skills:hidden", "no", false));
+        let lock = std::sync::RwLock::new(skills);
+
+        let items = build_menu_items("$", 0, &reg, &custom, Some(&lock), None)
+            .expect("$ must list skills");
+        assert!(items.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "web-access"));
+        assert!(!items.iter().any(|(n, _)| n == "hidden"));
+        for (n, _) in &items {
+            assert!(!n.contains('/'), "row leaked slash syntax: {}", n);
+        }
+    }
+
+    #[test]
+    fn dollar_trigger_filters_and_parity_with_skills_submode() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        let bra = build_menu_items("$bra", 0, &reg, &custom, Some(&lock), None)
+            .expect("filter must match");
+        assert_eq!(bra.len(), 1);
+        assert_eq!(bra[0].0, "brainstorming");
+
+        let via_dollar = build_menu_items("$web", 0, &reg, &custom, Some(&lock), None);
+        let via_slash = build_menu_items("/skills web", 0, &reg, &custom, Some(&lock), None);
+        assert_eq!(via_dollar, via_slash);
+
+        assert!(build_menu_items("$zz", 0, &reg, &custom, Some(&lock), None).is_none());
+    }
+
+    #[test]
+    fn dollar_trigger_only_at_start_and_closes_on_space() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        assert!(build_menu_items("hi $bra", 0, &reg, &custom, Some(&lock), None).is_none());
+        assert!(build_menu_items("$brainstorming ", 0, &reg, &custom, Some(&lock), None).is_none());
+    }
+
     // Regression: HistoryPrev used to leave the cursor at end-of-text,
     // so a recalled `/session foo` from history would `is_in_history()`
     // true AND have the slash prefix — without the call-site gate, the
@@ -2149,6 +2223,17 @@ mod menu_tests {
         assert_eq!(line, "describe [Image #1]"); // first paste this session
         assert_eq!(state.pending_image_markers, vec![1]);
         assert!(line.contains("[Image #1]"), "marker survives in line for the survival filter");
+    }
+
+    #[test]
+    fn parse_dollar_line_splits_name_and_args() {
+        assert_eq!(parse_dollar_line("$brainstorming"), Some(("brainstorming".to_string(), String::new())));
+        assert_eq!(parse_dollar_line("$brainstorming why is X"), Some(("brainstorming".to_string(), "why is X".to_string())));
+        assert_eq!(parse_dollar_line("$brainstorming  spaced "), Some(("brainstorming".to_string(), "spaced".to_string())));
+        assert_eq!(parse_dollar_line("hello"), None);
+        assert_eq!(parse_dollar_line("/skills x"), None);
+        assert_eq!(parse_dollar_line("$"), None);
+        assert_eq!(parse_dollar_line("$   "), None);
     }
 }
 
@@ -4269,6 +4354,66 @@ pub use crate::modals::SessionPicker;
 // existing call sites (execute_slash_command).
 pub use crate::modals::ProviderWizard;
 
+/// Parse a committed `$<name> [args]` line into `(name, args)`. Returns `None`
+/// when the line is not `$`-prefixed or carries no skill name. Mirrors
+/// `parse_slash_line` but for the `$` skills trigger.
+fn parse_dollar_line(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix('$')?;
+    let trimmed = rest.trim_start();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("");
+    if name.is_empty() {
+        return None;
+    }
+    let args = parts.next().unwrap_or("").trim();
+    Some((name.to_string(), args.to_string()))
+}
+
+/// Build the second-level skills palette: user-invocable skills whose bare
+/// name or fully-qualified `<ns>:<name>` starts with `prefix_lower`. A bare
+/// name is shown when it is unique across the registry; otherwise the
+/// qualified name is shown to disambiguate. Sorted for stable navigation.
+/// Shared by the `/skills ` sub-mode and the `$` trigger so both stay in lockstep.
+fn build_skill_menu_items(
+    skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    prefix_lower: &str,
+) -> Vec<(String, String)> {
+    let mut items: Vec<(String, String)> = Vec::new();
+    if let Some(reg) = skill_registry {
+        if let Ok(reg) = reg.read() {
+            let skills: Vec<_> = reg.user_invocable().collect();
+            for skill in &skills {
+                let bare = skill
+                    .name
+                    .split_once(':')
+                    .map(|(_, s)| s)
+                    .unwrap_or(skill.name.as_str());
+                let full_lower = skill.name.to_ascii_lowercase();
+                let bare_lower = bare.to_ascii_lowercase();
+                if bare_lower.starts_with(prefix_lower) || full_lower.starts_with(prefix_lower) {
+                    let bare_is_unique = skills.iter().all(|other| {
+                        other.name == skill.name
+                            || other
+                                .name
+                                .split_once(':')
+                                .map(|(_, s)| s)
+                                .unwrap_or(other.name.as_str())
+                                != bare
+                    });
+                    let display = if bare_is_unique {
+                        bare.to_string()
+                    } else {
+                        skill.name.clone()
+                    };
+                    items.push((display, skill.description.clone()));
+                }
+            }
+        }
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+}
+
 /// Filter the command registry by the buf's prefix after '/'. Returns the
 /// (name, desc) pairs matching, or None if menu shouldn't show (buf doesn't
 /// start with '/' or has whitespace, meaning the user has moved on to args).
@@ -4303,6 +4448,19 @@ fn build_menu_items(
         );
     }
 
+    // `$`-trigger skills picker. A fast shortcut to the `/skills` palette:
+    // `$` at the start of the buffer lists user-invocable skills under bare
+    // names; `$bra` filters. A space (user typing args) closes the menu, the
+    // same way `/skills <name> ` does. Shares `build_skill_menu_items` with
+    // the `/skills ` sub-mode so contents stay identical.
+    if let Some(after) = buf.strip_prefix('$') {
+        if after.contains(char::is_whitespace) {
+            return None;
+        }
+        let items = build_skill_menu_items(skill_registry, &after.to_ascii_lowercase());
+        return if items.is_empty() { None } else { Some(items) };
+    }
+
     if !buf.starts_with('/') {
         return None;
     }
@@ -4320,51 +4478,10 @@ fn build_menu_items(
     // to `/skills <name>` so the `skills` arm in execute_slash_command
     // looks up `skills:<name>` in the registry and dispatches.
     if let Some(after) = buf.strip_prefix("/skills ") {
-        // Beyond the skill name (user typing skill args) — close menu.
         if after.contains(char::is_whitespace) {
             return None;
         }
-        let prefix_lower = after.to_ascii_lowercase();
-        let mut items: Vec<(String, String)> = Vec::new();
-        if let Some(reg) = skill_registry {
-            if let Ok(reg) = reg.read() {
-                let skills: Vec<_> = reg.user_invocable().collect();
-                for skill in &skills {
-                    // Match against either the bare suffix (`adapter-check…`)
-                    // or the full qualified name (`ascend-model-agent-plugin:
-                    // adapter-check…`). Bare match keeps the shorthand UX;
-                    // full match lets users narrow by plugin (`/ascend-`).
-                    let bare = skill
-                        .name
-                        .split_once(':')
-                        .map(|(_, s)| s)
-                        .unwrap_or(skill.name.as_str());
-                    let full_lower = skill.name.to_ascii_lowercase();
-                    let bare_lower = bare.to_ascii_lowercase();
-                    if bare_lower.starts_with(&prefix_lower)
-                        || full_lower.starts_with(&prefix_lower)
-                    {
-                        let bare_is_unique = skills.iter().all(|other| {
-                            other.name == skill.name
-                                || other
-                                    .name
-                                    .split_once(':')
-                                    .map(|(_, s)| s)
-                                    .unwrap_or(other.name.as_str())
-                                    != bare
-                        });
-                        let display = if bare_is_unique {
-                            bare.to_string()
-                        } else {
-                            skill.name.clone()
-                        };
-                        items.push((display, skill.description.clone()));
-                    }
-                }
-            }
-        }
-        // Stable order so navigation feels predictable across runs.
-        items.sort_by(|a, b| a.0.cmp(&b.0));
+        let items = build_skill_menu_items(skill_registry, &after.to_ascii_lowercase());
         return if items.is_empty() { None } else { Some(items) };
     }
 
@@ -4518,6 +4635,47 @@ fn handle_idle_key(
                 //     (once the arg is filled in) commits normally through
                 //     the regular BufferResult::Commit → execute_slash_command
                 //     path at the bottom of this function.
+
+                // `$`-mode: items carry bare skill names. Tab completes to
+                // `$name ` (review, then Enter); Enter invokes immediately.
+                if app.buf.text.starts_with('$') && !items.is_empty() {
+                    let name = items[app.menu.selected].0.clone();
+                    app.menu.selected = 0;
+                    if code == KeyCode::Tab {
+                        app.buf.text = format!("${} ", name);
+                        app.buf.cursor = app.buf.text.len();
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        return Ok(());
+                    }
+                    // Enter → invoke now via the shared skills arm.
+                    let committed = format!("${}", name);
+                    renderer.render(UiLine::ClearTransient);
+                    renderer.render(UiLine::User(committed.clone()));
+                    app.buf.text.clear();
+                    app.buf.cursor = 0;
+                    ctx.history.push(crate::input::history::HistoryEntry {
+                        text: committed.clone(),
+                        images: Vec::new(),
+                    });
+                    app.state.last_submitted_message = Some(committed.clone());
+                    execute_slash_command(
+                        "skills",
+                        &name,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        &mut app.active_modal,
+                        &mut app.fixissue_pending,
+                        &mut app.fixissue_buffer,
+                        &mut app.setup_pending,
+                    )?;
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        app.state.last_submitted_message = None;
+                        redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                    }
+                    return Ok(());
+                }
+
                 let name = items[app.menu.selected].0.clone();
                 let needs_args = ctx
                     .commands
@@ -4807,6 +4965,50 @@ fn handle_idle_key(
             // content". Mirrors the queue branch below which already
             // clears AFTER expansion.
             app.menu.selected = 0;
+            // `$<name> [args]` committed (Tab-parked then Enter, or typed in
+            // full). Resolve to a user-invocable skill and dispatch through the
+            // same `skills` arm as `/skills <name> <args>`; the user-visible
+            // echo stays `$name` so `/skills` never appears.
+            if let Some((skill_name, skill_args)) = parse_dollar_line(&line) {
+                let is_user_skill = ctx
+                    .skill_registry
+                    .read()
+                    .ok()
+                    .and_then(|r| r.get(&skill_name).map(|s| s.user_invocable))
+                    .unwrap_or(false);
+                if is_user_skill {
+                    renderer.render(UiLine::User(line.clone()));
+                    ctx.history.push(crate::input::history::HistoryEntry {
+                        text: line.clone(),
+                        images: Vec::new(),
+                    });
+                    app.state.last_submitted_message = Some(line.clone());
+                    let arg = if skill_args.is_empty() {
+                        skill_name.clone()
+                    } else {
+                        format!("{} {}", skill_name, skill_args)
+                    };
+                    execute_slash_command(
+                        "skills",
+                        &arg,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        &mut app.active_modal,
+                        &mut app.fixissue_pending,
+                        &mut app.fixissue_buffer,
+                        &mut app.setup_pending,
+                    )?;
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        app.state.last_submitted_message = None;
+                        redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                    }
+                    app.buf.clear_pastes();
+                    return Ok(());
+                }
+                // Not a known skill: fall through so `$foo` is sent as a
+                // normal message (e.g. "$5 budget" keeps working).
+            }
             // Only treat `/name …` as a slash command when `name` is
             // actually registered. Unrecognised `/foo …` (e.g. the user
             // typed `/test 文件下有哪些文件` meaning to *ask about*
@@ -5006,6 +5208,8 @@ fn redraw_with_menu(
 ) {
     let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
         crate::render::MenuKind::AtMention
+    } else if buf.text.starts_with('$') {
+        crate::render::MenuKind::Skill
     } else {
         crate::render::MenuKind::SlashCommand
     };
@@ -7107,6 +7311,8 @@ fn draw_spinner_now(
         let selected = menu_selected.min(items.len().saturating_sub(1));
         let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
             crate::render::MenuKind::AtMention
+        } else if buf.text.starts_with('$') {
+            crate::render::MenuKind::Skill
         } else {
             crate::render::MenuKind::SlashCommand
         };
