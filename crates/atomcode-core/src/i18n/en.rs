@@ -133,6 +133,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Image in clipboard · ctrl+v to paste".into(),
         Msg::StatusClipboardImageHintSlash =>
             "Image in clipboard · /paste".into(),
+        Msg::StatusWebuiHint =>
+            "Tips: Use /webui to open AtomCode in your browser".into(),
 
         // ── /status command body ──
         Msg::StatusBody { model, dir, config, tokens } =>
@@ -368,6 +370,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "to claim a free token quota".into(),
         Msg::IdleHintCodingplanFull =>
             "/login  to claim a free token quota".into(),
+        Msg::IdleHintWebui => "/webui".into(),
+        Msg::IdleHintWebuiSuffix =>
+            "open a synced session in the browser".into(),
+        Msg::IdleHintWebuiFull =>
+            "/webui  open a synced session in the browser".into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>
@@ -741,6 +748,7 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),
 
         // ── Command descriptions ──
+        Msg::CmdDescWebui => "Launch the browser webui (subcommands: stop, lan, --host <addr>)".into(),
 Msg::CmdDescSetup =>
 "Scan project, install seeds, and run setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescResume => "Resume a previous session".into(),

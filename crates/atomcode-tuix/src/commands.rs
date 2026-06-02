@@ -71,6 +71,11 @@ impl CommandRegistry {
 
 const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false },
+    // needs_args=true so selecting it only completes to `/webui ` (does NOT
+    // launch) — lets the user append a subcommand (stop / lan / --host <addr>)
+    // before Enter. A bare `/webui ` + Enter still launches on 127.0.0.1.
+    Command { name: "webui",   desc: "Launch the browser webui (subcommands: stop, lan, --host <addr>)", needs_args: true },
+    Command { name: "sync",    desc: "Attach to live webui session (/sync off to detach)", needs_args: false },
     Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
     Command { name: "rename",  desc: "Rename current session", needs_args: true },
@@ -131,6 +136,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
 pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
     use crate::i18n::{t, Msg};
     let msg = match name {
+        "webui" => Msg::CmdDescWebui,
         "setup" => Msg::CmdDescSetup,
         "resume" => Msg::CmdDescResume,
         "rename" => Msg::CmdDescRename,

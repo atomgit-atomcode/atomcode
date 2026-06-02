@@ -843,6 +843,7 @@ mod tests {
 
     // ── Helpers ────────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn test_ctx() -> HookContext {
         HookContext {
             event: "pre_tool_use".to_string(),
@@ -855,6 +856,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_hook(event: HookEvent, matcher: Option<&str>, cmd: &str) -> HookConfig {
         HookConfig {
             event,

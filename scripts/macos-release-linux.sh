@@ -63,6 +63,15 @@ mkdir -p "$DIST"
 echo "=== AtomCode Linux Release ${VERSION} (cross-compile from macOS) ==="
 echo ""
 
+# Build the embedded webui frontend so the binary embeds the latest UI.
+if [ -d "$ROOT/webui" ] && command -v npm >/dev/null 2>&1; then
+  echo "Building webui frontend..."
+  (cd "$ROOT/webui" && npm ci && npm run build)
+else
+  echo "warning: skipping webui build (npm not found or webui/ missing); using committed webui/dist" >&2
+fi
+echo ""
+
 # Step 1: Select target architecture
 echo "请选择目标架构："
 echo "  1) Linux x64 (x86_64-unknown-linux-musl)"

@@ -47,10 +47,18 @@ fn render_welcome(renderer: &mut dyn Renderer, ctx: &LoopCtx) {
     });
 }
 
-fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
+pub(crate) fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
     if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
         ctx.telemetry.set_session_id(uuid);
     }
+    // Mirror the session's persistent id onto the agent so the
+    // `x-atomcode-session-id` header tracks the conversation identity —
+    // resuming a saved session reuses its original id for gateway prefix-
+    // cache affinity, instead of minting a fresh per-process uuid.
+    ctx.agent
+        .cmd_tx
+        .send(AgentCommand::SetSessionId(session.id.as_str().to_string()))
+        .ok();
 }
 
 /// Scan session messages for a pending tool approval — an
@@ -199,6 +207,83 @@ fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
         }
     }
     out
+}
+
+/// 把 TUI 附着到指定的 LiveSession（回放快照 + 启动转发器 + 渲染确认）。
+/// 供 `/webui` 自动附着和 `/sync` 手动附着共用，不重复逻辑。
+fn attach_live_session(
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    session: std::sync::Arc<atomcode_core::live::LiveSession>,
+) {
+    // 幂等附着：先终止已有的转发器，否则旧任务仍订阅同一广播、同样投进
+    // runtime_event_tx，导致每个 LiveEvent 被渲染两次（输入回显、文本增量、
+    // 工具调用全部重复）。tokio 里 drop JoinHandle 只会分离任务、不会取消，
+    // 所以必须显式 abort 后再 spawn 新转发器。
+    if let Some(h) = ctx.sync_forwarder.take() {
+        h.abort();
+    }
+    // 回放快照：渲染既有消息。
+    let snapshot: Vec<atomcode_core::conversation::message::Message> =
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(session.snapshot())
+        });
+    {
+        use atomcode_core::conversation::message::{MessageContent, Role};
+        renderer.render(UiLine::TurnSeparator {
+            label: "— 同步快照 —".to_string(),
+        });
+        for m in &snapshot {
+            match (&m.role, &m.content) {
+                (Role::User, MessageContent::Text(s)) => {
+                    renderer.render(UiLine::User(s.clone()));
+                }
+                (Role::Assistant, MessageContent::Text(s)) => {
+                    if !s.is_empty() {
+                        renderer.render(UiLine::AssistantText(s.clone()));
+                        renderer.render(UiLine::AssistantLineBreak);
+                    }
+                }
+                (
+                    Role::Assistant,
+                    MessageContent::AssistantWithToolCalls { text, tool_calls, .. },
+                ) => {
+                    if let Some(t) = text {
+                        if !t.is_empty() {
+                            renderer.render(UiLine::AssistantText(t.clone()));
+                            renderer.render(UiLine::AssistantLineBreak);
+                        }
+                    }
+                    for tc in tool_calls {
+                        renderer.render(UiLine::ToolCall {
+                            name: tc.name.clone(),
+                            detail: super::format_tool_detail(&tc.name, &tc.arguments),
+                        });
+                    }
+                }
+                (Role::Tool, MessageContent::ToolResult(r)) => {
+                    renderer.render(UiLine::ToolResult {
+                        success: r.success,
+                        summary: super::summarise(&r.output, r.success),
+                    });
+                }
+                _ => {}
+            }
+        }
+        renderer.render(UiLine::TurnSeparator {
+            label: "— 同步快照结束 —".to_string(),
+        });
+    }
+    let handle = super::live_sync::spawn_live_forwarder(
+        session.clone(),
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    );
+    ctx.sync_forwarder = Some(handle);
+    ctx.sync_session = Some(session);
+    renderer.render(UiLine::CommandOutput(
+        "已同步当前会话（与浏览器实时互通）".to_string(),
+    ));
 }
 
 pub(super) fn execute_slash_command(
@@ -487,10 +572,10 @@ pub(super) fn execute_slash_command(
                 atomcode_core::session::Session::default_session(ctx.working_dir.clone());
             ctx.bg_manager
                 .set_foreground_session(ctx.current_session.clone());
-            // Bind telemetry session_id to the new session's UUID.
-            if let Ok(uuid) = uuid::Uuid::parse_str(ctx.current_session.id.as_str()) {
-                ctx.telemetry.set_session_id(uuid);
-            }
+            // Bind telemetry + agent session id to the new session's UUID
+            // (the ClearConversation above intentionally leaves the id alone;
+            // this is the single source of truth).
+            bind_telemetry_to_session(ctx, &ctx.current_session);
             // `reset()` wipes the terminal AND the renderer's cached
             // footer/stream state, so the next Welcome renders against
             // a known (row 1, col 1) anchor. This is what makes
@@ -752,6 +837,72 @@ pub(super) fn execute_slash_command(
         }
         "memory" => {
             ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
+        }
+        "webui" => {
+            let a = arg.trim();
+            let msg = if a == "stop" {
+                // 同步停止，无需 block_on。
+                atomcode_daemon::stop_server()
+            } else {
+                // 解析绑定地址：默认 127.0.0.1；支持 `--host <addr>` / `--host=<addr>`，
+                // 以及快捷词 `lan`（= 0.0.0.0，暴露到局域网/外网）。
+                fn parse_host(a: &str) -> String {
+                    if a == "lan" || a == "0.0.0.0" {
+                        return "0.0.0.0".to_string();
+                    }
+                    let toks: Vec<&str> = a.split_whitespace().collect();
+                    for (i, tok) in toks.iter().enumerate() {
+                        if let Some(v) = tok.strip_prefix("--host=") {
+                            if !v.is_empty() {
+                                return v.to_string();
+                            }
+                        }
+                        if *tok == "--host" {
+                            if let Some(v) = toks.get(i + 1) {
+                                return v.to_string();
+                            }
+                        }
+                    }
+                    "127.0.0.1".to_string()
+                }
+                let host = parse_host(a);
+                let open_msg = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(atomcode_daemon::ensure_server_and_open(&host, 13456, true))
+                });
+                // 自动附着：建立（或取得已有的）LiveSession，并把 TUI 接入同步。
+                let session = atomcode_daemon::ensure_live_session(
+                    ctx.working_dir.clone(),
+                    ctx.telemetry.clone(),
+                );
+                attach_live_session(ctx, renderer, session);
+                open_msg
+            };
+            renderer.render(UiLine::CommandOutput(msg));
+            renderer.flush();
+        }
+        "sync" => {
+            if arg.trim() == "off" {
+                if let Some(h) = ctx.sync_forwarder.take() {
+                    h.abort();
+                }
+                ctx.sync_session = None;
+                renderer.render(UiLine::CommandOutput(
+                    "已退出同步，回到独立会话".to_string(),
+                ));
+            } else {
+                match atomcode_daemon::current_live_session() {
+                    Some(session) => {
+                        attach_live_session(ctx, renderer, session);
+                    }
+                    None => {
+                        renderer.render(UiLine::CommandOutput(
+                            "没有活动的 webui 会话，请先运行 /webui".to_string(),
+                        ));
+                    }
+                }
+            }
+            renderer.flush();
         }
         "login" => {
             run_login_flow(renderer, ctx)?;

@@ -169,6 +169,15 @@ echo "Artifacts: ${DIST}"
 echo "Targets: ${ATOMCODE_WINDOWS_TARGETS:-x64}"
 echo ""
 
+# Build the embedded webui frontend so the binary embeds the latest UI.
+if [ -d webui ] && command -v npm >/dev/null 2>&1; then
+  echo "Building webui frontend..."
+  (cd webui && npm ci && npm run build)
+else
+  echo "warning: skipping webui build (npm not found or webui/ missing); using committed webui/dist" >&2
+fi
+echo ""
+
 if want_target x64; then
     build_windows_x64
 fi

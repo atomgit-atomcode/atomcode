@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>WebUI 界面 · AtomCode 文档</title>
+<meta name="description" content="AtomCode 的浏览器界面：用 /webui 一键启动，在浏览器里聊天、管理会话与模型配置，并通过 /sync 多端实时同步。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="webui">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.24.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>WebUI 界面</h1>
+      <p class="lede">除了终端 TUI，AtomCode 还内置一个<strong>浏览器界面</strong>：在 TUI 里输入 <code>/webui</code> 即可一键启动，在浏览器里聊天、翻看历史会话、增删改模型配置、上传图片，并通过 <code>/sync</code> 让终端与浏览器<strong>实时同步</strong>同一个会话。它复用本机的登录态、模型与会话历史，不需要另外配置。</p>
+
+      <h2>启动与关闭</h2>
+      <p>在 AtomCode 的 TUI 输入框里运行：</p>
+      <pre><code># 启动 webui 并自动打开浏览器（默认绑定 127.0.0.1:13456，仅本机可访问）
+/webui
+
+# 关闭 webui 服务
+/webui stop</code></pre>
+      <p>启动后 AtomCode 会在本机起一个 HTTP 服务，并自动打开浏览器到形如 <code>http://127.0.0.1:13456/?token=&lt;一次性令牌&gt;</code> 的地址。URL 里带的 <code>token</code> 用于鉴权，<strong>等同于密码</strong>，请勿外传。同时，当前 TUI 会话会自动接入实时同步（见下文 <a href="#多端实时同步">多端实时同步</a>）。</p>
+
+      <div class="callout callout-warn">
+        <strong>默认只监听本机</strong>
+        <p>webui 默认绑定 <code>127.0.0.1</code>，只有本机能访问。要让手机等设备访问，<strong>不要</strong>直接用 <code>--host 0.0.0.0</code> 暴露到公网，请走蒲公英虚拟局域网方案 —— 见 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
+      </div>
+
+      <h2>界面功能</h2>
+      <p>浏览器界面把终端里的能力搬到了图形界面上，主要包括：</p>
+      <table>
+        <thead>
+          <tr><th>区域</th><th>能做什么</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>侧边栏</td><td>按项目分组的历史会话列表、搜索会话、新建对话、重命名 / 删除会话；可收起为图标栏，移动端为抽屉。</td></tr>
+          <tr><td>模型选择器</td><td>输入框下方直接切换 provider / 模型；同名模型会附带 provider 标识消歧。</td></tr>
+          <tr><td>模型配置</td><td>设置里增 / 删 / 改 provider：名称、类型（openai / claude / ollama）、模型、Base URL、API Key、上下文窗口，以及设为默认。</td></tr>
+          <tr><td>设置</td><td>主题（浅色 / 深色）、语言（中 / 英）、模型配置、远程访问入口。</td></tr>
+          <tr><td>图片附件</td><td>粘贴或选择图片随消息发送（单张上限 2MB），非视觉模型走 VL 兜底；历史里显示缩略图。</td></tr>
+          <tr><td>工具执行</td><td>实时展示工具调用的参数与输出，可逐行展开查看，历史回看同样可见。</td></tr>
+          <tr><td>附件菜单（+）</td><td>上传图片、选择文件作为上下文、插入技能（Skills）。</td></tr>
+          <tr><td>工作目录</td><td>切换工作目录、浏览目录、新建文件夹、设为默认工作目录。</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="多端实时同步">多端实时同步</h2>
+      <p>webui 背后是一个 <strong>LiveSession</strong>：同一个会话可以同时被终端和多个浏览器标签页打开，任意一端的输入、AI 的增量回复、工具调用结果都会<strong>实时广播</strong>到所有连接的视图，晚加入的一端还会先收到快照回放。</p>
+      <ul>
+        <li>运行 <code>/webui</code> 时，当前 TUI 会话会<strong>自动接入</strong>同步 —— 你在终端发的消息会出现在浏览器里，反之亦然。</li>
+        <li>在<strong>另一个</strong> TUI 里运行 <code>/sync</code>，即可接入当前正在运行的 webui 会话（需先有 <code>/webui</code> 在跑）。</li>
+        <li><code>/sync off</code> —— 退出同步，回到独立会话。</li>
+      </ul>
+      <p>这让「终端里发起、手机 / 平板上盯进度」或「多人围观同一个 agent 会话」成为可能。</p>
+
+      <h2>远程访问</h2>
+      <p>想从手机等设备打开 webui，又不暴露公网？借助蒲公英（Oray PGY）组建的虚拟局域网，用 <code>/webui --host &lt;虚拟 IP&gt;</code> 把服务绑定到虚拟 IP，再在「远程访问」面板扫码即可。完整流程见 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./webui-remote-access.html">远程访问指南</a> —— 用蒲公英从手机安全打开 webui</li>
+        <li><a href="./headless-daemon.html">Headless 与 Daemon</a> —— webui 背后的 daemon 与 HTTP/SSE 接口</li>
+        <li><a href="./slash-commands.html">斜杠命令</a> —— <code>/webui</code>、<code>/sync</code> 等命令速查</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

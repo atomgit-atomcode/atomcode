@@ -80,6 +80,15 @@ build_daemon() {
 echo "=== AtomCode Daemon Release ${VERSION} ==="
 echo ""
 
+# Build the embedded webui frontend so the binary embeds the latest UI.
+if [ -d webui ] && command -v npm >/dev/null 2>&1; then
+  echo "Building webui frontend..."
+  (cd webui && npm ci && npm run build)
+else
+  echo "warning: skipping webui build (npm not found or webui/ missing); using committed webui/dist" >&2
+fi
+echo ""
+
 build_daemon "aarch64-apple-darwin" "darwin-arm64"
 build_daemon "x86_64-apple-darwin" "darwin-x64"
 

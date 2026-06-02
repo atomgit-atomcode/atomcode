@@ -545,6 +545,15 @@ enum Commands {
         #[arg(long)]
         client: Option<String>,
     },
+    /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
+    Webui {
+        /// 端口（默认 13456）
+        #[arg(long, default_value = "13456")]
+        port: u16,
+        /// 绑定地址（默认 127.0.0.1；用 0.0.0.0 暴露到局域网/外网，注意仅 token 保护、无 TLS）
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
     /// Telemetry controls
     Telemetry {
         #[command(subcommand)]
@@ -867,8 +876,11 @@ async fn run() -> Result<i32> {
         }
     }
 
-    let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
+    let telemetry = Telemetry::init(resolved.clone(), env!("CARGO_PKG_VERSION").into());
     install_panic_hook(telemetry.clone());
+
+    // Emit install_completed if this is the first launch after a referral install
+    telemetry.maybe_emit_install_completed(&resolved.atomcode_dir);
     // ── End telemetry init ────────────────────────────────────────────────────
 
     // Handle subcommands. Most are self-contained (`handle_command` runs
@@ -909,7 +921,9 @@ async fn run() -> Result<i32> {
                     ..CurrentContext::current()
                 };
                 let outcome = CurrentContext::scope(scope_ctx, || async {
-                    telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: cli.dangerously_skip_permissions });
+                    telemetry.track(Event::OpenAtomcode {
+                        dangerously_skip_permissions: cli.dangerously_skip_permissions,
+                    });
                     run_codingplan_core(Some(&telemetry))
                 })
                 .await;
@@ -976,9 +990,7 @@ async fn run() -> Result<i32> {
                         if let Some(ref c) = client {
                             cmd.arg("--client").arg(c);
                         }
-                        let status = cmd
-                            .status()
-                            .context("Failed to start atomcode-daemon")?;
+                        let status = cmd.status().context("Failed to start atomcode-daemon")?;
                         return Ok(if status.success() { 0 } else { 1 });
                     }
                     None => {
@@ -987,6 +999,14 @@ async fn run() -> Result<i32> {
                         return Ok(1);
                     }
                 }
+            }
+            Commands::Webui { port, host } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let msg = atomcode_daemon::ensure_server_and_open(&host, port, false).await;
+                eprintln!("{msg}");
+                // server 是后台 task；保持进程存活直到用户 Ctrl+C
+                let _ = tokio::signal::ctrl_c().await;
+                return Ok(0);
             }
             Commands::Telemetry { action } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -1048,7 +1068,7 @@ async fn run() -> Result<i32> {
                 vision_preprocessor_provider: None,
                 language: None,
                 ui: Default::default(),
-            plugin: Default::default(),
+                plugin: Default::default(),
             }
         })
     } else {
@@ -1072,10 +1092,7 @@ async fn run() -> Result<i32> {
     };
 
     // ── i18n locale ──
-    let locale = atomcode_tuix::i18n::resolve_initial_locale(
-        cli.lang.as_deref(),
-        config.language,
-    );
+    let locale = atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
     atomcode_tuix::i18n::set_locale(locale);
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
@@ -1406,12 +1423,22 @@ async fn run() -> Result<i32> {
     } else {
         SessionMode::Tui
     };
-    // Bind telemetry session_id to the AtomCode session's UUID (if a session is available).
-    // This means events from this process run are correlated to the actual session file.
-    // If no session exists yet, session_id stays as launch_id (the default).
+    // Bind telemetry to the continued session's id (if any). A fresh run needs
+    // nothing here: the agent bootstraps telemetry + header + datalog from its
+    // own session id. The TUI manages its own binding via
+    // `bind_telemetry_to_session`.
     if let Some(ref s) = session_to_continue {
         if let Ok(uuid) = uuid::Uuid::parse_str(s.id.as_str()) {
             telemetry.set_session_id(uuid);
+        }
+        // Headless `-c`: the TUI rebinds itself, so only push to the agent
+        // here, so the continued session's id reaches the header + datalog.
+        if effective_prompt.is_some() {
+            agent_handle
+                .client
+                .cmd_tx
+                .send(AgentCommand::SetSessionId(s.id.as_str().to_string()))
+                .ok();
         }
     }
     let scope_ctx = CurrentContext {
@@ -1566,10 +1593,7 @@ fn redirect_stderr_to_log_file() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let marker = format!("\n--- atomcode session start (unix={epoch_secs}) ---\n");
-    let _ = std::io::Write::write_all(
-        &mut std::io::BufWriter::new(&file),
-        marker.as_bytes(),
-    );
+    let _ = std::io::Write::write_all(&mut std::io::BufWriter::new(&file), marker.as_bytes());
     // SAFETY: dup2 swaps the file descriptor table entry for fd 2
     // to point at `file`'s underlying fd. This is a standard, safe
     // operation; the worst case (dup2 fails) is the redirect doesn't
@@ -1623,7 +1647,10 @@ async fn run_headless(
     // should never reach this loop — but the log line gives the user a
     // clear signal that the flag is in effect.
     if skip_permissions {
-        eprintln!("{}", atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless));
+        eprintln!(
+            "{}",
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless)
+        );
     }
 
     let notifications = agent_loop.config.notifications.clone();
@@ -1948,10 +1975,16 @@ async fn run_headless(
             // still see that VL ran. Char count helps spot degenerate
             // outputs.
             AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
-                eprintln!("[vl-preprocess ok provider={} chars={}]", vl_key, char_count);
+                eprintln!(
+                    "[vl-preprocess ok provider={} chars={}]",
+                    vl_key, char_count
+                );
             }
             AgentEvent::MessagesSync { .. } => {
                 // Only used by TUI for /bg session persistence; ignore in CLI.
+            }
+            AgentEvent::UserEcho(_) | AgentEvent::PeerBusy(_) => {
+                // Live-sync only — not applicable in headless CLI.
             }
         }
     }
@@ -2058,6 +2091,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Daemon { .. } => {
             unreachable!("Daemon is handled inline in run() before handle_command")
+        }
+        Commands::Webui { .. } => {
+            unreachable!("Webui is handled inline in run() before handle_command")
         }
         Commands::Setup { .. } => {
             unreachable!("Setup is handled inline in run() before handle_command")
@@ -2202,16 +2238,25 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                     println!("  {:<30} {:>5}", "PostToolExecution", stats.post_tool_hooks);
                 }
                 if stats.on_tool_call_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnToolCallStart", stats.on_tool_call_start_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnToolCallStart", stats.on_tool_call_start_hooks
+                    );
                 }
                 if stats.post_turn_hooks > 0 {
                     println!("  {:<30} {:>5}", "PostTurn (legacy)", stats.post_turn_hooks);
                 }
                 if stats.on_model_response_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnModelResponse", stats.on_model_response_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnModelResponse", stats.on_model_response_hooks
+                    );
                 }
                 if stats.on_session_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnSessionStart", stats.on_session_start_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnSessionStart", stats.on_session_start_hooks
+                    );
                 }
                 if stats.on_session_end_hooks > 0 {
                     println!("  {:<30} {:>5}", "OnSessionEnd", stats.on_session_end_hooks);
@@ -2264,7 +2309,11 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
             if let Ok(cwd) = std::env::current_dir() {
                 let project_config = cwd.join(".atomcode").join("hooks").join("hooks.toml");
-                let exists = if project_config.exists() { "✓" } else { "✗" };
+                let exists = if project_config.exists() {
+                    "✓"
+                } else {
+                    "✗"
+                };
                 println!("  {} Project config:  {}", exists, project_config.display());
             }
 
@@ -2282,7 +2331,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
 /// Dispatch `atomcode plugin ...` subcommands. Each branch calls the same
 /// `atomcode_core::plugin::*` API the TUI's `/plugin` slash command uses, so
-    /// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
+/// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
 fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
     use atomcode_core::plugin::{installer, marketplace};
     match sub {
@@ -2611,12 +2660,15 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
             error_kind: Some("panic".to_string()),
-            error_data: Some(serde_json::json!({
-                "session_duration_secs": telemetry.uptime().as_secs() as u32,
-                "turns_completed": null,
-                "last_tool_name": null,
-                "last_event": null,
-            }).to_string()),
+            error_data: Some(
+                serde_json::json!({
+                    "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                    "turns_completed": null,
+                    "last_tool_name": null,
+                    "last_event": null,
+                })
+                .to_string(),
+            ),
         });
         default_hook(info);
     }));
@@ -2847,7 +2899,10 @@ mod tests {
         // Now a non-reasoning event arrives → close, then emit it.
         close_thinking_chunk(&mut buf, &mut open);
         buf.push_str("[tool→ read_file]\n");
-        assert_eq!(buf, "[thinking] I should check the file\n[tool→ read_file]\n");
+        assert_eq!(
+            buf,
+            "[thinking] I should check the file\n[tool→ read_file]\n"
+        );
     }
 
     // ── is_auth_gap_error ────────────────────────────────────────────

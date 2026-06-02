@@ -235,6 +235,7 @@ impl TurnRunner {
                 context_window,
                 0, // step — always 0 in calls.log today; step param
                 // kept for future per-tool-call correlation.
+                &self.provider.session_id(),
                 self.config.datalog.enabled,
             )
         };

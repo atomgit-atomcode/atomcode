@@ -1,17 +1,9 @@
 //! Webhook 测试
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use async_trait::async_trait;
-use tokio::sync::Mutex;
 
-use atomcode_core::hook::{
-    Hook, HookContext, HookResult, ToolResultContext,
-    UserMessageContext, TurnStartContext, TurnCompleteContext,
-    ToolCallStartContext, ErrorContext, SessionContext,
-};
+use atomcode_core::hook::Hook;
 use atomcode_core::hook::webhook::{WebhookHook, WebhookConfig};
 
 /// 测试用的 Mock HTTP 服务器（使用 wiremock）

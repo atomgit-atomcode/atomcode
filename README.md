@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.24.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -110,6 +110,12 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Bracketed paste** — long paste content collapsed to a compact indicator
 - **Skills** — user-defined commands loaded from your skill directory, invoked like any slash command
 
+### Web UI
+
+- **`/webui`** (in the TUI) or **`atomcode webui`** (CLI) launches a local browser UI as an alternative to the terminal interface — same agent, same sessions, rendered in your browser
+- **Loopback only** — the server binds to `127.0.0.1` and uses a one-time token; nothing is exposed to the network
+- **`/webui stop`** stops the in-process server (a later `/webui` restarts it)
+
 ### Safety
 
 - **Destructive command detection** — `rm -rf`, `git push --force`, `DROP TABLE`, etc. require explicit approval
@@ -148,6 +154,18 @@ cargo build --release
 ```
 
 and the binary will be generated at `target/release/atomcode`.
+
+### Package Managers
+
+AtomCode CLI can also be installed via the following package managers:
+
+```bash
+# Install using npm
+npm install -g @atomgit.com/atomcode
+
+# Install using Homebrew
+brew install --cask atomcode
+```
 
 ### Requirements
 

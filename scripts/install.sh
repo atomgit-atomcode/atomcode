@@ -50,6 +50,49 @@ else
 fi
 mkdir -p "$PREFIX"
 
+# --- referral invite code handling ---
+# Priority: env var > --invite= arg
+INVITE="${ATOMCODE_INVITE:-}"
+
+# Parse --invite=ABC12345 or --invite ABC12345 from command-line arguments.
+# Use while+shift instead of for+shift — for iterates a snapshot of $@.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --invite=*) INVITE="${1#*=}"; shift ;;
+    --invite)   shift; INVITE="$1"; shift ;;
+    *)          shift ;;
+  esac
+done
+
+if [ -n "$INVITE" ]; then
+  ATOMCODE_DIR="${ATOMCODE_HOME:-$HOME/.atomcode}"
+  mkdir -p "$ATOMCODE_DIR"
+
+  # Generate install_uuid (prefer uuidgen, fallback to /proc or /dev/urandom)
+  INSTALL_UUID=""
+  if command -v uuidgen >/dev/null 2>&1; then
+    INSTALL_UUID="$(uuidgen)"
+  elif [ -f /proc/sys/kernel/random/uuid ]; then
+    INSTALL_UUID="$(cat /proc/sys/kernel/random/uuid)"
+  else
+    # Fallback: read raw bytes and format as UUID without relying on od word order.
+    INSTALL_HEX="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    INSTALL_UUID="$(printf '%s' "$INSTALL_HEX" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/')"
+  fi
+
+  # Validate invite code: 8 alphanumeric chars
+  if echo "$INVITE" | grep -qE '^[A-Za-z0-9]{8}$'; then
+    cat > "$ATOMCODE_DIR/pending_invite" <<EOF
+invite_code=${INVITE}
+install_uuid=${INSTALL_UUID}
+attempted_at=$(date +%s)
+EOF
+  else
+    echo "Warning: invalid invite code format, skipping referral" >&2
+  fi
+fi
+# --- end referral handling ---
+
 # --- download ---
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

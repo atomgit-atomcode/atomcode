@@ -134,6 +134,10 @@ pub enum Msg<'a> {
     /// user to fall back on the `/paste` slash command, which works
     /// in every terminal regardless of host keybinds.
     StatusClipboardImageHintSlash,
+    /// Lowest-priority status-row fallback: nudge the user toward the
+    /// `/webui` command (browser UI) when no higher-priority hint
+    /// (warnings / usage / upgrade) is competing for the slot.
+    StatusWebuiHint,
 
     // ── /status command body ──
     StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },
@@ -270,6 +274,12 @@ pub enum Msg<'a> {
     IdleHintCodingplanSuffix,
     /// Complete plain-text version: "/codingplan  to claim a free token quota"
     IdleHintCodingplanFull,
+    /// "/webui" command label
+    IdleHintWebui,
+    /// "open a synced session in the browser" (text after /webui)
+    IdleHintWebuiSuffix,
+    /// Complete plain-text version: "/webui  open a synced session in the browser"
+    IdleHintWebuiFull,
 
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,
@@ -534,6 +544,7 @@ pub enum Msg<'a> {
     SetupAutoReloaded { skills: usize, warnings: usize },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
+    CmdDescWebui,
     CmdDescSetup,
     CmdDescResume,
     CmdDescRename,

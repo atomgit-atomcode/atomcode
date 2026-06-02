@@ -61,6 +61,8 @@
     <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
     <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
     <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
   </div>
 
   <div class="dside-group">
@@ -168,6 +170,21 @@
       </table>
       <p>Full configuration and usage at <a href="./mcp.html">MCP Integration</a>.</p>
 
+      <h2>Web UI &amp; sync</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>What it does</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/webui</code></td><td>Launch the browser interface and open it (binds <code>127.0.0.1:13456</code> by default — local only). The current TUI session is attached to live sync automatically</td></tr>
+          <tr><td><code>/webui --host &lt;addr&gt;</code></td><td>Bind the server to a given address; <code>/webui lan</code> equals <code>--host 0.0.0.0</code> (exposes it to the LAN). Pair with a 蒲公英 virtual IP for remote access — see <a href="./webui-remote-access.html">Remote Access</a></td></tr>
+          <tr><td><code>/webui stop</code></td><td>Stop the webui server</td></tr>
+          <tr><td><code>/sync</code></td><td>Attach the current TUI to a running webui session (run <code>/webui</code> first). Both ends sync live in both directions; multiple browsers / terminals can watch the same session</td></tr>
+          <tr><td><code>/sync off</code></td><td>Leave sync and return to a standalone session</td></tr>
+        </tbody>
+      </table>
+      <p>More in <a href="./webui.html">Web UI</a>.</p>
+
       <h2>Config &amp; help</h2>
       <table>
         <thead>
@@ -182,6 +199,7 @@
           <tr><td><code>/welcome</code></td><td>Re-open the 3-step first-run wizard (welcome → language → setup). Non-empty sessions are confirmed with a <code>y/N</code> before clearing the screen. Both language and default onboarding path can be revisited here</td></tr>
           <tr><td><code>/logout</code></td><td>Clear the AtomGit OAuth token</td></tr>
           <tr><td><code>/upgrade</code></td><td>Auto-upgrade to the latest version; <code>/upgrade rollback</code> reverts to the previous version</td></tr>
+          <tr><td><code>/guide</code></td><td>Built-in onboarding guide: <code>/guide</code> lists topics you can ask about (quickstart, switch model, MCP, Skills, memory, background tasks, context, keybindings, config); <code>/guide &lt;topic&gt;</code> explains it right in the chat (first run auto-installs the <code>atomcode-skills</code> plugin)</td></tr>
           <tr><td><code>/help</code></td><td>List every available slash command</td></tr>
           <tr><td><code>/keys</code></td><td>Show the keyboard-shortcut reference (grouped by input / history / session / modal navigation, with per-terminal compatibility notes for <code>Shift+Enter</code> and <code>Alt+Enter</code>). See <a href="./keybindings.html">Keybindings</a></td></tr>
           <tr><td><code>/quit</code></td><td>Exit atomcode (or hit <code>Ctrl+C</code> twice)</td></tr>
