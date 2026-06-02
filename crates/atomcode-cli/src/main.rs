@@ -1485,7 +1485,14 @@ async fn run() -> Result<i32> {
             // the user hasn't opted out via `auto_update = false` AND we're not
             // running as `atomcode.bak` (backup should stay pinned; see the
             // `is_running_as_backup` guard up top).
-            if config.auto_update && !is_running_as_backup() && !cli.dev {
+            // In distro-pm (HarmonyBrew) builds the package manager owns
+            // upgrades, so skip spawning the detached prep process entirely —
+            // `prepare_deferred_upgrade` would no-op anyway.
+            if config.auto_update
+                && !is_running_as_backup()
+                && !cli.dev
+                && !atomcode_core::self_update::is_package_managed()
+            {
                 spawn_detached_upgrade_prep();
             }
 
