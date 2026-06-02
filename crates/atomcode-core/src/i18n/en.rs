@@ -319,6 +319,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Failed to save session: {error}. The name was not persisted.").into(),
         Msg::SessionNoneSelected =>
             "No session selected".into(),
+        Msg::SessionDeleted { name } =>
+            format!("\"{name}\" deleted").into(),
+        Msg::SessionDeleteConfirm { name } =>
+            format!("Press Ctrl+D again to delete \"{name}\"").into(),
+        Msg::SessionDeleteFailed { error } =>
+            format!("Failed to delete session: {error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: confirm, Esc: cancel]").into(),
 

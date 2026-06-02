@@ -309,6 +309,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("保存会话失败：{error}。未持久化新名称。").into(),
         Msg::SessionNoneSelected =>
             "未选中会话".into(),
+        Msg::SessionDeleted { name } =>
+            format!("「{name}」已删除").into(),
+        Msg::SessionDeleteConfirm { name } =>
+            format!("再按 Ctrl+D 确认删除「{name}」").into(),
+        Msg::SessionDeleteFailed { error } =>
+            format!("删除会话失败：{error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: 确认, Esc: 取消]").into(),
 

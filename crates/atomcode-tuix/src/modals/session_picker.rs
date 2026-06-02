@@ -33,6 +33,10 @@ pub struct SessionPicker {
     pub rename_editing: bool,
     /// The new name being edited for rename.
     pub rename_buffer: String,
+    /// Index into `sessions` awaiting delete confirmation, or None.
+    pub confirm_delete: Option<usize>,
+    /// Status message shown in the footer (overwrites previous status).
+    pub delete_status: Option<String>,
 }
 
 impl SessionPicker {
@@ -45,6 +49,8 @@ impl SessionPicker {
             selected: 0,
             rename_editing: false,
             rename_buffer: String::new(),
+            confirm_delete: None,
+            delete_status: None,
         }
     }
 
@@ -66,6 +72,7 @@ impl SessionPicker {
             return;
         }
         self.selected = self.selected.saturating_sub(1);
+        self.confirm_delete = None;
     }
 
     pub fn down(&mut self) {
@@ -77,6 +84,7 @@ impl SessionPicker {
         if self.selected < max {
             self.selected += 1;
         }
+        self.confirm_delete = None;
     }
 
     pub fn chosen_id(&self) -> Option<atomcode_core::session::SessionId> {
@@ -170,23 +178,29 @@ impl Modal for SessionPicker {
         match code {
             KeyCode::Up => {
                 self.up();
+                self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             KeyCode::Down => {
                 self.down();
+                self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             KeyCode::Backspace => {
                 self.query.pop();
                 self.update_filter();
+                self.confirm_delete = None;
+                self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
                 self.query.push(c);
                 self.update_filter();
+                self.confirm_delete = None;
+                self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
@@ -196,6 +210,8 @@ impl Modal for SessionPicker {
                     if let Some(session) = self.sessions.get(idx) {
                         self.rename_buffer = session.name.clone();
                         self.rename_editing = true;
+                        self.confirm_delete = None;
+                        self.delete_status = None;
                         self.draw(buf, state, ctx, renderer);
                     }
                 } else {
@@ -204,6 +220,62 @@ impl Modal for SessionPicker {
                     ));
                     renderer.flush();
                 }
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Char(c) if mods.contains(KeyModifiers::CONTROL) && c == 'd' => {
+                // Ctrl+D: delete selected session (with confirmation)
+                let Some(idx) = self.filtered.get(self.selected).copied() else {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionNoneSelected).into_owned(),
+                    ));
+                    renderer.flush();
+                    return Ok(ModalAction::Continue);
+                };
+                if self.confirm_delete == Some(idx) {
+                    // Second Ctrl+D: confirm delete
+                    if let Some(session) = self.sessions.get(idx) {
+                        let id = session.id.clone();
+                        match ctx.session_manager.delete(&id) {
+                            Ok(()) => {
+                                let name = session.name.clone();
+                                self.sessions.remove(idx);
+                                self.confirm_delete = None;
+                                self.update_filter();
+                                // Point to the session that shifted into the deleted slot.
+                                // If that's out of bounds, go to the last one.
+                                self.selected = self
+                                    .filtered
+                                    .iter()
+                                    .position(|&fi| fi >= idx)
+                                    .unwrap_or(self.filtered.len().saturating_sub(1));
+                                self.delete_status = Some(
+                                    crate::i18n::t(crate::i18n::Msg::SessionDeleted {
+                                        name: &name,
+                                    }).into_owned(),
+                                );
+                            }
+                            Err(e) => {
+                                self.confirm_delete = None;
+                                self.delete_status = Some(
+                                    crate::i18n::t(crate::i18n::Msg::SessionDeleteFailed {
+                                        error: &e.to_string(),
+                                    }).into_owned(),
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    // First Ctrl+D: ask for confirmation
+                    self.confirm_delete = Some(idx);
+                    if let Some(session) = self.sessions.get(idx) {
+                        self.delete_status = Some(
+                            crate::i18n::t(crate::i18n::Msg::SessionDeleteConfirm {
+                                name: &session.name,
+                            }).into_owned(),
+                        );
+                    }
+                }
+                self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             KeyCode::Enter => {
@@ -245,18 +317,30 @@ impl Modal for SessionPicker {
                     }
                 }
             }
-            KeyCode::Esc => Ok(ModalAction::Close),
+            KeyCode::Esc => {
+                if self.confirm_delete.is_some() {
+                    self.confirm_delete = None;
+                    self.draw(buf, state, ctx, renderer);
+                    Ok(ModalAction::Continue)
+                } else {
+                    Ok(ModalAction::Close)
+                }
+            }
             _ => Ok(ModalAction::Continue),
         }
     }
 
     fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self);
+        let mut status = build_status(state, ctx);
+        if let Some(msg) = &self.delete_status {
+            status.hint = Some((msg.clone(), crate::render::HintSeverity::Info));
+        }
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),
             cursor_byte: buf.cursor,
             menu: Some(payload),
-            status: build_status(state, ctx),
+            status,
             attachments: Vec::new(),
         });
         renderer.flush();
@@ -278,7 +362,7 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
         return MenuPayload {
             items: vec![(label, String::new())],
             selected: 0,
-            kind: crate::render::MenuKind::SlashCommand,
+            kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
         };
     }
     let items: Vec<(String, String)> = p
@@ -305,7 +389,7 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
     MenuPayload {
         items,
         selected: p.selected,
-        kind: crate::render::MenuKind::SlashCommand,
+        kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
     }
 }
 

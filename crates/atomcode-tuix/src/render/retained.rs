@@ -926,6 +926,42 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("  {}  {}", padded, desc)
                 }
             }
+            super::MenuKind::TwoColumn { row_prefix, selected_marker } => {
+                // Name left-aligned, desc right-aligned. Rows fill the
+                // full screen width so pad_row_to_width adds no trailing
+                // spaces.  Optional selected_marker (show marker + space
+                // on selected row, same-width space pad on others) and
+                // row_prefix (prepended before name).
+                let full_w = rule_width + PAD_COL * 2;
+                let marker_w = unicode_width::UnicodeWidthStr::width(selected_marker);
+                let indicator = if selected {
+                    format!("{} ", selected_marker)
+                } else {
+                    " ".repeat(marker_w + 1) // marker + trailing space
+                };
+                let name = format!("{}{}", row_prefix, name);
+                let indicator_w = marker_w + 1;
+                let name_w = unicode_width::UnicodeWidthStr::width(name.as_str());
+                if desc.is_empty() {
+                    let rest = full_w.saturating_sub(indicator_w + name_w);
+                    format!("{}{}{}", indicator, name, " ".repeat(rest))
+                } else {
+                    let sep: usize = 2;
+                    // indicator_w + name + sep + desc must fit in full_w
+                    let desc_w = unicode_width::UnicodeWidthStr::width(desc);
+                    let avail = full_w.saturating_sub(indicator_w + sep);
+                    if name_w + desc_w <= avail {
+                        let pad = avail.saturating_sub(name_w + desc_w);
+                        format!("{}{}{}{}", indicator, name, " ".repeat(pad + sep), desc)
+                    } else {
+                        let max_name = avail.saturating_sub(desc_w);
+                        let truncated = crate::width::truncate_to_width(&name, max_name);
+                        let truncated_w = unicode_width::UnicodeWidthStr::width(truncated.as_str());
+                        let rest = full_w.saturating_sub(indicator_w + truncated_w + sep + desc_w);
+                        format!("{}{}{}{}{}", indicator, truncated, " ".repeat(sep), desc, " ".repeat(rest))
+                    }
+                }
+            }
         };
 
         let style = if selected {
@@ -1116,7 +1152,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ///   row 1: top rule
     ///   rows 2..2+N: middle input lines (N = wrap_with_cursor line count)
     ///   row 2+N: bottom rule
-    ///   rows 3+N..3+N+M: menu items (M = 0..4)
+    ///   rows 3+N..3+N+M: menu items (M = up to half screen height)
     ///   row 3+N+M: status line (if any chrome)
     ///
     /// Total rows = 1 + 1 + N + 1 + M + status_rows (where status is
@@ -1150,22 +1186,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let middle_rows = lines.len();
 
-        // Paginate menu to 4 items in view around `selected`.
+        // Paginate menu to at most half the screen height.
+        let max_menu = (h / 2).max(4);
         let (menu_items, selected_in_view) = if let Some(m) = self.menu.as_ref() {
             let len = m.items.len();
             if len == 0 {
                 (Vec::<(String, String)>::new(), None)
             } else {
-                let offset = if len <= 4 {
+                let offset = if len <= max_menu {
                     0
-                } else if m.selected < 4 {
+                } else if m.selected < max_menu {
                     0
                 } else {
                     (m.selected + 1)
-                        .saturating_sub(4)
-                        .min(len.saturating_sub(4))
+                        .saturating_sub(max_menu)
+                        .min(len.saturating_sub(max_menu))
                 };
-                let end = (offset + 4).min(len);
+                let end = (offset + max_menu).min(len);
                 let items: Vec<(String, String)> = m.items[offset..end].to_vec();
                 let sel = if m.selected >= offset && m.selected < end {
                     Some(m.selected - offset)
@@ -1181,7 +1218,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Spinner moved to body as a live paragraph row — footer no
         // longer reserves a spinner slot. Footer layout:
         //   top_rule / middle... / bot_rule / menu... / status
-        let menu_rows = menu_items.len().min(4);
+        let menu_rows = menu_items.len().min(max_menu);
         // Attachment-preview rows: one `└ [Image #N]` per kept marker,
         // sitting between bot_rule and the menu. The list arrives
         // pre-filtered by `compute_input_attachments` (only markers

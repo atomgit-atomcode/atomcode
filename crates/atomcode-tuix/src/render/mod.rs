@@ -311,6 +311,16 @@ pub enum MenuKind {
     /// `$`-trigger skills picker. Rows show the bare skill name + description,
     /// no `/`, `/skills`, or `$` prefix; selection marked with `▸`.
     Skill,
+    /// Two-column list: name left-aligned, desc right-aligned,
+    /// selected row uses reverse-video (no prefix, no arrow).
+    /// Used by session picker.
+    /// `row_prefix` is prepended before the name (e.g. `/`).
+    /// `selected_marker` is shown before the prefix for the selected row;
+    /// unselected rows get `display_width(marker)` spaces.
+    TwoColumn {
+        row_prefix: &'static str,
+        selected_marker: &'static str,
+    },
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.
