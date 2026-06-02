@@ -820,6 +820,7 @@ async fn main() {
 
     // Set a minimal pre-telemetry panic hook (replaced after telemetry init in run()).
     std::panic::set_hook(Box::new(|info| {
+        write_crash_log(info);
         restore_terminal_if_tui();
         eprintln!("\nAtomCode crashed: {}", info);
         if let Some(location) = info.location() {
@@ -2626,12 +2627,73 @@ fn run_codingplan_core(
     Ok(report.render())
 }
 
+/// Guard so the two-link panic-hook chain (pre-telemetry hook + telemetry-aware
+/// hook that chains to it) writes the crash log exactly once.
+static CRASH_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Synchronously append a panic's location + message + backtrace to
+/// `~/.atomcode/logs/panic.log`, then `flush` + `sync_all` so the bytes are
+/// durable **before** the hook returns and the runtime calls `abort()`
+/// (`panic = "abort"` in the release profile).
+///
+/// Why this exists: with `abort`, neither of the existing report paths
+/// survives a crash — stderr is lost when the terminal window closes (Windows
+/// resize crash), and `Telemetry::track` is async (mpsc → background tokio
+/// writer), so abort kills the writer mid-segment and the `.partial` queue file
+/// is discarded. A blocking, fsync'd file write is the only sink that survives.
+/// Best-effort: every step swallows errors so the hook never re-panics.
+fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    if CRASH_LOGGED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(home) = atomcode_core::tool::real_home_dir() else {
+        return;
+    };
+    let dir = home.join(".atomcode").join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("panic.log"))
+    else {
+        return;
+    };
+    let loc = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| "unknown".into());
+    let msg = info
+        .payload()
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    let thread = std::thread::current().name().unwrap_or("unknown").to_string();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // `force_capture` ignores RUST_BACKTRACE and always resolves frames.
+    let bt = std::backtrace::Backtrace::force_capture();
+    let _ = writeln!(f, "\n==== AtomCode panic @ unix:{ts} thread:{thread} ====");
+    let _ = writeln!(f, "location: {loc}");
+    let _ = writeln!(f, "message : {msg}");
+    let _ = writeln!(f, "backtrace:\n{bt}");
+    let _ = f.flush();
+    let _ = f.sync_all();
+}
+
 /// Install the telemetry-aware panic hook. Replaces the minimal pre-init hook
 /// set in `main()` so panics are both reported cleanly to the terminal AND
 /// sent as a `Panic` telemetry event before the process exits.
 fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Durable crash log FIRST — before restore_terminal / async telemetry /
+        // abort, any of which can lose the panic on Windows (see write_crash_log).
+        write_crash_log(info);
         restore_terminal_if_tui();
         let home = atomcode_core::tool::real_home_dir();
         let cwd = std::env::current_dir().ok();
