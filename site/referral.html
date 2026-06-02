@@ -325,7 +325,7 @@
 // env=local → local platform, env=test → test platform, default → production
 const ENV = new URLSearchParams(window.location.search).get('env') || '';
 const BASE_URL = ENV === 'local' ? 'http://localhost:8765'
-  : ENV === 'test' ? 'http://10.205.128.41:8765'
+  : ENV === 'test' ? 'https://test-acs.gitcode.net'
   : 'https://acs.atomgit.com';
 const API_BASE = BASE_URL + '/api/v1/referral';
 const LOGIN_URL = BASE_URL + '/auth/login?provider=atomgit&redirect_to=' + encodeURIComponent(
