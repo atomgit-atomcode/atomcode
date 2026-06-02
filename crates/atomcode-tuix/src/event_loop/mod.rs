@@ -5792,7 +5792,13 @@ pub(super) fn handle_upgrade_event(
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         UpgradeEvent::Failed(msg) => {
-            if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
+            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                // HarmonyBrew-managed build: self-update is intentionally
+                // disabled. Not an error — render as command output.
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::UpgradePackageManaged).into_owned(),
+                ));
+            } else if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
                 // Friendly path — not an error, just "nothing to do".
                 // self_update.rs's anyhow!() error is fixed-format
                 // English: "already on {current} (latest is {latest}).
@@ -7006,10 +7012,14 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             .ok()
             .and_then(|g| g.clone())
             .map(|v| {
-                (
-                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v }).into_owned(),
-                    crate::render::HintSeverity::Info,
-                )
+                let text = if atomcode_core::self_update::is_package_managed() {
+                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHintPm { version: &v })
+                        .into_owned()
+                } else {
+                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v })
+                        .into_owned()
+                };
+                (text, crate::render::HintSeverity::Info)
             })
     };
     // Pre-configure, `ctx.model_name` is a dummy from the startup fallback
