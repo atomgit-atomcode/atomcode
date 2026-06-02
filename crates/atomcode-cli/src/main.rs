@@ -1485,7 +1485,14 @@ async fn run() -> Result<i32> {
             // the user hasn't opted out via `auto_update = false` AND we're not
             // running as `atomcode.bak` (backup should stay pinned; see the
             // `is_running_as_backup` guard up top).
-            if config.auto_update && !is_running_as_backup() && !cli.dev {
+            // In distro-pm (HarmonyBrew) builds the package manager owns
+            // upgrades, so skip spawning the detached prep process entirely —
+            // `prepare_deferred_upgrade` would no-op anyway.
+            if config.auto_update
+                && !is_running_as_backup()
+                && !cli.dev
+                && !atomcode_core::self_update::is_package_managed()
+            {
                 spawn_detached_upgrade_prep();
             }
 
@@ -2423,7 +2430,16 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
             // (not a Failed event) — these arms exist only to keep the
             // match exhaustive if the TUI path ever reuses this code.
             UpgradeEvent::Failed(msg) => {
-                eprintln!("\nupgrade failed: {}", msg);
+                if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                    println!(
+                        "\n{}",
+                        atomcode_core::i18n::t(
+                            atomcode_core::i18n::Msg::UpgradePackageManaged
+                        )
+                    );
+                } else {
+                    eprintln!("\nupgrade failed: {}", msg);
+                }
             }
             UpgradeEvent::RolledBack { exe, backup } => {
                 println!(
@@ -2439,7 +2455,13 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
         Ok(Ok(_summary)) => Ok(()),
         Ok(Err(e)) => {
             let msg = format!("{:#}", e);
-            if msg.contains(ALREADY_LATEST) {
+            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                println!(
+                    "{}",
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                );
+                Ok(())
+            } else if msg.contains(ALREADY_LATEST) {
                 // Friendly path — not an error, just "nothing to do".
                 println!("  {}", msg.replace(&format!("{}: ", ALREADY_LATEST), ""));
                 Ok(())
@@ -2452,7 +2474,20 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
 }
 
 fn run_rollback_cli() -> Result<()> {
-    let summary = atomcode_core::self_update::run_rollback()?;
+    let summary = match atomcode_core::self_update::run_rollback() {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                println!(
+                    "{}",
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                );
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
     println!(
         "✓ Rolled back. Previous binary is now at {}, other version saved at {}",
         summary.exe.display(),

@@ -121,6 +121,9 @@ pub enum Msg<'a> {
     /// have to type a message to discover the dead-end.
     StatusOfficialBuildRequired,
     StatusUpgradeHint { version: &'a str },
+    /// Right-aligned status-row hint, HarmonyBrew variant: a newer version
+    /// exists, upgrade via the package manager rather than `/upgrade`.
+    StatusUpgradeHintPm { version: &'a str },
     StatusModelNotConfigured,
     /// macOS / Linux variant: "Image in clipboard · ctrl+v to paste".
     /// Ctrl+V is intercepted by Windows Terminal / conhost before
@@ -358,6 +361,9 @@ pub enum Msg<'a> {
     DiffFailed { error: &'a str },
 
     // ── /upgrade ──
+    /// Shown when `/upgrade` (or rollback) is invoked in a HarmonyBrew-managed
+    /// build: self-update is disabled, point the user at `brew upgrade`.
+    UpgradePackageManaged,
     UpgradeUnknownArg { arg: &'a str },
 
     // ── /skills ──

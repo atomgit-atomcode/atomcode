@@ -125,6 +125,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "CodingPlan needs the official build".into(),
         Msg::StatusUpgradeHint { version } =>
             format!("↑ {version} available · /upgrade").into(),
+        Msg::StatusUpgradeHintPm { version } =>
+            format!("↑ {version} available · brew upgrade atomcode").into(),
         Msg::StatusModelNotConfigured =>
             "(not configured)".into(),
         Msg::StatusClipboardImageHint =>
@@ -511,6 +513,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("git diff failed: {}", error).into(),
 
         // ── /upgrade ──
+        Msg::UpgradePackageManaged =>
+            "This build is managed by HarmonyBrew. Run `brew upgrade atomcode` to upgrade.".into(),
         Msg::UpgradeUnknownArg { arg } =>
             format!("unknown /upgrade argument: {}\n  usage: /upgrade [rollback|--force]", arg).into(),
 

@@ -8,6 +8,10 @@ default-run = "atomcode"
 name = "atomcode"
 path = "src/main.rs"
 
+[features]
+default = []
+distro-pm = ["atomcode-core/distro-pm", "atomcode-tuix/distro-pm"]
+
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
 atomcode-tuix = { path = "../atomcode-tuix" }

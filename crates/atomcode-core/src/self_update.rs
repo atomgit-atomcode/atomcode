@@ -495,11 +495,15 @@ fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
 /// When `force` is false and the manifest version is `<=` current, this
 /// returns an error carrying `ALREADY_LATEST` so callers can distinguish
 /// "already up to date" from a real failure.
+/// In `distro-pm` builds this returns immediately with an error carrying `PACKAGE_MANAGED` (upgrades are the package manager's job).
 pub async fn run_upgrade(
     current_version: String,
     force: bool,
     tx: mpsc::UnboundedSender<UpgradeEvent>,
 ) -> Result<UpgradeSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
     let current_version = current_version.as_str();
     let target = detect_target().ok_or_else(|| {
         anyhow!(
@@ -580,6 +584,20 @@ pub async fn run_upgrade(
 /// layer can render a calm informational message instead of a scary
 /// red error. Kept as a plain string to avoid an error-type refactor.
 pub const ALREADY_LATEST: &str = "ALREADY_LATEST";
+
+/// Sentinel embedded in the error returned by `run_upgrade` / `run_rollback`
+/// when this binary is a package-manager-managed build (HarmonyBrew).
+/// Callers special-case it to show "use `brew upgrade`" instead of a
+/// generic failure — mirrors the `ALREADY_LATEST` pattern.
+pub const PACKAGE_MANAGED: &str = "PACKAGE_MANAGED";
+
+/// True when this binary was compiled for package-manager distribution
+/// (the `distro-pm` feature, set by the HarmonyBrew formula). Such builds
+/// must never self-modify the binary — upgrades are the package manager's
+/// job.
+pub const fn is_package_managed() -> bool {
+    cfg!(feature = "distro-pm")
+}
 
 // ============================================================================
 // Deferred upgrade (download-in-session, apply-at-next-startup)
@@ -716,10 +734,14 @@ pub async fn fetch_manifest_if_newer(current_version: &str) -> Result<Option<Man
 /// Returns `Ok(None)` when we're already on the latest version (or newer).
 /// Idempotent: calling twice with the same manifest is a no-op after the
 /// first success (file + pointer already in place).
+/// In `distro-pm` builds this is a no-op returning `Ok(None)`.
 pub async fn prepare_deferred_upgrade(
     current_version: &str,
     tx: mpsc::UnboundedSender<UpgradeEvent>,
 ) -> Result<Option<PendingUpgrade>> {
+    if is_package_managed() {
+        return Ok(None);
+    }
     let target = detect_target().ok_or_else(|| {
         anyhow!(
             "this platform has no published atomcode release ({}/{})",
@@ -794,7 +816,11 @@ pub async fn prepare_deferred_upgrade(
 /// a session-external process (backup tool, AV software, buggy sync)
 /// could have touched the file between sessions. Verification is cheap
 /// compared to installing a corrupted binary.
+/// In `distro-pm` builds this is a no-op returning `Ok(None)`.
 pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
+    if is_package_managed() {
+        return Ok(None);
+    }
     let mut pending = match read_pending() {
         Ok(Some(p)) => p,
         Ok(None) => return Ok(None),
@@ -950,7 +976,11 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
 /// pointing at what was previously live. Calling rollback twice in a
 /// row returns you to the original state — intentional, so users can
 /// toggle between last-two versions without redownloading.
+/// In `distro-pm` builds this returns immediately with an error carrying `PACKAGE_MANAGED` (upgrades are the package manager's job).
 pub fn run_rollback() -> Result<RollbackSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
     let exe = current_exe_path()?;
     let backup = backup_path(&exe);
     if !backup.exists() {
@@ -1565,5 +1595,43 @@ mod tests {
             "error should mention HTTP 404, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn is_package_managed_tracks_feature() {
+        assert_eq!(super::is_package_managed(), cfg!(feature = "distro-pm"));
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[tokio::test]
+    async fn run_upgrade_blocked_when_package_managed() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = super::run_upgrade("v1.0.0".to_string(), true, tx)
+            .await
+            .expect_err("package-managed build must refuse self-upgrade");
+        assert!(err.to_string().contains(super::PACKAGE_MANAGED));
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[test]
+    fn run_rollback_blocked_when_package_managed() {
+        let err = super::run_rollback().expect_err("package-managed build must refuse rollback");
+        assert!(err.to_string().contains(super::PACKAGE_MANAGED));
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[test]
+    fn apply_pending_upgrade_noop_when_package_managed() {
+        assert!(super::apply_pending_upgrade().unwrap().is_none());
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[tokio::test]
+    async fn prepare_deferred_upgrade_noop_when_package_managed() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = super::prepare_deferred_upgrade("v1.0.0", tx)
+            .await
+            .expect("package-managed build must not error, just no-op");
+        assert!(result.is_none());
     }
 }

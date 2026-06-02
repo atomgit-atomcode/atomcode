@@ -74,6 +74,9 @@ atomcode-codingplan-crypto = { path = "../atomcode-codingplan-crypto", optional 
 [features]
 default = []
 codingplan-crypto = ["dep:atomcode-codingplan-crypto"]
+# Built by the HarmonyBrew formula (`cargo build --features distro-pm`).
+# Disables in-app binary self-update so the package manager owns upgrades.
+distro-pm = []
 
 # Non-blocking poll on stdin in the OAuth callback path so the stdin
 # reader thread can exit cleanly when the HTTP listener wins — otherwise

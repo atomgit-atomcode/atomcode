@@ -117,6 +117,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "CodingPlan 需要官方构建".into(),
         Msg::StatusUpgradeHint { version } =>
             format!("↑ {version} 可用 · 使用 /upgrade 升级").into(),
+        Msg::StatusUpgradeHintPm { version } =>
+            format!("↑ {version} 可用 · 运行 brew upgrade atomcode 升级").into(),
         Msg::StatusModelNotConfigured =>
             "（未配置）".into(),
         Msg::StatusClipboardImageHint =>
@@ -499,6 +501,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("git diff 失败：{}", error).into(),
 
         // ── /upgrade ──
+        Msg::UpgradePackageManaged =>
+            "本版本由 HarmonyBrew 管理，请运行 `brew upgrade atomcode` 升级".into(),
         Msg::UpgradeUnknownArg { arg } =>
             format!("未知的 /upgrade 参数：{}\n  用法：/upgrade [rollback|--force]", arg).into(),
 
