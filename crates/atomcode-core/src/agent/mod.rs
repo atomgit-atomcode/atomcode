@@ -900,7 +900,7 @@ impl AgentLoop {
         let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::from(provider);
 
         // Build the datalog writer before `config` is moved into the agent below.
-        let datalog = match runtime_label.as_deref() {
+        let mut datalog = match runtime_label.as_deref() {
             Some(label) => crate::turn::datalog::DatalogWriter::new_with_filename_tag(
                 &working_dir,
                 &config.datalog,
@@ -963,12 +963,17 @@ impl AgentLoop {
         // before the first turn's system prompt is assembled.
         let env_snapshot = crate::ctx::EnvSnapshot::capture(&working_dir);
 
-        // Stable per-conversation id. Attach it to the provider so every
-        // request carries the `x-atomcode-session-id` header — lets the
-        // forwarding gateway pin this conversation to one upstream for
-        // prefix-cache affinity.
-        let session_id = uuid::Uuid::new_v4().to_string();
+        // Bootstrap session id. Reuses the single id generator
+        // (`SessionId::new`, the same one Session/telemetry use) rather than
+        // minting a second raw uuid here. This is only the value used before
+        // the UI sends `SetSessionId` with the actual session-file id (the
+        // agent is constructed before the Session exists); from then on every
+        // consumer — header, datalog, telemetry, hooks — shares that id.
+        let session_id = crate::session::SessionId::new().as_str().to_string();
         turn_runner.provider.set_session_id(&session_id);
+        // Bootstrap the datalog with the same id (UI's SetSessionId updates
+        // it once the real session is established).
+        datalog.set_session_id(&session_id);
 
         let agent = Self {
             conversation,
@@ -1240,6 +1245,7 @@ impl AgentLoop {
                     self.turn_runner
                         .provider
                         .set_session_id(&self.session_id);
+                    self.datalog.set_session_id(&self.session_id);
                 }
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.

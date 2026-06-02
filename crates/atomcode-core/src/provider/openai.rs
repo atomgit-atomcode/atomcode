@@ -1287,6 +1287,13 @@ impl LlmProvider for OpenAiProvider {
         }
     }
 
+    fn session_id(&self) -> String {
+        self.session_id
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
     fn reasoning_history_policy(&self) -> ReasoningPolicy {
         // Explicit user override wins over the name/url heuristic so a new
         // provider quirk can be worked around via config.toml without a

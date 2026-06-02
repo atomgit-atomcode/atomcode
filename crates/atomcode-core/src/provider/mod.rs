@@ -87,6 +87,13 @@ pub trait LlmProvider: Send + Sync {
     /// warm across the conversation's requests. Default: no-op (providers
     /// that don't sit behind such a gateway ignore it).
     fn set_session_id(&self, _session_id: &str) {}
+
+    /// The currently-attached session id, or empty if none. Lets callers
+    /// (e.g. the datalog writer) tag log entries with the same session id
+    /// that rides the request header. Default: empty.
+    fn session_id(&self) -> String {
+        String::new()
+    }
 }
 
 /// Shared HTTP client with common timeouts and User-Agent.
