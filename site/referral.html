@@ -170,6 +170,7 @@
   html.light .metric-value{color:#0d0d0d}.metric-value.blue{color:#2f8cff}.metric-value.red{color:#ff4f4f}.metric-value.gold{color:var(--accent)}
   html.light .rank-table td{color:rgba(0,0,0,.72);border-bottom-color:rgba(0,0,0,.08)}
   html.light .rank-table tr.me td{background:rgba(47,140,255,.12)}html.light .rank-table tr.blocked td{background:rgba(255,110,110,.18)}
+  html.light .coding-reward{color:#805210;border-color:rgba(160,100,20,.65);background:rgba(160,100,20,.24);box-shadow:0 0 14px rgba(160,100,20,.18)}
   html.light .toast{background:rgba(255,255,255,.98);color:#0d0d0d;box-shadow:0 14px 36px rgba(0,0,0,.16)}
 
   @media (max-width:1024px){
@@ -213,7 +214,7 @@
 <main class="main">
   <div class="wrap">
     <section class="hero">
-      <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">长期进行中 · 每周一结算京东卡</span></div>
+      <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">长期进行中 · 每周一结算现金打款</span></div>
       <h1 data-i18n="hero.title">邀请有礼：AtomCode 裂变计划</h1>
       <p class="sub" data-i18n="hero.sub">获取您的专属安装命令，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。</p>
     </section>
@@ -350,7 +351,7 @@ const T = {
   'nav.referral': { zh: '邀请推荐', en: 'Referral' },
   'nav.codingplan': { zh: 'CodingPlan', en: 'CodingPlan' },
   'btn.repo': { zh: '开源仓库', en: 'Repository' },
-  'hero.badge': { zh: '长期进行中 · 每周一结算京东卡', en: 'Ongoing · settled every Monday' },
+  'hero.badge': { zh: '长期进行中 · 每周一结算现金打款', en: 'Ongoing · settled every Monday' },
   'hero.title': { zh: '邀请有礼：AtomCode 裂变计划', en: 'Referral Rewards: AtomCode Growth Program' },
   'hero.sub': { zh: '获取您的专属安装命令，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。', en: 'Get your dedicated install command and invite developers to install and use AtomCode. High conversion earns bonus rewards, with weekly leaderboard updates.' },
   'panel.login.title': { zh: '登录后领取专属邀请命令', en: 'Sign in to get your invite command' },
@@ -384,7 +385,7 @@ const T = {
   'toast.lang.en': { zh: '已切换到 English', en: 'Switched to English' },
   'board.empty': { zh: '本周排行榜暂无数据', en: 'No leaderboard data this week' },
   'board.title': { zh: '每周邀请风云榜', en: 'Weekly Referral Leaderboard' },
-  'board.hint': { zh: '按“本周新增活跃设备数”降序排列。每周日 23:59 截榜，周一结算京东卡。', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59, with settlement on Monday.' },
+  'board.hint': { zh: '按“本周新增活跃设备数”降序排列。每周日 23:59 截榜，周一结算现金打款。', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59, with settlement on Monday.' },
   'board.prev': { zh: '上一周', en: 'Previous week' },
   'board.next': { zh: '下一周', en: 'Next week' },
   'board.rank': { zh: '排名', en: 'Rank' },
@@ -404,7 +405,12 @@ const T = {
   'rules.good': { zh: '当 <b>R ≥ 25%</b> 时，视为优质推广，结算公式为：<code>安装数×2元 + 活跃数×5元</code>', en: 'When <b>R ≥ 25%</b>, it is counted as quality promotion: <code>installs×2 + active×5</code>.' },
   'rules.bad': { zh: '当 <span class="red">R &lt; 25%</span> 时，触发质量防刷熔断，安装量清零，仅保留有效活跃结算：<code>活跃数×5元</code>', en: 'When <span class="red">R &lt; 25%</span>, the quality guard is triggered: installs are cleared and only active referrals count: <code>active×5</code>.' },
   'rules.reward': { zh: '每周邀请风云榜 Top5 额外赠送 <code>CodingPlan Pro 30 天</code>，包含 GLM-5.1、Deepseek-v4 flash、Qwen3.6。', en: 'Weekly leaderboard Top 5 also receive <code>30 days of CodingPlan Pro</code>, including GLM-5.1, Deepseek-v4 flash, and Qwen3.6.' },
-  'rules.cash': { zh: '所有现金奖励统一折算为等额京东 E 卡，于每周一向邀请账号绑定的邮箱发放。', en: 'Cash rewards are converted to equivalent JD E-cards and sent every Monday to the email bound to the inviter account.' },
+  'rules.cash': { zh: '所有现金奖励根据双周统计数据进行结算，并统一收集收款信息进行打款。', en: 'All cash rewards are settled based on bi-weekly stats data, with payment details collected uniformly for disbursement.' },
+  'rules.anti.title': { zh: '严禁以下作弊行为', en: 'The following cheating behaviors are strictly prohibited:' },
+  'rules.anti.1': { zh: '使用虚拟机、模拟器、设备指纹修改工具等在同一台物理设备上重复安装激活。', en: 'Using VMs, emulators, or device fingerprint spoofing tools to repeatedly install and activate on the same physical device.' },
+  'rules.anti.2': { zh: '批量注册虚假账号、使用自动化脚本刷量。', en: 'Registering fake accounts in bulk or using automated scripts to inflate numbers.' },
+  'rules.anti.3': { zh: '通过机房 IP、公共代理、云服务器（VPS）等高风险网络环境恶意挂机。', en: 'Maliciously idling via high-risk network environments such as data center IPs, public proxies, or cloud servers (VPS).' },
+  'rules.anti.penalty': { zh: '处罚措施：系统识别到中高风险样本后，该笔奖励将自动转入人工深度审核队列，审核耗时可能延长。一经核实为恶意刷量，平台有权清空该邀请人的全部未发放奖励、收回邀请资格，情节严重者将依法封禁 AtomCode 账号。', en: 'Penalties: When the system detects medium-to-high risk samples, the reward will be automatically routed to a manual deep review queue, which may delay processing. Once confirmed as fraudulent, the platform reserves the right to forfeit all unpaid rewards of the inviter, revoke their invitation eligibility, and in severe cases, ban the AtomCode account in accordance with the law.' },
 };
 function t(key) { const item = T[key]; return item ? (item[LANG] || item.zh || key) : key; }
 function applyI18n() {
@@ -754,7 +760,12 @@ function renderRules(targetId) {
     '<ul><li>' + t('rules.good') + '</li>' +
     '<li>' + t('rules.bad') + '</li>' +
     '<li>' + t('rules.reward') + '</li>' +
-    '<li>' + t('rules.cash') + '</li></ul></section>';
+    '<li>' + t('rules.cash') + '</li></ul>' +
+    '<div class="rules-title" style="margin-top:18px"><span class="info" style="background:#ff4f4f">!</span>' + esc(t('rules.anti.title')) + '</div>' +
+    '<ul><li>' + t('rules.anti.1') + '</li>' +
+    '<li>' + t('rules.anti.2') + '</li>' +
+    '<li>' + t('rules.anti.3') + '</li></ul>' +
+    '<p style="margin-top:8px;color:#ff6868">' + esc(t('rules.anti.penalty')) + '</p></section>';
 }
 
 function pct(v) { return (v * 100).toFixed(2) + '%'; }
