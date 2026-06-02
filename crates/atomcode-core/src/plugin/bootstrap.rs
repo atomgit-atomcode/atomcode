@@ -180,7 +180,7 @@ fn maybe_install_default_skills() -> Vec<PluginJobEvent> {
             }
             Err(e) => {
                 let msg = format!(
-                    "auto-install of marketplace `{url}` failed: {e}. \
+                    "auto-install of marketplace `{url}` failed: {e:#}. \
                      Run `/plugin marketplace add {url}` manually when ready."
                 );
                 eprintln!("⚠ {msg}");
@@ -221,7 +221,7 @@ fn install_plugins_from_marketplace(
                 // registered during an earlier bootstrap attempt (e.g.
                 // re-run after deleting the marker).
                 let msg =
-                    format!("auto-install of plugin `{plugin}@{mp_name}` failed: {e}");
+                    format!("auto-install of plugin `{plugin}@{mp_name}` failed: {e:#}");
                 eprintln!("  ⚠ {msg}");
                 events.push(PluginJobEvent::Failed {
                     op: "auto-install-plugin".into(),
@@ -246,7 +246,7 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
     let list = match list_marketplaces() {
         Ok(l) => l,
         Err(e) => {
-            let msg = format!("could not enumerate marketplaces for auto-update: {e}");
+            let msg = format!("could not enumerate marketplaces for auto-update: {e:#}");
             eprintln!("⚠ {msg}");
             events.push(PluginJobEvent::Failed {
                 op: "auto-update".into(),
@@ -292,7 +292,7 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
                 }
             }
             Err(e) => {
-                let msg = format!("auto-update of marketplace `{}` failed: {e}", entry.name);
+                let msg = format!("auto-update of marketplace `{}` failed: {e:#}", entry.name);
                 eprintln!("⚠ {msg}");
                 events.push(PluginJobEvent::Failed {
                     op: "auto-update".into(),
