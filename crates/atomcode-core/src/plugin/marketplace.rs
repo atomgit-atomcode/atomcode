@@ -298,14 +298,23 @@ pub fn update_marketplace(name: &str) -> Result<MarketplaceInfo> {
         .ok_or_else(|| anyhow!("marketplace `{}` not found", name))?
         .clone();
     let target = paths::marketplaces_root().unwrap().join(name);
-    let git = find_git()?;
-    let out = Command::new(&git)
-        .args(["pull", "--ff-only"])
-        .current_dir(&target)
-        .output()
-        .context("spawn git pull")?;
-    if !out.status.success() {
-        bail!("git pull failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // If the clone directory is missing (e.g. deleted manually or a prior
+    // clone failed), re-clone from the registered source URL instead of
+    // failing with "No such file or directory" on `current_dir`.
+    if !target.exists() {
+        git_clone(&entry.source, &target)
+            .with_context(|| format!("re-clone marketplace `{}`", name))?;
+    } else {
+        let git = find_git()?;
+        let out = Command::new(&git)
+            .args(["pull", "--ff-only"])
+            .current_dir(&target)
+            .output()
+            .context("spawn git pull")?;
+        if !out.status.success() {
+            bail!("git pull failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
     }
     let commit = git_rev_parse(&target)?;
     let manifest = load_marketplace_manifest(&target)?;
