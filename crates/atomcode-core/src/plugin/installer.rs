@@ -65,10 +65,27 @@ fn install_external(
     let target_rel = format!("installed/{}/{}", marketplace, plugin_key);
     let target_abs = plugins_root.join(&target_rel);
     if target_abs.exists() {
-        bail!(
-            "plugin install dir already exists: {}",
-            target_abs.display()
-        );
+        // The directory already exists. This can happen when a previous
+        // install was cancelled (Esc) after the clone succeeded but before
+        // the state file was updated, or when the install failed partway
+        // through. If the plugin is NOT recorded in installed_plugins.json,
+        // treat the directory as a stale leftover and remove it so the
+        // install can proceed. Otherwise, bail out.
+        let id = plugin_id(plugin_key, marketplace);
+        let installed_path = paths::installed_plugins_file().unwrap();
+        let is_registered = load_installed_plugins_file(&installed_path)
+            .map(|f| f.plugins.contains_key(&id))
+            .unwrap_or(false);
+        if is_registered {
+            bail!(
+                "plugin install dir already exists and is registered: {}",
+                target_abs.display()
+            );
+        }
+        // Stale leftover — remove and continue.
+        std::fs::remove_dir_all(&target_abs).with_context(|| {
+            format!("failed to remove stale install dir {}", target_abs.display())
+        })?;
     }
     if let Some(parent) = target_abs.parent() {
         std::fs::create_dir_all(parent).ok();

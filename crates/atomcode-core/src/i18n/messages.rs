@@ -495,6 +495,7 @@ pub enum Msg<'a> {
     PluginMgrEmptyInstalled,
     PluginMgrCloning,
     PluginMgrInstalling { plugin: &'a str },
+    PluginMgrEscToCancel,
     // Scope selection screen.
     PluginScopeUser,
     PluginScopeUserDesc,

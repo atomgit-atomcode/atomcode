@@ -38,6 +38,9 @@ enum Screen {
     Installed,
     /// Scope selection — shown before installing a plugin.
     ScopeSelect { plugin: String, mp: String },
+    /// Installing in progress — shown after scope is selected.
+    /// Waits for async install to complete; Esc cancels.
+    Installing { plugin: String, mp: String },
 }
 
 pub struct PluginManager {
@@ -103,6 +106,7 @@ impl PluginManager {
             Screen::Installed => self.installed.len(),
             Screen::AddUrl => 0,
             Screen::ScopeSelect { .. } => 3, // user / project / local
+            Screen::Installing { .. } => 0, // No selectable rows — just status text
         }
     }
 
@@ -219,8 +223,12 @@ impl PluginManager {
             2 => InstallScope::Local,
             _ => return,
         };
-        self.dispatch_install(plugin, mp, scope, ctx);
-        self.goto(Screen::Home);
+        self.dispatch_install(plugin.clone(), mp.clone(), scope, ctx);
+        // Stay on an Installing screen so the user sees the progress state,
+        // mirroring Claude Code's UX.  on_plugin_event will navigate back
+        // to the Plugins list once the job completes.
+        self.screen = Screen::Installing { plugin, mp };
+        self.selected = 0;
     }
 
     fn enter_remove(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
@@ -355,6 +363,13 @@ impl PluginManager {
                 ];
                 (rows, t(Msg::PluginScopeHint).into_owned())
             }
+            Screen::Installing { plugin, .. } => {
+                let rows = vec![
+                    (t(Msg::PluginMgrInstalling { plugin }).into_owned(), String::new()),
+                    (t(Msg::PluginMgrEscToCancel).into_owned(), String::new()),
+                ];
+                (rows, String::new())
+            }
         }
     }
 }
@@ -410,13 +425,22 @@ impl Modal for PluginManager {
                 if matches!(self.screen, Screen::Home) {
                     return Ok(ModalAction::Close);
                 }
-                // Scope select goes back to plugins list; others go to Home.
-                if matches!(self.screen, Screen::ScopeSelect { .. }) {
-                    // We need to figure out the mp name to go back to Plugins screen.
-                    // Since ScopeSelect holds plugin & mp, just go to Home for simplicity.
-                    self.goto(Screen::Home);
-                } else {
-                    self.goto(Screen::Home);
+                match &self.screen {
+                    Screen::ScopeSelect { plugin: _, mp } => {
+                        // Scope select → go back to Plugins list.
+                        let mp = mp.clone();
+                        self.goto(Screen::Plugins { mp });
+                    }
+                    Screen::Installing { plugin: _, mp } => {
+                        // Cancel the in-flight install and go back to Plugins list.
+                        self.pending = None;
+                        self.installing_plugin = None;
+                        let mp = mp.clone();
+                        self.goto(Screen::Plugins { mp });
+                    }
+                    _ => {
+                        self.goto(Screen::Home);
+                    }
                 }
             }
             KeyCode::Enter => {
@@ -430,6 +454,9 @@ impl Modal for PluginManager {
                         Screen::Browse => self.enter_browse(),
                         Screen::Plugins { .. } => self.enter_plugins(ctx, renderer),
                         Screen::ScopeSelect { .. } => self.enter_scope_select(ctx),
+                        Screen::Installing { .. } => {
+                            // No-op: already installing, Enter does nothing.
+                        }
                         Screen::RemoveMarketplace => self.enter_remove(ctx, renderer),
                         Screen::Installed => self.enter_installed(ctx, renderer),
                         Screen::AddUrl => {}
@@ -500,6 +527,12 @@ impl Modal for PluginManager {
         self.pending = None;
         self.installing_plugin = None;
         self.reload();
+        // If we were on the Installing screen, navigate back to the
+        // Plugins list so the user sees the updated installed state.
+        if let Screen::Installing { mp, .. } = &self.screen {
+            let mp = mp.clone();
+            self.goto(Screen::Plugins { mp });
+        }
     }
 }
 
