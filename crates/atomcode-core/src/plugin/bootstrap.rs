@@ -73,6 +73,23 @@ const BOOTSTRAP_MARKER_FILENAME: &str = ".plugin_bootstrap_v2";
 /// changed under HEAD) return an empty vec.
 pub fn run_startup_hooks(config: &Config) -> Vec<PluginJobEvent> {
     let mut events = Vec::new();
+
+    // Early check: if git is not available, skip both auto-install and
+    // auto-update entirely and emit a single friendly message instead of
+    // per-marketplace spawn failures that confuse users on machines without
+    // git on PATH (common on macOS GUI-launched processes that don't inherit
+    // the user's shell profile).
+    if super::marketplace::find_git().is_err() {
+        eprintln!(
+            "⚠ git is not installed or not on PATH. \
+             Plugin marketplace auto-install and auto-update are disabled. \
+             Install git (e.g. `xcode-select --install` on macOS, \
+             `sudo apt install git` on Ubuntu) and restart AtomCode."
+        );
+        events.push(PluginJobEvent::GitNotFound);
+        return events;
+    }
+
     if config.plugin.auto_install_default_skills {
         events.extend(maybe_install_default_skills());
     }

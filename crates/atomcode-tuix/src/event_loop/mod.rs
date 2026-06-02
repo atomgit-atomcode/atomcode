@@ -5901,6 +5901,13 @@ pub(super) fn handle_plugin_job_event(
             }
             renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
         }
+        PluginJobEvent::GitNotFound => {
+            // Not an error — a friendly hint to guide the user to install git.
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::PluginGitNotFound).into_owned(),
+            ));
+            renderer.flush();
+        }
         PluginJobEvent::PluginAlreadyInstalled { id } => {
             // Stale install? Try reload + expand so the user still
             // gets an answer if the plugin was installed but not loaded.
