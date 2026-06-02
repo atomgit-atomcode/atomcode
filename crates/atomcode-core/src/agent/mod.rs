@@ -952,6 +952,13 @@ impl AgentLoop {
         // before the first turn's system prompt is assembled.
         let env_snapshot = crate::ctx::EnvSnapshot::capture(&working_dir);
 
+        // Stable per-conversation id. Attach it to the provider so every
+        // request carries the `x-atomcode-session-id` header — lets the
+        // forwarding gateway pin this conversation to one upstream for
+        // prefix-cache affinity.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        turn_runner.provider.set_session_id(&session_id);
+
         let agent = Self {
             conversation,
             tool_registry: shared_tools.clone(),
@@ -964,7 +971,7 @@ impl AgentLoop {
             turn_tokens: 0,
             total_tokens: 0,
             turn_start: None,
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id,
             tool_call_count: 0,
             turn_count: 0,
             max_turns: None,
