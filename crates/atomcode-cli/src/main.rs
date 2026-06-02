@@ -1423,12 +1423,22 @@ async fn run() -> Result<i32> {
     } else {
         SessionMode::Tui
     };
-    // Bind telemetry session_id to the AtomCode session's UUID (if a session is available).
-    // This means events from this process run are correlated to the actual session file.
-    // If no session exists yet, session_id stays as launch_id (the default).
+    // Bind telemetry to the continued session's id (if any). A fresh run needs
+    // nothing here: the agent bootstraps telemetry + header + datalog from its
+    // own session id. The TUI manages its own binding via
+    // `bind_telemetry_to_session`.
     if let Some(ref s) = session_to_continue {
         if let Ok(uuid) = uuid::Uuid::parse_str(s.id.as_str()) {
             telemetry.set_session_id(uuid);
+        }
+        // Headless `-c`: the TUI rebinds itself, so only push to the agent
+        // here, so the continued session's id reaches the header + datalog.
+        if effective_prompt.is_some() {
+            agent_handle
+                .client
+                .cmd_tx
+                .send(AgentCommand::SetSessionId(s.id.as_str().to_string()))
+                .ok();
         }
     }
     let scope_ctx = CurrentContext {

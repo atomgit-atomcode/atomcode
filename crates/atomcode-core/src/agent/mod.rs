@@ -971,9 +971,14 @@ impl AgentLoop {
         // consumer — header, datalog, telemetry, hooks — shares that id.
         let session_id = crate::session::SessionId::new().as_str().to_string();
         turn_runner.provider.set_session_id(&session_id);
-        // Bootstrap the datalog with the same id (UI's SetSessionId updates
-        // it once the real session is established).
+        // Bootstrap the datalog + telemetry with the same id (UI's
+        // SetSessionId updates all three once the real session is
+        // established). This is what keeps header / datalog / event-reporting
+        // on ONE id even in headless, where there's no UI bind.
         datalog.set_session_id(&session_id);
+        if let Ok(uuid) = uuid::Uuid::parse_str(&session_id) {
+            turn_runner.context.telemetry.set_session_id(uuid);
+        }
 
         let agent = Self {
             conversation,
@@ -1246,6 +1251,9 @@ impl AgentLoop {
                         .provider
                         .set_session_id(&self.session_id);
                     self.datalog.set_session_id(&self.session_id);
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&self.session_id) {
+                        self.turn_runner.context.telemetry.set_session_id(uuid);
+                    }
                 }
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.
