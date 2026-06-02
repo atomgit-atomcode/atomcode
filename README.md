@@ -168,9 +168,9 @@ atomcode uninstall --dry-run      # show plan, change nothing
 If the binary is already broken or missing:
 
 ```bash
-curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.sh | sh
+curl -fsSL https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/uninstall.sh | sh
 # Windows:
-irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.ps1 | iex
+irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/uninstall.ps1 | iex
 ```
 
 By default credentials (`auth.toml`, `mcp.json`, `config.toml`, `ATOMCODE.md`) are kept; pass `--purge` to remove them too.

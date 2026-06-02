@@ -168,9 +168,9 @@ atomcode uninstall --dry-run      # 仅打印计划，不实际删除
 二进制已损坏或丢失时使用兜底脚本：
 
 ```bash
-curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.sh | sh
+curl -fsSL https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/uninstall.sh | sh
 # Windows:
-irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.ps1 | iex
+irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/uninstall.ps1 | iex
 ```
 
 默认保留凭据（`auth.toml`、`mcp.json`、`config.toml`、`ATOMCODE.md`），传 `--purge` 才会一起清除。

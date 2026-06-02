@@ -1,10 +1,11 @@
 #!/bin/sh
 # AtomCode installer — curl | sh
 #
-#   curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.sh | sh
+#   curl -fsSL https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/install.sh | sh
 #
 # Env overrides:
-#   ATOMCODE_VERSION   release tag to install (default: v4.24.0)
+#   ATOMCODE_VERSION   release tag to install (default: latest release, auto-detected
+#                        from the AtomGit API)
 #   ATOMCODE_PREFIX    install dir (absolute path; default: /usr/local/bin if writable,
 #                        else ~/.local/bin). On HarmonyOS as non-root, default is ~/.local/bin.
 # IMPORTANT: when changing install paths, the PATH-rc edit format, or filenames here,
@@ -13,8 +14,10 @@
 # the manifest, but binary path / rc-edit format are not checked.
 set -eu
 
-VERSION="${ATOMCODE_VERSION:-v4.24.0}"
+# Fallback version used only when ATOMCODE_VERSION is unset and the API lookup fails.
+DEFAULT_VERSION="v4.24.0"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
+REPO_LATEST_API="https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
 
 # --- detect platform ---
 uname_s=$(uname -s)
@@ -32,9 +35,6 @@ case "$uname_m" in
     x86_64|amd64)  arch="x64"   ;;
     *) echo "Unsupported arch: $uname_m"; exit 1 ;;
 esac
-
-BIN_NAME="atomcode-${VERSION}-${os}-${arch}"
-URL="${REPO_BASE}/${VERSION}/${BIN_NAME}"
 
 # --- pick install dir ---
 if [ -n "${ATOMCODE_PREFIX:-}" ]; then
@@ -55,16 +55,36 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 DEST="$TMP/atomcode"
 
-echo "==> Downloading $BIN_NAME"
-echo "    from $URL"
+# Pick download tool: $_fetch streams a URL to stdout (for the API lookup),
+# $_down saves a URL to a file (for the binary).
 if command -v curl >/dev/null 2>&1; then
-    curl -fL --progress-bar -o "$DEST" "$URL"
+    _fetch="curl -sL --connect-timeout 5 --max-time 10"
+    _down="curl -fL --progress-bar -o"
 elif command -v wget >/dev/null 2>&1; then
-    wget --show-progress -O "$DEST" "$URL"
+    _fetch="wget -qO- --timeout=10 --tries=1"
+    _down="wget --show-progress -O"
 else
-    echo "Error: need curl or wget."
+    echo "Error: need curl or wget." >&2
     exit 1
 fi
+
+# --- resolve version ---
+# Honor ATOMCODE_VERSION if set; otherwise auto-detect the latest release tag
+# from the API, falling back to DEFAULT_VERSION if the lookup yields nothing.
+if [ -n "${ATOMCODE_VERSION:-}" ]; then
+    VERSION="$ATOMCODE_VERSION"
+else
+    echo "==> Detecting latest version"
+    VERSION=$($_fetch "$REPO_LATEST_API" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$VERSION" ] || VERSION="$DEFAULT_VERSION"
+fi
+
+BIN_NAME="atomcode-${VERSION}-${os}-${arch}"
+URL="${REPO_BASE}/${VERSION}/${BIN_NAME}"
+
+echo "==> Downloading $BIN_NAME"
+echo "    from $URL"
+$_down "$DEST" "$URL"
 
 # Sanity check: must be a real binary, not an HTML 404 page
 if head -c 4 "$DEST" | grep -q "<" 2>/dev/null; then
