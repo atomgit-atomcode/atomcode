@@ -2,7 +2,7 @@
 // Task 15 — sessionId + cwd lifted to App
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, LiveWireEvent, SessionMessage } from '../api';
+import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, FsListResult } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -137,6 +137,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const [slashSkills, setSlashSkills] = useState<SkillInfo[] | null>(null);
+  const [slashLoading, setSlashLoading] = useState(false);
+  const [slashOpen, setSlashOpen] = useState(false);
+  const [slashQuery, setSlashQuery] = useState('');
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [atOpen, setAtOpen] = useState(false);
+  const [atQuery, setAtQuery] = useState('');
+  const [atIndex, setAtIndex] = useState(0);
+  const [atItems, setAtItems] = useState<{ name: string; is_dir: boolean }[]>([]);
+  const [atLoading, setAtLoading] = useState(false);
   const [sync, setSync] = useState<boolean>(() => {
     try { return new URLSearchParams(location.search).get('sync') === '1'; } catch { return false; }
   });
@@ -147,6 +157,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
   const liveAbortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const slashRef = useRef<HTMLDivElement>(null);
+  const atRef = useRef<HTMLDivElement>(null);
   // 当前 Chat 正在显示的会话 id。用于区分「外部切换会话(需重置+加载历史)」
   // 与「本次新建会话首条消息完成后自己拿到的 id(不应重置)」。
   const activeIdRef = useRef<string | null>(null);
@@ -230,6 +242,33 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
 
   // Abort the live (/live) stream if the component unmounts while sync is on.
   useEffect(() => () => { liveAbortRef.current?.abort(); }, []);
+
+  // 斜杠菜单：点击外部关闭
+  useEffect(() => {
+    if (!slashOpen) return;
+    const h = (e: MouseEvent) => {
+      if (slashRef.current && !slashRef.current.contains(e.target as Node)) {
+        setSlashOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [slashOpen]);
+
+  // @ 菜单：点击外部关闭
+  useEffect(() => {
+    if (!atOpen) return;
+    const h = (e: MouseEvent) => {
+      if (atRef.current && !atRef.current.contains(e.target as Node)) {
+        setAtOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [atOpen]);
+
+  // 切换目录后清空 atItems 缓存，下次 @ 重新拉取
+  useEffect(() => { setAtItems([]); }, [cwd]);
 
   // ── 共享的实时流启/停逻辑 ──
   function startLiveStream() {
@@ -544,9 +583,56 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
   }
 
   function handleKeyDown(e: KeyboardEvent) {
-    // 忽略 IME 组字阶段的回车（中文/日文等输入法选词确认），避免误发送。
-    // `isComposing` 为现代浏览器标准属性，覆盖输入法组字状态。
     if (e.isComposing) return;
+
+    // 斜杠菜单导航
+    if (slashOpen) {
+      const filtered = (slashSkills ?? []).filter((s) => s.name.toLowerCase().includes(slashQuery.toLowerCase())).sort((a, b) => a.name.localeCompare(b.name));
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSlashIndex((i) => Math.min(i + 1, filtered.length - 1));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSlashIndex((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === 'Enter' && filtered.length > 0) {
+        e.preventDefault();
+        insertSkill(filtered[slashIndex].name);
+        return;
+      }
+      if (e.key === 'Escape') {
+        setSlashOpen(false);
+        return;
+      }
+    }
+
+    // @ 菜单导航
+    if (atOpen) {
+      const filtered = atItems.filter((item) => item.name.toLowerCase().startsWith(atQuery.toLowerCase()));
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setAtIndex((i) => Math.min(i + 1, filtered.length - 1));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setAtIndex((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === 'Enter' && filtered.length > 0) {
+        e.preventDefault();
+        insertAtPath(filtered[atIndex].name);
+        return;
+      }
+      if (e.key === 'Escape') {
+        setAtOpen(false);
+        return;
+      }
+    }
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
@@ -557,12 +643,102 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
     abortRef.current?.abort();
   }
 
-  // Auto-resize textarea
+  // 从光标前的 / 替换为选中的技能名。
+  function insertSkill(name: string) {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const pos = ta.selectionStart ?? ta.value.length;
+    const before = ta.value.slice(0, pos);
+    const after = ta.value.slice(pos);
+    const slashIdx = before.lastIndexOf('/');
+    const next = before.slice(0, slashIdx) + `/${name} ` + after;
+    setInput(next);
+    setSlashOpen(false);
+    requestAnimationFrame(() => {
+      ta.focus();
+      const newPos = slashIdx + name.length + 2;
+      ta.setSelectionRange(newPos, newPos);
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+    });
+  }
+
+  // 从光标前的 @ 替换为选中的文件/目录路径。
+  function insertAtPath(path: string) {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const pos = ta.selectionStart ?? ta.value.length;
+    const before = ta.value.slice(0, pos);
+    const after = ta.value.slice(pos);
+    const atIdx = before.lastIndexOf('@');
+    const next = before.slice(0, atIdx) + `@${path} ` + after;
+    setInput(next);
+    setAtOpen(false);
+    requestAnimationFrame(() => {
+      ta.focus();
+      const newPos = atIdx + path.length + 2;
+      ta.setSelectionRange(newPos, newPos);
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+    });
+  }
+
+  // Auto-resize textarea + slash-command + @-mention detection
   function handleInput(e: Event) {
     const ta = e.target as HTMLTextAreaElement;
-    setInput(ta.value);
+    const val = ta.value;
+    setInput(val);
     ta.style.height = 'auto';
     ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+
+    const pos = ta.selectionStart ?? val.length;
+    const before = val.slice(0, pos);
+
+    // 检测光标前是否有 /（行首 或 空格后）
+    const slashIdx = before.lastIndexOf('/');
+    if (slashIdx >= 0 && (slashIdx === 0 || before[slashIdx - 1] === ' ')) {
+      const query = before.slice(slashIdx + 1);
+      if (!query.includes(' ') && query.length <= 30) {
+        if (slashSkills === null && !slashLoading) {
+          setSlashLoading(true);
+          getSkills()
+            .then(setSlashSkills)
+            .catch(() => setSlashSkills([]))
+            .finally(() => setSlashLoading(false));
+        }
+        setAtOpen(false);
+        setSlashQuery(query);
+        setSlashIndex(0);
+        setSlashOpen(true);
+        return;
+      }
+    }
+
+    // 检测光标前是否有 @（行首 或 空格后）
+    const atIdx = before.lastIndexOf('@');
+    if (atIdx >= 0 && (atIdx === 0 || before[atIdx - 1] === ' ')) {
+      const query = before.slice(atIdx + 1);
+      if (!query.includes(' ') && query.length <= 60) {
+        setSlashOpen(false);
+        setAtQuery(query);
+        setAtIndex(0);
+        setAtOpen(true);
+        if (!atLoading) {
+          setAtLoading(true);
+          listDir(cwd).then((r) => {
+            const items: { name: string; is_dir: boolean }[] = [];
+            for (const d of r.dirs) items.push({ name: d, is_dir: true });
+            if (r.files) for (const f of r.files) items.push({ name: f, is_dir: false });
+            items.sort((a, b) => a.name.localeCompare(b.name));
+            setAtItems(items);
+          }).catch(() => setAtItems([])).finally(() => setAtLoading(false));
+        }
+        return;
+      }
+    }
+
+    setSlashOpen(false);
+    setAtOpen(false);
   }
 
   // 在 textarea 光标处插入文本（skill 命令 / 文件路径），并复位高度、聚焦。
@@ -683,6 +859,44 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
                 ×
               </button>
             </div>
+          ))}
+        </div>
+      )}
+      {atOpen && (
+        <div class="at-popover" ref={atRef}>
+          {atLoading && <div class="at-loading">Loading...</div>}
+          {!atLoading && atItems.filter((item) => item.name.toLowerCase().startsWith(atQuery.toLowerCase())).map((item, i) => (
+            <button
+              key={item.name}
+              class={'at-row' + (i === atIndex ? ' active' : '')}
+              onMouseDown={(e) => { e.preventDefault(); insertAtPath(item.name); }}
+              onMouseEnter={() => setAtIndex(i)}
+              type="button"
+              title={item.name}
+            >
+              <span class="at-icon">{item.is_dir ? '📁' : '📄'}</span>
+              <span class="at-name">{item.name}</span>
+            </button>
+          ))}
+          {!atLoading && atItems.length === 0 && (
+            <div class="at-empty">No files found</div>
+          )}
+        </div>
+      )}
+      {slashOpen && (
+        <div class="slash-popover" ref={slashRef}>
+          {(slashSkills ?? []).filter((s) => s.name.toLowerCase().includes(slashQuery.toLowerCase())).sort((a, b) => a.name.localeCompare(b.name)).map((s, i) => (
+            <button
+              key={s.name}
+              class={'slash-row' + (i === slashIndex ? ' active' : '')}
+              onMouseDown={(e) => { e.preventDefault(); insertSkill(s.name); }}
+              onMouseEnter={() => setSlashIndex(i)}
+              type="button"
+              title={s.description || ''}
+            >
+              <span class="slash-name">/{s.name}</span>
+              {s.description && <span class="slash-desc">{s.description}</span>}
+            </button>
           ))}
         </div>
       )}

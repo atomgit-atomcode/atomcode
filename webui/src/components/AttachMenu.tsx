@@ -148,7 +148,7 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages }: AttachMenuProp
               <div class="attach-note">{t('attach.skillsEmpty')}</div>
             )}
             {!loading &&
-              skills?.map((s) => (
+              [...(skills ?? [])].sort((a, b) => a.name.localeCompare(b.name)).map((s) => (
                 <button
                   key={s.name}
                   class="attach-skill-row"

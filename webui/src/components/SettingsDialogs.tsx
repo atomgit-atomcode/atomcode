@@ -18,6 +18,7 @@ import {
 import { useSettings, Theme } from '../settings';
 import { Lang } from '../i18n';
 import { ConfirmDialog } from './ConfirmDialog';
+import { Select } from './Select';
 
 /** Shared modal chrome for the settings dialogs. */
 function SettingsModal({
@@ -165,7 +166,10 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
               <span class="modal-label">
                 {t('settings.providers')} ({config.providers.length})
               </span>
-              {config.providers.map((p) => (
+              {[...config.providers].sort((a, b) => {
+                if (a.is_default !== b.is_default) return a.is_default ? -1 : 1;
+                return a.name.localeCompare(b.name);
+              }).map((p) => (
                 <div key={p.name} class={'provider-card' + (p.is_default ? ' default' : '')}>
                   <div class="provider-card-head">
                     <span class="provider-name">{p.name}</span>
@@ -361,15 +365,15 @@ function ProviderFormDialog({
         <div class="add-model-row">
           <div class="add-model-field add-model-field-type">
             <label class="add-model-label">{t('settings.providerType')}</label>
-            <select
-              class="menu-input"
+            <Select
               value={type}
-              onChange={(e) => setType((e.target as HTMLSelectElement).value)}
-            >
-              <option value="openai">openai</option>
-              <option value="claude">claude</option>
-              <option value="ollama">ollama</option>
-            </select>
+              options={[
+                { value: 'openai', label: 'openai' },
+                { value: 'claude', label: 'claude' },
+                { value: 'ollama', label: 'ollama' },
+              ]}
+              onChange={(v) => setType(v)}
+            />
           </div>
           <div class="add-model-field add-model-field-default">
             <label class="add-model-checkbox-label">
