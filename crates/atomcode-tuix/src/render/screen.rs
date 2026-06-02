@@ -64,6 +64,14 @@ pub struct Screen {
     /// no patch is emitted and the stale physical glyph survives —
     /// the "right-edge ghost row tail" symptom.
     physical_dirty: bool,
+    /// Last-emitted cursor position (for diff suppression).
+    /// `None` means "no CUP emitted yet — always emit on the first
+    /// frame that sets a cursor". Tracks the **1-indexed** position
+    /// that `render_diff` actually wrote to `out`.
+    last_cursor: Option<(u16, u16)>,
+    /// Last-emitted cursor visibility (`?25h` / `?25l`).
+    /// `None` means "no visibility sequence emitted yet".
+    last_cursor_visible: Option<bool>,
 }
 
 impl Screen {
@@ -78,6 +86,8 @@ impl Screen {
             cursor: None,
             cursor_visible: true,
             physical_dirty: false,
+            last_cursor: None,
+            last_cursor_visible: None,
         }
     }
 
@@ -227,13 +237,36 @@ impl Screen {
             out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
         }
         out.extend_from_slice(&body);
-        if let Some((r, c)) = self.cursor {
-            let _ = write!(&mut out, "\x1b[{};{}H", r, c);
+        // Diff-suppressed CUP: only jump the physical cursor when the
+        // position actually changed — every unnecessary CUP forces the
+        // terminal to re-render the target area, which manifests as
+        // visible input-box flicker on terminals that don't support
+        // DECSET 2026 (synchronized output). During streaming the
+        // spinner tick (100ms interval) repaints the body, then parks
+        // the cursor at the input box — without this guard every tick
+        // emits CUP back to the same (row,col), causing a 10Hz refresh
+        // storm on the input row even when nothing changed there.
+        let stale_cursor = cold_start || self.cursor != self.last_cursor;
+        if stale_cursor {
+            if let Some((r, c)) = self.cursor {
+                let _ = write!(&mut out, "\x1b[{};{}H", r, c);
+            }
+            self.last_cursor = self.cursor;
         }
-        if self.cursor_visible {
-            out.extend_from_slice(b"\x1b[?25h");
-        } else {
-            out.extend_from_slice(b"\x1b[?25l");
+        // Same diff-suppression for cursor visibility: only emit
+        // `?25h` / `?25l` when the visibility state actually transitions.
+        // Streaming hides the cursor (cursor_visible=false) in
+        // `paint_footer` and keeps it hidden — re-sending `?25l`
+        // on every frame is harmless for compliant DEC terminals
+        // but can trigger unnecessary repaint cycles on some hosts.
+        let stale_vis = cold_start || Some(self.cursor_visible) != self.last_cursor_visible;
+        if stale_vis {
+            if self.cursor_visible {
+                out.extend_from_slice(b"\x1b[?25h");
+            } else {
+                out.extend_from_slice(b"\x1b[?25l");
+            }
+            self.last_cursor_visible = Some(self.cursor_visible);
         }
         if has_visible_work {
             out.extend_from_slice(b"\x1b[?2026l");
@@ -269,6 +302,11 @@ impl Screen {
         // for the failure mode this guards against (right-edge ghost
         // tail after invalidate + shrink).
         self.physical_dirty = true;
+        // Physical state is now unknown — force cursor re-emit on the
+        // next render_diff (cold-start already guarantees full repaint,
+        // but we still need CUP+vis after the patches land).
+        self.last_cursor = None;
+        self.last_cursor_visible = None;
     }
 
     /// Blank `prev_cells` for rows `[start_row, height)`. Used by callers
