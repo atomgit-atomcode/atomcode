@@ -3778,13 +3778,25 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Release DECSTBM first so EL isn't constrained by the
         // stale (pre-resize) scroll region.
         let _ = self.out.write_all(b"\x1b[r");
-        let mut seq = String::with_capacity((rows as usize) * 8 + 8);
-        for row in 1..=(rows as usize) {
-            use std::fmt::Write;
-            let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+        if self.caps.legacy_conhost {
+            // Classic Windows conhost (10.0.19041) fastfails (0xc0000409 —
+            // "整个终端窗口直接消失") when it receives the per-row CUP+EL wipe
+            // burst below while its console buffer is mid-resize (window drag).
+            // A single ED2 (erase whole display) + home is ONE sequence conhost
+            // handles cleanly, so it sidesteps the crash. We avoid ED2 on other
+            // terminals (see note below) only because iTerm2 3.5+ ignores it
+            // under some states — conhost honors it, so it's the safe choice
+            // on this host specifically.
+            let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+        } else {
+            let mut seq = String::with_capacity((rows as usize) * 8 + 8);
+            for row in 1..=(rows as usize) {
+                use std::fmt::Write;
+                let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+            }
+            seq.push_str("\x1b[H");
+            let _ = self.out.write_all(seq.as_bytes());
         }
-        seq.push_str("\x1b[H");
-        let _ = self.out.write_all(seq.as_bytes());
         self.screen.resize(cols, rows);
         // Rebuild the semantic welcome banner against the new width so
         // its right-aligned version/license pair stays adaptive after
