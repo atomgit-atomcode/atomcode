@@ -1802,17 +1802,19 @@ body {
 
 .landing-inner {
   width: 100%;
-  max-width: 820px;
+  /* 落地内容随视口适度放大：小屏（≤~1780px）维持 820 的协调观感不变，
+     大屏上逐步放宽，避免标题/输入框在大量留白中显得过小、比例失衡。 */
+  max-width: clamp(820px, 46vw, 1120px);
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 18px;
-  /* 略高于真正的垂直居中，观感更接近 claude.ai */
-  margin-bottom: 8vh;
+  gap: clamp(16px, 1.4vw, 28px);
+  /* 略高于真正的垂直居中，观感更接近 claude.ai；大屏上限制上移量避免悬空。 */
+  margin-bottom: min(8vh, 96px);
 }
 
 .landing-brand {
-  font-size: 34px;
+  font-size: clamp(34px, 2.6vw, 52px);
   font-weight: 600;
   letter-spacing: -0.02em;
   color: var(--app-brand-text);
