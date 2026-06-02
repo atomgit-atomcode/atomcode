@@ -90,12 +90,17 @@
       <pre><code>irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/install.ps1 | iex</code></pre>
       <p>It downloads the Windows x64 prebuilt binary and updates <code>PATH</code>; open a fresh terminal to use the <code>atomcode</code> command.</p>
 
-      <h3>Option 2: install via npm</h3>
+      <h3>Option 2: install using npm</h3>
       <p>If you already have Node.js 18+ installed, install globally with npm:</p>
       <pre><code>npm install -g @atomgit.com/atomcode</code></pre>
       <p>The package uses <code>optionalDependencies</code> to pull the prebuilt binary for your platform (macOS x64 / arm64, Linux x64 / arm64, Windows x64, HarmonyOS arm64) — one command, cross-platform.</p>
 
-      <h3>Option 3: build from source</h3>
+      <h3>Option 3: install using Homebrew</h3>
+      <p>If you have Homebrew installed, install the cask (macOS x64 / arm64, Linux x64 / arm64):</p>
+      <pre><code>brew install --cask atomcode</code></pre>
+      <p>The cask downloads the prebuilt binary for your platform and links it to your <code>PATH</code> automatically.</p>
+
+      <h3>Option 4: build from source</h3>
       <pre><code>git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
 cargo build --release

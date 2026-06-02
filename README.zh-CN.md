@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.24.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -148,6 +148,18 @@ cargo build --release
 ```
 
 编译产物会在 `target/release/atomcode` 生成。
+
+### 包管理器安装
+
+除了从源码构建外，AtomCode CLI 也可以通过以下包管理器安装：
+
+```bash
+# 使用 npm 安装
+npm install -g @atomgit.com/atomcode
+
+# 使用 Homebrew 安装
+brew install --cask atomcode
+```
 
 ### 依赖
 

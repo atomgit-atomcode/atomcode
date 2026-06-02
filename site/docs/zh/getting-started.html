@@ -95,7 +95,12 @@
       <pre><code>npm install -g @atomgit.com/atomcode</code></pre>
       <p>包会按当前平台从 <code>optionalDependencies</code> 自动解析对应的预编译二进制(macOS x64 / arm64、Linux x64 / arm64、Windows x64、HarmonyOS arm64),一行命令搞定跨平台安装。</p>
 
-      <h3>方式 3:从源码构建</h3>
+      <h3>方式 3:通过 Homebrew</h3>
+      <p>已安装 Homebrew 时,可以通过 cask 安装(支持 macOS x64 / arm64、Linux x64 / arm64):</p>
+      <pre><code>brew install --cask atomcode</code></pre>
+      <p>Homebrew 会自动下载对应平台的预编译二进制并配置 <code>PATH</code>。</p>
+
+      <h3>方式 4:从源码构建</h3>
       <pre><code>git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
 cargo build --release
