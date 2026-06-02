@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -337,12 +337,18 @@ fn validate_skill_name(name: &str) -> anyhow::Result<()> {
     }
     if !name
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        .all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '-' || c == '_' || c == '/')
     {
         anyhow::bail!(
-            "skill name '{}' must contain only lowercase letters, digits, hyphens, and underscores",
+            "skill name '{}' must contain only letters, digits, hyphens, slashes, and underscores",
             name
         );
+    }
+    if name.starts_with('/') || name.ends_with('/') {
+        anyhow::bail!("skill name '{}' must not start or end with a slash", name);
+    }
+    if name.contains("//") {
+        anyhow::bail!("skill name '{}' must not contain consecutive slashes", name);
     }
     if name.starts_with('-') || name.ends_with('-') {
         anyhow::bail!("skill name '{}' must not start or end with a hyphen", name);
@@ -353,10 +359,18 @@ fn validate_skill_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Normalize a skill name for internal storage: lowercase all letters and
+/// replace `/` with `-` so that names like `ssh-dev-suite/long-task` become
+/// `ssh-dev-suite-long-task`. This avoids ambiguity with the namespace
+/// separator `:` and keeps the key filesystem-safe.
+fn normalize_skill_name(name: &str) -> String {
+    name.to_ascii_lowercase().replace('/', "-")
+}
+
 fn make_name(base: &str, namespace: Option<&str>) -> String {
     match namespace {
-        Some(ns) => format!("{}:{}", ns, base),
-        None => base.to_string(),
+        Some(ns) => format!("{}:{}", ns.to_ascii_lowercase(), normalize_skill_name(base)),
+        None => normalize_skill_name(base),
     }
 }
 
@@ -365,14 +379,20 @@ fn make_name(base: &str, namespace: Option<&str>) -> String {
 // ---------------------------------------------------------------------------
 
 /// Registry of loaded skills, indexed by name.
+///
+/// `BTreeMap` (not `HashMap`) so iteration order is deterministic (sorted by
+/// name). The skill list is injected into the system prompt; a stable order
+/// keeps the prompt prefix byte-identical across process launches, which is
+/// required for provider-side prompt-prefix caching to hit. Same rationale as
+/// `ToolRegistry`. See `skill_iteration_is_deterministic_sorted_order`.
 pub struct SkillRegistry {
-    skills: HashMap<String, Skill>,
+    skills: BTreeMap<String, Skill>,
 }
 
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {
-            skills: HashMap::new(),
+            skills: BTreeMap::new(),
         }
     }
 
@@ -460,21 +480,25 @@ impl SkillRegistry {
     /// (`ascend-model-verification`) instead of the registered fully
     /// qualified key (`ascend-model-agent-plugin:ascend-model-verification`).
     ///
+    /// The lookup normalizes the input (lowercase + `/` → `-`) to match
+    /// the storage convention, so callers can pass names in any case.
+    ///
     /// Discipline: returns `None` when more than one namespace would match
     /// the bare name. Silent-pick-the-first would mask real ambiguity (and
     /// the LLM would invoke the wrong plugin) — better to error out so the
     /// caller surfaces the candidates.
     pub fn get(&self, name: &str) -> Option<&Skill> {
-        if let Some(s) = self.skills.get(name) {
+        let normalized = normalize_skill_name(name);
+        if let Some(s) = self.skills.get(&normalized) {
             return Some(s);
         }
         // Only run the fallback when the request is unqualified. A
         // qualified-but-missing lookup (`foo:bar` typo'd as `foo:baz`)
         // should fail loudly, not silently rebind to some other plugin.
-        if name.contains(':') {
+        if normalized.contains(':') {
             return None;
         }
-        let suffix = format!(":{}", name);
+        let suffix = format!(":{}", normalized);
         let mut hits = self.skills.iter().filter(|(k, _)| k.ends_with(&suffix));
         let first = hits.next()?;
         if hits.next().is_some() {
@@ -815,6 +839,56 @@ mod tests {
         assert!(reg.get("plugin-b:verify").is_some());
     }
 
+    fn named_skill(name: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: "d".into(),
+            template: "body".into(),
+            disable_model_invocation: false,
+            user_invocable: true,
+            argument_hint: None,
+            allowed_tools: vec![],
+            skill_dir: PathBuf::new(),
+            source_path: PathBuf::new(),
+        }
+    }
+
+    /// Prompt-cache stability guard. The skill list is injected verbatim into
+    /// the system prompt (agent/prompt.rs `=== AVAILABLE SKILLS ===`). If the
+    /// registry iterates in a per-process-random order (the old `HashMap`
+    /// behavior), the system prompt prefix differs byte-for-byte on every
+    /// launch, so provider-side prompt-prefix caching misses on every fresh
+    /// session — measured ~3% vs ~90%+ hit rate on a 78-skill setup. Iteration
+    /// MUST be deterministic (sorted by name), matching `ToolRegistry`'s
+    /// BTreeMap rationale.
+    #[test]
+    fn skill_iteration_is_deterministic_sorted_order() {
+        let mut reg = SkillRegistry::new();
+        // Insert in deliberately scrambled order.
+        for name in [
+            "superpowers:zeta",
+            "skills:alpha",
+            "plugin:mid",
+            "skills:beta",
+            "aaa:first",
+        ] {
+            reg.register(named_skill(name));
+        }
+
+        let got: Vec<&str> = reg.invocable_by_llm().map(|s| s.name.as_str()).collect();
+        let mut want = got.clone();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "invocable_by_llm must yield names in sorted order for prompt-cache stability"
+        );
+
+        let got_all: Vec<&str> = reg.all().map(|s| s.name.as_str()).collect();
+        let mut want_all = got_all.clone();
+        want_all.sort_unstable();
+        assert_eq!(got_all, want_all, "all() iteration must be deterministic too");
+    }
+
     #[test]
     fn test_get_qualified_miss_does_not_fallback() {
         // A qualified-but-typo'd name must not silently rebind to a
@@ -990,5 +1064,154 @@ mod tests {
         );
 
         std::env::remove_var("ATOMCODE_HOME");
+    }
+
+    /// Regression test: skill names containing uppercase letters should be
+    /// accepted and normalized to lowercase internally. This covers the bug
+    /// where plugins with mixed-case skill directory names (e.g.
+    /// `Ascend-Model-Verification`) caused `validate_skill_name` to reject
+    /// them, making `/plugin reload` fail.
+    #[test]
+    fn test_uppercase_skill_name_accepted_and_normalized() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("Ascend-Model-Verification");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Ascend-Model-Verification\ndescription: Verify model\n---\nDo verify.",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        reg.load_skills_dir(tmp.path(), Some("MyPlugin"), &mut warnings);
+
+        assert!(warnings.is_empty(), "uppercase skill name should not produce warnings: {:?}", warnings);
+        // Internal storage key must be all-lowercase
+        assert!(
+            reg.get("myplugin:ascend-model-verification").is_some(),
+            "skill should be stored under lowercased name"
+        );
+        // Suffix fallback also works with lowercase
+        assert!(
+            reg.get("ascend-model-verification").is_some(),
+            "bare lowercased name should resolve via suffix fallback"
+        );
+    }
+
+    /// When the frontmatter `name` field contains uppercase but the directory
+    /// name is lowercase, the frontmatter name wins but is lowercased.
+    #[test]
+    fn test_frontmatter_uppercase_name_normalized() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: MyCustomSkill\ndescription: custom\n---\nBody.",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        reg.load_skills_dir(tmp.path(), Some("skills"), &mut warnings);
+
+        assert!(warnings.is_empty(), "no warnings expected: {:?}", warnings);
+        assert!(
+            reg.get("skills:mycustomskill").is_some(),
+            "frontmatter name with uppercase should be lowercased in storage"
+        );
+    }
+
+    /// Flat .md file with uppercase stem should also be accepted and normalized.
+    #[test]
+    fn test_flat_command_uppercase_stem() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("MyCommand.md"),
+            "---\ndescription: \"Upper cmd\"\n---\nDo stuff.\n",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        reg.load_flat_commands(tmp.path(), Some("skills"), &mut warnings);
+
+        assert!(warnings.is_empty(), "no warnings expected: {:?}", warnings);
+        assert!(
+            reg.get("skills:mycommand").is_some(),
+            "flat command with uppercase stem should be lowercased in storage"
+        );
+    }
+
+    /// Regression test: skill names containing `/` (e.g. `ssh-dev-suite/long-task`)
+    /// should be accepted and normalized so `/` becomes `-` in the internal key.
+    /// This covers the bug where plugin frontmatter names with slash separators
+    /// caused `validate_skill_name` to reject them.
+    #[test]
+    fn test_slash_in_skill_name_accepted_and_normalized() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("long-task");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: ssh-dev-suite/long-task\ndescription: Long task\n---\nDo task.",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        reg.load_skills_dir(tmp.path(), Some("MyPlugin"), &mut warnings);
+
+        assert!(warnings.is_empty(), "slash in skill name should not produce warnings: {:?}", warnings);
+        // `/` is normalized to `-` in the storage key
+        assert!(
+            reg.get("myplugin:ssh-dev-suite-long-task").is_some(),
+            "skill with slash should be stored with slash replaced by hyphen"
+        );
+        // Suffix fallback works
+        assert!(
+            reg.get("ssh-dev-suite-long-task").is_some(),
+            "bare normalized name should resolve via suffix fallback"
+        );
+    }
+
+    #[test]
+    fn test_normalize_skill_name() {
+        assert_eq!(normalize_skill_name("Foo"), "foo");
+        assert_eq!(normalize_skill_name("ssh-dev-suite/long-task"), "ssh-dev-suite-long-task");
+        assert_eq!(normalize_skill_name("MySkill/SubName"), "myskill-subname");
+        assert_eq!(normalize_skill_name("hello"), "hello");
+        assert_eq!(normalize_skill_name("A/B/C"), "a-b-c");
+    }
+
+    /// `SkillRegistry::get()` is case-insensitive and normalizes `/` → `-`
+    /// so callers (LLM, TUI) can pass names in any case or with slashes.
+    #[test]
+    fn test_get_is_case_insensitive_and_normalizes_slash() {
+        let mut reg = SkillRegistry::new();
+        reg.skills.insert(
+            "myplugin:ssh-dev-suite-long-task".into(),
+            Skill {
+                name: "myplugin:ssh-dev-suite-long-task".into(),
+                description: "v".into(),
+                template: "body".into(),
+                disable_model_invocation: false,
+                user_invocable: true,
+                argument_hint: None,
+                allowed_tools: vec![],
+                skill_dir: PathBuf::new(),
+                source_path: PathBuf::new(),
+            },
+        );
+
+        // Case-insensitive exact match
+        assert!(reg.get("MyPlugin:SSH-Dev-Suite-Long-Task").is_some());
+        // Slash normalized to hyphen
+        assert!(reg.get("ssh-dev-suite/long-task").is_some());
+        // Case + slash combined
+        assert!(reg.get("SSH-Dev-Suite/Long-Task").is_some());
+        // Qualified name with slash
+        assert!(reg.get("MyPlugin:ssh-dev-suite/long-task").is_some());
     }
 }

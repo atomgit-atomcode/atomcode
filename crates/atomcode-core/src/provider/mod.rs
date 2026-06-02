@@ -249,7 +249,7 @@ mod format_http_error_tests {
         assert_eq!(
             format_http_error(
                 StatusCode::TOO_MANY_REQUESTS,
-                "https://llm-api.atomgit.com/v1/chat/completions",
+                "https://pre-llm-api-cce.atomgit.com/v1/chat/completions",
                 "codingplan rate limit exceeded for type='Pro'",
             ),
             "[429] codingplan rate limit exceeded for type='Pro'"
@@ -321,6 +321,21 @@ mod format_http_error_tests {
 /// (with token refresh if expired).
 pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> {
     let mut config = if config.api_key.is_none() && config.provider_type != "ollama" {
+        // Security: only fall back to the OAuth access_token when the
+        // provider talks to a trusted AtomGit gateway. Sending the
+        // platform credential to an attacker-controlled base_url would
+        // leak the user's AtomGit identity.
+        let base_url = config.base_url.as_deref().unwrap_or("");
+        if !crate::coding_plan::crypto::is_atomgit_gateway(base_url) {
+            anyhow::bail!(
+                "Provider '{}' has no api_key and base_url '{base_url}' is not \
+                 a trusted AtomGit gateway.\n\
+                 Either set an explicit api_key in your config.toml, or use the \
+                 AtomGit OAuth flow by setting base_url to \
+                 https://pre-llm-api-cce.atomgit.com/v1",
+                config.provider_type,
+            );
+        }
         let mut c = config.clone();
         c.api_key = Some(load_auth_token()?);
         c
@@ -765,5 +780,123 @@ mod tests {
         // so this is actually safe. Kept here so the comment lives in
         // a real test and a future false-positive case can be added.
         assert!(!model_name_suggests_vision("focar-text-7b"));
+    }
+
+    // ── Security: OAuth token exfiltration guard ──────────────────
+
+    fn cfg_no_key(provider_type: &str, base_url: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: provider_type.to_string(),
+            api_key: None,
+            model: "m".to_string(),
+            base_url: base_url.map(|s| s.to_string()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 8000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        }
+    }
+
+    /// CVE guard: `create_provider` MUST NOT fall back to the OAuth
+    /// access_token when the provider points to an untrusted base_url.
+    #[test]
+    fn create_provider_rejects_no_api_key_on_untrusted_gateway() {
+        let result = super::create_provider(&cfg_no_key("openai", Some("https://evil.attacker.tld")));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for api_key=None + untrusted base_url"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no api_key") || msg.contains("untrusted"),
+            "expected gateway guard error, got: {}",
+            msg
+        );
+    }
+
+    /// Same guard with base_url = None (empty-string check).
+    #[test]
+    fn create_provider_rejects_no_api_key_on_empty_base_url() {
+        let result = super::create_provider(&cfg_no_key("openai", None));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for api_key=None + base_url=None"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no api_key") || msg.contains("untrusted"),
+            "expected gateway guard error, got: {}",
+            msg
+        );
+    }
+
+    /// Explicit api_key must still work even with an untrusted base_url
+    /// (user has deliberately configured a third-party provider).
+    #[test]
+    fn create_provider_accepts_explicit_key_on_untrusted_gateway() {
+        let result = super::create_provider(&cfg("openai", "sk-real-123"));
+        assert!(
+            result.is_ok(),
+            "explicit api_key on untrusted base_url should be accepted, got: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+    }
+
+    /// Trusted gateway + no api_key should pass the guard and then
+    /// either succeed (if auth.toml exists, e.g., on a developer
+    /// machine) or fail at `load_auth_token()`. Either way the error
+    /// must NOT be a gateway-guard error.
+    #[test]
+    fn create_provider_delegates_auth_on_trusted_gateway() {
+        let result =
+            super::create_provider(&cfg_no_key("openai", Some("https://pre-llm-api-cce.atomgit.com/v1")));
+        let msg = match &result {
+            Err(e) => e.to_string(),
+            Ok(_) => "provider constructed (auth.toml exists)".to_string(),
+        };
+        assert!(
+            !msg.contains("gateway") && !msg.contains("no api_key"),
+            "trusted gateway should pass the guard; got gateway-guard error: {}",
+            msg
+        );
+    }
+
+    /// Legacy CodingPlan hostname (api-ai.gitcode.com) — same as above.
+    #[test]
+    fn create_provider_delegates_auth_on_legacy_codingplan_gateway() {
+        let result =
+            super::create_provider(&cfg_no_key("openai", Some("https://api-ai.gitcode.com/v1")));
+        let msg = match &result {
+            Err(e) => e.to_string(),
+            Ok(_) => "provider constructed (auth.toml exists)".to_string(),
+        };
+        assert!(
+            !msg.contains("gateway") && !msg.contains("no api_key"),
+            "legacy gateway should pass the guard; got gateway-guard error: {}",
+            msg
+        );
+    }
+
+    /// Malicious subdomain of the trusted host must NOT pass the guard.
+    #[test]
+    fn create_provider_rejects_no_api_key_on_lookalike_gateway() {
+        let result = super::create_provider(&cfg_no_key("openai", Some("https://pre-llm-api-cce.atomgit.com.evil.com")));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for lookalike domain"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no api_key") || msg.contains("untrusted"),
+            "expected gateway guard error for lookalike domain, got: {}",
+            msg
+        );
     }
 }

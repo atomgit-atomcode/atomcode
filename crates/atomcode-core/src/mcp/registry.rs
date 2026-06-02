@@ -240,14 +240,14 @@ impl McpRegistry {
         let configs = match load_mcp_config(project_dir) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[mcp] Failed to load config: {}", e);
+                tracing::warn!("[mcp] Failed to load config: {}", e);
                 return registry;
             }
         };
 
         for config in configs {
             if let Err(e) = registry.add_server(config).await {
-                eprintln!("[mcp] Failed to connect server: {}", e);
+                tracing::warn!("[mcp] Failed to connect server: {}", e);
             }
         }
 
@@ -339,7 +339,7 @@ impl McpRegistry {
                             message: format!("tools/list failed: {}", e),
                         });
                     } else {
-                        eprintln!("[mcp] Failed to list tools from {}: {}", server_name, e);
+                        tracing::warn!("[mcp] Failed to list tools from {}: {}", server_name, e);
                     }
                 }
             }
@@ -382,7 +382,7 @@ impl McpRegistry {
                         message: format!("tools/list failed: {}", e),
                     });
                 } else {
-                    eprintln!("[mcp] Failed to list tools from {}: {}", server_name, e);
+                    tracing::warn!("[mcp] Failed to list tools from {}: {}", server_name, e);
                 }
                 Vec::new()
             }

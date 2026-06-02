@@ -78,7 +78,8 @@ async fn run_background_inner(
         .try_read()
         .map(|g| g.clone())
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let hooks = crate::hook::json_config::load_hooks_config(&bg_working_dir);
+    let mut hook_engine = crate::hook::HookEngine::new();
+    hook_engine.load_all(&bg_working_dir);
 
     let mut runner = TurnRunner {
         provider,
@@ -88,10 +89,9 @@ async fn run_background_inner(
         ctx,
         permission,
         recently_edited_files: Vec::new(),
-        hook_executor: std::sync::Arc::new(
-            crate::hook::executor::HookExecutor::new(hooks)
-        ),
+        hook_engine: std::sync::Arc::new(hook_engine),
         loop_guard: Default::default(),
+        current_turn_number: 0,
     };
 
     let mut conversation = Conversation::new();

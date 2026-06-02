@@ -54,7 +54,7 @@ impl FileHistory {
 
         // Ensure backup directory exists
         if let Err(e) = tokio::fs::create_dir_all(&self.backup_dir).await {
-            eprintln!("[file-history] Failed to create backup dir: {}", e);
+            tracing::warn!("[file-history] Failed to create backup dir: {}", e);
             return None;
         }
 
@@ -72,7 +72,7 @@ impl FileHistory {
 
         // Copy file to backup (system-level copy, no memory overhead)
         if let Err(e) = tokio::fs::copy(file_path, &backup_path).await {
-            eprintln!("[file-history] Failed to backup {}: {}", file_path, e);
+            tracing::warn!("[file-history] Failed to backup {}: {}", file_path, e);
             return None;
         }
 

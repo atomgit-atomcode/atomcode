@@ -494,6 +494,14 @@ struct Cli {
     /// Disable telemetry for this invocation.
     #[arg(long = "no-telemetry", default_value_t = false, global = true)]
     pub no_telemetry: bool,
+
+    /// Skip all permission prompts — auto-approve every tool call (bash,
+    /// file edits, MCP, etc.). Equivalent to Claude Code's
+    /// --dangerously-skip-permissions. The TUI shows a red ⚠ BYPASS
+    /// badge while active. Use in CI/CD, eval harnesses, or when you
+    /// trust the agent's built-in safety constraints.
+    #[arg(short = 'y', long = "dangerously-skip-permissions", default_value_t = false)]
+    pub dangerously_skip_permissions: bool,
 }
 
 #[derive(Subcommand)]
@@ -571,6 +579,23 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Manage hooks (list, test, enable/disable)
+    #[command(subcommand)]
+    Hooks(HookCommands),
+}
+
+/// Subcommands for hooks management
+#[derive(Subcommand)]
+enum HookCommands {
+    /// List all loaded hooks with their status
+    List,
+    /// Test a specific hook by name
+    Test {
+        /// Hook name to test
+        name: String,
+    },
+    /// Show hook configuration paths
+    Paths,
 }
 
 #[derive(Subcommand)]
@@ -884,7 +909,7 @@ async fn run() -> Result<i32> {
                     ..CurrentContext::current()
                 };
                 let outcome = CurrentContext::scope(scope_ctx, || async {
-                    telemetry.track(Event::OpenAtomcode);
+                    telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: cli.dangerously_skip_permissions });
                     run_codingplan_core(Some(&telemetry))
                 })
                 .await;
@@ -1329,12 +1354,13 @@ async fn run() -> Result<i32> {
     // Bare `atomcode` (no `-c`) starts completely fresh.
     let conversation = Conversation::new();
 
-    let (mut agent_loop, agent_handle) = AgentLoop::new(
+    let (mut agent_loop, agent_handle) = AgentLoop::new_with_skip_permissions(
         config.clone(),
         provider,
         tool_registry,
         tool_context.clone(),
         conversation,
+        cli.dangerously_skip_permissions,
     );
     agent_loop.set_max_turns(cli.max_turns);
     let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
@@ -1399,7 +1425,7 @@ async fn run() -> Result<i32> {
         // (--version, --help, --update, login, logout, status, upgrade,
         // rollback, telemetry) return via handle_command before reaching
         // this point and must NOT emit open_atomcode.
-        telemetry.track(Event::OpenAtomcode);
+        telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: cli.dangerously_skip_permissions });
 
         // Headless mode: -p / --prompt-file triggers non-interactive execution.
         // `fixissue` also sets `force_verbose` so tool activity is visible — the
@@ -1417,6 +1443,7 @@ async fn run() -> Result<i32> {
                 verbose,
                 capture,
                 working_dir.clone(),
+                cli.dangerously_skip_permissions,
             )
             .await?;
 
@@ -1477,7 +1504,7 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone()).await?;
+            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions).await?;
             Ok(0)
         };
 
@@ -1559,7 +1586,8 @@ fn redirect_stderr_to_log_file() {
 /// Run agent in headless mode (pipe-friendly: stdout = LLM text only,
 /// logs/diagnostics → stderr). Non-interactive: `bash` approvals are
 /// auto-allowed (stderr logs the reason); other tools that require approval
-/// are still denied.
+/// are still denied — **unless** `--dangerously-skip-permissions` was
+/// passed, in which case all tool calls are auto-approved.
 ///
 /// `verbose=false` (default): Claude Code -p style — only the assistant reply
 /// reaches the user. Tool calls, token usage, and turn summary are silent.
@@ -1575,11 +1603,21 @@ async fn run_headless(
     verbose: bool,
     capture: bool,
     working_dir: PathBuf,
+    skip_permissions: bool,
 ) -> Result<(i32, Option<String>)> {
     // Tell the panic hook / error path to skip TUI cleanup — raw mode was
     // never enabled here, so `disable_raw_mode` would be a wasted ioctl
     // (and on Windows can panic when stdin isn't a real console handle).
     HEADLESS_MODE.store(true, Ordering::Relaxed);
+
+    // Emit a warning when --dangerously-skip-permissions is active.
+    // The actual permission bypass is handled by InteractivePermissionDecider
+    // (will_auto_approve always returns true), so ApprovalNeeded events
+    // should never reach this loop — but the log line gives the user a
+    // clear signal that the flag is in effect.
+    if skip_permissions {
+        eprintln!("{}", atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless));
+    }
 
     let notifications = agent_loop.config.notifications.clone();
     let (cmd_tx, mut event_rx) = {
@@ -1702,7 +1740,16 @@ async fn run_headless(
                 tool_name, reason, ..
             } => {
                 close_thinking_line(&mut thinking_line_open);
-                if tool_name == "bash" {
+                if skip_permissions {
+                    // --dangerously-skip-permissions: auto-approve everything.
+                    // This branch should rarely be reached because
+                    // InteractivePermissionDecider.will_auto_approve()
+                    // returns true, preventing ApprovalRequested from being
+                    // emitted in the first place. But if it does reach here
+                    // (e.g. a race), honor the flag.
+                    eprintln!("[headless] auto-approved {}: {}", tool_name, reason);
+                    cmd_tx.send(AgentCommand::ApproveTool)?;
+                } else if tool_name == "bash" {
                     // -p / headless cannot prompt; user opts in by using non-interactive mode.
                     eprintln!("[headless] auto-approved bash: {}", reason);
                     cmd_tx.send(AgentCommand::ApproveTool)?;
@@ -1793,6 +1840,9 @@ async fn run_headless(
                 // meant to be loud). No exit-code change, no shutdown —
                 // we expect the turn to keep running.
                 eprintln!("[warning] {}", w);
+            }
+            AgentEvent::HookWarningHint(msg) => {
+                eprintln!("[hook-warning] {}", msg);
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 if verbose {
@@ -2102,6 +2152,122 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             } else {
                 println!("  No saved OAuth token found for MCP server {:?}", name);
             }
+            Ok(())
+        }
+        Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
+    }
+}
+
+/// Handle hooks subcommands
+async fn handle_hooks(cmd: HookCommands) -> Result<()> {
+    HEADLESS_MODE.store(true, Ordering::Relaxed);
+
+    match cmd {
+        HookCommands::List => {
+            let mut engine = atomcode_core::hook::HookEngine::new();
+            engine.load_all(&std::env::current_dir().unwrap_or_default());
+
+            let stats = engine.stats();
+            let total = stats.pre_tool_hooks
+                + stats.post_tool_hooks
+                + stats.post_turn_hooks
+                + stats.system_prompt_hooks
+                + stats.on_session_start_hooks
+                + stats.on_session_end_hooks
+                + stats.on_error_hooks
+                + stats.on_user_prompt_submit_hooks
+                + stats.on_tool_call_start_hooks
+                + stats.on_model_response_hooks;
+
+            println!("\nLoaded Hooks:");
+            println!("─────────────────────────────────────────────");
+
+            if total == 0 {
+                println!("  (No hooks loaded)");
+            } else {
+                println!("  {:<30} {:>5}", "Type", "Count");
+                println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
+
+                if stats.pre_tool_hooks > 0 {
+                    println!("  {:<30} {:>5}", "PreToolExecution", stats.pre_tool_hooks);
+                }
+                if stats.post_tool_hooks > 0 {
+                    println!("  {:<30} {:>5}", "PostToolExecution", stats.post_tool_hooks);
+                }
+                if stats.on_tool_call_start_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnToolCallStart", stats.on_tool_call_start_hooks);
+                }
+                if stats.post_turn_hooks > 0 {
+                    println!("  {:<30} {:>5}", "PostTurn (legacy)", stats.post_turn_hooks);
+                }
+                if stats.on_model_response_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnModelResponse", stats.on_model_response_hooks);
+                }
+                if stats.on_session_start_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnSessionStart", stats.on_session_start_hooks);
+                }
+                if stats.on_session_end_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnSessionEnd", stats.on_session_end_hooks);
+                }
+                if stats.on_error_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnError", stats.on_error_hooks);
+                }
+                if stats.system_prompt_hooks > 0 {
+                    println!("  {:<30} {:>5}", "SystemPrompt", stats.system_prompt_hooks);
+                }
+
+                println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
+                println!("  {:<30} {:>5}", "Total", total);
+            }
+
+            println!();
+
+            // 显示 hooks 目录
+            println!("Hook Directories:");
+            println!("─────────────────────────────────────────────");
+            if let Some(home) = dirs::home_dir() {
+                let global_dir = home.join(".atomcode").join("hooks");
+                let exists = if global_dir.exists() { "✓" } else { "✗" };
+                println!("  {} Global:   {}", exists, global_dir.display());
+            }
+
+            if let Ok(cwd) = std::env::current_dir() {
+                let project_dir = cwd.join(".atomcode").join("hooks");
+                let exists = if project_dir.exists() { "✓" } else { "✗" };
+                println!("  {} Project:  {}", exists, project_dir.display());
+            }
+
+            println!();
+            Ok(())
+        }
+        HookCommands::Test { name } => {
+            println!("Testing hook: {}", name);
+            println!("(TODO: Implement hook testing)");
+            Ok(())
+        }
+        HookCommands::Paths => {
+            println!("\nHook Configuration Paths:");
+            println!("─────────────────────────────────────────────");
+
+            if let Some(home) = dirs::home_dir() {
+                let global_config = home.join(".atomcode").join("hooks").join("hooks.toml");
+                let exists = if global_config.exists() { "✓" } else { "✗" };
+                println!("  {} Global config:   {}", exists, global_config.display());
+            }
+
+            if let Ok(cwd) = std::env::current_dir() {
+                let project_config = cwd.join(".atomcode").join("hooks").join("hooks.toml");
+                let exists = if project_config.exists() { "✓" } else { "✗" };
+                println!("  {} Project config:  {}", exists, project_config.display());
+            }
+
+            println!("\nDocumentation:");
+            println!("─────────────────────────────────────────────");
+            println!("  docs/hooks.md - Hook usage guide");
+            println!("  docs/hook-timing-complete.md - Complete timing list");
+            println!("  docs/hook-expansion-summary.md - Expansion summary");
+            println!();
+
             Ok(())
         }
     }

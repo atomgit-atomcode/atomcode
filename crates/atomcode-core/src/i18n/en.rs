@@ -151,6 +151,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::StatusCpUsage { usage, reset_at, duration } =>
             format!("  Usage: {}  ·  resets {} (in {})\n", usage, reset_at, duration).into(),
+        Msg::StatusCpMonthlyExhausted { duration } =>
+            format!("  ⚠ Monthly quota exhausted, available again in {}\n", duration).into(),
         Msg::StatusCpWindowExhausted =>
             "  ⚠ Current window quota exhausted\n".into(),
         Msg::StatusCpWindowHint { hint } =>
@@ -232,6 +234,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderMenuDeleteDesc => "Remove a provider".into(),
         Msg::ProviderMenuSetDefault => "set-default".into(),
         Msg::ProviderMenuSetDefaultDesc => "Switch the default provider".into(),
+        Msg::ProviderImportPrompt =>
+            "Paste a template to auto-detect (curl / JSON / TOML), or Enter to fill manually:".into(),
+        Msg::ProviderImportParsed { base_url, type_name, model } =>
+            format!("Detected: {base_url} · {type_name} · {model}").into(),
+        Msg::ProviderImportFailed =>
+            "Not recognized as a template. Paste curl / JSON / TOML, or Enter to fill manually.".into(),
         Msg::ProviderNoProviders =>
             "No providers configured yet.".into(),
         Msg::ProviderDeleteConfirm { name } =>
@@ -250,7 +258,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepTypeWithHint { current } =>
             format!("Type? [{current}] (openai / claude / ollama, blank to keep)").into(),
         Msg::ProviderStepBaseUrl =>
-            "Base URL? (blank to use provider default)".into(),
+            "Base URL? (e.g. https://api.deepseek.com/v1)".into(),
         Msg::ProviderStepBaseUrlWithHint { current } =>
             format!("Base URL? [{current}] (blank to keep)").into(),
         Msg::ProviderDefaultHint => "provider default".into(),
@@ -264,12 +272,19 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepModelWithHint { current } =>
             format!("Model? [{current}] (blank to keep)").into(),
         Msg::ProviderNameEmpty => "Name cannot be empty.".into(),
+        Msg::ProviderBaseUrlEmpty => "Base URL cannot be empty.".into(),
         Msg::ProviderUnknownType =>
             "Unknown type. Choose openai / claude / ollama.".into(),
         Msg::ProviderUnknownTypeEdit =>
             "Unknown type. Choose openai / claude / ollama or leave blank.".into(),
         Msg::ProviderModelEmpty => "Model cannot be empty.".into(),
         Msg::ProviderEditKeep => "(keep)".into(),
+        Msg::ProviderTypeInferred { type_name } =>
+            format!("Detected type: {type_name}").into(),
+        Msg::ProviderStepNameDefault { default } =>
+            format!("Provider name? [{default}] (blank to use this)").into(),
+        Msg::ProviderStepProgress { current, total } =>
+            format!("({current}/{total})").into(),
 
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
@@ -640,9 +655,17 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMarketplaceUsage =>
             "usage: /plugin marketplace [add|remove|update|list] <args>".into(),
         Msg::PluginInstallUsage =>
-            "usage: /plugin install <plugin>@<marketplace>".into(),
+            "usage: /plugin install <plugin> or <plugin>@<marketplace>".into(),
+        Msg::PluginInstallNotFound { plugin } =>
+            format!("plugin `{plugin}` not found in any marketplace. Use /plugin marketplace list to see registered marketplaces.").into(),
+        Msg::PluginInstallAmbiguous { plugin } =>
+            format!("plugin `{plugin}` exists in multiple marketplaces, please specify one:").into(),
         Msg::PluginUninstallUsage =>
-            "usage: /plugin uninstall <plugin>@<marketplace>".into(),
+            "usage: /plugin uninstall <plugin> or <plugin>@<marketplace>".into(),
+        Msg::PluginUninstallNotFound { plugin } =>
+            format!("plugin `{plugin}` is not installed. Use /plugin list to see installed plugins.").into(),
+        Msg::PluginUninstallAmbiguous { plugin } =>
+            format!("plugin `{plugin}` is installed from multiple marketplaces, please specify:\n").into(),
         Msg::PluginNoMarketplaces =>
             "no marketplaces registered".into(),
         Msg::PluginMarketplacesHeader =>
@@ -663,6 +686,27 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list marketplaces: {error}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),
+        Msg::PluginInstallingByName { plugin } =>
+            format!("installing `{plugin}`…").into(),
+        Msg::PluginAlreadyInstalled { id } =>
+            format!("  plugin `{id}` is already installed.\n  PS: To reinstall, first run `/plugin uninstall {id}` then `/plugin install {id}`\n").into(),
+        Msg::PluginMgrBrowse => "Browse & install".into(),
+        Msg::PluginMgrAdd => "Add marketplace…".into(),
+        Msg::PluginMgrRemove => "Remove marketplace…".into(),
+        Msg::PluginMgrInstalled { count } => format!("Installed ({count})").into(),
+        Msg::PluginMgrInstalledMark => "✓ installed".into(),
+        Msg::PluginMgrHintNav => "↑/↓ select · ⏎ open · esc back".into(),
+        Msg::PluginMgrHintToggle => "⏎ install/uninstall · esc back".into(),
+        Msg::PluginMgrHintRemove => "⏎ remove · esc back".into(),
+        Msg::PluginMgrHintUninstall => "⏎ uninstall · esc back".into(),
+        Msg::PluginMgrHintUrl => "type/paste git URL · ⏎ add · esc cancel".into(),
+Msg::PluginMgrHintPending => "Installing, please wait… · esc back".into(),
+Msg::PluginMgrInstallingLabel => "Installing…".into(),
+        Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…”".into(),
+        Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace.".into(),
+        Msg::PluginMgrEmptyInstalled => "No plugins installed.".into(),
+        Msg::PluginMgrCloning => "Cloning marketplace…".into(),
+        Msg::PluginMgrInstalling { plugin } => format!("Installing {plugin}…").into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("uninstalled `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
@@ -723,6 +767,31 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescSkills => "Browse loaded skills".into(),
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
+        Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
+        Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
+        Msg::GuideMenuTopics => "Common topics:".into(),
+        Msg::GuideMenuGettingStarted => "Getting started          First install, login, config".into(),
+        Msg::GuideMenuSwitchModel => "Switch models            /model /provider usage".into(),
+        Msg::GuideMenuMcp => "Using MCP                MCP server config & management".into(),
+        Msg::GuideMenuSkills => "Skills and plugins       /skills /plugin usage".into(),
+        Msg::GuideMenuMemory => "Memory feature           /remember /forget /memory".into(),
+        Msg::GuideMenuBackground => "Background tasks         /bg background execution".into(),
+        Msg::GuideMenuContext => "Context management       /compact /context /cost".into(),
+        Msg::GuideMenuKeybindings => "Keyboard shortcuts       Keyboard shortcut reference".into(),
+        Msg::GuideMenuConfig => "Configuration            config.toml reference".into(),
+        Msg::GuideMenuTip => "
+  Tip: type /guide <your question> for a specific answer.
+  Example: /guide How to switch models
+".into(),
+        Msg::GuideMenuDocUrl => "  Full docs: https://atomcode.atomgit.com/docs/en/".into(),
+        Msg::CmdGuideInstalling => "Installing ask skill, please wait...".into(),
+        Msg::CmdGuideAutoInstall => "ask skill not installed — auto-installing atomcode@atomcode-skills...".into(),
+        Msg::CmdGuideAutoInvoke { topic } =>
+            format!("ask skill installed, now answering: {}", topic).into(),
+        Msg::CmdGuideSkillNotFound =>
+            "Installation complete but ask skill not found — run /plugin reload and try again".into(),
+        Msg::CmdGuideInstallFailed { error } =>
+            format!("ask skill install failed: {}. Run /plugin install atomcode@atomcode-skills manually", error).into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
 
         // ── config save failed ──
@@ -764,6 +833,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("✓ VL recognised image, returned {char_count} chars").into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
             format!("✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {total_tokens} tokens").into(),
+        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
+            format!("✗ Stopped · {turn_count} rounds · {tool_call_count} tools · {duration} · {total_tokens} tokens").into(),
         Msg::LoginQrHeader =>
             "  Sign in to AtomGit — scan the QR code with your WeChat:\n\n".into(),
         Msg::LoginUrlAfterQr =>
@@ -805,6 +876,14 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             model
         )
         .into(),
+        // ── --dangerously-skip-permissions / -y ──
+        Msg::BypassWarningBanner =>
+            "\u{26a0} --dangerously-skip-permissions is active: all tool calls are auto-approved (no permission prompts)\n".into(),
+        Msg::BypassWarningHeadless =>
+            "[headless] --dangerously-skip-permissions: all tool calls are auto-approved".into(),
+        Msg::BypassBadge =>
+            "\u{26a0} BYPASS".into(),
+
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \

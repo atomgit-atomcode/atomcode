@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.3</span>
+    <span class="dhdr-ver">v4.24.0</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -88,7 +88,11 @@ atomcode -c
 atomcode --continue
 
 # 使用指定的配置文件
-atomcode --config ./custom.toml</code></pre>
+atomcode --config ./custom.toml
+
+# 跳过所有权限确认,自动批准工具调用
+atomcode -y
+atomcode --dangerously-skip-permissions</code></pre>
 
       <h2>CLI 参数总览</h2>
       <table>
@@ -106,12 +110,23 @@ atomcode --config ./custom.toml</code></pre>
           <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>非交互模式下把工具调用、token 用量等信息打到 stderr</td></tr>
           <tr><td><code>--max-turns N</code></td><td>—</td><td>强制限制 Agent 循环的最大轮数,防止无限跑下去</td></tr>
           <tr><td><code>--disable-tools LIST</code></td><td>—</td><td>逗号分隔,禁用某些工具。例如 <code>--disable-tools bash,web_fetch</code></td></tr>
+          <tr><td><code>--dangerously-skip-permissions</code></td><td><code>-y</code></td><td>跳过所有权限确认,自动批准所有工具调用(bash、文件编辑、MCP 等)。TUI 模式下状态栏显示 ⚠ BYPASS 徽章</td></tr>
         </tbody>
       </table>
 
       <div class="callout callout-tip">
         <strong>Tip</strong>
         <p><code>--disable-tools</code> 让被禁用的工具对模型完全不可见(不会出现在 schemas 中),模型就不会重复尝试调用它。在沙箱评测、离线环境、禁止联网的 CI 等场景里非常实用。</p>
+      </div>
+
+      <div class="callout callout-warning">
+        <strong>Warning</strong>
+        <p><code>-y</code> / <code>--dangerously-skip-permissions</code> 会跳过所有权限确认,包括 bash 命令执行、文件写入和 MCP 工具调用等。Agent 可以不经确认直接执行任意操作。请仅在以下场景使用:</p>
+        <ul>
+          <li>CI/CD 流水线等自动化环境</li>
+          <li>沙箱或容器内的评测基准测试</li>
+          <li>你充分信任 Agent 内置安全约束的非关键项目</li>
+        </ul>
       </div>
 
       <h2>描述任务的原则</h2>

@@ -139,101 +139,20 @@ impl Tool for GrepTool {
             }
         };
 
-        // Walk files using ignore crate (respects .gitignore, skips binary, multi-threaded)
-        let walker = WalkBuilder::new(&resolved)
-            .hidden(true) // skip hidden files
-            .git_ignore(true) // respect .gitignore
-            .git_global(true)
-            .git_exclude(true)
-            .build();
-
-        let mut matches: Vec<String> = Vec::new();
-        let mut files_searched = 0usize;
-        let mut match_count = 0usize;
-
-        for entry in walker {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-                continue;
-            }
-
-            let file_path = entry.path();
-
-            // Skip known noise directories/files not covered by .gitignore
-            let path_str = file_path.to_string_lossy();
-            if path_str.contains("/datalog/")
-                || path_str.ends_with(".log")
-                || path_str.contains("/target/")
-                || path_str.contains("/dist/")
-                || path_str.contains("/node_modules/")
-            {
-                continue;
-            }
-
-            // Read file (skip binary)
-            let content = match std::fs::read_to_string(file_path) {
-                Ok(c) => c,
-                Err(_) => continue, // binary or unreadable
-            };
-
-            files_searched += 1;
-            let lines: Vec<&str> = content.lines().collect();
-
-            // Find matching lines
-            let mut file_matches: Vec<usize> = Vec::new();
-            for (i, line) in lines.iter().enumerate() {
-                if re.is_match(line) {
-                    file_matches.push(i);
-                    if match_count + file_matches.len() >= max {
-                        break;
-                    }
-                }
-            }
-
-            if file_matches.is_empty() {
-                continue;
-            }
-
-            // Format matches with context
-            let rel_path = file_path
-                .strip_prefix(&wd)
-                .unwrap_or(file_path)
-                .to_string_lossy();
-
-            let mut shown: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            for &match_line in &file_matches {
-                let start = match_line.saturating_sub(context_lines);
-                let end = (match_line + context_lines + 1).min(lines.len());
-
-                // Separator between non-contiguous chunks
-                if !shown.is_empty() && start > 0 && !shown.contains(&(start - 1)) {
-                    matches.push("--".to_string());
-                }
-
-                for i in start..end {
-                    if shown.contains(&i) {
-                        continue;
-                    }
-                    shown.insert(i);
-
-                    let prefix = if i == match_line {
-                        format!("{}:{}:", rel_path, i + 1)
-                    } else {
-                        format!("{}-{}-", rel_path, i + 1)
-                    };
-                    matches.push(format!("{}{}", prefix, lines[i]));
-                }
-            }
-
-            match_count += file_matches.len();
-            if match_count >= max {
-                break;
-            }
-        }
+        // The `ignore` walk and per-file `std::fs::read_to_string` are BLOCKING
+        // syscalls. On a hung filesystem (e.g. a dead network mount) they would
+        // stall the async worker thread, so the turn-level `cancel.cancelled()`
+        // race in execute_single_tool never gets polled and Esc can't cancel.
+        // Run the whole traversal on the blocking pool so the executor stays
+        // responsive: cancel aborts the turn promptly (the orphaned blocking
+        // thread is abandoned and dies when the OS I/O finally errors).
+        let (matches, files_searched) = tokio::task::spawn_blocking({
+            let resolved = resolved.clone();
+            let wd = wd.clone();
+            move || grep_walk(&resolved, &re, &wd, max, context_lines)
+        })
+        .await
+        .unwrap_or_else(|_| (Vec::new(), 0usize));
 
         // Annotate matching lines with enclosing function name (tree-sitter)
         let mut searcher = ctx.semantic.lock().await;
@@ -342,6 +261,115 @@ impl GrepTool {
 
         Some(out)
     }
+}
+
+/// Synchronous file-tree walk + per-file regex scan, pulled out of
+/// `GrepTool::execute` so it can run inside `tokio::task::spawn_blocking`
+/// (the `ignore` crate has no async API and the per-file reads block).
+/// Keeping it off the async worker keeps cancellation responsive while a
+/// hung filesystem is traversed. Returns (formatted match lines, files searched).
+fn grep_walk(
+    resolved: &std::path::Path,
+    re: &regex::Regex,
+    wd: &std::path::Path,
+    max: usize,
+    context_lines: usize,
+) -> (Vec<String>, usize) {
+    let walker = WalkBuilder::new(resolved)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    let mut matches: Vec<String> = Vec::new();
+    let mut files_searched = 0usize;
+    let mut match_count = 0usize;
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            continue;
+        }
+
+        let file_path = entry.path();
+
+        // Skip known noise directories/files not covered by .gitignore
+        let path_str = file_path.to_string_lossy();
+        if path_str.contains("/datalog/")
+            || path_str.ends_with(".log")
+            || path_str.contains("/target/")
+            || path_str.contains("/dist/")
+            || path_str.contains("/node_modules/")
+        {
+            continue;
+        }
+
+        // Read file (skip binary)
+        let content = match std::fs::read_to_string(file_path) {
+            Ok(c) => c,
+            Err(_) => continue, // binary or unreadable
+        };
+
+        files_searched += 1;
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Find matching lines
+        let mut file_matches: Vec<usize> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if re.is_match(line) {
+                file_matches.push(i);
+                if match_count + file_matches.len() >= max {
+                    break;
+                }
+            }
+        }
+
+        if file_matches.is_empty() {
+            continue;
+        }
+
+        // Format matches with context
+        let rel_path = file_path
+            .strip_prefix(wd)
+            .unwrap_or(file_path)
+            .to_string_lossy();
+
+        let mut shown: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &match_line in &file_matches {
+            let start = match_line.saturating_sub(context_lines);
+            let end = (match_line + context_lines + 1).min(lines.len());
+
+            // Separator between non-contiguous chunks
+            if !shown.is_empty() && start > 0 && !shown.contains(&(start - 1)) {
+                matches.push("--".to_string());
+            }
+
+            for i in start..end {
+                if shown.contains(&i) {
+                    continue;
+                }
+                shown.insert(i);
+
+                let prefix = if i == match_line {
+                    format!("{}:{}:", rel_path, i + 1)
+                } else {
+                    format!("{}-{}-", rel_path, i + 1)
+                };
+                matches.push(format!("{}{}", prefix, lines[i]));
+            }
+        }
+
+        match_count += file_matches.len();
+        if match_count >= max {
+            break;
+        }
+    }
+    (matches, files_searched)
 }
 
 /// Extract a likely code identifier from a grep pattern for graph lookup.

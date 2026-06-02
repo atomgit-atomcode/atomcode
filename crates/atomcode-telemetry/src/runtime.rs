@@ -581,7 +581,7 @@ mod session_id_tests {
                 ..Default::default()
             },
             || async {
-                tel.track(Event::OpenAtomcode);
+                tel.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
             },
         )
         .await;
