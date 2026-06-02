@@ -867,8 +867,11 @@ async fn run() -> Result<i32> {
         }
     }
 
-    let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
+    let telemetry = Telemetry::init(resolved.clone(), env!("CARGO_PKG_VERSION").into());
     install_panic_hook(telemetry.clone());
+
+    // Emit install_completed if this is the first launch after a referral install
+    telemetry.maybe_emit_install_completed(&resolved.atomcode_dir);
     // ── End telemetry init ────────────────────────────────────────────────────
 
     // Handle subcommands. Most are self-contained (`handle_command` runs
@@ -909,7 +912,9 @@ async fn run() -> Result<i32> {
                     ..CurrentContext::current()
                 };
                 let outcome = CurrentContext::scope(scope_ctx, || async {
-                    telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: cli.dangerously_skip_permissions });
+                    telemetry.track(Event::OpenAtomcode {
+                        dangerously_skip_permissions: cli.dangerously_skip_permissions,
+                    });
                     run_codingplan_core(Some(&telemetry))
                 })
                 .await;
@@ -976,9 +981,7 @@ async fn run() -> Result<i32> {
                         if let Some(ref c) = client {
                             cmd.arg("--client").arg(c);
                         }
-                        let status = cmd
-                            .status()
-                            .context("Failed to start atomcode-daemon")?;
+                        let status = cmd.status().context("Failed to start atomcode-daemon")?;
                         return Ok(if status.success() { 0 } else { 1 });
                     }
                     None => {
@@ -1048,7 +1051,7 @@ async fn run() -> Result<i32> {
                 vision_preprocessor_provider: None,
                 language: None,
                 ui: Default::default(),
-            plugin: Default::default(),
+                plugin: Default::default(),
             }
         })
     } else {
@@ -1072,10 +1075,7 @@ async fn run() -> Result<i32> {
     };
 
     // ── i18n locale ──
-    let locale = atomcode_tuix::i18n::resolve_initial_locale(
-        cli.lang.as_deref(),
-        config.language,
-    );
+    let locale = atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
     atomcode_tuix::i18n::set_locale(locale);
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
@@ -1559,10 +1559,7 @@ fn redirect_stderr_to_log_file() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let marker = format!("\n--- atomcode session start (unix={epoch_secs}) ---\n");
-    let _ = std::io::Write::write_all(
-        &mut std::io::BufWriter::new(&file),
-        marker.as_bytes(),
-    );
+    let _ = std::io::Write::write_all(&mut std::io::BufWriter::new(&file), marker.as_bytes());
     // SAFETY: dup2 swaps the file descriptor table entry for fd 2
     // to point at `file`'s underlying fd. This is a standard, safe
     // operation; the worst case (dup2 fails) is the redirect doesn't
@@ -1616,7 +1613,10 @@ async fn run_headless(
     // should never reach this loop — but the log line gives the user a
     // clear signal that the flag is in effect.
     if skip_permissions {
-        eprintln!("{}", atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless));
+        eprintln!(
+            "{}",
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless)
+        );
     }
 
     let notifications = agent_loop.config.notifications.clone();
@@ -1941,7 +1941,10 @@ async fn run_headless(
             // still see that VL ran. Char count helps spot degenerate
             // outputs.
             AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
-                eprintln!("[vl-preprocess ok provider={} chars={}]", vl_key, char_count);
+                eprintln!(
+                    "[vl-preprocess ok provider={} chars={}]",
+                    vl_key, char_count
+                );
             }
             AgentEvent::MessagesSync { .. } => {
                 // Only used by TUI for /bg session persistence; ignore in CLI.
@@ -2195,16 +2198,25 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                     println!("  {:<30} {:>5}", "PostToolExecution", stats.post_tool_hooks);
                 }
                 if stats.on_tool_call_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnToolCallStart", stats.on_tool_call_start_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnToolCallStart", stats.on_tool_call_start_hooks
+                    );
                 }
                 if stats.post_turn_hooks > 0 {
                     println!("  {:<30} {:>5}", "PostTurn (legacy)", stats.post_turn_hooks);
                 }
                 if stats.on_model_response_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnModelResponse", stats.on_model_response_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnModelResponse", stats.on_model_response_hooks
+                    );
                 }
                 if stats.on_session_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnSessionStart", stats.on_session_start_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnSessionStart", stats.on_session_start_hooks
+                    );
                 }
                 if stats.on_session_end_hooks > 0 {
                     println!("  {:<30} {:>5}", "OnSessionEnd", stats.on_session_end_hooks);
@@ -2257,7 +2269,11 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
             if let Ok(cwd) = std::env::current_dir() {
                 let project_config = cwd.join(".atomcode").join("hooks").join("hooks.toml");
-                let exists = if project_config.exists() { "✓" } else { "✗" };
+                let exists = if project_config.exists() {
+                    "✓"
+                } else {
+                    "✗"
+                };
                 println!("  {} Project config:  {}", exists, project_config.display());
             }
 
@@ -2275,7 +2291,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
 /// Dispatch `atomcode plugin ...` subcommands. Each branch calls the same
 /// `atomcode_core::plugin::*` API the TUI's `/plugin` slash command uses, so
-    /// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
+/// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
 fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
     use atomcode_core::plugin::{installer, marketplace};
     match sub {
@@ -2576,12 +2592,15 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
             error_kind: Some("panic".to_string()),
-            error_data: Some(serde_json::json!({
-                "session_duration_secs": telemetry.uptime().as_secs() as u32,
-                "turns_completed": null,
-                "last_tool_name": null,
-                "last_event": null,
-            }).to_string()),
+            error_data: Some(
+                serde_json::json!({
+                    "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                    "turns_completed": null,
+                    "last_tool_name": null,
+                    "last_event": null,
+                })
+                .to_string(),
+            ),
         });
         default_hook(info);
     }));
@@ -2812,7 +2831,10 @@ mod tests {
         // Now a non-reasoning event arrives → close, then emit it.
         close_thinking_chunk(&mut buf, &mut open);
         buf.push_str("[tool→ read_file]\n");
-        assert_eq!(buf, "[thinking] I should check the file\n[tool→ read_file]\n");
+        assert_eq!(
+            buf,
+            "[thinking] I should check the file\n[tool→ read_file]\n"
+        );
     }
 
     // ── is_auth_gap_error ────────────────────────────────────────────

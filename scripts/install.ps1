@@ -10,7 +10,16 @@
 # crates/atomcode-core/src/uninstall/paths.rs. The CI parity test guards
 # the manifest, but binary path / PATH edit are not checked.
 
+param(
+  [string]$Invite = ""
+)
+
 $ErrorActionPreference = "Stop"
+
+# --- referral invite argument fallback ---
+if (-not $Invite) {
+  $Invite = $env:ATOMCODE_INVITE
+}
 
 $Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.23.3" }
 $RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
@@ -47,6 +56,28 @@ $Prefix = if ($env:ATOMCODE_PREFIX) {
 if (-not (Test-Path $Prefix)) {
     New-Item -ItemType Directory -Path $Prefix -Force | Out-Null
 }
+
+# --- referral invite code handling ---
+if ($Invite) {
+  $AtomcodeDir = if ($env:ATOMCODE_HOME) {
+    $env:ATOMCODE_HOME
+  } else {
+    Join-Path $env:USERPROFILE ".atomcode"
+  }
+
+  New-Item -ItemType Directory -Force -Path $AtomcodeDir | Out-Null
+
+  $InstallUuid = [guid]::NewGuid().ToString()
+
+  $pendingInvite = @"
+invite_code=$Invite
+install_uuid=$InstallUuid
+attempted_at=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+"@
+
+  Set-Content -Path (Join-Path $AtomcodeDir "pending_invite") -Value $pendingInvite
+}
+# --- end referral handling ---
 
 # --- download ---
 $Dest = Join-Path $Prefix "atomcode.exe"

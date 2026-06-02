@@ -6,6 +6,7 @@ pub mod config;
 pub mod event;
 pub mod identity;
 pub mod notice;
+pub mod pending_invite;
 pub mod queue;
 pub mod runtime;
 pub mod scrub;

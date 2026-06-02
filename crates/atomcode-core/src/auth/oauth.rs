@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use atomcode_telemetry::{Event, Telemetry};
 
+use crate::config::Config;
+
 /// Default Platform server base URL (client_secret is kept on the broker).
 /// Override with the `ATOMCODE_PLATFORM_SERVER` environment variable.
 const DEFAULT_PLATFORM_SERVER: &str = "https://acs.atomgit.com";
@@ -72,6 +74,13 @@ fn blocking_client() -> reqwest::blocking::Client {
         .user_agent(crate::ATOMCODE_USER_AGENT)
         .build()
         .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
+fn pending_invite_for_login() -> (Option<String>, Option<uuid::Uuid>) {
+    match atomcode_telemetry::pending_invite::load(&Config::config_dir()) {
+        Some(invite) => (Some(invite.invite_code), Some(invite.install_uuid)),
+        None => (None, None),
+    }
 }
 
 /// Stored authentication data
@@ -384,7 +393,11 @@ impl LoginSession {
             // any task-local scope, so events emitted outside the main scope
             // (e.g. before scope is entered, or from spawned tasks) inherit it.
             t.set_account_id(Some(auth_info.user.id.to_string()));
-            t.track(Event::LoginSuccess);
+            let (invite_code, install_uuid) = pending_invite_for_login();
+            t.track(Event::LoginSuccess {
+                invite_code,
+                install_uuid,
+            });
         }
 
         Ok(auth_info)
