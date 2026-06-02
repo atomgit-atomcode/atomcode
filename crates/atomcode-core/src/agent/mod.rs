@@ -956,6 +956,13 @@ impl AgentLoop {
         // before the first turn's system prompt is assembled.
         let env_snapshot = crate::ctx::EnvSnapshot::capture(&working_dir);
 
+        // Stable per-conversation id. Attach it to the provider so every
+        // request carries the `x-atomcode-session-id` header — lets the
+        // forwarding gateway pin this conversation to one upstream for
+        // prefix-cache affinity.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        turn_runner.provider.set_session_id(&session_id);
+
         let agent = Self {
             conversation,
             tool_registry: shared_tools.clone(),
@@ -968,7 +975,7 @@ impl AgentLoop {
             turn_tokens: 0,
             total_tokens: 0,
             turn_start: None,
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id,
             tool_call_count: 0,
             turn_count: 0,
             max_turns: None,
@@ -1217,6 +1224,10 @@ impl AgentLoop {
                     // Clear the conversation history in the agent loop.
                     self.conversation = Conversation::new();
                     self.datalog.clear();
+                    // New conversation → new session id (e.g. /session,
+                    // /clear). Keeps the x-atomcode-session-id header aligned
+                    // with the logical conversation, not the process lifetime.
+                    self.reset_session_id();
                 }
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.
@@ -1226,6 +1237,12 @@ impl AgentLoop {
                         crate::conversation::turn::TurnTracker::rebuild(&messages);
                     self.conversation.messages = messages;
                     self.conversation.turn_tracker = turn_tracker;
+                    // NOTE: deliberately do NOT regenerate session_id here.
+                    // SetMessages also fires on `-c`/`--continue` auto-restore
+                    // and `/resume` of the current session — those CONTINUE an
+                    // existing conversation, so a new id would fragment one
+                    // logical session into two on the gateway. Only an explicit
+                    // fresh start (ClearConversation: /session, /clear) resets.
                 }
                 AgentCommand::SetPlanMode(enabled) => {
                     self.plan_mode = enabled;
@@ -2681,6 +2698,17 @@ impl AgentLoop {
             .saturating_sub(cold_zone_tokens)
             .saturating_sub(output_reserve)
             .max(window / 4) // defensive floor: tail never below 25% of window
+    }
+
+    /// Regenerate the per-conversation session id and propagate it to the
+    /// provider so the `x-atomcode-session-id` header tracks the logical
+    /// conversation. Called when the conversation is replaced (`/clear`,
+    /// `/session`, resume) — without this the id would persist for the
+    /// whole process and lump distinct conversations under one session on
+    /// the gateway.
+    fn reset_session_id(&mut self) {
+        self.session_id = uuid::Uuid::new_v4().to_string();
+        self.turn_runner.provider.set_session_id(&self.session_id);
     }
 
     async fn maybe_compress_history(&mut self, system_prompt: &str) {

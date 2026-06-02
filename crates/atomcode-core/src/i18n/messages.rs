@@ -505,6 +505,9 @@ pub enum Msg<'a> {
     PluginUninstallFailed { error: &'a str },
     PluginListFailed { error: &'a str },
     PluginReloadDone { skills: usize, warnings: usize },
+    /// Git not found on the system — marketplace auto-install and auto-update
+    /// are disabled. Shown as a friendly hint (not an error) at startup.
+    PluginGitNotFound,
     /// Marketplace `add` completion toast. Emitted by `handle_plugin_job_event`
     /// for both manual `/plugin marketplace add` and the detached
     /// startup-bootstrap auto-install. `count` is the number of plugins the

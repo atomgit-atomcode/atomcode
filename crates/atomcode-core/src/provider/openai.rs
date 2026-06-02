@@ -143,6 +143,15 @@ pub struct OpenAiProvider {
     /// at construction; a `/model` switch rebuilds the provider so this
     /// stays in sync with the live config.
     supports_vision: bool,
+    /// Stable per-conversation id, set once via `set_session_id` after the
+    /// owning agent generates it. Sent as the `x-atomcode-session-id` header
+    /// on every request so a forwarding gateway (LiteLLM) can pin the
+    /// conversation to one upstream account/replica for prefix-cache
+    /// affinity. Empty (the default) → header omitted (e.g. summary / sub-
+    /// agent calls that never had an id attached). `std::sync::RwLock`: set
+    /// once at startup, read (cheaply cloned, never held across `.await`)
+    /// per request.
+    session_id: std::sync::Arc<std::sync::RwLock<String>>,
 }
 
 impl OpenAiProvider {
@@ -181,6 +190,7 @@ impl OpenAiProvider {
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
             supports_vision: config.accepts_images(),
+            session_id: std::sync::Arc::new(std::sync::RwLock::new(String::new())),
         })
     }
 
@@ -564,6 +574,17 @@ impl LlmProvider for OpenAiProvider {
                 if let Ok(serialized) = serde_json::to_string_pretty(&body) {
                     let _ = std::fs::write(&path, serialized);
                 }
+                // Sidecar: the `x-atomcode-session-id` header value sent with
+                // THIS request (header isn't part of the body dump). Lets us
+                // correlate a wire-dump request to the session id the gateway
+                // sees: `grep -rl <uuid> ~/.atomcode/wire-dump/*.session`.
+                let sid = self
+                    .session_id
+                    .read()
+                    .ok()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let _ = std::fs::write(dir.join(format!("{}.session", ts)), &sid);
             }
         }
         // ────────────────────────────────────────────────────────────────
@@ -582,6 +603,14 @@ impl LlmProvider for OpenAiProvider {
         let api_key = self.api_key.clone();
         let provider_label = self.model.clone();
         let base_url_for_signing = self.base_url.clone();
+        // Stable per-conversation routing key for the forwarding gateway.
+        // Read once here (never held across `.await`); empty → header omitted.
+        let session_id_hdr = self
+            .session_id
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
 
         tokio::spawn(async move {
             // Upfront signing precheck. Without this, the retry factory
@@ -657,6 +686,7 @@ impl LlmProvider for OpenAiProvider {
                 let base_url_clone = base_url_for_signing.clone();
                 let client_for_factory = client.clone();
                 let token_for_factory = current_token.clone();
+                let session_id_for_factory = session_id_hdr.clone();
                 let resign = move || -> reqwest::RequestBuilder {
                     let extra_headers = build_codingplan_headers(
                         &base_url_clone,
@@ -671,6 +701,11 @@ impl LlmProvider for OpenAiProvider {
                         .body(body_for_factory.clone());
                     for (name, value) in extra_headers {
                         req = req.header(name, value);
+                    }
+                    // Stable session id → lets the forwarding gateway pin this
+                    // conversation to one upstream for prefix-cache affinity.
+                    if !session_id_for_factory.is_empty() {
+                        req = req.header("x-atomcode-session-id", session_id_for_factory.clone());
                     }
                     req
                 };
@@ -1244,6 +1279,12 @@ impl LlmProvider for OpenAiProvider {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+
+    fn set_session_id(&self, session_id: &str) {
+        if let Ok(mut g) = self.session_id.write() {
+            *g = session_id.to_string();
+        }
     }
 
     fn reasoning_history_policy(&self) -> ReasoningPolicy {
@@ -2192,6 +2233,106 @@ mod tests {
             !has_marker_delta,
             "abrupt close on tiny error blob must NOT emit the [stream ended …] marker delta: {:?}",
             events
+        );
+    }
+
+    const CLEAN_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+         data: [DONE]\n\n";
+
+    /// Once `set_session_id` is called, every request must carry the
+    /// `x-atomcode-session-id` header so the forwarding gateway can pin the
+    /// conversation to one upstream for prefix-cache affinity.
+    #[tokio::test]
+    async fn sends_x_atomcode_session_id_header_when_set() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(CLEAN_SSE),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        p.set_session_id("affinity-key-xyz");
+        let _ = collect_stream(&p).await;
+
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("requests recorded");
+        assert_eq!(reqs.len(), 1, "exactly one request");
+        let hdr = reqs[0].headers.get("x-atomcode-session-id");
+        assert!(hdr.is_some(), "header must be present when session id set");
+        assert_eq!(hdr.unwrap().to_str().unwrap(), "affinity-key-xyz");
+    }
+
+    /// `reset_session_id` (on /clear, /session, resume) re-calls
+    /// `set_session_id`; the header must reflect the LATEST value so a new
+    /// conversation gets its new id, not the process's first one.
+    #[tokio::test]
+    async fn set_session_id_is_resettable_latest_wins() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(CLEAN_SSE),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        p.set_session_id("old-session");
+        p.set_session_id("new-session"); // simulates reset_session_id
+        let _ = collect_stream(&p).await;
+
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("requests recorded");
+        assert_eq!(
+            reqs[0]
+                .headers
+                .get("x-atomcode-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "new-session"
+        );
+    }
+
+    /// Without a session id attached (e.g. summary / sub-agent calls), the
+    /// header must be omitted entirely — an empty value would pin all such
+    /// calls together on the gateway, which is wrong.
+    #[tokio::test]
+    async fn omits_session_header_when_unset() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(CLEAN_SSE),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        // no set_session_id call
+        let _ = collect_stream(&p).await;
+
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("requests recorded");
+        assert!(
+            reqs[0].headers.get("x-atomcode-session-id").is_none(),
+            "header must be absent when no session id attached"
         );
     }
 

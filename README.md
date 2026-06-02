@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.24.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -154,6 +154,18 @@ cargo build --release
 ```
 
 and the binary will be generated at `target/release/atomcode`.
+
+### Package Managers
+
+AtomCode CLI can also be installed via the following package managers:
+
+```bash
+# Install using npm
+npm install -g @atomgit.com/atomcode
+
+# Install using Homebrew
+brew install --cask atomcode
+```
 
 ### Requirements
 
