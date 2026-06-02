@@ -2843,20 +2843,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // universal `\<Enter>` block above (kbd_hint_set arm), which is
     // one line and terminal-agnostic.
 
-    // Bind the initial session's persistent id onto the agent (and
-    // telemetry) so even a brand-new session uses its session-file id for
-    // the x-atomcode-session-id header — not Agent::new's transient uuid.
-    // This is what makes a later /resume of this session reuse the SAME id.
-    // The -c replay block below rebinds to the continued session if present.
-    if let Ok(uuid) = uuid::Uuid::parse_str(ctx.current_session.id.as_str()) {
-        ctx.telemetry.set_session_id(uuid);
-    }
-    ctx.agent
-        .cmd_tx
-        .send(AgentCommand::SetSessionId(
-            ctx.current_session.id.as_str().to_string(),
-        ))
-        .ok();
+    // Bind the initial session's persistent id onto the agent + telemetry so
+    // even a brand-new session uses its session-file id for the
+    // x-atomcode-session-id header (not Agent::new's bootstrap). Makes a later
+    // /resume reuse the SAME id. The -c replay block below rebinds if present.
+    commands::bind_telemetry_to_session(&ctx, &ctx.current_session);
 
     // Auto-continue: if the CLI loaded the most recent session for this
     // working dir (via `atomcode -c` / `--continue`), replay its messages
@@ -2873,15 +2864,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 .ok();
             // Continue accumulating into the same session file — future
             // TurnComplete saves overwrite it instead of creating a new one.
-            if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
-                ctx.telemetry.set_session_id(uuid);
-            }
-            // Header session id = this continued session's persistent id, so
+            // Header + telemetry = this continued session's persistent id, so
             // `-c` reuses the saved session's id (not a fresh per-process one).
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::SetSessionId(session.id.as_str().to_string()))
-                .ok();
+            commands::bind_telemetry_to_session(&ctx, &session);
             ctx.current_session = session;
             app.state.on_turn_complete();
         }

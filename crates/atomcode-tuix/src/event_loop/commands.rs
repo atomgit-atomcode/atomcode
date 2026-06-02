@@ -47,7 +47,7 @@ fn render_welcome(renderer: &mut dyn Renderer, ctx: &LoopCtx) {
     });
 }
 
-fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
+pub(crate) fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
     if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
         ctx.telemetry.set_session_id(uuid);
     }
