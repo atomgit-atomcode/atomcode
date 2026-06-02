@@ -43,8 +43,8 @@
   .hdr-logo img{width:24px;height:24px;border-radius:6px;flex-shrink:0}
   .ver{display:inline-flex;align-items:center;padding:2px 7px;margin-left:6px;font-family:var(--mono);font-size:10px;letter-spacing:.5px;color:var(--accent);border:1px solid rgba(232,160,80,.4);border-radius:3px;font-weight:500;background:rgba(232,160,80,.08);transition:all .25s}
   .ver:hover{background:var(--accent);color:#000;border-color:var(--accent)}
-  .hdr-nav{display:flex;gap:22px;font-family:var(--mono);font-size:12px;letter-spacing:1.5px;text-transform:uppercase}
-  .hdr-nav a{position:relative;padding:6px 2px;color:rgba(255,255,255,.65);transition:color .2s}
+  .hdr-nav{display:flex;align-items:center;gap:22px;font-family:var(--mono);font-size:12px;letter-spacing:1.5px;text-transform:uppercase}
+  .hdr-nav a{position:relative;padding:6px 2px;line-height:1;color:rgba(255,255,255,.65);transition:color .2s}
   .hdr-nav a::after{content:"";position:absolute;bottom:0;left:0;right:0;height:1px;background:var(--accent);transform:scaleX(0);transform-origin:left;transition:transform .25s}
   .hdr-nav a:hover,.hdr-nav a.active{color:#fff}
   .hdr-nav a.active::after{transform:scaleX(1)}
@@ -635,10 +635,10 @@
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="#features" data-section="features" data-i18n="nav.features">功能</a>
-    <a href="#editor-plugins" data-section="editor-plugins" data-i18n="nav.plugins">插件</a>
+    <a href="#editor-plugins" data-section="editor-plugins" data-i18n="nav.plugins">IDE插件</a>
     <a href="#install" data-section="install" data-i18n="nav.install">安装</a>
     <a href="./docs/index.html" target="_blank" rel="noopener" data-i18n="nav.docs">文档</a>
-    <a href="https://atomcode-plugin.atomgit.com" target="_blank" rel="noopener" data-i18n="nav.marketplace">Skill</a>
+    <a href="https://atomcode-plugin.atomgit.com" target="_blank" rel="noopener" data-i18n="nav.marketplace">Skills</a>
     <a class="nav-cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">
       <span data-i18n="nav.codingplan">Coding Plan</span>
     </a>
@@ -657,10 +657,10 @@
 <!-- mobile drawer -->
 <nav class="mb-drawer" id="mbDrawer" aria-label="移动端导航">
   <a href="#features" data-i18n="nav.features">功能</a>
-  <a href="#editor-plugins" data-i18n="nav.plugins">插件</a>
+  <a href="#editor-plugins" data-i18n="nav.plugins">IDE插件</a>
   <a href="#install" data-i18n="nav.install">安装</a>
   <a href="./docs/index.html" target="_blank" rel="noopener" data-i18n="nav.docs">文档</a>
-  <a href="https://atomcode-plugin.atomgit.com" target="_blank" rel="noopener" data-i18n="nav.marketplace">Skill</a>
+  <a href="https://atomcode-plugin.atomgit.com" target="_blank" rel="noopener" data-i18n="nav.marketplace">Skills</a>
   <a class="cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">
     <span data-i18n="nav.codingplan">Coding Plan</span>
   </a>
@@ -1123,8 +1123,8 @@ const T={
   'nav.compare':{zh:'对比',en:'Compare'},
   'nav.install':{zh:'安装',en:'Install'},
 'nav.docs':{zh:'文档',en:'Docs'},
-'nav.marketplace':{zh:'Skill',en:'Skill'},
-'nav.plugins':{zh:'插件',en:'Plugins'},
+'nav.marketplace':{zh:'Skills',en:'Skills'},
+'nav.plugins':{zh:'IDE插件',en:'IDE Plugins'},
   'nav.codingplan':{zh:'Coding Plan',en:'Coding Plan'},
   'btn.repo':{zh:'开源仓库',en:'Repository'},
   'btn.start':{zh:'立即开始',en:'Get Started'},
