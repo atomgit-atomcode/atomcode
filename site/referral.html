@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="referrer" content="strict-origin-when-cross-origin">
 <title>邀请有礼 · AtomCode</title>
 <meta name="description" content="邀请开发者安装并使用 AtomCode，按周结算安装与活跃奖励。">
 <link rel="icon" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
@@ -95,6 +96,9 @@
   .install-cmd-section .copy-btn{height:32px;border-radius:0;border-color:rgba(232,160,80,.28);color:rgba(232,160,80,.9);background:transparent}
   .install-cmd-section .copy-btn:hover{background:var(--accent);color:#000;border-color:var(--accent)}
   .cmd-footnote{padding:0 16px 16px;color:var(--faint);font-size:13px;letter-spacing:.5px}
+  .invite-link-box{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:22px;padding:16px 18px;background:#000;border:1px solid rgba(232,160,80,.20);border-radius:8px;box-shadow:0 0 0 1px rgba(122,166,255,.08),0 0 30px rgba(122,166,255,.10)}
+  .invite-url{min-width:0;font-family:var(--mono);font-size:16px;line-height:1.45;color:#9ecbff;word-break:break-all}
+  .invite-link-box .copy-btn{flex-shrink:0}
 
   .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;padding-top:20px;border-top:1px solid var(--line)}
   .metric{min-width:0;padding:18px 16px;border:1px solid var(--line);border-radius:8px;background:rgba(0,0,0,.16)}
@@ -162,6 +166,8 @@
   html.light .panel-title,html.light .section-title,html.light .user-name,html.light .period b{color:#0d0d0d}
   html.light .panel-meta,html.light .user-id,html.light .metric-label,html.light .metric-note,html.light .period,html.light .rank-table th{color:rgba(0,0,0,.48)}
   html.light .cmd-box,html.light .install-cmd-section,html.light .rules code{background:#fff;border-color:rgba(0,0,0,.10)}
+  html.light .invite-link-box{background:#fff;border-color:rgba(0,0,0,.10)}
+  html.light .invite-url{color:#1f6fd1}
   html.light .rules code{color:#0d0d0d;background:rgba(0,0,0,.035);border-color:rgba(0,0,0,.12)}
   html.light .install-cmd-section .cp-bar,html.light .install-actions{background:rgba(0,0,0,.025);border-color:rgba(0,0,0,.08)}
   html.light .install-cmd-section .cp-bar .label,html.light .cmd-footnote{color:rgba(0,0,0,.50)}
@@ -216,7 +222,7 @@
     <section class="hero">
       <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">长期进行中 · 每周一结算现金打款</span></div>
       <h1 data-i18n="hero.title">邀请有礼：AtomCode 裂变计划</h1>
-      <p class="sub" data-i18n="hero.sub">获取您的专属安装命令，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。</p>
+      <p class="sub" data-i18n="hero.sub">获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。</p>
     </section>
 
     <div id="loading-state" class="state active"><div class="spinner"></div></div>
@@ -226,7 +232,7 @@
         <div class="panel-head">
           <div class="panel-title">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
-            <span data-i18n="panel.login.title">登录后领取专属邀请命令</span>
+            <span data-i18n="panel.login.title">登录后领取专属邀请链接</span>
           </div>
           <div class="panel-meta" data-i18n="panel.meta.login">数据更新时间：登录后可见</div>
         </div>
@@ -254,7 +260,7 @@
             <div><div class="user-name" id="user-name-1"></div><div class="user-id" id="user-id-1"></div></div>
             <button class="logout-btn" onclick="logout()" data-i18n="logout">退出</button>
           </div>
-          <p class="cmd-label" data-i18n="invite.none">你还没有邀请码，生成后即可复制专属安装命令分享给其他开发者。</p>
+          <p class="cmd-label" data-i18n="invite.none">你还没有邀请码，生成后即可复制官网邀请链接分享给其他开发者。</p>
           <button class="gen-btn" id="gen-btn" onclick="generateCode()" data-i18n="invite.generate">生成邀请码</button>
           <p id="gen-error" class="error-msg" style="display:none"></p>
         </div>
@@ -278,25 +284,10 @@
             <div><div class="user-name" id="user-name-2"></div><div class="user-id" id="user-id-2"></div></div>
             <button class="logout-btn" onclick="logout()" data-i18n="logout">退出</button>
           </div>
-          <p class="cmd-label" data-i18n="cmd.label">复制专属安装命令，分享给其他开发者</p>
-          <div class="cmd-box">
-            <div class="install-cmd-list">
-              <div class="install-cmd-section">
-                <div class="cp-bar">
-                  <span class="label">macOS / Linux / HarmonyOS PC</span>
-                  <button class="copy-btn" id="copy-unix-btn" onclick="copyInstallCommand('unix')" data-copy-label="short">📋 复制</button>
-                </div>
-                <pre class="cmd-text" id="cmd-unix-text"></pre>
-              </div>
-              <div class="install-cmd-section">
-                <div class="cp-bar">
-                  <span class="label">Windows · PowerShell</span>
-                  <button class="copy-btn" id="copy-win-btn" onclick="copyInstallCommand('win')" data-copy-label="short">📋 复制</button>
-                </div>
-                <pre class="cmd-text" id="cmd-win-text"></pre>
-              </div>
-            </div>
-            <div class="cmd-footnote" data-i18n="cmd.footnote">macOS / Linux / HarmonyOS PC + Windows · 自动选 PATH</div>
+          <p class="cmd-label" data-i18n="cmd.label">复制官网邀请链接，分享给其他开发者</p>
+          <div class="invite-link-box">
+            <div class="invite-url" id="invite-url-text"></div>
+            <button class="copy-btn" id="copy-link-btn" onclick="copyInviteLink()" data-copy-label="short">📋 复制</button>
           </div>
           <div class="metrics">
             <div class="metric"><div class="metric-label" data-i18n="metric.devices">本周新增设备安装</div><div class="metric-value"><span id="stat-devices">0</span><span class="unit" data-i18n="unit.devices">台</span></div></div>
@@ -353,8 +344,8 @@ const T = {
   'btn.repo': { zh: '开源仓库', en: 'Repository' },
   'hero.badge': { zh: '长期进行中 · 每周一结算现金打款', en: 'Ongoing · settled every Monday' },
   'hero.title': { zh: '邀请有礼：AtomCode 裂变计划', en: 'Referral Rewards: AtomCode Growth Program' },
-  'hero.sub': { zh: '获取您的专属安装命令，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。', en: 'Get your dedicated install command and invite developers to install and use AtomCode. High conversion earns bonus rewards, with weekly leaderboard updates.' },
-  'panel.login.title': { zh: '登录后领取专属邀请命令', en: 'Sign in to get your invite command' },
+  'hero.sub': { zh: '获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。', en: 'Get your official invite link and invite developers to install and use AtomCode. High conversion earns bonus rewards, with weekly leaderboard updates.' },
+  'panel.login.title': { zh: '登录后领取专属邀请链接', en: 'Sign in to get your invite link' },
   'panel.meta.login': { zh: '数据更新时间：登录后可见', en: 'Updated: visible after sign-in' },
   'panel.mine': { zh: '我的专属邀请面板', en: 'My Referral Dashboard' },
   'panel.meta.prefix': { zh: '数据更新时间：', en: 'Updated: ' },
@@ -362,13 +353,13 @@ const T = {
   'login.desc': { zh: '使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。', en: 'Sign in with AtomGit to generate your invite code and view this week’s installs, active users, and estimated settlement.' },
   'login.btn': { zh: '使用 AtomGit 账号登录', en: 'Sign in with AtomGit' },
   'logout': { zh: '退出', en: 'Log out' },
-  'invite.none': { zh: '你还没有邀请码，生成后即可复制专属安装命令分享给其他开发者。', en: 'You do not have an invite code yet. Generate one to copy and share your dedicated install command.' },
+  'invite.none': { zh: '你还没有邀请码，生成后即可复制官网邀请链接分享给其他开发者。', en: 'You do not have an invite code yet. Generate one to copy and share your official invite link.' },
   'invite.generate': { zh: '生成邀请码', en: 'Generate Invite Code' },
   'invite.generating': { zh: '生成中...', en: 'Generating...' },
-  'cmd.label': { zh: '复制专属安装命令，分享给其他开发者', en: 'Copy your dedicated install command and share it with other developers' },
+  'cmd.label': { zh: '复制官网邀请链接，分享给其他开发者', en: 'Copy your official invite link and share it with other developers' },
   'cmd.copy': { zh: '📋 复制', en: '📋 Copy' },
   'cmd.copied': { zh: '✓ 已复制', en: '✓ Copied' },
-  'cmd.footnote': { zh: 'macOS / Linux / HarmonyOS PC + Windows · 自动选 PATH', en: 'macOS / Linux / HarmonyOS PC + Windows · auto PATH' },
+  'cmd.footnote': { zh: '打开链接后，官网会自动生成带邀请码的安装命令', en: 'The website generates invite-aware install commands automatically' },
   'metric.devices': { zh: '本周新增设备安装', en: 'New installs this week' },
   'metric.active': { zh: '本周新增账号活跃', en: 'New active accounts this week' },
   'metric.rate': { zh: '当前活跃转化率', en: 'Current active conversion' },
@@ -431,25 +422,22 @@ function showToast(message) {
   setTimeout(() => toast.classList.remove('show'), 1200);
 }
 
-// ── Install commands (auto-detect OS, invite code injected by updateInstallCommands) ──
-const VERSION = 'v4.24.0';
-const RELEASE_BASE = 'https://atomgit.com/atomgit_atomcode/atomcode/releases/download/' + VERSION;
-let OS_CMDS = {};  // populated by updateInstallCommands()
-function highlightCommand(text) {
-  const stash = [];
-  text = String(text || '').replace(/(https?:\/\/\S+)/g, m => {
-    stash.push(m);
-    return '\x00' + (stash.length - 1) + '\x00';
-  });
-  text = esc(text).replace(/\b(curl|irm|iex|sh|PowerShell|ATOMCODE_INVITE)\b/g, '<span class="accent">$1</span>');
-  return text.replace(/\x00(\d+)\x00/g, (_, i) => '<span class="str">' + esc(stash[i]) + '</span>');
+// ── Invite link (the index page turns ?invite=CODE into install commands) ──
+const PUBLIC_SITE_BASE = 'https://atomcode.atomgit.com';
+let inviteLink = '';
+function currentSiteBase() {
+  const origin = window.location.origin || '';
+  return /^https?:\/\//.test(origin) ? origin : PUBLIC_SITE_BASE;
 }
-
-function renderInstallCommands() {
-  const unixEl = document.getElementById('cmd-unix-text');
-  const winEl = document.getElementById('cmd-win-text');
-  if (unixEl) unixEl.innerHTML = highlightCommand(OS_CMDS.unix || '');
-  if (winEl) winEl.innerHTML = highlightCommand(OS_CMDS.win || '');
+function inviteLandingUrl(code) {
+  if (!/^[A-Za-z0-9]{8}$/.test(String(code || ''))) return '';
+  const params = new URLSearchParams({ invite: code });
+  if (ENV) params.set('env', ENV);
+  return currentSiteBase() + '?' + params.toString();
+}
+function renderInviteLink() {
+  const el = document.getElementById('invite-url-text');
+  if (el) el.textContent = inviteLink;
 }
 
 let currentSid = null;
@@ -534,7 +522,7 @@ function renderAuthenticated(data) {
   if (data.invite_code) {
     currentCode = data.invite_code;
     fillUser('2', currentUser);
-    updateInstallCommands(currentCode);
+    updateInviteLink(currentCode);
     showState('auth-code');
     loadSummary();
     loadLeaderboard(formatLocalDate(getMonday()));
@@ -569,18 +557,39 @@ async function generateCode() {
   }
 }
 
-function updateInstallCommands(code) {
-  OS_CMDS = {
-    unix: 'curl -fsSL ' + RELEASE_BASE + '/install.sh | sh -s -- --invite=' + code,
-    win: '$env:ATOMCODE_INVITE=\'' + code + '\'; irm ' + RELEASE_BASE + '/install.ps1 | iex',
-  };
-  renderInstallCommands();
+function updateInviteLink(code) {
+  inviteLink = inviteLandingUrl(code);
+  renderInviteLink();
 }
 
-async function copyInstallCommand(kind) {
-  const cmd = OS_CMDS[kind] || '';
-  await navigator.clipboard.writeText(cmd);
-  const btn = document.getElementById(kind === 'win' ? 'copy-win-btn' : 'copy-unix-btn');
+function legacyCopy(text) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.top = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try { ta.setSelectionRange(0, text.length); } catch (e) {}
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch (e) {
+    return false;
+  }
+}
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text).catch(() => legacyCopy(text));
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+async function copyInviteLink() {
+  await copyText(inviteLink);
+  const btn = document.getElementById('copy-link-btn');
   btn.textContent = t('cmd.copied');
   btn.classList.add('copied');
   setTimeout(() => { btn.textContent = t('cmd.copy'); btn.classList.remove('copied'); }, 1600);
@@ -842,7 +851,7 @@ function initLangToggle() {
     LANG = LANG === 'zh' ? 'en' : 'zh';
     try { localStorage.setItem('atomcode_lang', LANG); } catch (e) {}
     applyI18n();
-    renderInstallCommands();
+    renderInviteLink();
     renderSummary(currentSummary);
     reloadVisibleLeaderboard();
     showToast(t('toast.lang.' + LANG));

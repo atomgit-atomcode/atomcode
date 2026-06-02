@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="referrer" content="strict-origin-when-cross-origin">
 <title>AtomCode · 在你的终端中运行的 AI 编程助手</title>
 <meta name="description" content="AtomCode — Claude Code 的开源平替。连接任意大模型，自主多步执行，30 秒上手。">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
@@ -1305,16 +1306,26 @@ const RELEASE_BASE='https://atomgit.com/atomgit_atomcode/atomcode/releases/downl
 // Install scripts are served version-free from the repo (raw host); the scripts
 // auto-detect the latest release themselves, so no version is pinned in the URL.
 const SCRIPT_BASE='https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts';
+const INVITE_PARAM=new URLSearchParams(window.location.search).get('invite')||'';
+const INVITE_CODE=/^[A-Za-z0-9]{8}$/.test(INVITE_PARAM)?INVITE_PARAM:'';
+function unixInstallCmd(){
+  return `curl -fsSL ${SCRIPT_BASE}/install.sh | sh${INVITE_CODE?` -s -- --invite=${INVITE_CODE}`:''}`;
+}
+function winInstallCmd(){
+  return INVITE_CODE
+    ? `$env:ATOMCODE_INVITE='${INVITE_CODE}'; irm ${SCRIPT_BASE}/install.ps1 | iex`
+    : `irm ${SCRIPT_BASE}/install.ps1 | iex`;
+}
 const OS_CMDS={
-  mac:`curl -fsSL ${SCRIPT_BASE}/install.sh | sh`,
-  linux:`curl -fsSL ${SCRIPT_BASE}/install.sh | sh`,
-  win:`irm ${SCRIPT_BASE}/install.ps1 | iex`,
-  harmony:`curl -fsSL ${SCRIPT_BASE}/install.sh | sh`,
+  mac:unixInstallCmd(),
+  linux:unixInstallCmd(),
+  win:winInstallCmd(),
+  harmony:unixInstallCmd(),
 };
 function osHint(os){return t('os.'+os);}
 const METHOD_CMDS={
-  oneclick:{zh:`# macOS / Linux / HarmonyOS PC\ncurl -fsSL ${SCRIPT_BASE}/install.sh | sh\n\n# Windows · PowerShell\nirm ${SCRIPT_BASE}/install.ps1 | iex`,
-            en:`# macOS / Linux / HarmonyOS PC\ncurl -fsSL ${SCRIPT_BASE}/install.sh | sh\n\n# Windows · PowerShell\nirm ${SCRIPT_BASE}/install.ps1 | iex`},
+  oneclick:{zh:`# macOS / Linux / HarmonyOS PC\n${unixInstallCmd()}\n\n# Windows · PowerShell\n${winInstallCmd()}`,
+            en:`# macOS / Linux / HarmonyOS PC\n${unixInstallCmd()}\n\n# Windows · PowerShell\n${winInstallCmd()}`},
   source:{zh:`# 需要 Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # 验证安装`,
           en:`# Requires Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # verify install`},
   binary:{zh:`# 从 Releases 页面下载\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# 或直接 curl 取对应平台\ncurl -L -o atomcode \\\n  ${RELEASE_BASE}/atomcode-${VERSION}-darwin-arm64\nchmod +x atomcode && mv atomcode /usr/local/bin/`,
