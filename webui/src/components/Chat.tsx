@@ -1179,14 +1179,16 @@ function UserMessageView({ msg }: { msg: Message }) {
 
   return (
     <div class="user-message-wrapper">
-      <div class="user-message-bubble">
+      <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
         {images}
         {skillTitle && (
           <button class="skill-collapse" onClick={() => setExpanded(false)}>
             {t('chat.skillCollapse')}
           </button>
         )}
-        {msg.text}
+        {/* 技能/文档型内容本就是 markdown（注入的 SKILL.md），渲染它；
+            普通用户消息保持逐字纯文本（不把用户输入当 markdown 解析）。 */}
+        {skillTitle ? <Markdown content={msg.text} /> : msg.text}
       </div>
     </div>
   );

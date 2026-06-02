@@ -293,6 +293,12 @@ body {
   font-weight: 400;
 }
 
+/* 技能/文档型消息展开后按 markdown 渲染：取消气泡的 pre-wrap，避免块级元素
+   之间出现多余空白；首/尾块去掉外边距使其贴合气泡内边距。 */
+.user-message-bubble.is-markdown { white-space: normal; }
+.user-message-bubble.is-markdown > :first-child { margin-top: 0; }
+.user-message-bubble.is-markdown > :last-child { margin-bottom: 0; }
+
 /* 排队中的用户消息：弱化显示，附「排队中」标签与撤回按钮。 */
 .user-message-wrapper.queued .user-message-bubble {
   opacity: 0.7;
