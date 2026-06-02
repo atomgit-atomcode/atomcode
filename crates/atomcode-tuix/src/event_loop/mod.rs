@@ -4357,8 +4357,6 @@ pub use crate::modals::ProviderWizard;
 /// Parse a committed `$<name> [args]` line into `(name, args)`. Returns `None`
 /// when the line is not `$`-prefixed or carries no skill name. Mirrors
 /// `parse_slash_line` but for the `$` skills trigger.
-// wired up by the $ commit-dispatch task
-#[allow(dead_code)]
 fn parse_dollar_line(line: &str) -> Option<(String, String)> {
     let rest = line.strip_prefix('$')?;
     let trimmed = rest.trim_start();
@@ -4926,6 +4924,50 @@ fn handle_idle_key(
             // content". Mirrors the queue branch below which already
             // clears AFTER expansion.
             app.menu.selected = 0;
+            // `$<name> [args]` committed (Tab-parked then Enter, or typed in
+            // full). Resolve to a user-invocable skill and dispatch through the
+            // same `skills` arm as `/skills <name> <args>`; the user-visible
+            // echo stays `$name` so `/skills` never appears.
+            if let Some((skill_name, skill_args)) = parse_dollar_line(&line) {
+                let is_user_skill = ctx
+                    .skill_registry
+                    .read()
+                    .ok()
+                    .and_then(|r| r.get(&skill_name).map(|s| s.user_invocable))
+                    .unwrap_or(false);
+                if is_user_skill {
+                    renderer.render(UiLine::User(line.clone()));
+                    ctx.history.push(crate::input::history::HistoryEntry {
+                        text: line.clone(),
+                        images: Vec::new(),
+                    });
+                    app.state.last_submitted_message = Some(line.clone());
+                    let arg = if skill_args.is_empty() {
+                        skill_name.clone()
+                    } else {
+                        format!("{} {}", skill_name, skill_args)
+                    };
+                    execute_slash_command(
+                        "skills",
+                        &arg,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        &mut app.active_modal,
+                        &mut app.fixissue_pending,
+                        &mut app.fixissue_buffer,
+                        &mut app.setup_pending,
+                    )?;
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        app.state.last_submitted_message = None;
+                        redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                    }
+                    app.buf.clear_pastes();
+                    return Ok(());
+                }
+                // Not a known skill: fall through so `$foo` is sent as a
+                // normal message (e.g. "$5 budget" keeps working).
+            }
             // Only treat `/name …` as a slash command when `name` is
             // actually registered. Unrecognised `/foo …` (e.g. the user
             // typed `/test 文件下有哪些文件` meaning to *ask about*
