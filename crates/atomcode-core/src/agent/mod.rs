@@ -1220,6 +1220,10 @@ impl AgentLoop {
                     // Clear the conversation history in the agent loop.
                     self.conversation = Conversation::new();
                     self.datalog.clear();
+                    // New conversation → new session id (e.g. /session,
+                    // /clear). Keeps the x-atomcode-session-id header aligned
+                    // with the logical conversation, not the process lifetime.
+                    self.reset_session_id();
                 }
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.
@@ -1229,6 +1233,9 @@ impl AgentLoop {
                         crate::conversation::turn::TurnTracker::rebuild(&messages);
                     self.conversation.messages = messages;
                     self.conversation.turn_tracker = turn_tracker;
+                    // Resuming a different saved conversation is a new session
+                    // boundary for prefix-cache affinity.
+                    self.reset_session_id();
                 }
                 AgentCommand::SetPlanMode(enabled) => {
                     self.plan_mode = enabled;
@@ -2684,6 +2691,17 @@ impl AgentLoop {
             .saturating_sub(cold_zone_tokens)
             .saturating_sub(output_reserve)
             .max(window / 4) // defensive floor: tail never below 25% of window
+    }
+
+    /// Regenerate the per-conversation session id and propagate it to the
+    /// provider so the `x-atomcode-session-id` header tracks the logical
+    /// conversation. Called when the conversation is replaced (`/clear`,
+    /// `/session`, resume) — without this the id would persist for the
+    /// whole process and lump distinct conversations under one session on
+    /// the gateway.
+    fn reset_session_id(&mut self) {
+        self.session_id = uuid::Uuid::new_v4().to_string();
+        self.turn_runner.provider.set_session_id(&self.session_id);
     }
 
     async fn maybe_compress_history(&mut self, system_prompt: &str) {

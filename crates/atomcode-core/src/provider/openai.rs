@@ -2270,6 +2270,42 @@ mod tests {
         assert_eq!(hdr.unwrap().to_str().unwrap(), "affinity-key-xyz");
     }
 
+    /// `reset_session_id` (on /clear, /session, resume) re-calls
+    /// `set_session_id`; the header must reflect the LATEST value so a new
+    /// conversation gets its new id, not the process's first one.
+    #[tokio::test]
+    async fn set_session_id_is_resettable_latest_wins() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(CLEAN_SSE),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        p.set_session_id("old-session");
+        p.set_session_id("new-session"); // simulates reset_session_id
+        let _ = collect_stream(&p).await;
+
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("requests recorded");
+        assert_eq!(
+            reqs[0]
+                .headers
+                .get("x-atomcode-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "new-session"
+        );
+    }
+
     /// Without a session id attached (e.g. summary / sub-agent calls), the
     /// header must be omitted entirely — an empty value would pin all such
     /// calls together on the gateway, which is wrong.
