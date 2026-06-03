@@ -547,8 +547,8 @@ enum Commands {
     },
     /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
     Webui {
-        /// 端口（默认 13456）
-        #[arg(long, default_value = "13456")]
+        /// 端口（默认 13457，刻意错开 VSCode 守护进程的 13456，避免抢端口导致扩展 401/无响应）
+        #[arg(long, default_value_t = atomcode_daemon::WEBUI_DEFAULT_PORT)]
         port: u16,
         /// 绑定地址（默认 127.0.0.1；用 0.0.0.0 暴露到局域网/外网，注意仅 token 保护、无 TLS）
         #[arg(long, default_value = "127.0.0.1")]

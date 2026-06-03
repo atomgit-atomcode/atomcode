@@ -868,7 +868,11 @@ pub(super) fn execute_slash_command(
                 let host = parse_host(a);
                 let open_msg = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
-                        .block_on(atomcode_daemon::ensure_server_and_open(&host, 13456, true))
+                        .block_on(atomcode_daemon::ensure_server_and_open(
+                            &host,
+                            atomcode_daemon::WEBUI_DEFAULT_PORT,
+                            true,
+                        ))
                 });
                 // 自动附着：建立（或取得已有的）LiveSession，并把 TUI 接入同步。
                 let session = atomcode_daemon::ensure_live_session(

@@ -77,12 +77,12 @@
 
       <h2>启动与关闭</h2>
       <p>在 AtomCode 的 TUI 输入框里运行：</p>
-      <pre><code># 启动 webui 并自动打开浏览器（默认绑定 127.0.0.1:13456，仅本机可访问）
+      <pre><code># 启动 webui 并自动打开浏览器（默认绑定 127.0.0.1:13457，仅本机可访问）
 /webui
 
 # 关闭 webui 服务
 /webui stop</code></pre>
-      <p>启动后 AtomCode 会在本机起一个 HTTP 服务，并自动打开浏览器到形如 <code>http://127.0.0.1:13456/?token=&lt;一次性令牌&gt;</code> 的地址。URL 里带的 <code>token</code> 用于鉴权，<strong>等同于密码</strong>，请勿外传。同时，当前 TUI 会话会自动接入实时同步（见下文 <a href="#多端实时同步">多端实时同步</a>）。</p>
+      <p>启动后 AtomCode 会在本机起一个 HTTP 服务，并自动打开浏览器到形如 <code>http://127.0.0.1:13457/?token=&lt;一次性令牌&gt;</code> 的地址。URL 里带的 <code>token</code> 用于鉴权，<strong>等同于密码</strong>，请勿外传。同时，当前 TUI 会话会自动接入实时同步（见下文 <a href="#多端实时同步">多端实时同步</a>）。</p>
 
       <div class="callout callout-warn">
         <strong>默认只监听本机</strong>

@@ -830,6 +830,7 @@ async fn activity_tracker_middleware(
 fn resolve_client_mode(header: &str) -> SessionMode {
     match header {
         "vscode" => SessionMode::Vscode,
+        "webui" => SessionMode::Webui,
         "atomcode-air" => SessionMode::AtomcodeAir,
         _ => SessionMode::Ide,
     }
@@ -3036,6 +3037,16 @@ fn primary_lan_ipv4() -> Option<String> {
         _ => None,
     }
 }
+
+/// 进程内 webui server 的默认端口。**刻意区别于独立守护进程的 13456**。
+///
+/// 进程内 webui（TUI `/webui`、`atomcode webui`）以 `enforce_token=true` 启动，而
+/// VSCode 扩展自带的守护进程以 `enforce_token=false`（不带 token）在 13456 上工作。
+/// 二者若共用 13456，会互相踩端口：webui 抢到后，VSCode 的 `/project`、`/models`、
+/// `/chat` 乃至 `/shutdown` 都会因缺 token 返回 401，扩展既用不了也停不掉它，表现为
+/// “daemon started but not responding”。让 webui 默认错开到 13457 即可彻底分离
+/// （webui 的访问 URL 是生成的，端口号对用户无感；被占时仍会向上扫描）。
+pub const WEBUI_DEFAULT_PORT: u16 = 13457;
 
 /// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token，开浏览器。
 ///
