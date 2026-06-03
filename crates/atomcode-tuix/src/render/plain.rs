@@ -448,6 +448,7 @@ mod tests {
             raw_mode: false,
             scroll_region: false,
             unicode_symbols: false,
+            legacy_conhost: false,
         }
     }
 
@@ -464,6 +465,7 @@ mod tests {
             raw_mode: false,
             scroll_region: false,
             unicode_symbols: true,
+            legacy_conhost: false,
         }
     }
 

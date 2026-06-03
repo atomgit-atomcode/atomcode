@@ -7236,7 +7236,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
-    } else if let Some(warning) = ctx.monitor_warning.lock().ok().and_then(|g| g.clone()) {
+    } else if let Some(warning) = monitor::is_codingplan_provider(&ctx.config.default_provider)
+        .then(|| ctx.monitor_warning.lock().ok().and_then(|g| g.clone()))
+        .flatten()
+    {
+        // Only surface the CodingPlan drift warning while a CodingPlan-managed
+        // (AtomGit*) provider is active. A warning set on an AtomGit provider
+        // must not linger after the user switches to a custom provider via a
+        // path that doesn't clear the slot (e.g. `/provider`) — the hint is
+        // meaningless for non-CodingPlan models.
         Some((warning.display_text(), crate::render::HintSeverity::Warning))
     } else if let Some(hook_msg) = ctx.hook_warning_hint.lock().ok().and_then(|g| g.clone()) {
         Some((hook_msg, crate::render::HintSeverity::Warning))
