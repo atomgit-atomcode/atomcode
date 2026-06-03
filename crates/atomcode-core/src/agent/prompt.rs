@@ -206,19 +206,14 @@ Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
         // See `ctx::env` for the snapshot / disclaimer rationale.
         prompt.push_str(&self.env_snapshot.as_prompt_section());
 
-        // Plan mode: inject planning-only instructions before rules.
-        if self.plan_mode {
-            prompt.push_str(
-                "\n=== PLAN MODE (ACTIVE) ===\n\
-                 You are in PLAN MODE. You can explore, read files, run commands, and analyze the codebase.\n\
-                 You MUST NOT edit, create, or delete any files. Only read-only tools are available.\n\
-                 Your job is to:\n\
-                 1. Analyze the codebase and understand the current state\n\
-                 2. Create a detailed implementation plan with specific files, functions, and changes\n\
-                 3. Present the plan clearly so the user can review before executing\n\
-                 Do NOT attempt to make any changes. Focus on analysis and planning only.\n\n"
-            );
-        }
+        // NOTE: the PLAN MODE block used to be injected into the system prompt
+        // here. It was moved OUT — toggling plan mode mid-session rewrote
+        // messages[0] and zeroed the ENTIRE prefix cache (~12% of system-prompt
+        // cache breaks in the line-data). Plan mode is now announced ONCE via a
+        // synthetic history message when it is toggled (see
+        // `AgentCommand::SetPlanMode`), and enforced structurally by read-only
+        // tool gating (`use_read_only`). The system prompt stays a session-level
+        // constant. See `plan_mode_is_not_in_system_prompt`.
 
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.

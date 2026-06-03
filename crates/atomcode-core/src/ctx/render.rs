@@ -120,7 +120,13 @@ pub fn build_messages(
             },
             conv.cold_summaries.join("\n---\n")
         );
-        result.push(Message::new(Role::System, cold_text));
+        // Role::User (NOT System): a System-role cold summary gets folded into
+        // messages[0] by the consecutive-system merger below, so every new
+        // compression rewrote the ~16K system prefix and zeroed the whole cache.
+        // As a User message it rides next to the surviving history instead, and
+        // the frozen system prompt stays byte-stable across compactions. See
+        // `test_no_consecutive_system_messages_after_compression`.
+        result.push(Message::new(Role::User, cold_text));
     }
 
     // Add all current messages
@@ -232,7 +238,10 @@ pub fn build_messages(
                     .collect::<Vec<_>>()
                     .join("\n")
             );
-            result.push(Message::new(Role::System, digest));
+            // Role::User, same rationale as the cold-zone summary above: keep
+            // the compaction digest out of messages[0] so the frozen system
+            // prompt survives compaction in the prefix cache.
+            result.push(Message::new(Role::User, digest));
         }
 
         // Find first surviving message, clamped to last_turn_start so the last turn always survives.
@@ -2260,20 +2269,30 @@ mod tests {
             );
         }
 
-        // The merged system message must still carry both the original
-        // prompt and the cold-zone summary so the model retains context.
-        let merged = msgs
+        // The system message keeps ONLY the original prompt — the cold-zone
+        // summary must NOT be merged into it (that rewrote messages[0] on every
+        // compression and zeroed the prefix cache). The summary now rides on a
+        // User message so the model still retains the context.
+        let sys = msgs
             .iter()
             .find(|m| matches!(m.role, Role::System))
             .and_then(|m| m.text())
             .expect("at least one system message");
         assert!(
-            merged.contains("you are atomcode"),
-            "merged system must keep original prompt"
+            sys.contains("you are atomcode"),
+            "system must keep original prompt"
         );
         assert!(
-            merged.contains("Earlier conversation history"),
-            "merged system must keep cold-zone summary"
+            !sys.contains("Earlier conversation history"),
+            "cold-zone summary must NOT be in the system message (prefix-cache stability)"
+        );
+        let summary_in_user = msgs.iter().any(|m| {
+            matches!(m.role, Role::User)
+                && m.text().map_or(false, |t| t.contains("Earlier conversation history"))
+        });
+        assert!(
+            summary_in_user,
+            "cold-zone summary must ride on a User message so context is retained"
         );
     }
 

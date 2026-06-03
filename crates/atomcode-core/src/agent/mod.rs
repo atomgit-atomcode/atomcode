@@ -1284,10 +1284,26 @@ impl AgentLoop {
                     // fresh start (ClearConversation: /session, /clear) resets.
                 }
                 AgentCommand::SetPlanMode(enabled) => {
+                    let changed = self.plan_mode != enabled;
                     self.plan_mode = enabled;
-                    // Plan-mode toggles the agent's read-only contract and the
-                    // PLAN MODE system block — a legitimate one-time rebuild.
-                    self.cached_system_prompt = None;
+                    // Plan mode is communicated to the model via a ONE-TIME
+                    // synthetic history message, NOT the system prompt — keeping
+                    // it out of messages[0] is what stops a plan-mode toggle from
+                    // zeroing the whole prefix cache. The read-only tool gating
+                    // (see `use_read_only`) enforces the constraint every turn
+                    // regardless. We do NOT touch cached_system_prompt here.
+                    if changed {
+                        let note = if enabled {
+                            "[PLAN MODE ACTIVATED] You are now in plan mode. Only read-only \
+                             tools are available — you MUST NOT edit, create, or delete any \
+                             files. Explore and analyze the codebase, then present a detailed \
+                             implementation plan for the user to review before making any changes."
+                        } else {
+                            "[PLAN MODE ENDED] Plan mode is off. You may now edit files and \
+                             carry out the plan."
+                        };
+                        self.conversation.add_synthetic_user_message(note);
+                    }
                 }
                 AgentCommand::Compact { prompt } => {
                     self.run_compact(prompt).await;
@@ -3816,6 +3832,41 @@ mod agent_handle_tests {
         assert!(
             sys3.contains(&new_wd.display().to_string()),
             "the rebuilt prompt should reflect the new cwd"
+        );
+    }
+
+    /// Part-2 (systemA): plan mode must NOT live in the system prompt. Toggling
+    /// it would otherwise rewrite messages[0] and zero the prefix cache. It's
+    /// announced via a synthetic history message instead (see SetPlanMode) and
+    /// enforced by read-only tool gating.
+    #[tokio::test]
+    async fn plan_mode_is_not_in_system_prompt() {
+        let wd = std::path::PathBuf::from(format!("/tmp/atomcode_planmode_{}", std::process::id()));
+        let (mut loop_, _handle) = super::AgentLoop::new_with_shared_parts(
+            crate::config::Config::default(),
+            crate::provider::unavailable_provider("test"),
+            std::sync::Arc::new(crate::tool::ToolRegistry::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+            Some("test".to_string()),
+            crate::tool::ToolContext::new(wd),
+            crate::conversation::Conversation::new(),
+        );
+
+        loop_.plan_mode = false;
+        let sys_off = loop_.build_system_prompt();
+
+        // Toggle plan mode ON and rebuild from a cold cache.
+        loop_.cached_system_prompt = None;
+        loop_.plan_mode = true;
+        let sys_on = loop_.build_system_prompt();
+
+        assert!(
+            !sys_on.contains("PLAN MODE"),
+            "plan mode must NOT appear in the system prompt"
+        );
+        assert_eq!(
+            sys_off, sys_on,
+            "plan_mode must not change the system prompt at all (it's frozen; mode rides in history)"
         );
     }
 
