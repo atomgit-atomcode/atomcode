@@ -3909,6 +3909,53 @@ fn attach_image_to_input(
     Ok(true)
 }
 
+/// Submit-time image-path recognition.
+///
+/// `try_attach_image_from_path` only runs on `InputEvent::Paste`. Paths that
+/// arrive as plain keystrokes never hit that branch: a user typing the path,
+/// or — the common case — a Windows paste that conhost / Windows Terminal
+/// delivers as individual key events instead of a bracketed paste. Those would
+/// otherwise be sent to the model as a literal path string, leaving it to
+/// fumble with `OpenFile` / `Bash dir` / base64 to read the bytes.
+///
+/// Scan the outgoing `text` for whitespace-separated tokens that resolve to a
+/// real local image file (same strict checks as the paste path: absolute +
+/// known image extension + existing file ≤ `MAX_PATH_IMAGE_BYTES`), read them
+/// as image attachments, and replace the path token with an `[Image #N]`
+/// marker so the payload matches the paste/drag flow. No-op when the model
+/// can't take images — the path is left as text for the model to handle.
+fn attach_typed_image_paths(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    text: &mut String,
+    images: &mut Vec<ImagePart>,
+    kept_markers: &mut Vec<usize>,
+) {
+    if !ctx.config.can_handle_attached_images() {
+        return;
+    }
+    // Snapshot tokens before mutating `text`. The `/` `\` pre-filter avoids a
+    // filesystem stat on every word of a long message — an absolute path
+    // always carries a separator.
+    let tokens: Vec<String> = text
+        .split_whitespace()
+        .filter(|t| t.contains('/') || t.contains('\\'))
+        .map(str::to_string)
+        .collect();
+    for tok in tokens {
+        let Some((img, _hash)) = try_attach_image_from_path(&tok) else {
+            continue;
+        };
+        app.state.session_image_count += 1;
+        let n = app.state.session_image_count;
+        *text = text.replacen(&tok, &format!("[Image #{}]", n), 1);
+        renderer.render(UiLine::ImageAttachment(n));
+        images.push(img);
+        kept_markers.push(n);
+    }
+}
+
 /// `/paste` slash-command handler. Exists for Windows users whose
 /// Ctrl+V is intercepted by Windows Terminal / conhost before the
 /// keystroke reaches atomcode — the terminal-layer `paste` action
@@ -5126,7 +5173,7 @@ fn handle_idle_key(
                 if ctx.sync_session.is_none() {
                     renderer.render(UiLine::User(line.clone()));
                 }
-                let expanded = app.buf.expand_pastes(&line);
+                let mut expanded = app.buf.expand_pastes(&line);
                 // Pastes have now been substituted into `expanded`;
                 // safe to drop the registry. Doing it any earlier
                 // (e.g. up at the buf.text.clear() prep) was the
@@ -5171,6 +5218,21 @@ fn handle_idle_key(
                         kept_markers.push(n);
                     }
                 }
+                // Recognize bare image paths that were typed / pasted as
+                // keystrokes (notably Windows conhost paste) and never went
+                // through the `InputEvent::Paste` image detection. Mutates
+                // `expanded` (path token -> `[Image #N]`) and appends to
+                // `images` / `kept_markers`. `last_submitted_message` was
+                // already cached above from the raw form, so Ctrl+C edit
+                // restores the editable path, not the marker.
+                attach_typed_image_paths(
+                    app,
+                    ctx,
+                    renderer,
+                    &mut expanded,
+                    &mut images,
+                    &mut kept_markers,
+                );
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: line.clone(),
                     images: kept_refs,
