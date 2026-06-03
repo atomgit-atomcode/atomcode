@@ -329,7 +329,7 @@ impl MenuKind {
     /// rendering.
     pub fn max_visible_rows(&self, screen_height: usize, item_count: usize) -> usize {
         match self {
-            MenuKind::SlashCommand | MenuKind::AtMention => item_count.min(4),
+            MenuKind::SlashCommand | MenuKind::AtMention | MenuKind::Skill => item_count.min(4),
             MenuKind::TwoColumn { .. } => item_count.min(screen_height / 2).max(4),
         }
     }
