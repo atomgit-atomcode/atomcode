@@ -323,6 +323,18 @@ pub enum MenuKind {
     },
 }
 
+impl MenuKind {
+    /// Max visible rows for this menu kind. Both `paint_footer` and
+    /// `current_footer_rows` use this so the estimate matches actual
+    /// rendering.
+    pub fn max_visible_rows(&self, screen_height: usize, item_count: usize) -> usize {
+        match self {
+            MenuKind::SlashCommand | MenuKind::AtMention => item_count.min(4),
+            MenuKind::TwoColumn { .. } => item_count.min(screen_height / 2).max(4),
+        }
+    }
+}
+
 /// Slash-command palette payload: filtered entries + which one is selected.
 #[derive(Debug, Clone, Default)]
 pub struct MenuPayload {

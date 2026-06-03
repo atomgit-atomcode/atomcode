@@ -1186,8 +1186,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let middle_rows = lines.len();
 
-        // Paginate menu to at most half the screen height.
-        let max_menu = (h / 2).max(4);
+        // Paginate menu using the kind-specific cap.
+        let max_menu = self
+            .menu
+            .as_ref()
+            .map(|m| m.kind.max_visible_rows(h, m.items.len()))
+            .unwrap_or(4);
         let (menu_items, selected_in_view) = if let Some(m) = self.menu.as_ref() {
             let len = m.items.len();
             if len == 0 {
@@ -1365,10 +1369,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .len()
                 .max(1)
         };
+        let h = self.screen.height() as usize;
         let menu_rows = self
             .menu
             .as_ref()
-            .map(|m| m.items.len().min(4))
+            .map(|m| m.kind.max_visible_rows(h, m.items.len()))
             .unwrap_or(0);
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
@@ -3666,18 +3671,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             let has_status = !self.status.model.is_empty()
                 || !self.status.cwd.is_empty()
                 || self.status.hint.is_some();
+            let h = self.screen.height() as usize;
+            let menu_rows = self
+                .menu
+                .as_ref()
+                .map(|m| m.kind.max_visible_rows(h, m.items.len()))
+                .unwrap_or(0);
             let middle_rows = footer_rows.saturating_sub(
                 1 /* spinner */
                 + 1 /* top rule */
                 + 1 /* bot rule */
-                + self.menu.as_ref().map(|m| m.items.len().min(4)).unwrap_or(0)
+                + menu_rows
                 + if has_status { 1 } else { 0 },
             );
-            let menu_rows = self
-                .menu
-                .as_ref()
-                .map(|m| m.items.len().min(4))
-                .unwrap_or(0);
             let buf_display_w = crate::width::display_width(&self.input_buf);
             self.paint_frame();
             let mut bytes = self.screen.render_diff();
