@@ -43,6 +43,9 @@ pub enum LiveEvent {
     Turn(TurnEvent),
     /// turn 状态变化（视图据此禁用/启用输入框）。
     StateChanged(TurnState),
+    /// 任一视图（webui 下拉框 / TUI /model）切换了模型。其余视图据此同步显示与选中项。
+    /// 仅作显示/状态广播——实际下一轮用哪个 provider 由进程级选择（daemon 侧 LIVE_PROVIDER）决定。
+    ProviderChanged(String),
 }
 
 /// turn 执行策略。实现者负责对 `conv` 跑一次完整 turn（含工具循环），并把过程
@@ -149,6 +152,12 @@ impl LiveSession {
     /// 执行器在需要交互审批时注册响应通道（也供测试直接用）。
     pub async fn register_approver(&self, tx: mpsc::UnboundedSender<PermissionDecision>) {
         *self.approver.lock().await = Some(tx);
+    }
+
+    /// 广播一次模型切换给所有视图（不触碰 turn 状态）。任一端切换模型时调用，
+    /// 让另一端的下拉框 / 头部显示实时跟随。返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_provider_changed(&self, provider: String) -> bool {
+        self.events.send(LiveEvent::ProviderChanged(provider)).is_ok()
     }
 
     /// 任一视图批准/拒绝。先到先得：取走通道并投递；已无通道返回 false。

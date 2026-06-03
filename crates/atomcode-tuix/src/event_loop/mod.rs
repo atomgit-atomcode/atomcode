@@ -5844,6 +5844,36 @@ fn handle_streaming_key(
     Ok(())
 }
 
+/// Deliver a tool-approval decision to whichever turn is actually waiting.
+///
+/// In **sync mode** the running turn belongs to the in-process LiveSession
+/// coordinator (`DaemonTurnExecutor`), not this TUI's own agent — so the
+/// decision must go to the LiveSession's approver slot
+/// (`current_live_session().approve`), exactly like the webui's
+/// `/live/permission`. Sending it to the TUI agent (which isn't running this
+/// turn) leaves the tool blocked forever: the "Running … 141s, and the webui
+/// approval card never closes" bug. `ApproveToolAlways` degrades to `Allow`
+/// here — the live approver has no persistent "always" slot, matching the
+/// webui path. In normal (non-sync) mode the decision goes to the TUI agent
+/// as before.
+fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
+    if ctx.sync_forwarder.is_some() {
+        let decision = match cmd {
+            AgentCommand::ApproveTool | AgentCommand::ApproveToolAlways => {
+                atomcode_core::tool::PermissionDecision::Allow
+            }
+            _ => atomcode_core::tool::PermissionDecision::Deny,
+        };
+        if let Some(session) = atomcode_daemon::current_live_session() {
+            let _ = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(session.approve(decision))
+            });
+        }
+    } else {
+        ctx.agent.cmd_tx.send(cmd).ok();
+    }
+}
+
 fn handle_approval_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -5864,7 +5894,7 @@ fn handle_approval_key(
             // First Ctrl+C: deny the tool and arm the exit confirmation
             app.exit_pending = Some(now);
             renderer.pop_approval_prompt();
-            ctx.agent.cmd_tx.send(AgentCommand::DenyTool).ok();
+            deliver_approval(ctx, AgentCommand::DenyTool);
             app.state.on_approval_resolved();
             renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
@@ -5887,7 +5917,7 @@ fn handle_approval_key(
     // responded — without this, the prompt stays in scrollback next to
     // the tool result, creating visual noise.
     renderer.pop_approval_prompt();
-    ctx.agent.cmd_tx.send(cmd).ok();
+    deliver_approval(ctx, cmd);
     app.state.on_approval_resolved();
     Ok(())
 }
@@ -7084,6 +7114,35 @@ fn handle_agent_event(
                 state.on_submit();
             } else {
                 state.on_turn_complete();
+            }
+        }
+        AgentEvent::ProviderChanged(provider) => {
+            // Live-sync: another view (webui dropdown) switched the model —
+            // mirror it into the TUI's active provider + header. Skip when it's
+            // already our provider (the echo of the TUI's own /model switch, which
+            // already applied + persisted). Persistence is done by whoever
+            // originated the switch (webui → /live/provider endpoint; TUI → the
+            // /model picker's save_and_reload), so here we only sync in-memory
+            // state and notify the agent — no second disk write.
+            if ctx.config.default_provider != provider
+                && ctx.config.providers.contains_key(&provider)
+            {
+                ctx.config.default_provider = provider.clone();
+                ctx.model_name = ctx
+                    .config
+                    .providers
+                    .get(&provider)
+                    .map(|p| p.model.clone())
+                    .unwrap_or(provider);
+                ctx.runtime_factory.set_config(ctx.config.clone());
+                let _ = ctx
+                    .agent
+                    .cmd_tx
+                    .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+                let dir_display =
+                    crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+                renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
+                renderer.flush();
             }
         }
     }

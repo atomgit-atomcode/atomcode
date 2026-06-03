@@ -47,8 +47,29 @@ static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
 /// 设置当前 LiveSession 选中的 provider（None 时不覆盖，保留既有选择）。
 fn set_live_provider(provider: Option<String>) {
     if let Some(p) = provider {
-        *LIVE_PROVIDER.lock().unwrap() = Some(p);
+        live_set_provider(p);
     }
+}
+
+/// 设置进程级选中 provider 并把切换广播给所有视图（TUI live 转发器 / 其他 webui tab）。
+/// webui 下拉框（/live/provider）、/live/message 带的 provider、以及 TUI 的 /model 选择器
+/// 都经此处，确保任一端切换模型时，另一端的下拉框与头部显示都能实时跟随。
+pub fn live_set_provider(provider: String) {
+    *LIVE_PROVIDER.lock().unwrap() = Some(provider.clone());
+    if let Some(s) = current_live_session() {
+        s.notify_provider_changed(provider);
+    }
+}
+
+/// 当前生效的 provider 名：优先进程级选择（LIVE_PROVIDER），回退 config 默认。
+/// 供 /live 快照在新 tab 连上时回显正确的选中模型。
+fn live_current_provider() -> String {
+    if let Some(p) = LIVE_PROVIDER.lock().unwrap().clone() {
+        return p;
+    }
+    Config::load(&Config::default_path())
+        .map(|c| c.default_provider)
+        .unwrap_or_default()
 }
 
 /// 进程级共享 MCP 缓存（供 TUI 侧 ensure_live_session 使用，无需 AppState）。
@@ -474,7 +495,9 @@ use crate::AppState;
 #[serde(tag = "type")]
 pub(crate) enum LiveWireEvent {
     #[serde(rename = "snapshot")]
-    Snapshot { messages: Vec<crate::MessageInfo>, session_id: String, project_hash: String },
+    Snapshot { messages: Vec<crate::MessageInfo>, session_id: String, project_hash: String, provider: String },
+    #[serde(rename = "provider")]
+    Provider { provider: String },
     #[serde(rename = "user")]
     UserMessage { text: String, images: Vec<crate::ImageData> },
     #[serde(rename = "text")]
@@ -506,6 +529,7 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
             images: images.into_iter().map(|i| crate::ImageData { media_type: i.media_type, data: i.data }).collect(),
         },
         LiveEvent::StateChanged(s) => LiveWireEvent::State { running: matches!(s, TurnState::Running) },
+        LiveEvent::ProviderChanged(p) => LiveWireEvent::Provider { provider: p },
         LiveEvent::Turn(te) => match te {
             TE::TextDelta(content) => LiveWireEvent::TextDelta { content },
             TE::ReasoningDelta(content) => LiveWireEvent::ReasoningDelta { content },
@@ -545,6 +569,7 @@ pub(crate) async fn live_stream(State(state): State<AppState>) -> impl IntoRespo
         messages: snapshot.iter().map(crate::MessageInfo::from).collect(),
         session_id: live_session_id().unwrap_or_default(),
         project_hash,
+        provider: live_current_provider(),
     });
     tokio::spawn(async move {
         loop {
@@ -630,6 +655,35 @@ pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<
         images: req.images.into_iter().map(|i| ImagePart { media_type: i.media_type, data: i.data }).collect(),
     });
     Json(serde_json::json!({ "accepted": ok }))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct LiveProviderReq {
+    pub provider: String,
+}
+
+/// POST /live/provider — webui 切换模型即时同步。
+///
+/// 与"发送消息才带 provider"不同，下拉框一变就调本端点，让对端立即跟随而无需先发消息。
+/// 行为与 TUI 的 /model 选择器对齐：把它持久化为 config 默认 provider（仅当确为已知
+/// provider，避免把无效名写进配置），再在 live 总线上广播 ProviderChanged，使 TUI 头部
+/// 与其他 webui tab 的下拉框实时更新。下一轮实际用哪个模型由 LIVE_PROVIDER 决定（已在
+/// live_set_provider 里更新）。
+pub(crate) async fn live_provider(
+    State(state): State<AppState>,
+    Json(req): Json<LiveProviderReq>,
+) -> impl IntoResponse {
+    if let Ok(mut cfg) = Config::load(&Config::default_path()) {
+        if cfg.providers.contains_key(&req.provider) && cfg.default_provider != req.provider {
+            cfg.default_provider = req.provider.clone();
+            let _ = cfg.save(&Config::default_path());
+        }
+    }
+    // 确保有 live 会话可供广播（与 /live/message 一致的幂等 ensure）。
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    ensure_live_session(working_dir, state.telemetry.clone());
+    live_set_provider(req.provider);
+    Json(serde_json::json!({ "ok": true }))
 }
 
 #[derive(serde::Deserialize)]

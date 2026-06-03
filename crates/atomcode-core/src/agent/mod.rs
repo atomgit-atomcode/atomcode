@@ -394,6 +394,8 @@ pub enum AgentEvent {
     UserEcho(String),
     /// 同步会话的对端正在进行 turn（true=进行中），用于禁用/恢复本端输入。
     PeerBusy(bool),
+    /// 同步会话的另一视图（webui 下拉框）切换了模型。TUI 据此更新头部显示与活动 provider。
+    ProviderChanged(String),
 }
 
 /// The current phase of the agent (for UI display).

@@ -13,6 +13,7 @@ mod api_provider;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
+pub use live_api::live_set_provider;
 mod telemetry_scope;
 pub mod auth_token;
 pub mod permission_bridge;
@@ -3650,6 +3651,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live", get(live_api::live_stream))
         .route("/live/message", post(live_api::live_message))
         .route("/live/permission", post(live_api::live_permission))
+        .route("/live/provider", post(live_api::live_provider))
         // Skills API
         .route("/skills", get(get_skills))
         // Filesystem API

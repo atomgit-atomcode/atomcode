@@ -2,7 +2,7 @@
 // Task 15 — sessionId + cwd lifted to App
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -394,6 +394,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         const loaded = sessionMessagesToDisplay(e.messages);
         setMessages(loaded.length > 0 ? loaded : []);
         setHistoryHint(null);
+        // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
+        if (e.provider) setProvider(e.provider);
         // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
         // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
         // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
@@ -402,6 +404,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           loadedForRef.current = e.session_id;
           onSessionId(e.session_id);
         }
+        break;
+      }
+      case 'provider': {
+        // 对端（TUI /model 或其他 webui tab）切换了模型 → 跟随更新下拉框选中项。
+        // 直接 setProvider（不回调 onChange），避免再 POST 回去形成回环。
+        setProvider(e.provider);
         break;
       }
       case 'user': {
@@ -1028,7 +1036,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             {(tokens.total / 1000).toFixed(1)}k tokens
           </span>
         )}
-        <ModelSelector value={provider} onChange={setProvider} />
+        <ModelSelector
+          value={provider}
+          onChange={(p) => {
+            setProvider(p);
+            // 同步模式：下拉框一变就通知后端，TUI 头部与其他端实时跟随
+            // （非同步模式只改本端的待发 provider，发消息时再带上）。
+            if (sync) void postLiveProvider(p);
+          }}
+        />
         {busy ? (
           <>
             {/* 执行中仍可发送：按下即排队，当前回合结束后自动发出。 */}

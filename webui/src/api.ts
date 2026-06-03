@@ -441,7 +441,8 @@ export async function getSession(
 // --- Live session (multi-tab real-time sync) ---
 
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string }
+  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string }
+  | { type: 'provider'; provider: string }
   | { type: 'user'; text: string; images?: ImageData[] }
   | { type: 'text'; content: string }
   | { type: 'reasoning'; content: string }
@@ -491,6 +492,16 @@ export async function postLiveMessage(
       ...(images && images.length ? { images } : {}),
       ...(provider ? { provider } : {}),
     }),
+  });
+}
+
+/** Sync-mode model switch: notify the daemon immediately when the dropdown
+ *  changes (not just on send), so the TUI header and other tabs follow. */
+export async function postLiveProvider(provider: string): Promise<void> {
+  await fetch('/live/provider', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ provider }),
   });
 }
 
