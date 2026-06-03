@@ -99,7 +99,7 @@
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/undo</code></td><td>Roll back every AI file edit from the last turn, using file-history snapshots</td></tr>
+          <tr><td><code>/undo</code> · <code>/undo N</code></td><td>Roll conversation memory back to before the last turn (or turn N) and restore that prompt into the input box; rewinds memory only — does not revert files on disk</td></tr>
           <tr><td><code>/diff</code></td><td>Show the git diff of uncommitted changes in the working directory</td></tr>
           <tr><td><code>/cost</code></td><td>Show output tokens for the current session. APIs without usage reporting are estimated automatically</td></tr>
           <tr><td><code>/context</code></td><td>Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage</td></tr>
@@ -233,11 +233,13 @@ Session token usage
 - Current turn tokens: 2156
 - Context: 42K / 128K</code></pre>
 
-      <h3>Roll back when the result isn't what you wanted</h3>
+      <h3>Rewind and re-ask when the answer goes sideways</h3>
       <pre><code>&gt; add JSDoc to every function
-... (AI edited 12 files)
+... (the reply went off the rails)
 &gt; /undo
-Rolled back 12 file edits from the last turn.</code></pre>
+Rolled back to turn 3 of 3.
+⚠ Only conversation memory was rewound; files on disk were not restored. Revert code manually or check /diff.
+(your last prompt is back in the input box — edit and resend)</code></pre>
 
       <h3>Swap the model when it underperforms</h3>
       <pre><code>&gt; /model

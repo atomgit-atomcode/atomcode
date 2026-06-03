@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Sessions &amp; Undo · AtomCode Docs</title>
-<meta name="description" content="Persistent session restore, /undo rollback, clearing and compacting context.">
+<meta name="description" content="Persistent session restore, /undo conversation rewind, clearing and compacting context.">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <link rel="stylesheet" href="../docs.css">
 <script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
@@ -73,7 +73,7 @@
 
   <main class="dmain prose-docs">
 <h1>Sessions &amp; Undo</h1>
-      <p class="lede">AtomCode persists every conversation by default, so you can restore, resume, clear, or compact at any time. File edits are also tracked in file-history — a single <code>/undo</code> rolls back every change from the last turn.</p>
+      <p class="lede">AtomCode persists every conversation by default, so you can restore, resume, clear, or compact at any time. A single <code>/undo</code> rewinds conversation memory back to any earlier turn.</p>
 
       <h2>Session lifecycle</h2>
       <p>Each <code>atomcode</code> launch creates a session. A session contains:</p>
@@ -146,14 +146,15 @@
         </tbody>
       </table>
 
-      <h2>File edits and <code>/undo</code></h2>
-      <p>Every file-editing tool in AtomCode (<code>write_file</code>, <code>edit_file</code>, <code>search_replace</code>, …) snapshots the original content to file-history before writing. Running:</p>
-      <pre><code>/undo</code></pre>
-      <p>rolls back every file edit from the AI's last turn to its pre-tool-call state, in one shot.</p>
+      <h2>Rewinding conversation memory with <code>/undo</code></h2>
+      <p><code>/undo</code> rewinds <strong>conversation memory</strong> to before a given turn — removing that turn and everything after it — and drops the prompt you typed for that turn back into the input box so you can edit and resend it.</p>
+      <pre><code>/undo      # rewind the last turn
+/undo N    # rewind to turn N (1-based; counts only the prompts you actually typed)</code></pre>
+      <p>The scrollback dividers for the removed turns are cleared too, and the session is saved immediately — so your next <code>/resume</code> reflects the rewound state.</p>
 
       <div class="callout callout-warn">
         <strong>Where the boundary is</strong>
-        <p><code>/undo</code> only reverts file edits — it does <em>not</em> undo side effects from bash commands. If the model ran <code>rm -rf</code> or dropped a database, <code>/undo</code> can't help you — those actions should have triggered a permission confirmation before they ran.</p>
+        <p><code>/undo</code> rewinds conversation memory <em>only</em> — it does <strong>not</strong> restore files on disk. If the AI edited code during those turns, those changes stay in your working tree; use <code>/diff</code> to review and revert them manually, or rely on git. You can't <code>/undo</code> while a turn is in flight — press Esc to cancel it first.</p>
       </div>
 
       <h2>Inspecting and trimming cost</h2>
