@@ -289,7 +289,22 @@ pub fn build_messages(
     let microcompact_threshold = (token_budget as u64 * 4 * 70 / 100) as usize;
     microcompact(&mut result, conv.messages.len(), microcompact_threshold);
 
-    replace_stale_reads(&mut result);
+    // NOTE (prompt-cache): we intentionally do NOT refresh historical
+    // `read_file` results from current disk here. An earlier version called
+    // `replace_stale_reads(&mut result)` so the model would "always see the
+    // latest code" after an edit — but that re-rendered an OLD tool_result
+    // message (same tool_call_id) from the file's *current* bytes. Once any
+    // file was edited, every prior read of it changed (shifted line-number
+    // gutters, re-formatted fences) → the sent history mutated mid-stream →
+    // the provider prefix cache collapsed from the first rewritten message
+    // onward. On deepseek-v4-flash that is a 50× cost cliff (cached
+    // 0.02元/M vs uncached 1元/M); measured hit-rate dropped from ~99% to
+    // 4–20% on long edit-heavy sessions. History is now append-only and
+    // byte-stable: a tool_result is frozen as first rendered. The model still
+    // sees the latest content whenever it needs it by simply reading again in
+    // the current turn — that appends at the tail and grows the cache prefix
+    // instead of breaking it. See `historical_read_results_are_frozen_after_edit`.
+    //
     // sanitize_messages drops AssistantWithToolCalls whose tool_calls
     // didn't all get followed by matching tool_result messages before
     // a non-tool boundary (next ATC / Text / MultiPart). Required to
@@ -962,104 +977,13 @@ fn microcompact(msgs: &mut Vec<Message>, _total_msg_count: usize, threshold_char
     }
 }
 
-/// Replace stale read_file results with current disk content.
-/// When a file was read then later edited, the old read result is outdated.
-/// This replaces it so the model always sees the latest version.
-fn replace_stale_reads(msgs: &mut Vec<Message>) {
-    struct ReadInfo {
-        file_path: String,
-        offset: Option<usize>,
-        limit: Option<usize>,
-    }
-    let mut call_id_to_read: std::collections::HashMap<String, ReadInfo> =
-        std::collections::HashMap::new();
-    let mut edit_call_to_file: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut edited_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for msg in msgs.iter() {
-        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
-            for tc in tool_calls {
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                    let file_path = args
-                        .get("file_path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if tc.name == "read_file" && !file_path.is_empty() {
-                        let offset = args
-                            .get("offset")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize);
-                        let limit = args
-                            .get("limit")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize);
-                        call_id_to_read.insert(
-                            tc.id.clone(),
-                            ReadInfo {
-                                file_path: file_path.clone(),
-                                offset,
-                                limit,
-                            },
-                        );
-                    }
-                    if matches!(tc.name.as_str(), "edit_file" | "write_file" | "create_file")
-                        && !file_path.is_empty()
-                    {
-                        edit_call_to_file.insert(tc.id.clone(), file_path);
-                    }
-                }
-            }
-        }
-        if let MessageContent::ToolResult(ref r) = msg.content {
-            if let Some(file_path) = edit_call_to_file.get(&r.call_id) {
-                if !r.output.starts_with("Error") {
-                    edited_files.insert(file_path.clone());
-                }
-            }
-        }
-    }
-
-    if edited_files.is_empty() {
-        return;
-    }
-
-    for msg in msgs.iter_mut() {
-        if let MessageContent::ToolResult(ref mut r) = msg.content {
-            if let Some(info) = call_id_to_read.get(&r.call_id) {
-                if !edited_files.contains(&info.file_path) {
-                    continue;
-                }
-                if let Ok(content) = std::fs::read_to_string(&info.file_path) {
-                    let all_lines: Vec<&str> = content.lines().collect();
-                    let total = all_lines.len();
-
-                    if info.offset.is_some() || info.limit.is_some() {
-                        let start = info.offset.unwrap_or(1).max(1) - 1;
-                        let start = start.min(total);
-                        let end = info.limit.map(|l| (start + l).min(total)).unwrap_or(total);
-                        let display: String = all_lines[start..end]
-                            .iter()
-                            .enumerate()
-                            .map(|(i, l)| format!("{:>4}| {}", start + i + 1, l))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        r.output = display;
-                    } else if total <= 300 {
-                        r.output = all_lines
-                            .iter()
-                            .enumerate()
-                            .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                    }
-                    // else: large-file full-read, keep existing skeleton as-is.
-                }
-            }
-        }
-    }
-}
+// `replace_stale_reads` was removed: it mutated historical `read_file`
+// tool_results in place from current disk bytes whenever their file had been
+// edited, which broke the provider prompt-prefix cache mid-conversation (see
+// the NOTE at the `microcompact` call site in `build_messages`, and the
+// `historical_read_results_are_frozen_after_edit` regression test). History is
+// kept append-only and byte-stable; the model re-reads in the current turn when
+// it needs the latest content.
 
 /// Walk forward tracking tool_call/tool_result pairing; remove orphans.
 /// Valid sequences: System → (User → Assistant/AssistantWithToolCalls → [ToolResult]* → ...)*
@@ -3176,6 +3100,155 @@ mod tests {
             "dropped messages alone is not a valid compaction success metric: \
              before={before_tokens}, after={after_tokens}"
         );
+    }
+
+    /// Regression: a historical `read_file` tool result must stay byte-for-byte
+    /// frozen as it was first rendered, even after the same file is edited later
+    /// in the session. Re-rendering it from current disk state (shifted line
+    /// numbers / different content) mutates a message in the MIDDLE of the sent
+    /// history, which collapses the provider prefix cache from that point on
+    /// (deepseek-v4-flash: cached 0.02元/M vs uncached 1元/M — a 50× cliff).
+    /// The model can always see the latest content by reading again in the
+    /// current turn; it must never come from rewriting old messages.
+    #[test]
+    fn historical_read_results_are_frozen_after_edit() {
+        use crate::tool::{ToolCall, ToolResult};
+
+        // A real file on disk whose CURRENT content differs from what we stored
+        // in history when it was first read.
+        let path = std::env::temp_dir().join(format!(
+            "atomcode_frozen_read_test_{}.rs",
+            std::process::id()
+        ));
+        std::fs::write(&path, "fn main() {}\n// EDITED LINE A\n// EDITED LINE B\n").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut conv = Conversation::new();
+        conv.add_user_message("read the file");
+
+        // Turn 1: read_file → frozen result (single line, old gutter).
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall {
+                id: "call_read".into(),
+                name: "read_file".into(),
+                arguments: format!(r#"{{"file_path":"{path_str}"}}"#),
+            }],
+            None,
+        );
+        let frozen_read = "   1| fn main() {}".to_string();
+        conv.add_tool_result(ToolResult {
+            call_id: "call_read".into(),
+            output: frozen_read.clone(),
+            success: true,
+        });
+
+        // Turn 2: edit_file on the SAME path → marks the file as edited.
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall {
+                id: "call_edit".into(),
+                name: "edit_file".into(),
+                arguments: format!(r#"{{"file_path":"{path_str}"}}"#),
+            }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "call_edit".into(),
+            output: "Edited successfully".into(),
+            success: true,
+        });
+        conv.add_user_message("continue");
+
+        let (msgs, _stats) = build_messages(&conv, "sys", 1_000_000, "");
+        std::fs::remove_file(&path).ok();
+
+        let read_result = msgs.iter().find_map(|m| match &m.content {
+            MessageContent::ToolResult(r) if r.call_id == "call_read" => Some(r.output.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            read_result.as_deref(),
+            Some(frozen_read.as_str()),
+            "historical read_file result was re-rendered from live disk — \
+             the sent prefix is no longer byte-stable and the prompt cache breaks"
+        );
+    }
+
+    /// Acceptance criterion: between two consecutive turns — even when the file
+    /// is edited ON DISK in between — turn N's rendered messages must remain a
+    /// byte-exact PREFIX of turn N+1's. The cache only grows at the tail; it
+    /// never gets cut mid-stream. This is the property the deepseek-v4-flash
+    /// prefix cache relies on.
+    #[test]
+    fn consecutive_turns_keep_byte_stable_prefix_across_disk_edit() {
+        use crate::tool::{ToolCall, ToolResult};
+
+        let path = std::env::temp_dir().join(format!(
+            "atomcode_prefix_stable_test_{}.rs",
+            std::process::id()
+        ));
+        std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        // ── Turn N: a read of the file, then a user message. ──
+        let mut conv = Conversation::new();
+        conv.add_user_message("look at the file");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall {
+                id: "c_read".into(),
+                name: "read_file".into(),
+                arguments: format!(r#"{{"file_path":"{path_str}"}}"#),
+            }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "c_read".into(),
+            output: "   1| line one\n   2| line two\n   3| line three".into(),
+            success: true,
+        });
+        conv.add_user_message("now edit it");
+
+        let (turn_n, _) = build_messages(&conv, "sys", 1_000_000, "");
+
+        // ── Between turns: the model edits the file (disk content changes,
+        //    line numbers shift) and a new user turn begins. ──
+        std::fs::write(&path, "INSERTED HEADER\nline one\nline two\nline three\n").unwrap();
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall {
+                id: "c_edit".into(),
+                name: "edit_file".into(),
+                arguments: format!(r#"{{"file_path":"{path_str}"}}"#),
+            }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "c_edit".into(),
+            output: "Edited successfully".into(),
+            success: true,
+        });
+        conv.add_user_message("what changed?");
+
+        let (turn_n1, _) = build_messages(&conv, "sys", 1_000_000, "");
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            turn_n1.len() > turn_n.len(),
+            "turn N+1 must extend turn N at the tail"
+        );
+        // Compare by (role + content) so any mid-stream mutation surfaces as a
+        // prefix break, not just a length change.
+        let fingerprint = |m: &Message| format!("{:?}|{:?}", m.role, m.content);
+        for (i, m) in turn_n.iter().enumerate() {
+            assert_eq!(
+                fingerprint(&turn_n1[i]),
+                fingerprint(m),
+                "prefix diverged at message {i}: turn N+1 rewrote a historical \
+                 message instead of only appending — prompt cache would break here"
+            );
+        }
     }
 
 }
