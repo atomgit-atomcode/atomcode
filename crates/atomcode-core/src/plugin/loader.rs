@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::manifest::{load_plugin_manifest, PluginManifest};
 use super::paths;
-use super::state::load_installed_plugins_file;
+use super::state::{load_installed_plugins_file, InstallScope};
 
 #[derive(Debug, Clone)]
 pub struct InstalledPluginAssets {
@@ -13,6 +13,8 @@ pub struct InstalledPluginAssets {
     pub marketplace: String,
     pub plugin_dir: PathBuf,
     pub manifest: PluginManifest,
+    /// Installation scope.
+    pub scope: InstallScope,
 }
 
 impl InstalledPluginAssets {
@@ -43,43 +45,74 @@ impl InstalledPluginAssets {
     }
 }
 
-/// Iterate over every installed plugin. Returns empty Vec when state file is
+/// Iterate over every installed plugin across all scopes. Returns empty Vec when state file is
 /// missing or the plugin home is not configured. Skips entries whose
 /// plugin_dir does not exist on disk (keeps reload resilient to deletions).
 pub fn iter_installed_plugin_assets() -> Vec<InstalledPluginAssets> {
-    let Some(state_path) = paths::installed_plugins_file() else { return vec![]; };
-    let state = match load_installed_plugins_file(&state_path) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let Some(plugins_root) = paths::plugins_root() else { return vec![]; };
+    let mut result = Vec::new();
 
-    state
-        .plugins
-        .into_values()
-        .filter_map(|e| {
-            let abs = plugins_root.join(&e.plugin_dir);
-            if !abs.exists() {
-                return None;
+    // User scope (global).
+    if let Some(state_path) = paths::installed_plugins_file() {
+        if let Ok(state) = load_installed_plugins_file(&state_path) {
+            if let Some(plugins_root) = paths::plugins_root() {
+                for e in state.plugins.into_values() {
+                    let abs = plugins_root.join(&e.plugin_dir);
+                    if !abs.exists() {
+                        continue;
+                    }
+                    let mut manifest = load_plugin_manifest(&abs).unwrap_or_default();
+                    // Auto-detect: when no plugin.json was found (manifest is default)
+                    // AND the plugin_dir itself contains a SKILL.md, the directory IS
+                    // the skill (common with git-subdir installs from CC marketplaces
+                    // like claude-plugins-official). Without this, skills_path()
+                    // defaults to "skills" and the loader looks for <dir>/skills/ —
+                    // which doesn't exist, so the installed skill is silently ignored.
+                    if manifest.skills.is_none() && abs.join("SKILL.md").exists() {
+                        manifest.skills = Some(super::manifest::PathOrList::One("./".into()));
+                    }
+                    result.push(InstalledPluginAssets {
+                        plugin: e.plugin,
+                        marketplace: e.marketplace,
+                        plugin_dir: abs,
+                        manifest,
+                        scope: e.scope,
+                    });
+                }
             }
-            let mut manifest = load_plugin_manifest(&abs).unwrap_or_default();
-            // Auto-detect: when no plugin.json was found (manifest is default)
-            // AND the plugin_dir itself contains a SKILL.md, the directory IS
-            // the skill (common with git-subdir installs from CC marketplaces
-            // like claude-plugins-official). Without this, skills_path()
-            // defaults to "skills" and the loader looks for <dir>/skills/ —
-            // which doesn't exist, so the installed skill is silently ignored.
-            if manifest.skills.is_none() && abs.join("SKILL.md").exists() {
-                manifest.skills = Some(super::manifest::PathOrList::One("./".into()));
+        }
+    }
+
+    // Project and Local scopes.
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for scope in [InstallScope::Project, InstallScope::Local] {
+        if let Some(project_root) = paths::project_plugins_root(&working_dir, &scope) {
+            if let Some(state_path) = paths::project_installed_plugins_file(&working_dir, &scope) {
+                if state_path.exists() {
+                    if let Ok(state) = load_installed_plugins_file(&state_path) {
+                        for e in state.plugins.into_values() {
+                            let abs = project_root.join(&e.plugin_dir);
+                            if !abs.exists() {
+                                continue;
+                            }
+                            let mut manifest = load_plugin_manifest(&abs).unwrap_or_default();
+                            if manifest.skills.is_none() && abs.join("SKILL.md").exists() {
+                                manifest.skills = Some(super::manifest::PathOrList::One("./".into()));
+                            }
+                            result.push(InstalledPluginAssets {
+                                plugin: e.plugin,
+                                marketplace: e.marketplace,
+                                plugin_dir: abs,
+                                manifest,
+                                scope: e.scope,
+                            });
+                        }
+                    }
+                }
             }
-            Some(InstalledPluginAssets {
-                plugin: e.plugin,
-                marketplace: e.marketplace,
-                plugin_dir: abs,
-                manifest,
-            })
-        })
-        .collect()
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -115,11 +148,12 @@ mod tests {
         let _home = isolated_home();
         let repo = make_repo("p");
         add_marketplace(&format!("file://{}", repo.display())).unwrap();
-        install("p", "p").unwrap();
+        install("p", "p", InstallScope::User).unwrap();
         let assets = iter_installed_plugin_assets();
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].plugin, "p");
         assert!(assets[0].skills_dir().exists());
+        assert_eq!(assets[0].scope, InstallScope::User);
     }
 
     /// Debug test: dump the real-world installed plugins + skill loading.

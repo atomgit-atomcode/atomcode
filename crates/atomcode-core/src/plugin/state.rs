@@ -3,6 +3,37 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// Installation scope for a plugin — determines where the plugin files
+/// are stored and who can see them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallScope {
+    /// User-global: installed to `~/.atomcode/plugins/`, visible in all projects.
+    User,
+    /// Project-shared: installed to `.atomcode/plugins/`, committed to git,
+    /// visible to all collaborators.
+    Project,
+    /// Local-only: installed to `.atomcode/plugins/local/`, git-ignored,
+    /// visible only to the current user in the current project.
+    Local,
+}
+
+impl Default for InstallScope {
+    fn default() -> Self {
+        Self::User
+    }
+}
+
+impl std::fmt::Display for InstallScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstallScope::User => write!(f, "user"),
+            InstallScope::Project => write!(f, "project"),
+            InstallScope::Local => write!(f, "local"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplacesFile {
     pub version: u32,
@@ -45,6 +76,9 @@ pub struct InstalledPluginEntry {
     /// Relative to the plugins root (`$ATOMCODE_HOME/plugins/`) (e.g. `marketplaces/foo/plugin-a`).
     pub plugin_dir: String,
     pub installed_at: String,
+    /// Installation scope — determines where the plugin lives and who can see it.
+    #[serde(default)]
+    pub scope: InstallScope,
 }
 
 pub fn load_marketplaces_file(path: &Path) -> Result<MarketplacesFile> {
