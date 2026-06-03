@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <title>邀请有礼 · AtomCode</title>
-<meta name="description" content="邀请开发者安装并使用 AtomCode，按周结算安装与活跃奖励。">
+<meta name="description" content="邀请开发者安装并使用 AtomCode，按双周结算安装与活跃奖励。">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <style>
   *,*::before,*::after{box-sizing:border-box}
@@ -128,10 +128,10 @@
   .section-title{display:flex;align-items:center;gap:10px;font-size:22px;font-weight:800;letter-spacing:-.3px}
   .section-title .mark{color:var(--accent);font-family:var(--mono)}
   .section-hint{margin-top:6px;color:var(--faint);font-size:12px}
-  .period{padding:8px 13px;border:1px solid var(--line);border-radius:7px;background:rgba(255,255,255,.03);font-size:12px;color:var(--muted);white-space:nowrap}
-  .period b{color:#fff}
-  .period-arrow{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:1px solid var(--line);background:transparent;color:var(--muted);font-size:12px;cursor:pointer;transition:all .2s}
-  .period-arrow:hover{color:#fff;border-color:rgba(255,255,255,.3)}
+  .period{display:flex;align-items:center;gap:10px;padding:6px 8px;border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.035);font-size:12px;color:var(--muted);white-space:nowrap}
+  .period b{display:inline-flex;align-items:center;min-height:28px;padding:0 4px;color:#fff}
+  .period-arrow{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border:1px solid rgba(255,255,255,.18);border-radius:7px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.76);font-size:13px;line-height:1;cursor:pointer;transition:background .2s,color .2s,border-color .2s,box-shadow .2s}
+  .period-arrow:hover{color:#fff;border-color:rgba(232,160,80,.55);background:rgba(232,160,80,.14);box-shadow:0 0 0 3px rgba(232,160,80,.10)}
 
   .leaderboard{margin-bottom:20px}
   .rank-table{width:100%;border-collapse:collapse;font-size:13px}
@@ -182,7 +182,10 @@
   html.light .panel,html.light .leaderboard,html.light .rules{border-color:rgba(0,0,0,.14);background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(255,255,255,.42));box-shadow:0 22px 60px rgba(0,0,0,.10)}
   html.light .panel-head,html.light .rank-table th{background:rgba(0,0,0,.025);border-color:rgba(0,0,0,.10)}
   html.light .panel-title,html.light .section-title,html.light .user-name,html.light .period b{color:#0d0d0d}
-  html.light .panel-meta,html.light .user-id,html.light .metric-label,html.light .metric-note,html.light .period,html.light .rank-table th{color:rgba(0,0,0,.48)}
+  html.light .panel-meta,html.light .user-id,html.light .metric-label,html.light .metric-note,html.light .rank-table th{color:rgba(0,0,0,.48)}
+  html.light .period{color:rgba(0,0,0,.62);border-color:rgba(0,0,0,.16);background:rgba(255,255,255,.64);box-shadow:0 8px 24px rgba(0,0,0,.06)}
+  html.light .period-arrow{color:#8a4f12;border-color:rgba(200,118,24,.38);background:rgba(200,118,24,.12)}
+  html.light .period-arrow:hover{color:#fff;border-color:#c87618;background:#c87618;box-shadow:0 0 0 3px rgba(200,118,24,.16)}
   html.light .invite-link-box{background:#fff;border-color:rgba(0,0,0,.10)}
   html.light .invite-url{color:#1f6fd1}
   html.light .invite-link-box .copy-btn{background:rgba(200,118,24,.10);border-color:rgba(200,118,24,.34);color:#9b5d14}
@@ -262,7 +265,7 @@
 <main class="main">
   <div class="wrap">
     <section class="hero">
-      <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">长期进行中 · 每周一结算现金打款</span></div>
+      <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">长期进行中 · 每双周结算现金打款</span></div>
       <h1 data-i18n="hero.title">邀请有礼：AtomCode 裂变计划</h1>
       <p class="sub" data-i18n="hero.sub">获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。</p>
     </section>
@@ -383,7 +386,7 @@ const T = {
   'nav.referral': { zh: '邀请推荐', en: 'Referral' },
   'nav.codingplan': { zh: 'Coding Plan', en: 'Coding Plan' },
   'btn.repo': { zh: '开源仓库', en: 'Repository' },
-  'hero.badge': { zh: '长期进行中 · 每周一结算现金打款', en: 'Ongoing · settled every Monday' },
+  'hero.badge': { zh: '长期进行中 · 每双周结算现金打款', en: 'Ongoing · settled bi-weekly' },
   'hero.title': { zh: '邀请有礼：AtomCode 裂变计划', en: 'Referral Rewards: AtomCode Growth Program' },
   'hero.sub': { zh: '获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。', en: 'Get your official invite link and invite developers to install and use AtomCode. High conversion earns bonus rewards, with weekly leaderboard updates.' },
   'panel.login.title': { zh: '登录后领取专属邀请链接', en: 'Sign in to get your invite link' },
@@ -404,7 +407,7 @@ const T = {
   'metric.devices': { zh: '本周新增设备安装', en: 'New installs this week' },
   'metric.active': { zh: '本周新增账号活跃', en: 'New active accounts this week' },
   'metric.rate': { zh: '当前活跃转化率', en: 'Current active conversion' },
-  'metric.amount': { zh: '本周预计结算金额', en: 'Estimated settlement this week' },
+  'metric.amount': { zh: '本周预计结算金额', en: 'Estimated settlement this week period' },
   'unit.devices': { zh: '台', en: '' },
   'unit.people': { zh: '人', en: '' },
   'note.healthy': { zh: '已达质量线，安装与活跃双项结算', en: 'Quality line reached; installs and active accounts both count' },
@@ -418,7 +421,7 @@ const T = {
   'toast.copied': { zh: '✓ 已复制 · 粘贴到终端运行', en: '✓ Copied · paste into your terminal' },
   'board.empty': { zh: '本周排行榜暂无数据', en: 'No leaderboard data this week' },
   'board.title': { zh: '每周邀请风云榜', en: 'Weekly Referral Leaderboard' },
-  'board.hint': { zh: '按"本周新增活跃设备数"降序排列。每周日 23:59 截榜，周一结算现金打款。', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59, with settlement on Monday.' },
+  'board.hint': { zh: '按"本周新增活跃设备数"降序排列。每周日 23:59 截榜，现金奖励每双周结算打款。', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59, with cash rewards settled bi-weekly.' },
   'board.prev': { zh: '上一周', en: 'Previous week' },
   'board.next': { zh: '下一周', en: 'Next week' },
   'board.rank': { zh: '排名', en: 'Rank' },
@@ -426,19 +429,20 @@ const T = {
   'board.devices': { zh: '设备安装 (A)', en: 'Installs (A)' },
   'board.active': { zh: '活跃设备 (B)', en: 'Active (B)' },
   'board.rate': { zh: '转化率 (R)', en: 'Rate (R)' },
-  'board.amount': { zh: '结算金额', en: 'Amount' },
+  'board.amount': { zh: '预估结算金额', en: 'Estimated settlement' },
   'board.status': { zh: '状态', en: 'Status' },
   'board.reward': { zh: '榜单奖励', en: 'Reward' },
   'board.me': { zh: '我', en: 'Me' },
   'status.blocked': { zh: '触发熔断，仅结算活跃', en: 'Quality guard triggered; active only' },
   'status.normal': { zh: '正常结算', en: 'Normal settlement' },
+  'status.pending': { zh: '审核中', en: 'Under review' },
   'reward.tip': { zh: '每周榜单 Top5 赠送 CodingPlan Pro 套餐 30 天，包含 GLM-5.1、Deepseek-v4 flash、Qwen3.6。', en: 'Weekly Top 5 receive 30 days of CodingPlan Pro, including GLM-5.1, Deepseek-v4 flash, and Qwen3.6.' },
   'rules.title': { zh: '结算规则与防刷熔断说明', en: 'Settlement Rules and Quality Guard' },
   'rules.desc': { zh: '为保障社区健康发展，系统自动计算安装与活跃的转化率（R = 活跃数/安装数）。', en: 'To keep the community healthy, the system calculates conversion automatically (R = active / installs).' },
   'rules.good': { zh: '当 <b>R ≥ 25%</b> 时，视为优质推广，结算公式为：<code>安装数×2元 + 活跃数×5元</code>', en: 'When <b>R ≥ 25%</b>, it is counted as quality promotion: <code>installs×2 + active×5</code>.' },
   'rules.bad': { zh: '当 <span class="red">R &lt; 25%</span> 时，触发质量防刷熔断，安装量清零，仅保留有效活跃结算：<code>活跃数×5元</code>', en: 'When <span class="red">R &lt; 25%</span>, the quality guard is triggered: installs are cleared and only active referrals count: <code>active×5</code>.' },
   'rules.reward': { zh: '每周邀请风云榜 Top5 额外赠送 <code>CodingPlan Pro 30 天</code>，包含 GLM-5.1、Deepseek-v4 flash、Qwen3.6。', en: 'Weekly leaderboard Top 5 also receive <code>30 days of CodingPlan Pro</code>, including GLM-5.1, Deepseek-v4 flash, and Qwen3.6.' },
-  'rules.cash': { zh: '所有现金奖励根据双周统计数据进行结算，并统一收集收款信息进行打款。', en: 'All cash rewards are settled based on bi-weekly stats data, with payment details collected uniformly for disbursement.' },
+  'rules.cash': { zh: '所有现金奖励每双周汇总结算，并统一收集收款信息进行打款。', en: 'All cash rewards are summarized and settled bi-weekly, with payment details collected uniformly for disbursement.' },
   'rules.anti.title': { zh: '严禁以下作弊行为', en: 'The following cheating behaviors are strictly prohibited:' },
   'rules.anti.1': { zh: '使用虚拟机、模拟器、设备指纹修改工具等在同一台物理设备上重复安装激活。', en: 'Using VMs, emulators, or device fingerprint spoofing tools to repeatedly install and activate on the same physical device.' },
   'rules.anti.2': { zh: '批量注册虚假账号、使用自动化脚本刷量。', en: 'Registering fake accounts in bulk or using automated scripts to inflate numbers.' },
@@ -759,7 +763,7 @@ function renderBoard(targetId, data) {
 function rowHtml(row) {
   const blocked = Number(row.rate) < .25;
   const rankClass = row.rank === 1 ? ' top1' : row.rank === 2 ? ' top2' : row.rank === 3 ? ' top3' : '';
-  const statusText = row.status || (blocked ? t('status.blocked') : t('status.normal') + ' (' + row.devices + '\xd72 + ' + row.active + '\xd75)');
+  const statusText = row.status || t('status.pending');
   const rewardTip = t('reward.tip');
   const rewardHtml = Number(row.rank) <= 5
     ? '<span class="coding-reward" data-tip="' + escAttr(rewardTip) + '" onmouseenter="showRewardTip(this)" onmouseleave="hideRewardTip()" onfocus="showRewardTip(this)" onblur="hideRewardTip()" tabindex="0" aria-label="' + escAttr(rewardTip) + '">C</span>'
