@@ -881,7 +881,9 @@ async fn run() -> Result<i32> {
     install_panic_hook(telemetry.clone());
 
     // Emit install_completed if this is the first launch after a referral install
-    telemetry.maybe_emit_install_completed(&resolved.atomcode_dir);
+    telemetry
+        .maybe_emit_install_completed(&resolved.atomcode_dir)
+        .await;
     // ── End telemetry init ────────────────────────────────────────────────────
 
     // Handle subcommands. Most are self-contained (`handle_command` runs

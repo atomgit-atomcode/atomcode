@@ -3548,10 +3548,14 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     }
 
     // Step 4: Initialize telemetry runtime (R1.3, R1.6)
+    let atomcode_dir = resolved.atomcode_dir.clone();
     let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
 
     // Step 4.5: Install panic hook (R9.1, R9.2, R9.3, R9.4)
     install_panic_hook(telemetry.clone());
+
+    // Emit install_completed when daemon/webui is the first post-install entrypoint.
+    telemetry.maybe_emit_install_completed(&atomcode_dir).await;
 
     // Step 5: Precompute repo_origin (R4.2)
     // Use the project working directory (from config or cwd) rather than the
