@@ -32,6 +32,10 @@ pub struct HttpClient {
     status: Arc<Mutex<ServerStatus>>,
     next_id: AtomicU64,
     client: reqwest::Client,
+    /// Streamable-HTTP session id. Stateful servers (e.g. Figma Dev Mode) return
+    /// `Mcp-Session-Id` on the `initialize` response and reject later requests that
+    /// don't echo it back. Captured on first sight, then sent on every request.
+    session_id: Arc<Mutex<Option<String>>>,
 }
 
 impl HttpClient {
@@ -59,6 +63,27 @@ impl HttpClient {
             status: Arc::new(Mutex::new(ServerStatus::Disconnected)),
             next_id: AtomicU64::new(1),
             client,
+            session_id: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Current Streamable-HTTP session id, if the server handed one out.
+    async fn session_id(&self) -> Option<String> {
+        self.session_id.lock().await.clone()
+    }
+
+    /// Capture the `Mcp-Session-Id` response header (case-insensitive) so it can
+    /// be echoed on subsequent requests. No-op when the server doesn't use one.
+    async fn capture_session_id(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(value) = headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+        {
+            let mut guard = self.session_id.lock().await;
+            if guard.as_deref() != Some(value) {
+                *guard = Some(value.to_string());
+            }
         }
     }
 
@@ -108,6 +133,16 @@ impl HttpClient {
             req = req.header(key, value);
         }
 
+        let user_has_session = self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+        if !user_has_session {
+            if let Some(sid) = self.session_id().await {
+                req = req.header("Mcp-Session-Id", sid);
+            }
+        }
+
         if !user_has_authorization {
             if let Some(token) = self.load_oauth_token()? {
                 req = req.bearer_auth(token);
@@ -146,6 +181,10 @@ impl HttpClient {
                 body
             );
         }
+
+        // Persist the session id handed out by stateful Streamable-HTTP servers
+        // (typically on the `initialize` response) so later requests are accepted.
+        self.capture_session_id(response.headers()).await;
 
         // MCP "Streamable HTTP" servers (deepwiki, context7, etc.) may
         // return responses as `text/event-stream` SSE frames rather than
@@ -231,6 +270,13 @@ impl HttpClient {
         let user_has_authorization = self.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
         for (key, value) in &self.headers {
             req = req.header(key, value);
+        }
+
+        let user_has_session = self.headers.keys().any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+        if !user_has_session {
+            if let Some(sid) = self.session_id().await {
+                req = req.header("Mcp-Session-Id", sid);
+            }
         }
 
         if !user_has_authorization {
@@ -465,5 +511,151 @@ mod sse_tests {
                     data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}\n\n";
         let resp = parse_sse_jsonrpc(body, 5).expect("parse");
         assert_eq!(resp.id, 5);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use reqwest::header::HeaderMap;
+
+    fn test_client() -> HttpClient {
+        HttpClient::new(
+            "test".to_string(),
+            "http://127.0.0.1:3845/mcp".to_string(),
+            BTreeMap::new(),
+            None,
+            Some(5_000),
+        )
+    }
+
+    #[tokio::test]
+    async fn captures_session_id_from_response_headers() {
+        let client = test_client();
+        assert!(client.session_id().await.is_none());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-session-id", "abc-123".parse().unwrap());
+        client.capture_session_id(&headers).await;
+
+        assert_eq!(client.session_id().await.as_deref(), Some("abc-123"));
+    }
+
+    #[tokio::test]
+    async fn ignores_missing_or_empty_session_id() {
+        let client = test_client();
+        client.capture_session_id(&HeaderMap::new()).await;
+        assert!(client.session_id().await.is_none());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-session-id", "".parse().unwrap());
+        client.capture_session_id(&headers).await;
+        assert!(client.session_id().await.is_none());
+    }
+
+    /// Live end-to-end check against a running Figma Dev Mode MCP server.
+    /// Run with: `cargo test -p atomcode-core --lib live_figma -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires Figma Dev Mode MCP server on http://127.0.0.1:3845/mcp"]
+    async fn live_figma_lists_tools() {
+        let mut client = test_client();
+        client.initialize().await.expect("initialize");
+        assert!(
+            client.session_id().await.is_some(),
+            "expected a session id after initialize"
+        );
+        let tools = client.list_tools().await.expect("list_tools");
+        assert!(!tools.tools.is_empty(), "expected non-empty tool list");
+    }
+
+    const MOCK_SESSION: &str = "mock-session-xyz";
+
+    fn http_response(status: u16, session: Option<&str>, body: &str) -> String {
+        let reason = match status {
+            200 => "OK",
+            202 => "Accepted",
+            400 => "Bad Request",
+            _ => "OK",
+        };
+        let mut out = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n");
+        if let Some(s) = session {
+            out.push_str(&format!("Mcp-Session-Id: {s}\r\n"));
+        }
+        out.push_str(&format!("Content-Length: {}\r\nConnection: keep-alive\r\n\r\n{}", body.len(), body));
+        out
+    }
+
+    /// Minimal stateful Streamable-HTTP MCP server: hands out a session id on
+    /// `initialize` and rejects `tools/list` (HTTP 400) unless the client echoes
+    /// it back via `Mcp-Session-Id` — exactly how Figma's Dev Mode server behaves.
+    async fn run_mock(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    let n = match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    let has_session = req
+                        .lines()
+                        .any(|l| l.starts_with("mcp-session-id:") && l.contains(MOCK_SESSION));
+
+                    let response = if req.contains("\"initialize\"") {
+                        http_response(
+                            200,
+                            Some(MOCK_SESSION),
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"1.0"}}}"#,
+                        )
+                    } else if req.contains("notifications/initialized") {
+                        http_response(202, None, "")
+                    } else if req.contains("tools/list") {
+                        if has_session {
+                            http_response(
+                                200,
+                                None,
+                                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping","description":"d","inputSchema":{}}]}}"#,
+                            )
+                        } else {
+                            http_response(
+                                400,
+                                None,
+                                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"missing session"}}"#,
+                            )
+                        }
+                    } else {
+                        http_response(400, None, "{}")
+                    };
+
+                    if sock.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn echoes_session_id_so_followup_requests_are_accepted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        tokio::spawn(run_mock(listener));
+
+        let mut client = HttpClient::new("mock".into(), url, BTreeMap::new(), None, Some(5_000));
+        client.initialize().await.expect("initialize");
+        assert_eq!(client.session_id().await.as_deref(), Some(MOCK_SESSION));
+
+        // Without the session id echoed back, the mock rejects this with HTTP 400.
+        let tools = client
+            .list_tools()
+            .await
+            .expect("tools/list should succeed once the session id is echoed");
+        assert_eq!(tools.tools.len(), 1);
+        assert_eq!(tools.tools[0].name, "ping");
     }
 }
