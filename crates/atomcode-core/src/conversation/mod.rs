@@ -55,6 +55,14 @@ impl Conversation {
 
     /// Number of real (non-synthetic) user prompts. This is the maximum `N`
     /// accepted by `/undo N`, and what bare `/undo` targets (the last prompt).
+    ///
+    /// NOTE: `N` counts only real prompts so it matches the prompts the user
+    /// actually typed. The scrollback dividers drawn by `replay_session`
+    /// (`modals/session_picker.rs`) go before EVERY `Role::User` message,
+    /// including synthetic injections (compaction markers, plan-mode notes) —
+    /// so in the rare case of a standalone synthetic user message, the visible
+    /// divider count can run one ahead of `N` for later turns. This is the
+    /// intentional Phase A trade-off; tighter alignment is deferred to Phase B.
     pub fn prompt_count(&self) -> usize {
         self.messages
             .iter()
