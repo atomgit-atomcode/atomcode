@@ -1983,8 +1983,10 @@ async fn run_headless(
                     vl_key, char_count
                 );
             }
-            AgentEvent::MessagesSync { .. } => {
-                // Only used by TUI for /bg session persistence; ignore in CLI.
+            AgentEvent::ConversationTruncated { .. }
+            | AgentEvent::UndoFailed { .. }
+            | AgentEvent::MessagesSync { .. } => {
+                // Only used by TUI for /bg or /undo; ignore in headless CLI.
             }
             AgentEvent::UserEcho(_)
             | AgentEvent::PeerBusy(_)
