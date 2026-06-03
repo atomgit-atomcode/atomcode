@@ -171,6 +171,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
   // project_hash 迟到（刷新后由 App 异步回填）导致的重复加载 / 覆盖当前对话。
   const loadedForRef = useRef<string | null>(null);
+  // 实时（/live）总线对应的会话 id（来自 snapshot）。用于门控实时事件：仅当用户当前
+  // 查看的就是这个实时会话时才把输出渲染进画布——否则用户从侧栏打开了别的历史会话，
+  // 实时输出会串进错误页面、且刷新即消失（刷新会按真实会话重载）。
+  const liveSessionIdRef = useRef<string | null>(null);
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
   // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
@@ -389,29 +393,41 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // ── Live event handler ──
   function onLiveEvent(e: LiveWireEvent) {
+    // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
+    if (e.type === 'snapshot') {
+      liveSessionIdRef.current = e.session_id || null;
+      const loaded = sessionMessagesToDisplay(e.messages);
+      setMessages(loaded.length > 0 ? loaded : []);
+      setHistoryHint(null);
+      // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
+      if (e.provider) setProvider(e.provider);
+      // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
+      // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
+      // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
+      if (e.session_id) {
+        activeIdRef.current = e.session_id;
+        loadedForRef.current = e.session_id;
+        onSessionId(e.session_id);
+      }
+      return;
+    }
+    // 模型切换是进程级（全局），与正在查看哪个会话无关 → 不门控，始终更新下拉框。
+    if (e.type === 'provider') {
+      setProvider(e.provider);
+      return;
+    }
+
+    // 门控：仅当"当前查看的会话"就是实时会话时，才把实时输出渲染进画布。否则用户
+    // 从侧栏打开了另一个历史会话，实时事件不应串进该页面（串进去刷新还会消失）。
+    if (
+      liveSessionIdRef.current &&
+      activeIdRef.current &&
+      activeIdRef.current !== liveSessionIdRef.current
+    ) {
+      return;
+    }
+
     switch (e.type) {
-      case 'snapshot': {
-        const loaded = sessionMessagesToDisplay(e.messages);
-        setMessages(loaded.length > 0 ? loaded : []);
-        setHistoryHint(null);
-        // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
-        if (e.provider) setProvider(e.provider);
-        // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
-        // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
-        // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
-        if (e.session_id) {
-          activeIdRef.current = e.session_id;
-          loadedForRef.current = e.session_id;
-          onSessionId(e.session_id);
-        }
-        break;
-      }
-      case 'provider': {
-        // 对端（TUI /model 或其他 webui tab）切换了模型 → 跟随更新下拉框选中项。
-        // 直接 setProvider（不回调 onChange），避免再 POST 回去形成回环。
-        setProvider(e.provider);
-        break;
-      }
       case 'user': {
         // Append the peer's user message + empty assistant placeholder
         setMessages((prev) => [
