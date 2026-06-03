@@ -734,10 +734,37 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "undo" => {
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdUndoNotSupported).into_owned(),
-            ));
-            renderer.flush();
+            if state.phase != crate::state::UiPhase::Idle {
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::CmdUndoBusy).into_owned(),
+                ));
+                renderer.flush();
+            } else {
+                let a = arg.trim();
+                // None = bare /undo (last turn); Some(n) = /undo n; Err = bad arg.
+                let parsed: Result<Option<usize>, ()> = if a.is_empty() {
+                    Ok(None)
+                } else {
+                    match a.parse::<usize>() {
+                        Ok(n) if n >= 1 => Ok(Some(n)),
+                        _ => Err(()),
+                    }
+                };
+                match parsed {
+                    Ok(nth) => {
+                        ctx.agent
+                            .cmd_tx
+                            .send(AgentCommand::UndoToPrompt { nth })
+                            .ok();
+                    }
+                    Err(()) => {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::CmdUndoBadArg).into_owned(),
+                        ));
+                        renderer.flush();
+                    }
+                }
+            }
         }
         "cost" => {
             let total = state.prompt_tokens + state.completion_tokens;
