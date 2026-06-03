@@ -385,11 +385,12 @@ impl PluginManager {
                 (rows, t(Msg::PluginScopeHint).into_owned())
             }
             Screen::Installing { plugin, .. } => {
-                let rows = vec![
-                    (t(Msg::PluginMgrInstalling { plugin }).into_owned(), String::new()),
-                    (t(Msg::PluginMgrEscToCancel).into_owned(), String::new()),
-                ];
-                (rows, String::new())
+                let hint = format!(
+                    "{} ({})",
+                    t(Msg::PluginMgrInstalling { plugin }),
+                    t(Msg::PluginMgrEscToCancel)
+                );
+                (Vec::new(), hint)
             }
         }
     }
@@ -498,9 +499,12 @@ impl Modal for PluginManager {
         let (items, hint) = self.rows();
         // Status row: show a pending spinner-ish note if a job is in flight,
         // otherwise the navigation hint for this screen.
-        let hint = match &self.pending {
-            Some(p) => p.clone(),
-            None => hint,
+        let hint = match &self.screen {
+            Screen::Installing { .. } => hint,
+            _ => match &self.pending {
+                Some(p) => p.clone(),
+                None => hint,
+            },
         };
         // The hint rides as the last (non-selectable) menu row's label so it
         // is visible under the list without a dedicated widget.
@@ -508,7 +512,9 @@ impl Modal for PluginManager {
         items.push((format!("— {} —", hint), String::new()));
         let selectable = self.current_len();
         let selected = if selectable == 0 {
-            items.len().saturating_sub(1)
+            // No items are selectable, so nothing should be highlighted.
+            // Using an out-of-bounds index (like items.len()) ensures that.
+            items.len()
         } else {
             self.selected.min(selectable.saturating_sub(1))
         };
@@ -698,5 +704,15 @@ mod tests {
             assert!(!label.is_empty());
             assert!(!desc.is_empty());
         }
+    }
+
+    #[test]
+    fn installing_screen_has_no_rows_and_carries_hint() {
+        let mut m = manager(vec![], vec![]);
+        m.goto(Screen::Installing { plugin: "discrawl".into(), mp: "mp".into() });
+        let (rows, hint) = m.rows();
+        assert!(rows.is_empty());
+        assert!(hint.contains("discrawl"));
+        assert!(hint.contains("Esc"));
     }
 }
