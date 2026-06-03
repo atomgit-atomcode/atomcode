@@ -30,6 +30,9 @@ impl AgentLoop {
             self.conversation.messages.clear();
             self.conversation.turn_tracker = crate::conversation::turn::TurnTracker::new();
             self.session_files.clear();
+            // Explicit /cd is a deliberate context switch (cwd, git snapshot,
+            // skills all change below) → rebuild the frozen system prompt.
+            self.cached_system_prompt = None;
             // Refresh env snapshot for the new directory. The old git
             // branch / status belongs to the previous repo; keeping it
             // would lie to the model.

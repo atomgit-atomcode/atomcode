@@ -581,6 +581,13 @@ pub struct AgentLoop {
     /// Vec<String> — empty means no extensions. Reset at session start and on reload.
     cached_system_prompt_extensions: Vec<String>,
 
+    /// Session-frozen system prompt (LLM prefix-cache stability — the system
+    /// message is messages[0], so any byte change zeroes the whole cache).
+    /// Built once via `build_system_prompt`, reused verbatim every turn.
+    /// `None` = needs (re)build. Invalidated only at explicit contract
+    /// boundaries: SetPlanMode, ClearConversation, ReloadConfig, change_dir.
+    cached_system_prompt: Option<String>,
+
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -1024,6 +1031,7 @@ impl AgentLoop {
             reindex_tx: None,
             datalog,
             cached_system_prompt_extensions: Vec::new(),
+            cached_system_prompt: None,
             cmd_rx,
             event_tx,
         };
@@ -1149,6 +1157,9 @@ impl AgentLoop {
                         .get(&old_provider_name)
                         .map(|p| p.provider_type.clone());
                     self.config = new_config;
+                    // Config/instructions/model may have changed → rebuild the
+                    // frozen system prompt on the next turn.
+                    self.cached_system_prompt = None;
                     // Rebuild hook engine from config files.
                     let wd = self
                         .turn_runner
@@ -1241,6 +1252,8 @@ impl AgentLoop {
                     // Clear the conversation history in the agent loop.
                     self.conversation = Conversation::new();
                     self.datalog.clear();
+                    // New session → re-snapshot the system prompt next turn.
+                    self.cached_system_prompt = None;
                     // session_id is NOT reset here: /session pairs this with
                     // a SetSessionId carrying the new session file's id, and
                     // that's the single source of truth for the header.
@@ -1272,6 +1285,9 @@ impl AgentLoop {
                 }
                 AgentCommand::SetPlanMode(enabled) => {
                     self.plan_mode = enabled;
+                    // Plan-mode toggles the agent's read-only contract and the
+                    // PLAN MODE system block — a legitimate one-time rebuild.
+                    self.cached_system_prompt = None;
                 }
                 AgentCommand::Compact { prompt } => {
                     self.run_compact(prompt).await;
@@ -1885,6 +1901,13 @@ impl AgentLoop {
             // the prompt guides the model to work efficiently.
 
             // Refresh hook system-prompt extensions before building the prompt.
+            // NOTE: this still runs every turn (unchanged), but once the
+            // session-level system prompt is frozen (see build_system_prompt)
+            // the refreshed value is only consumed on a cold cache — i.e. the
+            // first build and after an explicit invalidation. Keeping the
+            // refresh unconditional avoids an ordering hazard where a
+            // build_system_prompt call on another path (e.g. RefreshContextStats)
+            // could freeze a prompt before SystemPromptHook output was collected.
             self.cached_system_prompt_extensions = self
                 .turn_runner
                 .hook_engine
@@ -3736,6 +3759,64 @@ mod agent_handle_tests {
 
         assert_eq!(factory.config.default_provider, "fresh");
         assert_eq!(factory.working_dir, std::path::PathBuf::from("/tmp/new"));
+    }
+
+    /// Part-2 regression (system-prompt prefix-cache stability): the system
+    /// prompt is messages[0], so any byte change zeroes the entire prefix
+    /// cache. It must stay byte-identical across turns even when the model
+    /// changes the working directory (the most common mid-session mutation).
+    /// Only an explicit cache invalidation (plan-mode toggle, /clear, reload,
+    /// /cd) may rebuild it.
+    #[tokio::test]
+    async fn system_prompt_is_frozen_across_model_cwd_change() {
+        let old_wd =
+            std::path::PathBuf::from(format!("/tmp/atomcode_sysfreeze_old_{}", std::process::id()));
+        let new_wd =
+            std::path::PathBuf::from(format!("/tmp/atomcode_sysfreeze_new_{}", std::process::id()));
+
+        let tool_context = crate::tool::ToolContext::new(old_wd.clone());
+        let (mut loop_, _handle) = super::AgentLoop::new_with_shared_parts(
+            crate::config::Config::default(),
+            crate::provider::unavailable_provider("test"),
+            std::sync::Arc::new(crate::tool::ToolRegistry::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+            Some("test".to_string()),
+            tool_context,
+            crate::conversation::Conversation::new(),
+        );
+
+        // Turn 1: build + freeze.
+        let sys1 = loop_.build_system_prompt();
+        assert!(
+            sys1.contains(&old_wd.display().to_string()),
+            "sanity: the working directory IS interpolated into the system prompt"
+        );
+
+        // Model runs its `cd` tool — writes working_dir directly, exactly like
+        // tool/cd.rs / tool/bash.rs do (does NOT go through change_dir).
+        *loop_.turn_runner.context.working_dir.write().await = new_wd.clone();
+
+        // Turn 2+: system prompt MUST be byte-identical despite the cwd change.
+        let sys2 = loop_.build_system_prompt();
+        assert_eq!(
+            sys1, sys2,
+            "system prompt must be frozen across a model cwd change (prefix cache)"
+        );
+        assert!(
+            !sys2.contains(&new_wd.display().to_string()),
+            "the frozen prompt must NOT pick up the new cwd"
+        );
+
+        // Explicit boundary: invalidating the cache (as plan-mode toggle,
+        // /clear, reload, or /cd do) rebuilds and DOES reflect the new cwd —
+        // proving the freeze above was real, not a coincidence.
+        loop_.cached_system_prompt = None;
+        let sys3 = loop_.build_system_prompt();
+        assert_ne!(sys1, sys3, "after invalidation the prompt should rebuild");
+        assert!(
+            sys3.contains(&new_wd.display().to_string()),
+            "the rebuilt prompt should reflect the new cwd"
+        );
     }
 
     #[test]

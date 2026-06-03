@@ -8,6 +8,37 @@ impl AgentLoop {
     // `agent::discipline::reflection_prompt`.
 
     pub(crate) fn build_system_prompt(&mut self) -> String {
+        // ── Session-level immutability (LLM prefix-cache stability) ──
+        // The system prompt is messages[0]; a single byte change zeroes the
+        // ENTIRE prefix cache for the whole conversation. Measured: ~20% of
+        // long-session cache collapses started right here, because the prompt
+        // was rebuilt every turn from live inputs that drift mid-session —
+        // chiefly the working directory (rewritten on every model `cd`, see
+        // tool/cd.rs + tool/bash.rs) and the plan-mode block, plus memory /
+        // layered-instructions re-read from disk each turn.
+        //
+        // So build it ONCE per session and reuse the exact same bytes every
+        // turn. The cache is invalidated (set to None) only at explicit,
+        // user-initiated contract boundaries — plan-mode toggle, /clear,
+        // config reload, explicit /cd — each rare and each a legitimate
+        // one-time reset. The model's OWN `cd` tool does NOT invalidate:
+        // live cwd still reaches the model through the cd/bash tool RESULTS,
+        // so freezing the cwd line here never blinds it. See
+        // `system_prompt_is_frozen_across_model_cwd_change`.
+        if let Some(ref cached) = self.cached_system_prompt {
+            return cached.clone();
+        }
+        let prompt = self.assemble_system_prompt();
+        self.cached_system_prompt = Some(prompt.clone());
+        prompt
+    }
+
+    /// Assemble the system prompt from scratch. Called by
+    /// `build_system_prompt` only on a cold cache. Every mid-session-variable
+    /// input it reads (cwd, plan_mode, on-disk memory/instructions, skills,
+    /// hook extensions) is snapshotted HERE and frozen until the next
+    /// explicit cache invalidation — that is the whole point.
+    fn assemble_system_prompt(&self) -> String {
         // Dynamic rules: select prompt sections based on task type.
         // If user has a custom system_prompt in config, use that instead (override).
         let rules = if let Some(custom) = self

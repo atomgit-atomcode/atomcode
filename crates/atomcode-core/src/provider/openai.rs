@@ -1967,6 +1967,64 @@ mod tests {
     }
 
     #[test]
+    fn format_messages_is_deterministic_and_prefix_stable() {
+        // Part-2 lock (assistant prefix-cache stability): a historical
+        // assistant message must serialize to BYTE-IDENTICAL JSON every turn,
+        // and growing the conversation must NOT change the serialization of the
+        // earlier (prefix) messages — otherwise the provider prefix cache
+        // breaks at that assistant message. This already holds because we reuse
+        // the stored tool_call `arguments` string verbatim (no per-turn
+        // re-stringify) and serde_json key order is deterministic; this test
+        // pins it against regressions (someone re-encoding args, reordering
+        // keys, or trimming reasoning_content off old messages).
+        use super::{OpenAiProvider, ReasoningPolicy};
+        use crate::conversation::message::{Message, MessageContent, Role};
+        use crate::tool::ToolResult;
+
+        let history = vec![
+            atc_message(Some("thought about it")),
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "c1".into(),
+                    output: "done".into(),
+                    success: true,
+                }),
+                synthetic: false,
+            },
+        ];
+
+        // Same input rendered on two turns → identical bytes.
+        let a = serde_json::to_string(&OpenAiProvider::format_messages(
+            &history,
+            ReasoningPolicy::Include,
+            false,
+        ))
+        .unwrap();
+        let b = serde_json::to_string(&OpenAiProvider::format_messages(
+            &history,
+            ReasoningPolicy::Include,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(a, b, "assistant/tool serialization must be deterministic");
+
+        // Next turn appends a new assistant message; the ORIGINAL prefix
+        // messages must serialize byte-for-byte the same (cache grows at tail).
+        let mut grown = history.clone();
+        grown.push(atc_message(Some("second thought")));
+        let out_prefix = OpenAiProvider::format_messages(&history, ReasoningPolicy::Include, false);
+        let out_grown = OpenAiProvider::format_messages(&grown, ReasoningPolicy::Include, false);
+        for (i, m) in out_prefix.iter().enumerate() {
+            assert_eq!(
+                serde_json::to_string(m).unwrap(),
+                serde_json::to_string(&out_grown[i]).unwrap(),
+                "prefix message {i} re-serialized differently after the conversation grew"
+            );
+        }
+    }
+
+    #[test]
     fn format_messages_exclude_omits_reasoning_content_key() {
         // DeepSeek-R1 rejects the request if reasoning_content key is present,
         // so under Exclude we must NOT emit the key even when we have a value.
