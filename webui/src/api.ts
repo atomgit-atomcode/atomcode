@@ -4,7 +4,11 @@
 const token = new URLSearchParams(location.search).get('token') ?? '';
 
 function authHeaders(): Record<string, string> {
-  return token ? { Authorization: 'Bearer ' + token } : {};
+  // Tag every request so the daemon attributes telemetry (mode field) to webui
+  // rather than the generic `ide` fallback. See daemon resolve_client_mode.
+  const h: Record<string, string> = { 'X-AtomCode-Client': 'webui' };
+  if (token) h.Authorization = 'Bearer ' + token;
+  return h;
 }
 
 /** Current session token (from the page URL). */
