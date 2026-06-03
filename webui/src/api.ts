@@ -457,8 +457,10 @@ export type LiveWireEvent =
 export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,
   signal?: AbortSignal,
+  sessionId?: string | null,
 ): Promise<void> {
-  const resp = await fetch('/live', { headers: authHeaders(), signal });
+  const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+  const resp = await fetch(`/live${params}`, { headers: authHeaders(), signal });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const reader = resp.body!.getReader();
   const decoder = new TextDecoder();
@@ -483,6 +485,7 @@ export async function postLiveMessage(
   message: string,
   images?: ImageData[],
   provider?: string,
+  sessionId?: string | null,
 ): Promise<void> {
   await fetch('/live/message', {
     method: 'POST',
@@ -491,6 +494,7 @@ export async function postLiveMessage(
       message,
       ...(images && images.length ? { images } : {}),
       ...(provider ? { provider } : {}),
+      ...(sessionId ? { session_id: sessionId } : {}),
     }),
   });
 }

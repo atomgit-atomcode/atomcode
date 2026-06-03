@@ -895,23 +895,13 @@ pub(super) fn execute_slash_command(
                     "127.0.0.1".to_string()
                 }
                 let host = parse_host(a);
-                // 先用 TUI 当前会话（如 `atomcode -c` 续聊的会话）播种 LiveSession，
-                // 并在开浏览器**之前**完成——否则浏览器可能抢先连上 /live、先建出一个空
-                // LiveSession，webui 就落到空白新页面而非当前会话。仅当前会话非空时才复用
-                // 其 id（让后续每轮覆盖同一文件、不产生重复会话）。
-                let (initial, sid) = if ctx.current_session.messages.is_empty() {
-                    (Vec::new(), None)
-                } else {
-                    (
-                        ctx.current_session.messages.clone(),
-                        Some(ctx.current_session.id.clone()),
-                    )
-                };
-                let session = atomcode_daemon::ensure_live_session_seeded(
+                // #561 修复：先用 TUI 当前会话播种 LiveSession（session_id + 历史），
+                // 再开浏览器——否则浏览器抢先连 /live 会建出空白 LiveSession。
+                let session = atomcode_daemon::ensure_live_session(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
-                    initial,
-                    sid,
+                    Some(ctx.current_session.id.clone()),
+                    ctx.current_session.messages.clone(),
                 );
                 let open_msg = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
@@ -939,17 +929,16 @@ pub(super) fn execute_slash_command(
                     "已退出同步，回到独立会话".to_string(),
                 ));
             } else {
-                match atomcode_daemon::current_live_session() {
-                    Some(session) => {
-                        // 重新附着：TUI 可能错过了 webui 期间的对话，回放快照补上。
-                        attach_live_session(ctx, renderer, session, true);
-                    }
-                    None => {
-                        renderer.render(UiLine::CommandOutput(
-                            "没有活动的 webui 会话，请先运行 /webui".to_string(),
-                        ));
-                    }
-                }
+                // #561 修复：始终用 ensure_live_session 把当前会话上下文传给 LiveSession，
+                // 这样即使 WebUI 先启动了 LiveSession（用不同 session_id），/sync 也能
+                // 把它替换为 TUI 的会话。
+                let session = atomcode_daemon::ensure_live_session(
+                    ctx.working_dir.clone(),
+                    ctx.telemetry.clone(),
+                    Some(ctx.current_session.id.clone()),
+                    ctx.current_session.messages.clone(),
+                );
+                attach_live_session(ctx, renderer, session, true);
             }
             renderer.flush();
         }
