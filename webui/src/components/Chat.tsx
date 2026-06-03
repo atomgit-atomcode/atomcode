@@ -92,6 +92,9 @@ interface ChatProps {
   onSessionId: (id: string) => void;
   cwd: string;
   onPermission: (req: PermissionRequestEvent) => void;
+  /** 审批已被解决时通知 App 清掉 /chat 的审批卡片：传 call_id 仅在匹配时清（工具已执行），
+   *  传 null 则无条件清（回合 done/stopped/error 或用户中止——此时不可能再有待批准项）。 */
+  onPermissionResolved?: (callId: string | null) => void;
   /** Metadata of the currently-active session (for loading history) */
   activeSession?: SessionMetaWithProject | null;
   /** 刷新后正按 URL 短 id 还原会话；为 true 时抑制新建落地页，避免闪屏。 */
@@ -124,7 +127,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession, restoring }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -412,6 +415,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       }
       case 'state': {
         setBusy(e.running);
+        // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
+        // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
+        if (!e.running) setLivePending(null);
         break;
       }
       case 'permission_request': {
@@ -424,6 +430,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       default: {
         const mapped = liveToSSE(e);
         if (mapped) handleEvent(mapped);
+        // 工具结果到达即代表该工具的审批已被处理（本端或对端 TUI 批准后工具已执行），
+        // 清掉与之对应的残留审批卡片（call_id 匹配才清，避免误删尚未处理的其它请求）。
+        if (e.type === 'tool_result') {
+          setLivePending((cur) => resolvePendingAfterDecision(cur, e.id));
+        }
         break;
       }
     }
@@ -523,6 +534,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
           duration_ms: event.duration_ms,
           output: event.output,
         });
+        // 工具已执行完 → 其审批必已解决，清掉 /chat 残留的同 call_id 审批卡片。
+        onPermissionResolved?.(event.id);
         break;
 
       case 'tokens':
@@ -548,17 +561,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
         loadedForRef.current = event.session_id;
         onSessionId(event.session_id);
         setBusy(false);
+        onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         break;
 
       case 'stopped':
         setBusy(false);
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
+        onPermissionResolved?.(null);
         break;
 
       case 'error':
         appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
         setBusy(false);
         setQueued([]); // 出错：丢弃排队消息
+        onPermissionResolved?.(null);
         break;
 
       default:
@@ -609,6 +625,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       }
       setBusy(false);
       setQueued([]); // 连接错误：与 stopped/error 一致，丢弃排队消息
+      // 中止/连接错误时流被掐断，不会再有 done/stopped 事件 → 兜底清掉审批卡片，
+      // 否则点「停止」时若正挂着审批卡片，它会一直残留。
+      onPermissionResolved?.(null);
     } finally {
       abortRef.current = null;
     }
