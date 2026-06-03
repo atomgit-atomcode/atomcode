@@ -47,6 +47,30 @@ impl PlanType {
     /// `Max → Pro → Lite` and stop at the first successful claim.
     pub const CASCADE_ORDER: &'static [PlanType] =
         &[PlanType::Max, PlanType::Pro, PlanType::Lite];
+
+    /// Best-effort map of a `StatusResponse.codingplan_free.plan_name`
+    /// (e.g. `"CodingPlan Lite"` / `"CodingPlan Pro"` / `"CodingPlan Max"`)
+    /// back to the tier. Used so the drift monitor can query
+    /// `models-v2?plan_type=` with the user's **actual** tier — `plan_available`
+    /// is computed relative to the requested tier (see `ModelEntry`), so
+    /// querying `Max` for a Lite user wrongly marks higher-tier models
+    /// available and fires a permanent "list updated" false positive.
+    ///
+    /// Checked most-specific first; `Max`/`Pro`/`Lite` don't overlap as
+    /// substrings. Returns `None` for unrecognised names (e.g. `"CodingPlan
+    /// Free"`) so the caller can skip rather than guess a tier.
+    pub fn from_plan_name(plan_name: &str) -> Option<PlanType> {
+        let lower = plan_name.to_ascii_lowercase();
+        if lower.contains("max") {
+            Some(PlanType::Max)
+        } else if lower.contains("pro") {
+            Some(PlanType::Pro)
+        } else if lower.contains("lite") {
+            Some(PlanType::Lite)
+        } else {
+            None
+        }
+    }
 }
 
 /// `POST /api/v5/coding-plan/claim-v2` response.
@@ -320,6 +344,22 @@ mod tests {
             &[PlanType::Max, PlanType::Pro, PlanType::Lite],
             "cascade must walk highest tier first"
         );
+    }
+
+    /// Drift monitor maps the status plan_name back to the tier so it can
+    /// query models-v2 with the user's ACTUAL tier (not Max), avoiding the
+    /// permanent "list updated" false positive on Lite/Pro.
+    #[test]
+    fn plan_type_from_plan_name() {
+        assert_eq!(PlanType::from_plan_name("CodingPlan Lite"), Some(PlanType::Lite));
+        assert_eq!(PlanType::from_plan_name("CodingPlan Pro"), Some(PlanType::Pro));
+        assert_eq!(PlanType::from_plan_name("CodingPlan Max"), Some(PlanType::Max));
+        // Case-insensitive.
+        assert_eq!(PlanType::from_plan_name("codingplan lite"), Some(PlanType::Lite));
+        // Unrecognised tiers (Free / empty / junk) → None so the caller skips
+        // rather than defaulting to Max and re-introducing the false positive.
+        assert_eq!(PlanType::from_plan_name("CodingPlan Free"), None);
+        assert_eq!(PlanType::from_plan_name(""), None);
     }
 
     #[test]
