@@ -3089,8 +3089,11 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
             // 0 = 关闭 idle 看门狗（见 spawn_idle_timeout_task：idle_timeout_secs==0 直接 return）。
             // 进程内 webui 应随主程序常驻，不能自行 idle 关停。
             idle_timeout_secs: 0,
-            // 与 parse_daemon_args 的默认 client mode 一致（无 --client 标志时为 Ide）。
-            startup_mode: SessionMode::Ide,
+            // 进程内 webui（TUI `/webui`、`atomcode webui`）的会话开启事件应归因到 webui，
+            // 而非 parse_daemon_args 的默认 Ide。run_server 启动时据此发 OpenAtomcode{mode:webui}，
+            // 让"webui 会话开启数"可被统计——逐请求的 X-AtomCode-Client 头只覆盖会话内事件，
+            // 覆盖不到会话级的 open。宿主进程（TUI/CLI）自身的 OpenAtomcode 早已单独上报，互不影响。
+            startup_mode: SessionMode::Webui,
             // 传入同一 store：server 进入 webui 模式（enforce_token=true）并用它校验 token。
             webui_tokens: Some(tokens.clone()),
             // 进程内启动：抑制启动横幅，避免污染 TUI 画面。
