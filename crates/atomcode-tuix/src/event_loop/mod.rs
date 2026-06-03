@@ -3339,7 +3339,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &app.buf);
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -3720,7 +3720,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &app.buf);
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -6188,7 +6188,7 @@ fn handle_agent_event(
     fixissue_buffer: &mut String,
     setup_pending: &mut bool,
     reasoning_buffer: &mut String,
-    buf: &Buffer,
+    buf: &mut Buffer,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
@@ -6719,6 +6719,60 @@ fn handle_agent_event(
             // Save what we did have — a user who Ctrl+C'd mid-stream
             // should still be able to /resume the cleaned conversation.
             persist_current_session(ctx, messages, renderer);
+        }
+        AgentEvent::ConversationTruncated {
+            messages,
+            restored_prompt,
+            target_n,
+            prompts_before,
+        } => {
+            let new_len = messages.len();
+            // Persist the truncated conversation: messages + prune stale
+            // per-turn dividers (anchored by message-count) so /resume won't
+            // replay dividers for removed turns.
+            ctx.current_session.messages = messages.clone();
+            ctx.current_session
+                .turn_stats
+                .retain(|s| s.after_message <= new_len);
+            ctx.current_session.touch();
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone());
+            if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
+                        error: &e.to_string(),
+                    })
+                    .into_owned(),
+                ));
+            }
+            // Redraw scrollback from the truncated history — reuses the
+            // /resume replay path (clears screen, re-renders turn dividers).
+            crate::modals::session_picker::replay_session(renderer, &ctx.current_session, true);
+            // Put the rolled-back prompt back in the input box for editing.
+            buf.set_restored_text(restored_prompt);
+            // Confirmation + disk-divergence warning.
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::CmdUndoDone {
+                    target: target_n,
+                    last: prompts_before,
+                })
+                .into_owned(),
+            ));
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::CmdUndoDiskWarning).into_owned(),
+            ));
+            renderer.flush();
+            state.on_turn_complete();
+        }
+        AgentEvent::UndoFailed { requested, available } => {
+            let line = if available == 0 {
+                crate::i18n::t(crate::i18n::Msg::CmdUndoNoTurns).into_owned()
+            } else {
+                crate::i18n::t(crate::i18n::Msg::CmdUndoOutOfRange { requested, available })
+                    .into_owned()
+            };
+            renderer.render(UiLine::CommandOutput(line));
+            renderer.flush();
         }
         AgentEvent::Error { error, messages } => {
             renderer.render(UiLine::Error(error));

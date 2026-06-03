@@ -114,6 +114,11 @@ pub enum AgentCommand {
     /// the session has up-to-date message history even when a turn is
     /// still in progress (e.g. waiting for tool approval).
     SyncMessages,
+    /// Roll conversation memory back to just before the `nth` real user
+    /// prompt (1-based). `None` targets the last prompt (bare `/undo`). The
+    /// agent replies with `AgentEvent::ConversationTruncated` on success or
+    /// `AgentEvent::UndoFailed` when `nth` is out of range.
+    UndoToPrompt { nth: Option<usize> },
     /// Shutdown the agent.
     Shutdown,
 }
@@ -259,6 +264,19 @@ pub enum AgentEvent {
     TurnCancelled {
         messages: Vec<crate::conversation::message::Message>,
     },
+    /// Conversation memory was rolled back by `/undo`. Carries the truncated
+    /// message list (for the TUI to persist + replay), the removed prompt's
+    /// text (to restore into the input box), and turn numbers for the
+    /// confirmation line (`target_n..=prompts_before` were removed).
+    ConversationTruncated {
+        messages: Vec<crate::conversation::message::Message>,
+        restored_prompt: String,
+        target_n: usize,
+        prompts_before: usize,
+    },
+    /// `/undo` could not be honored: `requested` turn is out of range.
+    /// `available` real prompts exist (0 = nothing to undo).
+    UndoFailed { requested: usize, available: usize },
     /// Response to `AgentCommand::SyncMessages`. Carries a snapshot of
     /// `conversation.messages` at the time the agent processed the command.
     /// Used by the TUI to sync session state before backgrounding a session
@@ -1284,6 +1302,26 @@ impl AgentLoop {
                     // existing conversation, so a new id would fragment one
                     // logical session into two on the gateway. Only an explicit
                     // fresh start (ClearConversation: /session, /clear) resets.
+                }
+                AgentCommand::UndoToPrompt { nth } => {
+                    let available = self.conversation.prompt_count();
+                    let target = nth.unwrap_or(available);
+                    match self.conversation.undo_to_prompt(target) {
+                        Some(restored_prompt) => {
+                            let _ = self.event_tx.send(AgentEvent::ConversationTruncated {
+                                messages: self.conversation.messages.clone(),
+                                restored_prompt,
+                                target_n: target,
+                                prompts_before: available,
+                            });
+                        }
+                        None => {
+                            let _ = self.event_tx.send(AgentEvent::UndoFailed {
+                                requested: target,
+                                available,
+                            });
+                        }
+                    }
                 }
                 AgentCommand::SetPlanMode(enabled) => {
                     let changed = self.plan_mode != enabled;
