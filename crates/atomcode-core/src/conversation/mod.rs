@@ -53,6 +53,43 @@ impl Conversation {
         Self::default()
     }
 
+    /// Number of real (non-synthetic) user prompts. This is the maximum `N`
+    /// accepted by `/undo N`, and what bare `/undo` targets (the last prompt).
+    pub fn prompt_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User) && !m.synthetic)
+            .count()
+    }
+
+    /// Roll conversation memory back to just before the `nth` (1-based) real
+    /// user prompt, removing that prompt and every message after it, then
+    /// rebuilding the turn tracker. Synthetic user injections (compaction
+    /// markers, plan-mode notes) are ignored when counting but ARE removed
+    /// when they fall after the cut. Any leading non-user messages before the
+    /// first prompt are preserved. In-flight stream/tool buffers are cleared.
+    ///
+    /// Returns the removed prompt's text (for the UI to restore into the input
+    /// box), or `None` if `nth == 0` or `nth > prompt_count()`.
+    pub fn undo_to_prompt(&mut self, nth: usize) -> Option<String> {
+        if nth == 0 {
+            return None;
+        }
+        let start_idx = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.role, Role::User) && !m.synthetic)
+            .map(|(i, _)| i)
+            .nth(nth - 1)?;
+        let restored = self.messages[start_idx].text().unwrap_or("").to_string();
+        self.stream_buffer = None;
+        self.tool_call_buffer = None;
+        self.messages.truncate(start_idx);
+        self.turn_tracker = TurnTracker::rebuild(&self.messages);
+        Some(restored)
+    }
+
     /// Load conversation history from disk. Never fails — returns empty on any error.
     pub fn load(path: &std::path::Path) -> Self {
         let data = match std::fs::read_to_string(path) {
@@ -2316,5 +2353,83 @@ mod tests {
             conv.messages[1].synthetic,
             "two synthetics merged stays synthetic"
         );
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::*;
+    use crate::conversation::message::{Message, MessageContent, Role};
+
+    fn convo(msgs: Vec<Message>) -> Conversation {
+        let mut c = Conversation::new();
+        c.turn_tracker = TurnTracker::rebuild(&msgs);
+        c.messages = msgs;
+        c
+    }
+    fn user(s: &str) -> Message { Message::new(Role::User, s) }
+    fn asst(s: &str) -> Message { Message::new(Role::Assistant, s) }
+    fn synthetic_user(s: &str) -> Message {
+        Message { role: Role::User, content: MessageContent::Text(s.into()), synthetic: true }
+    }
+
+    #[test]
+    fn prompt_count_ignores_synthetic() {
+        let c = convo(vec![user("p1"), asst("a1"), synthetic_user("[ctx]"), user("p2"), asst("a2")]);
+        assert_eq!(c.prompt_count(), 2);
+    }
+
+    #[test]
+    fn undo_last_prompt_truncates_and_returns_text() {
+        let mut c = convo(vec![user("p1"), asst("a1"), user("p2"), asst("a2")]);
+        let restored = c.undo_to_prompt(2);
+        assert_eq!(restored.as_deref(), Some("p2"));
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.messages[0].text(), Some("p1"));
+        assert_eq!(c.turn_tracker.turns.len(), 1);
+    }
+
+    #[test]
+    fn undo_earlier_prompt_removes_following_turns() {
+        let mut c = convo(vec![user("p1"), asst("a1"), user("p2"), asst("a2"), user("p3"), asst("a3")]);
+        let restored = c.undo_to_prompt(2);
+        assert_eq!(restored.as_deref(), Some("p2"));
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.prompt_count(), 1);
+    }
+
+    #[test]
+    fn undo_counts_real_prompts_only() {
+        // real prompts: p1@0, p2@3. nth=2 must cut at idx 3, keeping the synthetic.
+        let mut c = convo(vec![user("p1"), asst("a1"), synthetic_user("[ctx]"), user("p2"), asst("a2")]);
+        let restored = c.undo_to_prompt(2);
+        assert_eq!(restored.as_deref(), Some("p2"));
+        assert_eq!(c.messages.len(), 3);
+    }
+
+    #[test]
+    fn undo_first_prompt_keeps_leading_non_user() {
+        let mut c = convo(vec![asst("sys"), user("p1"), asst("a1")]);
+        let restored = c.undo_to_prompt(1);
+        assert_eq!(restored.as_deref(), Some("p1"));
+        assert_eq!(c.messages.len(), 1);
+        assert_eq!(c.messages[0].text(), Some("sys"));
+    }
+
+    #[test]
+    fn undo_out_of_range_returns_none_and_no_mutation() {
+        let mut c = convo(vec![user("p1"), asst("a1")]);
+        assert!(c.undo_to_prompt(0).is_none());
+        assert!(c.undo_to_prompt(2).is_none());
+        assert_eq!(c.messages.len(), 2);
+    }
+
+    #[test]
+    fn undo_clears_inflight_buffers() {
+        let mut c = convo(vec![user("p1"), asst("a1"), user("p2")]);
+        c.stream_buffer = Some("partial".into());
+        c.undo_to_prompt(2);
+        assert!(c.stream_buffer.is_none());
+        assert!(c.tool_call_buffer.is_none());
     }
 }
