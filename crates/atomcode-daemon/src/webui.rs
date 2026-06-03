@@ -55,12 +55,18 @@ mod tests {
 
     #[test]
     fn serves_embedded_index() {
-        assert!(WebuiAssets::get("index.html").is_some(), "index.html should be embedded");
+        assert!(
+            WebuiAssets::get("index.html").is_some(),
+            "index.html should be embedded"
+        );
     }
 
     #[test]
     fn unknown_path_falls_back_to_index() {
         // 未知路径回退 index.html 内容（SPA 路由）
-        assert!(asset_or_index("some/spa/route").is_some(), "SPA route should fall back to index");
+        assert!(
+            asset_or_index("some/spa/route").is_some(),
+            "SPA route should fall back to index"
+        );
     }
 }

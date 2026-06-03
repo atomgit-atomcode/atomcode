@@ -8,19 +8,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_core::config::Config;
+use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::live::{LiveEvent, TurnExecutor, TurnState, UserInput};
-use atomcode_core::conversation::message::ImagePart;
+use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
-use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::lsp::manager::build_lsp_manager;
-use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::tool::PermissionDecision;
+use atomcode_core::tool::{ToolContext, ToolRegistry};
+use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{
-    ApprovalRequest, AutoPermissionDecider, AutoPermissionMode,
-    InteractivePermissionDecider, PermissionDecider,
+    ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
+    PermissionDecider,
 };
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::Telemetry;
@@ -73,9 +73,17 @@ fn live_current_provider() -> String {
 }
 
 /// 进程级共享 MCP 缓存（供 TUI 侧 ensure_live_session 使用，无需 AppState）。
-static LIVE_MCP_CACHE: OnceLock<Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>>> = OnceLock::new();
+static LIVE_MCP_CACHE: OnceLock<
+    Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>,
+        >,
+    >,
+> = OnceLock::new();
 
-fn live_mcp_cache() -> Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>> {
+fn live_mcp_cache(
+) -> Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>>
+{
     LIVE_MCP_CACHE
         .get_or_init(|| Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))
         .clone()
@@ -98,7 +106,13 @@ pub fn ensure_live_session(
     session_id: Option<atomcode_core::session::SessionId>,
     initial_messages: Vec<atomcode_core::conversation::message::Message>,
 ) -> Arc<atomcode_core::live::LiveSession> {
-    ensure_live_session_global(working_dir, live_mcp_cache(), telemetry, session_id, initial_messages)
+    ensure_live_session_global(
+        working_dir,
+        live_mcp_cache(),
+        telemetry,
+        session_id,
+        initial_messages,
+    )
 }
 
 /// 取或建当前活动 LiveSession（webui /live 用）。阶段③ Task 3 会把 auto_approve 改交互式。
@@ -108,7 +122,11 @@ pub fn ensure_live_session(
 /// `initial_messages`：新建时作为对话历史种子；已有 LiveSession 不受影响。
 pub(crate) fn ensure_live_session_global(
     working_dir: std::path::PathBuf,
-    mcp_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>>,
+    mcp_cache: Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>,
+        >,
+    >,
     telemetry: Arc<atomcode_telemetry::Telemetry>,
     session_id: Option<atomcode_core::session::SessionId>,
     initial_messages: Vec<atomcode_core::conversation::message::Message>,
@@ -125,7 +143,7 @@ pub(crate) fn ensure_live_session_global(
         }
         // session_id 不匹配 → 当前 LiveSession 属于旧会话，需要替换。
     }
-    let session_id = session_id.unwrap_or_else(atomcode_core::session::SessionId::new);
+    let session_id = session_id.unwrap_or_default();
     // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
     *LIVE_SESSION_ID.lock().unwrap() = Some(session_id.to_string());
     let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(DaemonTurnExecutor {
@@ -165,10 +183,9 @@ pub(crate) async fn build_turn_parts(
     telemetry: Arc<Telemetry>,
 ) -> anyhow::Result<TurnParts> {
     use atomcode_core::tool::{
-        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool,
-        list_dir::ListDirTool, read::ReadFileTool, search_replace::SearchReplaceTool,
-        todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool,
-        write::WriteFileTool,
+        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
+        read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
+        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
     };
 
     // Load config
@@ -188,25 +205,21 @@ pub(crate) async fn build_turn_parts(
     let provider = provider::create_provider(provider_config)?;
 
     // Build tool context — use "live" as session-id label
-    let mut tool_context = ToolContext::with_telemetry(
-        working_dir.to_path_buf(),
-        "live",
-        telemetry,
-    );
+    let mut tool_context =
+        ToolContext::with_telemetry(working_dir.to_path_buf(), "live", telemetry);
 
     let mut tool_registry = ToolRegistry::new();
 
     // Honour ATOMCODE_DISABLE_TOOLS env var (same logic as process_chat_request)
-    let disabled_tools: std::collections::HashSet<String> =
-        std::env::var("ATOMCODE_DISABLE_TOOLS")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     let enabled = |name: &str| !disabled_tools.contains(name);
 
     if enabled("read_file") {
@@ -314,8 +327,8 @@ pub(crate) async fn build_turn_parts(
     // exposes provider_name explicitly, so we calibrate ctx to it.)
     let ctx = match config.providers.get(&resolved_provider_name) {
         Some(pc) => atomcode_core::ctx::for_provider(pc),
-        None => atomcode_core::ctx::for_provider(
-            &atomcode_core::config::provider::ProviderConfig {
+        None => {
+            atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
                 provider_type: String::new(),
                 api_key: None,
                 model: String::new(),
@@ -331,8 +344,8 @@ pub(crate) async fn build_turn_parts(
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: true,
-            },
-        ),
+            })
+        }
     };
 
     // Build system prompt
@@ -374,7 +387,10 @@ impl TurnExecutor for DaemonTurnExecutor {
         let live_provider = LIVE_PROVIDER.lock().unwrap().clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
         let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
-        UserInput { text, images: input.images }
+        UserInput {
+            text,
+            images: input.images,
+        }
     }
 
     async fn run_turn(
@@ -397,7 +413,9 @@ impl TurnExecutor for DaemonTurnExecutor {
         {
             Ok(p) => p,
             Err(e) => {
-                let _ = events.send(LiveEvent::Turn(TurnEvent::Error(format!("构造 turn 失败：{e}"))));
+                let _ = events.send(LiveEvent::Turn(TurnEvent::Error(format!(
+                    "构造 turn 失败：{e}"
+                ))));
                 return;
             }
         };
@@ -495,17 +513,16 @@ impl TurnExecutor for DaemonTurnExecutor {
     }
 }
 
+use crate::AppState;
 use axum::{
     extract::State,
     response::{
-        sse::{Event, Sse, KeepAlive},
-        IntoResponse,
-        Json,
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json,
     },
 };
 use futures::stream::StreamExt;
 use serde::Serialize;
-use crate::AppState;
 
 // ============================================================================
 // Wire DTO: LiveWireEvent + to_wire
@@ -515,29 +532,56 @@ use crate::AppState;
 #[serde(tag = "type")]
 pub(crate) enum LiveWireEvent {
     #[serde(rename = "snapshot")]
-    Snapshot { messages: Vec<crate::MessageInfo>, session_id: String, project_hash: String, provider: String },
+    Snapshot {
+        messages: Vec<crate::MessageInfo>,
+        session_id: String,
+        project_hash: String,
+        provider: String,
+    },
     #[serde(rename = "provider")]
     Provider { provider: String },
     #[serde(rename = "user")]
-    UserMessage { text: String, images: Vec<crate::ImageData> },
+    UserMessage {
+        text: String,
+        images: Vec<crate::ImageData>,
+    },
     #[serde(rename = "text")]
     TextDelta { content: String },
     #[serde(rename = "reasoning")]
     ReasoningDelta { content: String },
     #[serde(rename = "tool_start")]
-    ToolStart { id: String, name: String, arguments: String },
+    ToolStart {
+        id: String,
+        name: String,
+        arguments: String,
+    },
     #[serde(rename = "tool_output")]
     ToolOutput { chunk: String },
     #[serde(rename = "tool_result")]
-    ToolResult { id: String, name: String, output: String, success: bool, duration_ms: u64 },
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+        success: bool,
+        duration_ms: u64,
+    },
     #[serde(rename = "tokens")]
-    Tokens { prompt: usize, completion: usize, total: usize },
+    Tokens {
+        prompt: usize,
+        completion: usize,
+        total: usize,
+    },
     #[serde(rename = "state")]
     State { running: bool },
     #[serde(rename = "error")]
     Error { message: String },
     #[serde(rename = "permission_request")]
-    PermissionRequest { tool_name: String, reason: String, call_id: String, arguments: String },
+    PermissionRequest {
+        tool_name: String,
+        reason: String,
+        call_id: String,
+        arguments: String,
+    },
 }
 
 /// Map one LiveEvent → 0/1 wire events (variants the frontend doesn't need → None).
@@ -546,30 +590,74 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
     Some(match ev {
         LiveEvent::UserMessage { text, images } => LiveWireEvent::UserMessage {
             text,
-            images: images.into_iter().map(|i| crate::ImageData { media_type: i.media_type, data: i.data }).collect(),
+            images: images
+                .into_iter()
+                .map(|i| crate::ImageData {
+                    media_type: i.media_type,
+                    data: i.data,
+                })
+                .collect(),
         },
-        LiveEvent::StateChanged(s) => LiveWireEvent::State { running: matches!(s, TurnState::Running) },
+        LiveEvent::StateChanged(s) => LiveWireEvent::State {
+            running: matches!(s, TurnState::Running),
+        },
         LiveEvent::ProviderChanged(p) => LiveWireEvent::Provider { provider: p },
         LiveEvent::Turn(te) => match te {
             TE::TextDelta(content) => LiveWireEvent::TextDelta { content },
             TE::ReasoningDelta(content) => LiveWireEvent::ReasoningDelta { content },
-            TE::ToolCallStarted { id, name, arguments } => LiveWireEvent::ToolStart { id, name, arguments },
+            TE::ToolCallStarted {
+                id,
+                name,
+                arguments,
+            } => LiveWireEvent::ToolStart {
+                id,
+                name,
+                arguments,
+            },
             TE::ToolOutputChunk { call_id: _, chunk } => LiveWireEvent::ToolOutput { chunk },
-            TE::ToolCallResult { call_id, name, output, success, duration } =>
-                LiveWireEvent::ToolResult { id: call_id, name, output, success, duration_ms: duration.as_millis() as u64 },
-            TE::TokenUsage { prompt_tokens, completion_tokens, total_tokens, .. } =>
-                LiveWireEvent::Tokens { prompt: prompt_tokens, completion: completion_tokens, total: total_tokens },
+            TE::ToolCallResult {
+                call_id,
+                name,
+                output,
+                success,
+                duration,
+            } => LiveWireEvent::ToolResult {
+                id: call_id,
+                name,
+                output,
+                success,
+                duration_ms: duration.as_millis() as u64,
+            },
+            TE::TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                ..
+            } => LiveWireEvent::Tokens {
+                prompt: prompt_tokens,
+                completion: completion_tokens,
+                total: total_tokens,
+            },
             TE::Error(message) => LiveWireEvent::Error { message },
-            TE::Warning(w) => LiveWireEvent::Error { message: format!("[warning] {w}") },
-            TE::ApprovalRequested { tool_name, reason, call, .. } =>
-                LiveWireEvent::PermissionRequest {
-                    tool_name,
-                    reason,
-                    call_id: call.id,
-                    arguments: call.arguments,
-                },
-            TE::ToolCallStreaming { .. } | TE::ToolBatchStarted { .. } | TE::ToolBatchCompleted { .. }
-            | TE::ContextStats { .. } | TE::WorkingDirChanged(_) => return None,
+            TE::Warning(w) => LiveWireEvent::Error {
+                message: format!("[warning] {w}"),
+            },
+            TE::ApprovalRequested {
+                tool_name,
+                reason,
+                call,
+                ..
+            } => LiveWireEvent::PermissionRequest {
+                tool_name,
+                reason,
+                call_id: call.id,
+                arguments: call.arguments,
+            },
+            TE::ToolCallStreaming { .. }
+            | TE::ToolBatchStarted { .. }
+            | TE::ToolBatchCompleted { .. }
+            | TE::ContextStats { .. }
+            | TE::WorkingDirChanged(_) => return None,
         },
     })
 }
@@ -633,7 +721,13 @@ pub(crate) async fn live_stream(
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(ev) => { if let Some(w) = to_wire(ev) { if tx.send(w).is_err() { break; } } }
+                Ok(ev) => {
+                    if let Some(w) = to_wire(ev) {
+                        if tx.send(w).is_err() {
+                            break;
+                        }
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -644,7 +738,11 @@ pub(crate) async fn live_stream(
         let json = serde_json::to_string(&w).unwrap_or_default();
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("ping"))
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -705,7 +803,10 @@ async fn preprocess_live_caption(
     }
 }
 
-pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<LiveMessageReq>) -> impl IntoResponse {
+pub(crate) async fn live_message(
+    State(state): State<AppState>,
+    Json(req): Json<LiveMessageReq>,
+) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
     // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
     set_live_provider(req.provider);
@@ -716,7 +817,14 @@ pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<
     // 此处只负责投递原始输入。
     let ok = session.send_input(UserInput {
         text: req.message,
-        images: req.images.into_iter().map(|i| ImagePart { media_type: i.media_type, data: i.data }).collect(),
+        images: req
+            .images
+            .into_iter()
+            .map(|i| ImagePart {
+                media_type: i.media_type,
+                data: i.data,
+            })
+            .collect(),
     });
     Json(serde_json::json!({ "accepted": ok }))
 }
@@ -745,7 +853,8 @@ pub(crate) async fn live_provider(
     }
     // 确保有 live 会话可供广播（与 /live/message 一致的幂等 ensure）。
     let working_dir = { state.project.read().await.working_dir.clone() };
-    ensure_live_session(working_dir, state.telemetry.clone(), None, Vec::new());    live_set_provider(req.provider);
+    ensure_live_session(working_dir, state.telemetry.clone(), None, Vec::new());
+    live_set_provider(req.provider);
     Json(serde_json::json!({ "ok": true }))
 }
 
@@ -783,7 +892,6 @@ pub(crate) async fn live_permission(
     };
     Json(serde_json::json!({ "accepted": ok }))
 }
-
 
 #[cfg(test)]
 mod tests {
