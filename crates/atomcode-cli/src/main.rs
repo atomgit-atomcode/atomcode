@@ -1986,7 +1986,9 @@ async fn run_headless(
             AgentEvent::MessagesSync { .. } => {
                 // Only used by TUI for /bg session persistence; ignore in CLI.
             }
-            AgentEvent::UserEcho(_) | AgentEvent::PeerBusy(_) => {
+            AgentEvent::UserEcho(_)
+            | AgentEvent::PeerBusy(_)
+            | AgentEvent::ProviderChanged(_) => {
                 // Live-sync only — not applicable in headless CLI.
             }
         }
