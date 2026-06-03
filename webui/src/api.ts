@@ -4,7 +4,11 @@
 const token = new URLSearchParams(location.search).get('token') ?? '';
 
 function authHeaders(): Record<string, string> {
-  return token ? { Authorization: 'Bearer ' + token } : {};
+  // X-AtomCode-Client lets the daemon tag telemetry as webui-originated
+  // (resolve_client_mode → SessionMode::Webui); sent regardless of token.
+  const h: Record<string, string> = { 'X-AtomCode-Client': 'webui' };
+  if (token) h.Authorization = 'Bearer ' + token;
+  return h;
 }
 
 /** Current session token (from the page URL). */

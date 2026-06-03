@@ -19,6 +19,7 @@ pub enum SessionMode {
     Ide,
     Vscode,
     AtomcodeAir,
+    Webui,
 }
 
 // ---------- Envelope (common to every event) ----------

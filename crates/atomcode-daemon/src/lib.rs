@@ -831,6 +831,7 @@ fn resolve_client_mode(header: &str) -> SessionMode {
     match header {
         "vscode" => SessionMode::Vscode,
         "atomcode-air" => SessionMode::AtomcodeAir,
+        "webui" => SessionMode::Webui,
         _ => SessionMode::Ide,
     }
 }
