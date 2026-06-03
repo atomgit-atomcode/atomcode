@@ -2638,7 +2638,16 @@ impl AgentLoop {
                         continue;
                     } else if is_rate_limited && self.retry_count < 5 {
                         self.retry_count += 1;
-                        let wait = (self.retry_count as u64 * 3).min(30);
+                        // 指数退避基线（3/6/9/12/15s）。但若网关在错误体里明确给了冷却
+                        // 时长（如 litellm 的 "No deployments available… Try again in 10
+                        // seconds"），就采纳它——否则更早重试只会打到仍在冷却的部署池，
+                        // 反而再次触发/延长冷却（用户侧表现为"明明有额度却一直 429"）。
+                        // 取二者较大值并封顶 30s。
+                        let computed = (self.retry_count as u64 * 3).min(30);
+                        let wait = parse_retry_after_hint(&e)
+                            .unwrap_or(0)
+                            .max(computed)
+                            .min(30);
                         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
                             "\n[Rate limited — retrying in {}s...]\n",
                             wait
@@ -3568,6 +3577,24 @@ fn is_rate_limited_error(e: &str) -> bool {
         || e.contains("限流")
 }
 
+/// Parse a gateway-suggested cooldown (in seconds) out of a rate-limit error
+/// body, e.g. litellm's `"No deployments available for selected model. Try
+/// again in 10 seconds."` Returns `None` when no explicit hint is present, in
+/// which case the caller falls back to its exponential backoff. ASCII-only
+/// lowercasing keeps byte offsets aligned with the original so the digit slice
+/// is valid even when the message contains earlier multibyte (e.g. Chinese)
+/// text.
+fn parse_retry_after_hint(e: &str) -> Option<u64> {
+    let lower = e.to_ascii_lowercase();
+    let idx = lower.find("try again in ")?;
+    let rest = &e[idx + "try again in ".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
 fn is_auth_error(e: &str) -> bool {
     e.contains("401 ")
         || e.contains("403 ")
@@ -3891,8 +3918,8 @@ mod agent_handle_tests {
 mod classifier_tests {
     use super::{
         extract_provider_ctx_limit, is_auth_error, is_codingplan_unavailable_error,
-        is_context_overflow_error, is_rate_limited_error, public_error_message,
-        public_error_reason, reload_should_clear_conversation,
+        is_context_overflow_error, is_rate_limited_error, parse_retry_after_hint,
+        public_error_message, public_error_reason, reload_should_clear_conversation,
     };
 
     // ── reload_should_clear_conversation ──
@@ -4304,6 +4331,25 @@ mod classifier_tests {
         // (which is generic Chinese "try again later").
         assert!(!is_rate_limited_error("请稍后再试"));
         assert!(!is_rate_limited_error("API error (500 Internal Server Error)"));
+    }
+
+    #[test]
+    fn retry_after_hint_parsed_from_litellm_no_deployments_body() {
+        // The exact shape elegant001 hit: litellm "No deployments available"
+        // with an embedded cooldown hint. The retry must honour the 10s so it
+        // doesn't hammer the still-cold pool at 3s.
+        let e = "[429] No deployments available for selected model, Try again in 10 seconds. \
+                 Passed model=deepseek-v4-flash. pre-call-checks=True, cooldown_list=['b5cb...']";
+        assert_eq!(parse_retry_after_hint(e), Some(10));
+        // Capital-T phrasing + a multibyte prefix must still parse (byte offsets
+        // stay aligned under ASCII-only lowercasing).
+        assert_eq!(
+            parse_retry_after_hint("模型繁忙：Try again in 30 seconds."),
+            Some(30)
+        );
+        // No hint → None (caller keeps its exponential backoff).
+        assert_eq!(parse_retry_after_hint("429 Too Many Requests"), None);
+        assert_eq!(parse_retry_after_hint("try again in soon"), None);
     }
 
     #[test]
