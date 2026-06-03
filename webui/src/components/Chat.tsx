@@ -2,7 +2,7 @@
 // Task 15 — sessionId + cwd lifted to App
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -92,6 +92,9 @@ interface ChatProps {
   onSessionId: (id: string) => void;
   cwd: string;
   onPermission: (req: PermissionRequestEvent) => void;
+  /** 审批已被解决时通知 App 清掉 /chat 的审批卡片：传 call_id 仅在匹配时清（工具已执行），
+   *  传 null 则无条件清（回合 done/stopped/error 或用户中止——此时不可能再有待批准项）。 */
+  onPermissionResolved?: (callId: string | null) => void;
   /** Metadata of the currently-active session (for loading history) */
   activeSession?: SessionMetaWithProject | null;
   /** 刷新后正按 URL 短 id 还原会话；为 true 时抑制新建落地页，避免闪屏。 */
@@ -124,7 +127,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession, restoring }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -168,6 +171,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
   // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
   // project_hash 迟到（刷新后由 App 异步回填）导致的重复加载 / 覆盖当前对话。
   const loadedForRef = useRef<string | null>(null);
+  // 实时（/live）总线对应的会话 id（来自 snapshot）。用于门控实时事件：仅当用户当前
+  // 查看的就是这个实时会话时才把输出渲染进画布——否则用户从侧栏打开了别的历史会话，
+  // 实时输出会串进错误页面、且刷新即消失（刷新会按真实会话重载）。
+  const liveSessionIdRef = useRef<string | null>(null);
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
   // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
@@ -386,21 +393,41 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
 
   // ── Live event handler ──
   function onLiveEvent(e: LiveWireEvent) {
-    switch (e.type) {
-      case 'snapshot': {
-        const loaded = sessionMessagesToDisplay(e.messages);
-        setMessages(loaded.length > 0 ? loaded : []);
-        setHistoryHint(null);
-        // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
-        // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
-        // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
-        if (e.session_id) {
-          activeIdRef.current = e.session_id;
-          loadedForRef.current = e.session_id;
-          onSessionId(e.session_id);
-        }
-        break;
+    // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
+    if (e.type === 'snapshot') {
+      liveSessionIdRef.current = e.session_id || null;
+      const loaded = sessionMessagesToDisplay(e.messages);
+      setMessages(loaded.length > 0 ? loaded : []);
+      setHistoryHint(null);
+      // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
+      if (e.provider) setProvider(e.provider);
+      // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
+      // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
+      // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
+      if (e.session_id) {
+        activeIdRef.current = e.session_id;
+        loadedForRef.current = e.session_id;
+        onSessionId(e.session_id);
       }
+      return;
+    }
+    // 模型切换是进程级（全局），与正在查看哪个会话无关 → 不门控，始终更新下拉框。
+    if (e.type === 'provider') {
+      setProvider(e.provider);
+      return;
+    }
+
+    // 门控：仅当"当前查看的会话"就是实时会话时，才把实时输出渲染进画布。否则用户
+    // 从侧栏打开了另一个历史会话，实时事件不应串进该页面（串进去刷新还会消失）。
+    if (
+      liveSessionIdRef.current &&
+      activeIdRef.current &&
+      activeIdRef.current !== liveSessionIdRef.current
+    ) {
+      return;
+    }
+
+    switch (e.type) {
       case 'user': {
         // Append the peer's user message + empty assistant placeholder
         setMessages((prev) => [
@@ -412,6 +439,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       }
       case 'state': {
         setBusy(e.running);
+        // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
+        // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
+        if (!e.running) setLivePending(null);
         break;
       }
       case 'permission_request': {
@@ -424,6 +454,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       default: {
         const mapped = liveToSSE(e);
         if (mapped) handleEvent(mapped);
+        // 工具结果到达即代表该工具的审批已被处理（本端或对端 TUI 批准后工具已执行），
+        // 清掉与之对应的残留审批卡片（call_id 匹配才清，避免误删尚未处理的其它请求）。
+        if (e.type === 'tool_result') {
+          setLivePending((cur) => resolvePendingAfterDecision(cur, e.id));
+        }
         break;
       }
     }
@@ -523,6 +558,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
           duration_ms: event.duration_ms,
           output: event.output,
         });
+        // 工具已执行完 → 其审批必已解决，清掉 /chat 残留的同 call_id 审批卡片。
+        onPermissionResolved?.(event.id);
         break;
 
       case 'tokens':
@@ -548,17 +585,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
         loadedForRef.current = event.session_id;
         onSessionId(event.session_id);
         setBusy(false);
+        onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         break;
 
       case 'stopped':
         setBusy(false);
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
+        onPermissionResolved?.(null);
         break;
 
       case 'error':
         appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
         setBusy(false);
         setQueued([]); // 出错：丢弃排队消息
+        onPermissionResolved?.(null);
         break;
 
       default:
@@ -609,6 +649,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
       }
       setBusy(false);
       setQueued([]); // 连接错误：与 stopped/error 一致，丢弃排队消息
+      // 中止/连接错误时流被掐断，不会再有 done/stopped 事件 → 兜底清掉审批卡片，
+      // 否则点「停止」时若正挂着审批卡片，它会一直残留。
+      onPermissionResolved?.(null);
     } finally {
       abortRef.current = null;
     }
@@ -1009,7 +1052,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession,
             {(tokens.total / 1000).toFixed(1)}k tokens
           </span>
         )}
-        <ModelSelector value={provider} onChange={setProvider} />
+        <ModelSelector
+          value={provider}
+          onChange={(p) => {
+            setProvider(p);
+            // 同步模式：下拉框一变就通知后端，TUI 头部与其他端实时跟随
+            // （非同步模式只改本端的待发 provider，发消息时再带上）。
+            if (sync) void postLiveProvider(p);
+          }}
+        />
         {busy ? (
           <>
             {/* 执行中仍可发送：按下即排队，当前回合结束后自动发出。 */}

@@ -115,8 +115,8 @@ fn pre_escape_windows_paths_in_json(s: &str) -> String {
     out
 }
 
-/// True iff `s` contains a Windows drive-letter path prefix
-/// (`[A-Za-z]:[\\/]`) appearing in a path-shaped context.
+/// True iff `s` contains an **under-escaped** Windows drive-letter path
+/// prefix (`[A-Za-z]:\` with a *single* backslash) in a path-shaped context.
 ///
 /// Required context: the drive letter is at the start of the body,
 /// or the byte before it is `\` (UNC long-path `\\?\D:\…`), `'`,
@@ -129,6 +129,21 @@ fn pre_escape_windows_paths_in_json(s: &str) -> String {
 /// "preceded-by-alphabetic" guard only ruled out multi-letter
 /// words like `category:\n`; single-letter labels slipped through
 /// and broke `write_file` on common Python sources.
+///
+/// **Single-backslash requirement (the 审核 / Windows-desktop bug).**
+/// Only a *lone* `\` after the colon can mis-decode under `serde_json`
+/// (`D:\test` → `D:<TAB>est`). Two cases must NOT trigger the body
+/// rewrite, because rewriting then doubles every real `\n`/`\t`
+/// elsewhere in the same string:
+/// * `X:/…` forward-slash paths — never escape-ambiguous.
+/// * `X:\\…` already-escaped paths — valid JSON that decodes
+///   correctly. A multi-line `content`/`old_string` blob frequently
+///   *contains* such a path (`excel_path = r'C:\\Users\\…\\文章.xlsx'`)
+///   right next to real `\n` newlines; firing here doubled all of
+///   them and landed a 30-line script on disk as ONE line of literal
+///   backslash-n → broken Python → the agent looped forever trying
+///   to "fix the encoding". Gate on the lone backslash so the
+///   correctly-escaped path leaves the surrounding newlines intact.
 fn looks_like_windows_path(s: &str) -> bool {
     let bytes = s.as_bytes();
     if bytes.len() < 3 {
@@ -141,7 +156,12 @@ fn looks_like_windows_path(s: &str) -> bool {
         if bytes[i + 1] != b':' {
             continue;
         }
-        if bytes[i + 2] != b'\\' && bytes[i + 2] != b'/' {
+        // Only a single backslash is ambiguous. `/` and `\\` decode
+        // correctly already — see the doc note above.
+        if bytes[i + 2] != b'\\' {
+            continue;
+        }
+        if bytes.get(i + 3) == Some(&b'\\') {
             continue;
         }
         // Path-context guard: only accept at start of body, or
@@ -1051,6 +1071,48 @@ mod tests {
             content
         );
         assert_eq!(content, "class A:\n    pass\n");
+    }
+
+    #[test]
+    fn repair_tool_args_content_with_escaped_windows_path_keeps_newlines() {
+        // The Windows "审核" screenshot bug: a write_file whose CONTENT is a
+        // multi-line Python script that *references* a correctly-escaped
+        // Windows path (`C:\\Users\\…`). The path made looks_like_windows_path
+        // fire on the WHOLE content body, and rewrite_windows_path_body then
+        // doubled every real `\n` newline into a literal backslash-n — landing
+        // the 4-line script on disk as ONE line of broken Python (the
+        // `(813 bytes, 1 lines)` in the report), after which `python` exits 1
+        // and the agent loops forever "fixing the encoding".
+        //
+        // Now the gate only fires on UNDER-escaped (single-backslash) drive
+        // paths, so the already-`\\`-escaped path is left alone and the real
+        // newlines survive.
+        let input = r#"{"file_path":"D:\\atomcode\\read_excel.py","content":"import openpyxl\nimport os\nexcel_path = r'C:\\Users\\Administrator\\Desktop\\文章.xlsx'\nprint(os.path.exists(excel_path))\n"}"#;
+        let out = repair_tool_args("write_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let content = v["content"].as_str().unwrap();
+        assert!(
+            content.contains('\n'),
+            "real newlines must survive — file becomes 1-line garbage otherwise: got {:?}",
+            content
+        );
+        assert!(
+            !content.contains("\\n"),
+            "no literal backslash-n must appear: got {:?}",
+            content
+        );
+        // The escaped path must still decode to single backslashes.
+        assert!(
+            content.contains(r"C:\Users\Administrator\Desktop\文章.xlsx"),
+            "embedded Windows path must round-trip: got {:?}",
+            content
+        );
+        assert_eq!(
+            content.lines().count(),
+            4,
+            "should be a 4-line script, not collapsed to 1: got {:?}",
+            content
+        );
     }
 
     #[test]

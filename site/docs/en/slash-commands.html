@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.24.1</span>
+    <span class="dhdr-ver">v4.24.2</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -81,7 +81,7 @@
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/login</code></td><td><strong>Recommended</strong> — one command runs AtomGit OAuth + claims CodingPlan free tokens + auto-configures a provider from the granted model list. The lowest-friction entry point for first-time users; re-running after you're already signed in idempotently re-syncs the model list. <em>As of v4.24.1 <code>/codingplan</code> has been folded into <code>/login</code>; the standalone entry has been removed</em></td></tr>
+          <tr><td><code>/login</code></td><td><strong>Recommended</strong> — one command runs AtomGit OAuth + claims CodingPlan free tokens + auto-configures a provider from the granted model list. The lowest-friction entry point for first-time users; re-running after you're already signed in idempotently re-syncs the model list. <em>As of v4.24.2 <code>/codingplan</code> has been folded into <code>/login</code>; the standalone entry has been removed</em></td></tr>
           <tr><td><code>/resume</code></td><td>Open the session picker to restore any previously persisted session (messages, directory, and model state)</td></tr>
           <tr><td><code>/session</code></td><td>Start a fresh, clean session</td></tr>
           <tr><td><code>/bg</code></td><td>Send the current session to the background and open a new foreground; subcommands: <code>/bg list</code>, <code>/bg &lt;N&gt;</code>, <code>/bg drop &lt;N&gt;</code>, <code>/bg help</code>. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
@@ -99,7 +99,7 @@
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/undo</code></td><td>Roll back every AI file edit from the last turn, using file-history snapshots</td></tr>
+          <tr><td><code>/undo</code> · <code>/undo N</code></td><td>Roll conversation memory back to before the last turn (or turn N) and restore that prompt into the input box; rewinds memory only — does not revert files on disk</td></tr>
           <tr><td><code>/diff</code></td><td>Show the git diff of uncommitted changes in the working directory</td></tr>
           <tr><td><code>/cost</code></td><td>Show output tokens for the current session. APIs without usage reporting are estimated automatically</td></tr>
           <tr><td><code>/context</code></td><td>Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage</td></tr>
@@ -176,7 +176,7 @@
           <tr><th>Command</th><th>What it does</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/webui</code></td><td>Launch the browser interface and open it (binds <code>127.0.0.1:13456</code> by default — local only). The current TUI session is attached to live sync automatically</td></tr>
+          <tr><td><code>/webui</code></td><td>Launch the browser interface and open it (binds <code>127.0.0.1:13457</code> by default — local only). The current TUI session is attached to live sync automatically</td></tr>
           <tr><td><code>/webui --host &lt;addr&gt;</code></td><td>Bind the server to a given address; <code>/webui lan</code> equals <code>--host 0.0.0.0</code> (exposes it to the LAN). Pair with a 蒲公英 virtual IP for remote access — see <a href="./webui-remote-access.html">Remote Access</a></td></tr>
           <tr><td><code>/webui stop</code></td><td>Stop the webui server</td></tr>
           <tr><td><code>/sync</code></td><td>Attach the current TUI to a running webui session (run <code>/webui</code> first). Both ends sync live in both directions; multiple browsers / terminals can watch the same session</td></tr>
@@ -233,11 +233,13 @@ Session token usage
 - Current turn tokens: 2156
 - Context: 42K / 128K</code></pre>
 
-      <h3>Roll back when the result isn't what you wanted</h3>
+      <h3>Rewind and re-ask when the answer goes sideways</h3>
       <pre><code>&gt; add JSDoc to every function
-... (AI edited 12 files)
+... (the reply went off the rails)
 &gt; /undo
-Rolled back 12 file edits from the last turn.</code></pre>
+Rolled back to turn 3 of 3.
+⚠ Only conversation memory was rewound; files on disk were not restored. Revert code manually or check /diff.
+(your last prompt is back in the input box — edit and resend)</code></pre>
 
       <h3>Swap the model when it underperforms</h3>
       <pre><code>&gt; /model

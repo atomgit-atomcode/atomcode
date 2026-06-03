@@ -114,6 +114,11 @@ pub enum AgentCommand {
     /// the session has up-to-date message history even when a turn is
     /// still in progress (e.g. waiting for tool approval).
     SyncMessages,
+    /// Roll conversation memory back to just before the `nth` real user
+    /// prompt (1-based). `None` targets the last prompt (bare `/undo`). The
+    /// agent replies with `AgentEvent::ConversationTruncated` on success or
+    /// `AgentEvent::UndoFailed` when `nth` is out of range.
+    UndoToPrompt { nth: Option<usize> },
     /// Shutdown the agent.
     Shutdown,
 }
@@ -259,6 +264,19 @@ pub enum AgentEvent {
     TurnCancelled {
         messages: Vec<crate::conversation::message::Message>,
     },
+    /// Conversation memory was rolled back by `/undo`. Carries the truncated
+    /// message list (for the TUI to persist + replay), the removed prompt's
+    /// text (to restore into the input box), and turn numbers for the
+    /// confirmation line (`target_n..=prompts_before` were removed).
+    ConversationTruncated {
+        messages: Vec<crate::conversation::message::Message>,
+        restored_prompt: String,
+        target_n: usize,
+        prompts_before: usize,
+    },
+    /// `/undo` could not be honored: `requested` turn is out of range.
+    /// `available` real prompts exist (0 = nothing to undo).
+    UndoFailed { requested: usize, available: usize },
     /// Response to `AgentCommand::SyncMessages`. Carries a snapshot of
     /// `conversation.messages` at the time the agent processed the command.
     /// Used by the TUI to sync session state before backgrounding a session
@@ -394,6 +412,8 @@ pub enum AgentEvent {
     UserEcho(String),
     /// 同步会话的对端正在进行 turn（true=进行中），用于禁用/恢复本端输入。
     PeerBusy(bool),
+    /// 同步会话的另一视图（webui 下拉框）切换了模型。TUI 据此更新头部显示与活动 provider。
+    ProviderChanged(String),
 }
 
 /// The current phase of the agent (for UI display).
@@ -580,6 +600,13 @@ pub struct AgentLoop {
     /// Populated by `refresh_hook_extensions` before calling `build_system_prompt`.
     /// Vec<String> — empty means no extensions. Reset at session start and on reload.
     cached_system_prompt_extensions: Vec<String>,
+
+    /// Session-frozen system prompt (LLM prefix-cache stability — the system
+    /// message is messages[0], so any byte change zeroes the whole cache).
+    /// Built once via `build_system_prompt`, reused verbatim every turn.
+    /// `None` = needs (re)build. Invalidated only at explicit contract
+    /// boundaries: SetPlanMode, ClearConversation, ReloadConfig, change_dir.
+    cached_system_prompt: Option<String>,
 
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
@@ -1024,6 +1051,7 @@ impl AgentLoop {
             reindex_tx: None,
             datalog,
             cached_system_prompt_extensions: Vec::new(),
+            cached_system_prompt: None,
             cmd_rx,
             event_tx,
         };
@@ -1149,6 +1177,9 @@ impl AgentLoop {
                         .get(&old_provider_name)
                         .map(|p| p.provider_type.clone());
                     self.config = new_config;
+                    // Config/instructions/model may have changed → rebuild the
+                    // frozen system prompt on the next turn.
+                    self.cached_system_prompt = None;
                     // Rebuild hook engine from config files.
                     let wd = self
                         .turn_runner
@@ -1241,6 +1272,8 @@ impl AgentLoop {
                     // Clear the conversation history in the agent loop.
                     self.conversation = Conversation::new();
                     self.datalog.clear();
+                    // New session → re-snapshot the system prompt next turn.
+                    self.cached_system_prompt = None;
                     // session_id is NOT reset here: /session pairs this with
                     // a SetSessionId carrying the new session file's id, and
                     // that's the single source of truth for the header.
@@ -1270,8 +1303,47 @@ impl AgentLoop {
                     // logical session into two on the gateway. Only an explicit
                     // fresh start (ClearConversation: /session, /clear) resets.
                 }
+                AgentCommand::UndoToPrompt { nth } => {
+                    let available = self.conversation.prompt_count();
+                    let target = nth.unwrap_or(available);
+                    match self.conversation.undo_to_prompt(target) {
+                        Some(restored_prompt) => {
+                            let _ = self.event_tx.send(AgentEvent::ConversationTruncated {
+                                messages: self.conversation.messages.clone(),
+                                restored_prompt,
+                                target_n: target,
+                                prompts_before: available,
+                            });
+                        }
+                        None => {
+                            let _ = self.event_tx.send(AgentEvent::UndoFailed {
+                                requested: target,
+                                available,
+                            });
+                        }
+                    }
+                }
                 AgentCommand::SetPlanMode(enabled) => {
+                    let changed = self.plan_mode != enabled;
                     self.plan_mode = enabled;
+                    // Plan mode is communicated to the model via a ONE-TIME
+                    // synthetic history message, NOT the system prompt — keeping
+                    // it out of messages[0] is what stops a plan-mode toggle from
+                    // zeroing the whole prefix cache. The read-only tool gating
+                    // (see `use_read_only`) enforces the constraint every turn
+                    // regardless. We do NOT touch cached_system_prompt here.
+                    if changed {
+                        let note = if enabled {
+                            "[PLAN MODE ACTIVATED] You are now in plan mode. Only read-only \
+                             tools are available — you MUST NOT edit, create, or delete any \
+                             files. Explore and analyze the codebase, then present a detailed \
+                             implementation plan for the user to review before making any changes."
+                        } else {
+                            "[PLAN MODE ENDED] Plan mode is off. You may now edit files and \
+                             carry out the plan."
+                        };
+                        self.conversation.add_synthetic_user_message(note);
+                    }
                 }
                 AgentCommand::Compact { prompt } => {
                     self.run_compact(prompt).await;
@@ -1885,6 +1957,13 @@ impl AgentLoop {
             // the prompt guides the model to work efficiently.
 
             // Refresh hook system-prompt extensions before building the prompt.
+            // NOTE: this still runs every turn (unchanged), but once the
+            // session-level system prompt is frozen (see build_system_prompt)
+            // the refreshed value is only consumed on a cold cache — i.e. the
+            // first build and after an explicit invalidation. Keeping the
+            // refresh unconditional avoids an ordering hazard where a
+            // build_system_prompt call on another path (e.g. RefreshContextStats)
+            // could freeze a prompt before SystemPromptHook output was collected.
             self.cached_system_prompt_extensions = self
                 .turn_runner
                 .hook_engine
@@ -2597,7 +2676,16 @@ impl AgentLoop {
                         continue;
                     } else if is_rate_limited && self.retry_count < 5 {
                         self.retry_count += 1;
-                        let wait = (self.retry_count as u64 * 3).min(30);
+                        // 指数退避基线（3/6/9/12/15s）。但若网关在错误体里明确给了冷却
+                        // 时长（如 litellm 的 "No deployments available… Try again in 10
+                        // seconds"），就采纳它——否则更早重试只会打到仍在冷却的部署池，
+                        // 反而再次触发/延长冷却（用户侧表现为"明明有额度却一直 429"）。
+                        // 取二者较大值并封顶 30s。
+                        let computed = (self.retry_count as u64 * 3).min(30);
+                        let wait = parse_retry_after_hint(&e)
+                            .unwrap_or(0)
+                            .max(computed)
+                            .min(30);
                         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
                             "\n[Rate limited — retrying in {}s...]\n",
                             wait
@@ -3527,6 +3615,24 @@ fn is_rate_limited_error(e: &str) -> bool {
         || e.contains("限流")
 }
 
+/// Parse a gateway-suggested cooldown (in seconds) out of a rate-limit error
+/// body, e.g. litellm's `"No deployments available for selected model. Try
+/// again in 10 seconds."` Returns `None` when no explicit hint is present, in
+/// which case the caller falls back to its exponential backoff. ASCII-only
+/// lowercasing keeps byte offsets aligned with the original so the digit slice
+/// is valid even when the message contains earlier multibyte (e.g. Chinese)
+/// text.
+fn parse_retry_after_hint(e: &str) -> Option<u64> {
+    let lower = e.to_ascii_lowercase();
+    let idx = lower.find("try again in ")?;
+    let rest = &e[idx + "try again in ".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
 fn is_auth_error(e: &str) -> bool {
     e.contains("401 ")
         || e.contains("403 ")
@@ -3738,6 +3844,99 @@ mod agent_handle_tests {
         assert_eq!(factory.working_dir, std::path::PathBuf::from("/tmp/new"));
     }
 
+    /// Part-2 regression (system-prompt prefix-cache stability): the system
+    /// prompt is messages[0], so any byte change zeroes the entire prefix
+    /// cache. It must stay byte-identical across turns even when the model
+    /// changes the working directory (the most common mid-session mutation).
+    /// Only an explicit cache invalidation (plan-mode toggle, /clear, reload,
+    /// /cd) may rebuild it.
+    #[tokio::test]
+    async fn system_prompt_is_frozen_across_model_cwd_change() {
+        let old_wd =
+            std::path::PathBuf::from(format!("/tmp/atomcode_sysfreeze_old_{}", std::process::id()));
+        let new_wd =
+            std::path::PathBuf::from(format!("/tmp/atomcode_sysfreeze_new_{}", std::process::id()));
+
+        let tool_context = crate::tool::ToolContext::new(old_wd.clone());
+        let (mut loop_, _handle) = super::AgentLoop::new_with_shared_parts(
+            crate::config::Config::default(),
+            crate::provider::unavailable_provider("test"),
+            std::sync::Arc::new(crate::tool::ToolRegistry::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+            Some("test".to_string()),
+            tool_context,
+            crate::conversation::Conversation::new(),
+        );
+
+        // Turn 1: build + freeze.
+        let sys1 = loop_.build_system_prompt();
+        assert!(
+            sys1.contains(&old_wd.display().to_string()),
+            "sanity: the working directory IS interpolated into the system prompt"
+        );
+
+        // Model runs its `cd` tool — writes working_dir directly, exactly like
+        // tool/cd.rs / tool/bash.rs do (does NOT go through change_dir).
+        *loop_.turn_runner.context.working_dir.write().await = new_wd.clone();
+
+        // Turn 2+: system prompt MUST be byte-identical despite the cwd change.
+        let sys2 = loop_.build_system_prompt();
+        assert_eq!(
+            sys1, sys2,
+            "system prompt must be frozen across a model cwd change (prefix cache)"
+        );
+        assert!(
+            !sys2.contains(&new_wd.display().to_string()),
+            "the frozen prompt must NOT pick up the new cwd"
+        );
+
+        // Explicit boundary: invalidating the cache (as plan-mode toggle,
+        // /clear, reload, or /cd do) rebuilds and DOES reflect the new cwd —
+        // proving the freeze above was real, not a coincidence.
+        loop_.cached_system_prompt = None;
+        let sys3 = loop_.build_system_prompt();
+        assert_ne!(sys1, sys3, "after invalidation the prompt should rebuild");
+        assert!(
+            sys3.contains(&new_wd.display().to_string()),
+            "the rebuilt prompt should reflect the new cwd"
+        );
+    }
+
+    /// Part-2 (systemA): plan mode must NOT live in the system prompt. Toggling
+    /// it would otherwise rewrite messages[0] and zero the prefix cache. It's
+    /// announced via a synthetic history message instead (see SetPlanMode) and
+    /// enforced by read-only tool gating.
+    #[tokio::test]
+    async fn plan_mode_is_not_in_system_prompt() {
+        let wd = std::path::PathBuf::from(format!("/tmp/atomcode_planmode_{}", std::process::id()));
+        let (mut loop_, _handle) = super::AgentLoop::new_with_shared_parts(
+            crate::config::Config::default(),
+            crate::provider::unavailable_provider("test"),
+            std::sync::Arc::new(crate::tool::ToolRegistry::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+            Some("test".to_string()),
+            crate::tool::ToolContext::new(wd),
+            crate::conversation::Conversation::new(),
+        );
+
+        loop_.plan_mode = false;
+        let sys_off = loop_.build_system_prompt();
+
+        // Toggle plan mode ON and rebuild from a cold cache.
+        loop_.cached_system_prompt = None;
+        loop_.plan_mode = true;
+        let sys_on = loop_.build_system_prompt();
+
+        assert!(
+            !sys_on.contains("PLAN MODE"),
+            "plan mode must NOT appear in the system prompt"
+        );
+        assert_eq!(
+            sys_off, sys_on,
+            "plan_mode must not change the system prompt at all (it's frozen; mode rides in history)"
+        );
+    }
+
     #[test]
     fn cloned_runtime_factories_allocate_unique_labels() {
         let factory = AgentRuntimeFactory::new_for_test(
@@ -3757,8 +3956,8 @@ mod agent_handle_tests {
 mod classifier_tests {
     use super::{
         extract_provider_ctx_limit, is_auth_error, is_codingplan_unavailable_error,
-        is_context_overflow_error, is_rate_limited_error, public_error_message,
-        public_error_reason, reload_should_clear_conversation,
+        is_context_overflow_error, is_rate_limited_error, parse_retry_after_hint,
+        public_error_message, public_error_reason, reload_should_clear_conversation,
     };
 
     // ── reload_should_clear_conversation ──
@@ -4170,6 +4369,25 @@ mod classifier_tests {
         // (which is generic Chinese "try again later").
         assert!(!is_rate_limited_error("请稍后再试"));
         assert!(!is_rate_limited_error("API error (500 Internal Server Error)"));
+    }
+
+    #[test]
+    fn retry_after_hint_parsed_from_litellm_no_deployments_body() {
+        // The exact shape elegant001 hit: litellm "No deployments available"
+        // with an embedded cooldown hint. The retry must honour the 10s so it
+        // doesn't hammer the still-cold pool at 3s.
+        let e = "[429] No deployments available for selected model, Try again in 10 seconds. \
+                 Passed model=deepseek-v4-flash. pre-call-checks=True, cooldown_list=['b5cb...']";
+        assert_eq!(parse_retry_after_hint(e), Some(10));
+        // Capital-T phrasing + a multibyte prefix must still parse (byte offsets
+        // stay aligned under ASCII-only lowercasing).
+        assert_eq!(
+            parse_retry_after_hint("模型繁忙：Try again in 30 seconds."),
+            Some(30)
+        );
+        // No hint → None (caller keeps its exponential backoff).
+        assert_eq!(parse_retry_after_hint("429 Too Many Requests"), None);
+        assert_eq!(parse_retry_after_hint("try again in soon"), None);
     }
 
     #[test]

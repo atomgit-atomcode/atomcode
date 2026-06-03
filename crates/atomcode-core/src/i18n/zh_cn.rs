@@ -399,6 +399,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("重载失败：{error}（保留先前配置）").into(),
         Msg::CmdUndoNotSupported =>
             "  撤销功能暂不支持。\n".into(),
+        Msg::CmdUndoDone { target, last } =>
+            format!("  ↩ 已退回到第 {target} 轮之前（删除第 {target}~{last} 轮）。你的提示词已填回输入框。\n").into(),
+        Msg::CmdUndoDiskWarning =>
+            "  ⚠ 仅回滚了对话记忆，磁盘文件未恢复。如需还原代码，请手动处理或用 /diff 查看。\n".into(),
+        Msg::CmdUndoNoTurns =>
+            "  没有可撤销的轮次。\n".into(),
+        Msg::CmdUndoOutOfRange { requested, available } =>
+            format!("  无效的轮次 {requested}（当前共 {available} 轮）。\n").into(),
+        Msg::CmdUndoBusy =>
+            "  当前回合进行中，无法撤销——请先按 Esc 取消。\n".into(),
+        Msg::CmdUndoBadArg =>
+            "  用法：/undo 或 /undo N（N 为轮次号）。\n".into(),
         Msg::CmdNoChanges =>
             "  （无变更）\n".into(),
         Msg::CmdCheckingUpdate =>
@@ -712,6 +724,14 @@ Msg::PluginMgrInstallingLabel => "安装中…".into(),
         Msg::PluginMgrEmptyInstalled => "暂无已安装插件。".into(),
         Msg::PluginMgrCloning => "正在克隆市场…".into(),
         Msg::PluginMgrInstalling { plugin } => format!("正在安装 {plugin}…").into(),
+Msg::PluginMgrEscToCancel => "Esc 取消".into(),
+Msg::PluginScopeUser => "为你安装（用户级）".into(),
+Msg::PluginScopeUserDesc => "~/.atomcode/plugins — 所有项目可见".into(),
+Msg::PluginScopeProject => "为所有协作者安装（项目级）".into(),
+Msg::PluginScopeProjectDesc => ".atomcode/plugins — 通过 git 共享".into(),
+Msg::PluginScopeLocal => "仅在本仓库为你安装（本地级）".into(),
+Msg::PluginScopeLocalDesc => ".atomcode/plugins/local — 不提交到 git".into(),
+Msg::PluginScopeHint => "↑↓ 选择范围 · Enter 确认 · Esc 返回".into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("已卸载 `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
@@ -761,7 +781,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescForget => "删除匹配的记忆".into(),
         Msg::CmdDescMemory => "显示所有已保存的记忆".into(),
         Msg::CmdDescMcp => "显示 MCP 服务器状态（子命令：reload）".into(),
-        Msg::CmdDescUndo => "撤销上次变更（暂不支持）".into(),
+        Msg::CmdDescUndo => "撤销：把对话记忆回退一轮（/undo 或 /undo N）".into(),
         Msg::CmdDescWorktree => "Git 工作树隔离（create/list/done/cleanup）".into(),
         Msg::CmdDescUpgrade => "升级到最新版本（子命令：rollback）".into(),
         Msg::CmdDescIssue => "为 AtomCode 报告 Bug / 提出功能建议（交互式向导）".into(),

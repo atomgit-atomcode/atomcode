@@ -547,8 +547,8 @@ enum Commands {
     },
     /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
     Webui {
-        /// 端口（默认 13456）
-        #[arg(long, default_value = "13456")]
+        /// 端口（默认 13457，刻意错开 VSCode 守护进程的 13456，避免抢端口导致扩展 401/无响应）
+        #[arg(long, default_value_t = atomcode_daemon::WEBUI_DEFAULT_PORT)]
         port: u16,
         /// 绑定地址（默认 127.0.0.1；用 0.0.0.0 暴露到局域网/外网，注意仅 token 保护、无 TLS）
         #[arg(long, default_value = "127.0.0.1")]
@@ -881,7 +881,9 @@ async fn run() -> Result<i32> {
     install_panic_hook(telemetry.clone());
 
     // Emit install_completed if this is the first launch after a referral install
-    telemetry.maybe_emit_install_completed(&resolved.atomcode_dir);
+    telemetry
+        .maybe_emit_install_completed(&resolved.atomcode_dir)
+        .await;
     // ── End telemetry init ────────────────────────────────────────────────────
 
     // Handle subcommands. Most are self-contained (`handle_command` runs
@@ -1981,10 +1983,14 @@ async fn run_headless(
                     vl_key, char_count
                 );
             }
-            AgentEvent::MessagesSync { .. } => {
-                // Only used by TUI for /bg session persistence; ignore in CLI.
+            AgentEvent::ConversationTruncated { .. }
+            | AgentEvent::UndoFailed { .. }
+            | AgentEvent::MessagesSync { .. } => {
+                // Only used by TUI for /bg or /undo; ignore in headless CLI.
             }
-            AgentEvent::UserEcho(_) | AgentEvent::PeerBusy(_) => {
+            AgentEvent::UserEcho(_)
+            | AgentEvent::PeerBusy(_)
+            | AgentEvent::ProviderChanged(_) => {
                 // Live-sync only — not applicable in headless CLI.
             }
         }
@@ -2382,14 +2388,14 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
         }
         PluginCli::Install { spec } => {
             let (plugin, mp) = parse_plugin_spec(&spec)?;
-            let info = installer::install(&plugin, &mp)
+            let info = installer::install(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
                 .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
             println!("  installed `{}@{}`", info.plugin, info.marketplace);
             Ok(())
         }
         PluginCli::Uninstall { spec } => {
             let (plugin, mp) = parse_plugin_spec(&spec)?;
-            installer::uninstall(&plugin, &mp)
+            installer::uninstall(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
                 .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
             println!("  uninstalled `{}@{}`", plugin, mp);
             Ok(())

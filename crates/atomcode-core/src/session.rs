@@ -41,6 +41,32 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+/// Per-turn summary stats, recorded at each completed turn so `/resume` can
+/// re-render the same `✓ … 工具 · tokens` divider the live turn showed
+/// (token/duration are otherwise lost — only `messages` is persisted).
+///
+/// `after_message` anchors the divider to a position in `messages`: it is the
+/// conversation message count at the moment the turn completed, so on replay
+/// the divider is emitted right after that many messages have been rendered.
+/// Anchoring by count (rather than a turn ordinal) stays correct even if some
+/// turns were cancelled and produced no stat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnStat {
+    /// Number of messages in the conversation when this turn completed.
+    pub after_message: usize,
+    /// LLM round-trips in the turn.
+    pub turn_count: usize,
+    /// Tool calls executed in the turn.
+    pub tool_call_count: usize,
+    /// Wall-clock duration of the turn, milliseconds.
+    pub duration_ms: u64,
+    /// Total tokens the turn consumed.
+    pub total_tokens: usize,
+    /// The turn ended in an error (render the ✗ "stopped" variant).
+    #[serde(default)]
+    pub errored: bool,
+}
+
 /// A session represents an independent conversation context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -65,6 +91,12 @@ pub struct Session {
     /// load as `false` (i.e., behave like auto-named).
     #[serde(default)]
     pub user_renamed: bool,
+    /// Per-turn summary stats (one per completed turn), so `/resume` can
+    /// re-render the `✓ … 工具 · tokens` divider between turns. `#[serde(default)]`
+    /// keeps sessions saved before this field loading — they replay with plain
+    /// inter-turn dividers (no stats numbers) instead.
+    #[serde(default)]
+    pub turn_stats: Vec<TurnStat>,
 }
 
 impl Session {
@@ -79,6 +111,7 @@ impl Session {
             updated_at: now,
             messages: Vec::new(),
             user_renamed: false,
+            turn_stats: Vec::new(),
         }
     }
 
@@ -92,6 +125,7 @@ impl Session {
             updated_at: current_timestamp(),
             messages: Vec::new(),
             user_renamed: false,
+            turn_stats: Vec::new(),
         }
     }
 
@@ -436,6 +470,31 @@ mod tests {
         let id1 = SessionId::new();
         let id2 = SessionId::new();
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn turn_stats_round_trip_and_default_empty_for_old_sessions() {
+        let mut s = Session::new(PathBuf::from("/tmp/x"));
+        s.turn_stats.push(TurnStat {
+            after_message: 4,
+            turn_count: 3,
+            tool_call_count: 5,
+            duration_ms: 6800,
+            total_tokens: 1651,
+            errored: false,
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.turn_stats.len(), 1);
+        assert_eq!(back.turn_stats[0].after_message, 4);
+        assert_eq!(back.turn_stats[0].total_tokens, 1651);
+
+        // A session saved before this field existed (no `turn_stats` key) must
+        // still load — `#[serde(default)]` → empty vec, replay falls back to
+        // plain dividers.
+        let old = r#"{"id":"abc","name":"x","working_dir":"/tmp/x","created_at":0,"updated_at":0,"messages":[]}"#;
+        let loaded: Session = serde_json::from_str(old).unwrap();
+        assert!(loaded.turn_stats.is_empty());
     }
 
     #[test]

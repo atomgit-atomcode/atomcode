@@ -208,7 +208,7 @@ fn install_plugins_from_marketplace(
     plugins: &[String],
 ) {
     for plugin in plugins {
-        match install(plugin, mp_name) {
+        match install(plugin, mp_name, super::state::InstallScope::User) {
             Ok(pi) => {
                 eprintln!(
                     "  ✓ Installed plugin `{}@{}` from marketplace `{mp_name}`.",

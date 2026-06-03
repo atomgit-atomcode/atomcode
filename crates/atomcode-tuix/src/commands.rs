@@ -100,7 +100,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "forget", desc: "Remove matching memories", needs_args: true },
     Command { name: "memory", desc: "Show all saved memories", needs_args: false },
     Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout)", needs_args: false },
-    Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
+    Command { name: "undo",    desc: "Undo a turn (memory rollback): /undo or /undo N", needs_args: true },
     Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
     Command { name: "issue",   desc: "Report a bug / request a feature for AtomCode itself (interactive wizard)", needs_args: false },

@@ -13,6 +13,8 @@ mod api_provider;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
+pub use live_api::ensure_live_session_seeded;
+pub use live_api::live_set_provider;
 mod telemetry_scope;
 pub mod auth_token;
 pub mod permission_bridge;
@@ -830,6 +832,7 @@ async fn activity_tracker_middleware(
 fn resolve_client_mode(header: &str) -> SessionMode {
     match header {
         "vscode" => SessionMode::Vscode,
+        "webui" => SessionMode::Webui,
         "atomcode-air" => SessionMode::AtomcodeAir,
         _ => SessionMode::Ide,
     }
@@ -3037,6 +3040,16 @@ fn primary_lan_ipv4() -> Option<String> {
     }
 }
 
+/// 进程内 webui server 的默认端口。**刻意区别于独立守护进程的 13456**。
+///
+/// 进程内 webui（TUI `/webui`、`atomcode webui`）以 `enforce_token=true` 启动，而
+/// VSCode 扩展自带的守护进程以 `enforce_token=false`（不带 token）在 13456 上工作。
+/// 二者若共用 13456，会互相踩端口：webui 抢到后，VSCode 的 `/project`、`/models`、
+/// `/chat` 乃至 `/shutdown` 都会因缺 token 返回 401，扩展既用不了也停不掉它，表现为
+/// “daemon started but not responding”。让 webui 默认错开到 13457 即可彻底分离
+/// （webui 的访问 URL 是生成的，端口号对用户无感；被占时仍会向上扫描）。
+pub const WEBUI_DEFAULT_PORT: u16 = 13457;
+
 /// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token，开浏览器。
 ///
 /// 返回给用户展示的状态串。在 `atomcode` 主程序（已有 tokio runtime）内调用。
@@ -3078,8 +3091,11 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
             // 0 = 关闭 idle 看门狗（见 spawn_idle_timeout_task：idle_timeout_secs==0 直接 return）。
             // 进程内 webui 应随主程序常驻，不能自行 idle 关停。
             idle_timeout_secs: 0,
-            // 与 parse_daemon_args 的默认 client mode 一致（无 --client 标志时为 Ide）。
-            startup_mode: SessionMode::Ide,
+            // 进程内 webui（TUI `/webui`、`atomcode webui`）的会话开启事件应归因到 webui，
+            // 而非 parse_daemon_args 的默认 Ide。run_server 启动时据此发 OpenAtomcode{mode:webui}，
+            // 让"webui 会话开启数"可被统计——逐请求的 X-AtomCode-Client 头只覆盖会话内事件，
+            // 覆盖不到会话级的 open。宿主进程（TUI/CLI）自身的 OpenAtomcode 早已单独上报，互不影响。
+            startup_mode: SessionMode::Webui,
             // 传入同一 store：server 进入 webui 模式（enforce_token=true）并用它校验 token。
             webui_tokens: Some(tokens.clone()),
             // 进程内启动：抑制启动横幅，避免污染 TUI 画面。
@@ -3548,10 +3564,14 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     }
 
     // Step 4: Initialize telemetry runtime (R1.3, R1.6)
+    let atomcode_dir = resolved.atomcode_dir.clone();
     let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
 
     // Step 4.5: Install panic hook (R9.1, R9.2, R9.3, R9.4)
     install_panic_hook(telemetry.clone());
+
+    // Emit install_completed when daemon/webui is the first post-install entrypoint.
+    telemetry.maybe_emit_install_completed(&atomcode_dir).await;
 
     // Step 5: Precompute repo_origin (R4.2)
     // Use the project working directory (from config or cwd) rather than the
@@ -3632,6 +3652,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live", get(live_api::live_stream))
         .route("/live/message", post(live_api::live_message))
         .route("/live/permission", post(live_api::live_permission))
+        .route("/live/provider", post(live_api::live_provider))
         // Skills API
         .route("/skills", get(get_skills))
         // Filesystem API

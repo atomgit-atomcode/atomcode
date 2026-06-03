@@ -15,9 +15,12 @@
 // when they finish so the modal can refresh its lists. Fast ops (uninstall,
 // remove marketplace) run inline and refresh immediately.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use atomcode_core::plugin::installer::InstalledPluginInfo;
 use atomcode_core::plugin::marketplace::MarketplaceInfo;
+use atomcode_core::plugin::InstallScope;
 use atomcode_core::plugin::PluginJobEvent;
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -35,6 +38,11 @@ enum Screen {
     AddUrl,
     RemoveMarketplace,
     Installed,
+    /// Scope selection — shown before installing a plugin.
+    ScopeSelect { plugin: String, mp: String },
+    /// Installing in progress — shown after scope is selected.
+    /// Waits for async install to complete; Esc cancels.
+    Installing { plugin: String, mp: String },
 }
 
 pub struct PluginManager {
@@ -50,6 +58,13 @@ pub struct PluginManager {
     /// The plugin name currently being installed (used to show ⏳ in the
     /// list). Cleared together with `pending` in `on_plugin_event`.
     installing_plugin: Option<String>,
+    /// Canonical plugin ids (`plugin@marketplace`) for installs that were
+    /// cancelled by the user pressing Esc while on the `Installing` screen.
+    /// When the background install job completes, `on_plugin_event` checks
+    /// this set: if the plugin id is present, the install is rolled back
+    /// (uninstalled) automatically so the filesystem is not left in an
+    /// inconsistent state.
+    cancelled_installs: HashSet<String>,
 }
 
 /// Path-safe segment, mirroring `marketplace::sanitize_name` (which is crate
@@ -74,6 +89,7 @@ impl PluginManager {
             url_input: String::new(),
             pending: None,
             installing_plugin: None,
+            cancelled_installs: HashSet::new(),
         };
         m.reload();
         m
@@ -99,6 +115,8 @@ impl PluginManager {
             Screen::Plugins { mp } => self.plugins_of(mp).map(|p| p.len()).unwrap_or(0),
             Screen::Installed => self.installed.len(),
             Screen::AddUrl => 0,
+            Screen::ScopeSelect { .. } => 3, // user / project / local
+            Screen::Installing { .. } => 0, // No selectable rows — just status text
         }
     }
 
@@ -123,12 +141,12 @@ impl PluginManager {
 
     // ─── Async dispatch (clone-heavy ops) ───
 
-    fn dispatch_install(&mut self, plugin: String, mp: String, ctx: &LoopCtx) {
+    fn dispatch_install(&mut self, plugin: String, mp: String, scope: InstallScope, ctx: &LoopCtx) {
         let tx = ctx.plugin_job_tx.clone();
         self.installing_plugin = Some(plugin.clone());
         self.pending = Some(t(Msg::PluginMgrInstalling { plugin: &plugin }).into_owned());
         tokio::task::spawn_blocking(move || {
-            let ev = match atomcode_core::plugin::installer::install(&plugin, &mp) {
+            let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
                 Ok(info) => PluginJobEvent::PluginInstalled(info),
                 Err(e) => {
                     if let Some(aie) = e
@@ -186,7 +204,18 @@ impl PluginManager {
         };
         if self.is_installed(&plugin, &mp) {
             // Uninstall is fast — run inline and refresh.
-            match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
+            // Look up the actual scope of the installed plugin so we
+            // uninstall from the right location (User / Project / Local).
+            let key = sanitize(&plugin);
+            let scope = self
+                .installed
+                .iter()
+                .find(|i| {
+                    i.marketplace == mp && (i.plugin == plugin || i.plugin == key)
+                })
+                .map(|i| i.scope.clone())
+                .unwrap_or(InstallScope::User);
+            match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
                 Ok(()) => {
                     reload_plugins(ctx);
                     renderer.render(UiLine::CommandOutput(
@@ -201,8 +230,26 @@ impl PluginManager {
             }
             renderer.flush();
         } else {
-            self.dispatch_install(plugin, mp, ctx);
+            // Show scope selection instead of installing directly.
+            self.goto(Screen::ScopeSelect { plugin, mp });
         }
+    }
+
+    fn enter_scope_select(&mut self, ctx: &LoopCtx) {
+        let Screen::ScopeSelect { plugin, mp } = &self.screen else { return };
+        let (plugin, mp) = (plugin.clone(), mp.clone());
+        let scope = match self.selected {
+            0 => InstallScope::User,
+            1 => InstallScope::Project,
+            2 => InstallScope::Local,
+            _ => return,
+        };
+        self.dispatch_install(plugin.clone(), mp.clone(), scope, ctx);
+        // Stay on an Installing screen so the user sees the progress state,
+        // mirroring Claude Code's UX.  on_plugin_event will navigate back
+        // to the Plugins list once the job completes.
+        self.screen = Screen::Installing { plugin, mp };
+        self.selected = 0;
     }
 
     fn enter_remove(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
@@ -223,8 +270,8 @@ impl PluginManager {
 
     fn enter_installed(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
         let Some(i) = self.installed.get(self.selected) else { return };
-        let (plugin, mp) = (i.plugin.clone(), i.marketplace.clone());
-        match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
+        let (plugin, mp, scope) = (i.plugin.clone(), i.marketplace.clone(), i.scope.clone());
+        match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
             Ok(()) => {
                 reload_plugins(ctx);
                 renderer.render(UiLine::CommandOutput(
@@ -317,11 +364,34 @@ impl PluginManager {
                 let rows = self
                     .installed
                     .iter()
-                    .map(|i| (i.plugin.clone(), format!("@{}", i.marketplace)))
+                    .map(|i| {
+                        let scope_label = match i.scope {
+                            InstallScope::User => String::new(),
+                            InstallScope::Project => " [project]".into(),
+                            InstallScope::Local => " [local]".into(),
+                        };
+                        (format!("{}{}", i.plugin, scope_label), format!("@{}", i.marketplace))
+                    })
                     .collect();
                 (rows, t(Msg::PluginMgrHintUninstall).into_owned())
             }
             Screen::AddUrl => (Vec::new(), t(Msg::PluginMgrHintUrl).into_owned()),
+            Screen::ScopeSelect { .. } => {
+                let rows = vec![
+                    (t(Msg::PluginScopeUser).into_owned(), t(Msg::PluginScopeUserDesc).into_owned()),
+                    (t(Msg::PluginScopeProject).into_owned(), t(Msg::PluginScopeProjectDesc).into_owned()),
+                    (t(Msg::PluginScopeLocal).into_owned(), t(Msg::PluginScopeLocalDesc).into_owned()),
+                ];
+                (rows, t(Msg::PluginScopeHint).into_owned())
+            }
+            Screen::Installing { plugin, .. } => {
+                let hint = format!(
+                    "{} ({})",
+                    t(Msg::PluginMgrInstalling { plugin }),
+                    t(Msg::PluginMgrEscToCancel)
+                );
+                (Vec::new(), hint)
+            }
         }
     }
 }
@@ -377,7 +447,27 @@ impl Modal for PluginManager {
                 if matches!(self.screen, Screen::Home) {
                     return Ok(ModalAction::Close);
                 }
-                self.goto(Screen::Home);
+                match &self.screen {
+                    Screen::ScopeSelect { plugin: _, mp } => {
+                        // Scope select → go back to Plugins list.
+                        let mp = mp.clone();
+                        self.goto(Screen::Plugins { mp });
+                    }
+                    Screen::Installing { plugin, mp } => {
+                        // Mark the install as cancelled so that when the
+                        // background job completes, on_plugin_event rolls
+                        // it back automatically.
+                        let id = format!("{}@{}", sanitize(plugin), mp);
+                        self.cancelled_installs.insert(id);
+                        self.pending = None;
+                        self.installing_plugin = None;
+                        let mp = mp.clone();
+                        self.goto(Screen::Plugins { mp });
+                    }
+                    _ => {
+                        self.goto(Screen::Home);
+                    }
+                }
             }
             KeyCode::Enter => {
                 // Block Enter while an async install/clone is in flight
@@ -389,6 +479,10 @@ impl Modal for PluginManager {
                         Screen::Home => self.enter_home(),
                         Screen::Browse => self.enter_browse(),
                         Screen::Plugins { .. } => self.enter_plugins(ctx, renderer),
+                        Screen::ScopeSelect { .. } => self.enter_scope_select(ctx),
+                        Screen::Installing { .. } => {
+                            // No-op: already installing, Enter does nothing.
+                        }
                         Screen::RemoveMarketplace => self.enter_remove(ctx, renderer),
                         Screen::Installed => self.enter_installed(ctx, renderer),
                         Screen::AddUrl => {}
@@ -405,9 +499,12 @@ impl Modal for PluginManager {
         let (items, hint) = self.rows();
         // Status row: show a pending spinner-ish note if a job is in flight,
         // otherwise the navigation hint for this screen.
-        let hint = match &self.pending {
-            Some(p) => p.clone(),
-            None => hint,
+        let hint = match &self.screen {
+            Screen::Installing { .. } => hint,
+            _ => match &self.pending {
+                Some(p) => p.clone(),
+                None => hint,
+            },
         };
         // The hint rides as the last (non-selectable) menu row's label so it
         // is visible under the list without a dedicated widget.
@@ -415,7 +512,9 @@ impl Modal for PluginManager {
         items.push((format!("— {} —", hint), String::new()));
         let selectable = self.current_len();
         let selected = if selectable == 0 {
-            items.len().saturating_sub(1)
+            // No items are selectable, so nothing should be highlighted.
+            // Using an out-of-bounds index (like items.len()) ensures that.
+            items.len()
         } else {
             self.selected.min(selectable.saturating_sub(1))
         };
@@ -455,10 +554,37 @@ impl Modal for PluginManager {
         Ok(ModalAction::Continue)
     }
 
-    fn on_plugin_event(&mut self, _ev: &PluginJobEvent) {
+    fn on_plugin_event(&mut self, ev: &PluginJobEvent) {
         self.pending = None;
         self.installing_plugin = None;
+
+        // If a cancelled install completed successfully, roll it back
+        // (uninstall) so the filesystem is not left in an inconsistent
+        // state.  This handles the race where the user presses Esc while
+        // a git clone is still in flight: the clone finishes and updates
+        // installed_plugins.json, but the user already expressed intent to
+        // cancel.
+        if let PluginJobEvent::PluginInstalled(info) = ev {
+            let id = format!("{}@{}", info.plugin, info.marketplace);
+            if self.cancelled_installs.take(&id).is_some() {
+                // Best-effort rollback — if this fails the stale dir
+                // cleanup logic in install_external will handle it on
+                // the next install attempt.
+                let _ = atomcode_core::plugin::installer::uninstall(
+                    &info.plugin,
+                    &info.marketplace,
+                    info.scope.clone(),
+                );
+            }
+        }
+
         self.reload();
+        // If we were on the Installing screen, navigate back to the
+        // Plugins list so the user sees the updated installed state.
+        if let Screen::Installing { mp, .. } = &self.screen {
+            let mp = mp.clone();
+            self.goto(Screen::Plugins { mp });
+        }
     }
 }
 
@@ -480,6 +606,7 @@ mod tests {
             plugin: plugin.to_string(),
             marketplace: mp.to_string(),
             plugin_dir: format!("installed/{}/{}", mp, plugin),
+            scope: InstallScope::User,
         }
     }
 
@@ -492,6 +619,7 @@ mod tests {
             url_input: String::new(),
             pending: None,
             installing_plugin: None,
+            cancelled_installs: HashSet::new(),
         }
     }
 
@@ -555,5 +683,36 @@ mod tests {
         assert_eq!(m.url_input, "git");
         m.url_input.pop();
         assert_eq!(m.url_input, "gi");
+    }
+
+    #[test]
+    fn scope_select_has_three_rows() {
+        let m = manager(vec![], vec![]);
+        let mut m2 = m;
+        m2.goto(Screen::ScopeSelect { plugin: "test".into(), mp: "mp".into() });
+        assert_eq!(m2.current_len(), 3);
+    }
+
+    #[test]
+    fn scope_select_rows_have_labels() {
+        let mut m = manager(vec![], vec![]);
+        m.goto(Screen::ScopeSelect { plugin: "test".into(), mp: "mp".into() });
+        let (rows, _hint) = m.rows();
+        assert_eq!(rows.len(), 3);
+        // Each row should have a non-empty label and description.
+        for (label, desc) in &rows {
+            assert!(!label.is_empty());
+            assert!(!desc.is_empty());
+        }
+    }
+
+    #[test]
+    fn installing_screen_has_no_rows_and_carries_hint() {
+        let mut m = manager(vec![], vec![]);
+        m.goto(Screen::Installing { plugin: "discrawl".into(), mp: "mp".into() });
+        let (rows, hint) = m.rows();
+        assert!(rows.is_empty());
+        assert!(hint.contains("discrawl"));
+        assert!(hint.contains("Esc"));
     }
 }

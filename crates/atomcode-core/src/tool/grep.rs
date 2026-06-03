@@ -298,14 +298,20 @@ fn grep_walk(
 
         let file_path = entry.path();
 
-        // Skip known noise directories/files not covered by .gitignore
-        let path_str = file_path.to_string_lossy();
-        if path_str.contains("/datalog/")
-            || path_str.ends_with(".log")
-            || path_str.contains("/target/")
-            || path_str.contains("/dist/")
-            || path_str.contains("/node_modules/")
-        {
+        // Skip known noise directories/files not covered by .gitignore.
+        // Use component-based checks instead of string contains so the logic
+        // works correctly on Windows (backslash separators) as well as Unix.
+        let is_noise_dir = file_path.components().any(|c| {
+            matches!(c, std::path::Component::Normal(name) if {
+                let name = name.to_string_lossy();
+                name == "datalog" || name == "target" || name == "dist" || name == "node_modules"
+            })
+        });
+        let is_log_file = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map_or(false, |e| e.eq_ignore_ascii_case("log"));
+        if is_noise_dir || is_log_file {
             continue;
         }
 

@@ -3353,7 +3353,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &app.buf);
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -3749,7 +3749,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &app.buf);
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -3936,6 +3936,53 @@ fn attach_image_to_input(
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     }
     Ok(true)
+}
+
+/// Submit-time image-path recognition.
+///
+/// `try_attach_image_from_path` only runs on `InputEvent::Paste`. Paths that
+/// arrive as plain keystrokes never hit that branch: a user typing the path,
+/// or — the common case — a Windows paste that conhost / Windows Terminal
+/// delivers as individual key events instead of a bracketed paste. Those would
+/// otherwise be sent to the model as a literal path string, leaving it to
+/// fumble with `OpenFile` / `Bash dir` / base64 to read the bytes.
+///
+/// Scan the outgoing `text` for whitespace-separated tokens that resolve to a
+/// real local image file (same strict checks as the paste path: absolute +
+/// known image extension + existing file ≤ `MAX_PATH_IMAGE_BYTES`), read them
+/// as image attachments, and replace the path token with an `[Image #N]`
+/// marker so the payload matches the paste/drag flow. No-op when the model
+/// can't take images — the path is left as text for the model to handle.
+fn attach_typed_image_paths(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    text: &mut String,
+    images: &mut Vec<ImagePart>,
+    kept_markers: &mut Vec<usize>,
+) {
+    if !ctx.config.can_handle_attached_images() {
+        return;
+    }
+    // Snapshot tokens before mutating `text`. The `/` `\` pre-filter avoids a
+    // filesystem stat on every word of a long message — an absolute path
+    // always carries a separator.
+    let tokens: Vec<String> = text
+        .split_whitespace()
+        .filter(|t| t.contains('/') || t.contains('\\'))
+        .map(str::to_string)
+        .collect();
+    for tok in tokens {
+        let Some((img, _hash)) = try_attach_image_from_path(&tok) else {
+            continue;
+        };
+        app.state.session_image_count += 1;
+        let n = app.state.session_image_count;
+        *text = text.replacen(&tok, &format!("[Image #{}]", n), 1);
+        renderer.render(UiLine::ImageAttachment(n));
+        images.push(img);
+        kept_markers.push(n);
+    }
 }
 
 /// `/paste` slash-command handler. Exists for Windows users whose
@@ -5155,7 +5202,7 @@ fn handle_idle_key(
                 if ctx.sync_session.is_none() {
                     renderer.render(UiLine::User(line.clone()));
                 }
-                let expanded = app.buf.expand_pastes(&line);
+                let mut expanded = app.buf.expand_pastes(&line);
                 // Pastes have now been substituted into `expanded`;
                 // safe to drop the registry. Doing it any earlier
                 // (e.g. up at the buf.text.clear() prep) was the
@@ -5200,6 +5247,21 @@ fn handle_idle_key(
                         kept_markers.push(n);
                     }
                 }
+                // Recognize bare image paths that were typed / pasted as
+                // keystrokes (notably Windows conhost paste) and never went
+                // through the `InputEvent::Paste` image detection. Mutates
+                // `expanded` (path token -> `[Image #N]`) and appends to
+                // `images` / `kept_markers`. `last_submitted_message` was
+                // already cached above from the raw form, so Ctrl+C edit
+                // restores the editable path, not the marker.
+                attach_typed_image_paths(
+                    app,
+                    ctx,
+                    renderer,
+                    &mut expanded,
+                    &mut images,
+                    &mut kept_markers,
+                );
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: line.clone(),
                     images: kept_refs,
@@ -5811,6 +5873,36 @@ fn handle_streaming_key(
     Ok(())
 }
 
+/// Deliver a tool-approval decision to whichever turn is actually waiting.
+///
+/// In **sync mode** the running turn belongs to the in-process LiveSession
+/// coordinator (`DaemonTurnExecutor`), not this TUI's own agent — so the
+/// decision must go to the LiveSession's approver slot
+/// (`current_live_session().approve`), exactly like the webui's
+/// `/live/permission`. Sending it to the TUI agent (which isn't running this
+/// turn) leaves the tool blocked forever: the "Running … 141s, and the webui
+/// approval card never closes" bug. `ApproveToolAlways` degrades to `Allow`
+/// here — the live approver has no persistent "always" slot, matching the
+/// webui path. In normal (non-sync) mode the decision goes to the TUI agent
+/// as before.
+fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
+    if ctx.sync_forwarder.is_some() {
+        let decision = match cmd {
+            AgentCommand::ApproveTool | AgentCommand::ApproveToolAlways => {
+                atomcode_core::tool::PermissionDecision::Allow
+            }
+            _ => atomcode_core::tool::PermissionDecision::Deny,
+        };
+        if let Some(session) = atomcode_daemon::current_live_session() {
+            let _ = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(session.approve(decision))
+            });
+        }
+    } else {
+        ctx.agent.cmd_tx.send(cmd).ok();
+    }
+}
+
 fn handle_approval_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -5831,7 +5923,7 @@ fn handle_approval_key(
             // First Ctrl+C: deny the tool and arm the exit confirmation
             app.exit_pending = Some(now);
             renderer.pop_approval_prompt();
-            ctx.agent.cmd_tx.send(AgentCommand::DenyTool).ok();
+            deliver_approval(ctx, AgentCommand::DenyTool);
             app.state.on_approval_resolved();
             renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
@@ -5854,7 +5946,7 @@ fn handle_approval_key(
     // responded — without this, the prompt stays in scrollback next to
     // the tool result, creating visual noise.
     renderer.pop_approval_prompt();
-    ctx.agent.cmd_tx.send(cmd).ok();
+    deliver_approval(ctx, cmd);
     app.state.on_approval_resolved();
     Ok(())
 }
@@ -6125,7 +6217,7 @@ fn handle_agent_event(
     fixissue_buffer: &mut String,
     setup_pending: &mut bool,
     reasoning_buffer: &mut String,
-    buf: &Buffer,
+    buf: &mut Buffer,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
@@ -6531,6 +6623,18 @@ fn handle_agent_event(
             // Clear reasoning buffer between turns
             reasoning_buffer.clear();
 
+            // Record this turn's stats (anchored by message count) so /resume
+            // can re-render the same `✓ … 工具 · tokens` divider between turns —
+            // sessions persist only `messages`, so without this the per-turn
+            // token/duration numbers are lost on reload and turns butt together.
+            ctx.current_session.turn_stats.push(atomcode_core::session::TurnStat {
+                after_message: messages.len(),
+                turn_count,
+                tool_call_count,
+                duration_ms: duration.as_millis() as u64,
+                total_tokens,
+                errored: matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error),
+            });
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
             persist_current_session(ctx, messages, renderer);
@@ -6644,6 +6748,60 @@ fn handle_agent_event(
             // Save what we did have — a user who Ctrl+C'd mid-stream
             // should still be able to /resume the cleaned conversation.
             persist_current_session(ctx, messages, renderer);
+        }
+        AgentEvent::ConversationTruncated {
+            messages,
+            restored_prompt,
+            target_n,
+            prompts_before,
+        } => {
+            let new_len = messages.len();
+            // Persist the truncated conversation: messages + prune stale
+            // per-turn dividers (anchored by message-count) so /resume won't
+            // replay dividers for removed turns.
+            ctx.current_session.messages = messages.clone();
+            ctx.current_session
+                .turn_stats
+                .retain(|s| s.after_message <= new_len);
+            ctx.current_session.touch();
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone());
+            if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
+                        error: &e.to_string(),
+                    })
+                    .into_owned(),
+                ));
+            }
+            // Redraw scrollback from the truncated history — reuses the
+            // /resume replay path (clears screen, re-renders turn dividers).
+            crate::modals::session_picker::replay_session(renderer, &ctx.current_session, true);
+            // Put the rolled-back prompt back in the input box for editing.
+            buf.set_restored_text(restored_prompt);
+            // Confirmation + disk-divergence warning.
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::CmdUndoDone {
+                    target: target_n,
+                    last: prompts_before,
+                })
+                .into_owned(),
+            ));
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::CmdUndoDiskWarning).into_owned(),
+            ));
+            renderer.flush();
+            state.on_turn_complete();
+        }
+        AgentEvent::UndoFailed { requested, available } => {
+            let line = if available == 0 {
+                crate::i18n::t(crate::i18n::Msg::CmdUndoNoTurns).into_owned()
+            } else {
+                crate::i18n::t(crate::i18n::Msg::CmdUndoOutOfRange { requested, available })
+                    .into_owned()
+            };
+            renderer.render(UiLine::CommandOutput(line));
+            renderer.flush();
         }
         AgentEvent::Error { error, messages } => {
             renderer.render(UiLine::Error(error));
@@ -7051,6 +7209,35 @@ fn handle_agent_event(
                 state.on_submit();
             } else {
                 state.on_turn_complete();
+            }
+        }
+        AgentEvent::ProviderChanged(provider) => {
+            // Live-sync: another view (webui dropdown) switched the model —
+            // mirror it into the TUI's active provider + header. Skip when it's
+            // already our provider (the echo of the TUI's own /model switch, which
+            // already applied + persisted). Persistence is done by whoever
+            // originated the switch (webui → /live/provider endpoint; TUI → the
+            // /model picker's save_and_reload), so here we only sync in-memory
+            // state and notify the agent — no second disk write.
+            if ctx.config.default_provider != provider
+                && ctx.config.providers.contains_key(&provider)
+            {
+                ctx.config.default_provider = provider.clone();
+                ctx.model_name = ctx
+                    .config
+                    .providers
+                    .get(&provider)
+                    .map(|p| p.model.clone())
+                    .unwrap_or(provider);
+                ctx.runtime_factory.set_config(ctx.config.clone());
+                let _ = ctx
+                    .agent
+                    .cmd_tx
+                    .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+                let dir_display =
+                    crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+                renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
+                renderer.flush();
             }
         }
     }
