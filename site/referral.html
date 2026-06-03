@@ -266,7 +266,7 @@
   <div class="wrap">
     <section class="hero">
       <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">长期进行中 · 每双周结算现金打款</span></div>
-      <h1 data-i18n="hero.title">邀请有礼：AtomCode 裂变计划</h1>
+      <h1 data-i18n="hero.title">邀请有礼：AtomCode 星推官计划</h1>
       <p class="sub" data-i18n="hero.sub">获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。</p>
     </section>
 
@@ -359,10 +359,11 @@
 <div class="toast" id="toast"></div>
 
 <script>
-// env=local → local platform, env=test → test platform, default → production
+// env=local → local platform, env=test → test platform, env=pre → pre-release platform, default → production
 const ENV = new URLSearchParams(window.location.search).get('env') || '';
 const BASE_URL = ENV === 'local' ? 'http://localhost:8765'
   : ENV === 'test' ? 'https://test-acs.gitcode.net'
+  : ENV === 'pre' ? 'https://pre-acs.atomgit.com'
   : 'https://acs.atomgit.com';
 const API_BASE = BASE_URL + '/api/v1/referral';
 const LOGIN_URL = BASE_URL + '/auth/login?provider=atomgit&redirect_to=' + encodeURIComponent(
@@ -387,7 +388,7 @@ const T = {
   'nav.codingplan': { zh: 'Coding Plan', en: 'Coding Plan' },
   'btn.repo': { zh: '开源仓库', en: 'Repository' },
   'hero.badge': { zh: '长期进行中 · 每双周结算现金打款', en: 'Ongoing · settled bi-weekly' },
-  'hero.title': { zh: '邀请有礼：AtomCode 裂变计划', en: 'Referral Rewards: AtomCode Growth Program' },
+  'hero.title': { zh: '邀请有礼：AtomCode 星推官计划', en: 'Referral Rewards: AtomCode Star Promoter Program' },
   'hero.sub': { zh: '获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。', en: 'Get your official invite link and invite developers to install and use AtomCode. High conversion earns bonus rewards, with weekly leaderboard updates.' },
   'panel.login.title': { zh: '登录后领取专属邀请链接', en: 'Sign in to get your invite link' },
   'panel.meta.login': { zh: '数据更新时间：登录后可见', en: 'Updated: visible after sign-in' },
@@ -424,6 +425,7 @@ const T = {
   'board.hint': { zh: '按"本周新增活跃设备数"降序排列。每周日 23:59 截榜，现金奖励每双周结算打款。', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59, with cash rewards settled bi-weekly.' },
   'board.prev': { zh: '上一周', en: 'Previous week' },
   'board.next': { zh: '下一周', en: 'Next week' },
+  'board.week.label': { zh: '第 {week} 周 ({range})', en: 'Week {week} ({range})' },
   'board.rank': { zh: '排名', en: 'Rank' },
   'board.promoter': { zh: '推广者昵称', en: 'Promoter' },
   'board.devices': { zh: '设备安装 (A)', en: 'Installs (A)' },
@@ -681,15 +683,17 @@ async function loadLeaderboard(weekStart, targetId, rulesId) {
     const data = await fetchLeaderboard(weekStart);
     const items = normalizeBoardItems(data);
     const meRow = data.me ? normalizeBoardItem(data.me, 0) : null;
+    const resolvedWeekStart = data.week_start || weekStart || formatLocalDate(getMonday());
     renderBoard(targetId, {
       items: items,
       meRow: meRow,
-      weekLabel: currentWeekLabel(),
-      weekStart: data.week_start || weekStart || '',
+      weekLabel: weekLabelFromStart(resolvedWeekStart),
+      weekStart: resolvedWeekStart,
     });
   } catch (e) {
     console.error('Failed to load leaderboard', e);
-    renderBoard(targetId, { items: [], meRow: null, weekLabel: currentWeekLabel(), weekStart: weekStart || '' });
+    const resolvedWeekStart = weekStart || formatLocalDate(getMonday());
+    renderBoard(targetId, { items: [], meRow: null, weekLabel: weekLabelFromStart(resolvedWeekStart), weekStart: resolvedWeekStart });
   }
   renderRules(rulesId);
 }
@@ -849,7 +853,14 @@ function maskDisplayName(value) {
   return chars.slice(0, 3).join('') + '***' + chars.slice(-2).join('');
 }
 function currentWeekLabel() {
-  const now = new Date();
+  return weekLabelFromDate(new Date());
+}
+function weekLabelFromStart(value) {
+  const date = value ? new Date(value + 'T00:00:00') : new Date();
+  return weekLabelFromDate(date);
+}
+function weekLabelFromDate(date) {
+  const now = new Date(date);
   const day = now.getDay() || 7;
   const monday = new Date(now);
   monday.setHours(0, 0, 0, 0);
@@ -861,7 +872,9 @@ function currentWeekLabel() {
   weekDate.setUTCDate(weekDate.getUTCDate() + 4 - utcDay);
   const yearStart = new Date(Date.UTC(weekDate.getUTCFullYear(), 0, 1));
   const weekNo = Math.ceil((((weekDate - yearStart) / 86400000) + 1) / 7);
-  return '第 ' + weekNo + ' 周 (' + shortDate(monday) + ' - ' + shortDate(sunday) + ')';
+  return t('board.week.label')
+    .replace('{week}', weekNo)
+    .replace('{range}', shortDate(monday) + ' - ' + shortDate(sunday));
 }
 function shortDate(date) {
   return String(date.getMonth() + 1).padStart(2, '0') + '.' + String(date.getDate()).padStart(2, '0');
