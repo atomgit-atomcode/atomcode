@@ -359,10 +359,11 @@
 <div class="toast" id="toast"></div>
 
 <script>
-// env=local → local platform, env=test → test platform, default → production
+// env=local → local platform, env=test → test platform, env=pre → pre-release platform, default → production
 const ENV = new URLSearchParams(window.location.search).get('env') || '';
 const BASE_URL = ENV === 'local' ? 'http://localhost:8765'
   : ENV === 'test' ? 'https://test-acs.gitcode.net'
+  : ENV === 'pre' ? 'https://pre-acs.atomgit.com'
   : 'https://acs.atomgit.com';
 const API_BASE = BASE_URL + '/api/v1/referral';
 const LOGIN_URL = BASE_URL + '/auth/login?provider=atomgit&redirect_to=' + encodeURIComponent(
