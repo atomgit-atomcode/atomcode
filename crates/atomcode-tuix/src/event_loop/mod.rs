@@ -6594,6 +6594,18 @@ fn handle_agent_event(
             // Clear reasoning buffer between turns
             reasoning_buffer.clear();
 
+            // Record this turn's stats (anchored by message count) so /resume
+            // can re-render the same `✓ … 工具 · tokens` divider between turns —
+            // sessions persist only `messages`, so without this the per-turn
+            // token/duration numbers are lost on reload and turns butt together.
+            ctx.current_session.turn_stats.push(atomcode_core::session::TurnStat {
+                after_message: messages.len(),
+                turn_count,
+                tool_call_count,
+                duration_ms: duration.as_millis() as u64,
+                total_tokens,
+                errored: matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error),
+            });
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
             persist_current_session(ctx, messages, renderer);
