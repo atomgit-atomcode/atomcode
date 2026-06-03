@@ -87,12 +87,26 @@ pub fn current_live_session() -> Option<Arc<atomcode_core::live::LiveSession>> {
 }
 
 /// 取或建当前活动 LiveSession（TUI 与 /live 共用）。进程级单例。
-/// 不需要传入 AppState — 使用进程级共享 MCP 缓存。
+/// 不需要传入 AppState — 使用进程级共享 MCP 缓存。新建时为空会话、随机 id。
 pub fn ensure_live_session(
     working_dir: std::path::PathBuf,
     telemetry: Arc<atomcode_telemetry::Telemetry>,
 ) -> Arc<atomcode_core::live::LiveSession> {
-    ensure_live_session_global(working_dir, live_mcp_cache(), telemetry)
+    ensure_live_session_global(working_dir, live_mcp_cache(), telemetry, Vec::new(), None)
+}
+
+/// 取或建当前活动 LiveSession，**新建时用给定的消息与 session_id 播种**。
+///
+/// 供 TUI 的 `/webui` 用：让 webui 直接落到 TUI 当前会话（如 `atomcode -c` 续聊的会话），
+/// 而不是一个空白新会话；并复用该会话的 id，使后续每轮持久化覆盖同一文件、不产生重复。
+/// 若已存在活动 LiveSession 则原样返回（不重新播种）。`session_id` 为 None 时用随机 id。
+pub fn ensure_live_session_seeded(
+    working_dir: std::path::PathBuf,
+    telemetry: Arc<atomcode_telemetry::Telemetry>,
+    initial: Vec<atomcode_core::conversation::message::Message>,
+    session_id: Option<atomcode_core::session::SessionId>,
+) -> Arc<atomcode_core::live::LiveSession> {
+    ensure_live_session_global(working_dir, live_mcp_cache(), telemetry, initial, session_id)
 }
 
 /// 取或建当前活动 LiveSession（webui /live 用）。阶段③ Task 3 会把 auto_approve 改交互式。
@@ -100,12 +114,14 @@ pub(crate) fn ensure_live_session_global(
     working_dir: std::path::PathBuf,
     mcp_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>>,
     telemetry: Arc<atomcode_telemetry::Telemetry>,
+    initial: Vec<atomcode_core::conversation::message::Message>,
+    session_id: Option<atomcode_core::session::SessionId>,
 ) -> Arc<atomcode_core::live::LiveSession> {
     let mut g = LIVE.lock().unwrap();
     if let Some(s) = g.as_ref() {
         return s.clone();
     }
-    let session_id = atomcode_core::session::SessionId::new();
+    let session_id = session_id.unwrap_or_else(atomcode_core::session::SessionId::new);
     // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
     *LIVE_SESSION_ID.lock().unwrap() = Some(session_id.to_string());
     let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(DaemonTurnExecutor {
@@ -116,7 +132,7 @@ pub(crate) fn ensure_live_session_global(
         auto_approve: false,
         session_id,
     });
-    let session = atomcode_core::live::LiveSession::new(executor, Vec::new());
+    let session = atomcode_core::live::LiveSession::new(executor, initial);
     *g = Some(session.clone());
     session
 }

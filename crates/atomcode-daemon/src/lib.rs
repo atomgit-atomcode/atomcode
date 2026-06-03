@@ -13,6 +13,7 @@ mod api_provider;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
+pub use live_api::ensure_live_session_seeded;
 pub use live_api::live_set_provider;
 mod telemetry_scope;
 pub mod auth_token;

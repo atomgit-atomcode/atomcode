@@ -215,6 +215,7 @@ fn attach_live_session(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     session: std::sync::Arc<atomcode_core::live::LiveSession>,
+    render_snapshot: bool,
 ) {
     // 幂等附着：先终止已有的转发器，否则旧任务仍订阅同一广播、同样投进
     // runtime_event_tx，导致每个 LiveEvent 被渲染两次（输入回显、文本增量、
@@ -223,12 +224,13 @@ fn attach_live_session(
     if let Some(h) = ctx.sync_forwarder.take() {
         h.abort();
     }
-    // 回放快照：渲染既有消息。
-    let snapshot: Vec<atomcode_core::conversation::message::Message> =
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(session.snapshot())
-        });
-    {
+    // 回放快照：渲染既有消息。`/webui` 用 TUI 当前会话播种 LiveSession，画面里早已有这些
+    // 消息（如 `atomcode -c` 续聊），此时 render_snapshot=false 跳过回放、避免重复刷一遍。
+    if render_snapshot {
+        let snapshot: Vec<atomcode_core::conversation::message::Message> =
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(session.snapshot())
+            });
         use atomcode_core::conversation::message::{MessageContent, Role};
         renderer.render(UiLine::TurnSeparator {
             label: "— 同步快照 —".to_string(),
@@ -893,6 +895,24 @@ pub(super) fn execute_slash_command(
                     "127.0.0.1".to_string()
                 }
                 let host = parse_host(a);
+                // 先用 TUI 当前会话（如 `atomcode -c` 续聊的会话）播种 LiveSession，
+                // 并在开浏览器**之前**完成——否则浏览器可能抢先连上 /live、先建出一个空
+                // LiveSession，webui 就落到空白新页面而非当前会话。仅当前会话非空时才复用
+                // 其 id（让后续每轮覆盖同一文件、不产生重复会话）。
+                let (initial, sid) = if ctx.current_session.messages.is_empty() {
+                    (Vec::new(), None)
+                } else {
+                    (
+                        ctx.current_session.messages.clone(),
+                        Some(ctx.current_session.id.clone()),
+                    )
+                };
+                let session = atomcode_daemon::ensure_live_session_seeded(
+                    ctx.working_dir.clone(),
+                    ctx.telemetry.clone(),
+                    initial,
+                    sid,
+                );
                 let open_msg = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
                         .block_on(atomcode_daemon::ensure_server_and_open(
@@ -901,12 +921,9 @@ pub(super) fn execute_slash_command(
                             true,
                         ))
                 });
-                // 自动附着：建立（或取得已有的）LiveSession，并把 TUI 接入同步。
-                let session = atomcode_daemon::ensure_live_session(
-                    ctx.working_dir.clone(),
-                    ctx.telemetry.clone(),
-                );
-                attach_live_session(ctx, renderer, session);
+                // 附着把 TUI 接入同步。画面里已有当前会话（播种来源），故 render_snapshot=false
+                // 跳过快照回放，避免把同一段对话重复刷一遍。
+                attach_live_session(ctx, renderer, session, false);
                 open_msg
             };
             renderer.render(UiLine::CommandOutput(msg));
@@ -924,7 +941,8 @@ pub(super) fn execute_slash_command(
             } else {
                 match atomcode_daemon::current_live_session() {
                     Some(session) => {
-                        attach_live_session(ctx, renderer, session);
+                        // 重新附着：TUI 可能错过了 webui 期间的对话，回放快照补上。
+                        attach_live_session(ctx, renderer, session, true);
                     }
                     None => {
                         renderer.render(UiLine::CommandOutput(
