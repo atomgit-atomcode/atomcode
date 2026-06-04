@@ -940,10 +940,14 @@ pub fn get_valid_token() -> Result<String> {
 
     // Check if token is expired (with 5-minute safety margin)
     if let Some(expires_in) = auth.expires_in {
+        // A pre-1970 wall clock would otherwise panic here — and
+        // get_valid_token runs on EVERY authenticated API call (atomgit /
+        // coding_plan clients), not just /login. Treat that as expired
+        // (now = i64::MAX) so it force-refreshes instead of crashing (#45).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX);
         let expires_at = auth.created_at + expires_in;
 
         if now >= expires_at - 300 {
