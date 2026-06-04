@@ -163,6 +163,24 @@ pub(super) fn format_http_error(
     }
 }
 
+/// Whether a 429 / rate-limit error is **non-retryable** — i.e. a quota that
+/// only refills at a fixed future time (monthly / period quota exhausted).
+/// Retrying these before the reset is futile and just hammers the gateway, so
+/// callers fail fast instead of burning the retry budget.
+///
+/// Transient limits (rolling window, "请求过于频繁", load too high, generic
+/// "限流") are deliberately NOT matched here — those recover on their own and
+/// stay retryable. Matching is substring-based so it works on the raw JSON
+/// body, the extracted message, and the `[429] …` formatted string alike.
+pub(crate) fn is_non_retryable_rate_limit(msg: &str) -> bool {
+    msg.contains("额度已用完")
+        || msg.contains("额度已耗尽")
+        || msg.contains("额度耗尽")
+        || msg.contains("配额已用完")
+        || msg.contains("配额已耗尽")
+        || msg.contains("配额耗尽")
+}
+
 pub(super) fn extract_error_message(body: &str) -> String {
     let trimmed = body.trim();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -186,6 +204,48 @@ pub(super) fn extract_error_message(body: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod non_retryable_rate_limit_tests {
+    use super::is_non_retryable_rate_limit;
+
+    #[test]
+    fn monthly_quota_exhausted_is_non_retryable() {
+        // The exact body users hit: a 429 whose quota only resets at a fixed
+        // future time. Retrying before then is futile — must fail fast.
+        assert!(is_non_retryable_rate_limit(
+            "当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。"
+        ));
+        // Also matches on the raw JSON envelope (what retry.rs sees).
+        assert!(is_non_retryable_rate_limit(
+            r#"{"error":{"message":"当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。","type":"auth_error","code":"429"}}"#
+        ));
+        // And on the agent-side formatted string.
+        assert!(is_non_retryable_rate_limit("[429] 当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。"));
+    }
+
+    #[test]
+    fn quota_exhausted_variants_are_non_retryable() {
+        assert!(is_non_retryable_rate_limit("额度已耗尽"));
+        assert!(is_non_retryable_rate_limit("配额已用完"));
+    }
+
+    #[test]
+    fn transient_rate_limits_remain_retryable() {
+        // Rolling-window / load limits recover on their own — keep retrying.
+        assert!(!is_non_retryable_rate_limit("滚动窗口限流，请稍后再试"));
+        assert!(!is_non_retryable_rate_limit("请求过于频繁，请稍后再试"));
+        assert!(!is_non_retryable_rate_limit("模型「GLM-5.1」的请求负载过高，请稍后再试。"));
+        assert!(!is_non_retryable_rate_limit("服务繁忙"));
+        assert!(!is_non_retryable_rate_limit("当前已被限流"));
+    }
+
+    #[test]
+    fn unrelated_text_is_not_matched() {
+        assert!(!is_non_retryable_rate_limit(""));
+        assert!(!is_non_retryable_rate_limit("Internal Server Error"));
+    }
 }
 
 #[cfg(test)]

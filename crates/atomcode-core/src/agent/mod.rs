@@ -2630,6 +2630,12 @@ impl AgentLoop {
                 TurnResult::Failed(e) => {
                     // Retry logic for transient errors
                     let is_rate_limited = is_rate_limited_error(&e);
+                    // A 429 whose quota only resets at a fixed future time
+                    // (monthly / period quota exhausted) can't recover by
+                    // retrying — fail fast and show the upstream reason as-is,
+                    // instead of the 5-shot rate-limit backoff (which just
+                    // delays the same error by ~45s and re-hammers the gateway).
+                    let is_quota_exhausted = crate::provider::is_non_retryable_rate_limit(&e);
                     let is_auth_error = is_auth_error(&e);
                     let is_messages_illegal = e.contains("illegal") || e.contains("messages");
                     // Upstream context-length overflow (OpenRouter 400, OpenAI
@@ -2684,6 +2690,20 @@ impl AgentLoop {
                         };
                         let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
                         continue;
+                    } else if is_quota_exhausted {
+                        // Non-retryable: surface the upstream message verbatim
+                        // (e.g. "当前月度额度已用完，请于 … 后继续使用。") so the
+                        // user sees the real reason and reset time, not a
+                        // generic "请稍后再试".
+                        self.datalog.log_error(&e);
+                        self.report_error("rate_limit_exhausted", &e).await;
+                        let shown = e.strip_prefix("[429] ").unwrap_or(&e).to_string();
+                        let _ = self.event_tx.send(AgentEvent::Error {
+                            error: shown,
+                            messages: self.conversation.messages.clone(),
+                        });
+                        self.finish_turn(TurnStopReason::Error);
+                        return;
                     } else if is_rate_limited && self.retry_count < 5 {
                         self.retry_count += 1;
                         // 指数退避基线（3/6/9/12/15s）。但若网关在错误体里明确给了冷却

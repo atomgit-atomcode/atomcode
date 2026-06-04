@@ -215,6 +215,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "globset",
+ "http",
  "ignore",
  "libc",
  "regex",
