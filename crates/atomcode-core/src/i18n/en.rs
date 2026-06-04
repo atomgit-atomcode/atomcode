@@ -666,7 +666,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SetupFailedRow { kind, slug, error } =>
             format!("  × {}:{} — {}\n", kind, slug, error).into(),
         Msg::CmdSetupTip =>
-            "\u{1f4a1} Tip: Run \x1b[1;96m/setup\x1b[0m to auto-configure hooks, skills, and MCP for this project.".into(),
+            // No leading emoji: U+1F4A1 has terminal/font-dependent display
+            // width (1 vs 2 cells), which desynced this line's cell layout
+            // on some terminals (garbled "TTip:RRun…" over SSH). ASCII-only
+            // prefix keeps the width unambiguous.
+            "Tip: Run \x1b[1;96m/setup\x1b[0m to auto-configure hooks, skills, and MCP for this project.".into(),
         Msg::CmdSetupRunning =>
             "Running atomcode setup...".into(),
         Msg::CmdSetupSkillsReloaded { count } =>
