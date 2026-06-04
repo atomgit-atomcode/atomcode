@@ -11,6 +11,7 @@ pub mod subtask_driver;
 mod diagnose;
 mod discipline;
 pub mod execute;
+mod local_shell;
 mod prompt;
 mod services;
 mod tool_dispatch;
