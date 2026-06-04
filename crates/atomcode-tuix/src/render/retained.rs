@@ -1439,6 +1439,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let clipped = clip_cells_to_width(row, body_width);
             self.screen.draw_row(i, 0, &clipped);
         }
+        // Clear any rows between the last painted body row and the body
+        // area boundary (body_height). When the footer shrinks (e.g. slash
+        // menu closes), body_height grows, but the number of body_lines
+        // may not fill the newly available space. Rows that were
+        // previously occupied by the taller footer (which contained CJK
+        // text from skill descriptions in the sub-mode menu) would retain
+        // stale content in `self.cells` — the next `render_diff` would
+        // compare that stale content against `prev_cells` (which has the
+        // same stale content from the older frame) and find no diff,
+        // leaving ghost CJK characters on screen.
+        let painted = rows.len();
+        if painted < body_height {
+            let blank_row = vec![Cell::blank(); w.min(body_width)];
+            for r in painted..body_height {
+                self.screen.draw_row(r, 0, &blank_row);
+            }
+        }
     }
 
     /// 1-indexed row where the LAST EXISTING body row sits on
