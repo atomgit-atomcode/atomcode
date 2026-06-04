@@ -18,6 +18,8 @@ pub enum SessionMode {
     Tui,
     Ide,
     Vscode,
+    #[serde(rename = "webui")]
+    Webui,
     AtomcodeAir,
     Webui,
 }
@@ -799,6 +801,11 @@ mod tests {
     #[test]
     fn session_mode_ide_serializes_as_ide() {
         assert_eq!(serde_json::to_string(&SessionMode::Ide).unwrap(), "\"ide\"");
+    }
+
+    #[test]
+    fn session_mode_webui_serializes_as_webui() {
+        assert_eq!(serde_json::to_string(&SessionMode::Webui).unwrap(), "\"webui\"");
     }
 }
 

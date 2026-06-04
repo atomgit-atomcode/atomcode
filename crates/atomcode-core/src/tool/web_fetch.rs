@@ -709,22 +709,22 @@ mod tests {
     // ── approval() end-to-end ──────────────────────────────────────────────
 
     #[test]
-    fn approval_auto_approves_localhost_literal() {
+    fn approval_localhost_literal_requires_approval() {
         let tool = WebFetchTool;
         let args = r#"{"url":"http://127.0.0.1:8080/"}"#;
         assert!(matches!(
             tool.approval(args),
-            ApprovalRequirement::AutoApprove
+            ApprovalRequirement::RequireApproval(_)
         ));
     }
 
     #[test]
-    fn approval_auto_approves_file_scheme() {
+    fn approval_file_scheme_requires_approval() {
         let tool = WebFetchTool;
         let args = r#"{"url":"file:///etc/passwd"}"#;
         assert!(matches!(
             tool.approval(args),
-            ApprovalRequirement::AutoApprove
+            ApprovalRequirement::RequireApproval(_)
         ));
     }
 
@@ -739,12 +739,12 @@ mod tests {
     }
 
     #[test]
-    fn approval_auto_approves_unknown_domain() {
+    fn approval_unknown_domain_requires_approval() {
         let tool = WebFetchTool;
         let args = r#"{"url":"https://example.com/"}"#;
         assert!(matches!(
             tool.approval(args),
-            ApprovalRequirement::AutoApprove
+            ApprovalRequirement::RequireApproval(_)
         ));
     }
 

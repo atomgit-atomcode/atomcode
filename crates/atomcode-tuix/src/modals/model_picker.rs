@@ -74,6 +74,10 @@ impl Modal for ModelPicker {
                 // the switch lives only in memory and the next startup
                 // reverts to whatever was last saved.
                 save_and_reload(ctx, renderer);
+                // Live-sync: broadcast this switch so an attached webui's model
+                // dropdown follows. No-op when no live session exists (it just
+                // updates the process-level selection, which is harmless).
+                atomcode_daemon::live_set_provider(chosen.clone());
                 // Clear any stale drift warning tied to the PREVIOUS
                 // active provider — if the new provider is also CodingPlan,
                 // the re-fire below will repopulate the slot with a

@@ -319,6 +319,10 @@ export function App() {
             onSessionId={handleSessionAssigned}
             cwd={cwd}
             onPermission={setPending}
+            onPermissionResolved={(callId) =>
+              setPending((cur: any) =>
+                callId === null ? null : resolvePendingAfterDecision(cur, callId),
+              )}
             activeSession={activeSession}
             restoring={restoring}
           />

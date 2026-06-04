@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.24.1</span>
+    <span class="dhdr-ver">v4.24.2</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -73,7 +73,7 @@
 
   <main class="dmain prose-docs">
 <h1>会话与撤销</h1>
-      <p class="lede">AtomCode 默认持久化每一次对话,允许你随时恢复、继续、清空或压缩。同时文件编辑会被记录进 file-history,一条 <code>/undo</code> 就能回滚上一轮的所有改动。</p>
+      <p class="lede">AtomCode 默认持久化每一次对话,允许你随时恢复、继续、清空或压缩。一条 <code>/undo</code> 就能把对话记忆回退到此前任意一轮。</p>
 
       <h2>会话的生命周期</h2>
       <p>每次启动 atomcode 都会自动创建一个会话,会话包含:</p>
@@ -146,14 +146,15 @@
         </tbody>
       </table>
 
-      <h2>文件编辑与 <code>/undo</code></h2>
-      <p>AtomCode 的所有文件编辑工具(<code>write_file</code>、<code>edit_file</code>、<code>search_replace</code> 等)在写入前都会把原始内容快照到 file-history。执行:</p>
-      <pre><code>/undo</code></pre>
-      <p>会把上一轮 AI 执行的全部文件编辑一次性回滚到工具调用前的状态。</p>
+      <h2>对话记忆回退 <code>/undo</code></h2>
+      <p><code>/undo</code> 把<strong>对话记忆</strong>回退到某一轮之前,删除那一轮及其后的全部消息,并把那一轮你输入的 prompt 还原回输入框,方便你修改后重发。</p>
+      <pre><code>/undo      # 回退最后一轮
+/undo N    # 回退到第 N 轮(N 从 1 开始,只计你真实输入的轮次)</code></pre>
+      <p>回退后,scrollback 里被删轮次的分隔线会一并清掉,会话也会立即落盘——下次 <code>/resume</code> 看到的就是回退后的状态。</p>
 
       <div class="callout callout-warn">
         <strong>注意边界</strong>
-        <p><code>/undo</code> 只回滚文件编辑,<em>不</em>回滚 bash 命令的副作用。比如模型执行了 <code>rm -rf</code> 或者把数据库 drop 了,<code>/undo</code> 帮不了你——那些操作本身在执行前应该已经触发过权限确认。</p>
+        <p><code>/undo</code> <em>只</em>回滚对话记忆,<strong>不会恢复磁盘上的文件</strong>。如果那几轮里 AI 改过代码,这些改动仍保留在工作区——需要还原请用 <code>/diff</code> 查看后手动处理,或借助 git。当前回合进行中时无法 <code>/undo</code>,请先按 Esc 取消。</p>
       </div>
 
       <h2>查看和清理成本</h2>

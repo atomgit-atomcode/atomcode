@@ -337,6 +337,31 @@ fn humanize_age(ts: u64) -> String {
 /// per-keystroke latency). `reset = false` appends to existing scrollback
 /// — used by the CLI auto-continue path at startup, which has the welcome
 /// banner above the replay and shouldn't wipe it.
+/// Build the inter-turn divider label from a persisted turn stat. `None`
+/// (old session, or a cancelled turn that recorded no stat) → empty label,
+/// which renders as a plain horizontal rule so the visual interval is still
+/// restored. `done` is fixed on replay (the live rotation is cosmetic).
+fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String {
+    match stat {
+        Some(s) if s.errored => crate::i18n::t(crate::i18n::Msg::TurnSummaryError {
+            turn_count: s.turn_count,
+            tool_call_count: s.tool_call_count,
+            duration: &crate::render::fmt_dur(std::time::Duration::from_millis(s.duration_ms)),
+            total_tokens: s.total_tokens,
+        })
+        .into_owned(),
+        Some(s) => crate::i18n::t(crate::i18n::Msg::TurnSummary {
+            done: "Done",
+            turn_count: s.turn_count,
+            tool_call_count: s.tool_call_count,
+            duration: &crate::render::fmt_dur(std::time::Duration::from_millis(s.duration_ms)),
+            total_tokens: s.total_tokens,
+        })
+        .into_owned(),
+        None => String::new(),
+    }
+}
+
 pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, reset: bool) {
     use atomcode_core::conversation::message::{MessageContent, Role};
     if reset {
@@ -346,7 +371,24 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
     renderer.render(UiLine::TurnSeparator {
         label: resumed.clone(),
     });
-    for m in &session.messages {
+    // Per-turn dividers: the live session draws a `✓ … 工具 · tokens` rule at
+    // every turn end, but only `messages` is persisted. `turn_stats` is anchored
+    // by "message count at turn end" — so as we replay, a divider goes before
+    // each new-turn user message (turn boundary), carrying the stored stats when
+    // present (None → plain rule, which still restores the interval for old
+    // sessions). Without this the previous turn's last output butts straight
+    // against the next user input.
+    let mut seen_user = false;
+    for (i, m) in session.messages.iter().enumerate() {
+        if matches!(m.role, Role::User) {
+            if seen_user {
+                let stat = session.turn_stats.iter().find(|s| s.after_message == i);
+                renderer.render(UiLine::TurnSeparator {
+                    label: turn_divider_label(stat),
+                });
+            }
+            seen_user = true;
+        }
         match (&m.role, &m.content) {
             (Role::User, MessageContent::Text(s)) => {
                 renderer.render(UiLine::User(s.clone()));
@@ -391,6 +433,17 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
             _ => {}
         }
     }
+    // Final turn's divider (anchored at the end), mirroring the live view which
+    // showed a stats rule after the last turn too.
+    if let Some(stat) = session
+        .turn_stats
+        .iter()
+        .find(|s| s.after_message == session.messages.len())
+    {
+        renderer.render(UiLine::TurnSeparator {
+            label: turn_divider_label(Some(stat)),
+        });
+    }
     renderer.render(UiLine::TurnComplete);
     renderer.render(UiLine::TurnSeparator {
         label: resumed,
@@ -414,6 +467,29 @@ mod tests {
             message_count: msgs,
             file_size: 0,
         }
+    }
+
+    #[test]
+    fn turn_divider_label_renders_stats_or_plain_rule() {
+        use atomcode_core::session::TurnStat;
+        let s = TurnStat {
+            after_message: 4,
+            turn_count: 3,
+            tool_call_count: 5,
+            duration_ms: 6800,
+            total_tokens: 1651,
+            errored: false,
+        };
+        // Persisted stat → the same `✓ … 工具 · tokens` line the live turn showed
+        // (locale-independent: digits + glyph appear in both en/zh templates).
+        let normal = super::turn_divider_label(Some(&s));
+        assert!(normal.contains('✓'), "got {normal:?}");
+        assert!(normal.contains('3') && normal.contains('5') && normal.contains("1651"), "got {normal:?}");
+        // Errored turn → ✗ variant.
+        let err = TurnStat { errored: true, ..s.clone() };
+        assert!(super::turn_divider_label(Some(&err)).contains('✗'));
+        // No stat (old session / cancelled turn) → empty label → plain rule.
+        assert_eq!(super::turn_divider_label(None), "");
     }
 
     #[test]

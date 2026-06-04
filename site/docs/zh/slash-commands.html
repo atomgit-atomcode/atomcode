@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.24.1</span>
+    <span class="dhdr-ver">v4.24.2</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -81,7 +81,7 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/login</code></td><td><strong>推荐</strong> — 一条命令完成 AtomGit OAuth + 申领 CodingPlan 免费额度 + 自动根据额度模型列表写好 provider 配置。首次启动最省事的入口;已登录后重跑会幂等地同步最新模型列表。<em>v4.24.1 起 <code>/codingplan</code> 已折进 <code>/login</code>,旧入口已移除</em></td></tr>
+          <tr><td><code>/login</code></td><td><strong>推荐</strong> — 一条命令完成 AtomGit OAuth + 申领 CodingPlan 免费额度 + 自动根据额度模型列表写好 provider 配置。首次启动最省事的入口;已登录后重跑会幂等地同步最新模型列表。<em>v4.24.2 起 <code>/codingplan</code> 已折进 <code>/login</code>,旧入口已移除</em></td></tr>
           <tr><td><code>/resume</code></td><td>打开会话选择器,恢复任意一个之前的持久化会话(含消息、目录和模型状态)</td></tr>
           <tr><td><code>/session</code></td><td>创建一个全新的、干净的会话</td></tr>
           <tr><td><code>/bg</code></td><td>将当前会话放到后台并打开新的前台会话;子命令: <code>/bg list</code>、<code>/bg &lt;N&gt;</code>、<code>/bg drop &lt;N&gt;</code>、<code>/bg help</code>。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
@@ -99,7 +99,7 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/undo</code></td><td>回滚上一轮 AI 对本地文件的所有编辑,基于 file-history 快照</td></tr>
+          <tr><td><code>/undo</code> · <code>/undo N</code></td><td>把对话记忆回退到上一轮(或第 N 轮)之前,并把那一轮的 prompt 还原回输入框;只回退记忆,不恢复磁盘文件</td></tr>
           <tr><td><code>/diff</code></td><td>显示当前工作目录未提交改动的 git diff</td></tr>
           <tr><td><code>/cost</code></td><td>展示当前会话输出 token 数。不支持 usage 报告的 API 会自动估算</td></tr>
           <tr><td><code>/context</code></td><td>显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用</td></tr>
@@ -176,7 +176,7 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/webui</code></td><td>启动浏览器界面并自动打开浏览器(默认绑定 <code>127.0.0.1:13456</code>,仅本机)。当前 TUI 会话会自动接入实时同步</td></tr>
+          <tr><td><code>/webui</code></td><td>启动浏览器界面并自动打开浏览器(默认绑定 <code>127.0.0.1:13457</code>,仅本机)。当前 TUI 会话会自动接入实时同步</td></tr>
           <tr><td><code>/webui --host &lt;addr&gt;</code></td><td>把服务绑定到指定地址;<code>/webui lan</code> 等价于 <code>--host 0.0.0.0</code>(暴露到局域网)。配合蒲公英虚拟 IP 可远程访问,见 <a href="./webui-remote-access.html">远程访问指南</a></td></tr>
           <tr><td><code>/webui stop</code></td><td>关闭 webui 服务</td></tr>
           <tr><td><code>/sync</code></td><td>把当前 TUI 接入正在运行的 webui 会话(需先 <code>/webui</code>)。两端实时双向同步,多个浏览器 / 终端可同时围观同一会话</td></tr>
@@ -233,11 +233,13 @@ Session token usage
 - Current turn tokens: 2156
 - Context: 42K / 128K</code></pre>
 
-      <h3>改完不满意就回滚</h3>
+      <h3>问歪了就回退重问</h3>
       <pre><code>&gt; 给所有函数加 JSDoc
-... (AI 编辑了 12 个文件)
+... (回复跑偏了)
 &gt; /undo
-Rolled back 12 file edits from the last turn.</code></pre>
+已回退到第 3 轮(共 3 轮)。
+⚠ 仅回滚了对话记忆,磁盘文件未恢复。如需还原代码,请手动处理或用 /diff 查看。
+(刚才那条 prompt 已还原到输入框,可改完重发)</code></pre>
 
       <h3>模型表现不好换一个再试</h3>
       <pre><code>&gt; /model

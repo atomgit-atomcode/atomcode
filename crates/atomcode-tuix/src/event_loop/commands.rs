@@ -215,6 +215,7 @@ fn attach_live_session(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     session: std::sync::Arc<atomcode_core::live::LiveSession>,
+    render_snapshot: bool,
 ) {
     // 幂等附着：先终止已有的转发器，否则旧任务仍订阅同一广播、同样投进
     // runtime_event_tx，导致每个 LiveEvent 被渲染两次（输入回显、文本增量、
@@ -223,12 +224,13 @@ fn attach_live_session(
     if let Some(h) = ctx.sync_forwarder.take() {
         h.abort();
     }
-    // 回放快照：渲染既有消息。
-    let snapshot: Vec<atomcode_core::conversation::message::Message> =
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(session.snapshot())
-        });
-    {
+    // 回放快照：渲染既有消息。`/webui` 用 TUI 当前会话播种 LiveSession，画面里早已有这些
+    // 消息（如 `atomcode -c` 续聊），此时 render_snapshot=false 跳过回放、避免重复刷一遍。
+    if render_snapshot {
+        let snapshot: Vec<atomcode_core::conversation::message::Message> =
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(session.snapshot())
+            });
         use atomcode_core::conversation::message::{MessageContent, Role};
         renderer.render(UiLine::TurnSeparator {
             label: "— 同步快照 —".to_string(),
@@ -734,10 +736,37 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "undo" => {
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdUndoNotSupported).into_owned(),
-            ));
-            renderer.flush();
+            if state.phase != crate::state::UiPhase::Idle {
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::CmdUndoBusy).into_owned(),
+                ));
+                renderer.flush();
+            } else {
+                let a = arg.trim();
+                // None = bare /undo (last turn); Some(n) = /undo n; Err = bad arg.
+                let parsed: Result<Option<usize>, ()> = if a.is_empty() {
+                    Ok(None)
+                } else {
+                    match a.parse::<usize>() {
+                        Ok(n) if n >= 1 => Ok(Some(n)),
+                        _ => Err(()),
+                    }
+                };
+                match parsed {
+                    Ok(nth) => {
+                        ctx.agent
+                            .cmd_tx
+                            .send(AgentCommand::UndoToPrompt { nth })
+                            .ok();
+                    }
+                    Err(()) => {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::CmdUndoBadArg).into_owned(),
+                        ));
+                        renderer.flush();
+                    }
+                }
+            }
         }
         "cost" => {
             let total = state.prompt_tokens + state.completion_tokens;
@@ -866,16 +895,35 @@ pub(super) fn execute_slash_command(
                     "127.0.0.1".to_string()
                 }
                 let host = parse_host(a);
-                let open_msg = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(atomcode_daemon::ensure_server_and_open(&host, 13456, true))
-                });
-                // 自动附着：建立（或取得已有的）LiveSession，并把 TUI 接入同步。
-                let session = atomcode_daemon::ensure_live_session(
+                // 先用 TUI 当前会话（如 `atomcode -c` 续聊的会话）播种 LiveSession，
+                // 并在开浏览器**之前**完成——否则浏览器可能抢先连上 /live、先建出一个空
+                // LiveSession，webui 就落到空白新页面而非当前会话。仅当前会话非空时才复用
+                // 其 id（让后续每轮覆盖同一文件、不产生重复会话）。
+                let (initial, sid) = if ctx.current_session.messages.is_empty() {
+                    (Vec::new(), None)
+                } else {
+                    (
+                        ctx.current_session.messages.clone(),
+                        Some(ctx.current_session.id.clone()),
+                    )
+                };
+                let session = atomcode_daemon::ensure_live_session_seeded(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
+                    initial,
+                    sid,
                 );
-                attach_live_session(ctx, renderer, session);
+                let open_msg = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(atomcode_daemon::ensure_server_and_open(
+                            &host,
+                            atomcode_daemon::WEBUI_DEFAULT_PORT,
+                            true,
+                        ))
+                });
+                // 附着把 TUI 接入同步。画面里已有当前会话（播种来源），故 render_snapshot=false
+                // 跳过快照回放，避免把同一段对话重复刷一遍。
+                attach_live_session(ctx, renderer, session, false);
                 open_msg
             };
             renderer.render(UiLine::CommandOutput(msg));
@@ -893,7 +941,8 @@ pub(super) fn execute_slash_command(
             } else {
                 match atomcode_daemon::current_live_session() {
                     Some(session) => {
-                        attach_live_session(ctx, renderer, session);
+                        // 重新附着：TUI 可能错过了 webui 期间的对话，回放快照补上。
+                        attach_live_session(ctx, renderer, session, true);
                     }
                     None => {
                         renderer.render(UiLine::CommandOutput(
@@ -1966,77 +2015,83 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 ),
             }
         }
-        "install" => match parse_plugin_arg(parts.next().unwrap_or("").trim()) {
-            Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
-                // Explicit plugin@marketplace — install directly.
-                let tx = ctx.plugin_job_tx.clone();
-                ok(renderer, t(Msg::PluginInstalling { plugin: &plugin, marketplace: &mp }).into_owned());
-                tokio::task::spawn_blocking(move || {
-                    let ev = match atomcode_core::plugin::installer::install(&plugin, &mp) {
-                        Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
-                        Err(e) => {
-                            if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
-                                atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
-                                    id: _aie.id.clone(),
-                                }
-                            } else {
-                                atomcode_core::plugin::PluginJobEvent::Failed {
-                                    op: "install".into(),
-                                    msg: format!("{:#}", e),
-                                }
-                            }
-                        }
-                    };
-                    let _ = tx.send(ev);
-                });
-            }
-            Some(PluginArg::Bare { plugin }) => {
-                // Bare plugin name — resolve across all marketplaces.
-                match atomcode_core::plugin::installer::resolve_plugin_marketplace(&plugin) {
-                    Ok(matches) if matches.len() == 1 => {
-                        let m = &matches[0];
-                        let mp = m.marketplace.clone();
-                        let resolved_plugin = m.plugin.clone();
-                        let tx = ctx.plugin_job_tx.clone();
-                        ok(renderer, t(Msg::PluginInstallingByName { plugin: &plugin }).into_owned());
-                        tokio::task::spawn_blocking(move || {
-                            let ev = match atomcode_core::plugin::installer::install(&resolved_plugin, &mp) {
-                                Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
-                                Err(e) => {
-                                    if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
-                                        atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
-                                            id: _aie.id.clone(),
-                                        }
-                                    } else {
-                                        atomcode_core::plugin::PluginJobEvent::Failed {
-                                            op: "install".into(),
-                                            msg: format!("{:#}", e),
-                                        }
+        "install" => {
+            // Parse: /plugin install <plugin>@<marketplace> [--scope user|project|local]
+            let rest = parts.next().unwrap_or("").trim();
+            let scope_arg = parts.next().unwrap_or("").trim();
+            let scope = parse_scope_arg(scope_arg);
+            match parse_plugin_arg(rest) {
+                Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
+                    // Explicit plugin@marketplace — install directly.
+                    let tx = ctx.plugin_job_tx.clone();
+                    ok(renderer, t(Msg::PluginInstalling { plugin: &plugin, marketplace: &mp }).into_owned());
+                    tokio::task::spawn_blocking(move || {
+                        let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
+                            Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                            Err(e) => {
+                                if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
+                                    atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                        id: _aie.id.clone(),
+                                    }
+                                } else {
+                                    atomcode_core::plugin::PluginJobEvent::Failed {
+                                        op: "install".into(),
+                                        msg: format!("{:#}", e),
                                     }
                                 }
-                            };
-                            let _ = tx.send(ev);
-                        });
-                    }
-                    Ok(matches) if matches.len() > 1 => {
-                        // Multiple marketplaces contain this plugin — show a
-                        // disambiguation list with the install command to use.
-                        let mut msg = t(Msg::PluginInstallAmbiguous { plugin: &plugin }).into_owned();
-                        for m in &matches {
-                            msg.push_str(&format!("  /plugin install {}@{}\n", m.plugin, m.marketplace));
+                            }
+                        };
+                        let _ = tx.send(ev);
+                    });
+                }
+                Some(PluginArg::Bare { plugin }) => {
+                    // Bare plugin name — resolve across all marketplaces.
+                    match atomcode_core::plugin::installer::resolve_plugin_marketplace(&plugin) {
+                        Ok(matches) if matches.len() == 1 => {
+                            let m = &matches[0];
+                            let mp = m.marketplace.clone();
+                            let resolved_plugin = m.plugin.clone();
+                            let tx = ctx.plugin_job_tx.clone();
+                            ok(renderer, t(Msg::PluginInstallingByName { plugin: &plugin }).into_owned());
+                            tokio::task::spawn_blocking(move || {
+                                let ev = match atomcode_core::plugin::installer::install(&resolved_plugin, &mp, scope) {
+                                    Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                                    Err(e) => {
+                                        if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
+                                            atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                                id: _aie.id.clone(),
+                                            }
+                                        } else {
+                                            atomcode_core::plugin::PluginJobEvent::Failed {
+                                                op: "install".into(),
+                                                msg: format!("{:#}", e),
+                                            }
+                                        }
+                                    }
+                                };
+                                let _ = tx.send(ev);
+                            });
                         }
-                        err(renderer, msg);
-                    }
-                    _ => {
-                        ok(renderer, t(Msg::PluginInstallNotFound { plugin: &plugin }).into_owned());
+                        Ok(matches) if matches.len() > 1 => {
+                            // Multiple marketplaces contain this plugin — show a
+                            // disambiguation list with the install command to use.
+                            let mut msg = t(Msg::PluginInstallAmbiguous { plugin: &plugin }).into_owned();
+                            for m in &matches {
+                                msg.push_str(&format!("  /plugin install {}@{}\n", m.plugin, m.marketplace));
+                            }
+                            err(renderer, msg);
+                        }
+                        _ => {
+                            ok(renderer, t(Msg::PluginInstallNotFound { plugin: &plugin }).into_owned());
+                        }
                     }
                 }
+                None => err(renderer, t(Msg::PluginInstallUsage).into_owned()),
             }
-            None => err(renderer, t(Msg::PluginInstallUsage).into_owned()),
         },
         "uninstall" => match parse_plugin_arg(parts.next().unwrap_or("").trim()) {
             Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
-                match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
+                match atomcode_core::plugin::installer::uninstall(&plugin, &mp, atomcode_core::plugin::InstallScope::User) {
                     Ok(()) => {
                         super::reload_plugins(ctx);
                         ok(renderer, t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned());
@@ -2055,8 +2110,8 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                     0 => ok(renderer, t(Msg::PluginUninstallNotFound { plugin: &plugin }).into_owned()),
                     1 => {
                         let p = &matches[0];
-                        let (plug, mp) = (p.plugin.clone(), p.marketplace.clone());
-                        match atomcode_core::plugin::installer::uninstall(&plug, &mp) {
+                        let (plug, mp, scope) = (p.plugin.clone(), p.marketplace.clone(), p.scope.clone());
+                        match atomcode_core::plugin::installer::uninstall(&plug, &mp, scope) {
                             Ok(()) => {
                                 super::reload_plugins(ctx);
                                 ok(renderer, t(Msg::PluginUninstalled { plugin: &plug, marketplace: &mp }).into_owned());
@@ -2141,6 +2196,18 @@ fn parse_plugin_arg(s: &str) -> Option<PluginArg> {
     Some(PluginArg::Bare {
         plugin: s.to_string(),
     })
+}
+
+/// Parse a `--scope user|project|local` argument.
+/// Defaults to `User` if missing or unrecognized.
+fn parse_scope_arg(s: &str) -> atomcode_core::plugin::InstallScope {
+    // Accept both `--scope user` and bare `user`.
+    let val = s.strip_prefix("--scope=").unwrap_or(s).trim();
+    match val.to_lowercase().as_str() {
+        "project" => atomcode_core::plugin::InstallScope::Project,
+        "local" => atomcode_core::plugin::InstallScope::Local,
+        _ => atomcode_core::plugin::InstallScope::User,
+    }
 }
 
 /// Handle `/worktree` subcommands: create, list, done, cleanup.

@@ -17,7 +17,7 @@
 //!   [`crate::agent::prompt`] 层面做。
 //! - **不改工具集筛选**：哪些工具暴露给模型是 [`crate::tool::ToolRegistry`]
 //!   的职责,与 ctx 无关。
-//! - **不重写 render/microcompact/replace_stale_reads**：`build_messages`
+//! - **不重写 render/microcompact**：`build_messages`
 //!   直接透传给 [`crate::ctx::render::build_messages`] —— 与默认行为同
 //!   pipeline,只是 ctx_window 更小、配合更紧的 tool-output 截断。
 //!   想要 render pipeline 级别的定制,完全重写自己的 `build_messages`

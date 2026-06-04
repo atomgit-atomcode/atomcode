@@ -210,8 +210,15 @@ fn glob_search(
         if !path.is_file() {
             continue;
         }
-        // Skip directories that should be excluded (node_modules, .git, etc.)
-        if should_skip_path(path) {
+        // Prune skip-dirs (node_modules, .git, .atomcode, …) only BELOW the
+        // explicitly-requested search root. When the agent points glob *at* a
+        // skip-listed dir (e.g. `.atomcode/skills`, `.claude/...`), that dir's
+        // own path segments must not be re-filtered — otherwise the search
+        // always returns empty even though that exact path was requested.
+        // Broad searches stay unaffected: the root is the workspace, so
+        // `.atomcode` is a child component below the root and is still pruned
+        // (and `.hidden(true)` already stops the walker descending into it).
+        if should_skip_below(search_path, path) {
             continue;
         }
         if let Some(file_name) = path.file_name() {
@@ -250,6 +257,15 @@ fn should_skip_path(path: &std::path::Path) -> bool {
         }
     }
     false
+}
+
+/// Like [`should_skip_path`], but only inspects components STRICTLY BELOW
+/// `root`. Components of `root` itself are exempt, so a glob aimed directly at
+/// a skip-listed directory (`.atomcode/skills`, `.claude/...`) still returns
+/// its files. Paths not under `root` (shouldn't happen for walker entries)
+/// fall back to checking every component.
+fn should_skip_below(root: &std::path::Path, path: &std::path::Path) -> bool {
+    should_skip_path(path.strip_prefix(root).unwrap_or(path))
 }
 
 /// Simple glob match supporting `*` (match any non-separator chars) and
@@ -665,6 +681,72 @@ mod tests {
         assert!(
             r.output.contains("Button.vue"),
             "glob must find file under English directory. output: {}",
+            r.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_finds_files_when_explicitly_targeting_skip_listed_dotdir() {
+        // 显式指向 .atomcode/（在 SKIP_DIRS 里的隐藏内部目录）应能搜到其中文件。
+        // 回归：早先 should_skip_path 对路径每一段生效，导致即便显式给出该路径，
+        // 结果里含 `.atomcode` 段就被滤掉，永远返回空。
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".atomcode/skills/coding")).unwrap();
+        std::fs::write(
+            dir.path().join(".atomcode/skills/coding/SKILL.md"),
+            "# skill",
+        )
+        .unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = GlobTool;
+
+        // 形式一：pattern 内含具体的 .atomcode/skills 前缀。
+        let r = tool
+            .execute(r#"{"pattern":".atomcode/skills/**/*.md"}"#, &ctx)
+            .await
+            .unwrap();
+        assert!(r.success, "glob should succeed: {}", r.output);
+        assert!(
+            r.output.contains("SKILL.md"),
+            "glob must find files under an explicitly targeted .atomcode/. output: {}",
+            r.output
+        );
+
+        // 形式二：通过 path 参数显式指向 .atomcode/skills。
+        let r2 = tool
+            .execute(r#"{"pattern":"**/*.md","path":".atomcode/skills"}"#, &ctx)
+            .await
+            .unwrap();
+        assert!(r2.success, "glob should succeed: {}", r2.output);
+        assert!(
+            r2.output.contains("SKILL.md"),
+            "glob must find files when path explicitly points into .atomcode/. output: {}",
+            r2.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_broad_search_still_skips_dotatomcode() {
+        // 广度搜索（根=工作区）仍应跳过 .atomcode/，行为不变。
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".atomcode/skills")).unwrap();
+        std::fs::write(dir.path().join(".atomcode/skills/internal.md"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/visible.md"), "y").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = GlobTool;
+        let r = tool.execute(r#"{"pattern":"**/*.md"}"#, &ctx).await.unwrap();
+        assert!(r.success, "glob should succeed: {}", r.output);
+        assert!(
+            r.output.contains("visible.md"),
+            "broad glob must find visible files. output: {}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("internal.md"),
+            "broad glob must still skip .atomcode/. output: {}",
             r.output
         );
     }

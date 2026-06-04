@@ -16,6 +16,9 @@ pub(crate) mod paths;
 pub(crate) mod state;
 pub(crate) mod url;
 
+// Re-export types needed by downstream crates (TUI, CLI).
+pub use state::InstallScope;
+
 #[cfg(test)]
 pub(crate) mod test_support;
 

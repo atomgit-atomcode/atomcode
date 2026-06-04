@@ -484,6 +484,7 @@ pub fn resolve_workspace_path(raw_path: &str, working_dir: &Path) -> Result<Path
 }
 
 fn is_sensitive_path(path: &Path) -> bool {
+    #[cfg(not(target_os = "windows"))]
     const SYSTEM_PROTECTED_PREFIXES: &[&str] = &[
         "/System",
         "/bin",
@@ -497,6 +498,15 @@ fn is_sensitive_path(path: &Path) -> bool {
         "/var/root",
         "/private/var/root",
     ];
+    #[cfg(target_os = "windows")]
+    const SYSTEM_PROTECTED_PREFIXES: &[&str] = &[
+        r"C:\Windows",
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+        r"C:\ProgramData",
+        r"C:\PerfLogs",
+    ];
+    #[cfg(not(target_os = "windows"))]
     const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[
         "/usr/local",
         "/private/usr/local",
@@ -507,6 +517,8 @@ fn is_sensitive_path(path: &Path) -> bool {
         "/var/tmp",
         "/private/var/tmp",
     ];
+    #[cfg(target_os = "windows")]
+    const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[];
     const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config"];
     const SECRET_FILE_NAMES: &[&str] = &[
         ".bashrc",
@@ -1955,5 +1967,21 @@ mod tests {
         // Test that non-tilde paths are preserved
         let expanded = expand_user_path("/absolute/path");
         assert_eq!(expanded, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn approval_for_windows_system_protected_prefix_requires_always() {
+        assert!(is_sensitive_path(Path::new(r"C:\Windows\System32\config.sys")));
+        assert!(is_sensitive_path(Path::new(r"C:\Program Files\SomeApp\app.exe")));
+        assert!(is_sensitive_path(Path::new(r"C:\ProgramData\secrets.txt")));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn approval_for_unix_system_protected_prefix_requires_always() {
+        assert!(is_sensitive_path(Path::new("/System/Library/CoreServices/boot.efi")));
+        assert!(is_sensitive_path(Path::new("/etc/passwd")));
+        assert!(is_sensitive_path(Path::new("/var/log/syslog")));
     }
 }

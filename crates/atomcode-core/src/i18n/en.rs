@@ -403,6 +403,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("reload failed: {error} (kept previous config)").into(),
         Msg::CmdUndoNotSupported =>
             "  Undo is not yet supported.\n".into(),
+        Msg::CmdUndoDone { target, last } =>
+            format!("  ↩ Rolled back to before turn {target} (removed turns {target}–{last}). Your prompt is back in the input box.\n").into(),
+        Msg::CmdUndoDiskWarning =>
+            "  ⚠ Only conversation memory was rolled back — files on disk were NOT restored. Use /diff to review.\n".into(),
+        Msg::CmdUndoNoTurns =>
+            "  Nothing to undo (no prompts yet).\n".into(),
+        Msg::CmdUndoOutOfRange { requested, available } =>
+            format!("  Invalid turn {requested} (conversation has {available} turn(s)).\n").into(),
+        Msg::CmdUndoBusy =>
+            "  Can't undo while the agent is working — press Esc to cancel first.\n".into(),
+        Msg::CmdUndoBadArg =>
+            "  Usage: /undo  or  /undo N  (N = turn number).\n".into(),
         Msg::CmdNoChanges =>
             "  (no changes)\n".into(),
         Msg::CmdCheckingUpdate =>
@@ -718,6 +730,14 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
         Msg::PluginMgrEmptyInstalled => "No plugins installed.".into(),
         Msg::PluginMgrCloning => "Cloning marketplace…".into(),
         Msg::PluginMgrInstalling { plugin } => format!("Installing {plugin}…").into(),
+        Msg::PluginMgrEscToCancel => "Esc to cancel".into(),
+        Msg::PluginScopeUser => "Install for you (user scope)".into(),
+        Msg::PluginScopeUserDesc => "~/.atomcode/plugins — all projects".into(),
+        Msg::PluginScopeProject => "Install for all collaborators (project scope)".into(),
+        Msg::PluginScopeProjectDesc => ".atomcode/plugins — shared via git".into(),
+        Msg::PluginScopeLocal => "Install for you, in this repo only (local scope)".into(),
+        Msg::PluginScopeLocalDesc => ".atomcode/plugins/local — not committed".into(),
+        Msg::PluginScopeHint => "↑↓ Select scope · Enter confirm · Esc back".into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("uninstalled `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
@@ -767,7 +787,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescForget => "Remove matching memories".into(),
         Msg::CmdDescMemory => "Show all saved memories".into(),
         Msg::CmdDescMcp => "Show MCP server status (subcommand: reload)".into(),
-        Msg::CmdDescUndo => "Undo last change (not yet supported)".into(),
+        Msg::CmdDescUndo => "Undo: roll conversation memory back a turn (/undo or /undo N)".into(),
         Msg::CmdDescWorktree => "Git worktree isolation (create/list/done/cleanup)".into(),
         Msg::CmdDescUpgrade => "Upgrade atomcode to latest (subcommand: rollback)".into(),
         Msg::CmdDescIssue => "Report a bug / request a feature for AtomCode itself (interactive wizard)".into(),

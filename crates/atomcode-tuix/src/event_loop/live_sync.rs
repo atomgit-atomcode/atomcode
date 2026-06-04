@@ -74,6 +74,14 @@ pub(crate) fn spawn_live_forwarder(
                         break;
                     }
                 }
+                Ok(LiveEvent::ProviderChanged(provider)) => {
+                    if fan_tx
+                        .send(RuntimeEvent { runtime_id, event: AgentEvent::ProviderChanged(provider) })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }

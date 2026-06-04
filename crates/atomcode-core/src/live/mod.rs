@@ -43,6 +43,9 @@ pub enum LiveEvent {
     Turn(TurnEvent),
     /// turn 状态变化（视图据此禁用/启用输入框）。
     StateChanged(TurnState),
+    /// 任一视图（webui 下拉框 / TUI /model）切换了模型。其余视图据此同步显示与选中项。
+    /// 仅作显示/状态广播——实际下一轮用哪个 provider 由进程级选择（daemon 侧 LIVE_PROVIDER）决定。
+    ProviderChanged(String),
 }
 
 /// turn 执行策略。实现者负责对 `conv` 跑一次完整 turn（含工具循环），并把过程
@@ -151,9 +154,24 @@ impl LiveSession {
         *self.approver.lock().await = Some(tx);
     }
 
-    /// 任一视图批准/拒绝。先到先得：取走通道并投递；已无通道返回 false。
+    /// 广播一次模型切换给所有视图（不触碰 turn 状态）。任一端切换模型时调用，
+    /// 让另一端的下拉框 / 头部显示实时跟随。返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_provider_changed(&self, provider: String) -> bool {
+        self.events.send(LiveEvent::ProviderChanged(provider)).is_ok()
+    }
+
+    /// 任一视图批准/拒绝，投递决定到执行器持有的审批通道。
+    ///
+    /// 通道在整个回合内保持注册（**不**取走 sender）：同一回合里 TurnRunner 可能
+    /// 顺序触发多个工具审批，它们复用执行器在 `run_turn` 起始注册的同一个
+    /// `perm_resp_rx`。早先这里用 `.take()` 投递一次后即 drop sender，导致通道
+    /// 关闭，回合内第二个及之后的工具在 `InteractivePermissionDecider::decide()`
+    /// 里 `recv()` 立刻得到 `None` → 被秒拒（webui 发起、tuix 审批时尤为明显）。
+    /// 回合结束由 coordinator 将槽清空，故不会跨回合误用。
+    ///
+    /// 槽为空（回合外）或通道已关闭时返回 false。
     pub async fn approve(&self, decision: PermissionDecision) -> bool {
-        if let Some(tx) = self.approver.lock().await.take() {
+        if let Some(tx) = self.approver.lock().await.as_ref() {
             tx.send(decision).is_ok()
         } else {
             false
@@ -377,17 +395,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_first_come_first_served() {
+    async fn approval_channel_survives_multiple_tools_in_one_turn() {
         use crate::tool::PermissionDecision;
         let calls = Arc::new(AtomicUsize::new(0));
         let session = LiveSession::new(fake(calls), Vec::new());
 
+        // 回合外、未注册审批通道：投递失败。
+        assert!(!session.approve(PermissionDecision::Allow).await);
+
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PermissionDecision>();
         session.register_approver(tx).await;
 
-        assert!(session.approve(PermissionDecision::Allow).await);   // first delivers
-        assert!(!session.approve(PermissionDecision::Deny).await);   // second: slot empty
+        // 同一回合内连续多个工具审批，每次都必须成功投递。回归用例：早先 approve()
+        // 用 .take() 在第一次投递后 drop 掉唯一的 sender，关闭了执行器持有的
+        // 审批通道，使第二个及之后的工具被 InteractivePermissionDecider 秒拒。
+        assert!(session.approve(PermissionDecision::Allow).await);
+        assert!(session.approve(PermissionDecision::Deny).await);
+        assert!(session.approve(PermissionDecision::Allow).await);
 
+        assert!(matches!(rx.recv().await, Some(PermissionDecision::Allow)));
+        assert!(matches!(rx.recv().await, Some(PermissionDecision::Deny)));
         assert!(matches!(rx.recv().await, Some(PermissionDecision::Allow)));
     }
 }
