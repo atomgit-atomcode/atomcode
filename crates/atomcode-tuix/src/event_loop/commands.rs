@@ -953,6 +953,188 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "app" => {
+            // 把当前会话经【自建多租户中继】暴露给手机 App，二维码配对。
+            // 与 /webui 同源共用进程内 LiveSession（同一段对话、双向实时同步），
+            // 区别：① 不开浏览器，吐终端二维码；② 本机 server 走 daemon 模式
+            // （无 token，仅回环绑定），鉴权边界落在中继的 route token。
+            //
+            // 中继地址 → (ws 拨号 URL, App 用的 https 根)。
+            fn derive_relay_urls(base: &str) -> (String, String) {
+                let trimmed = base.trim().trim_end_matches('/');
+                // 用户可能直接给 wss://.../ws/daemon：剥掉路径还原成根。
+                let https_base = if let Some(rest) = trimmed.strip_prefix("wss://") {
+                    format!("https://{}", rest.trim_end_matches("/ws/daemon"))
+                } else if let Some(rest) = trimmed.strip_prefix("ws://") {
+                    format!("http://{}", rest.trim_end_matches("/ws/daemon"))
+                } else {
+                    trimmed.to_string()
+                };
+                let ws_url = if let Some(rest) = https_base.strip_prefix("https://") {
+                    format!("wss://{rest}/ws/daemon")
+                } else if let Some(rest) = https_base.strip_prefix("http://") {
+                    format!("ws://{rest}/ws/daemon")
+                } else {
+                    // 没写 scheme：默认按 TLS 处理。
+                    format!("wss://{https_base}/ws/daemon")
+                };
+                (ws_url, https_base)
+            }
+            // 最小百分号编码：query value 里除 unreserved 外全部转义，
+            // App 端 Uri.queryParameters 会自动解码还原。
+            fn pct(s: &str) -> String {
+                let mut out = String::with_capacity(s.len() * 3);
+                for b in s.bytes() {
+                    match b {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'
+                        | b'~' => out.push(b as char),
+                        _ => out.push_str(&format!("%{b:02X}")),
+                    }
+                }
+                out
+            }
+
+            let a = arg.trim();
+            let msg = if a == "stop" {
+                let killed = ctx
+                    .app_relay_child
+                    .take()
+                    .map(|mut c| {
+                        let _ = c.start_kill();
+                    })
+                    .is_some();
+                if let Some(h) = ctx.sync_forwarder.take() {
+                    h.abort();
+                }
+                ctx.sync_session = None;
+                let server_stopped = atomcode_daemon::stop_app_server();
+                if killed || server_stopped {
+                    "已停止 App 远程访问".to_string()
+                } else {
+                    "App 远程访问未在运行".to_string()
+                }
+            } else {
+                // 中继地址：命令参数优先，否则读 ATOMCODE_APP_RELAY 环境变量。
+                let relay_base = if a.is_empty() {
+                    std::env::var("ATOMCODE_APP_RELAY").ok()
+                } else {
+                    Some(a.trim_start_matches("--relay").trim().to_string())
+                };
+                match relay_base.filter(|s| !s.is_empty()) {
+                    None => "用法：/app <中继地址>，或先设环境变量 \
+                             ATOMCODE_APP_RELAY=https://你的中继域名\n\
+                             （中继地址 = 你部署的 relay-server 公网根地址，\
+                             例如 https://relay.example.com）"
+                        .to_string(),
+                    Some(relay) => {
+                        // 1) 用当前会话播种全局 LiveSession（与 /webui 同源）。
+                        let (initial, sid) = if ctx.current_session.messages.is_empty() {
+                            (Vec::new(), None)
+                        } else {
+                            (
+                                ctx.current_session.messages.clone(),
+                                Some(ctx.current_session.id.clone()),
+                            )
+                        };
+                        let session = atomcode_daemon::ensure_live_session_seeded(
+                            ctx.working_dir.clone(),
+                            ctx.telemetry.clone(),
+                            initial,
+                            sid,
+                        );
+                        // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
+                        let started = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(
+                                atomcode_daemon::ensure_app_server(
+                                    "127.0.0.1",
+                                    atomcode_daemon::APP_DEFAULT_PORT,
+                                ),
+                            )
+                        });
+                        match started {
+                            Err(e) => format!("App server 启动失败：{e}"),
+                            Ok((_h, port)) => {
+                                // 3) route token（中继路由 key + 凭证）+ 中继 URL。
+                                let token = format!(
+                                    "{}{}",
+                                    uuid::Uuid::new_v4().simple(),
+                                    uuid::Uuid::new_v4().simple()
+                                );
+                                let (ws_url, https_base) = derive_relay_urls(&relay);
+                                let machine = std::env::var("HOSTNAME")
+                                    .ok()
+                                    .or_else(|| std::env::var("COMPUTERNAME").ok());
+                                // 4) 拉起 relay-client 子进程；自身即 daemon，故
+                                //    --no-supervise-daemon。kill_on_drop：TUI 退出随之清理。
+                                let bin = std::env::var("ATOMCODE_RELAY_CLIENT_BIN")
+                                    .unwrap_or_else(|_| "atomcode-relay-client".to_string());
+                                let daemon_url = format!("http://127.0.0.1:{port}");
+                                let mut cmd = tokio::process::Command::new(&bin);
+                                cmd.arg("run")
+                                    .arg("--relay")
+                                    .arg(&ws_url)
+                                    .arg("--token")
+                                    .arg(&token)
+                                    .arg("--daemon")
+                                    .arg(&daemon_url)
+                                    // relay-client 自己别再拉 daemon —— 我们(atomcode)
+                                    // 就是 daemon。注意是带值的 `--supervise-daemon false`，
+                                    // 不存在 `--no-supervise-daemon`（clap ArgAction::Set）。
+                                    .arg("--supervise-daemon")
+                                    .arg("false")
+                                    .kill_on_drop(true)
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null());
+                                if let Some(m) = &machine {
+                                    cmd.arg("--machine-name").arg(m);
+                                }
+                                match cmd.spawn() {
+                                    Err(e) => format!(
+                                        "启动 relay-client 失败（{e}）。请确认 `{bin}` \
+                                         可执行（在 PATH 中，或用 ATOMCODE_RELAY_CLIENT_BIN \
+                                         指定其路径）。"
+                                    ),
+                                    Ok(child) => {
+                                        if let Some(mut old) = ctx.app_relay_child.take() {
+                                            let _ = old.start_kill();
+                                        }
+                                        ctx.app_relay_child = Some(child);
+                                        // 5) 配对 URI（App 扫码解析 r= / t= / m=）。
+                                        let m_param = machine
+                                            .as_deref()
+                                            .map(|m| format!("&m={}", pct(m)))
+                                            .unwrap_or_default();
+                                        let pair_uri = format!(
+                                            "atomcode-link://pair?r={}&t={}{}",
+                                            pct(&https_base),
+                                            token,
+                                            m_param
+                                        );
+                                        // 6) TUI 自己附着同一 LiveSession（终端↔手机互通）。
+                                        attach_live_session(ctx, renderer, session, false);
+                                        match crate::render::qr::render_login_qr(
+                                            &pair_uri,
+                                            crate::render::qr::QrStyle::Dense1x2,
+                                        ) {
+                                            Some(q) => format!(
+                                                "用 AtomCode App 扫码连接（手机需能访问中继 \
+                                                 {https_base}）：\n\n{q}\n配对链接：{pair_uri}\n\
+                                                 （/app stop 断开）"
+                                            ),
+                                            None => format!(
+                                                "配对链接（二维码生成失败，手动填）：{pair_uri}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            renderer.render(UiLine::CommandOutput(msg));
+            renderer.flush();
+        }
         "login" => {
             run_login_flow(renderer, ctx)?;
         }

@@ -835,6 +835,9 @@ pub struct LoopCtx {
     pub sync_session: Option<std::sync::Arc<atomcode_core::live::LiveSession>>,
     /// live 转发任务句柄（分离同步时 abort）。
     pub sync_forwarder: Option<tokio::task::JoinHandle<()>>,
+    /// `/app` 拉起的 relay-client 子进程。`kill_on_drop(true)`，所以 TUI 退出或
+    /// `/app stop` 时随之清理，不留僵尸进程。None=未开启 App 远程访问。
+    pub app_relay_child: Option<tokio::process::Child>,
     /// `true` when the TUI was launched with `PlainRenderer` (CI / pipe
     /// / non-TTY). The onboarding wizard checks this — plain mode can't
     /// run interactive multi-step flows, so first-run falls through to
@@ -7179,6 +7182,14 @@ fn handle_agent_event(
             if running {
                 state.on_submit();
             } else {
+                // 对端轮次结束：先把流式累积的助手行【收尾落地】，等价于本地
+                // TurnComplete 的第一步 AssistantLineBreak。否则这段回复一直挂在
+                // “流式当前行”里不提交，要等下一轮才被一起刷出来 —— 表现为
+                // “手机发的消息要再发一句、桌面端才显示上一条回复”。
+                // 同时 reset think-stripper，避免上一轮残留状态吞掉下一轮文本。
+                renderer.render(UiLine::AssistantLineBreak);
+                renderer.flush();
+                think.reset();
                 state.on_turn_complete();
             }
         }

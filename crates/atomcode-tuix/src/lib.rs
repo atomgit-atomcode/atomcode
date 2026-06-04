@@ -587,6 +587,7 @@ pub async fn run(
         pending_guide_topic: None,
         sync_session: None,
         sync_forwarder: None,
+        app_relay_child: None,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

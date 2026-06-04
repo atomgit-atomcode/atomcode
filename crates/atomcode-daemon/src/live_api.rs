@@ -737,6 +737,17 @@ pub(crate) async fn live_permission(
     Json(serde_json::json!({ "accepted": ok }))
 }
 
+/// POST /live/cancel —— 取消当前正在运行的 turn(停止生成)。
+/// 任一视图(手机 App「停止」/ webui / TUI)都可调用,先到先停。
+/// 返回 `{"cancelled": bool}`:false 表示当前没有运行中的 turn。
+pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResponse {
+    let cancelled = match current_live_session() {
+        Some(s) => s.cancel_turn().await,
+        None => false,
+    };
+    Json(serde_json::json!({ "cancelled": cancelled }))
+}
+
 
 #[cfg(test)]
 mod tests {

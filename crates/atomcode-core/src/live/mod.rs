@@ -82,6 +82,9 @@ pub struct LiveSession {
     /// 当前 turn 的审批响应通道。执行器在需要交互审批的 turn 开始时注册（经 run_turn
     /// 的 approver 参数）；任一视图调用 `approve` 先到先得地投递决定。
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+    /// 当前运行中 turn 的取消令牌。协调器在 turn 开始时填入、结束时清空；
+    /// 任一视图调用 [`LiveSession::cancel_turn`] 即可中断正在跑的回合(停止生成)。
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 impl LiveSession {
@@ -97,6 +100,7 @@ impl LiveSession {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let turn_state = Arc::new(Mutex::new(TurnState::Idle));
         let approver = Arc::new(Mutex::new(None));
+        let current_cancel = Arc::new(Mutex::new(None));
 
         let session = Arc::new(Self {
             snapshot: snapshot.clone(),
@@ -104,6 +108,7 @@ impl LiveSession {
             input_tx,
             turn_state: turn_state.clone(),
             approver: approver.clone(),
+            current_cancel: current_cancel.clone(),
         });
 
         tokio::spawn(coordinator(
@@ -114,6 +119,7 @@ impl LiveSession {
             input_rx,
             turn_state,
             approver,
+            current_cancel,
         ));
 
         session
@@ -177,6 +183,19 @@ impl LiveSession {
             false
         }
     }
+
+    /// 取消当前正在运行的 turn(停止生成)。无运行中 turn 时返回 false。
+    /// 真正的中断由协调器为本回合登记的 [`CancellationToken`] 驱动 —— 执行器
+    /// 的 `run_turn` 把它透传给 TurnRunner,模型流随之中止。任一视图(手机 /
+    /// webui / TUI)都可调用,先到先停。
+    pub async fn cancel_turn(&self) -> bool {
+        if let Some(tok) = self.current_cancel.lock().await.as_ref() {
+            tok.cancel();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// 协调器：单写者跑 turn。
@@ -188,6 +207,7 @@ async fn coordinator(
     mut input_rx: mpsc::UnboundedReceiver<UserInput>,
     turn_state: Arc<Mutex<TurnState>>,
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) {
     while let Some(input) = input_rx.recv().await {
         // 单写者守卫：运行中直接忽略本次输入（不排队，避免乱序）。
@@ -253,9 +273,13 @@ async fn coordinator(
         }
 
         // 跑一次 turn（执行器内部持 conv 锁修改并广播 Turn 事件）。
+        // 为本回合建取消令牌并登记,供 cancel_turn 中断;turn 结束后清空。
+        let cancel = CancellationToken::new();
+        *current_cancel.lock().await = Some(cancel.clone());
         executor
-            .run_turn(&conversation, events.clone(), approver.clone(), CancellationToken::new())
+            .run_turn(&conversation, events.clone(), approver.clone(), cancel)
             .await;
+        *current_cancel.lock().await = None;
 
         // turn 结束：清空审批槽（防止旧通道被下一个 turn 误用）。
         *approver.lock().await = None;
