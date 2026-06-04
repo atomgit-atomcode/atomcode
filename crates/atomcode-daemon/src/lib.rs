@@ -1077,6 +1077,82 @@ async fn health() -> impl IntoResponse {
     })
 }
 
+/// Webui index route with one-time-token → HttpOnly-cookie handoff.
+///
+/// `/webui` opens `http://host:port/?token=<uuid>`. Serving index.html
+/// straight from that URL would leave the token in the address bar and
+/// browser history, where a malicious extension could read it off
+/// `location.search` (CWE-598). Instead, when a valid `?token=` is
+/// present we move it into an HttpOnly `atomcode_webui` cookie and 302 to
+/// a token-less URL; the browser then loads the SPA cookie-only and every
+/// same-origin API/SSE request carries the cookie automatically.
+///
+/// Non-token requests (the post-redirect load, SPA navigations, the
+/// VSCode/standalone daemon where `enforce_token=false`) fall straight
+/// through to the static asset server.
+///
+/// `Secure` is intentionally omitted: the webui is served over plain HTTP
+/// on localhost/LAN, where a `Secure` cookie would never be sent.
+/// `HttpOnly` (blocks JS/extension reads) + `SameSite=Strict` (blocks
+/// cross-site sends) carry the protection.
+async fn serve_webui_index(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    if state.enforce_token {
+        if let Some(query) = uri.query() {
+            if let Some(token) = first_query_value(query, "token") {
+                if !token.is_empty() && state.webui_tokens.is_valid(&token) {
+                    let rest = strip_query_key(query, "token");
+                    let location = if rest.is_empty() {
+                        "/".to_string()
+                    } else {
+                        format!("/?{rest}")
+                    };
+                    let cookie = format!(
+                        "{}={}; Path=/; HttpOnly; SameSite=Strict",
+                        auth_token::WEBUI_COOKIE,
+                        token
+                    );
+                    return axum::response::Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(header::LOCATION, location)
+                        .header(header::SET_COOKIE, cookie)
+                        .body(axum::body::Body::empty())
+                        .map(IntoResponse::into_response)
+                        .unwrap_or_else(|_| {
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        });
+                }
+            }
+        }
+    }
+    webui::serve_webui(uri).await
+}
+
+/// First value for `key` in a raw `a=b&c=d` query string. Returns the raw
+/// (still percent-encoded) value; the webui token is a hex UUID so no
+/// decoding is needed.
+fn first_query_value(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let mut it = pair.splitn(2, '=');
+        match (it.next(), it.next()) {
+            (Some(k), Some(v)) if k == key => Some(v.to_string()),
+            _ => None,
+        }
+    })
+}
+
+/// Drop every `key=…` pair from a raw query string, preserving the rest
+/// verbatim so `session` / `sync` survive the token-stripping redirect.
+fn strip_query_key(query: &str, key: &str) -> String {
+    query
+        .split('&')
+        .filter(|pair| pair.split('=').next().unwrap_or("") != key)
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// POST /shutdown - Trigger graceful shutdown via HTTP (R7.1, R7.2)
 async fn shutdown_handler(State(state): State<AppState>) -> impl IntoResponse {
     state.shutdown_tx.send(true).ok();
@@ -3397,12 +3473,20 @@ async fn get_tunnel_status(
     let pgy_reachable = matches!(state.bind_host.as_str(), "0.0.0.0" | "::")
         || pgy.ipv4.as_deref() == Some(state.bind_host.as_str());
 
-    // 复用请求自带的 token（与当前页面同一 token）拼远程 URL。
+    // 复用请求自带的 token（与当前页面同一 token）拼远程 URL。Cookie 交接后
+    // SPA 的请求把 token 放在 HttpOnly Cookie 里而非 Authorization 头，所以两处都取。
     let token = auth_token::token_from_header(
         headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok()),
-    );
+    )
+    .or_else(|| {
+        auth_token::token_from_cookie(
+            headers
+                .get(axum::http::header::COOKIE)
+                .and_then(|h| h.to_str().ok()),
+        )
+    });
 
     let (remote_url, qr_svg) = match (&pgy.ipv4, &token) {
         (Some(ip), Some(tok)) if pgy_reachable => {
@@ -3687,13 +3771,16 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         bind_port: port,
     };
 
-    // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。
-    // 页面必须可加载，SPA 才能读取 ?token= 并在后续 API 调用中携带。
+    // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。页面必须可加载，
+    // 其中 `/` 把首次访问的 `?token=` 交接成 HttpOnly Cookie（见 serve_webui_index），
+    // 之后 SPA 的同源请求自动携带该 Cookie 完成鉴权。
     let public = Router::new()
         // Health check
         .route("/health", get(health))
-        // WebUI static assets + SPA fallback (Task 3/4)
-        .route("/", axum::routing::get(webui::serve_webui))
+        // WebUI static assets + SPA fallback (Task 3/4). The `/` route
+        // does the one-time-token → HttpOnly-cookie handoff (CWE-598); the
+        // fallback serves SPA routes/assets and never carries a token.
+        .route("/", axum::routing::get(serve_webui_index))
         .fallback(webui::serve_webui);
 
     // 受保护路由：所有数据/API 端点。仅 webui 模式（enforce_token=true）强制 token 鉴权；
@@ -3953,6 +4040,33 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_query_value_extracts_token() {
+        assert_eq!(first_query_value("token=abc", "token"), Some("abc".into()));
+        assert_eq!(
+            first_query_value("session=Y&token=abc&sync=1", "token"),
+            Some("abc".into())
+        );
+        assert_eq!(first_query_value("session=Y", "token"), None);
+        assert_eq!(first_query_value("", "token"), None);
+        // A bare key with no `=` is not a value.
+        assert_eq!(first_query_value("token", "token"), None);
+    }
+
+    #[test]
+    fn strip_query_key_preserves_other_params() {
+        assert_eq!(strip_query_key("token=abc", "token"), "");
+        assert_eq!(
+            strip_query_key("token=abc&session=Y", "token"),
+            "session=Y"
+        );
+        assert_eq!(
+            strip_query_key("session=Y&token=abc&sync=1", "token"),
+            "session=Y&sync=1"
+        );
+        assert_eq!(strip_query_key("session=Y", "token"), "session=Y");
+    }
 
     fn origin_is_allowed(origin: &str) -> bool {
         let origin = HeaderValue::from_str(origin).unwrap();

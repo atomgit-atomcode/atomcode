@@ -6,13 +6,23 @@
 
 use axum::{
     extract::State,
-    http::{header::AUTHORIZATION, StatusCode},
+    http::{
+        header::{AUTHORIZATION, COOKIE},
+        StatusCode,
+    },
     middleware::Next,
     response::Response,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
+
+/// Name of the HttpOnly cookie that carries the webui token after the
+/// `/?token=` handoff (see `serve_webui_index` in lib.rs). Keeping the
+/// credential in an HttpOnly cookie — rather than the URL — prevents a
+/// malicious browser extension from reading it off `location.search`
+/// (CWE-598 / CWE-522).
+pub const WEBUI_COOKIE: &str = "atomcode_webui";
 
 /// 进程内有效 webui token 集合。线程安全，可放进 `AppState`。
 #[derive(Clone, Default)]
@@ -55,6 +65,24 @@ pub fn token_from_header(value: Option<&str>) -> Option<String> {
     }
 }
 
+/// 从 `Cookie` 头解析 `atomcode_webui=<token>`。Cookie 是 `/?token=` 交接后
+/// 凭证的主要载体（HttpOnly，前端 JS / 浏览器插件读不到），EventSource/同源
+/// fetch 会自动携带。空值视为无。
+pub fn token_from_cookie(value: Option<&str>) -> Option<String> {
+    let v = value?;
+    let prefix = format!("{WEBUI_COOKIE}=");
+    for pair in v.split(';') {
+        let pair = pair.trim();
+        if let Some(tok) = pair.strip_prefix(&prefix) {
+            let tok = tok.trim();
+            if !tok.is_empty() {
+                return Some(tok.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Axum 中间件：校验 `Authorization: Bearer <token>` 是否为有效的 webui token。
 ///
 /// 签名与 `activity_tracker_middleware`（同 crate）保持一致——
@@ -69,11 +97,17 @@ pub async fn require_webui_token(
         // 独立 daemon / VSCode 实例：不强制 token，保持原行为。
         return Ok(next.run(req).await);
     }
+    // Accept the token from either the `Authorization: Bearer` header
+    // (programmatic clients, legacy URL-token front-ends) OR the HttpOnly
+    // `atomcode_webui` cookie set by the `/?token=` handoff. Header wins
+    // when both are present.
     let header = req
         .headers()
         .get(AUTHORIZATION)
         .and_then(|h| h.to_str().ok());
-    match token_from_header(header) {
+    let cookie = req.headers().get(COOKIE).and_then(|h| h.to_str().ok());
+    let token = token_from_header(header).or_else(|| token_from_cookie(cookie));
+    match token {
         Some(tok) if state.webui_tokens.is_valid(&tok) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
@@ -116,5 +150,33 @@ mod tests {
     fn mint_is_unique() {
         let store = WebuiTokenStore::new();
         assert_ne!(store.mint(), store.mint());
+    }
+
+    #[test]
+    fn extracts_token_from_cookie() {
+        assert_eq!(
+            token_from_cookie(Some("atomcode_webui=abc123")),
+            Some("abc123".to_string())
+        );
+        // Among other cookies, any order.
+        assert_eq!(
+            token_from_cookie(Some("foo=1; atomcode_webui=abc123; bar=2")),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            token_from_cookie(Some("bar=2; atomcode_webui=xyz")),
+            Some("xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn cookie_without_token_is_none() {
+        assert_eq!(token_from_cookie(None), None);
+        assert_eq!(token_from_cookie(Some("")), None);
+        assert_eq!(token_from_cookie(Some("foo=1; bar=2")), None);
+        assert_eq!(token_from_cookie(Some("atomcode_webui=")), None);
+        assert_eq!(token_from_cookie(Some("atomcode_webui= ")), None);
+        // Must not match a different cookie that merely ends with the name.
+        assert_eq!(token_from_cookie(Some("x_atomcode_webui=nope")), None);
     }
 }
