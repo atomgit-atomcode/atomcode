@@ -1,5 +1,11 @@
 use super::*;
 
+/// Monotonic counter for synthetic local-shell call ids. `messages.len()`
+/// is NOT unique — `add_user_message` merges consecutive User text without
+/// growing the vec, so two `!` in a row would collide. A process-wide
+/// counter guarantees a unique id regardless of conversation merging.
+static LOCAL_SHELL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl AgentLoop {
     /// Handle a user-invoked `!cmd`. Executes the shell command in the
     /// agent's working dir, streams output to the TUI as a synthetic tool
@@ -13,7 +19,10 @@ impl AgentLoop {
         }
 
         let wd = self.turn_runner.context.working_dir.read().await.clone();
-        let call_id = format!("local-shell-{}", self.conversation.messages.len());
+        let call_id = format!(
+            "local-shell-{}",
+            LOCAL_SHELL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
 
         let _ = self.event_tx.send(crate::agent::AgentEvent::ToolCallStarted {
             id: call_id.clone(),
