@@ -65,6 +65,11 @@ pub struct PluginManager {
     /// (uninstalled) automatically so the filesystem is not left in an
     /// inconsistent state.
     cancelled_installs: HashSet<String>,
+    /// Set by a successful uninstall / marketplace-removal so `handle_key`
+    /// closes the manager afterwards. Without this the modal lingered on a
+    /// now-empty list whose render is indistinguishable from the idle prompt,
+    /// silently swallowing keystrokes until the user discovered Esc.
+    close_requested: bool,
 }
 
 /// Path-safe segment, mirroring `marketplace::sanitize_name` (which is crate
@@ -90,6 +95,7 @@ impl PluginManager {
             pending: None,
             installing_plugin: None,
             cancelled_installs: HashSet::new(),
+            close_requested: false,
         };
         m.reload();
         m
@@ -223,6 +229,7 @@ impl PluginManager {
                             .into_owned(),
                     ));
                     self.reload();
+                    self.close_requested = true;
                 }
                 Err(e) => renderer.render(UiLine::Error(
                     t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
@@ -262,6 +269,7 @@ impl PluginManager {
                     t(Msg::PluginMarketplaceRemoved { name: &name }).into_owned(),
                 ));
                 self.reload();
+                self.close_requested = true;
             }
             Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
         }
@@ -278,6 +286,7 @@ impl PluginManager {
                     t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned(),
                 ));
                 self.reload();
+                self.close_requested = true;
             }
             Err(e) => renderer.render(UiLine::Error(
                 t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
@@ -490,6 +499,11 @@ impl Modal for PluginManager {
                 }
             }
             _ => {}
+        }
+        // A successful uninstall / marketplace removal closes the manager so
+        // it never lingers on an empty list that mimics the idle prompt.
+        if std::mem::take(&mut self.close_requested) {
+            return Ok(ModalAction::Close);
         }
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
