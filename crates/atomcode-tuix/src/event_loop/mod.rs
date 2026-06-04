@@ -8056,6 +8056,10 @@ pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
         .get(&ctx.config.default_provider)
         .map(|p| p.provider_type.as_str())
         .unwrap_or("");
+    // Model-name check delegates to the provider so the UI "applicable" hint
+    // and the actual request-body gate (OpenAiProvider) can never diverge.
     (ptype == "deepseek" || ptype == "openai")
-        && ctx.model_name.to_ascii_lowercase().contains("deepseek-v4")
+        && atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
+            &ctx.model_name,
+        )
 }

@@ -24,34 +24,11 @@ use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::Config;
-use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
-
-#[allow(dead_code)]
-fn build_oauth_provider() -> ProviderConfig {
-    ProviderConfig {
-        provider_type: "openai".to_string(),
-        api_key: None,
-        model: "MiniMax-M2.7".to_string(),
-        base_url: Some("https://llm-api.atomgit.com/v1".to_string()),
-        system_prompt: None,
-        user_agent: None,
-        context_window: 64_000,
-        max_tokens: None,
-        thinking_type: None,
-        thinking_keep: None,
-        reasoning_history: None,
-        reasoning_effort: None,
-        thinking_enabled: None,
-        thinking_budget: None,
-        skip_tls_verify: false,
-        ephemeral: false,
-    }
-}
 
 fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
     if matches!(

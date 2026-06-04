@@ -836,7 +836,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
 
         // ── reasoning effort ──
-        Msg::ReasoningEffortNoEffect => "reasoning_effort has no effect on the current model (only DeepSeek V4 / reasoner)".into(),
+        Msg::ReasoningEffortNoEffect => "reasoning_effort has no effect on the current model (only DeepSeek V4)".into(),
 
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>

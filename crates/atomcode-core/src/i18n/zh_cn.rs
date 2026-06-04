@@ -824,7 +824,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
 
         // ── reasoning effort ──
-        Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 / reasoner 有效）".into(),
+        Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 有效）".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>
