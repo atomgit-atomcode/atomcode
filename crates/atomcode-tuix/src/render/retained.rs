@@ -4718,6 +4718,67 @@ mod tests {
         );
     }
 
+    /// Regression: after a `/skills` menu containing CJK skill names/descs
+    /// closes, no glyph fragments may linger on screen. The user saw stray
+    /// `式` / `致` characters at column 0 below the input box after browsing
+    /// the installed-skills list and then clearing the buffer.
+    #[test]
+    fn closing_cjk_skill_menu_leaves_no_residual_glyphs() {
+        // Small screen so body + the menu-grown footer compete for rows and
+        // the body must scroll when the menu opens (and back when it closes).
+        let (mut r, buf) = new_capturing(80, 12);
+        let status = status_basic();
+
+        // Some ASCII body content (welcome-banner stand-in).
+        for i in 0..6 {
+            r.render(UiLine::User(format!("line-{i}")));
+        }
+
+        // A skills menu with CJK content, larger than the visible window so
+        // it paginates (mirrors "scroll down through installed skills").
+        let items: Vec<(String, String)> = (0..12)
+            .map(|i| (format!("技能{i}"), "代码格式化导致的问题".to_string()))
+            .collect();
+        r.render(UiLine::InputPrompt {
+            buf: "/skills ".into(),
+            cursor_byte: "/skills ".len(),
+            menu: Some(MenuPayload {
+                items: items.clone(),
+                selected: 8, // scrolled down past the first page
+                kind: crate::render::MenuKind::Skill,
+            }),
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Close the menu (user cleared the buffer).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 12);
+        drain_into_vterm(&buf, &mut vterm);
+
+        for row in 0..12 {
+            let text = vterm.row_text(row);
+            assert!(
+                !text.contains('式')
+                    && !text.contains('致')
+                    && !text.contains('技')
+                    && !text.contains('能'),
+                "residual menu glyph lingered on row {}: {:?}",
+                row,
+                text
+            );
+        }
+    }
+
     /// Regression: user showed a 5-column CJK table with long cells
     /// overflowing past the terminal's right edge — `flush_aligned_table`
     /// was ignoring terminal width. This test verifies the full pipeline
