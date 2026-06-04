@@ -4249,6 +4249,7 @@ mod tests {
             mode_indicator: Some("PLAN".into()),
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
+            reasoning_effort: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -4293,6 +4294,7 @@ mod tests {
             mode_indicator: None,
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
+            reasoning_effort: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
