@@ -124,7 +124,11 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // skill list. Selecting a skill commits as `/skills <name>` →
     // dispatched by the `skills` arm in execute_slash_command.
     Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
-    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: true },
+    // needs_args=false so selecting `/plugin` opens the manager modal on the
+    // first Enter (like /model, /provider, /session). Subcommands
+    // (`/plugin install x@mp`, `uninstall`, `marketplace`, `list`) still work
+    // by typing the full line — needs_args only changes the menu-Enter behavior.
+    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: false },
     // Windows fallback for Ctrl+V: Windows Terminal / conhost
     // intercept Ctrl+V as their own `paste` action (which forwards
     // only `CF_UNICODETEXT`) before the keystroke reaches atomcode,

@@ -634,6 +634,7 @@ mod tests {
             pending: None,
             installing_plugin: None,
             cancelled_installs: HashSet::new(),
+            close_requested: false,
         }
     }
 
