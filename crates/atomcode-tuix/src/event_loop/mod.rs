@@ -5741,10 +5741,12 @@ fn handle_agent_event(
             pending_tools.insert(id, (display.clone(), detail, true));
             state.on_tool_call_started(&display);
         }
-        AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
-            // Display real-time tool output (e.g., bash stdout/stderr)
-            // Only show when the user has enabled it via Ctrl+O
-            if state.show_tool_output {
+        AgentEvent::ToolOutputChunk { call_id, chunk } => {
+            // Display real-time tool output (e.g., bash stdout/stderr).
+            // Normally gated behind Ctrl+O verbose mode, but user-invoked
+            // `!` shell commands always stream in full — the user ran them
+            // precisely to see the output.
+            if state.show_tool_output || call_id.starts_with("local-shell-") {
                 // Append to the scrollback as command output
                 renderer.render(UiLine::CommandOutput(chunk));
                 renderer.flush();
@@ -5918,7 +5920,10 @@ fn handle_agent_event(
             // The previous over-correction (screenshot 44 → 47) showed
             // that "looks like 2 blank lines" is just font line-height
             // padding — the actual row count is 1, which is correct.
-            if name == "bash" && !state.show_tool_output {
+            if name == "bash"
+                && !state.show_tool_output
+                && !call_id.starts_with("local-shell-")
+            {
                 renderer.render(UiLine::CommandOutput(
                     "  ○ Press Ctrl+O to show real-time output\n".to_string(),
                 ));
