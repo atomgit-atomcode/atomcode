@@ -2323,6 +2323,32 @@ mod tool_format_tests {
         assert_eq!(display_tool_name("_x"), "X");
     }
 
+    /// MCP tool names arrive on the wire as `mcp__<server>__<tool>` —
+    /// the double underscores carry meaning. Naive PascalCase folds the
+    /// three parts into one blob (`McpZouwuQueryRequirements`), which
+    /// the issue reporter (#299) couldn't visually parse. Render with
+    /// middle-dot separators instead.
+    #[test]
+    fn display_tool_name_splits_mcp_server_and_tool() {
+        assert_eq!(
+            display_tool_name("mcp__zouwu__query"),
+            "mcp · zouwu · query"
+        );
+        assert_eq!(
+            display_tool_name("mcp__zouwu-mcp-server__query_requirements"),
+            "mcp · zouwu-mcp-server · query_requirements"
+        );
+    }
+
+    /// Defensive: an `mcp__`-prefixed name that's missing the second
+    /// `__` boundary (e.g. partial / malformed wire name) falls back
+    /// to the generic PascalCase path rather than panicking on a
+    /// missing split.
+    #[test]
+    fn display_tool_name_mcp_missing_second_separator_falls_back() {
+        assert_eq!(display_tool_name("mcp__lonely"), "McpLonely");
+    }
+
     /// Short form strips the redundant noun suffix so batch UI shows
     /// `Read(mod.rs)` instead of `ReadFile(mod.rs)` — matches CC's
     /// function-call-style tool labels. Strip list is generic
@@ -7831,7 +7857,22 @@ fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
 /// protocol uses `read_file`, `edit_file`, `web_fetch` etc.; the UI shows
 /// `ReadFile`, `EditFile`, `WebFetch` — a CC-style convention that reads
 /// more cleanly at a glance.
+///
+/// MCP tools arrive on the wire as `mcp__<server>__<tool>`. Naive
+/// PascalCase collapses the three parts into `McpZouwuQueryRequirements`
+/// where the server / tool boundary disappears. Render them with a
+/// middle-dot separator so users can tell at a glance which part is the
+/// server and which is the tool (#299).
 pub fn display_tool_name(snake: &str) -> String {
+    if let Some(rest) = snake.strip_prefix("mcp__") {
+        if let Some((server, tool)) = rest.split_once("__") {
+            return format!("mcp · {} · {}", server, tool);
+        }
+    }
+    pascal_case(snake)
+}
+
+fn pascal_case(snake: &str) -> String {
     let mut out = String::with_capacity(snake.len());
     for word in snake.split('_') {
         let mut chars = word.chars();
