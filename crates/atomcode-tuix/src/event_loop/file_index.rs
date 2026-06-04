@@ -137,8 +137,8 @@ impl FileIndex {
     /// spawned (first-ever call), `false` otherwise.
     ///
     /// **Staged warm-up**: before spawning the full-tree walk, the
-    /// root's direct children are collected synchronously via a quick
-    /// `read_dir` and stored immediately. This lets `filter()` return
+    /// root's direct children are collected synchronously via a shallow
+    /// (depth-1) gitignore-aware scan and stored immediately. This lets `filter()` return
     /// results on the very first `@` keystroke (showing top-level
     /// files/dirs) without waiting for the full walk to finish.
     /// The background thread replaces the cache with the complete
@@ -152,8 +152,8 @@ impl FileIndex {
         }
         *self.building.borrow_mut() = true;
 
-        // Stage 1: quick synchronous scan of root's direct children.
-        // This is a single `read_dir` syscall — effectively instant.
+        // Stage 1: quick synchronous depth-1 scan of root's direct children.
+        // Bounded to one directory level (gitignore-aware) — effectively instant.
         *self.entries.borrow_mut() = Some(Self::scan_shallow(&self.root.borrow()));
 
         // Stage 2: spawn background thread for the full walk.
@@ -253,8 +253,19 @@ impl FileIndex {
     }
 
     fn walk_inner(root: PathBuf) -> Vec<Entry> {
+        Self::walk_with_depth(root, None)
+    }
+
+    /// Gitignore-respecting walk shared by the full index (`max_depth = None`)
+    /// and the staged warm-up (`max_depth = Some(1)` → the root's direct
+    /// children only). Routing both through one function guarantees the
+    /// shallow and full views apply identical filtering (gitignore, `.git/`,
+    /// whitespace), so warm-up results never include entries the full index
+    /// later hides.
+    fn walk_with_depth(root: PathBuf, max_depth: Option<usize>) -> Vec<Entry> {
         let mut out = Vec::new();
-        let walker = WalkBuilder::new(&root)
+        let mut builder = WalkBuilder::new(&root);
+        builder
             .hidden(false)
             .git_ignore(true)
             .git_global(true)
@@ -262,8 +273,10 @@ impl FileIndex {
             .ignore(true)
             .parents(true)
             .require_git(false)
-            .max_filesize(None)
-            .build();
+            .max_filesize(None);
+        // None = unbounded (full subtree); Some(1) = root + its direct children.
+        builder.max_depth(max_depth);
+        let walker = builder.build();
 
         for result in walker {
             let Ok(dent) = result else { continue };
@@ -273,7 +286,7 @@ impl FileIndex {
             if rel.as_os_str().is_empty() {
                 continue; // skip the root itself
             }
-            let is_dir = dent.file_type().map_or(false, |t| t.is_dir());
+            let is_dir = dent.file_type().is_some_and(|t| t.is_dir());
             let mut s = rel_path_to_forward_slash(rel);
 
             // v1 limitation: skip paths containing whitespace (would break
@@ -303,46 +316,17 @@ impl FileIndex {
         out
     }
 
-    /// Fast synchronous scan of a single directory's direct children
-    /// (no recursion). Used by the staged warm-up to show immediate
-    /// results before the full-tree `walk_inner` completes.
+    /// Shallow warm-up scan of the root's direct children, used to show
+    /// immediate results on the first `@` before the full-tree walk finishes.
     ///
-    /// Behaviour is deliberately kept in sync with `walk_inner`:
-    /// - Hidden files/dirs are **not** skipped (walk_inner uses `.hidden(false)`)
-    /// - Only `.git/` is explicitly excluded
-    /// - Paths containing whitespace are excluded
+    /// Delegates to `walk_with_depth(.., Some(1))` so it applies the **exact
+    /// same** filtering as the full index — crucially gitignore — rather than
+    /// a raw `read_dir`. This prevents gitignored top-level dirs
+    /// (`node_modules/`, `target/`, …) from flashing in the popup and then
+    /// vanishing once the full walk replaces the cache. Still bounded to one
+    /// directory level, so it stays effectively instant.
     fn scan_shallow(root: &Path) -> Vec<Entry> {
-        let mut out = Vec::new();
-        let Ok(rd) = std::fs::read_dir(root) else {
-            return out;
-        };
-        for result in rd {
-            let Ok(dent) = result else {
-                continue;
-            };
-            let Ok(name) = dent.file_name().into_string() else {
-                continue;
-            };
-            // Skip `.git/` specifically (same as walk_inner).
-            if name == ".git" {
-                continue;
-            }
-            // v1 limitation: skip paths containing whitespace.
-            if name.contains(char::is_whitespace) {
-                continue;
-            }
-            let is_dir = dent.file_type().map_or(false, |t| t.is_dir());
-            let mut rel = name;
-            if is_dir {
-                rel.push('/');
-            }
-            out.push(Entry {
-                rel_path: rel,
-                is_dir,
-                depth: 1,
-            });
-        }
-        out
+        Self::walk_with_depth(root.to_path_buf(), Some(1))
     }
 
     /// Re-point the index to a new root directory and clear all cached
@@ -640,6 +624,31 @@ mod tests {
         assert!(
             !names.contains(&"ignored.txt"),
             "gitignored file should be skipped: {:?}",
+            names
+        );
+    }
+
+    // Regression: the staged warm-up's shallow scan must apply the SAME
+    // gitignore filtering as the full walk. Otherwise a gitignored top-level
+    // dir would flash in the popup during warm-up and then vanish once the
+    // full walk replaces the cache.
+    #[test]
+    fn scan_shallow_respects_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join(".gitignore"), "ignored/\n");
+        write_file(&tmp.path().join("ignored/").join("secret.txt"), "x");
+        write_file(&tmp.path().join("visible.txt"), "v");
+
+        let shallow = FileIndex::scan_shallow(tmp.path());
+        let names: Vec<&str> = shallow.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(
+            names.contains(&"visible.txt"),
+            "shallow scan should list non-ignored direct children: {:?}",
+            names
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("ignored")),
+            "shallow scan must honour .gitignore (no `ignored/`): {:?}",
             names
         );
     }
