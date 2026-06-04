@@ -1,6 +1,7 @@
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
 
+import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
@@ -20,11 +21,28 @@ interface ToolRow {
   output?: string;
 }
 
+/** One ordered conversation segment: a run of assistant text, or one tool
+ *  call. Storing parts in arrival order preserves the chronological
+ *  text→tool→text→tool interleaving the LLM produced (matching the TUI),
+ *  instead of collapsing every tool to the head of the message. */
+type MsgPart =
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; tool: ToolRow };
+
 interface Message {
   role: 'user' | 'assistant';
-  text: string;
-  tools: ToolRow[];
+  parts: MsgPart[];
   images?: ImageData[];
+}
+
+/** Concatenate all text segments (error-detection, skill-title, etc.). */
+function messageText(m: Message): string {
+  return m.parts.reduce((acc, p) => (p.kind === 'text' ? acc + p.text : acc), '');
+}
+
+/** Whether a message contains any tool segments. */
+function messageHasTools(m: Message): boolean {
+  return m.parts.some((p) => p.kind === 'tool');
 }
 
 /** Max attached images per message and per-image byte cap (raw file size). */
@@ -347,28 +365,37 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (msg.role === 'user') {
         loaded.push({
           role: 'user',
-          text: stripVisionAnnotation(msg.content ?? ''),
-          tools: [],
+          parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
           images: msg.images && msg.images.length ? msg.images : undefined,
         });
       } else if (msg.role === 'assistant') {
-        const tools: ToolRow[] = (msg.tool_calls ?? []).map((tc) => ({
-          id: tc.id,
-          name: tc.name,
-          args: tc.arguments || tc.display || '',
-          status: 'done' as const,
-        }));
-        loaded.push({ role: 'assistant', text: msg.content ?? '', tools });
+        // Text comes first (the LLM speaks, then calls tools), so the part
+        // order for a persisted round is [text, tool, tool, …].
+        const parts: MsgPart[] = [];
+        if (msg.content) parts.push({ kind: 'text', text: msg.content });
+        for (const tc of msg.tool_calls ?? []) {
+          parts.push({
+            kind: 'tool',
+            tool: {
+              id: tc.id,
+              name: tc.name,
+              args: tc.arguments || tc.display || '',
+              status: 'done',
+            },
+          });
+        }
+        loaded.push({ role: 'assistant', parts });
       } else if (msg.role === 'tool' && msg.tool_result) {
         const result = msg.tool_result;
-        for (let i = loaded.length - 1; i >= 0; i--) {
+        outer: for (let i = loaded.length - 1; i >= 0; i--) {
           const m = loaded[i];
           if (m.role !== 'assistant') continue;
-          const row = m.tools.find((t) => t.id === result.call_id);
-          if (row) {
-            row.output = result.summary;
-            row.status = result.success ? 'done' : 'error';
-            break;
+          for (const p of m.parts) {
+            if (p.kind === 'tool' && p.tool.id === result.call_id) {
+              p.tool.output = result.summary;
+              p.tool.status = result.success ? 'done' : 'error';
+              break outer;
+            }
           }
         }
       }
@@ -432,8 +459,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         // Append the peer's user message + empty assistant placeholder
         setMessages((prev) => [
           ...prev,
-          { role: 'user', text: e.text, tools: [], images: e.images && e.images.length ? e.images : undefined },
-          { role: 'assistant', text: '', tools: [] },
+          { role: 'user', parts: [{ kind: 'text', text: e.text }], images: e.images && e.images.length ? e.images : undefined },
+          { role: 'assistant', parts: [] },
         ]);
         break;
       }
@@ -482,10 +509,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (prev.length === 0) return prev;
       const last = prev[prev.length - 1];
       if (last.role !== 'assistant') return prev;
-      return [
-        ...prev.slice(0, -1),
-        { ...last, text: last.text + content },
-      ];
+      const parts = last.parts.slice();
+      const tail = parts[parts.length - 1];
+      if (tail && tail.kind === 'text') {
+        // Continue the current text run.
+        parts[parts.length - 1] = { kind: 'text', text: tail.text + content };
+      } else {
+        // First text, or text after a tool → start a new text segment so the
+        // chronological order (…tool → text…) is preserved.
+        parts.push({ kind: 'text', text: content });
+      }
+      return [...prev.slice(0, -1), { ...last, parts }];
     });
   }
 
@@ -497,10 +531,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (prev.length === 0) return prev;
       const last = prev[prev.length - 1];
       if (last.role !== 'assistant') return prev;
-      const tools = last.tools.map((t) =>
-        t.id === id ? { ...t, ...update } : t,
+      const parts = last.parts.map((p) =>
+        p.kind === 'tool' && p.tool.id === id
+          ? { kind: 'tool' as const, tool: { ...p.tool, ...update } }
+          : p,
       );
-      return [...prev.slice(0, -1), { ...last, tools }];
+      return [...prev.slice(0, -1), { ...last, parts }];
     });
   }
 
@@ -508,14 +544,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     setMessages((prev) => {
       if (prev.length === 0) return prev;
       const last = prev[prev.length - 1];
-      if (last.role !== 'assistant' || last.tools.length === 0) return prev;
-      const tools = last.tools.slice();
-      const lastTool = tools[tools.length - 1];
-      tools[tools.length - 1] = {
-        ...lastTool,
-        output: (lastTool.output ?? '') + chunk,
+      if (last.role !== 'assistant') return prev;
+      // Append to the most recent tool segment's output.
+      let idx = -1;
+      for (let i = last.parts.length - 1; i >= 0; i--) {
+        if (last.parts[i].kind === 'tool') {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0) return prev;
+      const parts = last.parts.slice();
+      const tp = parts[idx] as { kind: 'tool'; tool: ToolRow };
+      parts[idx] = {
+        kind: 'tool',
+        tool: { ...tp.tool, output: (tp.tool.output ?? '') + chunk },
       };
-      return [...prev.slice(0, -1), { ...last, tools }];
+      return [...prev.slice(0, -1), { ...last, parts }];
     });
   }
 
@@ -526,7 +571,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (last.role !== 'assistant') return prev;
       return [
         ...prev.slice(0, -1),
-        { ...last, tools: [...last.tools, tool] },
+        { ...last, parts: [...last.parts, { kind: 'tool', tool }] },
       ];
     });
   }
@@ -623,8 +668,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // Push user message + empty assistant placeholder
     setMessages((prev) => [
       ...prev,
-      { role: 'user', text, tools: [], images: images.length ? images : undefined },
-      { role: 'assistant', text: '', tools: [] },
+      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined },
+      { role: 'assistant', parts: [] },
     ]);
 
     const controller = new AbortController();
@@ -1160,15 +1205,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             return <UserMessageView key={idx} msg={msg} />;
           }
 
+          const text = messageText(msg);
           const isError =
-            msg.text.includes('[错误:') ||
-            msg.text.includes('[连接错误:') ||
-            msg.text.includes('[Error:') ||
-            msg.text.includes('[Connection error:');
+            text.includes('[错误:') ||
+            text.includes('[连接错误:') ||
+            text.includes('[Error:') ||
+            text.includes('[Connection error:');
           const streaming = isLast && busy;
           // 终条且简短（无工具、单行）时，去掉多余的“时间线末端”橙点，只留一个起始点。
           const terse =
-            isLast && !streaming && msg.tools.length === 0 && !msg.text.includes('\n');
+            isLast && !streaming && !messageHasTools(msg) && !text.includes('\n');
           const dotClass = isError ? 'dot-error' : 'dot-brand';
           const cls =
             'timeline-message ' +
@@ -1179,28 +1225,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
           return (
             <div key={idx} class={cls}>
-              {/* Tool rows */}
-              {msg.tools.length > 0 && (
-                <div class="tool-list">
-                  {msg.tools.map((tool) => (
-                    <ToolRowView key={tool.id} tool={tool} />
-                  ))}
+              {/* Error turns are pure injected text — render flat. */}
+              {isError ? (
+                <div class="error-message-content">
+                  {text}
+                  {streaming && <span class="streaming-cursor" />}
                 </div>
-              )}
-
-              {/* Assistant text — show even if empty while streaming */}
-              {(msg.text || streaming) && (
-                isError ? (
-                  <div class="error-message-content">
-                    {msg.text}
-                    {streaming && <span class="streaming-cursor" />}
-                  </div>
-                ) : (
-                  <>
-                    <Markdown content={msg.text} />
-                    {streaming && <span class="streaming-cursor" />}
-                  </>
-                )
+              ) : (
+                <>
+                  {/* Segments in chronological order: text→tool→text→tool,
+                      matching the TUI. Consecutive tools share one tool-list. */}
+                  {renderAssistantParts(msg.parts)}
+                  {streaming && <span class="streaming-cursor" />}
+                </>
               )}
             </div>
           );
@@ -1244,10 +1281,44 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   );
 }
 
+/** Render an assistant message's ordered parts in chronological order: each
+ *  text run becomes Markdown; runs of consecutive tool calls share one
+ *  `.tool-list` container. This is what preserves the text→tool→text→tool
+ *  interleaving (matching the TUI) instead of grouping all tools at the head. */
+function renderAssistantParts(parts: MsgPart[]): VNode[] {
+  const out: VNode[] = [];
+  let i = 0;
+  while (i < parts.length) {
+    const p = parts[i];
+    if (p.kind === 'tool') {
+      const groupKey = i;
+      const tools: ToolRow[] = [];
+      while (i < parts.length) {
+        const q = parts[i];
+        if (q.kind !== 'tool') break;
+        tools.push(q.tool);
+        i++;
+      }
+      out.push(
+        <div class="tool-list" key={`tg-${groupKey}`}>
+          {tools.map((tool) => (
+            <ToolRowView key={tool.id} tool={tool} />
+          ))}
+        </div>,
+      );
+    } else {
+      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} />);
+      i++;
+    }
+  }
+  return out;
+}
+
 function UserMessageView({ msg }: { msg: Message }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
-  const skillTitle = detectSkillContent(msg.text);
+  const text = messageText(msg);
+  const skillTitle = detectSkillContent(text);
   const [expanded, setExpanded] = useState(false);
 
   const images = msg.images && msg.images.length > 0 && (
@@ -1286,7 +1357,7 @@ function UserMessageView({ msg }: { msg: Message }) {
         )}
         {/* 技能/文档型内容本就是 markdown（注入的 SKILL.md），渲染它；
             普通用户消息保持逐字纯文本（不把用户输入当 markdown 解析）。 */}
-        {skillTitle ? <Markdown content={msg.text} /> : msg.text}
+        {skillTitle ? <Markdown content={text} /> : text}
       </div>
     </div>
   );
