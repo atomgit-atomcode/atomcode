@@ -3081,8 +3081,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // Fires once when the detached startup check resolves with a
             // positive result. Idle-only: in Streaming the spinner tick
             // redraws frequently enough that the hint picks up naturally.
+            // Preserve an active `/` command menu — don't blindly call
+            // `redraw_idle_plain(menu: None)` which would erase it.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
-                redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                let items = menu_for_display(&app.buf, &ctx);
+                if let Some(items) = items {
+                    redraw_with_menu(
+                        &app.buf,
+                        &items,
+                        app.menu.selected,
+                        &app.state,
+                        &ctx,
+                        renderer,
+                    );
+                } else {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                }
             }
 
             // ── OAuth poll thread results ──
@@ -3464,8 +3478,23 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Version-check wake ──
+            // Must check for an active `/` command menu before calling
+            // `redraw_idle_plain` — otherwise the menu gets erased when
+            // this fires a second or two after the user types `/`.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
-                redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                let items = menu_for_display(&app.buf, &ctx);
+                if let Some(items) = items {
+                    redraw_with_menu(
+                        &app.buf,
+                        &items,
+                        app.menu.selected,
+                        &app.state,
+                        &ctx,
+                        renderer,
+                    );
+                } else {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                }
             }
 
             // ── OAuth poll thread results ──

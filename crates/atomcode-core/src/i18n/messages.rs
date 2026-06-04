@@ -226,6 +226,9 @@ pub enum Msg<'a> {
     SessionListFailed { error: &'a str },
     SessionRenamed { old: &'a str, new: &'a str },
     SessionSaveFailed { error: &'a str },
+    SessionDeleted { name: &'a str },
+    SessionDeleteConfirm { name: &'a str },
+    SessionDeleteFailed { error: &'a str },
     SessionNoneSelected,
     SessionRenameEditing { buffer: &'a str },
 

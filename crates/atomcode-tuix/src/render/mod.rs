@@ -311,6 +311,28 @@ pub enum MenuKind {
     /// `$`-trigger skills picker. Rows show the bare skill name + description,
     /// no `/`, `/skills`, or `$` prefix; selection marked with `▸`.
     Skill,
+    /// Two-column list: name left-aligned, desc right-aligned,
+    /// selected row uses reverse-video (no prefix, no arrow).
+    /// Used by session picker.
+    /// `row_prefix` is prepended before the name (e.g. `/`).
+    /// `selected_marker` is shown before the prefix for the selected row;
+    /// unselected rows get `display_width(marker)` spaces.
+    TwoColumn {
+        row_prefix: &'static str,
+        selected_marker: &'static str,
+    },
+}
+
+impl MenuKind {
+    /// Max visible rows for this menu kind. Both `paint_footer` and
+    /// `current_footer_rows` use this so the estimate matches actual
+    /// rendering.
+    pub fn max_visible_rows(&self, screen_height: usize, item_count: usize) -> usize {
+        match self {
+            MenuKind::SlashCommand | MenuKind::AtMention | MenuKind::Skill => item_count.min(4),
+            MenuKind::TwoColumn { .. } => item_count.min(screen_height / 2).max(4),
+        }
+    }
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.
