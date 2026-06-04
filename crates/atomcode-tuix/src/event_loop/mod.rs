@@ -2371,6 +2371,22 @@ mod tool_format_tests {
         assert_eq!(display_tool_name_short("blast_radius"), "BlastRadius");
     }
 
+    /// The short form must NOT strip `_file`/`_files`/`_directory` from an
+    /// MCP tool name — that suffix is part of the real tool, not a redundant
+    /// noun. `mcp__fs__read_file` stays `mcp · fs · read_file`, not
+    /// `mcp · fs · read`.
+    #[test]
+    fn display_tool_name_short_keeps_mcp_suffix() {
+        assert_eq!(
+            display_tool_name_short("mcp__fs__read_file"),
+            "mcp · fs · read_file"
+        );
+        assert_eq!(
+            display_tool_name_short("mcp__playwright-mcp-server__browser_snapshot"),
+            "mcp · playwright-mcp-server · browser_snapshot"
+        );
+    }
+
     #[test]
     fn format_tool_detail_read_file_basename() {
         let args = r#"{"file_path":"/abs/path/to/foo.rs"}"#;
@@ -7899,6 +7915,13 @@ fn pascal_case(snake: &str) -> String {
 /// - `search_replace` → `SearchReplace` (suffix `_replace` not in
 ///    strip list, kept verbatim → preserves disambiguation)
 pub fn display_tool_name_short(snake: &str) -> String {
+    // MCP wire names (`mcp__server__tool`) carry their suffix as part of the
+    // real tool name — stripping `_file`/`_files`/`_directory` here would turn
+    // `mcp__fs__read_file` into `mcp · fs · read`. Hand the full name to
+    // display_tool_name so the `mcp · server · tool` split stays verbatim.
+    if snake.starts_with("mcp__") {
+        return display_tool_name(snake);
+    }
     const STRIP_SUFFIXES: &[&str] = &["_files", "_file", "_directory"];
     let trimmed = STRIP_SUFFIXES
         .iter()
