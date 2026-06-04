@@ -238,39 +238,38 @@ impl Screen {
         let mut out = Vec::with_capacity(body.len() + 32);
         if has_visible_work {
             out.extend_from_slice(b"\x1b[?2026h");
-            // Hide the cursor during the patch walk to prevent flicker.
-            // MUST pair with the stale_vis-guarded restore below; an
-            // unconditional hide with conditional restore leaves the
-            // cursor permanently invisible on non-DECSET-2026 terminals
-            // after the first frame (frame 2+ hide unconditionally but
-            // never restore because stale_vis=false).
-            if stale_vis {
-                out.extend_from_slice(b"\x1b[?25l");
-            }
+            // Hide the cursor for the patch walk. `serialize_patches`
+            // walks the caret across every changed cell, so any frame
+            // with patches WILL move it — hide unconditionally here and
+            // pair with the `has_visible_work`-guarded restore below.
+            // (Gating the hide on `stale_vis` was a bug: on frame 2+
+            // with unchanged visibility the caret bounced visibly across
+            // the patched cells on non-DECSET-2026 terminals.)
+            out.extend_from_slice(b"\x1b[?25l");
         }
         out.extend_from_slice(&body);
-        // Diff-suppressed CUP: only jump the physical cursor when the
-        // position actually changed — every unnecessary CUP forces the
-        // terminal to re-render the target area, which manifests as
-        // visible input-box flicker on terminals that don't support
-        // DECSET 2026 (synchronized output). During streaming the
-        // spinner tick (100ms interval) repaints the body, then parks
-        // the cursor at the input box — without this guard every tick
-        // emits CUP back to the same (row,col), causing a 10Hz refresh
-        // storm on the input row even when nothing changed there.
-        if stale_cursor {
+        // Park the caret. MANDATORY whenever `has_visible_work`: the
+        // patch walk above left the physical cursor on the last changed
+        // cell, so it must be jumped back to `self.cursor` regardless of
+        // whether the *logical* position changed since the last frame.
+        // (Gating solely on `stale_cursor` stranded the caret on the
+        // last patched row during streaming/idle repaints — the input
+        // position is stable frame-to-frame, so `stale_cursor` was false
+        // even though the patches had just moved the physical cursor.)
+        // On no-work frames the jump is only emitted when the position
+        // actually moved, so a genuinely empty, same-cursor frame still
+        // emits nothing — that's the real anti-flicker win.
+        if stale_cursor || has_visible_work {
             if let Some((r, c)) = self.cursor {
                 let _ = write!(&mut out, "\x1b[{};{}H", r, c);
             }
             self.last_cursor = self.cursor;
         }
-        // Same diff-suppression for cursor visibility: only emit
-        // `?25h` / `?25l` when the visibility state actually transitions.
-        // Streaming hides the cursor (cursor_visible=false) in
-        // `paint_footer` and keeps it hidden — re-sending `?25l`
-        // on every frame is harmless for compliant DEC terminals
-        // but can trigger unnecessary repaint cycles on some hosts.
-        if stale_vis {
+        // Restore visibility. Fires on `has_visible_work` frames to pair
+        // with the unconditional hide above; on no-work frames only when
+        // the visibility state actually transitions, so an idle toggle
+        // still lands without a redundant re-send every frame.
+        if stale_vis || has_visible_work {
             if self.cursor_visible {
                 out.extend_from_slice(b"\x1b[?25h");
             } else {
@@ -697,5 +696,91 @@ mod tests {
         let out = String::from_utf8_lossy(&bytes);
         assert!(out.starts_with("\x1b[?2026h\x1b[?25l"), "cold-start frame must open with BSU+hide: {:?}", out);
         assert!(out.ends_with("\x1b[?25h\x1b[?2026l"), "cold-start frame must close with show+ESU: {:?}", out);
+    }
+
+    /// REGRESSION: a later frame that emits cell patches but whose logical
+    /// cursor position is UNCHANGED from the previous frame must still emit
+    /// the parking CUP. `serialize_patches` walks the physical cursor
+    /// across the changed cells, so gating the park on `!stale_cursor`
+    /// alone strands the caret on the last patched row. The park is
+    /// mandatory whenever `has_visible_work` (patches moved the cursor).
+    #[test]
+    fn cursor_reparked_after_patches_even_when_position_unchanged() {
+        let mut s = Screen::new(10, 3);
+        // Frame 1: draw row 0, park caret at (2,5).
+        let mut c1 = Vec::new();
+        push_str_cells(&mut c1, "x", &CellStyle::default());
+        s.draw_row(0, 0, &c1);
+        s.set_cursor(2, 5);
+        let _ = s.render_diff(); // last_cursor becomes (2,5)
+
+        // Frame 2: patch a DIFFERENT row, caret stays at (2,5).
+        let mut c2 = Vec::new();
+        push_str_cells(&mut c2, "y", &CellStyle::default());
+        s.draw_row(1, 0, &c2);
+        s.set_cursor(2, 5);
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(
+            out.contains("\x1b[2;5H"),
+            "caret must be re-parked at (2,5) after patches, got {:?}",
+            out
+        );
+    }
+
+    /// A patched frame must hide the cursor for the patch walk and restore
+    /// it afterwards EVEN when visibility is unchanged frame-to-frame —
+    /// otherwise on non-DECSET-2026 terminals the visible caret bounces
+    /// across the changed cells. Hide/restore stay paired.
+    #[test]
+    fn patched_frame_hides_and_restores_cursor_even_when_visibility_unchanged() {
+        let mut s = Screen::new(10, 3);
+        // Frame 1: establishes last_cursor_visible = Some(true).
+        let mut c1 = Vec::new();
+        push_str_cells(&mut c1, "x", &CellStyle::default());
+        s.draw_row(0, 0, &c1);
+        s.set_cursor(1, 1);
+        let _ = s.render_diff();
+
+        // Frame 2: patches present, visibility still true.
+        let mut c2 = Vec::new();
+        push_str_cells(&mut c2, "y", &CellStyle::default());
+        s.draw_row(1, 0, &c2);
+        s.set_cursor(1, 1);
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(
+            out.starts_with("\x1b[?2026h\x1b[?25l"),
+            "patched frame must open with BSU+hide: {:?}",
+            out
+        );
+        assert!(
+            out.ends_with("\x1b[?25h\x1b[?2026l"),
+            "patched frame must close with show+ESU: {:?}",
+            out
+        );
+    }
+
+    /// The legitimate optimization must survive: a genuinely empty frame
+    /// (no patches, same cursor, same visibility) emits zero bytes — no
+    /// redundant CUP / visibility re-send / sync wrap.
+    #[test]
+    fn truly_empty_frame_after_park_emits_nothing() {
+        let mut s = Screen::new(10, 3);
+        let mut c1 = Vec::new();
+        push_str_cells(&mut c1, "x", &CellStyle::default());
+        s.draw_row(0, 0, &c1);
+        s.set_cursor(2, 5);
+        let _ = s.render_diff();
+
+        // Second frame: redraw the SAME content + SAME cursor → no delta.
+        s.draw_row(0, 0, &c1);
+        s.set_cursor(2, 5);
+        let bytes = s.render_diff();
+        assert!(
+            bytes.is_empty(),
+            "no-op frame must emit nothing, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
 }
