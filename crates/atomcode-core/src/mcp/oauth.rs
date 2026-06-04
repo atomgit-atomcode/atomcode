@@ -514,7 +514,9 @@ fn discover_resource_metadata_url(
         .json(&probe)
         .send()
     {
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
             if let Some(header) = resp
                 .headers()
                 .get(reqwest::header::WWW_AUTHENTICATE)
@@ -588,7 +590,11 @@ fn register_oauth_client(
     redirect_uri: &str,
 ) -> Result<ClientRegistrationResponse> {
     let Some(registration_endpoint) = metadata.registration_endpoint.as_deref() else {
-        bail!("MCP OAuth requires client_id because the authorization server does not advertise dynamic client registration");
+        bail!(
+            "MCP OAuth requires a pre-registered client_id because the authorization server \
+             does not support dynamic client registration (RFC 7591). \
+             Add a pre-registered client_id to auth.client_id in your .mcp.json and try again."
+        );
     };
     let resp = client
         .post(registration_endpoint)
@@ -603,9 +609,20 @@ fn register_oauth_client(
         .send()
         .context("Failed to dynamically register MCP OAuth client")?;
     if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED
+        {
+            bail!(
+                "MCP OAuth dynamic client registration failed: HTTP {status} — \
+                 the authorization server rejected the request. \
+                 Add a pre-registered client_id to auth.client_id \
+                 in your .mcp.json and try again.\n\
+                 Response: {body}"
+            );
+        }
         bail!(
-            "MCP OAuth dynamic client registration failed: HTTP {}",
-            resp.status()
+            "MCP OAuth dynamic client registration failed: HTTP {status}\nResponse: {body}"
         );
     }
     resp.json()
