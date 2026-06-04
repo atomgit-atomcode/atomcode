@@ -7954,6 +7954,37 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
         }
         "use_skill" => get_str("name").unwrap_or_default(),
         _ => {
+            // For MCP tools (name starts with mcp__), render the
+            // arguments as key=value pairs so users can see what
+            // parameters are being passed to the external server.
+            if name.starts_with("mcp__") {
+                if let Some(obj) = v.as_object() {
+                    let pairs: Vec<String> = obj
+                        .iter()
+                        .filter_map(|(k, val)| {
+                            let s = match val {
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Number(n) => n.to_string(),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                serde_json::Value::Array(a) => {
+                                    serde_json::to_string(a).unwrap_or_default()
+                                }
+                                serde_json::Value::Object(o) => {
+                                    serde_json::to_string(o).unwrap_or_default()
+                                }
+                                _ => return None,
+                            };
+                            if s.is_empty() {
+                                return None;
+                            }
+                            Some(format!("{}: \"{}\"", k, s.replace('"', "\\\"")))
+                        })
+                        .collect();
+                    if !pairs.is_empty() {
+                        return crate::width::truncate_with_ellipsis(&pairs.join(", "), 200);
+                    }
+                }
+            }
             // Fallback: try common single-key args that make sense as detail.
             for key in [
                 "file_path",
