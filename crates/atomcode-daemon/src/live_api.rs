@@ -55,7 +55,7 @@ fn set_live_provider(provider: Option<String>) {
 /// webui 下拉框（/live/provider）、/live/message 带的 provider、以及 TUI 的 /model 选择器
 /// 都经此处，确保任一端切换模型时，另一端的下拉框与头部显示都能实时跟随。
 pub fn live_set_provider(provider: String) {
-    *LIVE_PROVIDER.lock().unwrap() = Some(provider.clone());
+    *LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(provider.clone());
     if let Some(s) = current_live_session() {
         s.notify_provider_changed(provider);
     }
@@ -64,7 +64,7 @@ pub fn live_set_provider(provider: String) {
 /// 当前生效的 provider 名：优先进程级选择（LIVE_PROVIDER），回退 config 默认。
 /// 供 /live 快照在新 tab 连上时回显正确的选中模型。
 fn live_current_provider() -> String {
-    if let Some(p) = LIVE_PROVIDER.lock().unwrap().clone() {
+    if let Some(p) = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         return p;
     }
     Config::load(&Config::default_path())
@@ -83,7 +83,7 @@ fn live_mcp_cache() -> Arc<tokio::sync::RwLock<std::collections::HashMap<std::pa
 
 /// 取当前活动 LiveSession（无则 None）。供 TUI（同进程）附着用。
 pub fn current_live_session() -> Option<Arc<atomcode_core::live::LiveSession>> {
-    LIVE.lock().unwrap().clone()
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// 取或建当前活动 LiveSession（TUI 与 /live 共用）。进程级单例。
@@ -117,13 +117,13 @@ pub(crate) fn ensure_live_session_global(
     initial: Vec<atomcode_core::conversation::message::Message>,
     session_id: Option<atomcode_core::session::SessionId>,
 ) -> Arc<atomcode_core::live::LiveSession> {
-    let mut g = LIVE.lock().unwrap();
+    let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = g.as_ref() {
         return s.clone();
     }
     let session_id = session_id.unwrap_or_else(atomcode_core::session::SessionId::new);
     // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
-    *LIVE_SESSION_ID.lock().unwrap() = Some(session_id.to_string());
+    *LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
     let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(DaemonTurnExecutor {
         working_dir,
         provider_name: None,
@@ -136,10 +136,13 @@ pub(crate) fn ensure_live_session_global(
     *g = Some(session.clone());
     session
 }
-
-/// 取当前 LiveSession 的稳定 session_id 字符串（无则 None）。
-fn live_session_id() -> Option<String> {
-    LIVE_SESSION_ID.lock().unwrap().clone()
+/// 取当前 LiveSession 的稳定 session_id 字符串（无则 "unknown"）。
+fn live_session_id_or_unknown() -> String {
+    LIVE_SESSION_ID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// All components needed to run one agent turn.
@@ -367,12 +370,11 @@ impl TurnExecutor for DaemonTurnExecutor {
         if input.images.is_empty() {
             return input;
         }
-        let live_provider = LIVE_PROVIDER.lock().unwrap().clone();
+        let live_provider = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
         let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
         UserInput { text, images: input.images }
     }
-
     async fn run_turn(
         &self,
         conv: &Arc<Mutex<Conversation>>,
@@ -381,7 +383,7 @@ impl TurnExecutor for DaemonTurnExecutor {
         cancel: CancellationToken,
     ) {
         // 优先用 webui 选中的 provider（LIVE_PROVIDER），回退到执行器默认（self.provider_name）。
-        let live_provider = LIVE_PROVIDER.lock().unwrap().clone();
+        let live_provider = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
         let parts = match build_turn_parts(
             &self.working_dir,
@@ -397,7 +399,6 @@ impl TurnExecutor for DaemonTurnExecutor {
                 return;
             }
         };
-
         // Build the permission decider. When interactive, mirror process_chat_request:
         // create two channels, register the response sender into the LiveSession approver
         // slot (so any view calling LiveSession.approve() delivers the decision here),
@@ -583,7 +584,7 @@ pub(crate) async fn live_stream(State(state): State<AppState>) -> impl IntoRespo
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
     let _ = tx.send(LiveWireEvent::Snapshot {
         messages: snapshot.iter().map(crate::MessageInfo::from).collect(),
-        session_id: live_session_id().unwrap_or_default(),
+        session_id: live_session_id_or_unknown(),
         project_hash,
         provider: live_current_provider(),
     });
@@ -598,7 +599,13 @@ pub(crate) async fn live_stream(State(state): State<AppState>) -> impl IntoRespo
     });
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
-        let json = serde_json::to_string(&w).unwrap_or_default();
+        let json = match serde_json::to_string(&w) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("live_stream: serde_json serialization failed: {e}");
+                return Ok::<_, std::convert::Infallible>(Event::default().data(""));
+            }
+        };
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("ping"))

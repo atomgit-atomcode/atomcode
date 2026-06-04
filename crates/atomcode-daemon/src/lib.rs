@@ -3063,7 +3063,7 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
     // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
     //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
     let reuse = {
-        let guard = WEBUI.lock().unwrap();
+        let guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(handle) if !handle.abort.is_finished() => {
                 Some((handle.tokens.clone(), handle.port, handle.host.clone()))
@@ -3111,7 +3111,7 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
             }
         });
         {
-            let mut guard = WEBUI.lock().unwrap();
+            let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(WebuiHandle {
                 tokens: tokens.clone(),
                 port: actual_port,
@@ -3175,7 +3175,7 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
 
 /// 停止进程内 webui server（若在运行）。返回状态串。
 pub fn stop_server() -> String {
-    let mut guard = WEBUI.lock().unwrap();
+    let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.take() {
         handle.abort.abort();
         "已停止 webui server".to_string()
