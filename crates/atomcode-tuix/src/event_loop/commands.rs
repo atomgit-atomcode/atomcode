@@ -3004,6 +3004,10 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
         .ok();
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
     ctx.runtime_factory.set_working_dir(path.clone());
+    // Re-index the @-mention file index for the new working directory.
+    // Without this, the popup continues showing files from the original
+    // startup directory after the user runs `/cd`.
+    ctx.file_index.reset(path.clone());
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
 }
