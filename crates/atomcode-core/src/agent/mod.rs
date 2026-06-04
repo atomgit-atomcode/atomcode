@@ -11,6 +11,7 @@ pub mod subtask_driver;
 mod diagnose;
 mod discipline;
 pub mod execute;
+mod local_shell;
 mod prompt;
 mod services;
 mod tool_dispatch;
@@ -119,6 +120,13 @@ pub enum AgentCommand {
     /// agent replies with `AgentEvent::ConversationTruncated` on success or
     /// `AgentEvent::UndoFailed` when `nth` is out of range.
     UndoToPrompt { nth: Option<usize> },
+    /// User invoked `!cmd` bash mode. Runs the shell command locally and
+    /// injects `<bash-input>/<bash-stdout>/<bash-stderr>` into the
+    /// conversation as a User message — WITHOUT starting an LLM turn.
+    /// The model sees it on the user's next real message.
+    LocalShell {
+        cmd: String,
+    },
     /// Shutdown the agent.
     Shutdown,
 }
@@ -1148,6 +1156,9 @@ impl AgentLoop {
             match cmd {
                 AgentCommand::SendMessage { text, images, image_markers } => {
                     self.handle_send_message(text, images, image_markers).await;
+                }
+                AgentCommand::LocalShell { cmd } => {
+                    self.handle_local_shell(cmd).await;
                 }
                 AgentCommand::Cancel => {
                     crate::ctrace!("AGT", "outer Cancel -> cancel_token.cancel() (was_cancelled={})", self.cancel_token.is_cancelled());

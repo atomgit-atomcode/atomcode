@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 use base64::Engine;
 use atomcode_core::conversation::message::ImagePart;
 
-use crate::commands::{parse_slash_line, CommandRegistry};
+use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
 use crate::input::history::History;
 use crate::input::key_action::{classify, Action};
 use crate::input::InputEvent;
@@ -5283,7 +5283,20 @@ fn handle_idle_key(
                         .and_then(|r| r.get(cmd).map(|s| s.user_invocable))
                         .unwrap_or(false)
             });
-            if let Some((cmd, arg)) = as_slash {
+            if let Some(bash_cmd) = parse_bash_command(&line) {
+                // `!cmd` — user-invoked bash mode. Echo the line, hand off
+                // to the agent loop (executes + records context, no turn).
+                renderer.render(UiLine::User(line.clone()));
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::LocalShell { cmd: bash_cmd.to_string() })
+                    .ok();
+                // `!` lines carry no pastes/images; submit consumes the buffer.
+                app.buf.clear_pastes();
+                if matches!(app.state.phase, UiPhase::Idle) {
+                    redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                }
+            } else if let Some((cmd, arg)) = as_slash {
                 // Slash commands carry no image markers — echo the
                 // user line as-typed, before dispatch.
                 renderer.render(UiLine::User(line.clone()));
@@ -6441,10 +6454,12 @@ fn handle_agent_event(
             pending_tools.insert(id, (display.clone(), detail, true));
             state.on_tool_call_started(&display);
         }
-        AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
-            // Display real-time tool output (e.g., bash stdout/stderr)
-            // Only show when the user has enabled it via Ctrl+O
-            if state.show_tool_output {
+        AgentEvent::ToolOutputChunk { call_id, chunk } => {
+            // Display real-time tool output (e.g., bash stdout/stderr).
+            // Normally gated behind Ctrl+O verbose mode, but user-invoked
+            // `!` shell commands always stream in full — the user ran them
+            // precisely to see the output.
+            if state.show_tool_output || call_id.starts_with("local-shell-") {
                 // Append to the scrollback as command output
                 renderer.render(UiLine::CommandOutput(chunk));
                 renderer.flush();
@@ -6618,7 +6633,10 @@ fn handle_agent_event(
             // The previous over-correction (screenshot 44 → 47) showed
             // that "looks like 2 blank lines" is just font line-height
             // padding — the actual row count is 1, which is correct.
-            if name == "bash" && !state.show_tool_output {
+            if name == "bash"
+                && !state.show_tool_output
+                && !call_id.starts_with("local-shell-")
+            {
                 renderer.render(UiLine::CommandOutput(
                     "  ○ Press Ctrl+O to show real-time output\n".to_string(),
                 ));
