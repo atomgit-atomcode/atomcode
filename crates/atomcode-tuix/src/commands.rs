@@ -253,9 +253,41 @@ pub fn parse_slash_line(s: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Detect a `!cmd` bash-mode line. Returns the trimmed command when the
+/// line begins (strictly at column 0) with `!` and has a non-empty body.
+/// `!` alone, whitespace-only, or a non-leading `!` returns None.
+pub fn parse_bash_command(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('!')?;
+    let cmd = rest.trim();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_prefix_extracts_command() {
+        assert_eq!(parse_bash_command("!ls"), Some("ls"));
+        assert_eq!(parse_bash_command("!  echo hi"), Some("echo hi"));
+        assert_eq!(parse_bash_command("!git status"), Some("git status"));
+    }
+
+    #[test]
+    fn bare_bang_is_none() {
+        assert_eq!(parse_bash_command("!"), None);
+        assert_eq!(parse_bash_command("!   "), None);
+    }
+
+    #[test]
+    fn leading_space_not_bash() {
+        assert_eq!(parse_bash_command(" !ls"), None);
+        assert_eq!(parse_bash_command("echo !x"), None);
+    }
 
     #[test]
     fn registry_lookup_by_name() {

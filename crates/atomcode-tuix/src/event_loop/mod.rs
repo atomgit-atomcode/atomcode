@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 use base64::Engine;
 use atomcode_core::conversation::message::ImagePart;
 
-use crate::commands::{parse_slash_line, CommandRegistry};
+use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
 use crate::input::history::History;
 use crate::input::key_action::{classify, Action};
 use crate::input::InputEvent;
@@ -4763,7 +4763,20 @@ fn handle_idle_key(
                         .and_then(|r| r.get(cmd).map(|s| s.user_invocable))
                         .unwrap_or(false)
             });
-            if let Some((cmd, arg)) = as_slash {
+            if let Some(bash_cmd) = parse_bash_command(&line) {
+                // `!cmd` — user-invoked bash mode. Echo the line, hand off
+                // to the agent loop (executes + records context, no turn).
+                renderer.render(UiLine::User(line.clone()));
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::LocalShell { cmd: bash_cmd.to_string() })
+                    .ok();
+                // `!` lines carry no pastes/images; submit consumes the buffer.
+                app.buf.clear_pastes();
+                if matches!(app.state.phase, UiPhase::Idle) {
+                    redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                }
+            } else if let Some((cmd, arg)) = as_slash {
                 // Slash commands carry no image markers — echo the
                 // user line as-typed, before dispatch.
                 renderer.render(UiLine::User(line.clone()));
