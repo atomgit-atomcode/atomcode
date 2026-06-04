@@ -405,6 +405,32 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Does `raw_path` (as the model wrote it) or `canonical_path` (the
+/// resolved form) live under AtomCode's own config dir?
+///
+/// Both forms are checked because of #222: a user can keep an AtomCode
+/// data symlink (e.g. `~/.atomcode/cj -> /mnt/d/.../md/`) that points
+/// at a project they edit. The raw `~/.atomcode/...` prefix is enough
+/// evidence that the model is acting on AtomCode-managed storage, even
+/// if the canonical target lives outside the home dir. We still pass
+/// the canonical form through `starts_with` so a pure target like
+/// `~/.atomcode/memory.md` (no symlink) also matches.
+fn is_under_atomcode_home(raw_path: &str, canonical_path: &Path) -> bool {
+    let home = crate::config::Config::config_dir();
+    // Canonicalise the config dir so the `starts_with` comparison
+    // works even when `~/.atomcode` itself contains intermediate
+    // symlinks (macOS `/var → /private/var` is the common case).
+    let home_canon = std::fs::canonicalize(&home).unwrap_or(home.clone());
+
+    if canonical_path.starts_with(&home_canon) || canonical_path.starts_with(&home) {
+        return true;
+    }
+
+    let expanded = expand_user_path(raw_path);
+    let normalized = normalize_path(&expanded);
+    normalized.starts_with(&home_canon) || normalized.starts_with(&home)
+}
+
 fn canonicalize_candidate_path(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         return std::fs::canonicalize(path)
@@ -607,6 +633,18 @@ pub fn approval_for_path(
     // AtomCode-owned directories (plugins, skills) are trusted —
     // reading from them shouldn't require interactive approval.
     if action != ExternalPathAction::Write && is_atomcode_owned_path(&access.path) {
+        return Ok(ApprovalRequirement::AutoApprove);
+    }
+
+    // Cross-workspace writes to AtomCode's own config dir (default
+    // `~/.atomcode/`, or whatever `Config::config_dir()` resolves to via
+    // `ATOMCODE_HOME`) are part of how memory / skills / plugin state
+    // is stored. The user expects `memory.md`, `skills/*.md`, etc. to
+    // be writable from any project without a per-tool approval prompt
+    // (#222). Detect that here — both for the raw path the model
+    // produced (covers `~/.atomcode/...` when the user keeps a symlink
+    // there) and for the canonicalised target.
+    if is_under_atomcode_home(raw_path, &access.path) {
         return Ok(ApprovalRequirement::AutoApprove);
     }
 
@@ -1584,6 +1622,95 @@ mod tests {
             approval,
             ApprovalRequirement::RequireApprovalAlways(_)
         ));
+    }
+
+    /// Serialise ATOMCODE_HOME-mutating tests. `cargo test` runs in
+    /// parallel by default, and `std::env::set_var` is a process-wide
+    /// mutation — two of these tests racing flipped each other's
+    /// `Config::config_dir()` mid-call, producing a flaky failure
+    /// (test passes solo, fails in the suite).
+    static ATOMCODE_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Writing into AtomCode's own config dir from outside the
+    /// workspace must auto-approve — memory.md, skills, plugin state
+    /// are all expected to land there without per-call prompts (#222).
+    /// We exercise both an existing path and a not-yet-created one.
+    #[test]
+    fn approval_for_write_under_atomcode_home_is_auto() {
+        let _guard = ATOMCODE_HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("ATOMCODE_HOME").ok();
+        unsafe {
+            std::env::set_var("ATOMCODE_HOME", home.path());
+        }
+
+        let workspace = TempDir::new().unwrap();
+        let memory_file = home.path().join("memory.md");
+        std::fs::write(&memory_file, "scratch").unwrap();
+
+        let approval = approval_for_path(
+            &memory_file.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Write,
+        )
+        .unwrap();
+        assert!(matches!(approval, ApprovalRequirement::AutoApprove));
+
+        // Not-yet-created path under the home dir is also auto.
+        let new_file = home.path().join("skills").join("new.md");
+        let approval_new = approval_for_path(
+            &new_file.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Write,
+        )
+        .unwrap();
+        assert!(matches!(approval_new, ApprovalRequirement::AutoApprove));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+                None => std::env::remove_var("ATOMCODE_HOME"),
+            }
+        }
+    }
+
+    /// Regression for #222: a symlink that the user manually placed
+    /// inside `~/.atomcode/` to point at a separate project dir must
+    /// still auto-approve writes — the raw `~/.atomcode/<symlink>/...`
+    /// form is enough evidence that this is AtomCode-managed storage.
+    #[cfg(unix)]
+    #[test]
+    fn approval_for_write_through_atomcode_home_symlink_is_auto() {
+        let _guard = ATOMCODE_HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("ATOMCODE_HOME").ok();
+        unsafe {
+            std::env::set_var("ATOMCODE_HOME", home.path());
+        }
+
+        let project = TempDir::new().unwrap();
+        let link = home.path().join("cj");
+        std::os::unix::fs::symlink(project.path(), &link).unwrap();
+        let memory_path = link.join("memory").join("notes.md");
+
+        let workspace = TempDir::new().unwrap();
+        let approval = approval_for_path(
+            &memory_path.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Write,
+        )
+        .unwrap();
+        assert!(
+            matches!(approval, ApprovalRequirement::AutoApprove),
+            "expected AutoApprove for ~/.atomcode/cj symlink write"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+                None => std::env::remove_var("ATOMCODE_HOME"),
+            }
+        }
     }
 
     #[tokio::test]
