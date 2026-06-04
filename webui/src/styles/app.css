@@ -1679,13 +1679,18 @@ body {
   gap: 2px;
 }
 
-/* Up variant — used inside the input footer so dropdown opens above */
+/* Up variant — used inside the input footer so dropdown opens above.
+   Anchor the dropdown's RIGHT edge to the trigger (which sits near the
+   right of the footer, beside the send button) so it grows leftward into
+   the viewport instead of off the right edge. `max-width: 100vw - 32px`
+   keeps it on-screen even on narrow viewports. */
 .model-selector-up .model-dropdown {
   top: auto;
   bottom: 100%;
   margin-top: 0;
   margin-bottom: 4px;
-  left: 0;
+  left: auto;
+  right: 0;
   transform: none;
 }
 
