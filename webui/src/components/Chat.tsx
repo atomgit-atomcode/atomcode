@@ -319,7 +319,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function startLiveStream() {
     const controller = new AbortController();
     liveAbortRef.current = controller;
-    streamLive(onLiveEvent, controller.signal).catch(() => {
+    streamLive(onLiveEvent, controller.signal, activeIdRef.current).catch(() => {
       // Stream ended or errored; turn sync back off
       setSync(false);
     });
@@ -613,7 +613,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
       setBusy(true);
-      await postLiveMessage(text, images.length ? images : undefined, provider ?? undefined);
+      await postLiveMessage(text, images.length ? images : undefined, provider ?? undefined, activeIdRef.current);
       return;
     }
 

@@ -4,15 +4,15 @@
 //! Phase 2（官方中转隧道）会把账号 token 接入同一条 `is_valid` 校验链——
 //! 故鉴权统一收口在本模块，路由层只调中间件。
 
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
-use uuid::Uuid;
 use axum::{
     extract::State,
     http::{header::AUTHORIZATION, StatusCode},
     middleware::Next,
     response::Response,
 };
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+use uuid::Uuid;
 
 /// 进程内有效 webui token 集合。线程安全，可放进 `AppState`。
 #[derive(Clone, Default)]
@@ -44,9 +44,15 @@ impl WebuiTokenStore {
 /// 从 `Authorization` 头解析 Bearer token（大小写不敏感前缀）。
 pub fn token_from_header(value: Option<&str>) -> Option<String> {
     let v = value?;
-    let rest = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))?;
+    let rest = v
+        .strip_prefix("Bearer ")
+        .or_else(|| v.strip_prefix("bearer "))?;
     let rest = rest.trim();
-    if rest.is_empty() { None } else { Some(rest.to_string()) }
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
 }
 
 /// Axum 中间件：校验 `Authorization: Bearer <token>` 是否为有效的 webui token。
@@ -79,8 +85,14 @@ mod tests {
 
     #[test]
     fn extracts_bearer_token() {
-        assert_eq!(token_from_header(Some("Bearer abc123")), Some("abc123".to_string()));
-        assert_eq!(token_from_header(Some("bearer abc123")), Some("abc123".to_string()));
+        assert_eq!(
+            token_from_header(Some("Bearer abc123")),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            token_from_header(Some("bearer abc123")),
+            Some("abc123".to_string())
+        );
         assert_eq!(token_from_header(Some("abc123")), None);
         assert_eq!(token_from_header(None), None);
     }

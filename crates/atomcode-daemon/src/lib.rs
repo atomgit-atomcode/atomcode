@@ -13,11 +13,10 @@ mod api_provider;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
-pub use live_api::ensure_live_session_seeded;
 pub use live_api::live_set_provider;
-mod telemetry_scope;
 pub mod auth_token;
 pub mod permission_bridge;
+mod telemetry_scope;
 pub mod webui;
 
 pub(crate) use telemetry_scope::daemon_scope;
@@ -40,12 +39,14 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use atomcode_core::auth;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
+use atomcode_core::telemetry_bootstrap::detect_repo_origin;
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
@@ -56,11 +57,8 @@ use atomcode_core::turn::permission::{
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
-    CliOverride, CurrentContext, Event, RepoOrigin, SessionMode,
-    Telemetry, TelemetryState,
+    CliOverride, CurrentContext, Event, RepoOrigin, SessionMode, Telemetry, TelemetryState,
 };
-use atomcode_core::auth;
-use atomcode_core::telemetry_bootstrap::detect_repo_origin;
 
 // ============================================================================
 // Shared DTOs for P0 API endpoints
@@ -457,7 +455,10 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                 let display = if images.is_empty() {
                     raw
                 } else {
-                    match raw.find("[图片内容（由").or_else(|| raw.find("[图片识别失败]")) {
+                    match raw
+                        .find("[图片内容（由")
+                        .or_else(|| raw.find("[图片识别失败]"))
+                    {
                         Some(i) => raw[..i].trim_end().to_string(),
                         None => raw,
                     }
@@ -467,11 +468,11 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
         };
 
         // 提取 MultiPart 的图片，供 webui 历史渲染缩略图。
-        let images = match &msg.content {
-            atomcode_core::conversation::message::MessageContent::MultiPart { images, .. }
-                if !images.is_empty() =>
-            {
-                Some(
+        let images =
+            match &msg.content {
+                atomcode_core::conversation::message::MessageContent::MultiPart {
+                    images, ..
+                } if !images.is_empty() => Some(
                     images
                         .iter()
                         .map(|i| ImageData {
@@ -479,10 +480,9 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                             data: i.data.clone(),
                         })
                         .collect(),
-                )
-            }
-            _ => None,
-        };
+                ),
+                _ => None,
+            };
 
         Self {
             role: role.to_string(),
@@ -1189,7 +1189,12 @@ async fn change_dir(
         }
 
         let hash = hash_path(&new_path);
-        state.telemetry.track(Event::UseCommand { type_: "cd".into(), success: Some(true), error_kind: None, error_data: None });
+        state.telemetry.track(Event::UseCommand {
+            type_: "cd".into(),
+            success: Some(true),
+            error_kind: None,
+            error_data: None,
+        });
 
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
 
@@ -1417,7 +1422,12 @@ async fn delete_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         match delete_session_file(&hash, &id) {
             Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into(), success: Some(true), error_kind: None, error_data: None });
+                state_clone.telemetry.track(Event::UseCommand {
+                    type_: "delete_session".into(),
+                    success: Some(true),
+                    error_kind: None,
+                    error_data: None,
+                });
                 let msg = format!("Session {} deleted successfully", id);
                 (StatusCode::OK, Json(msg)).into_response()
             }
@@ -1476,7 +1486,12 @@ async fn rename_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         match rename_session_file(&hash, &id, &req.name) {
             Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand { type_: "rename".into(), success: Some(true), error_kind: None, error_data: None });
+                state_clone.telemetry.track(Event::UseCommand {
+                    type_: "rename".into(),
+                    success: Some(true),
+                    error_kind: None,
+                    error_data: None,
+                });
                 let msg = format!("Session {} renamed to '{}'", id, req.name);
                 (StatusCode::OK, Json(msg)).into_response()
             }
@@ -1579,7 +1594,11 @@ pub enum ChatEvent {
     ReasoningDelta { content: String },
     /// Tool call started
     #[serde(rename = "tool_start")]
-    ToolCallStarted { id: String, name: String, arguments: String },
+    ToolCallStarted {
+        id: String,
+        name: String,
+        arguments: String,
+    },
     /// Real-time tool output chunk
     #[serde(rename = "tool_output")]
     ToolOutputChunk { chunk: String },
@@ -1879,7 +1898,10 @@ async fn chat_stream(
     Json(mut req): Json<ChatRequest>,
 ) -> impl IntoResponse {
     // Parse session UUID for telemetry scope
-    let session_uuid = req.session_id.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let session_uuid = req
+        .session_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
     // Use current project working directory if not specified
     if req.working_dir.is_none() {
@@ -1914,7 +1936,9 @@ async fn chat_stream(
     // Use the request's working_dir to detect repo_origin dynamically (not the
     // startup-time cached value), because the user may switch projects via /cd.
     let chat_repo_origin = detect_repo_origin(
-        req.working_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."))
+        req.working_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(".")),
     );
     let ctx_for_task = CurrentContext {
         mode: Some(client_mode),
@@ -1947,7 +1971,8 @@ async fn chat_stream(
             if let Some(sid) = session_id {
                 chat_tasks.write().await.remove(&sid);
             }
-        }).await;
+        })
+        .await;
     });
 
     // Track active SSE connections for idle timeout using a Drop guard
@@ -1966,7 +1991,7 @@ async fn chat_stream(
     let conn_guard = SseConnectionGuard(active_conns);
     let guarded_stream = stream.chain(futures::stream::once(async move {
         drop(conn_guard); // explicitly drop to decrement
-        // This event is never actually sent because the stream ends here
+                          // This event is never actually sent because the stream ends here
         Ok(axum::response::sse::Event::default().comment("bye"))
     }));
 
@@ -2099,8 +2124,11 @@ async fn process_chat_request(
         }
     }
     // Build tool registry and context — use real telemetry from AppState (R11.1, R11.2, R11.3)
-    let mut tool_context =
-        ToolContext::with_telemetry(working_dir.clone(), req.session_id.as_deref().unwrap_or("default"), telemetry);
+    let mut tool_context = ToolContext::with_telemetry(
+        working_dir.clone(),
+        req.session_id.as_deref().unwrap_or("default"),
+        telemetry,
+    );
     let mut tool_registry = ToolRegistry::new();
     // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
     // the CLI's --disable-tools behaviour. Comma-separated tool names.
@@ -2170,7 +2198,9 @@ async fn process_chat_request(
             drop(cache);
             // Cache miss — create new registry for this project
             let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
-            new_registry.wait_for_initial_connections(Duration::from_secs(5)).await;
+            new_registry
+                .wait_for_initial_connections(Duration::from_secs(5))
+                .await;
             // Store in cache
             let mut cache = mcp_cache.write().await;
             // Evict LRU if cache is full
@@ -2183,10 +2213,13 @@ async fn process_chat_request(
                     cache.remove(&oldest_key);
                 }
             }
-            cache.insert(working_dir.clone(), CachedMcpRegistry {
-                registry: new_registry.clone(),
-                last_used: std::time::Instant::now(),
-            });
+            cache.insert(
+                working_dir.clone(),
+                CachedMcpRegistry {
+                    registry: new_registry.clone(),
+                    last_used: std::time::Instant::now(),
+                },
+            );
             new_registry
         }
     };
@@ -2225,8 +2258,7 @@ async fn process_chat_request(
     // approver, so it must keep the prior BypassAll behaviour — otherwise any
     // tool requiring approval would block the turn forever.
     let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = if webui_mode {
-        let (perm_req_tx, perm_req_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+        let (perm_req_tx, perm_req_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
         let (perm_resp_tx, perm_resp_rx) =
             tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
         let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
@@ -2234,7 +2266,11 @@ async fn process_chat_request(
         ));
         pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
         (
-            Box::new(InteractivePermissionDecider::new(perm_req_tx, perm_resp_rx, perm_store)),
+            Box::new(InteractivePermissionDecider::new(
+                perm_req_tx,
+                perm_resp_rx,
+                perm_store,
+            )),
             Some(perm_req_rx),
         )
     } else {
@@ -2264,8 +2300,7 @@ async fn process_chat_request(
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: true,
-
-})
+            })
         }
     };
     // Load configured hooks for this session (JSON/TOML/builtins/webhooks),
@@ -2286,7 +2321,8 @@ async fn process_chat_request(
     };
 
     // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
-    let system_prompt = build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
+    let system_prompt =
+        build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
@@ -2342,35 +2378,36 @@ async fn process_chat_request(
         // In standalone (BypassAll) mode there is no channel — this is `None`.
         let _keep_perm_req_rx = perm_req_rx;
         CurrentContext::scope(tel_ctx, || async move {
-        let mut conv = conversation_clone.lock().await;
+            let mut conv = conversation_clone.lock().await;
 
-        // Loop until LLM produces text without tool calls
-        loop {
-            let result = turn_runner
-                .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
-                .await;
+            // Loop until LLM produces text without tool calls
+            loop {
+                let result = turn_runner
+                    .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
+                    .await;
 
-            match result {
-                TurnResult::Responded { .. } => {
-                    // LLM produced text, turn is complete
-                    break;
-                }
-                TurnResult::UsedTools { .. } => {
-                    // Truncation of tool outputs is handled inside
-                    // TurnRunner::run_with_filter now. Nothing to do
-                    // here — just loop back for the next LLM call.
-                    continue;
-                }
-                TurnResult::Failed(e) => {
-                    let _ = turn_tx.send(TurnEvent::Error(e));
-                    break;
-                }
-                TurnResult::Cancelled => {
-                    break;
+                match result {
+                    TurnResult::Responded { .. } => {
+                        // LLM produced text, turn is complete
+                        break;
+                    }
+                    TurnResult::UsedTools { .. } => {
+                        // Truncation of tool outputs is handled inside
+                        // TurnRunner::run_with_filter now. Nothing to do
+                        // here — just loop back for the next LLM call.
+                        continue;
+                    }
+                    TurnResult::Failed(e) => {
+                        let _ = turn_tx.send(TurnEvent::Error(e));
+                        break;
+                    }
+                    TurnResult::Cancelled => {
+                        break;
+                    }
                 }
             }
-        }
-        }).await;
+        })
+        .await;
     });
 
     // Forward turn events to chat events
@@ -2731,7 +2768,12 @@ async fn stop_chat(
         // Cancel the chat task if it exists
         if let Some(cancel_token) = state_clone.chat_tasks.read().await.get(&req.session_id) {
             cancel_token.cancel();
-            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
+            state_clone.telemetry.track(Event::UseCommand {
+                type_: "stop".into(),
+                success: Some(true),
+                error_kind: None,
+                error_data: None,
+            });
             (
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
@@ -2741,7 +2783,12 @@ async fn stop_chat(
             )
         } else {
             // Session wasn't running, but we marked it as stopped
-            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
+            state_clone.telemetry.track(Event::UseCommand {
+                type_: "stop".into(),
+                success: Some(true),
+                error_kind: None,
+                error_data: None,
+            });
             (
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
@@ -2758,9 +2805,7 @@ async fn stop_chat(
 }
 
 /// GET /chat/active - Return list of session IDs currently generating
-async fn active_chat_sessions(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn active_chat_sessions(State(state): State<AppState>) -> impl IntoResponse {
     let sessions: Vec<String> = state.chat_tasks.read().await.keys().cloned().collect();
     Json(sessions)
 }
@@ -2917,12 +2962,15 @@ fn install_panic_hook(telemetry: Arc<Telemetry>) {
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
             error_kind: Some("panic".to_string()),
-            error_data: Some(serde_json::json!({
-                "session_duration_secs": telemetry.uptime().as_secs() as u32,
-                "turns_completed": null,
-                "last_tool_name": null,
-                "last_event": null,
-            }).to_string()),
+            error_data: Some(
+                serde_json::json!({
+                    "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                    "turns_completed": null,
+                    "last_tool_name": null,
+                    "last_event": null,
+                })
+                .to_string(),
+            ),
         });
         default_hook(info); // R9.4: preserve stderr output
     }));
@@ -3021,9 +3069,7 @@ async fn bind_scanning(
         "no free port in [{}, {}){}",
         start_port,
         start_port.saturating_add(max_tries),
-        last_err
-            .map(|e| format!(": {e}"))
-            .unwrap_or_default()
+        last_err.map(|e| format!(": {e}")).unwrap_or_default()
     ))
 }
 
@@ -3128,16 +3174,17 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
     // - 回环（127.0.0.1/localhost/::1）或通配（0.0.0.0/::）绑定时，回环都在监听集合内，用 127.0.0.1；
     // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在
     //   监听集合内，用它打开会 ERR_CONNECTION_REFUSED。此时必须用真实绑定地址打开。
-    let open_host: &str = if is_loopback_authority(&bound_host)
-        || bound_host == "0.0.0.0"
-        || bound_host == "::"
-    {
-        "127.0.0.1"
-    } else {
-        bound_host.as_str()
-    };
+    let open_host: &str =
+        if is_loopback_authority(&bound_host) || bound_host == "0.0.0.0" || bound_host == "::" {
+            "127.0.0.1"
+        } else {
+            bound_host.as_str()
+        };
     let sync_suffix = if sync { "&sync=1" } else { "" };
-    let local_url = format!("http://{}:{}/?token={}{}", open_host, actual_port, token, sync_suffix);
+    let local_url = format!(
+        "http://{}:{}/?token={}{}",
+        open_host, actual_port, token, sync_suffix
+    );
     let opened = atomcode_core::auth::oauth::open_browser(&local_url).is_ok();
     let mut msg = if opened {
         format!("已在浏览器打开 webui：{local_url}")
@@ -3157,14 +3204,18 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
         if bound_host == "0.0.0.0" || bound_host == "::" {
             // 绑定通配地址：探测本机局域网 IP 作为可访问地址。
             if let Some(ip) = primary_lan_ipv4() {
-                msg.push_str(&format!("\n局域网访问：http://{ip}:{actual_port}/?token={token}"));
+                msg.push_str(&format!(
+                    "\n局域网访问：http://{ip}:{actual_port}/?token={token}"
+                ));
             }
             msg.push_str(
                 "\n⚠️ 上面是局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
             );
         } else {
             // 显式指定了具体地址。
-            msg.push_str(&format!("\n访问地址：http://{bound_host}:{actual_port}/?token={token}"));
+            msg.push_str(&format!(
+                "\n访问地址：http://{bound_host}:{actual_port}/?token={token}"
+            ));
             msg.push_str(
                 "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
             );
@@ -3222,7 +3273,11 @@ fn pgy_ipv4_candidates(ifconfig_output: &str) -> Vec<String> {
     let mut in_p2p = false; // 当前接口块是否为 POINTOPOINT
     for line in ifconfig_output.lines() {
         // 接口块以非空白字符开头（如 `utun7: flags=...`）；缩进行是其属性。
-        let is_header = line.chars().next().map(|c| !c.is_whitespace()).unwrap_or(false);
+        let is_header = line
+            .chars()
+            .next()
+            .map(|c| !c.is_whitespace())
+            .unwrap_or(false);
         if is_header {
             in_p2p = line.contains("POINTOPOINT");
             continue;
@@ -3253,7 +3308,9 @@ fn extract_ip_eq(line: &str) -> Option<String> {
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .unwrap_or(rest.len());
     let cand = &rest[..end];
-    cand.parse::<std::net::Ipv4Addr>().ok().map(|_| cand.to_string())
+    cand.parse::<std::net::Ipv4Addr>()
+        .ok()
+        .map(|_| cand.to_string())
 }
 
 /// 兜底:从蒲公英日志抓自报虚拟 IP（段无关、权威），取最后一条 `ip=`。
@@ -3327,7 +3384,10 @@ async fn get_tunnel_status(
 ) -> impl IntoResponse {
     let pgy = tokio::task::spawn_blocking(pgy_probe)
         .await
-        .unwrap_or(PgyInfo { installed: false, ipv4: None });
+        .unwrap_or(PgyInfo {
+            installed: false,
+            ipv4: None,
+        });
 
     let reachable = !is_loopback_authority(&state.bind_host);
 
@@ -3471,7 +3531,9 @@ async fn fs_list(
 }
 
 #[derive(serde::Deserialize)]
-pub struct FsMkdirRequest { pub path: String }
+pub struct FsMkdirRequest {
+    pub path: String,
+}
 
 async fn fs_mkdir(
     State(_state): State<AppState>,
@@ -3552,7 +3614,12 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     };
 
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
-    let resolved = resolve(&cfg_telemetry, &cli_override, Config::config_dir(), &ProcessEnv);
+    let resolved = resolve(
+        &cfg_telemetry,
+        &cli_override,
+        Config::config_dir(),
+        &ProcessEnv,
+    );
 
     // Step 3: Print telemetry status line (R2.6) — suppressed in quiet (TUI) mode.
     if !quiet {
@@ -3804,7 +3871,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
                         ..CurrentContext::default()
                     },
                     || async {
-                        telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
+                        telemetry.track(Event::OpenAtomcode {
+                            dangerously_skip_permissions: false,
+                        });
                     },
                 )
                 .await;
@@ -3823,7 +3892,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             ..CurrentContext::default()
         },
         || async {
-            telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
+            telemetry.track(Event::OpenAtomcode {
+                dangerously_skip_permissions: false,
+            });
         },
     )
     .await;
@@ -3855,8 +3926,8 @@ mod fs_list_tests {
     #[test]
     fn lists_subdirs_of_temp() {
         // create a temp dir with a child dir + a file; expect only the child dir name
-        let base = std::env::temp_dir()
-            .join(format!("atomcode_fslist_test_{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("atomcode_fslist_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(base.join("childdir"));
         let _ = std::fs::write(base.join("afile.txt"), b"x");
         let dirs = list_subdirs(&base).unwrap();
@@ -3935,10 +4006,7 @@ mod tests {
 
     #[test]
     fn list_files_returns_files_skips_dirs_and_hidden() {
-        let tmp = std::env::temp_dir().join(format!(
-            "atomcode_list_files_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("atomcode_list_files_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("b.txt"), b"x").unwrap();
@@ -4048,7 +4116,10 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
             pgy_pick_ipv4(cands.clone(), Some("10.99.0.5".into())),
             Some("10.99.0.5".into())
         );
-        assert_eq!(pgy_pick_ipv4(cands.clone(), Some("172.31.9.9".into())), None);
+        assert_eq!(
+            pgy_pick_ipv4(cands.clone(), Some("172.31.9.9".into())),
+            None
+        );
         assert_eq!(pgy_pick_ipv4(cands, None), None);
     }
 
