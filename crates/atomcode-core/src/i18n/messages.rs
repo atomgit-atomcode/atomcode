@@ -586,6 +586,7 @@ pub enum Msg<'a> {
     CmdDescPlan,
     CmdDescBuild,
     CmdDescThink,
+    CmdDescEffort,
     CmdDescHelp,
     CmdDescKeys,
     CmdDescLanguage,
@@ -639,6 +640,11 @@ pub enum Msg<'a> {
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.
     CmdPasteNoImage,
+
+    // ── reasoning effort ──
+    /// Rendered when the user tries to set reasoning_effort on a
+    /// model that doesn't support it (only DeepSeek V4 / reasoner).
+    ReasoningEffortNoEffect,
 
     // ── config save failed ──
     ConfigSaveFailed { error: &'a str },

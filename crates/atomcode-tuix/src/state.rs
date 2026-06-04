@@ -256,6 +256,8 @@ pub struct UiState {
     /// event arrives. Mirrors `active_tool_batches` membership; cleared
     /// together.
     pub call_id_to_batch: std::collections::HashMap<String, String>,
+    /// Current reasoning_effort level for the active provider.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Per-batch state for an active `ToolBatchStarted`. Tracks how many
@@ -313,6 +315,7 @@ impl UiState {
             sub_agent_started_at: None,
             active_tool_batches: std::collections::HashMap::new(),
             call_id_to_batch: std::collections::HashMap::new(),
+            reasoning_effort: None,
         }
     }
 
@@ -594,6 +597,19 @@ impl UiState {
     /// Shows/hides both tool output and reasoning content.
     pub fn toggle_verbose(&mut self) {
         self.toggle_tool_output();
+    }
+
+    /// Cycle through reasoning_effort values: None → "high" → "max" → None.
+    /// Returns the new value (None = use API default).
+    pub fn cycle_reasoning_effort(&mut self) -> Option<&'static str> {
+        let next: Option<&'static str> = match self.reasoning_effort.as_deref() {
+            None => Some("high"),
+            Some("high") => Some("max"),
+            Some("max") => None,
+            _ => Some("high"),
+        };
+        self.reasoning_effort = next.map(|s| s.to_string());
+        next
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {

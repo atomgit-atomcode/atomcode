@@ -344,6 +344,7 @@ pub(crate) async fn build_turn_parts(
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,

@@ -97,6 +97,7 @@ pub(crate) struct ProviderInfo {
     pub thinking_type: Option<String>,
     pub thinking_keep: Option<String>,
     pub reasoning_history: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub skip_tls_verify: bool,
     pub ephemeral: bool,
 }
@@ -2295,6 +2296,7 @@ async fn process_chat_request(
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,

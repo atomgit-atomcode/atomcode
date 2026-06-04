@@ -800,6 +800,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescPlan => "Switch to Plan mode (read-only exploration)".into(),
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
+        Msg::CmdDescEffort => "DeepSeek reasoning effort control (high / max / off)".into(),
         Msg::CmdDescHelp => "Show this help".into(),
         Msg::CmdDescKeys => "Show keyboard shortcuts".into(),
         Msg::CmdDescLanguage => "Switch display language".into(),
@@ -833,6 +834,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdGuideInstallFailed { error } =>
             format!("ask skill install failed: {}. Run /plugin install atomcode@atomcode-skills manually", error).into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
+
+        // ── reasoning effort ──
+        Msg::ReasoningEffortNoEffect => "reasoning_effort has no effect on the current model (only DeepSeek V4 / reasoner)".into(),
 
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>

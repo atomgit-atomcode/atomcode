@@ -24,11 +24,34 @@ use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::Config;
+use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
+
+#[allow(dead_code)]
+fn build_oauth_provider() -> ProviderConfig {
+    ProviderConfig {
+        provider_type: "openai".to_string(),
+        api_key: None,
+        model: "MiniMax-M2.7".to_string(),
+        base_url: Some("https://llm-api.atomgit.com/v1".to_string()),
+        system_prompt: None,
+        user_agent: None,
+        context_window: 64_000,
+        max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
+        reasoning_history: None,
+        reasoning_effort: None,
+        thinking_enabled: None,
+        thinking_budget: None,
+        skip_tls_verify: false,
+        ephemeral: false,
+    }
+}
 
 fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
     if matches!(
@@ -1755,6 +1778,58 @@ pub(super) fn execute_slash_command(
                         }
                     } else {
                         renderer.render(UiLine::CommandOutput(t(Msg::ThinkUsage).into_owned()));
+                        renderer.flush();
+                    }
+                }
+            }
+        }
+        "effort" => {
+            let sub = arg.trim().to_ascii_lowercase();
+            let provider_name = ctx.config.default_provider.clone();
+            let applicable = crate::event_loop::reasoning_effort_applicable_on_provider(ctx);
+            if !applicable {
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::ReasoningEffortNoEffect).into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+            let provider = ctx.config.providers.get_mut(&provider_name);
+            match provider {
+                None => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::CmdNoActiveProvider).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                Some(p) => {
+                    if sub.is_empty() {
+                        // Show current status
+                        let current = p.reasoning_effort.as_deref().unwrap_or("off (API default)");
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Current reasoning effort: {current}\n  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n"
+                        )));
+                        renderer.flush();
+                    } else if sub == "high" || sub == "max" {
+                        p.reasoning_effort = Some(sub.to_string());
+                        ctx.reasoning_effort = Some(sub.to_string());
+                        crate::event_loop::save_and_reload(ctx, renderer);
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  ○ Reasoning effort set to: {sub}\n"
+                        )));
+                        renderer.flush();
+                    } else if sub == "off" {
+                        p.reasoning_effort = None;
+                        ctx.reasoning_effort = None;
+                        crate::event_loop::save_and_reload(ctx, renderer);
+                        renderer.render(UiLine::CommandOutput(
+                            "  ○ Reasoning effort: default (API auto)\n".to_string(),
+                        ));
+                        renderer.flush();
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            "  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n".into(),
+                        ));
                         renderer.flush();
                     }
                 }

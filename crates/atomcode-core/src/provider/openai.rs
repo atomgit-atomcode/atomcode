@@ -137,6 +137,8 @@ pub struct OpenAiProvider {
     /// `ProviderConfig::reasoning_history` at construction so bad values
     /// fail early at load time with a clear error, not silently mid-turn.
     reasoning_history_override: Option<ReasoningPolicy>,
+    /// DeepSeek V4 reasoning effort control (high / max / off).
+    reasoning_effort: Option<String>,
     /// Whether the active model accepts image inputs. Drives `MultiPart`
     /// serialisation: vision-capable → OpenAI image_url schema, text-only
     /// → flat string. Computed once from `ProviderConfig::accepts_images()`
@@ -189,6 +191,7 @@ impl OpenAiProvider {
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
+            reasoning_effort: config.reasoning_effort.clone(),
             supports_vision: config.accepts_images(),
             session_id: std::sync::Arc::new(std::sync::RwLock::new(String::new())),
         })
@@ -227,6 +230,13 @@ impl OpenAiProvider {
             return ReasoningPolicy::Include;
         }
         ReasoningPolicy::Exclude
+    }
+
+    /// Check whether the model supports DeepSeek's `reasoning_effort` field.
+    /// Only DeepSeek V4 (and later V4-derived) models accept this parameter.
+    pub fn reason_effort_applicable(model: &str, _base_url: &str) -> bool {
+        let m = model.to_ascii_lowercase();
+        m.contains("deepseek-v4")
     }
 
     /// Build Kimi's `thinking` request-body object from the two flat
@@ -548,6 +558,13 @@ impl LlmProvider for OpenAiProvider {
             Self::thinking_body_value(self.thinking_type.as_deref(), self.thinking_keep.as_deref())
         {
             body["thinking"] = th;
+        }
+
+        // DeepSeek V4 reasoning_effort: only emitted when applicable
+        if let Some(ref effort) = self.reasoning_effort {
+            if Self::reason_effort_applicable(&self.model, &self.base_url) {
+                body["reasoning_effort"] = json!(effort);
+            }
         }
 
         let policy = crate::provider::retry::RetryPolicy::default_policy();
@@ -1777,6 +1794,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("exclude".into()),
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -1816,6 +1834,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("always".into()),
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -2229,6 +2248,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,

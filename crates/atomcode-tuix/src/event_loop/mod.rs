@@ -848,6 +848,18 @@ pub struct LoopCtx {
     /// the topic is stashed here so `handle_plugin_job_event` can
     /// auto-invoke the skill once installation completes.
     pub pending_guide_topic: Option<String>,
+    /// Current reasoning_effort for the active provider's model.
+    /// None = not set (API uses its own default). Cycled via Ctrl+T.
+    pub reasoning_effort: Option<String>,
+    /// Transient status-line hint with auto-dismiss.
+    pub transient_hint: std::sync::Arc<std::sync::Mutex<Option<TransientHint>>>,
+}
+
+/// A transient hint shown on the status line, with auto-dismiss deadline.
+#[derive(Debug, Clone)]
+pub struct TransientHint {
+    pub text: String,
+    pub deadline: std::time::Instant,
 }
 
 /// Memoised result of the most recent clipboard probe. The hash is a
@@ -3046,6 +3058,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     #[cfg(windows)]
     let mut win_ctrl_c = tokio::signal::windows::ctrl_c()?;
 
+    sync_reasoning_effort_from_provider(&mut ctx);
+
     loop {
         #[cfg(unix)]
         tokio::select! {
@@ -4988,6 +5002,29 @@ fn handle_idle_key(
         }
         // No image in clipboard — fall through to normal key handling
         // (the `v` char will be inserted as a regular character via classify).
+    }
+
+    // Ctrl+T cycles reasoning_effort
+    if code == KeyCode::Char('t') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        if !reasoning_effort_applicable_on_provider(ctx) {
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::ReasoningEffortNoEffect).into_owned(),
+            ));
+            renderer.flush();
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            return Ok(());
+        }
+        let new_val = app.state.cycle_reasoning_effort();
+        ctx.reasoning_effort = new_val.map(|s| s.to_string());
+        persist_reasoning_effort(ctx);
+        let msg = match new_val {
+            Some(v) => format!("  reasoning_effort → {}\n", v),
+            None => "  reasoning_effort cleared (API default)\n".into(),
+        };
+        renderer.render(UiLine::CommandOutput(msg));
+        renderer.flush();
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
     }
 
     // Multi-line cursor nav (idle path). Mirror of the streaming-mode
@@ -7569,6 +7606,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         hint,
         mode_indicator,
         bypass_indicator,
+        reasoning_effort: if reasoning_effort_applicable_on_provider(ctx) {
+            ctx.reasoning_effort.clone()
+        } else {
+            None
+        },
         session_name,
     }
 }
@@ -7981,3 +8023,39 @@ pub(crate) fn summarise(output: &str, success: bool) -> String {
 
 // SessionPicker tests moved alongside the struct in
 // `crate::modals::session_picker::tests`.
+
+/// Sync ctx.reasoning_effort from the current default provider's config.
+fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
+    let applicable = reasoning_effort_applicable_on_provider(ctx);
+    ctx.reasoning_effort = if applicable {
+        ctx.config
+            .providers
+            .get(&ctx.config.default_provider)
+            .and_then(|p| p.reasoning_effort.clone())
+    } else {
+        None
+    };
+}
+
+/// Persist the current reasoning_effort to config.toml
+fn persist_reasoning_effort(ctx: &mut LoopCtx) {
+    let path = Config::default_path();
+    let default_provider = ctx.config.default_provider.clone();
+    if let Some(p) = ctx.config.providers.get_mut(&default_provider) {
+        p.reasoning_effort = ctx.reasoning_effort.clone();
+    }
+    if let Err(e) = ctx.config.save(&path) {
+        eprintln!("[reasoning_effort] failed to save config: {e}");
+    }
+}
+
+pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
+    let ptype = ctx
+        .config
+        .providers
+        .get(&ctx.config.default_provider)
+        .map(|p| p.provider_type.as_str())
+        .unwrap_or("");
+    (ptype == "deepseek" || ptype == "openai")
+        && ctx.model_name.to_ascii_lowercase().contains("deepseek-v4")
+}

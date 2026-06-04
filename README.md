@@ -84,7 +84,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 |----------|:---:|---|
 | Claude (Anthropic) | Yes | Claude Sonnet 4.5/4.6, Opus 4.6 |
 | OpenAI | Yes | GPT-4o, GPT-4.1 |
-| DeepSeek | Yes | DeepSeek V3, DeepSeek R1 |
+| DeepSeek | Yes | DeepSeek V3, DeepSeek R1, DeepSeek V4 |
 | Zhipu (GLM) | Yes | GLM-4, GLM-5 |
 | Qwen (Alibaba) | Yes | Qwen-Plus, Qwen-Max |
 | SiliconFlow | Yes | Various open models |
@@ -337,6 +337,8 @@ Then just type what you want:
 | `/config` | Edit config file |
 | `/status` | Show login status and model info |
 | `/logout` | Logout from AtomGit |
+| `/think` | Control extended thinking (on/off/budget N) |
+| `/effort` | DeepSeek reasoning effort control (high / max / off) |
 | `/help` | Show commands & shortcuts |
 | `/quit` | Exit (or Ctrl+C ×2) |
 

@@ -28,6 +28,7 @@ pub(crate) struct CreateProviderRequest {
     pub thinking_type: Option<String>,
     pub thinking_keep: Option<String>,
     pub reasoning_history: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     #[serde(default)]
@@ -62,6 +63,7 @@ pub(crate) struct PatchProviderRequest {
     pub thinking_type: Option<Option<String>>,
     pub thinking_keep: Option<Option<String>>,
     pub reasoning_history: Option<Option<String>>,
+    pub reasoning_effort: Option<Option<String>>,
     pub skip_tls_verify: Option<bool>,
 }
 
@@ -74,6 +76,7 @@ pub(crate) struct PatchThinkingRequest {
     pub thinking_type: Option<Option<String>>,
     pub keep: Option<Option<String>>,
     pub reasoning_history: Option<Option<String>>,
+    pub reasoning_effort: Option<Option<String>>,
 }
 
 // ============================================================================
@@ -143,6 +146,7 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
         thinking_type: req.thinking_type,
         thinking_keep: req.thinking_keep,
         reasoning_history: req.reasoning_history,
+        reasoning_effort: req.reasoning_effort,
         thinking_enabled: req.thinking_enabled,
         thinking_budget: req.thinking_budget,
         skip_tls_verify: req.skip_tls_verify,
@@ -256,6 +260,9 @@ pub(crate) async fn patch_provider(
     }
     if let Some(rh) = req.reasoning_history {
         existing.reasoning_history = rh;
+    }
+    if let Some(re) = req.reasoning_effort {
+        existing.reasoning_effort = re;
     }
     if let Some(stv) = req.skip_tls_verify {
         existing.skip_tls_verify = stv;
@@ -399,6 +406,9 @@ pub(crate) async fn patch_thinking(
     }
     if let Some(rh) = req.reasoning_history {
         provider.reasoning_history = rh;
+    }
+    if let Some(re) = req.reasoning_effort {
+        provider.reasoning_effort = re;
     }
 
     let default_provider = config.default_provider.clone();
