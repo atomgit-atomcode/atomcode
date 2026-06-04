@@ -729,8 +729,42 @@ const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
 /// parent can be Ctrl+C'd without cancelling the download.
 const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Run the entire program on a thread with a large, explicit stack.
+    // Rust gives the *main* OS thread the platform-default stack — on
+    // Windows that's only ~1 MB (vs 8 MB on Linux/macOS). The TUI event
+    // loop, the synchronous codingplan/OAuth work, and the rustls TLS
+    // handshakes all run on it via `block_on`, and a deep call chain there
+    // can overflow 1 MB. A stack overflow on Windows kills the process via
+    // an OS exception (STATUS_STACK_OVERFLOW) WITHOUT a Rust panic — so it
+    // never reaches the crash-log hook and looks like a silent exit. A
+    // 16 MB stack removes that platform asymmetry. (See the Windows
+    // post-scan onboarding crash investigation.)
+    let child = std::thread::Builder::new()
+        .name("atomcode-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("failed to spawn atomcode main thread");
+    // Under `panic = "abort"` a panic in the child already aborts the whole
+    // process, so `join` only returns an error on an abnormal thread exit;
+    // mirror Rust's conventional panic exit code in that case.
+    if child.join().is_err() {
+        std::process::exit(101);
+    }
+}
+
+fn real_main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        // Worker threads (for `tokio::spawn`ed tasks) get a generous stack
+        // too — same rationale as the main thread above.
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("failed to build tokio runtime");
+    rt.block_on(async_main());
+}
+
+async fn async_main() {
     // Set Windows console to UTF-8 so CJK and other multi-byte characters
     // render correctly instead of showing garbled output (mojibake).
     #[cfg(target_os = "windows")]

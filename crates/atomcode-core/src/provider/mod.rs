@@ -5,7 +5,7 @@ pub mod retry;
 
 use std::pin::Pin;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::Stream;
 
@@ -539,7 +539,9 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        // No `Client::new()` fallback — it panics on TLS/resolver init
+        // failure and `panic = "abort"` turns that into a process kill.
+        .context("failed to build OAuth refresh HTTP client")?;
     let builder = client
         .post(crate::auth::oauth::platform_refresh_url())
         .json(&serde_json::json!({ "refresh_token": refresh_token, "provider": "atomgit" }));

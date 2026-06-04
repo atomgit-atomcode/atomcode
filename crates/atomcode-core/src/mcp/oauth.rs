@@ -197,7 +197,11 @@ pub fn refresh_mcp_oauth_token(server_name: &str, token: &McpOAuthToken) -> Resu
         form.push(("resource", resource.clone()));
     }
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        // No `Client::new()` fallback — it panics on TLS/resolver init
+        // failure and `panic = "abort"` turns that into a process kill.
+        .context("failed to build MCP OAuth HTTP client")?;
     let resp = client
         .post(token_endpoint)
         .header("Accept", "application/json")
@@ -268,7 +272,11 @@ pub fn login_mcp_oauth(
         );
     }
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        // No `Client::new()` fallback — it panics on TLS/resolver init
+        // failure and `panic = "abort"` turns that into a process kill.
+        .context("failed to build MCP OAuth HTTP client")?;
     let discovered = discover_oauth_metadata(&client, url, &auth)?;
     let (redirect_uri, listener) = bind_callback_listener()?;
     let state = Uuid::new_v4().to_string();
@@ -408,7 +416,11 @@ pub fn login_github_oauth(
         bail!("OAuth state mismatch");
     }
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        // No `Client::new()` fallback — it panics on TLS/resolver init
+        // failure and `panic = "abort"` turns that into a process kill.
+        .context("failed to build MCP OAuth HTTP client")?;
     let resp = client
         .post(GITHUB_TOKEN_URL)
         .header("Accept", "application/json")

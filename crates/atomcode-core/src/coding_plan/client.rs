@@ -115,12 +115,19 @@ impl Client {
         // latency for a healthy path and fails fast otherwise — the
         // error surfaces as a benign "status fetch failed" line next to
         // the rest of the status report.
+        // NOTE: do NOT fall back to `Client::new()` on build failure — that
+        // helper *panics* if the TLS backend / resolver can't initialize,
+        // and with `panic = "abort"` (see workspace Cargo.toml) a panic here
+        // kills the whole process instead of surfacing as a recoverable
+        // error. `builder().build()` returns the same failure as a catchable
+        // `Err`, so propagate it and let the orchestrator render a clean
+        // "status fetch failed" line.
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
             .user_agent(crate::ATOMCODE_USER_AGENT)
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            .context("failed to build CodingPlan HTTP client")?;
         Ok(Self { http, token })
     }
 

@@ -61,19 +61,24 @@ pub fn user_url() -> String { format!("{}/api/v5/user", platform_base_url()) }
 /// OAuth-side request must carry the token or AtomGit's gate rejects it.
 /// Centralized so a future UA format change (e.g. append install-id)
 /// happens in one spot rather than at each `Client::new()` site.
-fn blocking_client() -> reqwest::blocking::Client {
+fn blocking_client() -> Result<reqwest::blocking::Client> {
     // Hard timeouts here too — the `get_valid_token` path calls
     // `refresh_access_token` synchronously whenever a stored token
     // looks expired, and that runs on the main TUI thread (via
     // `Client::from_stored_auth` → `/status`, drift monitor, etc.).
     // Without a cap, a slow or unreachable OAuth server would hang
     // the UI indefinitely. Same budget as the coding-plan client.
+    //
+    // Return `Result` rather than falling back to `Client::new()`: that
+    // helper *panics* on TLS/resolver init failure, and with `panic =
+    // "abort"` that takes down the whole process. `build()` reports the
+    // same failure as a catchable `Err` — propagate it.
     reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .user_agent(crate::ATOMCODE_USER_AGENT)
         .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        .context("failed to build OAuth HTTP client")
 }
 
 fn pending_invite_for_login() -> (Option<String>, Option<uuid::Uuid>) {
@@ -415,7 +420,13 @@ impl LoginSession {
 /// user action — separated from polling so callers can render the URL
 /// before yielding control to the wait loop.
 pub fn start_login() -> Result<LoginSession> {
-    let client = reqwest::blocking::Client::new();
+    // `Client::new()` panics on TLS/resolver init failure; with `panic =
+    // "abort"` that aborts the process before the QR can even render.
+    // Build fallibly and surface a recoverable error instead.
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(crate::ATOMCODE_USER_AGENT)
+        .build()
+        .context("failed to build OAuth login HTTP client")?;
     let resp: PlatformLoginResponse = client
         .get(platform_login_url())
         .query(&[("provider", "atomgit")])
@@ -869,7 +880,7 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         .as_deref()
         .context("No refresh_token available — please /login again")?;
 
-    let client = blocking_client();
+    let client = blocking_client()?;
 
     // Call Platform Broker API for refresh
     let response = client
