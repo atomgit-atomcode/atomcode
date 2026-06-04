@@ -106,12 +106,13 @@ pub fn ensure_live_session(
     session_id: Option<atomcode_core::session::SessionId>,
     initial_messages: Vec<atomcode_core::conversation::message::Message>,
 ) -> Arc<atomcode_core::live::LiveSession> {
+    // TUI 调用方传入的是已在内存里的 ctx.current_session.messages，直接用闭包包一层即可。
     ensure_live_session_global(
         working_dir,
         live_mcp_cache(),
         telemetry,
         session_id,
-        initial_messages,
+        move || initial_messages,
     )
 }
 
@@ -119,7 +120,8 @@ pub fn ensure_live_session(
 ///
 /// `session_id`：若提供且与现有 LiveSession 不同，则替换（解决 #561：TUI/WebUI
 /// 切换到新会话后 sync 应跟随）。None 时复用已有 LiveSession 或新建。
-/// `initial_messages`：新建时作为对话历史种子；已有 LiveSession 不受影响。
+/// `initial_messages`：**惰性**闭包，仅在确实要新建/替换 LiveSession 时（持锁内）
+/// 求值。复用既有会话时根本不会调用，从而避免 webui 每条消息都为被丢弃的历史读盘。
 pub(crate) fn ensure_live_session_global(
     working_dir: std::path::PathBuf,
     mcp_cache: Arc<
@@ -129,7 +131,7 @@ pub(crate) fn ensure_live_session_global(
     >,
     telemetry: Arc<atomcode_telemetry::Telemetry>,
     session_id: Option<atomcode_core::session::SessionId>,
-    initial_messages: Vec<atomcode_core::conversation::message::Message>,
+    initial_messages: impl FnOnce() -> Vec<atomcode_core::conversation::message::Message>,
 ) -> Arc<atomcode_core::live::LiveSession> {
     let mut g = LIVE.lock().unwrap();
     // 若已有 LiveSession 且 session_id 匹配（或调用方未指定），直接复用。
@@ -154,7 +156,9 @@ pub(crate) fn ensure_live_session_global(
         auto_approve: false,
         session_id,
     });
-    let session = atomcode_core::live::LiveSession::new(executor, initial_messages);
+    // 历史在锁内、确认要建会话后才求值——既省掉无谓读盘，也避免「锁外判定、锁内已被
+    // 别的请求替换」的 TOCTOU：是否新建与用什么历史新建是同一临界区里的决定。
+    let session = atomcode_core::live::LiveSession::new(executor, initial_messages());
     *g = Some(session.clone());
     session
 }
@@ -666,30 +670,27 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
 // Handlers: GET /live (SSE) + POST /live/message
 // ============================================================================
 
-/// 把前端传来的 session_id 字符串解析为 (SessionId, initial_messages)。
-/// 若 session_id 非空，尝试从 SessionManager 加载该会话的历史消息作为
-/// LiveSession 的种子；加载失败时降级为空历史（不阻断）。
-/// 返回 `(None, Vec::new())` 表示调用方未指定 session_id。
-fn resolve_session_context(
-    working_dir: &std::path::Path,
-    session_id_str: Option<String>,
-) -> (
-    Option<atomcode_core::session::SessionId>,
-    Vec<atomcode_core::conversation::message::Message>,
-) {
-    use atomcode_core::session::{SessionId, SessionManager};
-    let Some(id_str) = session_id_str else {
-        return (None, Vec::new());
-    };
+/// 把前端传来的 session_id 字符串解析为 `SessionId`（None/空字符串 → None）。
+/// 仅做解析、不读盘——历史加载留给 `load_session_messages`，且仅在 LiveSession
+/// 确实要新建/替换时经惰性闭包触发（见 ensure_live_session_global）。
+fn parse_session_id(session_id_str: Option<String>) -> Option<atomcode_core::session::SessionId> {
+    let id_str = session_id_str?;
     if id_str.is_empty() {
-        return (None, Vec::new());
+        return None;
     }
-    let sid = SessionId::from_string(id_str);
-    let messages = SessionManager::new(working_dir)
-        .load(&sid)
+    Some(atomcode_core::session::SessionId::from_string(id_str))
+}
+
+/// 从 SessionManager 加载指定会话的历史消息作为 LiveSession 种子；
+/// 加载失败时降级为空历史（不阻断）。
+fn load_session_messages(
+    working_dir: &std::path::Path,
+    sid: &atomcode_core::session::SessionId,
+) -> Vec<atomcode_core::conversation::message::Message> {
+    atomcode_core::session::SessionManager::new(working_dir)
+        .load(sid)
         .map(|s| s.messages)
-        .unwrap_or_default();
-    (Some(sid), messages)
+        .unwrap_or_default()
 }
 
 /// GET /live 查询参数。`session_id` 可选：提供时把 LiveSession 绑定到该会话
@@ -706,9 +707,20 @@ pub(crate) async fn live_stream(
 ) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
     let project_hash = crate::hash_path(&working_dir);
-    // 若前端传了 session_id，尝试从 SessionManager 加载历史以导入 LiveSession。
-    let (sid, initial) = resolve_session_context(&working_dir, q.session_id);
-    let session = ensure_live_session(working_dir, state.telemetry.clone(), sid, initial);
+    // 若前端传了 session_id，绑定到该会话；历史仅在确实要新建 LiveSession 时才读盘。
+    let sid = parse_session_id(q.session_id);
+    let load_dir = working_dir.clone();
+    let load_sid = sid.clone();
+    let session = ensure_live_session_global(
+        working_dir,
+        live_mcp_cache(),
+        state.telemetry.clone(),
+        sid,
+        move || match load_sid {
+            Some(s) => load_session_messages(&load_dir, &s),
+            None => Vec::new(),
+        },
+    );
     let (snapshot, mut rx) = session.join().await;
 
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
@@ -811,8 +823,20 @@ pub(crate) async fn live_message(
     // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
     set_live_provider(req.provider);
     // #561 修复：把调用方的 session_id 传递给 LiveSession，使 sync 与常规会话统一。
-    let (sid, initial) = resolve_session_context(&working_dir, req.session_id);
-    let session = ensure_live_session(working_dir, state.telemetry.clone(), sid, initial);
+    // 历史惰性加载——会话已存在且匹配时直接复用，不会为被丢弃的历史读盘。
+    let sid = parse_session_id(req.session_id);
+    let load_dir = working_dir.clone();
+    let load_sid = sid.clone();
+    let session = ensure_live_session_global(
+        working_dir,
+        live_mcp_cache(),
+        state.telemetry.clone(),
+        sid,
+        move || match load_sid {
+            Some(s) => load_session_messages(&load_dir, &s),
+            None => Vec::new(),
+        },
+    );
     // 视觉预处理在 coordinator 经 executor.preprocess_input 统一做（TUI / webui 共享），
     // 此处只负责投递原始输入。
     let ok = session.send_input(UserInput {

@@ -103,7 +103,6 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
         Some("vscode") => SessionMode::Vscode,
         Some("webui") => SessionMode::Webui,
         Some("atomcode-air") => SessionMode::AtomcodeAir,
-        Some("webui") => SessionMode::Webui,
         _ => SessionMode::Ide,
     };
 

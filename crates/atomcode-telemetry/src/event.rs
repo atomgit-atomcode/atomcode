@@ -21,7 +21,6 @@ pub enum SessionMode {
     #[serde(rename = "webui")]
     Webui,
     AtomcodeAir,
-    Webui,
 }
 
 // ---------- Envelope (common to every event) ----------
