@@ -2361,7 +2361,16 @@ impl AgentLoop {
                                 AgentCommand::ApproveToolAlways => {
                                     if let Some(ref req) = last_approval_request {
                                         if let Ok(mut store) = permission_store.write() {
-                                            store.grant_session(&req.call.name);
+                                            // Path-scoped approvals (sensitive
+                                            // reads) remember only this exact
+                                            // resource, so re-reading the same
+                                            // file stops re-prompting while
+                                            // other sensitive paths stay gated.
+                                            // Everything else grants the tool.
+                                            match &req.scope {
+                                                Some(scope) => store.grant_session_scope(scope),
+                                                None => store.grant_session(&req.call.name),
+                                            }
                                         }
                                     }
                                     *phase = AgentPhase::Thinking;

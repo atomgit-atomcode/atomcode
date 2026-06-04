@@ -636,10 +636,17 @@ pub fn approval_for_path(
         }
         ExternalPathAction::Read => {
             if sensitive {
-                ApprovalRequirement::RequireApprovalAlways(format!(
-                    "{}. This path looks sensitive and always requires confirmation.",
-                    base_reason
-                ))
+                // Reading is non-destructive, so re-confirming the SAME file on
+                // every chunk adds no safety. Scope the approval to this exact
+                // path: a session [A] remembers this file (so segmented reads
+                // stop re-prompting) while every other sensitive path still
+                // prompts. The canonical path is the scope key.
+                ApprovalRequirement::RequireApprovalScoped {
+                    reason: format!(
+                        "{base_reason}. This path looks sensitive and requires confirmation."
+                    ),
+                    scope: access.path.to_string_lossy().into_owned(),
+                }
             } else {
                 ApprovalRequirement::RequireApproval(format!("{base_reason}."))
             }
@@ -685,6 +692,13 @@ pub enum ApprovalRequirement {
     AutoApprove,
     RequireApproval(String),
     RequireApprovalAlways(String),
+    /// Prompt the user, but a session [A] remembers this exact `scope` (a
+    /// canonical resource key, e.g. a file path) rather than the whole tool.
+    /// Used for sensitive reads: re-reading the same file in segments stops
+    /// re-prompting once approved, while every other sensitive resource still
+    /// requires its own confirmation. Unlike a tool-wide grant, a scoped grant
+    /// only covers the matching `scope`.
+    RequireApprovalScoped { reason: String, scope: String },
 }
 
 /// Coarse-grained permission level for a tool, stored in `PermissionStore`.
@@ -715,6 +729,10 @@ pub struct PermissionStore {
     overrides: HashMap<String, PermissionLevel>,
     /// Session-level grants: tool names approved with [A]lways for this session.
     session_grants: HashSet<String>,
+    /// Session-level scoped grants: resource keys (e.g. canonical file paths)
+    /// approved with [A] for a `RequireApprovalScoped` call. Covers only the
+    /// matching scope, never a whole tool.
+    session_scope_grants: HashSet<String>,
 }
 
 impl PermissionStore {
@@ -722,12 +740,25 @@ impl PermissionStore {
         Self {
             overrides: HashMap::new(),
             session_grants: HashSet::new(),
+            session_scope_grants: HashSet::new(),
         }
     }
 
     /// Check whether a tool call should be auto-approved, needs asking, or denied.
     pub fn check(&self, tool_name: &str, approval: &ApprovalRequirement) -> PermissionDecision {
         if let ApprovalRequirement::RequireApprovalAlways(reason) = approval {
+            return PermissionDecision::Ask(reason.clone());
+        }
+
+        // Path-scoped approval (e.g. sensitive reads). Allowed ONLY by an exact
+        // per-scope session grant — deliberately NOT covered by a tool-wide [A]
+        // (`session_grants`), so pressing [A] on an innocuous external file can
+        // never silently unlock reads of ~/.ssh/id_rsa etc. Re-reading the same
+        // file in segments yields the same scope, so one [A] stops the prompts.
+        if let ApprovalRequirement::RequireApprovalScoped { reason, scope } = approval {
+            if self.session_scope_grants.contains(scope) {
+                return PermissionDecision::Allow;
+            }
             return PermissionDecision::Ask(reason.clone());
         }
 
@@ -763,6 +794,12 @@ impl PermissionStore {
     /// Grant session-level permission for a tool (user pressed [A]).
     pub fn grant_session(&mut self, tool_name: &str) {
         self.session_grants.insert(tool_name.to_string());
+    }
+
+    /// Grant session-level permission for a single scope key (user pressed [A]
+    /// on a `RequireApprovalScoped` call). Only this exact scope is unlocked.
+    pub fn grant_session_scope(&mut self, scope: &str) {
+        self.session_scope_grants.insert(scope.to_string());
     }
 
     /// Set an explicit override level for a tool.
@@ -1483,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_for_sensitive_read_outside_workspace_requires_always() {
+    fn approval_for_sensitive_read_outside_workspace_is_path_scoped() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         let target = outside.path().join("id_rsa");
@@ -1495,10 +1532,16 @@ mod tests {
             ExternalPathAction::Read,
         )
         .unwrap();
-        assert!(matches!(
-            approval,
-            ApprovalRequirement::RequireApprovalAlways(_)
-        ));
+        // Sensitive reads are PATH-SCOPED, not blanket "always ask": a session
+        // [A] remembers THIS exact file so re-reading it in segments doesn't
+        // re-prompt, while every other sensitive file still requires its own
+        // confirmation. The scope key is the canonical path.
+        match approval {
+            ApprovalRequirement::RequireApprovalScoped { scope, .. } => {
+                assert_eq!(Path::new(&scope), target.canonicalize().unwrap());
+            }
+            _ => panic!("expected RequireApprovalScoped for a sensitive external read"),
+        }
     }
 
     #[test]
@@ -1684,6 +1727,60 @@ mod tests {
             reg2.register_arc(name, arc).await;
         }
         assert!(reg2.get("dummy").await.is_some());
+    }
+
+    #[test]
+    fn test_permission_store_scoped_grant_allows_same_scope() {
+        // The user's bug: reading the SAME file in segments re-prompts on every
+        // chunk even after pressing [A]. With path-scoped grants, pressing [A]
+        // remembers the file's canonical path; subsequent reads (any
+        // offset/limit → same scope) auto-approve.
+        let mut store = PermissionStore::new();
+        let approval = ApprovalRequirement::RequireApprovalScoped {
+            reason: "sensitive read".into(),
+            scope: "/home/u/.config/notes.md".into(),
+        };
+        assert!(matches!(
+            store.check("read_file", &approval),
+            PermissionDecision::Ask(_)
+        ));
+        store.grant_session_scope("/home/u/.config/notes.md");
+        assert!(matches!(
+            store.check("read_file", &approval),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn test_permission_store_scoped_grant_does_not_cover_other_scopes() {
+        // Granting one file must not auto-approve a DIFFERENT sensitive file.
+        let mut store = PermissionStore::new();
+        store.grant_session_scope("/home/u/.config/notes.md");
+        let other = ApprovalRequirement::RequireApprovalScoped {
+            reason: "sensitive read".into(),
+            scope: "/home/u/.ssh/id_rsa".into(),
+        };
+        assert!(matches!(
+            store.check("read_file", &other),
+            PermissionDecision::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn test_permission_store_tool_grant_does_not_cover_scoped() {
+        // A tool-wide [A] (grant_session) must NOT auto-approve a path-scoped
+        // sensitive read — otherwise pressing [A] on an innocuous external file
+        // would silently allow reading ~/.ssh/id_rsa for the rest of the session.
+        let mut store = PermissionStore::new();
+        store.grant_session("read_file");
+        let approval = ApprovalRequirement::RequireApprovalScoped {
+            reason: "sensitive read".into(),
+            scope: "/home/u/.ssh/id_rsa".into(),
+        };
+        assert!(matches!(
+            store.check("read_file", &approval),
+            PermissionDecision::Ask(_)
+        ));
     }
 
     #[test]

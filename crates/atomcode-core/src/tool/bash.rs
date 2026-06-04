@@ -3388,7 +3388,16 @@ fn approval_for_command_paths(
             (Some(ApprovalRequirement::RequireApprovalAlways(reason)), _) => {
                 Some(ApprovalRequirement::RequireApprovalAlways(reason))
             }
+            // bash never path-scopes: a sensitive read embedded in an arbitrary
+            // command stays always-ask, so a per-file [A] grant (meant for the
+            // read_file tool) can't disarm the bash path guard.
+            (Some(ApprovalRequirement::RequireApprovalScoped { reason, .. }), _) => {
+                Some(ApprovalRequirement::RequireApprovalAlways(reason))
+            }
             (_, ApprovalRequirement::RequireApprovalAlways(reason)) => {
+                Some(ApprovalRequirement::RequireApprovalAlways(reason))
+            }
+            (_, ApprovalRequirement::RequireApprovalScoped { reason, .. }) => {
                 Some(ApprovalRequirement::RequireApprovalAlways(reason))
             }
             (Some(ApprovalRequirement::RequireApproval(reason)), _) => {

@@ -1275,7 +1275,8 @@ impl TurnRunner {
         // the decider which handles interactive prompts or automatic policy.
         let approval = tool.approval_with_context(&call.arguments, &self.context);
         if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
-        | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
+        | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason)
+        | crate::tool::ApprovalRequirement::RequireApprovalScoped { ref reason, .. } = approval
         {
             // Only emit the ApprovalRequested event (which triggers the
             // TUI approval prompt) when the decider actually needs user
