@@ -134,6 +134,12 @@ pub struct Telemetry {
     launch_id: Uuid,
     session_id: std::sync::Arc<std::sync::RwLock<Uuid>>,
     account_id: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    /// Launch-level session mode (Tui / Headless / Ide / …). Like `account_id`,
+    /// this outlives any single `CurrentContext` scope: it is set once at
+    /// startup and used as the envelope `mode` fallback whenever a task emits
+    /// outside a mode-bearing scope (e.g. a spawned task that forgot to
+    /// re-apply the task-local). A per-scope `CurrentContext.mode` still wins.
+    default_mode: std::sync::Arc<std::sync::RwLock<Option<crate::event::SessionMode>>>,
     app_version: String,
     os: &'static str,
     arch: &'static str,
@@ -173,6 +179,7 @@ impl Telemetry {
                 launch_id,
                 session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
                 account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
                 app_version,
                 os,
                 arch,
@@ -205,6 +212,7 @@ impl Telemetry {
                     launch_id,
                     session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
                     account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                    default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
                     app_version,
                     os,
                     arch,
@@ -238,6 +246,7 @@ impl Telemetry {
             launch_id,
             session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
             account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
             app_version,
             os,
             arch,
@@ -359,7 +368,11 @@ impl Telemetry {
             provider_host: ctx.provider_host,
             model: ctx.model,
             repo_origin: ctx.repo_origin,
-            mode: ctx.mode,
+            // Fall back to the launch-level default when no scope set a mode —
+            // otherwise an un-scoped spawned task would emit `mode: null`.
+            mode: ctx
+                .mode
+                .or_else(|| self.default_mode.read().ok().and_then(|g| *g)),
         }
     }
 
@@ -392,6 +405,17 @@ impl Telemetry {
     pub fn set_account_id(&self, id: Option<String>) {
         if let Ok(mut g) = self.account_id.write() {
             *g = id;
+        }
+    }
+
+    /// Set the launch-level default session mode (Tui / Headless / Ide / …).
+    /// Call once at startup: the CLI passes its resolved session mode, the
+    /// daemon passes its startup mode. Events emitted outside a mode-bearing
+    /// `CurrentContext` scope fall back to this instead of `mode: null`; an
+    /// explicit per-scope `CurrentContext.mode` still overrides it.
+    pub fn set_default_mode(&self, mode: Option<crate::event::SessionMode>) {
+        if let Ok(mut g) = self.default_mode.write() {
+            *g = mode;
         }
     }
 
@@ -452,6 +476,7 @@ impl Telemetry {
             launch_id,
             session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
             account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
             app_version,
             os: os_str(),
             arch: arch_str(),
@@ -699,6 +724,85 @@ mod session_id_tests {
             records[0].envelope.session_id, override_uuid,
             "CurrentContext.session_id should override the Telemetry-level session_id"
         );
+    }
+}
+
+#[cfg(test)]
+mod default_mode_tests {
+    use super::*;
+    use crate::event::{Event, SessionMode};
+
+    /// The bug fix: `mode` is a launch-level attribute (like `account_id`). When
+    /// a spawned task forgets to re-apply the task-local `CurrentContext` scope,
+    /// the envelope must fall back to the process default instead of emitting
+    /// `mode: null`. (Real impact: IDE-daemon turns whose telemetry escaped the
+    /// per-request scope were landing as null instead of `ide`.)
+    #[tokio::test]
+    async fn default_mode_fills_envelope_when_no_scope_mode() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        tel.set_default_mode(Some(SessionMode::Ide));
+
+        // Emit OUTSIDE any CurrentContext::scope — the failure mode of an
+        // un-scoped spawned task.
+        tel.track(Event::OpenAtomcode {
+            dangerously_skip_permissions: false,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].envelope.mode,
+            Some(SessionMode::Ide),
+            "envelope must fall back to the launch-level default mode"
+        );
+    }
+
+    /// A per-request scope (e.g. the daemon's `daemon_scope` with the client's
+    /// X-AtomCode-Client header) must still override the process default, so
+    /// vscode/webui clients are attributed correctly.
+    #[tokio::test]
+    async fn current_context_mode_overrides_default_mode() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        tel.set_default_mode(Some(SessionMode::Ide));
+
+        CurrentContext::scope(
+            CurrentContext {
+                mode: Some(SessionMode::Vscode),
+                ..Default::default()
+            },
+            || async {
+                tel.track(Event::OpenAtomcode {
+                    dangerously_skip_permissions: false,
+                });
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].envelope.mode,
+            Some(SessionMode::Vscode),
+            "an explicit per-scope mode must win over the launch default"
+        );
+    }
+
+    /// Without a default set and without a scope, mode stays `None` (unchanged
+    /// behavior — the default is opt-in).
+    #[tokio::test]
+    async fn no_default_and_no_scope_stays_none() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+
+        tel.track(Event::OpenAtomcode {
+            dangerously_skip_permissions: false,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].envelope.mode, None);
     }
 }
 

@@ -3636,6 +3636,13 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let atomcode_dir = resolved.atomcode_dir.clone();
     let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
 
+    // Launch-level fallback mode (Ide for the standalone daemon, Webui for the
+    // in-process webui). Per-request `daemon_scope` overrides this with the
+    // client's X-AtomCode-Client mode; the fallback only kicks in for telemetry
+    // emitted outside any per-request scope (e.g. an un-scoped spawned task),
+    // which previously landed as `mode: null`.
+    telemetry.set_default_mode(Some(startup_mode));
+
     // Step 4.5: Install panic hook (R9.1, R9.2, R9.3, R9.4)
     install_panic_hook(telemetry.clone());
 

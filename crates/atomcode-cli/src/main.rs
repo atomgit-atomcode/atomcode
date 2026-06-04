@@ -1427,6 +1427,10 @@ async fn run() -> Result<i32> {
     } else {
         SessionMode::Tui
     };
+    // Launch-level fallback: any telemetry emitted outside a mode-bearing
+    // CurrentContext scope (e.g. an un-scoped spawned task) attributes to this
+    // process mode instead of `null`. Per-scope mode still overrides it.
+    telemetry.set_default_mode(Some(session_mode));
     // Bind telemetry to the continued session's id (if any). A fresh run needs
     // nothing here: the agent bootstraps telemetry + header + datalog from its
     // own session id. The TUI manages its own binding via
