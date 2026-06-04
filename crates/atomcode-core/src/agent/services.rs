@@ -54,7 +54,12 @@ impl AgentLoop {
             duration: start.elapsed(),
         });
 
-        let context_text = crate::agent::local_shell::format_bash_context(&cmd, &outcome);
+        // Bound the injected context the same way per-turn tool results are
+        // bounded (ctx::truncate), so `!cat bigfile` can't blow up the
+        // conversation — the `!` path doesn't go through `truncate_output`.
+        let char_limit = (self.ctx.ctx_window() / 8).min(32_000).max(8_000);
+        let context_text =
+            crate::agent::local_shell::format_bash_context(&cmd, &outcome, char_limit);
         self.conversation.add_user_message(&context_text);
         // Intentionally NOT calling run_turn_loop(): `!` records context
         // silently; the model reads it on the user's next message.
