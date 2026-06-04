@@ -37,6 +37,34 @@ pub fn suppress_console_window_sync(cmd: &mut std::process::Command) {
 #[cfg(not(target_os = "windows"))]
 pub fn suppress_console_window_sync(_cmd: &mut std::process::Command) {}
 
+/// Build a shell command that runs `command` through the platform shell.
+///
+/// - Windows: `cmd.exe /C <command>` — the command string is passed via
+///   `raw_arg` so cmd.exe receives it **verbatim**. Using the normal `.arg()`
+///   would apply std's `CommandLineToArgvW` quoting, which cmd.exe does NOT
+///   follow — embedded quotes / `%VAR%` / `^` etc. would be mangled. This
+///   mirrors the spawn in `tool/bash.rs` (and `auth/oauth.rs`).
+/// - Other: `sh -c <command>`.
+///
+/// Caller still chains env/stdio/`kill_on_drop` and `suppress_console_window`
+/// as needed; this only fixes the program + command-string wiring.
+#[cfg(target_os = "windows")]
+pub fn shell_command(command: &str) -> tokio::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = tokio::process::Command::new("cmd.exe");
+    cmd.arg("/C");
+    cmd.as_std_mut().raw_arg(command);
+    cmd
+}
+
+/// See the Windows variant above.
+#[cfg(not(target_os = "windows"))]
+pub fn shell_command(command: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(command);
+    cmd
+}
+
 /// Decode raw bytes captured from a subprocess's stdout / stderr.
 ///
 /// Modern cross-platform tools (git, cargo, npm, …) emit UTF-8 even on

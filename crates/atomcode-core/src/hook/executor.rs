@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use super::config::matching_hooks;
 use super::{
@@ -224,18 +223,7 @@ impl HookExecutor {
     ) -> anyhow::Result<(bool, String, String)> {
         use std::process::Stdio;
 
-        #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut c = Command::new("cmd.exe");
-            c.arg("/C").arg(&hook.command);
-            c
-        };
-        #[cfg(not(target_os = "windows"))]
-        let mut cmd = {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(&hook.command);
-            c
-        };
+        let mut cmd = crate::process_utils::shell_command(&hook.command);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -297,18 +285,7 @@ impl HookExecutor {
         let ctx_json =
             serde_json::to_string(ctx).unwrap_or_else(|_| "{}".to_string());
 
-        #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut c = Command::new("cmd.exe");
-            c.arg("/C").arg(&hook.command);
-            c
-        };
-        #[cfg(not(target_os = "windows"))]
-        let mut cmd = {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(&hook.command);
-            c
-        };
+        let mut cmd = crate::process_utils::shell_command(&hook.command);
         cmd.env("ATOMCODE_HOOK_EVENT", &ctx.event)
             .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
             // Hook timeout drops the cmd.output() future; without

@@ -13,7 +13,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use super::config::matches_tool;
 use super::json_config::load_hooks_config;
@@ -553,18 +552,7 @@ impl ShellCommandHook {
             "{}".to_string()
         });
 
-        #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut c = Command::new("cmd.exe");
-            c.arg("/C").arg(&self.command);
-            c
-        };
-        #[cfg(not(target_os = "windows"))]
-        let mut cmd = {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(&self.command);
-            c
-        };
+        let mut cmd = crate::process_utils::shell_command(&self.command);
         cmd.env("ATOMCODE_HOOK_EVENT", &ctx.event)
             .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
             .kill_on_drop(true);
@@ -598,18 +586,7 @@ impl ShellCommandHook {
         &self,
         payload_json: &str,
     ) -> anyhow::Result<(bool, String, String)> {
-        #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut c = Command::new("cmd.exe");
-            c.arg("/C").arg(&self.command);
-            c
-        };
-        #[cfg(not(target_os = "windows"))]
-        let mut cmd = {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(&self.command);
-            c
-        };
+        let mut cmd = crate::process_utils::shell_command(&self.command);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
