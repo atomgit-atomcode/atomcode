@@ -137,26 +137,38 @@ pub fn build_messages(
     // 短距离重读在 keep_recent 保护内又压缩不到。两头不讨好。
     // 正确方案需要更深入设计，不在这里做。
 
-    // Safety: if over 80% of budget, drop oldest turns.
-    // BUT: skip if cold_summaries exist — that means LLM compression just ran
-    // and we're looking at the "keep_full=5" survivor set. Dropping those too
-    // would wipe ALL context (the bug that caused sent=0 in audit sessions).
+    // Safety: drop oldest turns — but ONLY as a true last-resort, at the same
+    // point the persisted compaction targets (`auto_compact_threshold`,
+    // budget − 13K ≈ 98.7% on 1M). Skip if cold_summaries exist — that means
+    // LLM compression just ran and we're looking at the "keep_full=5" survivor
+    // set; dropping those too would wipe ALL context (the sent=0 audit bug).
     //
-    // Threshold matches the FINAL BYTE CEILING below (line ~326). Earlier this
-    // line was `min(budget × 80%, 60K)`; the 60K cap is from the pre-1M-context
-    // era and made the drop path fire ~16× sooner than the FINAL BYTE CEILING
-    // on a 1M-window model — turning the LLM-compression main path
-    // (`needs_compression` fires at budget − 13K = 987K on 1M) into a fallback
-    // that almost never ran. User-reported symptom: with `context_window = 1M`
-    // configured, `build_messages` clamped its drop budget to 60K and the
-    // model went blind on conversations that should comfortably fit. See the
-    // 2026-05-27 audit screenshot for the data-flow trace.
-    let budget_80pct = token_budget * 80 / 100;
+    // This trigger used to be budget×80% — BELOW the persisted compaction
+    // threshold. A long session then lived in the 80%–98.7% band managed
+    // SOLELY by this path, which is recomputed from the (still-growing)
+    // conversation on every render: each time one more old turn had to be
+    // folded, the `[Context overflow: N earlier turns compressed]` digest
+    // changed (N→N+1) and the survivor cut slid forward, so the provider
+    // prefix cache broke every few turns. Measured on deepseek-v4-flash
+    // (2026-06-04): this was 50.8% of v4.24.2's remaining cache misses
+    // (cached 0.02元/M vs uncached 1元/M, 50×). Triggering at
+    // `auto_compact_threshold` lets the persisted compaction (task-boundary
+    // in agent/mod.rs + mid-turn `maybe_compress_history`) own context
+    // management — it breaks the prefix ONCE then freezes — and keeps this
+    // render append-only across the whole band. See
+    // `render_drop_defers_to_persisted_compaction_in_upper_band`.
+    //
+    // When it DOES fire (persisted compaction didn't run, or a single
+    // oversized turn blows the budget in one shot), drop down to 80% so there
+    // is a real buffer before it could fire again, rather than sitting on the
+    // trigger line and re-dropping every turn.
+    let drop_trigger = auto_compact_threshold(token_budget);
+    let drop_target = token_budget * 80 / 100;
     let total_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
     let mut dropped_tokens = 0usize;
 
-    if total_tokens > budget_80pct && conv.cold_summaries.is_empty() {
-        let tokens_to_drop = total_tokens - budget_80pct;
+    if total_tokens > drop_trigger && conv.cold_summaries.is_empty() {
+        let tokens_to_drop = total_tokens - drop_target;
 
         // ── HARD FLOOR: the last turn is sacred and NEVER dropped ──
         // Without this floor, a single oversized tool_result could make `tokens_to_drop`
@@ -3270,4 +3282,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn render_drop_defers_to_persisted_compaction_in_upper_band() {
+        // Regression: the render-time drop fallback used to trigger at 80% of
+        // budget — BELOW the persisted auto-compaction threshold
+        // (`auto_compact_threshold` ≈ budget − 13K ≈ 98.7% on 1M). A long
+        // session then lived in the 80%–98.7% band managed SOLELY by the
+        // render-drop, whose `[Context overflow: N earlier turns compressed]`
+        // digest and survivor boundary are recomputed from the (still-growing)
+        // conversation on every render. Each time one more old turn had to be
+        // folded, the digest changed (N→N+1) and the survivor cut slid forward
+        // → the prompt-prefix cache broke every few turns. Measured on
+        // deepseek-v4-flash (2026-06-04): 50.8% of 4.24.2's remaining misses.
+        //
+        // The drop path must now DEFER to the persisted compaction in this
+        // band: stay dormant and keep build_messages append-only. It only
+        // fires as a true last-resort once total exceeds the same threshold
+        // the persisted path uses (verified by the emergency check below).
+        let budget = 100_000usize;
+        let trigger = auto_compact_threshold(budget); // 95K (5K buffer ≤100K window)
+        let eighty = budget * 80 / 100; // 80K — the old (broken) trigger
+
+        // Build N real turns (must go through the API so `turn_tracker` is
+        // populated — `build_messages` returns the fallback path on empty
+        // turns and never exercises the drop logic). Each turn: a big user
+        // message + a short assistant reply, separated so they don't merge.
+        let turn = |c: &mut Conversation, i: usize, user_chars: usize| {
+            c.add_user_message(&format!("{i} {}", "x".repeat(user_chars)));
+            c.push_delta(&format!("ok {i}"));
+            c.finalize_stream();
+            c.turn_tracker.complete_current();
+        };
+        // ~84K tokens of history: sits squarely in the [80%, threshold) band.
+        let base = || {
+            let mut c = Conversation::new();
+            for i in 0..42 {
+                turn(&mut c, i, 8_000);
+            }
+            c
+        };
+        let conv = base();
+        let total: usize = conv.messages.iter().map(|m| m.estimate_tokens()).sum();
+        assert!(
+            total > eighty && total < trigger,
+            "precondition: total {total} must sit in [80%={eighty}, threshold={trigger})"
+        );
+
+        let (msgs, _) = build_messages(&conv, "sys", budget, "");
+        let has_drop_digest = msgs.iter().any(|m| {
+            matches!(&m.content, MessageContent::Text(t) if t.contains("earlier turns compressed"))
+        });
+        assert!(
+            !has_drop_digest,
+            "render-drop fired inside the 80%–98.7% band; it must defer to the \
+             persisted compaction (which breaks the prefix once then freezes) \
+             instead of pre-empting it and sliding the boundary every few turns"
+        );
+
+        // Append-only across the next turn: no historical message rewritten.
+        let mut conv2 = base();
+        turn(&mut conv2, 42, 8_000);
+        let (msgs2, _) = build_messages(&conv2, "sys", budget, "");
+        let fp = |m: &Message| format!("{:?}|{:?}", m.role, m.content);
+        for (i, m) in msgs.iter().enumerate() {
+            assert_eq!(
+                fp(&msgs2[i]),
+                fp(m),
+                "prefix diverged at message {i}: render stopped being append-only in the band"
+            );
+        }
+
+        // Emergency still works: once total clears the threshold, the
+        // last-resort drop MUST engage (we never want a true overflow).
+        let mut over = base();
+        turn(&mut over, 99, 60_000); // +~15K → over 95K
+        let (over_msgs, _) = build_messages(&over, "sys", budget, "");
+        let fired = over_msgs.iter().any(|m| {
+            matches!(&m.content, MessageContent::Text(t) if t.contains("earlier turns compressed"))
+        });
+        assert!(
+            fired,
+            "render-drop must still engage as a last-resort once total exceeds the threshold"
+        );
+    }
 }
