@@ -26,7 +26,7 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -739,19 +739,6 @@ pub enum ApprovalRequirement {
     RequireApprovalScoped { reason: String, scope: String },
 }
 
-/// Coarse-grained permission level for a tool, stored in `PermissionStore`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PermissionLevel {
-    /// Never ask — always execute automatically.
-    AlwaysAllow,
-    /// Ask every time (default for destructive operations).
-    Ask,
-    /// Allowed for the duration of the current session.
-    SessionAllow,
-    /// Never execute.
-    AlwaysDeny,
-}
-
 /// The resolved decision returned by `PermissionStore::check`.
 #[derive(Debug, Clone)]
 pub enum PermissionDecision {
@@ -761,10 +748,8 @@ pub enum PermissionDecision {
     Deny,
 }
 
-/// Stores per-tool permission overrides and session-level grants.
+/// Stores per-tool session-level grants.
 pub struct PermissionStore {
-    /// Per-tool level overrides: tool_name → level.
-    overrides: HashMap<String, PermissionLevel>,
     /// Session-level grants: tool names approved with [A]lways for this session.
     session_grants: HashSet<String>,
     /// Session-level scoped grants: resource keys (e.g. canonical file paths)
@@ -776,7 +761,6 @@ pub struct PermissionStore {
 impl PermissionStore {
     pub fn new() -> Self {
         Self {
-            overrides: HashMap::new(),
             session_grants: HashSet::new(),
             session_scope_grants: HashSet::new(),
         }
@@ -814,18 +798,8 @@ impl PermissionStore {
         if let ApprovalRequirement::RequireApproval(reason) = approval {
             return PermissionDecision::Ask(reason.clone());
         }
-        // 3. Explicit per-tool override (only reached for AutoApprove tools).
-        if let Some(level) = self.overrides.get(tool_name) {
-            match level {
-                PermissionLevel::AlwaysAllow | PermissionLevel::SessionAllow => {
-                    return PermissionDecision::Allow;
-                }
-                PermissionLevel::AlwaysDeny => return PermissionDecision::Deny,
-                PermissionLevel::Ask => {} // fall through to normal logic
-            }
-        }
 
-        // 4. Defer to the tool's own approval requirement.
+        // 3. Defer to the tool's own approval requirement (AutoApprove path).
         PermissionDecision::Allow
     }
 
@@ -840,10 +814,6 @@ impl PermissionStore {
         self.session_scope_grants.insert(scope.to_string());
     }
 
-    /// Set an explicit override level for a tool.
-    pub fn set_override(&mut self, tool_name: &str, level: PermissionLevel) {
-        self.overrides.insert(tool_name.to_string(), level);
-    }
 }
 
 /// Shared execution context passed to every tool invocation.
@@ -1803,27 +1773,6 @@ mod tests {
         store.grant_session("bash");
         let decision = store.check("bash", &ApprovalRequirement::AutoApprove);
         assert!(matches!(decision, PermissionDecision::Allow));
-    }
-
-    #[test]
-    fn test_permission_store_always_deny_override() {
-        let mut store = PermissionStore::new();
-        store.set_override("bash", PermissionLevel::AlwaysDeny);
-        // Even AutoApprove is blocked.
-        let decision = store.check("bash", &ApprovalRequirement::AutoApprove);
-        assert!(matches!(decision, PermissionDecision::Deny));
-    }
-
-    #[test]
-    fn test_permission_store_always_allow_cannot_bypass_destructive() {
-        // Even AlwaysAllow override must NOT bypass RequireApproval.
-        let mut store = PermissionStore::new();
-        store.set_override("bash", PermissionLevel::AlwaysAllow);
-        let decision = store.check(
-            "bash",
-            &ApprovalRequirement::RequireApproval("Destructive".into()),
-        );
-        assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
     #[tokio::test]
