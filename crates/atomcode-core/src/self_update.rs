@@ -400,6 +400,106 @@ fn try_remove_stale(path: &Path) -> bool {
     std::fs::remove_file(path).is_ok()
 }
 
+/// Clear a read-only attribute on `path` so a rename/remove isn't denied
+/// outright. Best-effort. On Unix a normal executable isn't read-only so
+/// this is a no-op; on Windows some AV / SCCM policies flag executables
+/// under `%LOCALAPPDATA%` read-only, which alone causes ERROR_ACCESS_DENIED.
+fn clear_readonly(path: &Path) {
+    // Windows-only: on Unix, `rename`/`remove_file` act on the directory
+    // entry and don't need the file itself writable, and `set_readonly(false)`
+    // there would widen the mode to world-writable. The read-only-attribute
+    // failure mode is Windows-specific (AV/SCCM marking %LOCALAPPDATA% exes).
+    #[cfg(windows)]
+    if let Ok(meta) = path.metadata() {
+        let mut perm = meta.permissions();
+        if perm.readonly() {
+            perm.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perm);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
+/// Rename `from` → `to`, hardened against the transient failures that make
+/// a naive `std::fs::rename` of a *running* Windows executable fail with
+/// `ERROR_ACCESS_DENIED` (os error 5):
+///
+///   * an AV / indexer (Windows Defender real-time scan) briefly holds the
+///     source or destination open without `FILE_SHARE_DELETE` — this clears
+///     well under a second, so we retry with exponential backoff;
+///   * a read-only attribute on the source — cleared before the first try;
+///   * a leftover destination from a prior interrupted upgrade that is
+///     momentarily locked — re-removed before each retry so the implicit
+///     `MOVEFILE_REPLACE_EXISTING` doesn't fail on it.
+///
+/// Cross-platform: on Unix these conditions don't arise, so the first
+/// attempt succeeds and the loop is never re-entered. Worst-case added
+/// latency on persistent failure is ~1.5s (100+200+400+800ms of sleeps),
+/// which is acceptable for a one-shot upgrade/rollback.
+fn robust_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    clear_readonly(from);
+    robust_rename_with(from, to, |f, t| std::fs::rename(f, t))
+}
+
+/// `robust_rename` with the underlying rename injected, so the cross-device
+/// fallback and retry logic can be exercised deterministically in tests.
+fn robust_rename_with<R>(from: &Path, to: &Path, mut rename: R) -> std::io::Result<()>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    const ATTEMPTS: u32 = 5;
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        // A locked / leftover destination makes the replace-existing rename
+        // fail; try to clear it (and its read-only attr) before each try.
+        if to.exists() {
+            clear_readonly(to);
+            let _ = std::fs::remove_file(to);
+        }
+        match rename(from, to) {
+            Ok(()) => return Ok(()),
+            // Cross-device: the staged binary lives under the user profile
+            // (e.g. C:\Users\…\.atomcode\staged\) while the running exe may be
+            // on another drive (H:\…). `rename` across volumes can NEVER
+            // succeed (ERROR_NOT_SAME_DEVICE / EXDEV), so don't waste the retry
+            // budget — copy the bytes across and drop the source instead.
+            Err(e) if is_cross_device_error(&e) => return copy_across_devices(from, to),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < ATTEMPTS {
+                    let ms = 100u64 << attempt; // 100, 200, 400, 800
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("rename failed")))
+}
+
+/// True when a failed `rename` was rejected because source and destination
+/// live on different filesystems/volumes. Windows reports ERROR_NOT_SAME_DEVICE
+/// (os error 17); Unix reports EXDEV (os error 18).
+fn is_cross_device_error(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    let code = 17;
+    #[cfg(not(windows))]
+    let code = 18;
+    e.raw_os_error() == Some(code)
+}
+
+/// Move a file across volumes by copying its bytes and then dropping the
+/// source. Used as the fallback when `rename` reports a cross-device error.
+/// Removing the source is best-effort: once the copy lands, the move has
+/// effectively succeeded, and a lingering staged file is harmless (it is
+/// superseded/cleaned by the next upgrade) — so a locked source must not
+/// fail the upgrade.
+fn copy_across_devices(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::copy(from, to)?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
 /// Put `new_bin` in place of `exe`, keeping the previous `exe` as `.bak`.
 ///
 /// Uses a **three-way swap** to avoid ever needing to delete `.bak` as a
@@ -438,8 +538,10 @@ fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
     // Clean up any leftover .rolling from a prior interrupted upgrade.
     try_remove_stale(&rolling);
 
-    // Step 1: live binary → rolling (Windows allows renaming a running exe)
-    std::fs::rename(exe, &rolling).with_context(|| {
+    // Step 1: live binary → rolling (Windows allows renaming a running exe).
+    // `robust_rename` retries through transient AV/indexer locks that
+    // otherwise surface as ERROR_ACCESS_DENIED (os error 5) here.
+    robust_rename(exe, &rolling).with_context(|| {
         format!(
             "renaming current binary {} -> {} (swap step 1)",
             exe.display(),
@@ -448,7 +550,7 @@ fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
     })?;
 
     // Step 2: new binary → live (the actual upgrade)
-    if let Err(e) = std::fs::rename(new_bin, exe) {
+    if let Err(e) = robust_rename(new_bin, exe) {
         // Best-effort unwind of step 1 so the user isn't left without
         // a live binary.
         let _ = std::fs::rename(&rolling, exe);
@@ -996,8 +1098,8 @@ pub fn run_rollback() -> Result<RollbackSummary> {
         std::fs::remove_file(&rolling).ok();
     }
 
-    // Step 1: live -> rolling
-    std::fs::rename(&exe, &rolling).with_context(|| {
+    // Step 1: live -> rolling (retry through transient Windows locks)
+    robust_rename(&exe, &rolling).with_context(|| {
         format!(
             "renaming {} -> {} (swap step 1)",
             exe.display(),
@@ -1005,7 +1107,7 @@ pub fn run_rollback() -> Result<RollbackSummary> {
         )
     })?;
     // Step 2: backup -> live
-    if let Err(e) = std::fs::rename(&backup, &exe) {
+    if let Err(e) = robust_rename(&backup, &exe) {
         // Best-effort unwind of step 1.
         let _ = std::fs::rename(&rolling, &exe);
         return Err(anyhow!("rollback failed at step 2 ({}); state restored", e));
@@ -1249,6 +1351,101 @@ mod tests {
         // No leftover .rolling file
         let rolling = rolling_path(&exe);
         assert!(!rolling.exists());
+    }
+
+    #[test]
+    fn robust_rename_moves_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        std::fs::write(&from, b"DATA").unwrap();
+
+        robust_rename(&from, &to).unwrap();
+
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"DATA");
+    }
+
+    #[test]
+    fn robust_rename_replaces_existing_destination() {
+        // Mirrors the swap's "rolling target left over from a prior run"
+        // case: the destination already exists and must be replaced.
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        std::fs::write(&from, b"NEW").unwrap();
+        std::fs::write(&to, b"STALE").unwrap();
+
+        robust_rename(&from, &to).unwrap();
+
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"NEW");
+    }
+
+    #[test]
+    fn is_cross_device_error_detects_platform_code() {
+        // Windows ERROR_NOT_SAME_DEVICE = 17; Unix EXDEV = 18.
+        #[cfg(windows)]
+        let exdev = 17;
+        #[cfg(not(windows))]
+        let exdev = 18;
+        assert!(is_cross_device_error(&std::io::Error::from_raw_os_error(exdev)));
+        // A permission-style error must NOT be mistaken for cross-device.
+        assert!(!is_cross_device_error(&std::io::Error::from_raw_os_error(13)));
+    }
+
+    #[test]
+    fn copy_across_devices_moves_and_removes_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("src");
+        let to = tmp.path().join("dst");
+        std::fs::write(&from, b"PAYLOAD").unwrap();
+
+        copy_across_devices(&from, &to).unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"PAYLOAD");
+        assert!(!from.exists(), "source must be consumed after the move");
+    }
+
+    #[test]
+    fn robust_rename_falls_back_to_copy_on_cross_device() {
+        // The reported bug: staged binary under the user profile (C:\…\.atomcode
+        // \staged\) vs a running exe on another drive (H:\). `rename` fails with
+        // ERROR_NOT_SAME_DEVICE; robust_rename must transparently copy instead of
+        // burning its retry budget on a deterministic failure.
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("staged-binary");
+        let to = tmp.path().join("exe");
+        std::fs::write(&from, b"NEWVERSION").unwrap();
+
+        #[cfg(windows)]
+        let exdev = 17;
+        #[cfg(not(windows))]
+        let exdev = 18;
+        let fake_rename = |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(exdev));
+
+        robust_rename_with(&from, &to, fake_rename).unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"NEWVERSION");
+        assert!(!from.exists(), "staged source must be consumed");
+    }
+
+    #[test]
+    fn robust_rename_clears_readonly_source() {
+        // A read-only source (a real Windows AV/SCCM failure mode) must
+        // still move. set_readonly is cross-platform enough to exercise
+        // the clear_readonly path here.
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        std::fs::write(&from, b"RO").unwrap();
+        let mut perm = std::fs::metadata(&from).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&from, perm).unwrap();
+
+        robust_rename(&from, &to).unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"RO");
     }
 
     #[test]
