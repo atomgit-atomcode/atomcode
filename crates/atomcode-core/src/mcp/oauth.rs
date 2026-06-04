@@ -727,7 +727,11 @@ fn open_browser(url: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn open_browser(url: &str) -> Result<()> {
-    std::process::Command::new("xdg-open").arg(url).spawn()?;
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
     Ok(())
 }
 
