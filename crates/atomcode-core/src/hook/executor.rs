@@ -224,10 +224,19 @@ impl HookExecutor {
     ) -> anyhow::Result<(bool, String, String)> {
         use std::process::Stdio;
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&hook.command)
-            .stdin(Stdio::piped())
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/C").arg(&hook.command);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&hook.command);
+            c
+        };
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // Hook timeout drops the inner future; without kill_on_drop
@@ -288,10 +297,19 @@ impl HookExecutor {
         let ctx_json =
             serde_json::to_string(ctx).unwrap_or_else(|_| "{}".to_string());
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&hook.command)
-            .env("ATOMCODE_HOOK_EVENT", &ctx.event)
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/C").arg(&hook.command);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&hook.command);
+            c
+        };
+        cmd.env("ATOMCODE_HOOK_EVENT", &ctx.event)
             .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
             // Hook timeout drops the cmd.output() future; without
             // kill_on_drop the sh subprocess keeps running detached.
