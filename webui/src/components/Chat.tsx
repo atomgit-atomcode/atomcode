@@ -128,7 +128,13 @@ function formatArgs(args: unknown): string {
   }
 }
 
-function abbreviateArgs(args: string, maxLen = 60): string {
+// The VISIBLE truncation is done by CSS ellipsis at the real row width
+// (.tool-name-secondary flexes to fill the row), so the preview length
+// follows the screen/window width. This cap is only a DOM-size guard for
+// pathological args (e.g. a tool fed a whole file); 1000 is far beyond any
+// realistic single-row character count, so it never truncates before the
+// screen edge — full args remain available by expanding the row.
+function abbreviateArgs(args: string, maxLen = 1000): string {
   if (args.length <= maxLen) return args;
   return args.slice(0, maxLen) + '…';
 }

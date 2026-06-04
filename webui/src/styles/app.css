@@ -438,11 +438,14 @@ body {
 }
 
 .tool-name-secondary {
+  /* Grow to fill the row between the tool name and the status badge so the
+     command preview uses the available width (no big blank gap) and shows
+     as much as fits; CSS ellipsis trims the rest at the real width. Full
+     args are available by clicking the row to expand. */
+  flex: 1 1 auto;
   color: var(--app-secondary-foreground);
   font-size: 0.95em;
   font-family: var(--app-monospace-font-family);
-  word-break: break-all;
-  overflow-wrap: anywhere;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
