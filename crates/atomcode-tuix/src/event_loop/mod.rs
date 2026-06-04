@@ -7363,6 +7363,19 @@ fn handle_agent_event(
             if running {
                 state.on_submit();
             } else {
+                // Peer's turn finished. In sync mode this is the ONLY
+                // turn-completion signal we get (the forwarder never sends
+                // AgentEvent::TurnComplete), so do the stream finalization
+                // TurnComplete normally performs:
+                //  1. Flush the buffered assistant line. A short reply with no
+                //     trailing newline (e.g. "在的！") otherwise stays parked in
+                //     the renderer's assistant_line_buf and never reaches
+                //     scrollback — the blank-assistant-bubble bug in sync mode.
+                //  2. Reset the <think> stripper between turns so a model that
+                //     left it inside=true can't swallow the next turn's text.
+                renderer.render(UiLine::AssistantLineBreak);
+                renderer.flush();
+                think.reset();
                 state.on_turn_complete();
             }
         }

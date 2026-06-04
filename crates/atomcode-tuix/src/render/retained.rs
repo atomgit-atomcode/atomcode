@@ -4723,6 +4723,44 @@ mod tests {
     /// was ignoring terminal width. This test verifies the full pipeline
     /// (streamed assistant text → `render_line_with_width` → body_lines)
     /// keeps every rendered body row within screen width.
+    // Regression for the `/sync` blank-assistant-reply bug: a streamed
+    // assistant reply with NO trailing newline (e.g. "在的！") only reaches
+    // scrollback once an AssistantLineBreak flushes the partial buffer.
+    // `flush_assistant_lines` commits only `\n`-terminated lines, so without
+    // the line break the reply stays parked in `assistant_line_buf` forever.
+    // In sync mode the PeerBusy(false) handler now emits that line break on
+    // the peer's turn completion (the forwarder never sends TurnComplete).
+    #[test]
+    fn assistant_partial_line_commits_only_after_line_break() {
+        let (mut r, _c) = new_counting(80, 24);
+        r.render(UiLine::User("123".into()));
+        r.render(UiLine::AssistantText("在的！".into())); // no trailing '\n'
+
+        // Wide CJK glyphs occupy 2 cells, so cell-by-cell extraction inserts a
+        // padding space after each — strip spaces before substring-matching.
+        let body = |r: &RetainedRenderer<CountingSink>| -> String {
+            r.body_lines
+                .iter()
+                .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace(' ', "")
+        };
+        // Buffered, not yet in scrollback (the exact state the bug got stuck in).
+        assert!(
+            !body(&r).contains("在的！"),
+            "partial line must stay buffered until a line break; body:\n{}",
+            body(&r)
+        );
+        // Turn completion (AssistantLineBreak) flushes it to scrollback.
+        r.render(UiLine::AssistantLineBreak);
+        assert!(
+            body(&r).contains("在的！"),
+            "assistant reply must be committed after AssistantLineBreak; body:\n{}",
+            body(&r)
+        );
+    }
+
     #[test]
     fn retained_wide_table_truncated_to_screen_width() {
         let term_w: u16 = 100;
