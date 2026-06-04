@@ -1744,6 +1744,41 @@ mod menu_tests {
     }
 
     #[test]
+    fn effort_top_level_is_gateway_only() {
+        // `/effort` at the top level surfaces the gateway entry, not the
+        // individual high/max/off choices (those live behind `/effort `).
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let items = build_menu_items("/effort", 0, &reg, &custom, None, None)
+            .expect("/effort gateway must appear");
+        assert!(items.iter().any(|(n, _)| n == "effort"));
+        assert!(!items.iter().any(|(n, _)| n == "high" || n == "max" || n == "off"));
+    }
+
+    #[test]
+    fn effort_sub_mode_lists_and_filters_choices() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        // `/effort ` (trailing space) → all three choices.
+        let all = build_menu_items("/effort ", 0, &reg, &custom, None, None)
+            .expect("/effort sub-mode must list choices");
+        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"high") && names.contains(&"max") && names.contains(&"off"),
+            "got: {names:?}"
+        );
+        // Prefix narrows.
+        let hi = build_menu_items("/effort hi", 0, &reg, &custom, None, None)
+            .expect("`hi` must match high");
+        assert_eq!(hi.len(), 1);
+        assert_eq!(hi[0].0, "high");
+        // No match → no menu.
+        assert!(build_menu_items("/effort zz", 0, &reg, &custom, None, None).is_none());
+        // A chosen value followed by a space (typing past) hides the menu.
+        assert!(build_menu_items("/effort high ", 0, &reg, &custom, None, None).is_none());
+    }
+
+    #[test]
     fn no_skill_registry_is_no_op() {
         // Ensures the legacy call path (None) keeps working.
         let reg = CommandRegistry::builtin();
@@ -4602,6 +4637,26 @@ fn build_menu_items(
         return if items.is_empty() { None } else { Some(items) };
     }
 
+    // Two-level palette for `/effort` (same gateway pattern as `/skills`).
+    // Once `/effort ` (trailing space) is in the buffer, list the three
+    // reasoning-effort choices; submission commits `/effort <choice>`.
+    if let Some(after) = buf.strip_prefix("/effort ") {
+        if after.contains(char::is_whitespace) {
+            return None;
+        }
+        let prefix = after.to_ascii_lowercase();
+        let items: Vec<(String, String)> = [
+            ("high", "Deeper reasoning (DeepSeek V4)"),
+            ("max", "Maximum reasoning depth (DeepSeek V4)"),
+            ("off", "Use the API default"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| n.starts_with(prefix.as_str()))
+        .map(|(n, d)| (n.to_string(), d.to_string()))
+        .collect();
+        return if items.is_empty() { None } else { Some(items) };
+    }
+
     let rest = &buf[1..];
     // Once a space appears (user is typing args), stop showing menu.
     if rest.contains(char::is_whitespace) {
@@ -4849,6 +4904,23 @@ fn handle_idle_key(
                         ));
                     }
 
+                    // `/effort` gateway: render the high/max/off sub-menu
+                    // immediately so it doesn't blink out and reappear.
+                    if name == "effort" {
+                        if let Some(items) = build_menu_items(
+                            &app.buf.text,
+                            app.buf.cursor,
+                            &ctx.commands,
+                            &ctx.custom_commands,
+                            Some(&ctx.skill_registry),
+                            Some(&ctx.file_index),
+                        ) {
+                            app.menu.selected = 0;
+                            redraw_with_menu(&app.buf, &items, 0, &app.state, ctx, renderer);
+                            return Ok(());
+                        }
+                    }
+
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     return Ok(());
                 }
@@ -4864,6 +4936,52 @@ fn handle_idle_key(
                 // skills always fired without args, and there was no
                 // way to pass `argument` into the skill from the
                 // picker.
+                // Sub-mode submit for `/effort`: the selected item is one of
+                // high|max|off. Tab completes to `/effort <choice> ` (parked,
+                // consistent with the top-level Tab≠Enter rule); Enter commits
+                // `/effort <choice>` and executes via the regular dispatch path.
+                let in_effort_sub_mode = app.buf.text.starts_with("/effort ");
+                if in_effort_sub_mode {
+                    if code == KeyCode::Tab {
+                        app.buf.text = format!("/effort {} ", name);
+                        app.buf.cursor = app.buf.text.len();
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        return Ok(());
+                    }
+                    let committed = format!("/effort {}", name);
+                    renderer.render(UiLine::ClearTransient);
+                    renderer.render(UiLine::User(committed.clone()));
+                    app.buf.text.clear();
+                    app.buf.cursor = 0;
+                    ctx.history.push(crate::input::history::HistoryEntry {
+                        text: committed.clone(),
+                        images: Vec::new(),
+                    });
+                    if let Some((cmd, arg)) = parse_slash_line(&committed) {
+                        execute_slash_command(
+                            cmd,
+                            arg,
+                            &mut app.state,
+                            ctx,
+                            renderer,
+                            &mut app.active_modal,
+                            &mut app.fixissue_pending,
+                            &mut app.fixissue_buffer,
+                            &mut app.setup_pending,
+                        )?;
+                        if matches!(app.state.phase, UiPhase::Idle) {
+                            redraw_after_slash(
+                                &app.buf,
+                                &app.state,
+                                ctx,
+                                &app.active_modal,
+                                renderer,
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+
                 let in_skills_sub_mode = app.buf.text.starts_with("/skills ");
                 if in_skills_sub_mode {
                     app.buf.text = format!("/skills {} ", name);

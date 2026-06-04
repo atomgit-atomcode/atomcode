@@ -107,7 +107,11 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false },
     Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
-    Command { name: "effort",  desc: "DeepSeek reasoning effort control (high / max / off)", needs_args: false },
+    // Gateway entry: opens a second-level palette (high / max / off).
+    // needs_args=true so Enter rewrites the buffer to `/effort ` and the
+    // sub-mode menu renders the three choices. Selecting one commits as
+    // `/effort <choice>` → dispatched by the `effort` arm.
+    Command { name: "effort",  desc: "DeepSeek reasoning effort control (high / max / off)", needs_args: true },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true },
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
