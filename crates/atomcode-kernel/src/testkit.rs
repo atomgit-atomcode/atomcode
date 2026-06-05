@@ -133,3 +133,37 @@ impl ToolMiddleware for ApprovalMiddleware {
         }
     }
 }
+
+/// Records every lifecycle callback it receives — used to prove the kernel wires
+/// the FULL LifecycleHooks surface (no dead methods).
+pub struct RecorderHook {
+    pub log: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecorderHook {
+    pub fn new() -> Self {
+        Self { log: Arc::new(Mutex::new(Vec::new())) }
+    }
+    fn record(&self, name: &str) {
+        self.log.lock().unwrap().push(name.to_string());
+    }
+}
+
+impl Default for RecorderHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for RecorderHook {
+    async fn session_start(&self, _convo: &mut Conversation) { self.record("session_start"); }
+    async fn user_prompt_submit(&self, _text: &mut String) { self.record("user_prompt_submit"); }
+    async fn turn_start(&self, _convo: &mut Conversation) { self.record("turn_start"); }
+    async fn pre_request(&self, _messages: &mut Vec<Message>) { self.record("pre_request"); }
+    async fn pre_tool(&self, _call: &ToolCall) -> Result<(), String> { self.record("pre_tool"); Ok(()) }
+    async fn post_tool(&self, _result: &mut ToolResult) { self.record("post_tool"); }
+    async fn turn_end(&self, _convo: &Conversation) -> Option<String> { self.record("turn_end"); None }
+    async fn on_error(&self, _error: &str) { self.record("on_error"); }
+    async fn session_end(&self, _convo: &Conversation) { self.record("session_end"); }
+}

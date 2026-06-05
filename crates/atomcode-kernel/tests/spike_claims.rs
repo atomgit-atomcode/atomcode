@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
-use atomcode_kernel::testkit::{ApprovalMiddleware, ContinueOnceHook, EchoTool, MockProvider, RiskyWriteTool};
+use atomcode_kernel::testkit::{ApprovalMiddleware, ContinueOnceHook, EchoTool, MockProvider, RecorderHook, RiskyWriteTool};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -160,4 +160,48 @@ async fn lifecycle_hook_injects_and_continues_loop() {
     assert!(turn_started, "TurnStarted must be observable (perception granularity)");
     assert!(echoed, "turn_end injection must continue the loop into another step (the echo step)");
     assert!(completed, "loop must complete after the hook stops injecting");
+}
+
+// CLAIM 7: the kernel wires the FULL LifecycleHooks surface — every lifecycle
+// point actually fires during a representative run (a tool call + an unknown
+// tool to trigger on_error + shutdown to trigger session_end).
+#[tokio::test]
+async fn lifecycle_hooks_complete_surface_all_fire() {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(ToolCall { id: "a".into(), name: "echo".into(), arguments: "{}".into() }),
+            StreamEvent::ToolCall(ToolCall { id: "b".into(), name: "does_not_exist".into(), arguments: "{}".into() }),
+            StreamEvent::Done,
+        ],
+        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done],
+    ]));
+
+    let recorder = Arc::new(RecorderHook::new());
+    let log = recorder.log.clone();
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo"]))
+        .hooks(recorder)
+        .build()
+        .spawn();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+
+    while let Some(ev) = handle.events.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            break;
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let fired = log.lock().unwrap().clone();
+    for point in [
+        "session_start", "user_prompt_submit", "turn_start", "pre_request",
+        "pre_tool", "post_tool", "on_error", "turn_end", "session_end",
+    ] {
+        assert!(fired.contains(&point.to_string()), "hook '{point}' was never called; fired = {fired:?}");
+    }
 }

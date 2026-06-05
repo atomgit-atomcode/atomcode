@@ -15,6 +15,7 @@ the proven production hot-paths into.
 | 4. One primitive serves one-shot AND interactive drivers | `tests/...::one_shot_adapter_auto_answers_and_aggregates` + `examples/minimal_specialization.rs` |
 | 5. Wire-compatible (serde round-trip) → web/daemon can use the same seam | `tests/...::events_and_commands_are_wire_serializable` |
 | 6. LifecycleHooks — turn-level injection (turn_end continues loop) + TurnStarted observation | `tests/spike_claims.rs::lifecycle_hook_injects_and_continues_loop` |
+| 7. Full LifecycleHooks surface — all 9 points wired & fire | `tests/spike_claims.rs::lifecycle_hooks_complete_surface_all_fire` |
 
 ## Driver model
 
@@ -38,10 +39,7 @@ primitive:
 
 Two distinct mechanisms: **perceive** = the read-only `AgentEvent` stream
 (observers cannot change the loop); **inject** = the `LifecycleHooks` trait
-(runs inside the loop, can mutate/continue it). The spike validates `turn_start`
-(mutate conversation) + `turn_end` (inject a follow-up and continue) + the
-`TurnStarted` event. The full kernel adds session_start/end, on_error,
-user_prompt_submit, pre_request. Out-of-process injection reuses the id-correlated
+(runs inside the loop, can mutate/continue it). The trait declares all 9 points — `session_start`, `user_prompt_submit`, `turn_start`, `pre_request`, `pre_tool`, `post_tool`, `turn_end`, `on_error`, `session_end` — each wired into the loop (Claim 7 asserts every one fires). Out-of-process injection reuses the id-correlated
 `Request`/`Respond` round-trip (a hook asks the remote driver and awaits).
 
 ## Key boundary facts

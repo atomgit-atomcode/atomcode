@@ -1,23 +1,48 @@
-use crate::message::Conversation;
+use crate::message::{Conversation, Message};
+use crate::tool::{ToolCall, ToolResult};
 use async_trait::async_trait;
 
 /// Turn-level injection seam — the "inject into the loop" side, distinct from the
-/// read-only AgentEvent stream (the "perceive" side). All methods default to
-/// no-op, so a neutral kernel pays nothing. The full design has more points
-/// (session_start/end, on_error, user_prompt_submit, pre_request); the spike
-/// validates turn_start + turn_end.
+/// read-only AgentEvent stream (the "perceive" side). Every method defaults to
+/// no-op, so a neutral kernel pays nothing. The kernel calls each of these at the
+/// matching point in the loop; specializations override what they need.
 #[async_trait]
 pub trait LifecycleHooks: Send + Sync {
-    /// Before the LLM is called for a turn. May mutate the conversation to inject
+    /// Session begins. Inject seed context / persona.
+    async fn session_start(&self, _convo: &mut Conversation) {}
+
+    /// A user message is about to enter the loop. Mutate to rewrite / augment.
+    async fn user_prompt_submit(&self, _text: &mut String) {}
+
+    /// Before the LLM is called for a turn. Mutate the conversation to inject
     /// context / reminders.
     async fn turn_start(&self, _convo: &mut Conversation) {}
 
-    /// When the model produces no tool calls (wants to stop). Return Some(text) to
-    /// inject a follow-up user message and CONTINUE the loop (e.g. discipline
-    /// "you're not done"); return None to let the turn complete.
+    /// Just before the provider request is built — last chance to mutate the
+    /// outgoing messages (production `ctx/render` lives here; mind prefix-cache).
+    async fn pre_request(&self, _messages: &mut Vec<Message>) {}
+
+    /// Before a tool executes. Return `Err(reason)` to block it. (`ToolMiddleware`
+    /// is the composable, per-tool form of this same point.)
+    async fn pre_tool(&self, _call: &ToolCall) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// After a tool executes. Mutate the result (truncate / transform / redact).
+    async fn post_tool(&self, _result: &mut ToolResult) {}
+
+    /// The model produced no tool calls (wants to stop). Return `Some(text)` to
+    /// inject a follow-up user message and CONTINUE the loop; `None` to complete.
     async fn turn_end(&self, _convo: &Conversation) -> Option<String> {
         None
     }
+
+    /// An error occurred (tool error / unknown tool / provider failure). Observe
+    /// or decide recovery.
+    async fn on_error(&self, _error: &str) {}
+
+    /// Session ends. Cleanup / final telemetry.
+    async fn session_end(&self, _convo: &Conversation) {}
 }
 
 /// Default no-op hooks — a neutral kernel installs these.

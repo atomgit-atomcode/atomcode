@@ -15,6 +15,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 pub struct AgentHandle {
     pub commands: UnboundedSender<AgentCommand>,
     pub events: UnboundedReceiver<AgentEvent>,
+    pub task: tokio::task::JoinHandle<()>,
 }
 
 /// Aggregated result for one-shot/batch drivers.
@@ -65,18 +66,18 @@ impl Agent {
             hooks: self.hooks,
             rt: RequestCtx::new(ev_tx),
         };
-        tokio::spawn(running.session_loop(cmd_rx));
-        AgentHandle { commands: cmd_tx, events: ev_rx }
+        let task = tokio::spawn(running.session_loop(cmd_rx));
+        AgentHandle { commands: cmd_tx, events: ev_rx, task }
     }
 
     /// One-shot adapter for batch/CI/CodeReview: send one message, auto-answer
-    /// Requests per policy, aggregate events into a structured Outcome.
+    /// Requests per policy, aggregate events into a structured Outcome, then let
+    /// the session tear down (so session_end runs).
     pub async fn run_to_completion(self, input: impl Into<String>, policy: AutoRespond) -> Outcome {
-        let handle = self.spawn();
+        let mut handle = self.spawn();
         let _ = handle.commands.send(AgentCommand::SendMessage { text: input.into() });
-        let mut events = handle.events;
         let mut outcome = Outcome::default();
-        while let Some(ev) = events.recv().await {
+        while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::TextDelta(t) => outcome.text.push_str(&t),
                 AgentEvent::ToolResult { result } => outcome.tool_results.push(result),
@@ -91,6 +92,7 @@ impl Agent {
                 _ => {}
             }
         }
+        let _ = handle.task.await;
         outcome
     }
 }
@@ -111,6 +113,7 @@ impl RunningAgent {
         if !self.persona.is_empty() {
             convo.push(Message::system(self.persona.clone()));
         }
+        self.hooks.session_start(&mut convo).await;
         loop {
             let cmd = match cmd_rx.recv().await {
                 Some(c) => c,
@@ -120,26 +123,32 @@ impl RunningAgent {
                 AgentCommand::Shutdown => break,
                 AgentCommand::Cancel => {}
                 AgentCommand::Respond { id, value } => self.rt.resolve(id, value),
-                AgentCommand::SendMessage { text } => {
+                AgentCommand::SendMessage { mut text } => {
+                    self.hooks.user_prompt_submit(&mut text).await;
                     convo.push(Message::user(text));
                     // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
                     // so a middleware blocked on approval can be answered out-of-band.
                     let mut turn = Box::pin(self.run_turn(&mut convo));
+                    let mut shutdown = false;
                     loop {
                         tokio::select! {
                             _ = &mut turn => break,
                             maybe = cmd_rx.recv() => match maybe {
                                 Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
-                                Some(AgentCommand::Shutdown) => return,
-                                Some(AgentCommand::Cancel) => {}             // spike: best-effort
-                                Some(AgentCommand::SendMessage { .. }) => {} // spike: ignore during turn
-                                None => return,
+                                Some(AgentCommand::Shutdown) => { shutdown = true; break; }
+                                Some(AgentCommand::Cancel) => {}
+                                Some(AgentCommand::SendMessage { .. }) => {}
+                                None => { shutdown = true; break; }
                             }
                         }
+                    }
+                    if shutdown {
+                        break;
                     }
                 }
             }
         }
+        self.hooks.session_end(&convo).await;
     }
 
     async fn run_turn(&self, convo: &mut Conversation) {
@@ -147,7 +156,9 @@ impl RunningAgent {
         self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
         loop {
-            let mut stream = self.provider.chat_stream(&convo.messages, &defs).await;
+            let mut messages = convo.messages.clone();
+            self.hooks.pre_request(&mut messages).await;
+            let mut stream = self.provider.chat_stream(&messages, &defs).await;
             let mut assistant_text = String::new();
             let mut pending_calls = Vec::new();
             while let Some(ev) = stream.next().await {
@@ -173,30 +184,38 @@ impl RunningAgent {
                 let tool = match self.tools.get(&call.name) {
                     Some(t) => t,
                     None => {
-                        convo.push(Message::tool_result(
-                            &call.id,
-                            format!("unknown or unmounted tool: {}", call.name),
-                            true,
-                        ));
+                        let content = format!("unknown or unmounted tool: {}", call.name);
+                        self.hooks.on_error(&content).await;
+                        convo.push(Message::tool_result(&call.id, content, true));
                         continue;
                     }
                 };
                 self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
+                // pre_tool hook (turn-level gate) then the composable tool-middleware chain.
                 let mut blocked: Option<String> = None;
-                for mw in &self.middlewares {
-                    if let Err(reason) = mw.before(&call, &tool, &self.rt).await {
-                        blocked = Some(reason);
-                        break;
+                if let Err(reason) = self.hooks.pre_tool(&call).await {
+                    blocked = Some(reason);
+                }
+                if blocked.is_none() {
+                    for mw in &self.middlewares {
+                        if let Err(reason) = mw.before(&call, &tool, &self.rt).await {
+                            blocked = Some(reason);
+                            break;
+                        }
                     }
                 }
-                let result = if let Some(reason) = blocked {
-                    ToolResult { call_id: call.id.clone(), content: format!("blocked by middleware: {reason}"), is_error: true }
+                let mut result = if let Some(reason) = blocked {
+                    ToolResult { call_id: call.id.clone(), content: format!("blocked: {reason}"), is_error: true }
                 } else {
                     let ctx = ToolContext { working_dir: std::env::current_dir().unwrap_or_default() };
                     let mut r = tool.execute(&call.arguments, &ctx).await;
                     r.call_id = call.id.clone();
                     r
                 };
+                self.hooks.post_tool(&mut result).await;
+                if result.is_error {
+                    self.hooks.on_error(&result.content).await;
+                }
                 self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
                 convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
             }
