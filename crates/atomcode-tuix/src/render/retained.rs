@@ -627,35 +627,39 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // it doesn't accumulate across ticks.
         let safe_name = scrub_controls(name);
         let safe_detail = scrub_controls(detail);
-        let body_str = if safe_detail.is_empty() {
-            safe_name
-        } else {
-            format!("{}({})", safe_name, safe_detail)
-        };
-        // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
-        // commands) from producing hundreds of terminal lines.
-        // This is a rendering safeguard only — the actual command
-        // execution uses the original, untruncated arguments.
-        let body_str = truncate_body_str(&body_str, 500);
-        // Append the spinner meta suffix (e.g. ` · 12s` or
-        // ` · 12s · 2 queued`) so the user has a time anchor while a
-        // long-running tool (cargo install, big test suite, etc.)
-        // executes. Without it the inflight row only shows
-        // `<spinner> Bash(cmd)` — no elapsed indicator — and looks
-        // indistinguishable from "stuck" once the user has been
-        // waiting >30s. `meta` carries its own leading ` · ` separator
-        // (or is empty); same single body style as the rest of the
-        // row, matching `build_spinner_body_row`'s convention where
-        // the suffix shares the label colour.
-        let body_str = if meta.is_empty() {
-            body_str
-        } else {
-            format!("{}{}", body_str, meta)
-        };
+
         let prefix = format!("{} ", icon);
         let prefix_style = self.style_for(Role::Muted);
-        let body_style = self.style_bold(Role::ToolName);
-        let new_rows = self.build_prefixed_rows(&prefix, &prefix_style, &body_str, &body_style);
+        let name_style = self.style_bold(Role::ToolName);
+        let detail_style = self.style_for(Role::Secondary);
+        let meta_style = self.style_bold(Role::ToolName);
+
+        let new_rows = if safe_detail.is_empty() {
+            // No detail: simple path — name + meta, all bold
+            self.build_mixed_style_rows(
+                &prefix, &prefix_style,
+                &safe_name, &name_style,
+                "", &detail_style,
+                meta, &meta_style,
+                &safe_name,
+            )
+        } else {
+            // Note: full_body intentionally excludes `meta` —
+            // build_mixed_style_rows appends meta separately in
+            // meta_style. Including meta in full_body would cause
+            // it to appear twice (once in the wrapped chunk, once
+            // as a separate append).
+            let full_body = format!("{}({})", safe_name, safe_detail);
+            let full_body = truncate_body_str(&full_body, 500);
+            let detail_display = format!("({})", safe_detail);
+            self.build_mixed_style_rows(
+                &prefix, &prefix_style,
+                &safe_name, &name_style,
+                &detail_display, &detail_style,
+                meta, &meta_style,
+                &full_body,
+            )
+        };
 
         let prev_rows = self.inflight_tool_rows;
         let n = new_rows.len();
@@ -750,6 +754,89 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         }
         self.inflight_tool_rows = n;
+    }
+
+    /// Build prefixed rows where the first-row body has mixed styling:
+    /// `name` in `name_style`, `detail` in `detail_style`. Continuation
+    /// rows use `detail_style`. Falls back to `build_prefixed_rows` with
+    /// `name_style` when detail is empty.
+    fn build_mixed_style_rows(
+        &self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        name: &str,
+        name_style: &CellStyle,
+        detail: &str,
+        detail_style: &CellStyle,
+        meta: &str,
+        meta_style: &CellStyle,
+        full_body: &str,
+    ) -> Vec<Vec<Cell>> {
+        if detail.is_empty() {
+            // No detail: append meta (if any) to name, all in name_style.
+            let body = if meta.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}{}", name, meta)
+            };
+            return self.build_prefixed_rows(prefix, prefix_style, &body, name_style);
+        }
+        let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
+        if w == 0 {
+            return Vec::new();
+        }
+        let prefix_w = crate::width::display_width(prefix);
+        let first_budget = w.saturating_sub(prefix_w);
+        let cont_pad: String = " ".repeat(prefix_w);
+        let name_dw = crate::width::display_width(name);
+        let detail_dw = crate::width::display_width(detail);
+        let meta_dw = crate::width::display_width(meta);
+        let mut rows = Vec::new();
+        if name_dw + detail_dw + meta_dw <= first_budget {
+            // Single-line: bold name + secondary detail + bold meta.
+            let mut row = Vec::new();
+            push_str_cells(&mut row, prefix, prefix_style);
+            push_str_cells(&mut row, name, name_style);
+            push_str_cells(&mut row, detail, detail_style);
+            if !meta.is_empty() {
+                push_str_cells(&mut row, meta, meta_style);
+            }
+            rows.push(row);
+        } else {
+            // Wrapping: first chunk splits at name boundary;
+            // meta is short, append to first row in meta_style.
+            let chunks: Vec<String> =
+                crate::width::wrap_line_to_width(full_body, first_budget.max(1))
+                    .into_iter()
+                    .map(|c| c.to_string())
+                    .collect();
+            for (i, chunk) in chunks.iter().enumerate() {
+                let mut row = Vec::new();
+                let pad = CellStyle::default();
+                if i == 0 {
+                    push_str_cells(&mut row, prefix, prefix_style);
+                    let chunk_dw = crate::width::display_width(chunk);
+                    if chunk_dw <= name_dw {
+                        push_str_cells(&mut row, chunk, name_style);
+                    } else {
+                        let name_part = crate::width::truncate_to_width(chunk, name_dw);
+                        push_str_cells(&mut row, &name_part, name_style);
+                        let rest = &chunk[name_part.len()..];
+                        if !rest.is_empty() {
+                            push_str_cells(&mut row, rest, detail_style);
+                        }
+                    }
+                    if !meta.is_empty() {
+                        push_str_cells(&mut row, meta, meta_style);
+                    }
+                } else {
+                    push_str_cells(&mut row, &cont_pad, &pad);
+                    push_str_cells(&mut row, chunk, detail_style);
+                }
+                rows.push(row);
+            }
+        }
+        rows
     }
 
     /// Pad a partially-built row with blank default-style cells until it
@@ -1849,14 +1936,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if let Some((_id, name, detail)) = self.inflight_tool.take() {
             let safe_name = scrub_controls(&name);
             let safe_detail = scrub_controls(&detail);
-            let body_str = if safe_detail.is_empty() {
-                safe_name
-            } else {
-                format!("{}({})", safe_name, safe_detail)
-            };
-            // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
-            // commands) from producing hundreds of terminal lines.
-            let body_str = truncate_body_str(&body_str, 500);
             // Clear any previously rendered inflight tool rows so
             // push_body_prefixed appends fresh committed lines.
             self.live_spinner_active = false;
@@ -1906,17 +1985,32 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // double-gap in screenshots). Use `remove` (not just 1)
             // so multi-row inflight spinners are fully covered.
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(remove as u16);
-            self.push_body_prefixed(
-                // Frozen icon matches the static ToolCall arm — see its
-                // comment for the Windows-font rationale that picked ●
-                // (U+25CF, Geometric Shapes block) over ▸ (U+25B8,
-                // missing from Consolas/NSimSun and rendered as `□`
-                // tofu in screenshots).
-                "\u{25cf} ",
-                &self.style_for(Role::Muted),
-                &body_str,
-                &self.style_bold(Role::ToolName),
-            );
+            if safe_detail.is_empty() {
+                self.push_body_prefixed(
+                    "\u{25cf} ",
+                    &self.style_for(Role::Muted),
+                    &safe_name,
+                    &self.style_bold(Role::ToolName),
+                );
+            } else {
+                // Mixed styling: bold name + secondary detail
+                let body_str = format!("{}({})", safe_name, safe_detail);
+                let body_str = truncate_body_str(&body_str, 500);
+                let detail_str = format!("({})", safe_detail);
+                let prefix_style = self.style_for(Role::Muted);
+                let name_style = self.style_bold(Role::ToolName);
+                let detail_style = self.style_for(Role::Secondary);
+                let rows = self.build_mixed_style_rows(
+                    "\u{25cf} ", &prefix_style,
+                    &safe_name, &name_style,
+                    &detail_str, &detail_style,
+                    "", &name_style,
+                    &body_str,
+                );
+                for row in rows {
+                    self.push_body_row(row);
+                }
+            }
         }
     }
 
@@ -3093,15 +3187,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let chip_a = chip(Color::Cyan);
                 let chip_n = chip(Color::Red);
 
-                // Build tool label so user knows which specific action
-                // they're approving (issue #439: parallel batch approvals
-                // showed identical prompts with no way to tell which file).
-                let tool_label = if detail.is_empty() {
-                    format!("{}: ", tool)
-                } else {
-                    format!("{}({}): ", tool, detail)
-                };
-
                 let waiting = t(Msg::ApprovalWaitingLabel);
                 let prefix_w = crate::width::display_width(&waiting);
                 let cont_pad: String = " ".repeat(prefix_w);
@@ -3125,8 +3210,28 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // row + chips fit within the screen width, append chips
                 // inline (issue #454). Otherwise, emit chips on a
                 // separate line so they remain visible.
-                let safe_tool_label = crate::sanitize::scrub_controls(&tool_label);
-                let mut prefixed_rows = self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
+                // "Waiting for approval:" prefix stays yellow (Warning bold);
+                // tool name is bold ToolName; (detail): uses default fg.
+                let safe_tool = crate::sanitize::scrub_controls(&tool);
+                let safe_detail = crate::sanitize::scrub_controls(&detail);
+                let tool_name_style = self.style_bold(Role::ToolName);
+                let detail_style = self.style_for(Role::Secondary);
+                let mut prefixed_rows = if detail.is_empty() {
+                    // No detail: "▶ Waiting for approval: tool:"
+                    let body = format!("{}: ", safe_tool);
+                    self.build_prefixed_rows(&waiting, &warn, &body, &tool_name_style)
+                } else {
+                    // Build rows with mixed styling: yellow prefix, bold tool, fg detail
+                    let detail_suffix = format!("({}): ", safe_detail);
+                    let full_body = format!("{}{}", safe_tool, detail_suffix);
+                    self.build_mixed_style_rows(
+                        &waiting, &warn,
+                        &safe_tool, &tool_name_style,
+                        &detail_suffix, &detail_style,
+                        "", &detail_style,
+                        &full_body,
+                    )
+                };
                 let screen_w = self.screen.width() as usize;
                 let last_row_w: usize = prefixed_rows
                     .last()

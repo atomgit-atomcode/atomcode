@@ -6679,9 +6679,17 @@ fn handle_agent_event(
                 && !state.show_tool_output
                 && !call_id.starts_with("local-shell-")
             {
-                renderer.render(UiLine::CommandOutput(
-                    "  ○ Press Ctrl+O to show real-time output\n".to_string(),
-                ));
+                // Use muted style matching ToolResult's summary_style:
+                // light theme → SGR 90 (DarkGrey), dark theme → SGR 2 (faint)
+                let reset = "\x1b[0m";
+                let mute = if crate::highlight::theme::is_light_for_render() {
+                    "\x1b[90m"
+                } else {
+                    "\x1b[2m"
+                };
+                renderer.render(UiLine::CommandOutput(format!(
+                    "{mute}  ○ Press Ctrl+o to show real-time output{reset}\n",
+                )));
             }
             renderer.flush();
             let _ = name;
