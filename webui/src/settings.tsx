@@ -33,7 +33,9 @@ function readTheme(): Theme {
   } catch {
     /* ignore */
   }
-  return 'system';
+  // Default to the warm-ivory light theme (claude.ai look) when the user
+  // hasn't picked one; they can still switch to dark/system in settings.
+  return 'light';
 }
 
 function readLang(): Lang {
