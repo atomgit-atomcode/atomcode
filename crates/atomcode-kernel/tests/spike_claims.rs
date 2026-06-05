@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, MessageSnapshot};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
-use atomcode_kernel::testkit::{ApprovalMiddleware, BudgetReminderHook, ContinueOnceHook, EchoTool, MockProvider, RecorderHook, RedactHook, RiskyWriteTool, RoundBudgetHook};
+use atomcode_kernel::testkit::{ApprovalMiddleware, ArgRewriteHook, BlockToolHook, BudgetReminderHook, ContinueOnceHook, DropToolsHook, EchoTool, MockProvider, RecorderHook, RedactHook, RiskyWriteTool, RoundBudgetHook};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -380,4 +380,103 @@ async fn on_model_response_can_transform_response_into_storage() {
         assistant.meta.as_ref().map_or(false, |m| m.tokens.prompt == 50),
         "kernel meta must be present on the response the hook received"
     );
+}
+
+// CLAIM 11 (fix #5): dropping tool_calls in on_model_response prevents execution.
+#[tokio::test]
+async fn dropping_tool_calls_in_on_model_response_prevents_execution() {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }),
+        StreamEvent::Done,
+    ]]));
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo"]))
+        .hooks(Arc::new(DropToolsHook))
+        .build()
+        .spawn();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+
+    let mut executed = false;
+    let mut completed = false;
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::ToolStarted { .. } | AgentEvent::ToolResult { .. } => executed = true,
+            AgentEvent::TurnComplete => { completed = true; break; }
+            _ => {}
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+    assert!(!executed, "a tool call dropped by on_model_response must NOT execute");
+    assert!(completed, "turn completes since pending became empty");
+}
+
+// CLAIM 12 (fix #6): pre_tool can rewrite args (reaches execution) and a blocked
+// tool emits no ghost ToolStarted (only a blocked ToolResult).
+#[tokio::test]
+async fn pre_tool_rewrites_args_and_blocks_without_ghost_started() {
+    // (a) rewrite args → reaches execution
+    {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{\"x\":1}".into() }), StreamEvent::Done],
+            vec![StreamEvent::Done],
+        ]));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["echo"]))
+            .hooks(Arc::new(ArgRewriteHook))
+            .build()
+            .spawn();
+        handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+        let mut echoed = String::new();
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::ToolResult { result } => echoed = result.content,
+                AgentEvent::TurnComplete => break,
+                _ => {}
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+        assert!(echoed.contains("rewritten"), "pre_tool rewritten args must reach execution; got {echoed}");
+    }
+    // (b) block → no ghost ToolStarted, but a blocked ToolResult
+    {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
+            vec![StreamEvent::Done],
+        ]));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["echo"]))
+            .hooks(Arc::new(BlockToolHook))
+            .build()
+            .spawn();
+        handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+        let mut started = false;
+        let mut blocked_result = false;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::ToolStarted { .. } => started = true,
+                AgentEvent::ToolResult { result } => {
+                    if result.content.contains("blocked") {
+                        blocked_result = true;
+                    }
+                }
+                AgentEvent::TurnComplete => break,
+                _ => {}
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+        assert!(!started, "a tool blocked by pre_tool must NOT emit a ghost ToolStarted");
+        assert!(blocked_result, "a blocked tool still yields a ToolResult");
+    }
 }

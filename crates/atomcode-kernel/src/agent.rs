@@ -221,6 +221,10 @@ impl RunningAgent {
             assistant_msg.meta = Some(meta);
             self.hooks.on_model_response(&mut assistant_msg).await;
             self.rt.emit(AgentEvent::Usage(assistant_msg.meta.clone().unwrap_or_default()));
+            // Fix #5: the hook may have transformed the response (e.g. dropped a tool
+            // call) — re-derive the calls to execute from the (possibly edited) message
+            // so a dropped call is NOT executed.
+            let pending_calls = assistant_msg.tool_calls.clone();
             convo.push(assistant_msg);
             if pending_calls.is_empty() {
                 if let Some(reminder) = self.hooks.turn_end(convo).await {
@@ -230,36 +234,45 @@ impl RunningAgent {
                 self.rt.emit(AgentEvent::TurnComplete);
                 return;
             }
-            for call in pending_calls {
-                let tool = match self.tools.get(&call.name) {
-                    Some(t) => t,
-                    None => {
-                        let content = format!("unknown or unmounted tool: {}", call.name);
-                        self.hooks.on_error(&content).await;
-                        convo.push(Message::tool_result(&call.id, content, true));
-                        continue;
-                    }
-                };
-                self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
-                let mut blocked: Option<String> = None;
-                if let Err(reason) = self.hooks.pre_tool(&call).await {
-                    blocked = Some(reason);
-                }
-                if blocked.is_none() {
-                    for mw in &self.middlewares {
-                        if let Err(reason) = mw.before(&call, &tool, &self.rt).await {
-                            blocked = Some(reason);
-                            break;
+            for mut call in pending_calls {
+                // Fix #6: pre_tool runs BEFORE lookup + before ToolStarted. It may
+                // rewrite the call (args/name) or block it (Err). Blocked/unknown
+                // tools never emit a ghost ToolStarted; ToolStarted fires only for a
+                // tool that actually executes.
+                let pre = self.hooks.pre_tool(&mut call).await;
+                let mut result = match (pre, self.tools.get(&call.name)) {
+                    (Err(reason), _) => ToolResult {
+                        call_id: call.id.clone(),
+                        content: format!("blocked: {reason}"),
+                        is_error: true,
+                    },
+                    (Ok(()), None) => ToolResult {
+                        call_id: call.id.clone(),
+                        content: format!("unknown or unmounted tool: {}", call.name),
+                        is_error: true,
+                    },
+                    (Ok(()), Some(tool)) => {
+                        let mut blocked: Option<String> = None;
+                        for mw in &self.middlewares {
+                            if let Err(reason) = mw.before(&call, &tool, &self.rt).await {
+                                blocked = Some(reason);
+                                break;
+                            }
+                        }
+                        if let Some(reason) = blocked {
+                            ToolResult {
+                                call_id: call.id.clone(),
+                                content: format!("blocked: {reason}"),
+                                is_error: true,
+                            }
+                        } else {
+                            self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
+                            let ctx = ToolContext { working_dir: std::env::current_dir().unwrap_or_default() };
+                            let mut r = tool.execute(&call.arguments, &ctx).await;
+                            r.call_id = call.id.clone();
+                            r
                         }
                     }
-                }
-                let mut result = if let Some(reason) = blocked {
-                    ToolResult { call_id: call.id.clone(), content: format!("blocked: {reason}"), is_error: true }
-                } else {
-                    let ctx = ToolContext { working_dir: std::env::current_dir().unwrap_or_default() };
-                    let mut r = tool.execute(&call.arguments, &ctx).await;
-                    r.call_id = call.id.clone();
-                    r
                 };
                 self.hooks.post_tool(&mut result).await;
                 if result.is_error {

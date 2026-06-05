@@ -180,7 +180,7 @@ impl LifecycleHooks for RecorderHook {
     async fn turn_start(&self, _convo: &mut Conversation) { self.record("turn_start"); }
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) { self.record("pre_request"); }
     async fn on_model_response(&self, _response: &mut Message) { self.record("on_model_response"); }
-    async fn pre_tool(&self, _call: &ToolCall) -> Result<(), String> { self.record("pre_tool"); Ok(()) }
+    async fn pre_tool(&self, _call: &mut ToolCall) -> Result<(), String> { self.record("pre_tool"); Ok(()) }
     async fn post_tool(&self, _result: &mut ToolResult) { self.record("post_tool"); }
     async fn turn_end(&self, _convo: &Conversation) -> Option<String> { self.record("turn_end"); None }
     async fn on_error(&self, _error: &str) { self.record("on_error"); }
@@ -233,5 +233,38 @@ impl LifecycleHooks for RedactHook {
         if response.text.contains("SECRET") {
             response.text = response.text.replace("SECRET", "[redacted]");
         }
+    }
+}
+
+/// Drops all tool calls from the response — proves the kernel HONORS
+/// on_model_response edits to tool_calls (a dropped call will not execute).
+pub struct DropToolsHook;
+
+#[async_trait]
+impl LifecycleHooks for DropToolsHook {
+    async fn on_model_response(&self, response: &mut Message) {
+        response.tool_calls.clear();
+    }
+}
+
+/// Rewrites a tool call's arguments in pre_tool — proves `&mut ToolCall` reaches
+/// execution.
+pub struct ArgRewriteHook;
+
+#[async_trait]
+impl LifecycleHooks for ArgRewriteHook {
+    async fn pre_tool(&self, call: &mut ToolCall) -> Result<(), String> {
+        call.arguments = "{\"rewritten\":true}".to_string();
+        Ok(())
+    }
+}
+
+/// Blocks every tool in pre_tool — proves a blocked tool emits no ghost ToolStarted.
+pub struct BlockToolHook;
+
+#[async_trait]
+impl LifecycleHooks for BlockToolHook {
+    async fn pre_tool(&self, _call: &mut ToolCall) -> Result<(), String> {
+        Err("blocked by policy".to_string())
     }
 }
