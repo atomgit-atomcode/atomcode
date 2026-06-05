@@ -895,7 +895,10 @@ pub(crate) async fn live_provider(
 
 #[derive(serde::Deserialize)]
 pub(crate) struct LivePermissionReq {
-    pub decision: String, // "allow" | "deny" | "always_allow"
+    pub decision: String, // "allow" | "deny" | "always_allow" | "allow_persist"
+    /// Full MCP tool name (`mcp__{server}__{tool}`); required for `allow_persist`.
+    #[serde(default)]
+    pub tool_name: Option<String>,
 }
 
 /// POST /live/permission — Deliver a permission decision for a pending live-session tool-approval
@@ -909,8 +912,24 @@ pub(crate) async fn live_permission(
     State(state): State<AppState>,
     Json(req): Json<LivePermissionReq>,
 ) -> impl IntoResponse {
-    use atomcode_core::tool::parse_permission_decision;
-    let decision = parse_permission_decision(&req.decision);
+    use atomcode_core::tool::{parse_permission_decision, PermissionDecision};
+    let decision = if req.decision == "allow_persist" {
+        if let Some(full) = req.tool_name.as_deref() {
+            let reg = state.mcp_registry.read().await.clone();
+            if let Some((server, tool)) = reg.split_tool_name(full).await {
+                let project_dir = state.project.read().await.working_dir.clone();
+                if let Err(e) =
+                    atomcode_core::mcp::config::add_auto_approved_tool(&project_dir, &server, &tool)
+                {
+                    tracing::warn!("[permission] persist autoApprove failed: {e}");
+                }
+                reg.mark_tool_auto_approved(full);
+            }
+        }
+        PermissionDecision::Allow
+    } else {
+        parse_permission_decision(&req.decision)
+    };
     let working_dir = { state.project.read().await.working_dir.clone() };
     let ok = match current_live_session() {
         Some(s) => s.approve(decision).await,

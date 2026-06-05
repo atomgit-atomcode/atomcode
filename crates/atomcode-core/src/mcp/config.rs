@@ -478,6 +478,73 @@ fn expand_tilde(s: &str) -> String {
     home.join(rest).to_string_lossy().to_string()
 }
 
+/// Persist a per-tool auto-approve grant: append `tool` to the `autoApprove`
+/// array of `server` in whichever config file defines it (project `.mcp.json`
+/// first, else user `mcp.json`). Creates the user file if neither defines it.
+/// Idempotent; preserves existing JSON content.
+pub fn add_auto_approved_tool(project_dir: &Path, server: &str, tool: &str) -> Result<()> {
+    let project_path = project_dir.join(".mcp.json");
+    let user_path = crate::config::Config::config_dir().join("mcp.json");
+
+    let defines = |p: &Path| -> bool {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                let obj = v.get("mcpServers").or_else(|| v.get("servers")).cloned()?;
+                obj.as_object().map(|m| m.contains_key(server))
+            })
+            .unwrap_or(false)
+    };
+
+    let target = if defines(&project_path) {
+        project_path
+    } else {
+        user_path
+    };
+
+    let mut root: serde_json::Value = if target.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&target)?)
+            .with_context(|| format!("parsing {}", target.display()))?
+    } else {
+        serde_json::json!({ "mcpServers": {} })
+    };
+
+    let key = if root.get("servers").is_some() && root.get("mcpServers").is_none() {
+        "servers"
+    } else {
+        "mcpServers"
+    };
+    if !root.get(key).map(|v| v.is_object()).unwrap_or(false) {
+        root[key] = serde_json::json!({});
+    }
+    let servers = root[key]
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{key} is not an object"))?;
+
+    let entry = servers
+        .entry(server.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let entry_obj = entry
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("server '{server}' entry is not an object"))?;
+    let list = entry_obj
+        .entry("autoApprove".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    let arr = list
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("autoApprove is not an array"))?;
+    if !arr.iter().any(|v| v.as_str() == Some(tool)) {
+        arr.push(serde_json::Value::String(tool.to_string()));
+    }
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target, serde_json::to_string_pretty(&root)?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,5 +762,26 @@ mod tests {
         );
         assert_eq!(p["auth"]["type"].as_str(), Some("oauth"));
         assert_eq!(p["auth"]["provider"].as_str(), Some("github"));
+    }
+
+    #[test]
+    fn add_auto_approved_tool_writes_into_project_mcp_json() {
+        let dir = std::env::temp_dir().join("ac_autoapprove_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{"srv":{"command":"x"}}}"#).unwrap();
+
+        add_auto_approved_tool(&dir, "srv", "query").expect("write ok");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+        let arr = written["mcpServers"]["srv"]["autoApprove"].as_array().expect("autoApprove array");
+        assert!(arr.iter().any(|v| v == "query"));
+
+        // Idempotent: second call must not duplicate.
+        add_auto_approved_tool(&dir, "srv", "query").unwrap();
+        let again: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(again["mcpServers"]["srv"]["autoApprove"].as_array().unwrap().len(), 1);
     }
 }
