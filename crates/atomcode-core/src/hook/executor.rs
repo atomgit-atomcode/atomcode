@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use super::config::matching_hooks;
 use super::{
@@ -224,10 +223,8 @@ impl HookExecutor {
     ) -> anyhow::Result<(bool, String, String)> {
         use std::process::Stdio;
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&hook.command)
-            .stdin(Stdio::piped())
+        let mut cmd = crate::process_utils::shell_command(&hook.command);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // Hook timeout drops the inner future; without kill_on_drop
@@ -256,8 +253,8 @@ impl HookExecutor {
             let output = child.wait_with_output().await?;
             anyhow::Ok((
                 output.status.success(),
-                String::from_utf8_lossy(&output.stdout).to_string(),
-                String::from_utf8_lossy(&output.stderr).to_string(),
+                crate::process_utils::decode_subprocess_output(&output.stdout),
+                crate::process_utils::decode_subprocess_output(&output.stderr),
             ))
         };
 
@@ -288,10 +285,8 @@ impl HookExecutor {
         let ctx_json =
             serde_json::to_string(ctx).unwrap_or_else(|_| "{}".to_string());
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&hook.command)
-            .env("ATOMCODE_HOOK_EVENT", &ctx.event)
+        let mut cmd = crate::process_utils::shell_command(&hook.command);
+        cmd.env("ATOMCODE_HOOK_EVENT", &ctx.event)
             .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
             // Hook timeout drops the cmd.output() future; without
             // kill_on_drop the sh subprocess keeps running detached.

@@ -1,6 +1,70 @@
 use super::*;
 
+/// Monotonic counter for synthetic local-shell call ids. `messages.len()`
+/// is NOT unique — `add_user_message` merges consecutive User text without
+/// growing the vec, so two `!` in a row would collide. A process-wide
+/// counter guarantees a unique id regardless of conversation merging.
+static LOCAL_SHELL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl AgentLoop {
+    /// Handle a user-invoked `!cmd`. Executes the shell command in the
+    /// agent's working dir, streams output to the TUI as a synthetic tool
+    /// call, and records the command + output into the conversation as a
+    /// User message. Does NOT start a turn — the model picks it up on the
+    /// next real message. No approval (user-initiated, mirrors a terminal).
+    pub(crate) async fn handle_local_shell(&mut self, cmd: String) {
+        let cmd = cmd.trim().to_string();
+        if cmd.is_empty() {
+            return;
+        }
+
+        let wd = self.turn_runner.context.working_dir.read().await.clone();
+        let call_id = format!(
+            "local-shell-{}",
+            LOCAL_SHELL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let _ = self.event_tx.send(crate::agent::AgentEvent::ToolCallStarted {
+            id: call_id.clone(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": cmd }).to_string(),
+        });
+
+        let event_tx = self.event_tx.clone();
+        let cid = call_id.clone();
+        let start = std::time::Instant::now();
+        let outcome = crate::tool::bash::run_shell(&cmd, &wd, 300, move |chunk| {
+            let _ = event_tx.send(crate::agent::AgentEvent::ToolOutputChunk {
+                call_id: cid.clone(),
+                chunk: chunk.to_string(),
+            });
+        })
+        .await;
+
+        let success = matches!(
+            outcome.exit,
+            crate::tool::bash::ShellExit::Exited { success: true, .. }
+        );
+
+        let _ = self.event_tx.send(crate::agent::AgentEvent::ToolCallResult {
+            call_id,
+            name: "bash".to_string(),
+            output: crate::agent::local_shell::format_bash_display(&outcome),
+            success,
+            duration: start.elapsed(),
+        });
+
+        // Bound the injected context the same way per-turn tool results are
+        // bounded (ctx::truncate), so `!cat bigfile` can't blow up the
+        // conversation — the `!` path doesn't go through `truncate_output`.
+        let char_limit = (self.ctx.ctx_window() / 8).min(32_000).max(8_000);
+        let context_text =
+            crate::agent::local_shell::format_bash_context(&cmd, &outcome, char_limit);
+        self.conversation.add_user_message(&context_text);
+        // Intentionally NOT calling run_turn_loop(): `!` records context
+        // silently; the model reads it on the user's next message.
+    }
+
     pub(crate) async fn change_dir(&mut self, path: &str) {
         let new_path = if path.starts_with('/') {
             std::path::PathBuf::from(path)

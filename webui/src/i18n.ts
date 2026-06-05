@@ -53,6 +53,12 @@ const zh = {
   // Model selector
   'model.label': '模型',
 
+  // Reasoning effort selector (DeepSeek V4 only)
+  'effort.label': '强度',
+  'effort.default': '默认',
+  'effort.high': 'High',
+  'effort.max': 'Max',
+
   // Chat
   'chat.startHint': '发送消息开始对话…',
   'chat.continueHint': '发送消息继续此会话',
@@ -183,6 +189,7 @@ const zh = {
   'perm.deny': '拒绝',
   'perm.approve': '批准',
   'perm.alwaysAllow': '本会话总是允许',
+  'perm.allowPersist': '永久允许此工具',
 
   // Sync toggle
   'sync.toggle': '同步当前会话',
@@ -239,6 +246,12 @@ const en: Record<MsgKey, string> = {
   'time.yesterday': 'yesterday',
 
   'model.label': 'Model',
+
+  // Reasoning effort selector (DeepSeek V4 only)
+  'effort.label': 'Effort',
+  'effort.default': 'Default',
+  'effort.high': 'High',
+  'effort.max': 'Max',
 
   'chat.startHint': 'Send a message to start a conversation…',
   'chat.continueHint': 'Send a message to continue this session',
@@ -362,6 +375,7 @@ const en: Record<MsgKey, string> = {
   'perm.deny': 'Deny',
   'perm.approve': 'Approve',
   'perm.alwaysAllow': 'Always allow this session',
+  'perm.allowPersist': 'Always allow this tool',
 
   // Sync toggle
   'sync.toggle': 'Sync current session',

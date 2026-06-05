@@ -24,9 +24,12 @@ export function MessageList() {
   }, []);
 
   // Only auto-scroll if the user hasn't scrolled up
+  // Use instant scroll to avoid layout repaint flicker during frequent
+  // tool-result updates (bash commands with long output). Smooth scroll
+  // is reserved for the manual scroll-to-bottom button click.
   useEffect(() => {
     if (!isUserScrolledUp) {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      bottomRef.current?.scrollIntoView();
     }
   }, [state.messages, state.queuedMessages, state.isGenerating]);
 

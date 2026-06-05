@@ -729,17 +729,72 @@ const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
 /// parent can be Ctrl+C'd without cancelling the download.
 const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Run the entire program on a thread with a large, explicit stack.
+    // Rust gives the *main* OS thread the platform-default stack — on
+    // Windows that's only ~1 MB (vs 8 MB on Linux/macOS). The TUI event
+    // loop, the synchronous codingplan/OAuth work, and the rustls TLS
+    // handshakes all run on it via `block_on`, and a deep call chain there
+    // can overflow 1 MB. A stack overflow on Windows kills the process via
+    // an OS exception (STATUS_STACK_OVERFLOW) WITHOUT a Rust panic — so it
+    // never reaches the crash-log hook and looks like a silent exit. A
+    // 16 MB stack removes that platform asymmetry. (See the Windows
+    // post-scan onboarding crash investigation.)
+    let child = std::thread::Builder::new()
+        .name("atomcode-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("failed to spawn atomcode main thread");
+    // Under `panic = "abort"` a panic in the child already aborts the whole
+    // process, so `join` only returns an error on an abnormal thread exit;
+    // mirror Rust's conventional panic exit code in that case.
+    if child.join().is_err() {
+        std::process::exit(101);
+    }
+}
+
+fn real_main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        // Worker threads (for `tokio::spawn`ed tasks) get a generous stack
+        // too — same rationale as the main thread above.
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("failed to build tokio runtime");
+    rt.block_on(async_main());
+}
+
+async fn async_main() {
     // Set Windows console to UTF-8 so CJK and other multi-byte characters
     // render correctly instead of showing garbled output (mojibake).
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::Globalization::CP_UTF8;
-        use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+        use windows_sys::Win32::System::Console::{GetConsoleCP, SetConsoleCP, SetConsoleOutputCP};
         unsafe {
             SetConsoleOutputCP(CP_UTF8);
             SetConsoleCP(CP_UTF8);
+
+            // SetConsoleCP(CP_UTF8) is best-effort — some IMEs ignore it and
+            // keep outputting in the system ANSI code page (e.g. CP936/GBK on
+            // Chinese Windows). When the console then interprets those bytes as
+            // UTF-8, CJK input renders as garbled mojibake. Detect the mismatch
+            // early so users know why their IME isn't working.
+            //
+            // We use eprintln! rather than a direct WriteConsoleW because at
+            // this early point in async_main the TUI has not yet taken over the
+            // terminal. stderr is still connected to the console and the
+            // message will be visible inline in PowerShell / conhost.
+            let actual_cp = GetConsoleCP();
+            if actual_cp != CP_UTF8 {
+                let _ = eprintln!(
+                    "\n⚠  Console input code page is {} (expected 65001/UTF-8).\n\
+                       Chinese/Japanese/Korean IME input may show garbled text.\n\
+                       → Use Windows Terminal for native UTF-8 support.\n\
+                       → Or enable Beta: Use Unicode UTF-8 in Region settings.\n",
+                    actual_cp,
+                );
+            }
         }
     }
 
@@ -847,6 +902,8 @@ async fn main() {
 async fn run() -> Result<i32> {
     let cli = Cli::parse();
 
+    let is_admin = atomcode_core::process_utils::is_running_as_admin();
+
     // ── Telemetry init ────────────────────────────────────────────────────────
     // Load config early (before subcommand dispatch) so we can read the
     // [telemetry] section. Failure to load config is non-fatal; telemetry
@@ -900,6 +957,7 @@ async fn run() -> Result<i32> {
     // `fixissue` is an interactive-feeling structured workflow (the user
     // is watching progress, not piping output). Force verbose so they see
     // tool calls / edits instead of long silences while the agent works.
+
     let mut force_verbose = false;
     if let Some(cmd) = cli.command {
         match cmd {
@@ -1135,6 +1193,7 @@ async fn run() -> Result<i32> {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -1426,6 +1485,10 @@ async fn run() -> Result<i32> {
     } else {
         SessionMode::Tui
     };
+    // Launch-level fallback: any telemetry emitted outside a mode-bearing
+    // CurrentContext scope (e.g. an un-scoped spawned task) attributes to this
+    // process mode instead of `null`. Per-scope mode still overrides it.
+    telemetry.set_default_mode(Some(session_mode));
     // Bind telemetry to the continued session's id (if any). A fresh run needs
     // nothing here: the agent bootstraps telemetry + header + datalog from its
     // own session id. The TUI manages its own binding via
@@ -1474,6 +1537,7 @@ async fn run() -> Result<i32> {
                 capture,
                 working_dir.clone(),
                 cli.dangerously_skip_permissions,
+                is_admin,
             )
             .await?;
 
@@ -1541,7 +1605,7 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions).await?;
+            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await?;
             Ok(0)
         };
 
@@ -1638,6 +1702,7 @@ async fn run_headless(
     capture: bool,
     working_dir: PathBuf,
     skip_permissions: bool,
+    is_admin: bool,
 ) -> Result<(i32, Option<String>)> {
     // Tell the panic hook / error path to skip TUI cleanup — raw mode was
     // never enabled here, so `disable_raw_mode` would be a wasted ioctl
@@ -1653,6 +1718,12 @@ async fn run_headless(
         eprintln!(
             "{}",
             atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless)
+        );
+    }
+    if is_admin {
+        eprintln!(
+            "{}",
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::AdminWarningHeadless)
         );
     }
 
@@ -1990,7 +2061,8 @@ async fn run_headless(
             }
             AgentEvent::UserEcho(_)
             | AgentEvent::PeerBusy(_)
-            | AgentEvent::ProviderChanged(_) => {
+            | AgentEvent::ProviderChanged(_)
+            | AgentEvent::ProjectSwitched(_) => {
                 // Live-sync only — not applicable in headless CLI.
             }
         }

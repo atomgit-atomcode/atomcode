@@ -65,6 +65,11 @@ pub struct PluginManager {
     /// (uninstalled) automatically so the filesystem is not left in an
     /// inconsistent state.
     cancelled_installs: HashSet<String>,
+    /// Set by a successful uninstall / marketplace-removal so `handle_key`
+    /// closes the manager afterwards. Without this the modal lingered on a
+    /// now-empty list whose render is indistinguishable from the idle prompt,
+    /// silently swallowing keystrokes until the user discovered Esc.
+    close_requested: bool,
 }
 
 /// Path-safe segment, mirroring `marketplace::sanitize_name` (which is crate
@@ -90,6 +95,7 @@ impl PluginManager {
             pending: None,
             installing_plugin: None,
             cancelled_installs: HashSet::new(),
+            close_requested: false,
         };
         m.reload();
         m
@@ -223,6 +229,11 @@ impl PluginManager {
                             .into_owned(),
                     ));
                     self.reload();
+                    // Stay in the manager after a successful uninstall so the
+                    // user can keep uninstalling. `reload` already refreshes
+                    // the lists and clamps `selected`; empty screens now show
+                    // an "esc back" hint, so lingering no longer mimics the
+                    // idle prompt.
                 }
                 Err(e) => renderer.render(UiLine::Error(
                     t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
@@ -262,6 +273,7 @@ impl PluginManager {
                     t(Msg::PluginMarketplaceRemoved { name: &name }).into_owned(),
                 ));
                 self.reload();
+                self.close_requested = true;
             }
             Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
         }
@@ -278,6 +290,8 @@ impl PluginManager {
                     t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned(),
                 ));
                 self.reload();
+                // Stay in the manager so the user can keep uninstalling (see
+                // the Plugins-screen uninstall path for the rationale).
             }
             Err(e) => renderer.render(UiLine::Error(
                 t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
@@ -491,6 +505,12 @@ impl Modal for PluginManager {
             }
             _ => {}
         }
+        // Marketplace removal closes the manager (removing a marketplace is a
+        // bigger, rarer action). Plugin uninstall deliberately does NOT — the
+        // user usually wants to uninstall several in a row.
+        if std::mem::take(&mut self.close_requested) {
+            return Ok(ModalAction::Close);
+        }
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
     }
@@ -620,6 +640,7 @@ mod tests {
             pending: None,
             installing_plugin: None,
             cancelled_installs: HashSet::new(),
+            close_requested: false,
         }
     }
 

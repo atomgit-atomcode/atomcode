@@ -80,6 +80,38 @@ fn compute_backoff(attempt: u32, policy: &RetryPolicy) -> Duration {
     floor + jitter
 }
 
+/// Read a 429 response body to decide whether retrying is futile. A
+/// quota-exhausted 429 (fixed future reset, e.g. monthly quota) won't recover
+/// by retrying, so we report it as non-retryable; transient limits (rolling
+/// window, load) stay retryable. Returns the response **reconstructed** with
+/// its body intact so the caller can still format the error message.
+async fn classify_429(resp: reqwest::Response) -> (reqwest::Response, bool) {
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    match resp.bytes().await {
+        Ok(body) => {
+            let non_retryable =
+                super::is_non_retryable_rate_limit(&String::from_utf8_lossy(&body));
+            let mut builder = http::Response::builder().status(status);
+            if let Some(h) = builder.headers_mut() {
+                *h = headers;
+            }
+            let rebuilt = builder.body(body).expect("reconstruct 429 response");
+            (reqwest::Response::from(rebuilt), non_retryable)
+        }
+        // Body unreadable → can't classify; keep the old behavior (retryable).
+        // Hand back a synthesized empty-bodied 429 so the caller still gets a
+        // Response to inspect.
+        Err(_) => {
+            let rebuilt = http::Response::builder()
+                .status(status)
+                .body(Vec::<u8>::new())
+                .expect("reconstruct empty 429 response");
+            (reqwest::Response::from(rebuilt), false)
+        }
+    }
+}
+
 /// Async retry wrapper for streaming providers.
 ///
 /// Uses `RequestBuilder::build_split()` so builder-chain errors
@@ -118,9 +150,19 @@ pub async fn send_with_retry(
         };
         match client.execute(this_req).await {
             Ok(resp) => {
-                if is_retryable_status(resp.status()) && attempt < policy.max_attempts {
-                    let wait = parse_retry_after(resp.headers())
-                        .unwrap_or_else(|| compute_backoff(attempt, policy));
+                let status = resp.status();
+                if is_retryable_status(status) && attempt < policy.max_attempts {
+                    let retry_after = parse_retry_after(resp.headers());
+                    // A 429 may be a non-recoverable quota exhaustion (fixed
+                    // future reset) rather than a transient limit — peek the
+                    // body and fail fast instead of burning the retry budget.
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        let (resp, non_retryable) = classify_429(resp).await;
+                        if non_retryable {
+                            return Ok(resp);
+                        }
+                    }
+                    let wait = retry_after.unwrap_or_else(|| compute_backoff(attempt, policy));
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -178,9 +220,19 @@ where
         // TODO: trace marker when atomcode-core gets a trace macro
         match client.execute(req).await {
             Ok(resp) => {
-                if is_retryable_status(resp.status()) && attempt < policy.max_attempts {
-                    let wait = parse_retry_after(resp.headers())
-                        .unwrap_or_else(|| compute_backoff(attempt, policy));
+                let status = resp.status();
+                if is_retryable_status(status) && attempt < policy.max_attempts {
+                    let retry_after = parse_retry_after(resp.headers());
+                    // Fail fast on a non-recoverable quota-exhausted 429 (see
+                    // `classify_429`) rather than retrying a request that can't
+                    // succeed until the quota resets.
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        let (resp, non_retryable) = classify_429(resp).await;
+                        if non_retryable {
+                            return Ok(resp);
+                        }
+                    }
+                    let wait = retry_after.unwrap_or_else(|| compute_backoff(attempt, policy));
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -248,6 +300,34 @@ pub fn send_with_retry_blocking(
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    fn make_429(body: &str) -> reqwest::Response {
+        let http_resp = http::Response::builder()
+            .status(429)
+            .body(body.to_string())
+            .unwrap();
+        reqwest::Response::from(http_resp)
+    }
+
+    #[tokio::test]
+    async fn classify_429_flags_quota_exhausted_as_non_retryable() {
+        let resp = make_429(
+            r#"{"error":{"message":"当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。"}}"#,
+        );
+        let (resp, non_retryable) = classify_429(resp).await;
+        assert!(non_retryable, "quota-exhausted 429 must not be retried");
+        assert_eq!(resp.status().as_u16(), 429);
+        // Body must survive reconstruction so the caller can still format it.
+        assert!(resp.text().await.unwrap().contains("额度已用完"));
+    }
+
+    #[tokio::test]
+    async fn classify_429_keeps_transient_limit_retryable() {
+        let resp = make_429(r#"{"error":{"message":"请求过于频繁，请稍后再试"}}"#);
+        let (resp, non_retryable) = classify_429(resp).await;
+        assert!(!non_retryable, "rolling-window 429 must stay retryable");
+        assert!(resp.text().await.unwrap().contains("请求过于频繁"));
+    }
 
     #[test]
     fn parse_retry_after_seconds() {

@@ -226,6 +226,9 @@ pub enum Msg<'a> {
     SessionListFailed { error: &'a str },
     SessionRenamed { old: &'a str, new: &'a str },
     SessionSaveFailed { error: &'a str },
+    SessionDeleted { name: &'a str },
+    SessionDeleteConfirm { name: &'a str },
+    SessionDeleteFailed { error: &'a str },
     SessionNoneSelected,
     SessionRenameEditing { buffer: &'a str },
 
@@ -583,6 +586,7 @@ pub enum Msg<'a> {
     CmdDescPlan,
     CmdDescBuild,
     CmdDescThink,
+    CmdDescEffort,
     CmdDescHelp,
     CmdDescKeys,
     CmdDescLanguage,
@@ -636,6 +640,11 @@ pub enum Msg<'a> {
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.
     CmdPasteNoImage,
+
+    // ── reasoning effort ──
+    /// Rendered when the user tries to set reasoning_effort on a
+    /// model that doesn't support it (only DeepSeek V4 / reasoner).
+    ReasoningEffortNoEffect,
 
     // ── config save failed ──
     ConfigSaveFailed { error: &'a str },
@@ -756,6 +765,13 @@ pub enum Msg<'a> {
     /// Status-bar badge text shown when --dangerously-skip-permissions is
     /// active. Typically "⚠ BYPASS" — kept short for the status row.
     BypassBadge,
+
+    // ── admin / root privilege warning ──
+    /// TUI scrollback warning when AtomCode is running as admin/root.
+    /// Includes leading "⚠ " and trailing "\n".
+    AdminWarningBanner,
+    /// Headless-mode stderr warning when running as admin/root.
+    AdminWarningHeadless,
 
     /// Confirmation hint after the first Ctrl+C on an empty buffer.
     /// "  (press Ctrl+C again to exit)\n" — leading indent + trailing

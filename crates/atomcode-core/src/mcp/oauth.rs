@@ -197,7 +197,11 @@ pub fn refresh_mcp_oauth_token(server_name: &str, token: &McpOAuthToken) -> Resu
         form.push(("resource", resource.clone()));
     }
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        // No `Client::new()` fallback — it panics on TLS/resolver init
+        // failure and `panic = "abort"` turns that into a process kill.
+        .context("failed to build MCP OAuth HTTP client")?;
     let resp = client
         .post(token_endpoint)
         .header("Accept", "application/json")
@@ -268,7 +272,11 @@ pub fn login_mcp_oauth(
         );
     }
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        // No `Client::new()` fallback — it panics on TLS/resolver init
+        // failure and `panic = "abort"` turns that into a process kill.
+        .context("failed to build MCP OAuth HTTP client")?;
     let discovered = discover_oauth_metadata(&client, url, &auth)?;
     let (redirect_uri, listener) = bind_callback_listener()?;
     let state = Uuid::new_v4().to_string();
@@ -408,7 +416,11 @@ pub fn login_github_oauth(
         bail!("OAuth state mismatch");
     }
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        // No `Client::new()` fallback — it panics on TLS/resolver init
+        // failure and `panic = "abort"` turns that into a process kill.
+        .context("failed to build MCP OAuth HTTP client")?;
     let resp = client
         .post(GITHUB_TOKEN_URL)
         .header("Accept", "application/json")
@@ -514,7 +526,9 @@ fn discover_resource_metadata_url(
         .json(&probe)
         .send()
     {
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
             if let Some(header) = resp
                 .headers()
                 .get(reqwest::header::WWW_AUTHENTICATE)
@@ -588,7 +602,11 @@ fn register_oauth_client(
     redirect_uri: &str,
 ) -> Result<ClientRegistrationResponse> {
     let Some(registration_endpoint) = metadata.registration_endpoint.as_deref() else {
-        bail!("MCP OAuth requires client_id because the authorization server does not advertise dynamic client registration");
+        bail!(
+            "MCP OAuth requires a pre-registered client_id because the authorization server \
+             does not support dynamic client registration (RFC 7591). \
+             Add a pre-registered client_id to auth.client_id in your .mcp.json and try again."
+        );
     };
     let resp = client
         .post(registration_endpoint)
@@ -603,9 +621,20 @@ fn register_oauth_client(
         .send()
         .context("Failed to dynamically register MCP OAuth client")?;
     if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED
+        {
+            bail!(
+                "MCP OAuth dynamic client registration failed: HTTP {status} — \
+                 the authorization server rejected the request. \
+                 Add a pre-registered client_id to auth.client_id \
+                 in your .mcp.json and try again.\n\
+                 Response: {body}"
+            );
+        }
         bail!(
-            "MCP OAuth dynamic client registration failed: HTTP {}",
-            resp.status()
+            "MCP OAuth dynamic client registration failed: HTTP {status}\nResponse: {body}"
         );
     }
     resp.json()
@@ -727,7 +756,11 @@ fn open_browser(url: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn open_browser(url: &str) -> Result<()> {
-    std::process::Command::new("xdg-open").arg(url).spawn()?;
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
     Ok(())
 }
 

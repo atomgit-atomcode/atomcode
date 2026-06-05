@@ -11,6 +11,7 @@ pub mod subtask_driver;
 mod diagnose;
 mod discipline;
 pub mod execute;
+mod local_shell;
 mod prompt;
 mod services;
 mod tool_dispatch;
@@ -119,6 +120,13 @@ pub enum AgentCommand {
     /// agent replies with `AgentEvent::ConversationTruncated` on success or
     /// `AgentEvent::UndoFailed` when `nth` is out of range.
     UndoToPrompt { nth: Option<usize> },
+    /// User invoked `!cmd` bash mode. Runs the shell command locally and
+    /// injects `<bash-input>/<bash-stdout>/<bash-stderr>` into the
+    /// conversation as a User message — WITHOUT starting an LLM turn.
+    /// The model sees it on the user's next real message.
+    LocalShell {
+        cmd: String,
+    },
     /// Shutdown the agent.
     Shutdown,
 }
@@ -379,6 +387,15 @@ pub enum AgentEvent {
     },
     /// Working directory changed.
     WorkingDirChanged(PathBuf),
+    /// Another client (e.g. the webui) switched the project working directory.
+    /// Unlike `WorkingDirChanged` — which is an in-place cwd change from the
+    /// agent's own `cd`/`change_dir` tool and keeps the conversation — this
+    /// means "switch project, start fresh here": the receiving view changes cwd
+    /// AND opens a new session. Delivered over the live-sync channel
+    /// (`LiveEvent::WorkingDirChanged` → here) so a same-process TUI follows a
+    /// webui directory switch. Kept distinct from `WorkingDirChanged` precisely
+    /// so an agent-driven `cd` mid-task never wipes the conversation.
+    ProjectSwitched(PathBuf),
     /// Context budget stats — piped into datalog and cached by the TUI
     /// for `/context`. Emitted after every turn's `ctx.build_messages`
     /// call, so stats reflect the snapshot the model actually saw.
@@ -958,6 +975,7 @@ impl AgentLoop {
                     thinking_type: None,
                     thinking_keep: None,
                     reasoning_history: None,
+                    reasoning_effort: None,
                     thinking_enabled: None,
                     thinking_budget: None,
                     skip_tls_verify: false,
@@ -1147,6 +1165,9 @@ impl AgentLoop {
             match cmd {
                 AgentCommand::SendMessage { text, images, image_markers } => {
                     self.handle_send_message(text, images, image_markers).await;
+                }
+                AgentCommand::LocalShell { cmd } => {
+                    self.handle_local_shell(cmd).await;
                 }
                 AgentCommand::Cancel => {
                     crate::ctrace!("AGT", "outer Cancel -> cancel_token.cancel() (was_cancelled={})", self.cancel_token.is_cancelled());
@@ -1626,10 +1647,10 @@ impl AgentLoop {
             crate::hook::UserPromptHookResult::Warning(msg) => {
                 // Non-fatal: show inline warning + status-bar hint, continue turn.
                 let _ = self.event_tx.send(AgentEvent::Warning(
-                    format!("Hook 执行异常，已跳过：{}", msg),
+                    format!("Hook skipped (error): {}", msg),
                 ));
                 let _ = self.event_tx.send(AgentEvent::HookWarningHint(
-                    format!("Hook 异常: {}", msg),
+                    format!("Hook error: {}", msg),
                 ));
             }
         }
@@ -2360,7 +2381,16 @@ impl AgentLoop {
                                 AgentCommand::ApproveToolAlways => {
                                     if let Some(ref req) = last_approval_request {
                                         if let Ok(mut store) = permission_store.write() {
-                                            store.grant_session(&req.call.name);
+                                            // Path-scoped approvals (sensitive
+                                            // reads) remember only this exact
+                                            // resource, so re-reading the same
+                                            // file stops re-prompting while
+                                            // other sensitive paths stay gated.
+                                            // Everything else grants the tool.
+                                            match &req.scope {
+                                                Some(scope) => store.grant_session_scope(scope),
+                                                None => store.grant_session(&req.call.name),
+                                            }
                                         }
                                     }
                                     *phase = AgentPhase::Thinking;
@@ -2620,6 +2650,12 @@ impl AgentLoop {
                 TurnResult::Failed(e) => {
                     // Retry logic for transient errors
                     let is_rate_limited = is_rate_limited_error(&e);
+                    // A 429 whose quota only resets at a fixed future time
+                    // (monthly / period quota exhausted) can't recover by
+                    // retrying — fail fast and show the upstream reason as-is,
+                    // instead of the 5-shot rate-limit backoff (which just
+                    // delays the same error by ~45s and re-hammers the gateway).
+                    let is_quota_exhausted = crate::provider::is_non_retryable_rate_limit(&e);
                     let is_auth_error = is_auth_error(&e);
                     let is_messages_illegal = e.contains("illegal") || e.contains("messages");
                     // Upstream context-length overflow (OpenRouter 400, OpenAI
@@ -2674,6 +2710,20 @@ impl AgentLoop {
                         };
                         let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
                         continue;
+                    } else if is_quota_exhausted {
+                        // Non-retryable: surface the upstream message verbatim
+                        // (e.g. "当前月度额度已用完，请于 … 后继续使用。") so the
+                        // user sees the real reason and reset time, not a
+                        // generic "请稍后再试".
+                        self.datalog.log_error(&e);
+                        self.report_error("rate_limit_exhausted", &e).await;
+                        let shown = e.strip_prefix("[429] ").unwrap_or(&e).to_string();
+                        let _ = self.event_tx.send(AgentEvent::Error {
+                            error: shown,
+                            messages: self.conversation.messages.clone(),
+                        });
+                        self.finish_turn(TurnStopReason::Error);
+                        return;
                     } else if is_rate_limited && self.retry_count < 5 {
                         self.retry_count += 1;
                         // 指数退避基线（3/6/9/12/15s）。但若网关在错误体里明确给了冷却
@@ -3128,39 +3178,121 @@ impl AgentLoop {
 
     /// Run a lightweight LLM call to summarize content. Returns empty string on failure.
     async fn run_llm_summary(&self, prompt: &str) -> String {
+        // System prompt kept in a local so the telemetry `system_tokens`
+        // estimate below matches exactly what is sent on the wire.
+        let sys = "You are a conversation summarizer. Output ONLY the summary.";
         let mut mini_conv = crate::conversation::Conversation::new();
         mini_conv.add_user_message(prompt);
-        let msgs = mini_conv
-            .to_provider_messages("You are a conversation summarizer. Output ONLY the summary.");
+        let msgs = mini_conv.to_provider_messages(sys);
+
+        let started = std::time::Instant::now();
+        // Telemetry token counters: populated from StreamEvent::Usage when the
+        // provider reports it, estimated otherwise (mirrors TurnRunner's
+        // no-usage fallback). This summary/compaction call goes to the SAME
+        // provider/base_url as a normal turn, so the upstream proxy logs it —
+        // but it bypasses `run_with_filter`, so the `tel_return!` macro never
+        // fires and the request was previously invisible to our telemetry,
+        // making AtomCode under-report vs the proxy by exactly these calls.
+        let mut tel_input: u32 = 0;
+        let mut tel_output: u32 = 0;
+        let mut tel_cached: u32 = 0;
+        let mut got_usage = false;
+        let mut errored = false;
 
         let mut summary = String::new();
-        if let Ok(mut stream) = self.turn_runner.provider.chat_stream(&msgs, None) {
-            use futures::StreamExt;
-            let first_timeout = std::time::Duration::from_secs(30);
-            let stream_timeout = std::time::Duration::from_secs(30);
-            let mut got_token = false;
-            loop {
-                let timeout = if got_token {
-                    stream_timeout
-                } else {
-                    first_timeout
-                };
-                match tokio::time::timeout(timeout, stream.next()).await {
-                    Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
-                        got_token = true;
-                        let clean = text
-                            .replace("<think>", "")
-                            .replace("</think>", "")
-                            .replace("<|im_start|>", "")
-                            .replace("<|im_end|>", "");
-                        summary.push_str(&clean);
+        match self.turn_runner.provider.chat_stream(&msgs, None) {
+            Ok(mut stream) => {
+                use futures::StreamExt;
+                let first_timeout = std::time::Duration::from_secs(30);
+                let stream_timeout = std::time::Duration::from_secs(30);
+                let mut got_token = false;
+                loop {
+                    let timeout = if got_token {
+                        stream_timeout
+                    } else {
+                        first_timeout
+                    };
+                    match tokio::time::timeout(timeout, stream.next()).await {
+                        Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
+                            got_token = true;
+                            let clean = text
+                                .replace("<think>", "")
+                                .replace("</think>", "")
+                                .replace("<|im_start|>", "")
+                                .replace("<|im_end|>", "");
+                            summary.push_str(&clean);
+                        }
+                        Ok(Some(Ok(crate::stream::StreamEvent::Usage(u)))) => {
+                            tel_input = tel_input.saturating_add(u.prompt_tokens as u32);
+                            tel_output = tel_output.saturating_add(u.completion_tokens as u32);
+                            tel_cached = tel_cached.saturating_add(u.cached_tokens as u32);
+                            got_usage = true;
+                        }
+                        Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
+                        Ok(Some(Ok(_))) => continue,
+                        Ok(Some(Err(_))) => {
+                            errored = true;
+                            break;
+                        }
+                        // timeout (Err) or end-of-stream (Ok(None))
+                        _ => break,
                     }
-                    Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
-                    Ok(Some(Ok(_))) => continue,
-                    _ => break,
                 }
             }
+            Err(_) => {
+                errored = true;
+            }
         }
+
+        // Estimate tokens when the provider didn't report usage (many
+        // OpenAI-compatible gateways ignore stream_options). ~4 chars/token in,
+        // ~3 out — same heuristic class as TurnRunner.
+        if !got_usage {
+            tel_input = ((sys.len() + prompt.len()) / 4) as u32;
+            tel_output = (summary.len() / 3) as u32;
+        }
+        let had_error = errored || (summary.trim().is_empty() && !got_usage);
+
+        // Build the same envelope context a normal turn would carry, so this
+        // request is attributed to the right provider/host/model/session.
+        let pcfg = self.config.providers.get(&self.config.default_provider);
+        let vendor = pcfg.map(|p| p.provider_type.clone());
+        let host = pcfg.and_then(|p| {
+            atomcode_telemetry::resolve_provider_host(&p.provider_type, p.base_url.as_deref())
+        });
+        let parent = atomcode_telemetry::CurrentContext::current();
+        let scope_ctx = atomcode_telemetry::CurrentContext {
+            turn_id: Some(uuid::Uuid::new_v4()),
+            provider: parent.provider.clone().or(vendor),
+            provider_host: parent.provider_host.clone().or(host),
+            model: parent
+                .model
+                .clone()
+                .or_else(|| Some(self.turn_runner.provider.model_name().to_string())),
+            ..parent
+        };
+        let event = atomcode_telemetry::Event::LlmChat {
+            duration_ms: started.elapsed().as_millis() as u32,
+            tool_calls_count: 0,
+            input_tokens: tel_input,
+            output_tokens: tel_output,
+            cached_tokens: tel_cached,
+            had_error,
+            context_window: self.ctx.ctx_window() as u32,
+            system_tokens: (sys.len() / 4 + 4) as u32,
+            tool_def_tokens: 0,
+            tool_result_tokens: 0,
+            message_tokens: (prompt.len() / 4) as u32,
+            messages_count: msgs.len() as u32,
+            error_kind: None,
+            error_data: None,
+        };
+        let tel = self.turn_runner.context.telemetry.clone();
+        atomcode_telemetry::CurrentContext::scope(scope_ctx, || async move {
+            tel.track(event);
+        })
+        .await;
+
         summary
     }
 

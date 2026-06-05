@@ -77929,7 +77929,7 @@ ${content}</tr>
     }, []);
     (0, import_react10.useEffect)(() => {
       if (!isUserScrolledUp) {
-        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+        bottomRef.current?.scrollIntoView();
       }
     }, [state.messages, state.queuedMessages, state.isGenerating]);
     const query = state.searchQuery.toLowerCase();

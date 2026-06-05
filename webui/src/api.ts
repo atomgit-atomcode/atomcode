@@ -4,8 +4,8 @@
 const token = new URLSearchParams(location.search).get('token') ?? '';
 
 function authHeaders(): Record<string, string> {
-  // Tag every request so the daemon attributes telemetry (mode field) to webui
-  // rather than the generic `ide` fallback. See daemon resolve_client_mode.
+  // X-AtomCode-Client lets the daemon tag telemetry as webui-originated
+  // (resolve_client_mode → SessionMode::Webui); sent regardless of token.
   const h: Record<string, string> = { 'X-AtomCode-Client': 'webui' };
   if (token) h.Authorization = 'Bearer ' + token;
   return h;
@@ -33,6 +33,11 @@ export interface ModelInfo {
   model: string;
   provider_type: string;
   is_default: boolean;
+  /** Whether this model accepts the DeepSeek `reasoning_effort` control
+   *  (deepseek-v4 family). The effort selector is shown only when true. */
+  effort_applicable: boolean;
+  /** Current effort: 'high' | 'max' | null (model default). */
+  reasoning_effort: string | null;
 }
 
 export async function getModels(): Promise<ModelInfo[]> {
@@ -128,7 +133,8 @@ export async function streamChat(
 
 export async function respondPermission(
   sessionId: string,
-  decision: 'allow' | 'deny' | 'always_allow',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
+  toolName?: string,
 ): Promise<{ success: boolean }> {
   const resp = await fetch('/chat/permission', {
     method: 'POST',
@@ -136,7 +142,7 @@ export async function respondPermission(
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ session_id: sessionId, decision }),
+    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName }),
   });
   return resp.json();
 }
@@ -457,8 +463,10 @@ export type LiveWireEvent =
 export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,
   signal?: AbortSignal,
+  sessionId?: string | null,
 ): Promise<void> {
-  const resp = await fetch('/live', { headers: authHeaders(), signal });
+  const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+  const resp = await fetch(`/live${params}`, { headers: authHeaders(), signal });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const reader = resp.body!.getReader();
   const decoder = new TextDecoder();
@@ -483,6 +491,7 @@ export async function postLiveMessage(
   message: string,
   images?: ImageData[],
   provider?: string,
+  sessionId?: string | null,
 ): Promise<void> {
   await fetch('/live/message', {
     method: 'POST',
@@ -491,6 +500,7 @@ export async function postLiveMessage(
       message,
       ...(images && images.length ? { images } : {}),
       ...(provider ? { provider } : {}),
+      ...(sessionId ? { session_id: sessionId } : {}),
     }),
   });
 }
@@ -505,13 +515,31 @@ export async function postLiveProvider(provider: string): Promise<void> {
   });
 }
 
+/** Set the DeepSeek V4 `reasoning_effort` for a provider. `effort` is
+ *  'high' | 'max' | null (clear → model default). Persists to the provider
+ *  config so the next turn (live or /chat) picks it up. */
+export async function postLiveReasoningEffort(
+  effort: string | null,
+  provider?: string,
+): Promise<void> {
+  await fetch('/live/reasoning_effort', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({
+      reasoning_effort: effort,
+      ...(provider ? { provider } : {}),
+    }),
+  });
+}
+
 export async function postLivePermission(
-  decision: 'allow' | 'deny' | 'always_allow',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
+  toolName?: string,
 ): Promise<{ accepted: boolean }> {
   const resp = await fetch('/live/permission', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ decision }),
+    body: JSON.stringify({ decision, tool_name: toolName }),
   });
   return resp.json();
 }

@@ -13,7 +13,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use super::config::matches_tool;
 use super::json_config::load_hooks_config;
@@ -553,10 +552,8 @@ impl ShellCommandHook {
             "{}".to_string()
         });
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&self.command)
-            .env("ATOMCODE_HOOK_EVENT", &ctx.event)
+        let mut cmd = crate::process_utils::shell_command(&self.command);
+        cmd.env("ATOMCODE_HOOK_EVENT", &ctx.event)
             .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
             .kill_on_drop(true);
 
@@ -581,7 +578,7 @@ impl ShellCommandHook {
             );
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(crate::process_utils::decode_subprocess_output(&output.stdout))
     }
 
     /// 执行 shell 命令并 pipe stdin，返回 (exit_ok, stdout, stderr)。
@@ -589,10 +586,8 @@ impl ShellCommandHook {
         &self,
         payload_json: &str,
     ) -> anyhow::Result<(bool, String, String)> {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&self.command)
-            .stdin(Stdio::piped())
+        let mut cmd = crate::process_utils::shell_command(&self.command);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -616,8 +611,8 @@ impl ShellCommandHook {
             let output = child.wait_with_output().await?;
             anyhow::Ok((
                 output.status.success(),
-                String::from_utf8_lossy(&output.stdout).to_string(),
-                String::from_utf8_lossy(&output.stderr).to_string(),
+                crate::process_utils::decode_subprocess_output(&output.stdout),
+                crate::process_utils::decode_subprocess_output(&output.stderr),
             ))
         };
 
