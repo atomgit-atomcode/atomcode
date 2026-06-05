@@ -107,20 +107,26 @@ impl ScriptHook {
     }
 
     async fn wait_for_output(child: &mut tokio::process::Child) -> Result<String, String> {
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        // Read raw bytes (not read_to_string, which hard-errors on non-UTF-8):
+        // a Chinese-Windows script's stderr arrives as CP936/GBK, so decode
+        // via the OEM-aware helper instead of assuming UTF-8.
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
 
         if let Some(ref mut out) = child.stdout {
-            out.read_to_string(&mut stdout)
+            out.read_to_end(&mut stdout_buf)
                 .await
                 .map_err(|e| format!("Failed to read stdout: {}", e))?;
         }
 
         if let Some(ref mut err) = child.stderr {
-            err.read_to_string(&mut stderr)
+            err.read_to_end(&mut stderr_buf)
                 .await
                 .map_err(|e| format!("Failed to read stderr: {}", e))?;
         }
+
+        let stdout = crate::process_utils::decode_subprocess_output(&stdout_buf);
+        let stderr = crate::process_utils::decode_subprocess_output(&stderr_buf);
 
         let status = child
             .wait()

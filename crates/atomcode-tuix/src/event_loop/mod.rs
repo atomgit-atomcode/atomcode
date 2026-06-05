@@ -7896,24 +7896,31 @@ fn draw_spinner_now(
 fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Option<&str>) -> String {
     let base = &state.spinner_label;
     let mut out = format!("{}{}", base, state.ellipsis());
-    // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
-    // `Running ReadFile… 4s`. CC behaviour: timer resets on every
-    // phase transition so the user reads "this thing has been
-    // running for N seconds", not "the whole turn so far is 1301s".
-    if let Some(d) = state.phase_elapsed() {
-        out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
+    // Order matters. The phase clock (`· 372ms`) ticks every frame, and any
+    // segment AFTER a rapidly-changing field shifts on every redraw — which
+    // read as flicker when the elapsed sat in the middle (user report:
+    // `Cogitating… · 372ms · thinking with high effort` jittered the effort
+    // text). So: static segments first, the ticking elapsed dead last.
+    //
+    // Reasoning-effort hint (deepseek-v4 high/max), mirroring CC's
+    // `… · thinking with high effort`. The value comes from the caller (the
+    // ctx-sourced, applicability-gated effort — the SAME source as the status
+    // bar's `[high]`, so the two never disagree). Placed FIRST among the
+    // metadata so `spinner_meta_suffix` can splice it out (a tool isn't
+    // "thinking") while still forwarding the trailing time/queue anchors.
+    if let Some(effort) = reasoning_effort {
+        out.push_str(&format!(" · thinking with {} effort", effort));
     }
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
     }
-    // Reasoning-effort hint (deepseek-v4 high/max), mirroring CC's
-    // `… · thinking with high effort`. The value comes from the caller (the
-    // ctx-sourced, applicability-gated effort — the SAME source as the
-    // status bar's `[high]`, so the two never disagree). Kept at the tail so
-    // `spinner_meta_suffix` can strip it before forwarding the time/queue
-    // metadata onto an in-flight tool row (a tool isn't "thinking").
-    if let Some(effort) = reasoning_effort {
-        out.push_str(&format!(" · thinking with {} effort", effort));
+    // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
+    // `Running ReadFile… 4s`. CC behaviour: timer resets on every phase
+    // transition so the user reads "this thing has been running for N
+    // seconds", not "the whole turn so far is 1301s". LAST, so its per-frame
+    // width changes never shift anything after it.
+    if let Some(d) = state.phase_elapsed() {
+        out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
     }
     out
 }

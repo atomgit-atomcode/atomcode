@@ -4134,21 +4134,29 @@ fn truncate_body_str(body_str: &str, max_cols: usize) -> String {
     format!("{}{}", head, suffix)
 }
 
-/// Pluck the metadata suffix (` · 12s` and/or ` · N queued`) out of a
-/// spinner label built by `format_spinner_label`. Labels have the
-/// shape `{base}{ellipsis}[ · {elapsed}][ · {n} queued]`, so the first
-/// ` · ` marks where the base ends and the metadata begins. Returns
-/// the slice **including** its leading ` · ` separator so callers can
-/// concatenate it directly, or `""` if the label has no metadata yet
-/// (no phase clock has ticked).
+/// Pluck the time/queue metadata suffix (` · N queued` and/or ` · 12s`) out
+/// of a spinner label built by `format_spinner_label`, to forward onto an
+/// in-flight tool row. Labels have the shape
+/// `{base}{ellipsis}[ · thinking with {effort} effort][ · {n} queued][ · {elapsed}]`
+/// — the effort hint comes FIRST among the metadata (and must NOT ride onto a
+/// tool row, which isn't "thinking"). Returns the slice **including** its
+/// leading ` · ` separator so callers can concatenate it directly, or `""` if
+/// there's no time/queue metadata yet.
 fn spinner_meta_suffix(label: &str) -> &str {
-    // The reasoning-effort hint (` · thinking with high effort`) is a
-    // thinking-phase tail — strip it before plucking the time/queue
-    // metadata so it doesn't ride onto an in-flight tool row.
-    let label = match label.find(" · thinking with ") {
-        Some(i) => &label[..i],
-        None => label,
-    };
+    const EFFORT_MARK: &str = " · thinking with ";
+    if let Some(start) = label.find(EFFORT_MARK) {
+        // Effort is the first metadata segment; it runs until the next ` · `
+        // (the queue/elapsed run) or end-of-string. Everything from that next
+        // separator on is the time/queue metadata to forward. Scanning from
+        // past the fixed marker lands inside the ASCII effort value, so the
+        // next ` · ` is unambiguously the following segment.
+        let scan_from = start + EFFORT_MARK.len();
+        return label[scan_from..]
+            .find(" · ")
+            .map(|rel| &label[scan_from + rel..])
+            .unwrap_or("");
+    }
+    // No effort hint: metadata begins at the first ` · ` after the base.
     label.find(" · ").map(|i| &label[i..]).unwrap_or("")
 }
 
@@ -5321,24 +5329,25 @@ mod tests {
     #[test]
     fn spinner_meta_suffix_extracts_after_first_separator() {
         assert_eq!(spinner_meta_suffix("Running Bash… · 12s"), " · 12s");
+        // Effort now leads the metadata run and elapsed trails it; queue (when
+        // present) sits between. The effort hint must NOT ride onto a tool row.
         assert_eq!(
-            spinner_meta_suffix("Running Bash… · 12s · 2 queued"),
-            " · 12s · 2 queued"
+            spinner_meta_suffix("Running Bash… · 2 queued · 12s"),
+            " · 2 queued · 12s"
         );
         // No metadata yet (no phase clock tick) → empty suffix.
         assert_eq!(spinner_meta_suffix("Pondering…"), "");
         assert_eq!(spinner_meta_suffix(""), "");
-        // The reasoning-effort tail must NOT ride onto an in-flight tool
-        // row — only the time/queue metadata forwards.
+        // Effort first, elapsed last → only the trailing elapsed forwards.
         assert_eq!(
-            spinner_meta_suffix("Running Bash… · 12s · thinking with high effort"),
+            spinner_meta_suffix("Running Bash… · thinking with high effort · 12s"),
             " · 12s"
         );
         assert_eq!(
-            spinner_meta_suffix("Running Bash… · 12s · 2 queued · thinking with max effort"),
-            " · 12s · 2 queued"
+            spinner_meta_suffix("Running Bash… · thinking with max effort · 2 queued · 12s"),
+            " · 2 queued · 12s"
         );
-        // Effort with no time/queue metadata before it → nothing forwards.
+        // Effort with no time/queue after it → nothing forwards.
         assert_eq!(
             spinner_meta_suffix("Running Bash… · thinking with high effort"),
             ""
