@@ -3169,39 +3169,121 @@ impl AgentLoop {
 
     /// Run a lightweight LLM call to summarize content. Returns empty string on failure.
     async fn run_llm_summary(&self, prompt: &str) -> String {
+        // System prompt kept in a local so the telemetry `system_tokens`
+        // estimate below matches exactly what is sent on the wire.
+        let sys = "You are a conversation summarizer. Output ONLY the summary.";
         let mut mini_conv = crate::conversation::Conversation::new();
         mini_conv.add_user_message(prompt);
-        let msgs = mini_conv
-            .to_provider_messages("You are a conversation summarizer. Output ONLY the summary.");
+        let msgs = mini_conv.to_provider_messages(sys);
+
+        let started = std::time::Instant::now();
+        // Telemetry token counters: populated from StreamEvent::Usage when the
+        // provider reports it, estimated otherwise (mirrors TurnRunner's
+        // no-usage fallback). This summary/compaction call goes to the SAME
+        // provider/base_url as a normal turn, so the upstream proxy logs it —
+        // but it bypasses `run_with_filter`, so the `tel_return!` macro never
+        // fires and the request was previously invisible to our telemetry,
+        // making AtomCode under-report vs the proxy by exactly these calls.
+        let mut tel_input: u32 = 0;
+        let mut tel_output: u32 = 0;
+        let mut tel_cached: u32 = 0;
+        let mut got_usage = false;
+        let mut errored = false;
 
         let mut summary = String::new();
-        if let Ok(mut stream) = self.turn_runner.provider.chat_stream(&msgs, None) {
-            use futures::StreamExt;
-            let first_timeout = std::time::Duration::from_secs(30);
-            let stream_timeout = std::time::Duration::from_secs(30);
-            let mut got_token = false;
-            loop {
-                let timeout = if got_token {
-                    stream_timeout
-                } else {
-                    first_timeout
-                };
-                match tokio::time::timeout(timeout, stream.next()).await {
-                    Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
-                        got_token = true;
-                        let clean = text
-                            .replace("<think>", "")
-                            .replace("</think>", "")
-                            .replace("<|im_start|>", "")
-                            .replace("<|im_end|>", "");
-                        summary.push_str(&clean);
+        match self.turn_runner.provider.chat_stream(&msgs, None) {
+            Ok(mut stream) => {
+                use futures::StreamExt;
+                let first_timeout = std::time::Duration::from_secs(30);
+                let stream_timeout = std::time::Duration::from_secs(30);
+                let mut got_token = false;
+                loop {
+                    let timeout = if got_token {
+                        stream_timeout
+                    } else {
+                        first_timeout
+                    };
+                    match tokio::time::timeout(timeout, stream.next()).await {
+                        Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
+                            got_token = true;
+                            let clean = text
+                                .replace("<think>", "")
+                                .replace("</think>", "")
+                                .replace("<|im_start|>", "")
+                                .replace("<|im_end|>", "");
+                            summary.push_str(&clean);
+                        }
+                        Ok(Some(Ok(crate::stream::StreamEvent::Usage(u)))) => {
+                            tel_input = tel_input.saturating_add(u.prompt_tokens as u32);
+                            tel_output = tel_output.saturating_add(u.completion_tokens as u32);
+                            tel_cached = tel_cached.saturating_add(u.cached_tokens as u32);
+                            got_usage = true;
+                        }
+                        Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
+                        Ok(Some(Ok(_))) => continue,
+                        Ok(Some(Err(_))) => {
+                            errored = true;
+                            break;
+                        }
+                        // timeout (Err) or end-of-stream (Ok(None))
+                        _ => break,
                     }
-                    Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
-                    Ok(Some(Ok(_))) => continue,
-                    _ => break,
                 }
             }
+            Err(_) => {
+                errored = true;
+            }
         }
+
+        // Estimate tokens when the provider didn't report usage (many
+        // OpenAI-compatible gateways ignore stream_options). ~4 chars/token in,
+        // ~3 out — same heuristic class as TurnRunner.
+        if !got_usage {
+            tel_input = ((sys.len() + prompt.len()) / 4) as u32;
+            tel_output = (summary.len() / 3) as u32;
+        }
+        let had_error = errored || (summary.trim().is_empty() && !got_usage);
+
+        // Build the same envelope context a normal turn would carry, so this
+        // request is attributed to the right provider/host/model/session.
+        let pcfg = self.config.providers.get(&self.config.default_provider);
+        let vendor = pcfg.map(|p| p.provider_type.clone());
+        let host = pcfg.and_then(|p| {
+            atomcode_telemetry::resolve_provider_host(&p.provider_type, p.base_url.as_deref())
+        });
+        let parent = atomcode_telemetry::CurrentContext::current();
+        let scope_ctx = atomcode_telemetry::CurrentContext {
+            turn_id: Some(uuid::Uuid::new_v4()),
+            provider: parent.provider.clone().or(vendor),
+            provider_host: parent.provider_host.clone().or(host),
+            model: parent
+                .model
+                .clone()
+                .or_else(|| Some(self.turn_runner.provider.model_name().to_string())),
+            ..parent
+        };
+        let event = atomcode_telemetry::Event::LlmChat {
+            duration_ms: started.elapsed().as_millis() as u32,
+            tool_calls_count: 0,
+            input_tokens: tel_input,
+            output_tokens: tel_output,
+            cached_tokens: tel_cached,
+            had_error,
+            context_window: self.ctx.ctx_window() as u32,
+            system_tokens: (sys.len() / 4 + 4) as u32,
+            tool_def_tokens: 0,
+            tool_result_tokens: 0,
+            message_tokens: (prompt.len() / 4) as u32,
+            messages_count: msgs.len() as u32,
+            error_kind: None,
+            error_data: None,
+        };
+        let tel = self.turn_runner.context.telemetry.clone();
+        atomcode_telemetry::CurrentContext::scope(scope_ctx, || async move {
+            tel.track(event);
+        })
+        .await;
+
         summary
     }
 
