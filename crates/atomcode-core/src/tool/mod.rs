@@ -743,13 +743,28 @@ pub enum ApprovalRequirement {
     RequireApprovalScoped { reason: String, scope: String },
 }
 
-/// The resolved decision returned by `PermissionStore::check`.
+/// The resolved decision returned by `PermissionStore::check` or by an
+/// interactive responder.
 #[derive(Debug, Clone)]
 pub enum PermissionDecision {
     Allow,
+    /// Allow AND remember for the session (tool-wide, or scoped — decided by
+    /// the responder's context). Returned over the approval channel when the
+    /// user picks "always allow"; `PermissionStore::check` never returns it.
+    AllowAlways,
     /// Ask the user — carries the reason string from `ApprovalRequirement`.
     Ask(String),
     Deny,
+}
+
+/// Parse the wire string used by the daemon's permission endpoints
+/// (`/chat/permission`, `/live/permission`) into a decision.
+pub fn parse_permission_decision(s: &str) -> PermissionDecision {
+    match s {
+        "allow" => PermissionDecision::Allow,
+        "always_allow" => PermissionDecision::AllowAlways,
+        _ => PermissionDecision::Deny,
+    }
 }
 
 /// Stores per-tool session-level grants.

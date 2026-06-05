@@ -902,19 +902,15 @@ pub(crate) struct LivePermissionReq {
 /// request. First-come-first-served via LiveSession.approve (takes the approver slot).
 ///
 /// Decision mapping mirrors /chat/permission:
-///   "allow" | "always_allow" → PermissionDecision::Allow
-///   anything else            → PermissionDecision::Deny
-/// Note: PermissionDecision has no AlwaysAllow variant; always_allow is treated as Allow
-/// (same as /chat/permission Phase-1 behaviour).
+///   "allow"        → PermissionDecision::Allow
+///   "always_allow" → PermissionDecision::AllowAlways (persisted for the session)
+///   anything else  → PermissionDecision::Deny
 pub(crate) async fn live_permission(
     State(state): State<AppState>,
     Json(req): Json<LivePermissionReq>,
 ) -> impl IntoResponse {
-    use atomcode_core::tool::PermissionDecision;
-    let decision = match req.decision.as_str() {
-        "allow" | "always_allow" => PermissionDecision::Allow,
-        _ => PermissionDecision::Deny,
-    };
+    use atomcode_core::tool::parse_permission_decision;
+    let decision = parse_permission_decision(&req.decision);
     let working_dir = { state.project.read().await.working_dir.clone() };
     let ok = match current_live_session() {
         Some(s) => s.approve(decision).await,

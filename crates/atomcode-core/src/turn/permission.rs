@@ -151,6 +151,9 @@ impl PermissionDecider for InteractivePermissionDecider {
         if let Ok(store) = self.permission_store.read() {
             match store.check(&call.name, approval) {
                 PermissionDecision::Allow => return PermissionDecision::Allow,
+                // `check()` never returns AllowAlways, but the match must be
+                // exhaustive — treat it as Allow defensively.
+                PermissionDecision::AllowAlways => return PermissionDecision::Allow,
                 PermissionDecision::Deny => return PermissionDecision::Deny,
                 PermissionDecision::Ask(_) => {} // fall through to interactive
             }
@@ -169,13 +172,30 @@ impl PermissionDecider for InteractivePermissionDecider {
         let request = ApprovalRequest {
             call: call.clone(),
             reason,
-            scope,
+            scope: scope.clone(),
         };
         if self.request_tx.send(request).is_err() {
             return PermissionDecision::Deny;
         }
-        let mut rx = self.response_rx.lock().await;
-        rx.recv().await.unwrap_or(PermissionDecision::Deny)
+        let resp = {
+            let mut rx = self.response_rx.lock().await;
+            rx.recv().await.unwrap_or(PermissionDecision::Deny)
+        };
+        match resp {
+            // "Always allow" from the responder: persist the grant for the
+            // session (scoped if the approval carried a scope, else tool-wide)
+            // then act as a normal Allow for this call.
+            PermissionDecision::AllowAlways => {
+                if let Ok(mut store) = self.permission_store.write() {
+                    match &scope {
+                        Some(s) => store.grant_session_scope(s),
+                        None => store.grant_session(&call.name),
+                    }
+                }
+                PermissionDecision::Allow
+            }
+            other => other,
+        }
     }
 
     fn will_auto_approve(&self, call: &ToolCall, approval: &ApprovalRequirement) -> bool {
@@ -681,5 +701,41 @@ mod tests {
             d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("test".into())),
             "new_with_skip_permissions(true) should set skip_permissions=true"
         );
+    }
+
+    #[tokio::test]
+    async fn allow_always_grants_session_for_tool() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let store = std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        let d = InteractivePermissionDecider::new(req_tx, resp_rx, store.clone());
+        let call = make_call("mcp__srv__q");
+        let approval = ApprovalRequirement::RequireApproval("mcp".into());
+        let fut = d.decide(&call, &approval);
+        tokio::spawn(async move {
+            let _req = req_rx.recv().await.unwrap();
+            resp_tx.send(PermissionDecision::AllowAlways).unwrap();
+        });
+        assert!(matches!(fut.await, PermissionDecision::Allow));
+        let call2 = make_call("mcp__srv__q");
+        assert!(d.will_auto_approve(&call2, &ApprovalRequirement::RequireApproval("mcp".into())));
+    }
+
+    #[tokio::test]
+    async fn allow_always_grants_scope_for_scoped_approval() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let store = std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        let d = InteractivePermissionDecider::new(req_tx, resp_rx, store.clone());
+        let call = make_call("read_file");
+        let approval = ApprovalRequirement::RequireApprovalScoped { reason: "sensitive".into(), scope: "/home/u/.ssh/id_rsa".into() };
+        let fut = d.decide(&call, &approval);
+        tokio::spawn(async move {
+            let _req = req_rx.recv().await.unwrap();
+            resp_tx.send(PermissionDecision::AllowAlways).unwrap();
+        });
+        assert!(matches!(fut.await, PermissionDecision::Allow));
+        assert!(d.will_auto_approve(&call, &ApprovalRequirement::RequireApprovalScoped { reason: "sensitive".into(), scope: "/home/u/.ssh/id_rsa".into() }));
+        assert!(!d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("x".into())));
     }
 }
