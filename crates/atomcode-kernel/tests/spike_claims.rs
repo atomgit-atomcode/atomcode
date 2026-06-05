@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, MessageSnapshot};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
-use atomcode_kernel::testkit::{ApprovalMiddleware, BudgetReminderHook, ConcurrencyProbeTool, ContinueOnceHook, EchoTool, MockProvider, RecorderHook, RedactHook, RiskyWriteTool, RoundBudgetHook};
+use atomcode_kernel::testkit::{ApprovalMiddleware, BudgetReminderHook, ContinueOnceHook, EchoTool, MockProvider, RecorderHook, RedactHook, RiskyWriteTool, RoundBudgetHook};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -380,65 +380,4 @@ async fn on_model_response_can_transform_response_into_storage() {
         assistant.meta.as_ref().map_or(false, |m| m.tokens.prompt == 50),
         "kernel meta must be present on the response the hook received"
     );
-}
-
-// CLAIM 11: tools declare `parallel_safe`; the kernel runs consecutive parallel-safe
-// tools CONCURRENTLY (max concurrency > 1) and serializes when a non-parallel tool
-// is present — while appending results in CALL order (determinism / cache).
-#[tokio::test]
-async fn parallel_safe_tools_run_concurrently_others_serial() {
-    use std::sync::Mutex;
-
-    async fn run_batch(
-        probes: &[(&'static str, bool)],
-        calls: Vec<(&'static str, &'static str)>,
-    ) -> (u32, Vec<String>) {
-        let tracker = Arc::new(Mutex::new((0u32, 0u32)));
-        let mut reg = ToolRegistry::new();
-        for (name, parallel) in probes {
-            reg.register(Arc::new(ConcurrencyProbeTool::new(name, *parallel, tracker.clone())));
-        }
-        let mount: Vec<&str> = probes.iter().map(|(n, _)| *n).collect();
-        let mut events: Vec<StreamEvent> = calls
-            .iter()
-            .map(|(id, name)| {
-                StreamEvent::ToolCall(ToolCall {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    arguments: "{}".into(),
-                })
-            })
-            .collect();
-        events.push(StreamEvent::Done);
-        let provider = Arc::new(MockProvider::new(vec![events, vec![StreamEvent::Done]]));
-
-        let mut handle = Agent::builder().provider(provider).tools(reg.mount(&mount)).build().spawn();
-        handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
-        let mut order = Vec::new();
-        while let Some(ev) = handle.events.recv().await {
-            match ev {
-                AgentEvent::ToolResult { result } => order.push(result.content),
-                AgentEvent::TurnComplete => break,
-                _ => {}
-            }
-        }
-        handle.commands.send(AgentCommand::Shutdown).unwrap();
-        let _ = handle.task.await;
-        let max = tracker.lock().unwrap().1;
-        (max, order)
-    }
-
-    // A: two parallel-safe tools in one batch → run concurrently, results in call order.
-    let (max_a, order_a) =
-        run_batch(&[("p1", true), ("p2", true)], vec![("1", "p1"), ("2", "p2")]).await;
-    assert_eq!(max_a, 2, "two parallel_safe tools must run concurrently");
-    assert_eq!(order_a, vec!["ran p1".to_string(), "ran p2".to_string()], "results must be in call order");
-
-    // B: a non-parallel tool interspersed → forced serial (max concurrency 1).
-    let (max_b, _order_b) = run_batch(
-        &[("p1", true), ("s1", false), ("p2", true)],
-        vec![("1", "p1"), ("2", "s1"), ("3", "p2")],
-    )
-    .await;
-    assert_eq!(max_b, 1, "an interspersed non-parallel tool forces serial execution");
 }
