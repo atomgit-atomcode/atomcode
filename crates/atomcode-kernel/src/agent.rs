@@ -1,4 +1,5 @@
 use crate::event::{AgentCommand, AgentEvent};
+use crate::hook::{LifecycleHooks, NoopHooks};
 use crate::message::{Conversation, Message};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
@@ -44,6 +45,7 @@ pub struct Agent {
     tools: MountedTools,
     persona: String,
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
+    hooks: Arc<dyn LifecycleHooks>,
 }
 
 impl Agent {
@@ -60,6 +62,7 @@ impl Agent {
             tools: self.tools,
             persona: self.persona,
             middlewares: self.middlewares,
+            hooks: self.hooks,
             rt: RequestCtx::new(ev_tx),
         };
         tokio::spawn(running.session_loop(cmd_rx));
@@ -97,6 +100,7 @@ struct RunningAgent {
     tools: MountedTools,
     persona: String,
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
+    hooks: Arc<dyn LifecycleHooks>,
     rt: RequestCtx,
 }
 
@@ -139,6 +143,8 @@ impl RunningAgent {
     }
 
     async fn run_turn(&self, convo: &mut Conversation) {
+        self.hooks.turn_start(convo).await;
+        self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
         loop {
             let mut stream = self.provider.chat_stream(&convo.messages, &defs).await;
@@ -156,6 +162,10 @@ impl RunningAgent {
             }
             convo.push(Message::assistant(assistant_text.clone(), pending_calls.clone()));
             if pending_calls.is_empty() {
+                if let Some(reminder) = self.hooks.turn_end(convo).await {
+                    convo.push(Message::user(reminder));
+                    continue;
+                }
                 self.rt.emit(AgentEvent::TurnComplete);
                 return;
             }
@@ -200,6 +210,7 @@ pub struct AgentBuilder {
     tools: Option<MountedTools>,
     persona: String,
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
+    hooks: Option<Arc<dyn LifecycleHooks>>,
 }
 
 impl AgentBuilder {
@@ -219,12 +230,17 @@ impl AgentBuilder {
         self.middlewares.push(m);
         self
     }
+    pub fn hooks(mut self, h: Arc<dyn LifecycleHooks>) -> Self {
+        self.hooks = Some(h);
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
             tools: self.tools.expect("tools are required"),
             persona: self.persona,
             middlewares: self.middlewares,
+            hooks: self.hooks.unwrap_or_else(|| Arc::new(NoopHooks)),
         }
     }
 }

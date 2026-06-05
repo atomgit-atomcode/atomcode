@@ -1,6 +1,7 @@
 //! Spike-only test doubles. NOT part of the kernel's real API.
 
-use crate::message::Message;
+use crate::hook::LifecycleHooks;
+use crate::message::{Conversation, Message};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
 use crate::request::RequestCtx;
@@ -9,6 +10,7 @@ use crate::tool::{RiskLevel, Tool, ToolCall, ToolContext, ToolDef, ToolResult};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Returns scripted stream events, one Vec per successive turn.
@@ -70,6 +72,35 @@ impl Tool for RiskyWriteTool {
     fn risk(&self) -> RiskLevel { RiskLevel::Risky }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         ToolResult { call_id: String::new(), content: format!("wrote: {args}"), is_error: false }
+    }
+}
+
+/// Injects one "keep going" reminder the first time the model tries to stop,
+/// then lets it complete. Proves turn-level injection changes the loop.
+pub struct ContinueOnceHook {
+    used: AtomicBool,
+}
+
+impl ContinueOnceHook {
+    pub fn new() -> Self {
+        Self { used: AtomicBool::new(false) }
+    }
+}
+
+impl Default for ContinueOnceHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for ContinueOnceHook {
+    async fn turn_end(&self, _convo: &Conversation) -> Option<String> {
+        if self.used.swap(true, Ordering::Relaxed) {
+            None
+        } else {
+            Some("keep going".to_string())
+        }
     }
 }
 

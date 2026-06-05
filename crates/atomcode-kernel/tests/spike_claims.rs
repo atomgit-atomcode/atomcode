@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
-use atomcode_kernel::testkit::{ApprovalMiddleware, EchoTool, MockProvider, RiskyWriteTool};
+use atomcode_kernel::testkit::{ApprovalMiddleware, ContinueOnceHook, EchoTool, MockProvider, RiskyWriteTool};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -120,4 +120,44 @@ fn events_and_commands_are_wire_serializable() {
     let cmd = AgentCommand::Respond { id: 7, value: serde_json::json!({"decision": "allow"}) };
     let s2 = serde_json::to_string(&cmd).expect("AgentCommand must serialize");
     let _back2: AgentCommand = serde_json::from_str(&s2).expect("AgentCommand must deserialize");
+}
+
+// CLAIM 6: a turn_end LifecycleHook injects a follow-up that CONTINUES the loop
+// (turn-level injection), and the finer TurnStarted event is observable.
+#[tokio::test]
+async fn lifecycle_hook_injects_and_continues_loop() {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    // Step 1: model stops (no tool calls). Step 2 (after the injected reminder):
+    // calls echo. Step 3: stops again → hook returns None → complete.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![StreamEvent::TextDelta("stopping".into()), StreamEvent::Done],
+        vec![
+            StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "echo".into(), arguments: "{}".into() }),
+            StreamEvent::Done,
+        ],
+        vec![StreamEvent::TextDelta("really done".into()), StreamEvent::Done],
+    ]));
+
+    let handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo"]))
+        .hooks(Arc::new(ContinueOnceHook::new()))
+        .build()
+        .spawn();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+
+    let mut events = handle.events;
+    let (mut turn_started, mut echoed, mut completed) = (false, false, false);
+    while let Some(ev) = events.recv().await {
+        match ev {
+            AgentEvent::TurnStarted => turn_started = true,
+            AgentEvent::ToolResult { result } if result.content.contains("echo: ") => echoed = true,
+            AgentEvent::TurnComplete => { completed = true; break; }
+            _ => {}
+        }
+    }
+    assert!(turn_started, "TurnStarted must be observable (perception granularity)");
+    assert!(echoed, "turn_end injection must continue the loop into another step (the echo step)");
+    assert!(completed, "loop must complete after the hook stops injecting");
 }

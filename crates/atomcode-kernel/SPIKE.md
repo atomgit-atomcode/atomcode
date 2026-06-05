@@ -14,6 +14,7 @@ the proven production hot-paths into.
 | 3. Selective tool mounting — unmounted tools invisible/inert | `src/tool.rs::tests::only_mounted_tools_are_exposed_or_resolvable` |
 | 4. One primitive serves one-shot AND interactive drivers | `tests/...::one_shot_adapter_auto_answers_and_aggregates` + `examples/minimal_specialization.rs` |
 | 5. Wire-compatible (serde round-trip) → web/daemon can use the same seam | `tests/...::events_and_commands_are_wire_serializable` |
+| 6. LifecycleHooks — turn-level injection (turn_end continues loop) + TurnStarted observation | `tests/spike_claims.rs::lifecycle_hook_injects_and_continues_loop` |
 
 ## Driver model
 
@@ -32,6 +33,16 @@ primitive:
 | TUI | keypresses | render loop | modal → Respond |
 | Web | WS/HTTP → AgentCommand | AgentEvent → SSE/WS | user → Respond frame |
 | server / daemon | per-session RPC | per-session SSE | policy or remote user |
+
+## Hook surface (perceive vs inject)
+
+Two distinct mechanisms: **perceive** = the read-only `AgentEvent` stream
+(observers cannot change the loop); **inject** = the `LifecycleHooks` trait
+(runs inside the loop, can mutate/continue it). The spike validates `turn_start`
+(mutate conversation) + `turn_end` (inject a follow-up and continue) + the
+`TurnStarted` event. The full kernel adds session_start/end, on_error,
+user_prompt_submit, pre_request. Out-of-process injection reuses the id-correlated
+`Request`/`Respond` round-trip (a hook asks the remote driver and awaits).
 
 ## Key boundary facts
 

@@ -22,6 +22,8 @@ pub enum AgentCommand {
 #[non_exhaustive]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentEvent {
+    /// A turn began (perception granularity).
+    TurnStarted,
     TextDelta(String),
     ToolStarted { call: ToolCall },
     ToolResult { result: ToolResult },
