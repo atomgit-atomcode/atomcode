@@ -33,6 +33,11 @@ export interface ModelInfo {
   model: string;
   provider_type: string;
   is_default: boolean;
+  /** Whether this model accepts the DeepSeek `reasoning_effort` control
+   *  (deepseek-v4 family). The effort selector is shown only when true. */
+  effort_applicable: boolean;
+  /** Current effort: 'high' | 'max' | null (model default). */
+  reasoning_effort: string | null;
 }
 
 export async function getModels(): Promise<ModelInfo[]> {
@@ -507,6 +512,23 @@ export async function postLiveProvider(provider: string): Promise<void> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ provider }),
+  });
+}
+
+/** Set the DeepSeek V4 `reasoning_effort` for a provider. `effort` is
+ *  'high' | 'max' | null (clear → model default). Persists to the provider
+ *  config so the next turn (live or /chat) picks it up. */
+export async function postLiveReasoningEffort(
+  effort: string | null,
+  provider?: string,
+): Promise<void> {
+  await fetch('/live/reasoning_effort', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({
+      reasoning_effort: effort,
+      ...(provider ? { provider } : {}),
+    }),
   });
 }
 

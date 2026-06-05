@@ -1653,6 +1653,18 @@ body {
   flex-shrink: 1;
 }
 
+/* Reasoning-effort selector — sits left of the model selector, only shown
+   for DeepSeek V4 models. Reuses the model-selector trigger/dropdown styles;
+   `.effort-prefix` is the small muted "Effort" label on the trigger. */
+.input-footer .effort-selector { flex-shrink: 0; }
+.effort-prefix {
+  color: var(--app-secondary-foreground);
+  font-size: 10px;
+  opacity: 0.7;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .input-footer .model-selector-trigger {
   height: 22px;
   color: var(--app-secondary-foreground);

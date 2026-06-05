@@ -1591,6 +1591,14 @@ pub struct ModelInfo {
     pub provider_type: String,
     /// Whether this is the default provider
     pub is_default: bool,
+    /// Whether this model accepts the DeepSeek `reasoning_effort` control
+    /// (the deepseek-v4 family). The webui shows the effort selector only
+    /// for models where this is true.
+    pub effort_applicable: bool,
+    /// Current `reasoning_effort` for this provider: `"high"`, `"max"`, or
+    /// `null` (the model's own default). Lets the webui reflect the active
+    /// effort in the selector.
+    pub reasoning_effort: Option<String>,
 }
 
 /// GET /models - List all available models from configured providers
@@ -1615,6 +1623,9 @@ async fn get_models() -> impl IntoResponse {
             model: p.model.clone(),
             provider_type: p.provider_type.clone(),
             is_default: name == &config.default_provider,
+            effort_applicable:
+                atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(&p.model),
+            reasoning_effort: p.reasoning_effort.clone(),
         })
         .collect();
 
@@ -3831,6 +3842,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/message", post(live_api::live_message))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/provider", post(live_api::live_provider))
+        .route(
+            "/live/reasoning_effort",
+            post(live_api::live_reasoning_effort),
+        )
         // Skills API
         .route("/skills", get(get_skills))
         // Filesystem API

@@ -894,6 +894,58 @@ pub(crate) async fn live_provider(
 }
 
 #[derive(serde::Deserialize)]
+pub(crate) struct LiveReasoningEffortReq {
+    /// 目标 provider；None 时取当前默认 provider。
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// "high" | "max" | null（清除 → 用模型自身默认）。其他取值拒绝。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+/// POST /live/reasoning_effort — webui 设置 DeepSeek V4 的 reasoning_effort。
+///
+/// 与 /live/provider 同源：持久化进目标 provider 的 `config.reasoning_effort`，
+/// 下一轮 turn 经 `build_turn_parts` → `create_provider` 自动生效——live 与
+/// /chat 两条路径都现读 config，故两端都会跟随。只有 deepseek-v4 系模型真正
+/// 消费该字段（见 OpenAiProvider::reason_effort_applicable），webui 已据此门控
+/// UI；服务端仅校验取值合法。
+pub(crate) async fn live_reasoning_effort(
+    State(state): State<AppState>,
+    Json(req): Json<LiveReasoningEffortReq>,
+) -> impl IntoResponse {
+    let effort = match req.reasoning_effort.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(v) if v.eq_ignore_ascii_case("high") => Some("high".to_string()),
+        Some(v) if v.eq_ignore_ascii_case("max") => Some("max".to_string()),
+        Some(other) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("invalid reasoning_effort: {other}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Ok(mut cfg) = Config::load(&Config::default_path()) {
+        let target = req
+            .provider
+            .clone()
+            .unwrap_or_else(|| cfg.default_provider.clone());
+        if let Some(p) = cfg.providers.get_mut(&target) {
+            p.reasoning_effort = effort;
+            let _ = cfg.save(&Config::default_path());
+        }
+    }
+    // 与 /live/provider 一致的幂等 ensure，保证有 live 会话存在。
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    ensure_live_session(working_dir, state.telemetry.clone(), None, Vec::new());
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+#[derive(serde::Deserialize)]
 pub(crate) struct LivePermissionReq {
     pub decision: String, // "allow" | "deny" | "always_allow" | "allow_persist"
     /// Full MCP tool name (`mcp__{server}__{tool}`); required for `allow_persist`.
