@@ -230,7 +230,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             endLine: f.endLine,
           }))
         : undefined;
-      const contextFiles = state.contextFiles;
+      const contextFiles = stateRef.current.contextFiles;
       const isQueued = state.isGenerating;
       const clientMessageId = `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       if (isQueued) {
