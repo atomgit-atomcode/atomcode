@@ -54,6 +54,10 @@ pub struct McpServerConfig {
     pub config: McpTransportConfig,
     /// Where this server config was loaded from (user-level or project-level).
     pub source: McpConfigSource,
+    /// When true, this server's tools auto-approve (no interactive prompt).
+    pub trust: bool,
+    /// Bare tool names permanently auto-approved for this server.
+    pub auto_approve: Vec<String>,
 }
 
 /// Configuration source for a server.
@@ -103,6 +107,10 @@ struct McpServerEntry {
     auth: Option<McpAuthEntry>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    trust: bool,
+    #[serde(default, rename = "autoApprove")]
+    auto_approve: Vec<String>,
 }
 
 use serde::Deserialize;
@@ -232,6 +240,8 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
         disabled: entry.disabled,
         config: transport,
         source: McpConfigSource::Project, // default; overwritten by load_config_file
+        trust: entry.trust,
+        auto_approve: entry.auto_approve.clone(),
     })
 }
 
