@@ -17,6 +17,21 @@ struct WebFetchArgs {
     url: String,
     #[serde(default = "default_max_chars")]
     max_chars: usize,
+    #[serde(default)]
+    format: FetchFormat,
+}
+
+/// How to render an HTML response. Non-HTML bodies (raw text, JSON, source
+/// served as text/plain) are returned as-is regardless of this. Defaults to
+/// Markdown — structured output (fenced code blocks, links, tables) an LLM can
+/// trust, unlike the lossy plain-text flatten that made callers re-fetch.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum FetchFormat {
+    #[default]
+    Markdown,
+    Text,
+    Html,
 }
 
 fn default_max_chars() -> usize {
@@ -177,18 +192,23 @@ impl Tool for WebFetchTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "web_fetch",
-            description: "Fetch a web page and return its content as clean text.\n\
-                Use after web_search to read a specific page (documentation, README, API reference).\n\
-                HTML is automatically converted to readable text.\n\
+            description: "Fetch a web page and return its content as Markdown.\n\
+                Use after web_search to read a specific page (documentation, README, source file, API reference).\n\
+                HTML is converted to Markdown by default — fenced code blocks, links and tables are preserved; \
+                pass \"format\":\"text\" for plain text, or \"format\":\"html\" for the raw HTML source.\n\
+                Note: code-hosting sites (GitHub, GitLab, atomgit, …) are JavaScript apps whose /raw/ URLs often \
+                return an empty shell — fetch the file's normal page (its source is server-rendered into the HTML), \
+                or read it from a local checkout with git.\n\
                 Only http:// and https:// URLs are allowed; requests to localhost, \
                 private networks, and cloud metadata endpoints are blocked.\n\
                 Examples:\n\
                 - {\"url\": \"https://github.com/user/repo\"}\n\
-                - {\"url\": \"https://docs.rs/reqwest/latest/reqwest/\"}".to_string(),
+                - {\"url\": \"https://docs.rs/reqwest/latest/reqwest/\", \"format\": \"text\"}".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "Absolute http(s) URL to fetch" },
+                    "format": { "type": "string", "enum": ["markdown", "text", "html"], "description": "Output format (default markdown). Use \"html\" to get the raw page source." },
                     "max_chars": { "type": "integer", "description": "Max characters to return (default 20000)" }
                 },
                 "required": ["url"]
@@ -237,7 +257,7 @@ impl Tool for WebFetchTool {
             .redirect(Policy::none())
             .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .user_agent("Mozilla/5.0 (compatible; atomcode/web_fetch)")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
             .build()
         {
             Ok(c) => c,
@@ -355,7 +375,7 @@ impl Tool for WebFetchTool {
         // Prevents misclassifying JSON payloads that happen to start with '<'
         // (rare, but the old code hit this).
         let is_html = ct_is_html || (ct_header.is_none() && body.trim_start().starts_with('<'));
-        let text = if is_html { html_to_text(&body) } else { body };
+        let text = render_body(parsed.format, is_html, body);
 
         let output = if text.len() > max {
             let mut end = max;
@@ -395,6 +415,33 @@ impl Tool for WebFetchTool {
             output: format!("Content from {}:\n\n{}{}", final_url, output, cap_note),
             success: true,
         })
+    }
+}
+
+/// Convert HTML to Markdown via `htmd` (turndown-style): fenced code blocks,
+/// links, lists and tables survive — far more useful to an LLM than flattened
+/// text, especially for code-hosting pages that ship the file inside
+/// `<pre><code>`. Falls back to the plain-text extractor if the parse errors or
+/// yields nothing, so we still surface whatever readable content exists.
+fn html_to_markdown(html: &str) -> String {
+    match htmd::HtmlToMarkdown::builder()
+        .skip_tags(vec!["script", "style", "meta", "link", "noscript", "iframe", "head"])
+        .build()
+        .convert(html)
+    {
+        Ok(md) if !md.trim().is_empty() => md,
+        _ => html_to_text(html),
+    }
+}
+
+/// Render a fetched body for the requested [`FetchFormat`]. Non-HTML bodies are
+/// returned verbatim for every format; only HTML is converted.
+fn render_body(format: FetchFormat, is_html: bool, body: String) -> String {
+    match format {
+        FetchFormat::Html => body,
+        _ if !is_html => body,
+        FetchFormat::Markdown => html_to_markdown(&body),
+        FetchFormat::Text => html_to_text(&body),
     }
 }
 
@@ -858,5 +905,50 @@ mod tests {
         let html = "<p>KEEP-ME</p><script>oops no close";
         let out = remove_tag_content(html, "script");
         assert!(out.contains("KEEP-ME"), "leading content lost: {}", out);
+    }
+
+    // Mirrors how code-hosting SPAs (atomgit/github/…) server-render a file:
+    // the source lives in `<pre><code class="language-..">` with per-line/token
+    // <span>s, wrapped in noisy page chrome. The old plain-text extractor flattened
+    // this into an undifferentiated blob the agent didn't trust; Markdown must
+    // surface it as a fenced code block so the first fetch is usable.
+    const FORGE_BLOB_HTML: &str = r#"<html><body>
+        <nav class="repo-header">Repos Issues Pulls Settings</nav>
+        <div class="blob-shiki-host"><pre class="blob-shiki"><code class="language-bash"><span class="line" id="L1"><span class="hljs-meta">#!/bin/sh</span></span>
+<span class="line" id="L2"><span class="hljs-comment"># OAT Pre-commit Check</span></span>
+<span class="line" id="L3"><span class="hljs-built_in">echo</span> "checking"</span>
+<span class="line" id="L4">exit 0</span></code></pre></div>
+        <footer>© 2026</footer></body></html>"#;
+
+    #[test]
+    fn html_to_markdown_renders_forge_code_as_fenced_block() {
+        let md = html_to_markdown(FORGE_BLOB_HTML);
+        assert!(md.contains("```"), "expected a fenced code block, got:\n{md}");
+        assert!(md.contains("#!/bin/sh"), "shebang missing:\n{md}");
+        assert!(
+            md.contains("# OAT Pre-commit Check") && md.contains("exit 0"),
+            "script body missing:\n{md}"
+        );
+    }
+
+    #[test]
+    fn render_body_routes_by_format() {
+        // html format → raw HTML returned verbatim (tags intact).
+        let raw = render_body(FetchFormat::Html, true, FORGE_BLOB_HTML.to_string());
+        assert!(raw.contains("<pre"), "html format should keep tags:\n{raw}");
+
+        // markdown format on HTML → fenced code, no raw <pre> tag.
+        let md = render_body(FetchFormat::Markdown, true, FORGE_BLOB_HTML.to_string());
+        assert!(md.contains("```") && !md.contains("<pre"), "markdown not produced:\n{md}");
+
+        // text format on HTML → plain text, no fence, no tags.
+        let txt = render_body(FetchFormat::Text, true, FORGE_BLOB_HTML.to_string());
+        assert!(txt.contains("#!/bin/sh") && !txt.contains("<pre"), "text not produced:\n{txt}");
+
+        // non-HTML body (e.g. a real raw text endpoint) → returned as-is for every format.
+        let plain = "plain text body".to_string();
+        for fmt in [FetchFormat::Markdown, FetchFormat::Text, FetchFormat::Html] {
+            assert_eq!(render_body(fmt, false, plain.clone()), plain);
+        }
     }
 }

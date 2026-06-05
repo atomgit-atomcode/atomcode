@@ -71,6 +71,7 @@ tar = "0.4"
 # default — the stub crate is linked only when this feature is enabled,
 # never in standard `cargo build`.
 atomcode-codingplan-crypto = { path = "../atomcode-codingplan-crypto", optional = true }
+htmd = "0.5.4"
 
 [features]
 default = []
