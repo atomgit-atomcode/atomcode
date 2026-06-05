@@ -3283,13 +3283,25 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
     // - 回环（127.0.0.1/localhost/::1）或通配（0.0.0.0/::）绑定时，回环都在监听集合内，用 127.0.0.1；
     // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在
     //   监听集合内，用它打开会 ERR_CONNECTION_REFUSED。此时必须用真实绑定地址打开。
-    let open_host: &str =
-        if is_loopback_authority(&bound_host) || bound_host == "0.0.0.0" || bound_host == "::" {
-            "127.0.0.1"
-        } else {
-            bound_host.as_str()
-        };
     let sync_suffix = if sync { "&sync=1" } else { "" };
+    let is_wildcard = bound_host == "0.0.0.0" || bound_host == "::";
+    // 通配绑定（用户意在暴露到网络）时探测本机局域网 IP。
+    let lan_ip = if is_wildcard { primary_lan_ipv4() } else { None };
+    // 选择自动打开浏览器 + 主显示用的地址：
+    // - 回环绑定：127.0.0.1。
+    // - 通配绑定（0.0.0.0/::）：优先用局域网 IP —— 它在本机和其它设备上都可访问，
+    //   契合 `--host 0.0.0.0` 暴露到网络的意图；用 127.0.0.1 只在本机有效、对远端
+    //   设备（手机/另一台机器）打开就是连接被拒。探测不到局域网 IP 时才回退 127.0.0.1。
+    // - 绑定具体非回环地址（如 Tailscale 100.x）：socket 只监听该地址，必须用它。
+    let open_host: String = if is_loopback_authority(&bound_host) {
+        "127.0.0.1".to_string()
+    } else if let Some(ip) = lan_ip.clone() {
+        ip
+    } else if is_wildcard {
+        "127.0.0.1".to_string()
+    } else {
+        bound_host.clone()
+    };
     let local_url = format!(
         "http://{}:{}/?token={}{}",
         open_host, actual_port, token, sync_suffix
@@ -3310,21 +3322,20 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
 
     // 绑定了非回环地址：给出访问 URL + 安全/作用域提示。
     if !is_loopback_authority(&bound_host) {
-        if bound_host == "0.0.0.0" || bound_host == "::" {
-            // 绑定通配地址：探测本机局域网 IP 作为可访问地址。
-            if let Some(ip) = primary_lan_ipv4() {
+        if is_wildcard {
+            // 主 URL（local_url）已是局域网 IP（若探测到）；额外补一条本机回环地址
+            // 方便本机使用。两条都带 sync_suffix —— 之前局域网链接漏了它，手机/其它
+            // 设备打开后不会接入同步会话。
+            if open_host.as_str() != "127.0.0.1" {
                 msg.push_str(&format!(
-                    "\n局域网访问：http://{ip}:{actual_port}/?token={token}"
+                    "\n本机访问：http://127.0.0.1:{actual_port}/?token={token}{sync_suffix}"
                 ));
             }
             msg.push_str(
-                "\n⚠️ 上面是局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
+                "\n⚠️ 主地址为局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
             );
         } else {
-            // 显式指定了具体地址。
-            msg.push_str(&format!(
-                "\n访问地址：http://{bound_host}:{actual_port}/?token={token}"
-            ));
+            // 显式指定了具体地址：local_url 已是该地址，这里仅补安全提示。
             msg.push_str(
                 "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
             );
