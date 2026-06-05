@@ -1,14 +1,15 @@
 use crate::event::{AgentCommand, AgentEvent};
 use crate::hook::{LifecycleHooks, NoopHooks};
-use crate::message::{Conversation, Message};
+use crate::message::{Conversation, Message, MessageMeta};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
 use crate::request::RequestCtx;
-use crate::stream::StreamEvent;
+use crate::stream::{StreamEvent, TokenUsage};
 use crate::tool::{MountedTools, ToolContext, ToolResult};
 use futures::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 /// Bidirectional session handle: send AgentCommand, receive AgentEvent.
@@ -156,11 +157,13 @@ impl RunningAgent {
         self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
         loop {
+            let start = Instant::now();
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages).await;
             let mut stream = self.provider.chat_stream(&messages, &defs).await;
             let mut assistant_text = String::new();
             let mut pending_calls = Vec::new();
+            let mut usage = TokenUsage::default();
             while let Some(ev) = stream.next().await {
                 match ev {
                     StreamEvent::TextDelta(t) => {
@@ -168,10 +171,30 @@ impl RunningAgent {
                         self.rt.emit(AgentEvent::TextDelta(t));
                     }
                     StreamEvent::ToolCall(c) => pending_calls.push(c),
+                    StreamEvent::Usage(u) => usage = u,
                     StreamEvent::Done => break,
                 }
             }
-            convo.push(Message::assistant(assistant_text.clone(), pending_calls.clone()));
+            let ctx_window = self.provider.context_window();
+            let used_tokens = usage.prompt;
+            let utilization = if ctx_window > 0 {
+                used_tokens as f32 / ctx_window as f32
+            } else {
+                0.0
+            };
+            let mut meta = MessageMeta {
+                tokens: usage,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                ctx_window,
+                used_tokens,
+                utilization,
+                cost: 0.0,
+            };
+            self.hooks.on_model_response(&mut meta).await;
+            self.rt.emit(AgentEvent::Usage(meta.clone()));
+            let mut assistant_msg = Message::assistant(assistant_text.clone(), pending_calls.clone());
+            assistant_msg.meta = Some(meta);
+            convo.push(assistant_msg);
             if pending_calls.is_empty() {
                 if let Some(reminder) = self.hooks.turn_end(convo).await {
                     convo.push(Message::user(reminder));

@@ -1,3 +1,4 @@
+use crate::message::MessageMeta;
 use crate::tool::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,8 @@ pub enum AgentEvent {
     ToolResult { result: ToolResult },
     /// Generic middleware ↔ driver round-trip. Kernel is agnostic to kind/payload.
     Request { id: RequestId, kind: String, payload: serde_json::Value },
+    /// Per-LLM-call execution stats (perception side; mirrors the message sidecar).
+    Usage(MessageMeta),
     TurnComplete,
     Error { message: String },
 }

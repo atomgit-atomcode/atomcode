@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
-use atomcode_kernel::stream::StreamEvent;
-use atomcode_kernel::testkit::{ApprovalMiddleware, ContinueOnceHook, EchoTool, MockProvider, RecorderHook, RiskyWriteTool};
+use atomcode_kernel::stream::{StreamEvent, TokenUsage};
+use atomcode_kernel::testkit::{ApprovalMiddleware, BudgetReminderHook, ContinueOnceHook, EchoTool, MockProvider, RecorderHook, RiskyWriteTool};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -200,8 +200,83 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
     let fired = log.lock().unwrap().clone();
     for point in [
         "session_start", "user_prompt_submit", "turn_start", "pre_request",
-        "pre_tool", "post_tool", "on_error", "turn_end", "session_end",
+        "on_model_response", "pre_tool", "post_tool", "on_error", "turn_end", "session_end",
     ] {
         assert!(fired.contains(&point.to_string()), "hook '{point}' was never called; fired = {fired:?}");
     }
+}
+
+// CLAIM 8: kernel records per-call execution stats onto the assistant message
+// (sidecar) + emits AgentEvent::Usage; a pre_request hook PROJECTS current
+// utilization back to the LLM as a TAIL reminder; and historical message bytes
+// stay identical across turns (prefix-cache safety).
+#[tokio::test]
+async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(
+        MockProvider::new(vec![
+            vec![
+                StreamEvent::Usage(TokenUsage { prompt: 100, completion: 5, cached: 0 }),
+                StreamEvent::TextDelta("reply A".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::Usage(TokenUsage { prompt: 300, completion: 5, cached: 0 }),
+                StreamEvent::TextDelta("reply B".into()),
+                StreamEvent::Done,
+            ],
+        ])
+        .with_ctx_window(1000),
+    );
+    let received = provider.received.clone();
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[] as &[&str]))
+        .hooks(Arc::new(BudgetReminderHook))
+        .build()
+        .spawn();
+
+    let mut usage_utils: Vec<f32> = Vec::new();
+
+    // Turn A
+    handle.commands.send(AgentCommand::SendMessage { text: "first".into() }).unwrap();
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::Usage(m) => usage_utils.push(m.utilization),
+            AgentEvent::TurnComplete => break,
+            _ => {}
+        }
+    }
+    // Turn B
+    handle.commands.send(AgentCommand::SendMessage { text: "second".into() }).unwrap();
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::Usage(m) => usage_utils.push(m.utilization),
+            AgentEvent::TurnComplete => break,
+            _ => {}
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    // (1) RECORD: turn A's utilization (100/1000 = 0.1) is observable via Usage event.
+    assert!(
+        usage_utils.iter().any(|u| (*u - 0.1).abs() < 0.001),
+        "turn A utilization 0.1 must be observable; got {usage_utils:?}"
+    );
+
+    let calls = received.lock().unwrap();
+    assert_eq!(calls.len(), 2, "two LLM calls expected");
+
+    // call A: just the user message — NO reminder yet (no meta in history).
+    assert_eq!(calls[0], vec![("User".to_string(), "first".to_string())]);
+
+    let b = &calls[1];
+    // (2) CACHE-SAFETY: the historical user message is byte-identical, not rewritten.
+    assert_eq!(b[0], calls[0][0], "historical message must not be rewritten (prefix-cache safety)");
+    // (3) SIDECAR: the assistant message text stays clean — cost is NOT baked into content.
+    assert_eq!(b[1], ("Assistant".to_string(), "reply A".to_string()), "assistant text must stay clean (meta is sidecar)");
+    // (4) PROJECTION: the LAST message is the tail utilization reminder the LLM perceives.
+    assert_eq!(b.last().unwrap(), &("User".to_string(), "[ctx 10%]".to_string()), "tail reminder must project utilization to the LLM");
 }

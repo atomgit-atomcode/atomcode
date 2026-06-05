@@ -1,4 +1,6 @@
+use crate::stream::TokenUsage;
 use crate::tool::ToolCall;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -8,28 +10,44 @@ pub enum Role {
     Tool,
 }
 
-/// Provider-neutral message. Deliberately minimal — NO Anthropic-specific
-/// thinking-signature plumbing (that becomes pluggable provider metadata in A1).
+/// Kernel-native per-message execution stats, recorded at on_model_response.
+/// A SIDECAR — never part of `text` — so storing it never changes the bytes the
+/// LLM sees (prefix-cache safety). The renderer (pre_request) chooses whether to
+/// PROJECT a summary of it into the request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MessageMeta {
+    pub tokens: TokenUsage,
+    pub elapsed_ms: u64,
+    pub ctx_window: u32,
+    pub used_tokens: u32,
+    pub utilization: f32,
+    pub cost: f64,
+}
+
+/// Provider-neutral message.
 #[derive(Clone, Debug)]
 pub struct Message {
     pub role: Role,
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
+    /// Kernel-native execution stats (sidecar). Never implicitly rendered into
+    /// `text` — projecting to the LLM is the renderer's explicit choice.
+    pub meta: Option<MessageMeta>,
 }
 
 impl Message {
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None }
+        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, meta: None }
     }
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None }
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, meta: None }
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None }
+        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, meta: None }
     }
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>, _is_error: bool) -> Self {
-        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()) }
+        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), meta: None }
     }
 }
 

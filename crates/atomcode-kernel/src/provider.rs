@@ -9,6 +9,10 @@ use futures::stream::BoxStream;
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn model_name(&self) -> &str;
+    /// Effective context window in tokens. 0 = unknown.
+    fn context_window(&self) -> u32 {
+        0
+    }
     async fn chat_stream(
         &self,
         messages: &[Message],
