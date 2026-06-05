@@ -3984,6 +3984,20 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         crate::tuix_trace!("RSZ", "wipe written");
         self.screen.resize(cols, rows);
+        // Mark physical state unknown so the upcoming paint_frame's
+        // render_diff cold-starts with a per-row CUP+EL preamble — exactly
+        // like reset() (:~3627) and resume_from_external() (:~3732), which
+        // rebuild the Screen the same way. Without this, `screen.resize`
+        // leaves `physical_dirty = false` + blank `prev_cells`, so the diff
+        // emits only cell patches and never clears the OLD footer rows. The
+        // per-row CUP+EL wipe above masks that on Unix / Windows Terminal,
+        // but legacy conhost is forced down to a single ED2 (to dodge the
+        // 0xc0000409 fastfail), and ED2 doesn't reliably clear the final
+        // geometry mid-drag — so the stale footer survives and the new
+        // footer stacks on top of it (the Windows resize footer-duplication
+        // bug). invalidate() must run AFTER resize so its sentinel rows are
+        // sized to the new width.
+        self.screen.invalidate();
         // Rebuild the semantic welcome banner against the new width so
         // its right-aligned version/license pair stays adaptive after
         // terminal resize instead of replaying stale gap cells.
@@ -10367,6 +10381,69 @@ mod tests {
                  ghosts them into visible body as duplicated tail).\nbytes: {:?}",
                 row,
                 post_paint_str
+            );
+        }
+    }
+
+    /// Windows resize footer-duplication regression: `on_resize` must call
+    /// `screen.invalidate()` after rebuilding the Screen so the repaint
+    /// cold-starts with a per-row CUP+EL preamble — like `reset()` and
+    /// `resume_from_external()` already do.
+    ///
+    /// On legacy conhost the resize wipe is forced down to a single ED2 (to
+    /// dodge the 0xc0000409 fastfail), so it emits NO per-row CUP+EL. The
+    /// body re-emit only covers body rows. That leaves the cold-start as the
+    /// ONLY thing that clears the FOOTER rows. Without `invalidate()`,
+    /// `physical_dirty` stays false, `render_diff` skips the cold-start, the
+    /// old footer rows are never cleared, and the new footer stacks on top
+    /// of them (the user-reported Windows resize corruption).
+    ///
+    /// We exercise the conhost path on purpose: on other terminals the
+    /// per-row CUP+EL wipe clears every row regardless, masking a missing
+    /// invalidate() — which is exactly why the bug is conhost-only and why a
+    /// default-path test wouldn't distinguish fixed from broken.
+    #[test]
+    fn on_resize_cold_starts_in_legacy_conhost() {
+        let w: u16 = 40;
+        let h: u16 = 12;
+        let (mut r, buf) = new_capturing(w, h);
+        r.caps.legacy_conhost = true;
+
+        // Warm: paint footer + a body line so prev_cells is populated, like a
+        // live session right before the user drags the window.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::AssistantText("pre-resize content\n".into()));
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // Shrink height → footer moves up; the old footer rows must be
+        // cleared. on_resize repaints internally (paint_frame → render_diff),
+        // so the cold-start (if any) lands in `buf` during this call.
+        let new_h: u16 = h - 3;
+        r.on_resize(w, new_h);
+
+        let out_bytes = buf.lock().unwrap().clone();
+        let out = String::from_utf8_lossy(&out_bytes);
+        // ED2 emits no per-row CUP+EL and the body re-emit only covers body
+        // rows, so per-row CUP+EL for EVERY row 1..=new_h can only come from
+        // the render_diff cold-start — which fires only if on_resize
+        // invalidated the screen.
+        for row in 1..=(new_h as usize) {
+            let needle = format!("\x1b[{};1H\x1b[K", row);
+            assert!(
+                out.contains(&needle),
+                "on_resize must cold-start (per-row CUP+EL) for row {} on legacy \
+                 conhost; without screen.invalidate() the footer rows are never \
+                 cleared and the old footer ghosts under the new one (Windows \
+                 resize footer-stacking bug).\nbytes: {:?}",
+                row,
+                out
             );
         }
     }
