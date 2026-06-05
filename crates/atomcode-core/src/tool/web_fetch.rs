@@ -15,8 +15,12 @@ pub struct WebFetchTool;
 #[derive(Deserialize)]
 struct WebFetchArgs {
     url: String,
-    #[serde(default = "default_max_chars")]
-    max_chars: usize,
+    /// Optional character cap on the returned text. Omitted → return the full
+    /// content (still bounded by the 2 MiB raw-response byte cap); provided →
+    /// truncate to this many chars with a note. No default truncation: a large
+    /// file returned whole beats a half file the caller then re-fetches.
+    #[serde(default)]
+    max_chars: Option<usize>,
     #[serde(default)]
     format: FetchFormat,
 }
@@ -32,10 +36,6 @@ enum FetchFormat {
     Markdown,
     Text,
     Html,
-}
-
-fn default_max_chars() -> usize {
-    20000
 }
 
 /// Hard cap on the raw response bytes we'll buffer before bailing. Keeps a
@@ -209,7 +209,7 @@ impl Tool for WebFetchTool {
                 "properties": {
                     "url": { "type": "string", "description": "Absolute http(s) URL to fetch" },
                     "format": { "type": "string", "enum": ["markdown", "text", "html"], "description": "Output format (default markdown). Use \"html\" to get the raw page source." },
-                    "max_chars": { "type": "integer", "description": "Max characters to return (default 20000)" }
+                    "max_chars": { "type": "integer", "description": "Optional. Truncate the returned text to this many characters; omit to return the full content (bounded only by a 2 MiB response cap)." }
                 },
                 "required": ["url"]
             }),
@@ -248,7 +248,6 @@ impl Tool for WebFetchTool {
                 )))
             }
         };
-        let max = parsed.max_chars.min(50000);
 
         let client = match reqwest::Client::builder()
             // Handle redirects manually so every hop re-runs scheme + IP checks.
@@ -377,20 +376,7 @@ impl Tool for WebFetchTool {
         let is_html = ct_is_html || (ct_header.is_none() && body.trim_start().starts_with('<'));
         let text = render_body(parsed.format, is_html, body);
 
-        let output = if text.len() > max {
-            let mut end = max;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!(
-                "{}\n\n[Truncated at {} chars, {} total]",
-                &text[..end],
-                max,
-                text.len()
-            )
-        } else {
-            text
-        };
+        let output = apply_char_cap(text, parsed.max_chars);
 
         if output.trim().is_empty() {
             return Ok(err_result(format!(
@@ -442,6 +428,27 @@ fn render_body(format: FetchFormat, is_html: bool, body: String) -> String {
         _ if !is_html => body,
         FetchFormat::Markdown => html_to_markdown(&body),
         FetchFormat::Text => html_to_text(&body),
+    }
+}
+
+/// Apply the optional caller-supplied character cap. `None` returns the full
+/// text (the 2 MiB raw-response byte cap is the only hard bound); `Some(max)`
+/// truncates at a UTF-8 char boundary and appends a note when over the limit.
+fn apply_char_cap(text: String, max_chars: Option<usize>) -> String {
+    match max_chars {
+        Some(max) if text.len() > max => {
+            let mut end = max;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!(
+                "{}\n\n[Truncated at {} chars, {} total]",
+                &text[..end],
+                max,
+                text.len()
+            )
+        }
+        _ => text,
     }
 }
 
@@ -950,5 +957,41 @@ mod tests {
         for fmt in [FetchFormat::Markdown, FetchFormat::Text, FetchFormat::Html] {
             assert_eq!(render_body(fmt, false, plain.clone()), plain);
         }
+    }
+
+    #[test]
+    fn max_chars_optional_in_args() {
+        // Omitted → None (no default truncation: full content is returned).
+        let a: WebFetchArgs = serde_json::from_str(r#"{"url":"https://example.com"}"#).unwrap();
+        assert_eq!(a.max_chars, None);
+        // Provided → honored verbatim.
+        let b: WebFetchArgs =
+            serde_json::from_str(r#"{"url":"https://example.com","max_chars":500}"#).unwrap();
+        assert_eq!(b.max_chars, Some(500));
+    }
+
+    #[test]
+    fn apply_char_cap_none_returns_full() {
+        // The whole point of the change: no cap → nothing is dropped, however big.
+        let big = "x".repeat(200_000);
+        assert_eq!(apply_char_cap(big.clone(), None), big);
+    }
+
+    #[test]
+    fn apply_char_cap_some_truncates_with_note() {
+        let out = apply_char_cap("x".repeat(100), Some(10));
+        assert!(out.starts_with(&"x".repeat(10)));
+        assert!(out.contains("[Truncated at 10 chars, 100 total]"), "{out}");
+        // Under the cap → untouched, no note.
+        assert_eq!(apply_char_cap("short".to_string(), Some(100)), "short");
+    }
+
+    #[test]
+    fn apply_char_cap_respects_utf8_boundaries() {
+        // "é" is 2 bytes; a cap of 5 lands mid-char and must back off, never panic.
+        let s = "é".repeat(10);
+        let out = apply_char_cap(s, Some(5));
+        let head = &out[..out.find("\n\n").unwrap()];
+        assert!(head.chars().all(|c| c == 'é'), "broke a char boundary: {head:?}");
     }
 }
