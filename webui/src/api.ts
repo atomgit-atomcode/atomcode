@@ -128,7 +128,8 @@ export async function streamChat(
 
 export async function respondPermission(
   sessionId: string,
-  decision: 'allow' | 'deny' | 'always_allow',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
+  toolName?: string,
 ): Promise<{ success: boolean }> {
   const resp = await fetch('/chat/permission', {
     method: 'POST',
@@ -136,7 +137,7 @@ export async function respondPermission(
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ session_id: sessionId, decision }),
+    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName }),
   });
   return resp.json();
 }
@@ -510,12 +511,13 @@ export async function postLiveProvider(provider: string): Promise<void> {
 }
 
 export async function postLivePermission(
-  decision: 'allow' | 'deny' | 'always_allow',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
+  toolName?: string,
 ): Promise<{ accepted: boolean }> {
   const resp = await fetch('/live/permission', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ decision }),
+    body: JSON.stringify({ decision, tool_name: toolName }),
   });
   return resp.json();
 }

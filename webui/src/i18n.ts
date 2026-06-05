@@ -183,6 +183,7 @@ const zh = {
   'perm.deny': '拒绝',
   'perm.approve': '批准',
   'perm.alwaysAllow': '本会话总是允许',
+  'perm.allowPersist': '永久允许此工具',
 
   // Sync toggle
   'sync.toggle': '同步当前会话',
@@ -362,6 +363,7 @@ const en: Record<MsgKey, string> = {
   'perm.deny': 'Deny',
   'perm.approve': 'Approve',
   'perm.alwaysAllow': 'Always allow this session',
+  'perm.allowPersist': 'Always allow this tool',
 
   // Sync toggle
   'sync.toggle': 'Sync current session',
