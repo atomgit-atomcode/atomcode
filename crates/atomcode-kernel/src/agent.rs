@@ -128,8 +128,16 @@ impl RunningAgent {
                 AgentCommand::Cancel => {}
                 AgentCommand::Respond { id, value } => self.rt.resolve(id, value),
                 AgentCommand::Snapshot => {
-                    let metas = convo.messages.iter().map(|m| m.meta.clone()).collect();
-                    self.rt.emit(AgentEvent::Snapshot { metas });
+                    let messages = convo
+                        .messages
+                        .iter()
+                        .map(|m| crate::event::MessageSnapshot {
+                            role: format!("{:?}", m.role),
+                            text: m.text.clone(),
+                            meta: m.meta.clone(),
+                        })
+                        .collect();
+                    self.rt.emit(AgentEvent::Snapshot { messages });
                 }
                 AgentCommand::SendMessage { mut text } => {
                     self.hooks.user_prompt_submit(&mut text).await;
@@ -201,19 +209,18 @@ impl RunningAgent {
             } else {
                 0.0
             };
-            let mut meta = MessageMeta {
+            let meta = MessageMeta {
                 tokens: usage,
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 ctx_window,
                 used_tokens,
                 utilization,
-                cost: 0.0,
                 round,
             };
-            self.hooks.on_model_response(&mut meta).await;
-            self.rt.emit(AgentEvent::Usage(meta.clone()));
             let mut assistant_msg = Message::assistant(assistant_text.clone(), pending_calls.clone());
             assistant_msg.meta = Some(meta);
+            self.hooks.on_model_response(&mut assistant_msg).await;
+            self.rt.emit(AgentEvent::Usage(assistant_msg.meta.clone().unwrap_or_default()));
             convo.push(assistant_msg);
             if pending_calls.is_empty() {
                 if let Some(reminder) = self.hooks.turn_end(convo).await {

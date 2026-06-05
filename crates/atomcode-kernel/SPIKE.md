@@ -18,7 +18,7 @@ the proven production hot-paths into.
 | 7. Full LifecycleHooks surface — all 9 points wired & fire | `tests/spike_claims.rs::lifecycle_hooks_complete_surface_all_fire` |
 | 8. Execution-state recorded (Message.meta) + projected to LLM (tail reminder) + cache-safe | `tests/spike_claims.rs::execution_state_recorded_projected_to_llm_and_cache_safe` |
 | 9. Round budget projected to LLM ("round X/Y") + hard cap, recorded in meta.round, cache-safe | `tests/spike_claims.rs::round_budget_projected_to_llm_and_hard_capped` |
-| 10. on_model_response enrich path — hook-written meta.cost reaches both the Usage event and stored Message.meta | `tests/spike_claims.rs::on_model_response_enriches_meta_into_event_and_storage` |
+| 10. on_model_response gets `&mut Message` — can transform the response; transform lands in storage (via Snapshot) | `tests/spike_claims.rs::on_model_response_can_transform_response_into_storage` |
 
 ## Driver model
 
@@ -46,6 +46,8 @@ Two distinct mechanisms: **perceive** = the read-only `AgentEvent` stream
 `Request`/`Respond` round-trip (a hook asks the remote driver and awaits).
 
 Execution-state feedback follows the rule: RECORD at `on_model_response` (kernel-native `Message.meta` sidecar), PROJECT to the LLM at `pre_request` as a tail reminder — never mutating historical bytes (prefix-cache safe). Hooks needing loop position get a `TurnCtx { round, max_rounds }`; `pre_request` uses it to project round budget to the LLM, and the kernel hard-caps the loop at `max_rounds` as a safety fuse.
+
+`on_model_response` receives `&mut Message` (the fully-built assistant message with kernel-filled `meta`). The hook may observe or TRANSFORM the response (e.g. redact text, truncate). `MessageMeta` holds only kernel-measured facts (`tokens`, `elapsed_ms`, `ctx_window`, `used_tokens`, `utilization`, `round`); cost and other specialization concerns live outside the kernel.
 
 ## Key boundary facts
 

@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
-use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use atomcode_kernel::event::{AgentCommand, AgentEvent, MessageSnapshot};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
-use atomcode_kernel::testkit::{ApprovalMiddleware, BudgetReminderHook, ContinueOnceHook, CostHook, EchoTool, MockProvider, RecorderHook, RiskyWriteTool, RoundBudgetHook};
+use atomcode_kernel::testkit::{ApprovalMiddleware, BudgetReminderHook, ContinueOnceHook, EchoTool, MockProvider, RecorderHook, RedactHook, RiskyWriteTool, RoundBudgetHook};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -334,55 +334,50 @@ async fn round_budget_projected_to_llm_and_hard_capped() {
     assert_eq!(calls[2][0], calls[0][0], "history must not be rewritten (prefix-cache safety)");
 }
 
-// CLAIM 10: a hook that enriches `meta.cost` in on_model_response — the enriched
-// value must reach BOTH the perception event (AgentEvent::Usage) AND storage
-// (the stored Message.meta, queried via Snapshot).
+// CLAIM 10: on_model_response receives the response as `&mut Message` and can
+// TRANSFORM it (here: redact a secret). The transform lands in storage (verified
+// via Snapshot), and the hook sees the kernel-filled meta.
 #[tokio::test]
-async fn on_model_response_enriches_meta_into_event_and_storage() {
+async fn on_model_response_can_transform_response_into_storage() {
     let reg = ToolRegistry::new();
     let provider = Arc::new(MockProvider::new(vec![vec![
-        StreamEvent::Usage(TokenUsage { prompt: 100, completion: 20, cached: 0 }),
-        StreamEvent::TextDelta("hi".into()),
+        StreamEvent::Usage(TokenUsage { prompt: 50, completion: 10, cached: 0 }),
+        StreamEvent::TextDelta("my password is SECRET".into()),
         StreamEvent::Done,
     ]]));
 
     let mut handle = Agent::builder()
         .provider(provider)
         .tools(reg.mount(&[]))
-        .hooks(Arc::new(CostHook::new(0.001))) // cost = (100+20) * 0.001 = 0.12
+        .hooks(Arc::new(RedactHook))
         .build()
         .spawn();
     handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
 
-    // (1) enrich → perception event
-    let mut event_cost: Option<f64> = None;
     while let Some(ev) = handle.events.recv().await {
-        match ev {
-            AgentEvent::Usage(m) => event_cost = Some(m.cost),
-            AgentEvent::TurnComplete => break,
-            _ => {}
-        }
-    }
-
-    // (2) enrich → storage: query the stored conversation metas via Snapshot
-    handle.commands.send(AgentCommand::Snapshot).unwrap();
-    let mut stored_costs: Vec<f64> = Vec::new();
-    while let Some(ev) = handle.events.recv().await {
-        if let AgentEvent::Snapshot { metas } = ev {
-            stored_costs = metas.into_iter().flatten().map(|m| m.cost).collect();
+        if matches!(ev, AgentEvent::TurnComplete) {
             break;
         }
     }
 
+    handle.commands.send(AgentCommand::Snapshot).unwrap();
+    let mut snap: Vec<MessageSnapshot> = Vec::new();
+    while let Some(ev) = handle.events.recv().await {
+        if let AgentEvent::Snapshot { messages } = ev {
+            snap = messages;
+            break;
+        }
+    }
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
+    let assistant = snap.iter().find(|m| m.role == "Assistant").expect("assistant message stored");
+    // (1) the hook's transform of the response landed in storage
+    assert_eq!(assistant.text, "my password is [redacted]", "on_model_response transform must land in storage");
+    assert!(!assistant.text.contains("SECRET"), "secret must be gone");
+    // (2) the hook saw the kernel-filled meta on the response
     assert!(
-        event_cost.map_or(false, |c| (c - 0.12).abs() < 1e-9),
-        "on_model_response must enrich cost into the Usage event; got {event_cost:?}"
-    );
-    assert!(
-        stored_costs.iter().any(|c| (*c - 0.12).abs() < 1e-9),
-        "enriched cost must land in stored Message.meta; got {stored_costs:?}"
+        assistant.meta.as_ref().map_or(false, |m| m.tokens.prompt == 50),
+        "kernel meta must be present on the response the hook received"
     );
 }

@@ -1,4 +1,4 @@
-use crate::message::{Conversation, Message, MessageMeta};
+use crate::message::{Conversation, Message};
 use crate::tool::{ToolCall, ToolResult};
 use async_trait::async_trait;
 
@@ -33,10 +33,11 @@ pub trait LifecycleHooks: Send + Sync {
     /// `ctx` carries the current round / max so a hook can project budget pressure.
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) {}
 
-    /// After the model response completes and the kernel has measured this call's
-    /// stats. Enrich `meta` (e.g. compute money cost) or observe. The kernel then
-    /// attaches `meta` to the assistant message (sidecar).
-    async fn on_model_response(&self, _meta: &mut MessageMeta) {}
+    /// After the model response: the kernel has built the assistant message
+    /// (`text` + `tool_calls` + kernel-filled `meta`) but not yet stored it. The
+    /// hook may observe or TRANSFORM the response (e.g. redact/truncate text).
+    /// `meta` is kernel-owned measurement — don't fabricate it.
+    async fn on_model_response(&self, _response: &mut Message) {}
 
     /// Before a tool executes. Return `Err(reason)` to block it. (`ToolMiddleware`
     /// is the composable, per-tool form of this same point.)

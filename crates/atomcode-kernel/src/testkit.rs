@@ -1,7 +1,7 @@
 //! Spike-only test doubles. NOT part of the kernel's real API.
 
 use crate::hook::{LifecycleHooks, TurnCtx};
-use crate::message::{Conversation, Message, MessageMeta};
+use crate::message::{Conversation, Message};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
 use crate::request::RequestCtx;
@@ -179,7 +179,7 @@ impl LifecycleHooks for RecorderHook {
     async fn user_prompt_submit(&self, _text: &mut String) { self.record("user_prompt_submit"); }
     async fn turn_start(&self, _convo: &mut Conversation) { self.record("turn_start"); }
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) { self.record("pre_request"); }
-    async fn on_model_response(&self, _meta: &mut MessageMeta) { self.record("on_model_response"); }
+    async fn on_model_response(&self, _response: &mut Message) { self.record("on_model_response"); }
     async fn pre_tool(&self, _call: &ToolCall) -> Result<(), String> { self.record("pre_tool"); Ok(()) }
     async fn post_tool(&self, _result: &mut ToolResult) { self.record("post_tool"); }
     async fn turn_end(&self, _convo: &Conversation) -> Option<String> { self.record("turn_end"); None }
@@ -222,23 +222,16 @@ impl LifecycleHooks for RoundBudgetHook {
     }
 }
 
-/// Enriches `meta.cost` in on_model_response: cost = (prompt + completion) * per_token.
-/// Proves the on_model_response enrich path lands in BOTH the Usage event and the
-/// stored Message.meta.
-pub struct CostHook {
-    pub per_token: f64,
-}
-
-impl CostHook {
-    pub fn new(per_token: f64) -> Self {
-        Self { per_token }
-    }
-}
+/// Transforms the model response in on_model_response: redacts a secret from the
+/// assistant text before it is stored. Proves `&mut Message` lets a hook rewrite
+/// the response, and that the rewrite lands in storage.
+pub struct RedactHook;
 
 #[async_trait]
-impl LifecycleHooks for CostHook {
-    async fn on_model_response(&self, meta: &mut MessageMeta) {
-        let billable = (meta.tokens.prompt + meta.tokens.completion) as f64;
-        meta.cost = billable * self.per_token;
+impl LifecycleHooks for RedactHook {
+    async fn on_model_response(&self, response: &mut Message) {
+        if response.text.contains("SECRET") {
+            response.text = response.text.replace("SECRET", "[redacted]");
+        }
     }
 }

@@ -2,6 +2,14 @@ use crate::message::MessageMeta;
 use crate::tool::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 
+/// Serializable per-message summary returned by Snapshot.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageSnapshot {
+    pub role: String,
+    pub text: String,
+    pub meta: Option<MessageMeta>,
+}
+
 pub type RequestId = u64;
 
 /// Driver → agent. Serializable so it crosses process/network boundaries
@@ -34,8 +42,8 @@ pub enum AgentEvent {
     Request { id: RequestId, kind: String, payload: serde_json::Value },
     /// Per-LLM-call execution stats (perception side; mirrors the message sidecar).
     Usage(MessageMeta),
-    /// Per-message execution stats for the whole conversation (reply to Snapshot).
-    Snapshot { metas: Vec<Option<MessageMeta>> },
+    /// Whole-conversation snapshot (reply to Snapshot command).
+    Snapshot { messages: Vec<MessageSnapshot> },
     TurnComplete,
     Error { message: String },
 }

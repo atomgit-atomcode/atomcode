@@ -21,7 +21,6 @@ pub struct MessageMeta {
     pub ctx_window: u32,
     pub used_tokens: u32,
     pub utilization: f32,
-    pub cost: f64,
     pub round: u32,
 }
 
