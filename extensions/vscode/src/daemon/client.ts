@@ -340,8 +340,13 @@ export class DaemonClient {
             if (restarted) {
               // Retry the stream by calling streamChat again
               const retryController = this.streamChat(req, callbacks);
-              // Forward abort from original controller to retry
-              controller.signal.addEventListener('abort', () => retryController.abort());
+              // Forward abort from original controller to retry.
+              // Check if already aborted (event already fired) to avoid missing the signal.
+              if (controller.signal.aborted) {
+                retryController.abort();
+              } else {
+                controller.signal.addEventListener('abort', () => retryController.abort());
+              }
             } else {
               callbacks.onError('Daemon not running');
             }
