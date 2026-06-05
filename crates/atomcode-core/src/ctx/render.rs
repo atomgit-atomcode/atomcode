@@ -150,7 +150,7 @@ pub fn build_messages(
     // folded, the `[Context overflow: N earlier turns compressed]` digest
     // changed (N→N+1) and the survivor cut slid forward, so the provider
     // prefix cache broke every few turns. Measured on deepseek-v4-flash
-    // (2026-06-04): this was 50.8% of v4.24.2's remaining cache misses
+    // (2026-06-04): this was 50.8% of v4.25.0's remaining cache misses
     // (cached 0.02元/M vs uncached 1元/M, 50×). Triggering at
     // `auto_compact_threshold` lets the persisted compaction (task-boundary
     // in agent/mod.rs + mid-turn `maybe_compress_history`) own context
@@ -3293,7 +3293,7 @@ mod tests {
         // conversation on every render. Each time one more old turn had to be
         // folded, the digest changed (N→N+1) and the survivor cut slid forward
         // → the prompt-prefix cache broke every few turns. Measured on
-        // deepseek-v4-flash (2026-06-04): 50.8% of 4.24.2's remaining misses.
+        // deepseek-v4-flash (2026-06-04): 50.8% of 4.25.0's remaining misses.
         //
         // The drop path must now DEFER to the persisted compaction in this
         // band: stay dormant and keep build_messages append-only. It only
