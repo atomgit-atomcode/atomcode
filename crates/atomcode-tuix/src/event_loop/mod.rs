@@ -7853,7 +7853,16 @@ fn draw_spinner_now(
     menu_selected: usize,
 ) {
     let frame = state.tick_spinner();
-    let label = format_spinner_label(state, queue_len);
+    // Same source + applicability gate as the status bar's `[high]`, so the
+    // spinner's effort hint and the status line never disagree. (Reading
+    // `state.reasoning_effort` here showed nothing when effort came from the
+    // provider config / webui rather than a Ctrl+T cycle.)
+    let effort = if reasoning_effort_applicable_on_provider(ctx) {
+        ctx.reasoning_effort.as_deref()
+    } else {
+        None
+    };
+    let label = format_spinner_label(state, queue_len, effort);
     let status = build_status(state, ctx);
     let menu = menu_for_display(buf, ctx).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
@@ -7884,7 +7893,7 @@ fn draw_spinner_now(
 /// word (e.g. `Pondering`, `Running ReadFile`); ellipsis + elapsed +
 /// queued suffixes are appended here so format is consistent across
 /// every call site.
-fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
+fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Option<&str>) -> String {
     let base = &state.spinner_label;
     let mut out = format!("{}{}", base, state.ellipsis());
     // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
@@ -7898,10 +7907,12 @@ fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
         out.push_str(&format!(" · {} queued", queue_len));
     }
     // Reasoning-effort hint (deepseek-v4 high/max), mirroring CC's
-    // `… · thinking with high effort`. Kept at the tail so
+    // `… · thinking with high effort`. The value comes from the caller (the
+    // ctx-sourced, applicability-gated effort — the SAME source as the
+    // status bar's `[high]`, so the two never disagree). Kept at the tail so
     // `spinner_meta_suffix` can strip it before forwarding the time/queue
     // metadata onto an in-flight tool row (a tool isn't "thinking").
-    if let Some(effort) = state.reasoning_effort.as_deref() {
+    if let Some(effort) = reasoning_effort {
         out.push_str(&format!(" · thinking with {} effort", effort));
     }
     out
