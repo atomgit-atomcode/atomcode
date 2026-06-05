@@ -15,8 +15,12 @@ pub struct WebFetchTool;
 #[derive(Deserialize)]
 struct WebFetchArgs {
     url: String,
-    #[serde(default = "default_max_chars")]
-    max_chars: usize,
+    /// Optional character cap on the returned text. Omitted → return the full
+    /// content (still bounded by the 2 MiB raw-response byte cap); provided →
+    /// truncate to this many chars with a note. No default truncation: a large
+    /// file returned whole beats a half file the caller then re-fetches.
+    #[serde(default)]
+    max_chars: Option<usize>,
     #[serde(default)]
     format: FetchFormat,
 }
@@ -32,10 +36,6 @@ enum FetchFormat {
     Markdown,
     Text,
     Html,
-}
-
-fn default_max_chars() -> usize {
-    20000
 }
 
 /// Hard cap on the raw response bytes we'll buffer before bailing. Keeps a
@@ -209,7 +209,7 @@ impl Tool for WebFetchTool {
                 "properties": {
                     "url": { "type": "string", "description": "Absolute http(s) URL to fetch" },
                     "format": { "type": "string", "enum": ["markdown", "text", "html"], "description": "Output format (default markdown). Use \"html\" to get the raw page source." },
-                    "max_chars": { "type": "integer", "description": "Max characters to return (default 20000)" }
+                    "max_chars": { "type": "integer", "description": "Optional. Truncate the returned text to this many characters; omit to return the full content (bounded only by a 2 MiB response cap)." }
                 },
                 "required": ["url"]
             }),
@@ -248,7 +248,6 @@ impl Tool for WebFetchTool {
                 )))
             }
         };
-        let max = parsed.max_chars.min(50000);
 
         let client = match reqwest::Client::builder()
             // Handle redirects manually so every hop re-runs scheme + IP checks.
@@ -377,20 +376,7 @@ impl Tool for WebFetchTool {
         let is_html = ct_is_html || (ct_header.is_none() && body.trim_start().starts_with('<'));
         let text = render_body(parsed.format, is_html, body);
 
-        let output = if text.len() > max {
-            let mut end = max;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!(
-                "{}\n\n[Truncated at {} chars, {} total]",
-                &text[..end],
-                max,
-                text.len()
-            )
-        } else {
-            text
-        };
+        let output = apply_char_cap(text, parsed.max_chars);
 
         if output.trim().is_empty() {
             return Ok(err_result(format!(
@@ -424,13 +410,69 @@ impl Tool for WebFetchTool {
 /// `<pre><code>`. Falls back to the plain-text extractor if the parse errors or
 /// yields nothing, so we still surface whatever readable content exists.
 fn html_to_markdown(html: &str) -> String {
-    match htmd::HtmlToMarkdown::builder()
+    let md = match htmd::HtmlToMarkdown::builder()
         .skip_tags(vec!["script", "style", "meta", "link", "noscript", "iframe", "head"])
         .build()
         .convert(html)
     {
         Ok(md) if !md.trim().is_empty() => md,
-        _ => html_to_text(html),
+        _ => return html_to_text(html),
+    };
+    // Source-file views on every code host (GitHub/GitLab/Gitee/atomgit/…) render
+    // the file as one big <pre><code> wrapped in nav + file-tree chrome. Once in
+    // Markdown that chrome is dozens of leading link/list lines before the code,
+    // which an LLM misreads as "an empty JS shell" and re-fetches. If a single
+    // fenced block dominates the page, return just it.
+    strip_to_dominant_code_block(&md).unwrap_or(md)
+}
+
+/// If a single fenced code block dominates the Markdown — the structural
+/// signature of a source-file view — return just that block; otherwise `None`.
+///
+/// Keyed ONLY on Markdown shape (one fence that is the bulk of the page and at
+/// least a handful of lines), never on a hostname or any forge's HTML/CSS — so
+/// it fires for any code host and leaves ordinary pages, whose code is a
+/// minority of the content, completely untouched.
+fn strip_to_dominant_code_block(md: &str) -> Option<String> {
+    /// A dominant block must be at least this many lines (skip tiny snippets).
+    const MIN_BLOCK_LINES: usize = 15;
+    /// …and at least this percent of the page's bytes (a clear majority, so a
+    /// docs page with a code example or two is never mistaken for a file view).
+    const MIN_BLOCK_PERCENT: usize = 55;
+
+    let total = md.trim().len();
+    if total == 0 {
+        return None;
+    }
+    let lines: Vec<&str> = md.lines().collect();
+    let is_fence = |l: &str| l.trim_start().starts_with("```");
+
+    let mut best: Option<(usize, usize, usize)> = None; // (start, end_inclusive, bytes)
+    let mut i = 0;
+    while i < lines.len() {
+        if is_fence(lines[i]) {
+            let start = i;
+            let mut j = i + 1;
+            while j < lines.len() && !is_fence(lines[j]) {
+                j += 1;
+            }
+            let end = j.min(lines.len() - 1); // closing fence, or last line if unterminated
+            let bytes: usize = lines[start..=end].iter().map(|l| l.len() + 1).sum();
+            if best.is_none_or(|(_, _, b)| bytes > b) {
+                best = Some((start, end, bytes));
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    let (start, end, bytes) = best?;
+    let block_lines = end - start + 1;
+    if block_lines >= MIN_BLOCK_LINES && bytes * 100 >= total * MIN_BLOCK_PERCENT {
+        Some(lines[start..=end].join("\n"))
+    } else {
+        None
     }
 }
 
@@ -442,6 +484,27 @@ fn render_body(format: FetchFormat, is_html: bool, body: String) -> String {
         _ if !is_html => body,
         FetchFormat::Markdown => html_to_markdown(&body),
         FetchFormat::Text => html_to_text(&body),
+    }
+}
+
+/// Apply the optional caller-supplied character cap. `None` returns the full
+/// text (the 2 MiB raw-response byte cap is the only hard bound); `Some(max)`
+/// truncates at a UTF-8 char boundary and appends a note when over the limit.
+fn apply_char_cap(text: String, max_chars: Option<usize>) -> String {
+    match max_chars {
+        Some(max) if text.len() > max => {
+            let mut end = max;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!(
+                "{}\n\n[Truncated at {} chars, {} total]",
+                &text[..end],
+                max,
+                text.len()
+            )
+        }
+        _ => text,
     }
 }
 
@@ -950,5 +1013,108 @@ mod tests {
         for fmt in [FetchFormat::Markdown, FetchFormat::Text, FetchFormat::Html] {
             assert_eq!(render_body(fmt, false, plain.clone()), plain);
         }
+    }
+
+    #[test]
+    fn max_chars_optional_in_args() {
+        // Omitted → None (no default truncation: full content is returned).
+        let a: WebFetchArgs = serde_json::from_str(r#"{"url":"https://example.com"}"#).unwrap();
+        assert_eq!(a.max_chars, None);
+        // Provided → honored verbatim.
+        let b: WebFetchArgs =
+            serde_json::from_str(r#"{"url":"https://example.com","max_chars":500}"#).unwrap();
+        assert_eq!(b.max_chars, Some(500));
+    }
+
+    #[test]
+    fn apply_char_cap_none_returns_full() {
+        // The whole point of the change: no cap → nothing is dropped, however big.
+        let big = "x".repeat(200_000);
+        assert_eq!(apply_char_cap(big.clone(), None), big);
+    }
+
+    #[test]
+    fn apply_char_cap_some_truncates_with_note() {
+        let out = apply_char_cap("x".repeat(100), Some(10));
+        assert!(out.starts_with(&"x".repeat(10)));
+        assert!(out.contains("[Truncated at 10 chars, 100 total]"), "{out}");
+        // Under the cap → untouched, no note.
+        assert_eq!(apply_char_cap("short".to_string(), Some(100)), "short");
+    }
+
+    #[test]
+    fn apply_char_cap_respects_utf8_boundaries() {
+        // "é" is 2 bytes; a cap of 5 lands mid-char and must back off, never panic.
+        let s = "é".repeat(10);
+        let out = apply_char_cap(s, Some(5));
+        let head = &out[..out.find("\n\n").unwrap()];
+        assert!(head.chars().all(|c| c == 'é'), "broke a char boundary: {head:?}");
+    }
+
+    // ── strip_to_dominant_code_block: operates purely on Markdown shape, so
+    // these tests never reference a hostname or a forge's HTML — the proof that
+    // the behaviour is generic, not keyed on gitcode/atomgit. ──
+
+    fn big_code_block(lang: &str, n: usize) -> String {
+        let body: String = (1..=n).map(|i| format!("var_{i} = {i}\n")).collect();
+        format!("```{lang}\n{body}```")
+    }
+
+    #[test]
+    fn strip_keeps_only_the_file_for_a_source_view() {
+        // Nav menu + repo file tree (links/bullets) followed by the file — the
+        // universal shape of a forge "view single file" page once in Markdown.
+        let md = format!(
+            "[Code](/r)\n[Issues](/r/issues)\n[Wiki](/r/wiki)\n\n* activation\n* cmake\n* scripts\n\n{}\n",
+            big_code_block("python", 40)
+        );
+        let out = strip_to_dominant_code_block(&md).expect("dominant block should be detected");
+        assert!(out.starts_with("```python"), "should begin at the fence:\n{out}");
+        assert!(out.contains("var_40 = 40"), "code body truncated:\n{out}");
+        assert!(
+            !out.contains("Issues") && !out.contains("activation") && !out.contains("Wiki"),
+            "nav / file-tree chrome leaked into the output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn strip_preserves_a_docs_page_with_an_example() {
+        // Prose-dominant page with a code example — must be returned whole.
+        let prose: String = (1..=30)
+            .map(|i| format!("Paragraph {i}: real explanatory prose that the reader needs.\n\n"))
+            .collect();
+        let md = format!("# Guide\n\n{prose}Example:\n\n```sh\nls -la\necho hi\n```\n\nClosing prose.\n");
+        assert!(
+            strip_to_dominant_code_block(&md).is_none(),
+            "a docs page was wrongly stripped down to its code example"
+        );
+    }
+
+    #[test]
+    fn strip_ignores_tiny_snippets_and_codeless_pages() {
+        // A short command snippet is not a file view.
+        assert!(strip_to_dominant_code_block("Run:\n\n```sh\nls\ncd /\npwd\n```\n").is_none());
+        // No code at all → never touched.
+        assert!(strip_to_dominant_code_block("# Title\n\nProse and [a link](/x). No code.\n").is_none());
+    }
+
+    #[test]
+    fn html_to_markdown_strips_forge_chrome_end_to_end() {
+        // A forge blob page: <nav> + file tree, then the file in <pre><code>.
+        let code: String = (1..=40).map(|n| format!("<span class=\"line\">x{n} = {n}</span>\n")).collect();
+        let html = format!(
+            "<html><body>\
+             <nav><a href=\"/r\">Code</a><a href=\"/r/issues\">Issues</a></nav>\
+             <ul><li>activation</li><li>cmake</li><li>scripts</li></ul>\
+             <pre class=\"blob-shiki\"><code class=\"language-python\">{code}</code></pre>\
+             <footer>© 2026</footer></body></html>"
+        );
+        let md = html_to_markdown(&html);
+        assert!(md.contains("```"), "expected a fenced code block:\n{md}");
+        assert!(md.contains("x40 = 40"), "code body missing:\n{md}");
+        assert!(
+            !md.contains("Issues") && !md.contains("activation"),
+            "page chrome survived end-to-end:\n{md}"
+        );
     }
 }
