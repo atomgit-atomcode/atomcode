@@ -410,13 +410,69 @@ impl Tool for WebFetchTool {
 /// `<pre><code>`. Falls back to the plain-text extractor if the parse errors or
 /// yields nothing, so we still surface whatever readable content exists.
 fn html_to_markdown(html: &str) -> String {
-    match htmd::HtmlToMarkdown::builder()
+    let md = match htmd::HtmlToMarkdown::builder()
         .skip_tags(vec!["script", "style", "meta", "link", "noscript", "iframe", "head"])
         .build()
         .convert(html)
     {
         Ok(md) if !md.trim().is_empty() => md,
-        _ => html_to_text(html),
+        _ => return html_to_text(html),
+    };
+    // Source-file views on every code host (GitHub/GitLab/Gitee/atomgit/…) render
+    // the file as one big <pre><code> wrapped in nav + file-tree chrome. Once in
+    // Markdown that chrome is dozens of leading link/list lines before the code,
+    // which an LLM misreads as "an empty JS shell" and re-fetches. If a single
+    // fenced block dominates the page, return just it.
+    strip_to_dominant_code_block(&md).unwrap_or(md)
+}
+
+/// If a single fenced code block dominates the Markdown — the structural
+/// signature of a source-file view — return just that block; otherwise `None`.
+///
+/// Keyed ONLY on Markdown shape (one fence that is the bulk of the page and at
+/// least a handful of lines), never on a hostname or any forge's HTML/CSS — so
+/// it fires for any code host and leaves ordinary pages, whose code is a
+/// minority of the content, completely untouched.
+fn strip_to_dominant_code_block(md: &str) -> Option<String> {
+    /// A dominant block must be at least this many lines (skip tiny snippets).
+    const MIN_BLOCK_LINES: usize = 15;
+    /// …and at least this percent of the page's bytes (a clear majority, so a
+    /// docs page with a code example or two is never mistaken for a file view).
+    const MIN_BLOCK_PERCENT: usize = 55;
+
+    let total = md.trim().len();
+    if total == 0 {
+        return None;
+    }
+    let lines: Vec<&str> = md.lines().collect();
+    let is_fence = |l: &str| l.trim_start().starts_with("```");
+
+    let mut best: Option<(usize, usize, usize)> = None; // (start, end_inclusive, bytes)
+    let mut i = 0;
+    while i < lines.len() {
+        if is_fence(lines[i]) {
+            let start = i;
+            let mut j = i + 1;
+            while j < lines.len() && !is_fence(lines[j]) {
+                j += 1;
+            }
+            let end = j.min(lines.len() - 1); // closing fence, or last line if unterminated
+            let bytes: usize = lines[start..=end].iter().map(|l| l.len() + 1).sum();
+            if best.is_none_or(|(_, _, b)| bytes > b) {
+                best = Some((start, end, bytes));
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    let (start, end, bytes) = best?;
+    let block_lines = end - start + 1;
+    if block_lines >= MIN_BLOCK_LINES && bytes * 100 >= total * MIN_BLOCK_PERCENT {
+        Some(lines[start..=end].join("\n"))
+    } else {
+        None
     }
 }
 
@@ -993,5 +1049,72 @@ mod tests {
         let out = apply_char_cap(s, Some(5));
         let head = &out[..out.find("\n\n").unwrap()];
         assert!(head.chars().all(|c| c == 'é'), "broke a char boundary: {head:?}");
+    }
+
+    // ── strip_to_dominant_code_block: operates purely on Markdown shape, so
+    // these tests never reference a hostname or a forge's HTML — the proof that
+    // the behaviour is generic, not keyed on gitcode/atomgit. ──
+
+    fn big_code_block(lang: &str, n: usize) -> String {
+        let body: String = (1..=n).map(|i| format!("var_{i} = {i}\n")).collect();
+        format!("```{lang}\n{body}```")
+    }
+
+    #[test]
+    fn strip_keeps_only_the_file_for_a_source_view() {
+        // Nav menu + repo file tree (links/bullets) followed by the file — the
+        // universal shape of a forge "view single file" page once in Markdown.
+        let md = format!(
+            "[Code](/r)\n[Issues](/r/issues)\n[Wiki](/r/wiki)\n\n* activation\n* cmake\n* scripts\n\n{}\n",
+            big_code_block("python", 40)
+        );
+        let out = strip_to_dominant_code_block(&md).expect("dominant block should be detected");
+        assert!(out.starts_with("```python"), "should begin at the fence:\n{out}");
+        assert!(out.contains("var_40 = 40"), "code body truncated:\n{out}");
+        assert!(
+            !out.contains("Issues") && !out.contains("activation") && !out.contains("Wiki"),
+            "nav / file-tree chrome leaked into the output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn strip_preserves_a_docs_page_with_an_example() {
+        // Prose-dominant page with a code example — must be returned whole.
+        let prose: String = (1..=30)
+            .map(|i| format!("Paragraph {i}: real explanatory prose that the reader needs.\n\n"))
+            .collect();
+        let md = format!("# Guide\n\n{prose}Example:\n\n```sh\nls -la\necho hi\n```\n\nClosing prose.\n");
+        assert!(
+            strip_to_dominant_code_block(&md).is_none(),
+            "a docs page was wrongly stripped down to its code example"
+        );
+    }
+
+    #[test]
+    fn strip_ignores_tiny_snippets_and_codeless_pages() {
+        // A short command snippet is not a file view.
+        assert!(strip_to_dominant_code_block("Run:\n\n```sh\nls\ncd /\npwd\n```\n").is_none());
+        // No code at all → never touched.
+        assert!(strip_to_dominant_code_block("# Title\n\nProse and [a link](/x). No code.\n").is_none());
+    }
+
+    #[test]
+    fn html_to_markdown_strips_forge_chrome_end_to_end() {
+        // A forge blob page: <nav> + file tree, then the file in <pre><code>.
+        let code: String = (1..=40).map(|n| format!("<span class=\"line\">x{n} = {n}</span>\n")).collect();
+        let html = format!(
+            "<html><body>\
+             <nav><a href=\"/r\">Code</a><a href=\"/r/issues\">Issues</a></nav>\
+             <ul><li>activation</li><li>cmake</li><li>scripts</li></ul>\
+             <pre class=\"blob-shiki\"><code class=\"language-python\">{code}</code></pre>\
+             <footer>© 2026</footer></body></html>"
+        );
+        let md = html_to_markdown(&html);
+        assert!(md.contains("```"), "expected a fenced code block:\n{md}");
+        assert!(md.contains("x40 = 40"), "code body missing:\n{md}");
+        assert!(
+            !md.contains("Issues") && !md.contains("activation"),
+            "page chrome survived end-to-end:\n{md}"
+        );
     }
 }
