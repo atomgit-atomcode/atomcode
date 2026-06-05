@@ -230,45 +230,80 @@ impl RunningAgent {
                 self.rt.emit(AgentEvent::TurnComplete);
                 return;
             }
-            for call in pending_calls {
-                let tool = match self.tools.get(&call.name) {
-                    Some(t) => t,
-                    None => {
-                        let content = format!("unknown or unmounted tool: {}", call.name);
-                        self.hooks.on_error(&content).await;
-                        convo.push(Message::tool_result(&call.id, content, true));
-                        continue;
-                    }
+            // Execute tool calls: maximal runs of CONSECUTIVE parallel-safe tools
+            // run concurrently; all others run serially. Results are emitted and
+            // appended in CALL order regardless of completion order (determinism /
+            // prefix-cache stability).
+            let mut i = 0;
+            while i < pending_calls.len() {
+                let is_safe = |idx: usize| {
+                    self.tools
+                        .get(&pending_calls[idx].name)
+                        .map_or(false, |t| t.parallel_safe())
                 };
-                self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
-                let mut blocked: Option<String> = None;
-                if let Err(reason) = self.hooks.pre_tool(&call).await {
-                    blocked = Some(reason);
-                }
-                if blocked.is_none() {
-                    for mw in &self.middlewares {
-                        if let Err(reason) = mw.before(&call, &tool, &self.rt).await {
-                            blocked = Some(reason);
-                            break;
-                        }
+                if is_safe(i) {
+                    let mut group = Vec::new();
+                    while i < pending_calls.len() && is_safe(i) {
+                        group.push(pending_calls[i].clone());
+                        i += 1;
                     }
-                }
-                let mut result = if let Some(reason) = blocked {
-                    ToolResult { call_id: call.id.clone(), content: format!("blocked: {reason}"), is_error: true }
+                    for call in &group {
+                        self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
+                    }
+                    let results = futures::future::join_all(group.iter().map(|c| self.run_one_tool(c))).await;
+                    for (call, result) in group.iter().zip(results) {
+                        self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
+                        convo.push(Message::tool_result(&call.id, &result.content, result.is_error));
+                    }
                 } else {
-                    let ctx = ToolContext { working_dir: std::env::current_dir().unwrap_or_default() };
-                    let mut r = tool.execute(&call.arguments, &ctx).await;
-                    r.call_id = call.id.clone();
-                    r
-                };
-                self.hooks.post_tool(&mut result).await;
-                if result.is_error {
-                    self.hooks.on_error(&result.content).await;
+                    let call = pending_calls[i].clone();
+                    self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
+                    let result = self.run_one_tool(&call).await;
+                    self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
+                    convo.push(Message::tool_result(&call.id, &result.content, result.is_error));
+                    i += 1;
                 }
-                self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
-                convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
             }
         }
+    }
+
+    /// Resolve + gate + execute a single tool call, returning its result. Does NOT
+    /// emit events or push to the conversation — the caller does that in call order
+    /// (so concurrent execution still yields deterministic ordering).
+    async fn run_one_tool(&self, call: &crate::tool::ToolCall) -> ToolResult {
+        let tool = match self.tools.get(&call.name) {
+            Some(t) => t,
+            None => {
+                let content = format!("unknown or unmounted tool: {}", call.name);
+                self.hooks.on_error(&content).await;
+                return ToolResult { call_id: call.id.clone(), content, is_error: true };
+            }
+        };
+        let mut blocked: Option<String> = None;
+        if let Err(reason) = self.hooks.pre_tool(call).await {
+            blocked = Some(reason);
+        }
+        if blocked.is_none() {
+            for mw in &self.middlewares {
+                if let Err(reason) = mw.before(call, &tool, &self.rt).await {
+                    blocked = Some(reason);
+                    break;
+                }
+            }
+        }
+        let mut result = if let Some(reason) = blocked {
+            ToolResult { call_id: call.id.clone(), content: format!("blocked: {reason}"), is_error: true }
+        } else {
+            let ctx = ToolContext { working_dir: std::env::current_dir().unwrap_or_default() };
+            let mut r = tool.execute(&call.arguments, &ctx).await;
+            r.call_id = call.id.clone();
+            r
+        };
+        self.hooks.post_tool(&mut result).await;
+        if result.is_error {
+            self.hooks.on_error(&result.content).await;
+        }
+        result
     }
 }
 

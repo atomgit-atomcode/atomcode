@@ -52,6 +52,11 @@ pub trait Tool: Send + Sync {
     fn risk(&self) -> RiskLevel {
         RiskLevel::Safe
     }
+    /// Whether this tool is safe to run concurrently with other tools in the same
+    /// batch. Conservative default: false (serial). Read-only tools opt in to true.
+    fn parallel_safe(&self) -> bool {
+        false
+    }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult;
 }
 

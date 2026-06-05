@@ -19,6 +19,7 @@ the proven production hot-paths into.
 | 8. Execution-state recorded (Message.meta) + projected to LLM (tail reminder) + cache-safe | `tests/spike_claims.rs::execution_state_recorded_projected_to_llm_and_cache_safe` |
 | 9. Round budget projected to LLM ("round X/Y") + hard cap, recorded in meta.round, cache-safe | `tests/spike_claims.rs::round_budget_projected_to_llm_and_hard_capped` |
 | 10. on_model_response gets `&mut Message` — can transform the response; transform lands in storage (via Snapshot) | `tests/spike_claims.rs::on_model_response_can_transform_response_into_storage` |
+| 11. Tools declare `parallel_safe`; kernel runs consecutive safe tools concurrently, others serial; results in call order | `tests/spike_claims.rs::parallel_safe_tools_run_concurrently_others_serial` |
 
 ## Driver model
 
