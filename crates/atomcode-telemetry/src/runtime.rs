@@ -157,6 +157,8 @@ pub enum TelemetryError {
     Disabled,
     #[error("telemetry queue unavailable")]
     QueueUnavailable,
+    #[error("telemetry queue busy")]
+    QueueBusy,
     #[error("telemetry queue append failed: {0}")]
     QueueAppend(#[source] anyhow::Error),
     #[error("telemetry queue roll failed: {0}")]
@@ -301,6 +303,29 @@ impl Telemetry {
         q.force_roll().map_err(TelemetryError::QueueRoll)?;
         self.counters.events_tracked.fetch_add(1, Ordering::Relaxed);
         tracing::debug!("telemetry event durably queued");
+        Ok(())
+    }
+
+    /// Best-effort synchronous durable emit for legacy blocking flows.
+    ///
+    /// This is intentionally non-blocking on the async queue mutex: login runs
+    /// through a few synchronous call paths, including TUI rendering code, and
+    /// blocking a Tokio worker here would be riskier than falling back to the
+    /// regular async queue at the call site.
+    pub fn track_durable_sync(&self, event: Event) -> Result<(), TelemetryError> {
+        if !self.enabled {
+            return Err(TelemetryError::Disabled);
+        }
+        let queue = self
+            .queue
+            .as_ref()
+            .ok_or(TelemetryError::QueueUnavailable)?;
+        let record = self.build_record(event);
+        let mut q = queue.try_lock().map_err(|_| TelemetryError::QueueBusy)?;
+        q.append(&record).map_err(TelemetryError::QueueAppend)?;
+        q.force_roll().map_err(TelemetryError::QueueRoll)?;
+        self.counters.events_tracked.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("telemetry event durably queued synchronously");
         Ok(())
     }
 
@@ -850,7 +875,7 @@ mod install_completed_tests {
         .unwrap();
     }
 
-    fn install_completed_records(dir: &TempDir) -> Vec<Value> {
+    fn records_for_event(dir: &TempDir, event_id: &str) -> Vec<Value> {
         let queue_dir = dir.path().join("telemetry/queue");
         let mut records = Vec::new();
         for entry in std::fs::read_dir(queue_dir).unwrap() {
@@ -861,12 +886,16 @@ mod install_completed_tests {
             let contents = std::fs::read_to_string(path).unwrap();
             for line in contents.lines().filter(|line| !line.is_empty()) {
                 let value: Value = serde_json::from_str(line).unwrap();
-                if value.get("event_id").and_then(|v| v.as_str()) == Some("install_completed") {
+                if value.get("event_id").and_then(|v| v.as_str()) == Some(event_id) {
                     records.push(value);
                 }
             }
         }
         records
+    }
+
+    fn install_completed_records(dir: &TempDir) -> Vec<Value> {
+        records_for_event(dir, "install_completed")
     }
 
     fn referral_state_uuid(dir: &TempDir) -> Uuid {
@@ -891,6 +920,30 @@ mod install_completed_tests {
 
         assert_eq!(referral_state_uuid(&dir), install_uuid);
         let records = install_completed_records(&dir);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("invite_code").and_then(|v| v.as_str()),
+            Some("ABC12345")
+        );
+        assert_eq!(
+            records[0].get("install_uuid").and_then(|v| v.as_str()),
+            Some(install_uuid.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_durable_login_success_rolls_ready_segment() {
+        let dir = TempDir::new().unwrap();
+        let tel = enabled_telemetry(&dir);
+        let install_uuid = Uuid::new_v4();
+
+        tel.track_durable_sync(Event::LoginSuccess {
+            invite_code: Some("ABC12345".into()),
+            install_uuid: Some(install_uuid),
+        })
+        .unwrap();
+
+        let records = records_for_event(&dir, "login_success");
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].get("invite_code").and_then(|v| v.as_str()),

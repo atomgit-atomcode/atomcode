@@ -182,10 +182,17 @@ pub(crate) async fn auth_login_poll(
                     .telemetry
                     .set_account_id(Some(user.id.to_string()));
                 let (invite_code, install_uuid) = pending_invite_for_login();
-                state_inner.telemetry.track(Event::LoginSuccess {
+                let event = Event::LoginSuccess {
                     invite_code,
                     install_uuid,
-                });
+                };
+                if let Err(e) = state_inner.telemetry.track_durable(event.clone()).await {
+                    tracing::warn!(
+                        ?e,
+                        "login_success durable enqueue failed; falling back to async telemetry"
+                    );
+                    state_inner.telemetry.track(event);
+                }
                 Json(LoginPollResponse {
                     status: "authorized".to_string(),
                     user: Some(user),
