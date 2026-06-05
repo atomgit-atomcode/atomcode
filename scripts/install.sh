@@ -15,7 +15,7 @@
 set -eu
 
 # Fallback version used only when ATOMCODE_VERSION is unset and the API lookup fails.
-DEFAULT_VERSION="v4.24.2"
+DEFAULT_VERSION="v4.25.0"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 REPO_LATEST_API="https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
 
