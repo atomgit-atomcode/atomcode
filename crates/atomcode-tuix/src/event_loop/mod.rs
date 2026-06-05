@@ -6091,15 +6091,17 @@ fn handle_streaming_key(
 /// (`current_live_session().approve`), exactly like the webui's
 /// `/live/permission`. Sending it to the TUI agent (which isn't running this
 /// turn) leaves the tool blocked forever: the "Running … 141s, and the webui
-/// approval card never closes" bug. `ApproveToolAlways` degrades to `Allow`
-/// here — the live approver has no persistent "always" slot, matching the
-/// webui path. In normal (non-sync) mode the decision goes to the TUI agent
+/// approval card never closes" bug. `ApproveToolAlways` sends `AllowAlways` so
+/// the LiveSession's decider persists a session grant (grant_session /
+/// grant_session_scope), exactly like the webui's "always allow this session"
+/// path. In normal (non-sync) mode the decision goes to the TUI agent
 /// as before.
 fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
     if ctx.sync_forwarder.is_some() {
         let decision = match cmd {
-            AgentCommand::ApproveTool | AgentCommand::ApproveToolAlways => {
-                atomcode_core::tool::PermissionDecision::Allow
+            AgentCommand::ApproveTool => atomcode_core::tool::PermissionDecision::Allow,
+            AgentCommand::ApproveToolAlways => {
+                atomcode_core::tool::PermissionDecision::AllowAlways
             }
             _ => atomcode_core::tool::PermissionDecision::Deny,
         };
