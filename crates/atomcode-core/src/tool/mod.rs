@@ -26,7 +26,7 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -545,7 +545,7 @@ fn is_sensitive_path(path: &Path) -> bool {
     ];
     #[cfg(target_os = "windows")]
     const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[];
-    const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config"];
+    const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg"];
     const SECRET_FILE_NAMES: &[&str] = &[
         ".bashrc",
         ".bash_profile",
@@ -557,7 +557,6 @@ fn is_sensitive_path(path: &Path) -> bool {
         ".env",
         ".env.local",
         "credentials",
-        "config",
         "id_rsa",
         "id_dsa",
         "id_ecdsa",
@@ -664,10 +663,15 @@ pub fn approval_for_path(
     Ok(match action {
         ExternalPathAction::Enumerate => {
             if sensitive {
-                ApprovalRequirement::RequireApprovalAlways(format!(
-                    "{}. This path looks sensitive and always requires confirmation.",
-                    base_reason
-                ))
+                // Listing a sensitive dir is less dangerous than reading its
+                // contents — match Read's scoped behaviour: one [A] remembers
+                // this exact path, every other sensitive path still prompts.
+                ApprovalRequirement::RequireApprovalScoped {
+                    reason: format!(
+                        "{base_reason}. This path looks sensitive and requires confirmation."
+                    ),
+                    scope: access.path.to_string_lossy().into_owned(),
+                }
             } else {
                 ApprovalRequirement::AutoApprove
             }
@@ -739,19 +743,6 @@ pub enum ApprovalRequirement {
     RequireApprovalScoped { reason: String, scope: String },
 }
 
-/// Coarse-grained permission level for a tool, stored in `PermissionStore`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PermissionLevel {
-    /// Never ask — always execute automatically.
-    AlwaysAllow,
-    /// Ask every time (default for destructive operations).
-    Ask,
-    /// Allowed for the duration of the current session.
-    SessionAllow,
-    /// Never execute.
-    AlwaysDeny,
-}
-
 /// The resolved decision returned by `PermissionStore::check` or by an
 /// interactive responder.
 #[derive(Debug, Clone)]
@@ -776,10 +767,8 @@ pub fn parse_permission_decision(s: &str) -> PermissionDecision {
     }
 }
 
-/// Stores per-tool permission overrides and session-level grants.
+/// Stores per-tool session-level grants.
 pub struct PermissionStore {
-    /// Per-tool level overrides: tool_name → level.
-    overrides: HashMap<String, PermissionLevel>,
     /// Session-level grants: tool names approved with [A]lways for this session.
     session_grants: HashSet<String>,
     /// Session-level scoped grants: resource keys (e.g. canonical file paths)
@@ -791,7 +780,6 @@ pub struct PermissionStore {
 impl PermissionStore {
     pub fn new() -> Self {
         Self {
-            overrides: HashMap::new(),
             session_grants: HashSet::new(),
             session_scope_grants: HashSet::new(),
         }
@@ -829,18 +817,8 @@ impl PermissionStore {
         if let ApprovalRequirement::RequireApproval(reason) = approval {
             return PermissionDecision::Ask(reason.clone());
         }
-        // 3. Explicit per-tool override (only reached for AutoApprove tools).
-        if let Some(level) = self.overrides.get(tool_name) {
-            match level {
-                PermissionLevel::AlwaysAllow | PermissionLevel::SessionAllow => {
-                    return PermissionDecision::Allow;
-                }
-                PermissionLevel::AlwaysDeny => return PermissionDecision::Deny,
-                PermissionLevel::Ask => {} // fall through to normal logic
-            }
-        }
 
-        // 4. Defer to the tool's own approval requirement.
+        // 3. Defer to the tool's own approval requirement (AutoApprove path).
         PermissionDecision::Allow
     }
 
@@ -855,10 +833,6 @@ impl PermissionStore {
         self.session_scope_grants.insert(scope.to_string());
     }
 
-    /// Set an explicit override level for a tool.
-    pub fn set_override(&mut self, tool_name: &str, level: PermissionLevel) {
-        self.overrides.insert(tool_name.to_string(), level);
-    }
 }
 
 /// Shared execution context passed to every tool invocation.
@@ -1622,6 +1596,27 @@ mod tests {
     }
 
     #[test]
+    fn enumerate_sensitive_outside_workspace_is_scoped_not_always() {
+        let workspace = TempDir::new().unwrap();
+        let home = real_home_dir().expect("home");
+        let ssh = home.join(".ssh");
+        let approval = approval_for_path(
+            &ssh.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Enumerate,
+        )
+        .expect("approval");
+        match approval {
+            ApprovalRequirement::RequireApprovalScoped { scope, .. } => {
+                // scope is the canonical path; .ssh may or may not exist on
+                // this machine, so just assert the scope string is non-empty.
+                assert!(!scope.is_empty(), "scope should be a non-empty path");
+            }
+            _ => panic!("expected RequireApprovalScoped for sensitive enumeration outside workspace"),
+        }
+    }
+
+    #[test]
     fn approval_for_write_outside_workspace_requires_always() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
@@ -1818,27 +1813,6 @@ mod tests {
         store.grant_session("bash");
         let decision = store.check("bash", &ApprovalRequirement::AutoApprove);
         assert!(matches!(decision, PermissionDecision::Allow));
-    }
-
-    #[test]
-    fn test_permission_store_always_deny_override() {
-        let mut store = PermissionStore::new();
-        store.set_override("bash", PermissionLevel::AlwaysDeny);
-        // Even AutoApprove is blocked.
-        let decision = store.check("bash", &ApprovalRequirement::AutoApprove);
-        assert!(matches!(decision, PermissionDecision::Deny));
-    }
-
-    #[test]
-    fn test_permission_store_always_allow_cannot_bypass_destructive() {
-        // Even AlwaysAllow override must NOT bypass RequireApproval.
-        let mut store = PermissionStore::new();
-        store.set_override("bash", PermissionLevel::AlwaysAllow);
-        let decision = store.check(
-            "bash",
-            &ApprovalRequirement::RequireApproval("Destructive".into()),
-        );
-        assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
     #[tokio::test]
@@ -2222,5 +2196,22 @@ mod tests {
         assert!(is_sensitive_path(Path::new("/System/Library/CoreServices/boot.efi")));
         assert!(is_sensitive_path(Path::new("/etc/passwd")));
         assert!(is_sensitive_path(Path::new("/var/log/syslog")));
+    }
+
+    #[test]
+    fn config_dir_and_bare_config_no_longer_sensitive() {
+        let home = real_home_dir().expect("home");
+        // ~/.config/<app>/settings is ordinary app config, not a secret.
+        assert!(!is_sensitive_path(&home.join(".config").join("app").join("settings.toml")));
+        // A bare file named `config` outside the workspace is not a secret.
+        assert!(!is_sensitive_path(std::path::Path::new("/tmp/somewhere/config")));
+    }
+
+    #[test]
+    fn real_secrets_still_sensitive() {
+        let home = real_home_dir().expect("home");
+        assert!(is_sensitive_path(&home.join(".ssh").join("id_rsa")));
+        assert!(is_sensitive_path(&home.join(".aws").join("credentials")));
+        assert!(is_sensitive_path(std::path::Path::new("/tmp/x/server.key")));
     }
 }

@@ -158,20 +158,18 @@ fn err_result(msg: impl Into<String>) -> ToolResult {
     }
 }
 
-fn host_is_auto_approved(host: &str) -> bool {
-    const ALLOWLIST: &[&str] = &[
-        "github.com",
-        "docs.rs",
-        "raw.githubusercontent.com",
-        "atomgit.com",
-        "gitcode.com",
-        "csdn.net",
-        "openatom.cn",
-    ];
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    ALLOWLIST
-        .iter()
-        .any(|allowed| host == *allowed || host.ends_with(&format!(".{}", allowed)))
+/// Whether a fetch to `host` should still prompt. Public hostnames auto-approve
+/// (execute() re-validates resolved IPs against SSRF rules); only loopback /
+/// private / link-local literals and `localhost`/`.local` names prompt.
+fn host_needs_approval(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return is_safe_ip(ip).is_err();
+    }
+    false
 }
 
 #[async_trait]
@@ -199,22 +197,22 @@ impl Tool for WebFetchTool {
     }
 
     fn approval(&self, args: &str) -> ApprovalRequirement {
-        // Check if the URL host is in the allowlist.
-        // Unknown domains require user approval.
         let parsed: Result<WebFetchArgs, _> = serde_json::from_str(args);
         match parsed {
             Ok(p) => {
                 if let Ok(url) = url::Url::parse(&p.url) {
                     if let Some(host) = url.host_str() {
-                        if host_is_auto_approved(host) {
-                            return ApprovalRequirement::AutoApprove;
+                        if host_needs_approval(host) {
+                            return ApprovalRequirement::RequireApproval(format!(
+                                "web_fetch 请求访问 {}",
+                                p.url
+                            ));
                         }
                     }
                 }
-                ApprovalRequirement::RequireApproval(format!(
-                    "web_fetch 请求访问 {}",
-                    p.url
-                ))
+                // Public host (or unparseable host) → auto-approve; execute()
+                // enforces SSRF protection on the resolved address.
+                ApprovalRequirement::AutoApprove
             }
             Err(_) => ApprovalRequirement::AutoApprove, // malformed args: let execute() handle the error
         }
@@ -662,50 +660,6 @@ mod tests {
         assert!(validate_scheme(&Url::parse("dict://evil.com/").unwrap()).is_err());
     }
 
-    // ── Auto-approve allowlist ─────────────────────────────────────────────
-
-    #[test]
-    fn auto_approve_known_docs() {
-        assert!(host_is_auto_approved("github.com"));
-        assert!(host_is_auto_approved("api.github.com"));
-        assert!(host_is_auto_approved("docs.rs"));
-        assert!(host_is_auto_approved("raw.githubusercontent.com"));
-    }
-
-    #[test]
-    fn auto_approve_chinese_dev_ecosystem() {
-        // Apex + www subdomain for each — matches real URLs users hand the model.
-        assert!(host_is_auto_approved("atomgit.com"));
-        assert!(host_is_auto_approved("www.atomgit.com"));
-        assert!(host_is_auto_approved("api.atomgit.com"));
-        assert!(host_is_auto_approved("gitcode.com"));
-        assert!(host_is_auto_approved("www.gitcode.com"));
-        assert!(host_is_auto_approved("csdn.net"));
-        assert!(host_is_auto_approved("www.csdn.net"));
-        assert!(host_is_auto_approved("blog.csdn.net"));
-        assert!(host_is_auto_approved("openatom.cn"));
-        assert!(host_is_auto_approved("www.openatom.cn"));
-    }
-
-    #[test]
-    fn auto_approve_is_exact_suffix_match_only() {
-        // Must not match e.g. "evilgithub.com" or "github.com.evil.com".
-        assert!(!host_is_auto_approved("evilgithub.com"));
-        assert!(!host_is_auto_approved("github.com.evil.com"));
-        assert!(!host_is_auto_approved("notdocs.rs"));
-    }
-
-    #[test]
-    fn auto_approve_trailing_dot_tolerated() {
-        // DNS-legal trailing dot shouldn't bypass the match.
-        assert!(host_is_auto_approved("github.com."));
-    }
-
-    #[test]
-    fn auto_approve_is_case_insensitive() {
-        assert!(host_is_auto_approved("GitHub.com"));
-    }
-
     // ── approval() end-to-end ──────────────────────────────────────────────
 
     #[test]
@@ -719,13 +673,12 @@ mod tests {
     }
 
     #[test]
-    fn approval_file_scheme_requires_approval() {
+    fn approval_file_scheme_auto_approves() {
+        // file:// has no host → host_needs_approval returns false → AutoApprove.
+        // execute() still hard-rejects via validate_scheme, so this is safe.
         let tool = WebFetchTool;
         let args = r#"{"url":"file:///etc/passwd"}"#;
-        assert!(matches!(
-            tool.approval(args),
-            ApprovalRequirement::RequireApproval(_)
-        ));
+        assert!(matches!(tool.approval(args), ApprovalRequirement::AutoApprove));
     }
 
     #[test]
@@ -739,9 +692,16 @@ mod tests {
     }
 
     #[test]
-    fn approval_unknown_domain_requires_approval() {
+    fn approval_auto_approves_unknown_public_domain() {
         let tool = WebFetchTool;
-        let args = r#"{"url":"https://example.com/"}"#;
+        let args = r#"{"url":"https://some-random-blog.example/"}"#;
+        assert!(matches!(tool.approval(args), ApprovalRequirement::AutoApprove));
+    }
+
+    #[test]
+    fn approval_private_ip_requires_approval() {
+        let tool = WebFetchTool;
+        let args = r#"{"url":"http://192.168.1.1/"}"#;
         assert!(matches!(
             tool.approval(args),
             ApprovalRequirement::RequireApproval(_)

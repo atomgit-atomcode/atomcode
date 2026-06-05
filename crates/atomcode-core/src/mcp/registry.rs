@@ -29,6 +29,11 @@ pub enum McpConnectEvent {
 /// Registry of connected MCP servers.
 pub struct McpRegistry {
     servers: Arc<RwLock<BTreeMap<String, Arc<dyn McpClient>>>>,
+    /// Server names whose tools are auto-approved (config `trust: true`).
+    trusted_servers: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// Full tool names (`mcp__{server}__{tool}`) permanently auto-approved via
+    /// each server's `autoApprove` config list.
+    auto_approved_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     server_timeouts_ms: Arc<RwLock<BTreeMap<String, u64>>>,
     /// Servers whose initial connect failed. The TUI's `/mcp` listing
     /// surfaces these as `failed: <error>` so a misconfigured server
@@ -48,6 +53,8 @@ impl McpRegistry {
     pub fn new() -> Self {
         Self {
             servers: Arc::new(RwLock::new(BTreeMap::new())),
+            trusted_servers: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            auto_approved_tools: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
             failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
             connect_events: None,
@@ -68,6 +75,8 @@ impl McpRegistry {
         (
             Self {
                 servers: Arc::new(RwLock::new(BTreeMap::new())),
+                trusted_servers: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+                auto_approved_tools: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
                 server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
                 failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
                 connect_events: Some(tx),
@@ -120,6 +129,8 @@ impl McpRegistry {
             let failed_servers = registry.failed_servers.clone();
             let initial_ready = registry.initial_ready.clone();
             let telemetry = registry.telemetry.clone();
+            let trusted_servers = registry.trusted_servers.clone();
+            let auto_approved_tools = registry.auto_approved_tools.clone();
             tokio::spawn(async move {
                 // Connect servers in parallel
                 let tasks: Vec<_> = configs
@@ -130,6 +141,8 @@ impl McpRegistry {
                         let failed_servers = failed_servers.clone();
                         let tx = combined_tx.clone();
                         let telemetry = telemetry.clone();
+                        let trusted_servers = trusted_servers.clone();
+                        let auto_approved_tools = auto_approved_tools.clone();
                         async move {
                             let name = config.name.clone();
                             let timeout_ms = config.timeout_ms();
@@ -172,6 +185,15 @@ impl McpRegistry {
                                     let mut servers = servers.write().await;
                                     servers.insert(name.clone(), Arc::from(client));
                                     drop(servers);
+                                    if config.trust {
+                                        trusted_servers.write().unwrap().insert(name.clone());
+                                    }
+                                    for tool in &config.auto_approve {
+                                        auto_approved_tools
+                                            .write()
+                                            .unwrap()
+                                            .insert(format!("mcp__{}__{}", name, tool));
+                                    }
                                     let mut timeouts = server_timeouts_ms.write().await;
                                     timeouts.insert(name.clone(), timeout_ms);
                                     let mut failed = failed_servers.write().await;
@@ -269,6 +291,35 @@ impl McpRegistry {
         registry
     }
 
+    /// Mark a server as trusted (its tools auto-approve). Tests + config-load (`trust: true`).
+    pub fn mark_trusted(&self, server_name: &str) {
+        self.trusted_servers.write().unwrap().insert(server_name.to_string());
+    }
+    /// Whether a server's tools should bypass interactive approval.
+    pub fn is_server_trusted(&self, server_name: &str) -> bool {
+        self.trusted_servers.read().unwrap().contains(server_name)
+    }
+    /// Permanently auto-approve a single tool (full name `mcp__{server}__{tool}`).
+    pub fn mark_tool_auto_approved(&self, full_tool_name: &str) {
+        self.auto_approved_tools.write().unwrap().insert(full_tool_name.to_string());
+    }
+    /// Whether a specific tool is permanently auto-approved.
+    pub fn is_tool_auto_approved(&self, full_tool_name: &str) -> bool {
+        self.auto_approved_tools.read().unwrap().contains(full_tool_name)
+    }
+    /// Split a full MCP tool name (`mcp__{server}__{tool}`) into (server, tool),
+    /// matching known server names so server names containing `__` still resolve.
+    pub async fn split_tool_name(&self, full: &str) -> Option<(String, String)> {
+        let rest = full.strip_prefix("mcp__")?;
+        let servers = self.servers.read().await;
+        for name in servers.keys() {
+            if let Some(tool) = rest.strip_prefix(&format!("{name}__")) {
+                return Some((name.clone(), tool.to_string()));
+            }
+        }
+        None
+    }
+
     /// Add a server to the registry.
     pub async fn add_server(&self, config: McpServerConfig) -> Result<()> {
         let mut client: Box<dyn McpClient> = match &config.config {
@@ -310,6 +361,15 @@ impl McpRegistry {
         let mut servers = self.servers.write().await;
         servers.insert(config.name.clone(), Arc::from(client));
         drop(servers);
+        if config.trust {
+            self.trusted_servers.write().unwrap().insert(config.name.clone());
+        }
+        for tool in &config.auto_approve {
+            self.auto_approved_tools
+                .write()
+                .unwrap()
+                .insert(format!("mcp__{}__{}", config.name, tool));
+        }
         let mut timeouts = self.server_timeouts_ms.write().await;
         timeouts.insert(config.name.clone(), config.timeout_ms());
         let mut failed = self.failed_servers.write().await;
@@ -476,6 +536,8 @@ impl McpRegistry {
     pub fn share(&self) -> Arc<Self> {
         Arc::new(Self {
             servers: self.servers.clone(),
+            trusted_servers: self.trusted_servers.clone(),
+            auto_approved_tools: self.auto_approved_tools.clone(),
             server_timeouts_ms: self.server_timeouts_ms.clone(),
             failed_servers: self.failed_servers.clone(),
             connect_events: self.connect_events.clone(),
@@ -535,6 +597,8 @@ mod tests {
             name: "broken".to_string(),
             source: super::super::config::McpConfigSource::Project,
             disabled: false,
+            trust: false,
+            auto_approve: vec![],
             config: super::super::config::McpTransportConfig::Stdio {
                 // Deliberately bogus binary so spawn() fails fast.
                 command: "/nonexistent/atomcode-mcp-test-binary".to_string(),

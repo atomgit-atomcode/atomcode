@@ -1159,7 +1159,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     <PermissionCard
       req={{ session_id: '', tool_name: livePending.tool_name, reason: livePending.reason, call_id: livePending.call_id, arguments: livePending.arguments }}
       onDone={() => setLivePending((cur) => resolvePendingAfterDecision(cur, livePending.call_id))}
-      onDecide={async (decision) => { await postLivePermission(decision); }}
+      onDecide={async (decision, toolName) => { await postLivePermission(decision, toolName); }}
     />
   );
 
