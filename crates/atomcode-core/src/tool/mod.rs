@@ -545,7 +545,7 @@ fn is_sensitive_path(path: &Path) -> bool {
     ];
     #[cfg(target_os = "windows")]
     const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[];
-    const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config"];
+    const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg"];
     const SECRET_FILE_NAMES: &[&str] = &[
         ".bashrc",
         ".bash_profile",
@@ -557,7 +557,6 @@ fn is_sensitive_path(path: &Path) -> bool {
         ".env",
         ".env.local",
         "credentials",
-        "config",
         "id_rsa",
         "id_dsa",
         "id_ecdsa",
@@ -2156,5 +2155,22 @@ mod tests {
         assert!(is_sensitive_path(Path::new("/System/Library/CoreServices/boot.efi")));
         assert!(is_sensitive_path(Path::new("/etc/passwd")));
         assert!(is_sensitive_path(Path::new("/var/log/syslog")));
+    }
+
+    #[test]
+    fn config_dir_and_bare_config_no_longer_sensitive() {
+        let home = real_home_dir().expect("home");
+        // ~/.config/<app>/settings is ordinary app config, not a secret.
+        assert!(!is_sensitive_path(&home.join(".config").join("app").join("settings.toml")));
+        // A bare file named `config` outside the workspace is not a secret.
+        assert!(!is_sensitive_path(std::path::Path::new("/tmp/somewhere/config")));
+    }
+
+    #[test]
+    fn real_secrets_still_sensitive() {
+        let home = real_home_dir().expect("home");
+        assert!(is_sensitive_path(&home.join(".ssh").join("id_rsa")));
+        assert!(is_sensitive_path(&home.join(".aws").join("credentials")));
+        assert!(is_sensitive_path(std::path::Path::new("/tmp/x/server.key")));
     }
 }
