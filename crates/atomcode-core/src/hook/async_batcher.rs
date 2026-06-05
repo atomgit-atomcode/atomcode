@@ -367,7 +367,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Helper to create a test config with mininal fields
+    /// Helper to create a test config with minimal fields
     fn test_config(name: &str, url: &str) -> AsyncWebhookConfig {
         AsyncWebhookConfig {
             name: name.to_string(),
