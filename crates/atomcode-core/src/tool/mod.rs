@@ -663,10 +663,15 @@ pub fn approval_for_path(
     Ok(match action {
         ExternalPathAction::Enumerate => {
             if sensitive {
-                ApprovalRequirement::RequireApprovalAlways(format!(
-                    "{}. This path looks sensitive and always requires confirmation.",
-                    base_reason
-                ))
+                // Listing a sensitive dir is less dangerous than reading its
+                // contents — match Read's scoped behaviour: one [A] remembers
+                // this exact path, every other sensitive path still prompts.
+                ApprovalRequirement::RequireApprovalScoped {
+                    reason: format!(
+                        "{base_reason}. This path looks sensitive and requires confirmation."
+                    ),
+                    scope: access.path.to_string_lossy().into_owned(),
+                }
             } else {
                 ApprovalRequirement::AutoApprove
             }
@@ -1573,6 +1578,27 @@ mod tests {
         assert!(!is_sensitive_path(Path::new(
             "/private/var/folders/xx/yy/T/file.txt"
         )));
+    }
+
+    #[test]
+    fn enumerate_sensitive_outside_workspace_is_scoped_not_always() {
+        let workspace = TempDir::new().unwrap();
+        let home = real_home_dir().expect("home");
+        let ssh = home.join(".ssh");
+        let approval = approval_for_path(
+            &ssh.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Enumerate,
+        )
+        .expect("approval");
+        match approval {
+            ApprovalRequirement::RequireApprovalScoped { scope, .. } => {
+                // scope is the canonical path; .ssh may or may not exist on
+                // this machine, so just assert the scope string is non-empty.
+                assert!(!scope.is_empty(), "scope should be a non-empty path");
+            }
+            _ => panic!("expected RequireApprovalScoped for sensitive enumeration outside workspace"),
+        }
     }
 
     #[test]
