@@ -1647,10 +1647,10 @@ impl AgentLoop {
             crate::hook::UserPromptHookResult::Warning(msg) => {
                 // Non-fatal: show inline warning + status-bar hint, continue turn.
                 let _ = self.event_tx.send(AgentEvent::Warning(
-                    format!("Hook 执行异常，已跳过：{}", msg),
+                    format!("Hook skipped (error): {}", msg),
                 ));
                 let _ = self.event_tx.send(AgentEvent::HookWarningHint(
-                    format!("Hook 异常: {}", msg),
+                    format!("Hook error: {}", msg),
                 ));
             }
         }
