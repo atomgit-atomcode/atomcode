@@ -770,10 +770,31 @@ async fn async_main() {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::Globalization::CP_UTF8;
-        use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+        use windows_sys::Win32::System::Console::{GetConsoleCP, SetConsoleCP, SetConsoleOutputCP};
         unsafe {
             SetConsoleOutputCP(CP_UTF8);
             SetConsoleCP(CP_UTF8);
+
+            // SetConsoleCP(CP_UTF8) is best-effort — some IMEs ignore it and
+            // keep outputting in the system ANSI code page (e.g. CP936/GBK on
+            // Chinese Windows). When the console then interprets those bytes as
+            // UTF-8, CJK input renders as garbled mojibake. Detect the mismatch
+            // early so users know why their IME isn't working.
+            //
+            // We use eprintln! rather than a direct WriteConsoleW because at
+            // this early point in async_main the TUI has not yet taken over the
+            // terminal. stderr is still connected to the console and the
+            // message will be visible inline in PowerShell / conhost.
+            let actual_cp = GetConsoleCP();
+            if actual_cp != CP_UTF8 {
+                let _ = eprintln!(
+                    "\n⚠  Console input code page is {} (expected 65001/UTF-8).\n\
+                       Chinese/Japanese/Korean IME input may show garbled text.\n\
+                       → Use Windows Terminal for native UTF-8 support.\n\
+                       → Or enable Beta: Use Unicode UTF-8 in Region settings.\n",
+                    actual_cp,
+                );
+            }
         }
     }
 

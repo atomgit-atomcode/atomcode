@@ -44,6 +44,39 @@ fn main() {
         println!("cargo:rerun-if-changed={}", icon);
         let mut res = winresource::WindowsResource::new();
         res.set_icon(icon);
+
+        // Embed the UTF-8 activeCodePage manifest so the process runs with
+        // UTF-8 as its ANSI code page from the moment the loader creates it.
+        // This is more reliable than SetConsoleCP(CP_UTF8) alone, which is a
+        // best-effort console-level setting that some IMEs ignore. Supported
+        // on Windows 10 1903+; silently ignored on older builds.
+        //
+        // The manifest also includes standard DPI awareness and supportedOS
+        // declarations so we don't lose the defaults that the MSVC CRT would
+        // otherwise embed. For mingw targets (which this project uses), these
+        // are not provided by the toolchain, so we supply them ourselves.
+        res.set_manifest(
+            r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application>
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+    <supportedOS>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+    </supportedOS>
+  </application>
+</assembly>"#,
+        );
+        // FILETYPE must be set for winresource to write the manifest block
+        // into the .rc file (it gates on this key at line 578 of lib.rs).
+        res.set_version_info(winresource::VersionInfo::FILETYPE, 1);
+
         if let Err(e) = res.compile() {
             println!("cargo:warning=winresource compile failed: {}", e);
         }
