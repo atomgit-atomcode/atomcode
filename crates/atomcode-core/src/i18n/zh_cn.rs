@@ -916,7 +916,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "\u{26a0} BYPASS".into(),
 
         Msg::AdminWarningBanner =>
-            "\u{26a0} 警告：正在以管理员权限运行。\n   模型可能可以访问系统文件。\n   请在 /codingplan 中配置\"信任目录\"以限制文件访问。\n".into(),
+            "\x1b[33m\u{26a0} 警告：正在以管理员权限运行。\n   模型可能可以访问系统文件。\n   请在 /codingplan 中配置\"信任目录\"以限制文件访问。\x1b[39m\n".into(),
         Msg::AdminWarningHeadless =>
             "[warning] 正在以管理员权限运行 — 模型可能可以访问系统文件。".into(),
 
