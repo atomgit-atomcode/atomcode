@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 /// Returns scripted stream events (one Vec per call) and RECORDS the messages it
@@ -87,7 +88,9 @@ impl Tool for RiskyWriteTool {
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}})
     }
-    fn risk(&self) -> RiskLevel { RiskLevel::Risky }
+    fn risk(&self, _args: &str) -> RiskLevel {
+        RiskLevel::Risky
+    }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         ToolResult { call_id: String::new(), content: format!("wrote: {args}"), is_error: false }
     }
@@ -122,10 +125,28 @@ impl LifecycleHooks for ContinueOnceHook {
     }
 }
 
-/// Specialization-side middleware: gates Risky tools by round-tripping an
-/// "approval" request to the driver via the kernel's GENERIC RequestCtx seam.
-/// The kernel itself has no idea this is "approval".
-pub struct ApprovalMiddleware;
+/// Specialization-side approval gate for risky tool calls. Reads the tool's
+/// ARG-AWARE risk; for a risky call it checks a session-grant cache ("remember")
+/// and, if not yet granted, round-trips an "approval" request to the driver over
+/// the kernel's generic RequestCtx seam. The kernel knows none of this.
+pub struct ApprovalMiddleware {
+    granted: Arc<Mutex<HashSet<String>>>,
+}
+
+impl ApprovalMiddleware {
+    pub fn new() -> Self {
+        Self { granted: Arc::new(Mutex::new(HashSet::new())) }
+    }
+    fn grant_key(call: &ToolCall) -> String {
+        format!("{}::{}", call.name, call.arguments)
+    }
+}
+
+impl Default for ApprovalMiddleware {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl ToolMiddleware for ApprovalMiddleware {
@@ -135,20 +156,30 @@ impl ToolMiddleware for ApprovalMiddleware {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> Result<(), String> {
-        if tool.risk() == RiskLevel::Safe {
+        // Safe call (arg-aware) → no approval.
+        if tool.risk(&call.arguments) == RiskLevel::Safe {
             return Ok(());
         }
+        // Session grant cache: an identical risky call already approved-always.
+        let key = Self::grant_key(call);
+        if self.granted.lock().unwrap().contains(&key) {
+            return Ok(());
+        }
+        // Round-trip to the driver for a decision.
         let decision = rt
             .request(
                 "approval",
-                serde_json::json!({ "tool": tool.name(), "call_id": call.id, "args": call.arguments }),
+                serde_json::json!({ "tool": tool.name(), "args": call.arguments }),
             )
             .await;
-        if decision.get("decision").and_then(|d| d.as_str()) == Some("allow") {
-            Ok(())
-        } else {
-            Err("denied".into())
+        if decision.get("decision").and_then(|d| d.as_str()) != Some("allow") {
+            return Err("denied".to_string());
         }
+        // "remember" → cache the grant so the same command is not asked again.
+        if decision.get("remember").and_then(|r| r.as_bool()) == Some(true) {
+            self.granted.lock().unwrap().insert(key);
+        }
+        Ok(())
     }
 }
 
@@ -233,6 +264,33 @@ impl LifecycleHooks for RedactHook {
         if response.text.contains("SECRET") {
             response.text = response.text.replace("SECRET", "[redacted]");
         }
+    }
+}
+
+/// A bash-like tool whose danger depends on the command (arg-aware risk).
+pub struct DangerousBashTool;
+
+#[async_trait]
+impl Tool for DangerousBashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+    fn description(&self) -> &str {
+        "Run a shell command"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {"cmd": {"type": "string"}}})
+    }
+    fn risk(&self, args: &str) -> RiskLevel {
+        const DANGEROUS: &[&str] = &["rm -rf", "sudo", "mkfs", "dd if=", ":(){"];
+        if DANGEROUS.iter().any(|p| args.contains(p)) {
+            RiskLevel::Risky
+        } else {
+            RiskLevel::Safe
+        }
+    }
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+        ToolResult { call_id: String::new(), content: format!("ran: {args}"), is_error: false }
     }
 }
 

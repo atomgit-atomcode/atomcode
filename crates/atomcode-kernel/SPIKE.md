@@ -21,6 +21,7 @@ the proven production hot-paths into.
 | 10. on_model_response gets `&mut Message` — can transform the response; transform lands in storage (via Snapshot) | `tests/spike_claims.rs::on_model_response_can_transform_response_into_storage` |
 | 11. on_model_response edits to tool_calls are honored (dropped call doesn't execute) | `tests/spike_claims.rs::dropping_tool_calls_in_on_model_response_prevents_execution` |
 | 12. pre_tool (`&mut ToolCall`) rewrites args + blocks before ToolStarted (no ghost row) | `tests/spike_claims.rs::pre_tool_rewrites_args_and_blocks_without_ghost_started` |
+| 13. Command-level approval — arg-aware `Tool::risk(args)`; ApprovalMiddleware gates dangerous commands, skips safe ones, caches session grants | `tests/spike_claims.rs::dangerous_command_requires_approval_safe_does_not_and_grant_is_cached` |
 
 ## Driver model
 
@@ -54,8 +55,11 @@ Execution-state feedback follows the rule: RECORD at `on_model_response` (kernel
 ## Key boundary facts
 
 - The kernel core (`agent.rs`, `event.rs`, `tool.rs`) never names "approval".
-  Tools carry only a `RiskLevel` flag; approval lives in
+  Tools carry an arg-aware `risk(&str) -> RiskLevel` method (the tool itself knows
+  which commands are dangerous); approval lives entirely in
   `testkit::ApprovalMiddleware` (specialization side) over `RequestCtx::request`.
+  `ApprovalMiddleware` also holds a session-grant cache so identical dangerous
+  commands are approved only once per session.
 - `ToolContext` carries no semantic/graph/lsp services — the kernel needs none.
 - Crate excluded from workspace `default-members`, so product builds are untouched.
 

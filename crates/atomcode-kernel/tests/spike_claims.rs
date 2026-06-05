@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, MessageSnapshot};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
-use atomcode_kernel::testkit::{ApprovalMiddleware, ArgRewriteHook, BlockToolHook, BudgetReminderHook, ContinueOnceHook, DropToolsHook, EchoTool, MockProvider, RecorderHook, RedactHook, RiskyWriteTool, RoundBudgetHook};
+use atomcode_kernel::testkit::{ApprovalMiddleware, ArgRewriteHook, BlockToolHook, BudgetReminderHook, ContinueOnceHook, DangerousBashTool, DropToolsHook, EchoTool, MockProvider, RecorderHook, RedactHook, RiskyWriteTool, RoundBudgetHook};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -58,7 +58,7 @@ async fn approval_middleware_gates_risky_tool_via_id_roundtrip() {
     let handle = Agent::builder()
         .provider(provider)
         .tools(reg.mount(&["risky_write"]))
-        .middleware(Arc::new(ApprovalMiddleware))
+        .middleware(Arc::new(ApprovalMiddleware::new()))
         .build()
         .spawn();
     let commands = handle.commands.clone();
@@ -99,7 +99,7 @@ async fn one_shot_adapter_auto_answers_and_aggregates() {
     let agent = Agent::builder()
         .provider(provider)
         .tools(reg.mount(&["risky_write"]))
-        .middleware(Arc::new(ApprovalMiddleware))
+        .middleware(Arc::new(ApprovalMiddleware::new()))
         .build();
     let outcome = agent.run_to_completion("write it", AutoRespond::AllowAll).await;
 
@@ -478,5 +478,92 @@ async fn pre_tool_rewrites_args_and_blocks_without_ghost_started() {
         let _ = handle.task.await;
         assert!(!started, "a tool blocked by pre_tool must NOT emit a ghost ToolStarted");
         assert!(blocked_result, "a blocked tool still yields a ToolResult");
+    }
+}
+
+// CLAIM 13: command-level approval — risk is ARG-AWARE (dangerous command → gated,
+// safe command → not gated), and a session grant ("remember") caches so an
+// identical dangerous command isn't asked twice.
+#[tokio::test]
+async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached() {
+    // --- Phase A: a SAFE command needs no approval ---
+    {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(DangerousBashTool));
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "bash".into(), arguments: "{\"cmd\":\"ls\"}".into() }), StreamEvent::Done],
+            vec![StreamEvent::Done],
+        ]));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["bash"]))
+            .middleware(Arc::new(ApprovalMiddleware::new()))
+            .build()
+            .spawn();
+        handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+        let mut asked = 0;
+        let mut ran = false;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Request { kind, .. } if kind == "approval" => asked += 1,
+                AgentEvent::ToolResult { result } if result.content.starts_with("ran:") => ran = true,
+                AgentEvent::TurnComplete => break,
+                _ => {}
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+        assert_eq!(asked, 0, "a safe command must NOT trigger approval");
+        assert!(ran, "safe command executes");
+    }
+
+    // --- Phase B: a DANGEROUS command is gated; an identical repeat is cached ---
+    {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(DangerousBashTool));
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "bash".into(), arguments: "{\"cmd\":\"rm -rf /tmp/x\"}".into() }), StreamEvent::Done],
+            vec![StreamEvent::Done],
+            vec![StreamEvent::ToolCall(ToolCall { id: "2".into(), name: "bash".into(), arguments: "{\"cmd\":\"rm -rf /tmp/x\"}".into() }), StreamEvent::Done],
+            vec![StreamEvent::Done],
+        ]));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["bash"]))
+            .middleware(Arc::new(ApprovalMiddleware::new()))
+            .build()
+            .spawn();
+        let commands = handle.commands.clone();
+        let mut asked = 0;
+        let mut ran = 0;
+        let mut turns_done = 0;
+        let mut sent_second = false;
+
+        commands.send(AgentCommand::SendMessage { text: "one".into() }).unwrap();
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Request { id, kind, .. } if kind == "approval" => {
+                    asked += 1;
+                    commands
+                        .send(AgentCommand::Respond { id, value: serde_json::json!({"decision":"allow","remember":true}) })
+                        .unwrap();
+                }
+                AgentEvent::ToolResult { result } if result.content.starts_with("ran:") => ran += 1,
+                AgentEvent::TurnComplete => {
+                    turns_done += 1;
+                    if turns_done == 1 && !sent_second {
+                        sent_second = true;
+                        commands.send(AgentCommand::SendMessage { text: "two".into() }).unwrap();
+                    } else if turns_done >= 2 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+        assert_eq!(asked, 1, "an identical dangerous command must be approved once then cached; asked={asked}");
+        assert_eq!(ran, 2, "both dangerous calls execute (first after approval, second from cache)");
     }
 }

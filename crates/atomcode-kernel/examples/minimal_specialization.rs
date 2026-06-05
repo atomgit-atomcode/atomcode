@@ -29,7 +29,7 @@ fn make_builder() -> AgentBuilder {
         .provider(provider)
         .tools(registry.mount(&["echo", "risky_write"]))
         .persona("You are a minimal demo agent.")
-        .middleware(Arc::new(ApprovalMiddleware))
+        .middleware(Arc::new(ApprovalMiddleware::new()))
 }
 
 #[tokio::main]

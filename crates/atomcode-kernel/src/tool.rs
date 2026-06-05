@@ -49,7 +49,11 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> serde_json::Value;
-    fn risk(&self) -> RiskLevel {
+    /// Risk classification for THIS call — arg-aware, so e.g. a bash tool can rate
+    /// `rm -rf` Risky and `ls` Safe. Conservative default: Safe. The tool owns this
+    /// (intrinsic knowledge of its args); a specialization's approval middleware
+    /// reads it to decide whether to gate.
+    fn risk(&self, _args: &str) -> RiskLevel {
         RiskLevel::Safe
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult;
@@ -113,7 +117,7 @@ mod tests {
         fn name(&self) -> &str { self.0 }
         fn description(&self) -> &str { "dummy" }
         fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
-        fn risk(&self) -> RiskLevel { self.1 }
+        fn risk(&self, _args: &str) -> RiskLevel { self.1 }
         async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
             ToolResult { call_id: String::new(), content: "ok".into(), is_error: false }
         }
