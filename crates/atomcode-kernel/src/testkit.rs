@@ -1,6 +1,6 @@
 //! Spike-only test doubles. NOT part of the kernel's real API.
 
-use crate::hook::LifecycleHooks;
+use crate::hook::{LifecycleHooks, TurnCtx};
 use crate::message::{Conversation, Message, MessageMeta};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
@@ -178,7 +178,7 @@ impl LifecycleHooks for RecorderHook {
     async fn session_start(&self, _convo: &mut Conversation) { self.record("session_start"); }
     async fn user_prompt_submit(&self, _text: &mut String) { self.record("user_prompt_submit"); }
     async fn turn_start(&self, _convo: &mut Conversation) { self.record("turn_start"); }
-    async fn pre_request(&self, _messages: &mut Vec<Message>) { self.record("pre_request"); }
+    async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) { self.record("pre_request"); }
     async fn on_model_response(&self, _meta: &mut MessageMeta) { self.record("on_model_response"); }
     async fn pre_tool(&self, _call: &ToolCall) -> Result<(), String> { self.record("pre_tool"); Ok(()) }
     async fn post_tool(&self, _result: &mut ToolResult) { self.record("post_tool"); }
@@ -195,10 +195,29 @@ pub struct BudgetReminderHook;
 
 #[async_trait]
 impl LifecycleHooks for BudgetReminderHook {
-    async fn pre_request(&self, messages: &mut Vec<Message>) {
+    async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
         let util = messages.iter().rev().find_map(|m| m.meta.as_ref().map(|x| x.utilization));
         if let Some(u) = util {
             messages.push(Message::user(format!("[ctx {:.0}%]", u * 100.0)));
+        }
+    }
+}
+
+/// Projects the current round budget back into the request as a TAIL reminder so
+/// the LLM can wrap up before the hard cap. Appends one synthetic message at the
+/// END — never mutates history → prefix-cache safe.
+pub struct RoundBudgetHook;
+
+#[async_trait]
+impl LifecycleHooks for RoundBudgetHook {
+    async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {
+        if let Some(max) = ctx.max_rounds {
+            let note = if ctx.round >= max {
+                format!("[round {}/{} - final round, wrap up now]", ctx.round, max)
+            } else {
+                format!("[round {}/{}]", ctx.round, max)
+            };
+            messages.push(Message::user(note));
         }
     }
 }

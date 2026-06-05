@@ -2,6 +2,16 @@ use crate::message::{Conversation, Message, MessageMeta};
 use crate::tool::{ToolCall, ToolResult};
 use async_trait::async_trait;
 
+/// Per-LLM-call execution context handed to hooks that need to know where in the
+/// loop they are (e.g. to project round budget to the LLM).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurnCtx {
+    /// 1-based index of the LLM call about to execute this turn.
+    pub round: u32,
+    /// Optional hard cap on rounds per turn (None = unlimited).
+    pub max_rounds: Option<u32>,
+}
+
 /// Turn-level injection seam — the "inject into the loop" side, distinct from the
 /// read-only AgentEvent stream (the "perceive" side). Every method defaults to
 /// no-op, so a neutral kernel pays nothing. The kernel calls each of these at the
@@ -20,7 +30,8 @@ pub trait LifecycleHooks: Send + Sync {
 
     /// Just before the provider request is built — last chance to mutate the
     /// outgoing messages (production `ctx/render` lives here; mind prefix-cache).
-    async fn pre_request(&self, _messages: &mut Vec<Message>) {}
+    /// `ctx` carries the current round / max so a hook can project budget pressure.
+    async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) {}
 
     /// After the model response completes and the kernel has measured this call's
     /// stats. Enrich `meta` (e.g. compute money cost) or observe. The kernel then

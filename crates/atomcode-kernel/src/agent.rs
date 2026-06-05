@@ -1,5 +1,5 @@
 use crate::event::{AgentCommand, AgentEvent};
-use crate::hook::{LifecycleHooks, NoopHooks};
+use crate::hook::{LifecycleHooks, NoopHooks, TurnCtx};
 use crate::message::{Conversation, Message, MessageMeta};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
@@ -48,6 +48,7 @@ pub struct Agent {
     persona: String,
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     hooks: Arc<dyn LifecycleHooks>,
+    max_rounds: Option<u32>,
 }
 
 impl Agent {
@@ -66,6 +67,7 @@ impl Agent {
             middlewares: self.middlewares,
             hooks: self.hooks,
             rt: RequestCtx::new(ev_tx),
+            max_rounds: self.max_rounds,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -105,6 +107,7 @@ struct RunningAgent {
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     hooks: Arc<dyn LifecycleHooks>,
     rt: RequestCtx,
+    max_rounds: Option<u32>,
 }
 
 impl RunningAgent {
@@ -156,10 +159,21 @@ impl RunningAgent {
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
+        let mut round: u32 = 0;
         loop {
+            round += 1;
+            // Hard cap (safety fuse): stop before exceeding max_rounds.
+            if let Some(max) = self.max_rounds {
+                if round > max {
+                    self.rt.emit(AgentEvent::Error { message: format!("max rounds ({max}) reached") });
+                    self.rt.emit(AgentEvent::TurnComplete);
+                    return;
+                }
+            }
+            let turn_ctx = TurnCtx { round, max_rounds: self.max_rounds };
             let start = Instant::now();
             let mut messages = convo.messages.clone();
-            self.hooks.pre_request(&mut messages).await;
+            self.hooks.pre_request(&mut messages, &turn_ctx).await;
             let mut stream = self.provider.chat_stream(&messages, &defs).await;
             let mut assistant_text = String::new();
             let mut pending_calls = Vec::new();
@@ -189,6 +203,7 @@ impl RunningAgent {
                 used_tokens,
                 utilization,
                 cost: 0.0,
+                round,
             };
             self.hooks.on_model_response(&mut meta).await;
             self.rt.emit(AgentEvent::Usage(meta.clone()));
@@ -214,7 +229,6 @@ impl RunningAgent {
                     }
                 };
                 self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
-                // pre_tool hook (turn-level gate) then the composable tool-middleware chain.
                 let mut blocked: Option<String> = None;
                 if let Err(reason) = self.hooks.pre_tool(&call).await {
                     blocked = Some(reason);
@@ -253,6 +267,7 @@ pub struct AgentBuilder {
     persona: String,
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     hooks: Option<Arc<dyn LifecycleHooks>>,
+    max_rounds: Option<u32>,
 }
 
 impl AgentBuilder {
@@ -276,6 +291,11 @@ impl AgentBuilder {
         self.hooks = Some(h);
         self
     }
+    /// Hard cap on LLM rounds per turn (safety fuse; None = unlimited).
+    pub fn max_rounds(mut self, n: u32) -> Self {
+        self.max_rounds = Some(n);
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -283,6 +303,7 @@ impl AgentBuilder {
             persona: self.persona,
             middlewares: self.middlewares,
             hooks: self.hooks.unwrap_or_else(|| Arc::new(NoopHooks)),
+            max_rounds: self.max_rounds,
         }
     }
 }

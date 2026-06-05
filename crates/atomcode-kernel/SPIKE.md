@@ -17,6 +17,7 @@ the proven production hot-paths into.
 | 6. LifecycleHooks — turn-level injection (turn_end continues loop) + TurnStarted observation | `tests/spike_claims.rs::lifecycle_hook_injects_and_continues_loop` |
 | 7. Full LifecycleHooks surface — all 9 points wired & fire | `tests/spike_claims.rs::lifecycle_hooks_complete_surface_all_fire` |
 | 8. Execution-state recorded (Message.meta) + projected to LLM (tail reminder) + cache-safe | `tests/spike_claims.rs::execution_state_recorded_projected_to_llm_and_cache_safe` |
+| 9. Round budget projected to LLM ("round X/Y") + hard cap, recorded in meta.round, cache-safe | `tests/spike_claims.rs::round_budget_projected_to_llm_and_hard_capped` |
 
 ## Driver model
 
@@ -43,7 +44,7 @@ Two distinct mechanisms: **perceive** = the read-only `AgentEvent` stream
 (runs inside the loop, can mutate/continue it). The trait declares all 10 points — `session_start`, `user_prompt_submit`, `turn_start`, `pre_request`, `on_model_response`, `pre_tool`, `post_tool`, `turn_end`, `on_error`, `session_end` — each wired into the loop (Claim 7 asserts every one fires). Out-of-process injection reuses the id-correlated
 `Request`/`Respond` round-trip (a hook asks the remote driver and awaits).
 
-Execution-state feedback follows the rule: RECORD at `on_model_response` (kernel-native `Message.meta` sidecar), PROJECT to the LLM at `pre_request` as a tail reminder — never mutating historical bytes (prefix-cache safe).
+Execution-state feedback follows the rule: RECORD at `on_model_response` (kernel-native `Message.meta` sidecar), PROJECT to the LLM at `pre_request` as a tail reminder — never mutating historical bytes (prefix-cache safe). Hooks needing loop position get a `TurnCtx { round, max_rounds }`; `pre_request` uses it to project round budget to the LLM, and the kernel hard-caps the loop at `max_rounds` as a safety fuse.
 
 ## Key boundary facts
 

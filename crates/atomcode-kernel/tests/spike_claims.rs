@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
-use atomcode_kernel::testkit::{ApprovalMiddleware, BudgetReminderHook, ContinueOnceHook, EchoTool, MockProvider, RecorderHook, RiskyWriteTool};
+use atomcode_kernel::testkit::{ApprovalMiddleware, BudgetReminderHook, ContinueOnceHook, EchoTool, MockProvider, RecorderHook, RiskyWriteTool, RoundBudgetHook};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -279,4 +279,57 @@ async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
     assert_eq!(b[1], ("Assistant".to_string(), "reply A".to_string()), "assistant text must stay clean (meta is sidecar)");
     // (4) PROJECTION: the LAST message is the tail utilization reminder the LLM perceives.
     assert_eq!(b.last().unwrap(), &("User".to_string(), "[ctx 10%]".to_string()), "tail reminder must project utilization to the LLM");
+}
+
+// CLAIM 9: per-turn round budget — kernel tracks `round` (recorded in Message.meta),
+// a pre_request hook PROJECTS "round X/Y" to the LLM (escalating to a final-round
+// warning), and a hard cap stops the loop if the model ignores it. Cache-safe.
+#[tokio::test]
+async fn round_budget_projected_to_llm_and_hard_capped() {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    // The model calls a tool EVERY round (never stops) — exercises the cap at max=3.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
+        vec![StreamEvent::ToolCall(ToolCall { id: "2".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
+        vec![StreamEvent::ToolCall(ToolCall { id: "3".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
+        // a 4th is scripted but must NEVER be requested (hard-capped at 3)
+        vec![StreamEvent::ToolCall(ToolCall { id: "4".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
+    ]));
+    let received = provider.received.clone();
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo"]))
+        .hooks(Arc::new(RoundBudgetHook))
+        .max_rounds(3)
+        .build()
+        .spawn();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+
+    let mut rounds_seen: Vec<u32> = Vec::new();
+    let mut capped = false;
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::Usage(m) => rounds_seen.push(m.round),
+            AgentEvent::Error { message } if message.contains("max rounds") => capped = true,
+            AgentEvent::TurnComplete => break,
+            _ => {}
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let calls = received.lock().unwrap();
+    // hard cap: only 3 LLM calls; the scripted 4th was never requested
+    assert_eq!(calls.len(), 3, "round 4 must be hard-capped; got {} calls", calls.len());
+    assert!(capped, "max-rounds cap must emit an Error event");
+    // projection escalates each round, ending with the final-round warning
+    assert_eq!(calls[0].last().unwrap(), &("User".to_string(), "[round 1/3]".to_string()));
+    assert_eq!(calls[1].last().unwrap(), &("User".to_string(), "[round 2/3]".to_string()));
+    assert_eq!(calls[2].last().unwrap(), &("User".to_string(), "[round 3/3 - final round, wrap up now]".to_string()));
+    // recording: each assistant message carried its round (1,2,3)
+    assert_eq!(rounds_seen, vec![1, 2, 3], "Message.meta.round must be recorded per round");
+    // cache-safety: the original user message is byte-identical across rounds
+    assert_eq!(calls[2][0], calls[0][0], "history must not be rewritten (prefix-cache safety)");
 }

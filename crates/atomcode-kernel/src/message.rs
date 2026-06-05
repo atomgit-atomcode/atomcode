@@ -22,6 +22,7 @@ pub struct MessageMeta {
     pub used_tokens: u32,
     pub utilization: f32,
     pub cost: f64,
+    pub round: u32,
 }
 
 /// Provider-neutral message.
