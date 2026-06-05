@@ -109,15 +109,41 @@ pub fn decode_subprocess_output(bytes: &[u8]) -> String {
             }
             GetOEMCP()
         };
-        let encoding = match cp {
-            936 => encoding_rs::GB18030,
-            950 => encoding_rs::BIG5,
-            932 => encoding_rs::SHIFT_JIS,
-            949 => encoding_rs::EUC_KR,
-            _ => return String::from_utf8_lossy(bytes).to_string(),
-        };
-        let (decoded, _, _) = encoding.decode(bytes);
-        return decoded.into_owned();
+
+        // Collect code-page candidates to try. The OEM CP reported by
+        // GetOEMCP() is tried first; when it's 65001 (UTF-8, meaning the
+        // "Beta: Use Unicode UTF-8 for worldwide language support" setting
+        // is enabled), cmd.exe resource strings are still emitted in the
+        // *original* OEM code page (e.g. 936/GBK on zh-CN, 950/Big5 on
+        // zh-TW). Since from_utf8 already failed, the bytes are clearly
+        // not UTF-8, so we append CJK fallbacks.
+        let mut cps: Vec<u32> = vec![cp];
+        if cp == 65001 {
+            cps.extend_from_slice(&[936, 950, 932, 949]);
+        }
+
+        for &try_cp in &cps {
+            let encoding = match try_cp {
+                936 => encoding_rs::GB18030,
+                950 => encoding_rs::BIG5,
+                932 => encoding_rs::SHIFT_JIS,
+                949 => encoding_rs::EUC_KR,
+                _ => continue,
+            };
+            let (decoded, _, had_errors) = encoding.decode(bytes);
+            if !had_errors {
+                return decoded.into_owned();
+            }
+            // Partial decode is still better than the all-U+FFFD garbage
+            // that from_utf8_lossy would produce. Accept it if at least
+            // some characters decoded cleanly.
+            let lossy_count = decoded.chars().filter(|&c| c == '\u{FFFD}').count();
+            if lossy_count > 0 && lossy_count < decoded.chars().count() / 2 {
+                return decoded.into_owned();
+            }
+        }
+
+        String::from_utf8_lossy(bytes).to_string()
     }
     #[cfg(not(target_os = "windows"))]
     String::from_utf8_lossy(bytes).to_string()
