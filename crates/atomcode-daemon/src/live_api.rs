@@ -44,6 +44,11 @@ static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
 /// 因此在 sync/live 模式下切换模型才能对下一轮生效（执行器是 Arc<dyn> 不可变，故用进程级覆盖）。
 static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
 
+/// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
+/// live_message / live_stream 端点写入；DaemonTurnExecutor::run_turn 读取后设置
+/// CurrentContext.mode，确保 live 路径发出的遥测事件携带正确的 client 来源。
+static LIVE_MODE: StdMutex<Option<atomcode_telemetry::SessionMode>> = StdMutex::new(None);
+
 /// 设置当前 LiveSession 选中的 provider（None 时不覆盖，保留既有选择）。
 fn set_live_provider(provider: Option<String>) {
     if let Some(p) = provider {
@@ -458,6 +463,15 @@ impl TurnExecutor for DaemonTurnExecutor {
 
         {
             let mut c = conv.lock().await;
+            // 设置 telemetry mode：取 live_message 端点在 LIVE_MODE 写入的 client 来源，
+            // 使本轮 turn 内 TurnRunner 发出的遥测事件携带正确的 envelope.mode。
+            let live_mode = *LIVE_MODE.lock().unwrap();
+            let scope_ctx = atomcode_telemetry::CurrentContext {
+                mode: live_mode,
+                session_id: uuid::Uuid::parse_str(self.session_id.as_str()).ok(),
+                ..atomcode_telemetry::CurrentContext::current()
+            };
+            atomcode_telemetry::CurrentContext::scope(scope_ctx, || async {
             loop {
                 let result = runner
                     .run(&mut c, &parts.system_prompt, &turn_tx, cancel.clone())
@@ -471,6 +485,7 @@ impl TurnExecutor for DaemonTurnExecutor {
                     }
                 }
             }
+            }).await;
         }
         drop(turn_tx);
         let _ = forward.await;
@@ -492,7 +507,7 @@ impl TurnExecutor for DaemonTurnExecutor {
 }
 
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     response::{
         sse::{Event, Sse, KeepAlive},
         IntoResponse,
@@ -659,7 +674,13 @@ async fn preprocess_live_caption(
     }
 }
 
-pub(crate) async fn live_message(State(state): State<AppState>, Json(req): Json<LiveMessageReq>) -> impl IntoResponse {
+pub(crate) async fn live_message(
+    State(state): State<AppState>,
+    Extension(client_mode): Extension<atomcode_telemetry::SessionMode>,
+    Json(req): Json<LiveMessageReq>,
+) -> impl IntoResponse {
+    // 更新进程级 live mode，使 DaemonTurnExecutor::run_turn 能用它设置 telemetry envelope mode。
+    *LIVE_MODE.lock().unwrap() = Some(client_mode);
     let working_dir = { state.project.read().await.working_dir.clone() };
     // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
     set_live_provider(req.provider);
