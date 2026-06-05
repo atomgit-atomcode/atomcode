@@ -2903,14 +2903,8 @@ async fn chat_permission(
     State(state): State<AppState>,
     Json(req): Json<PermissionDecisionRequest>,
 ) -> impl IntoResponse {
-    use atomcode_core::tool::PermissionDecision;
-    let decision = match req.decision.as_str() {
-        "allow" => PermissionDecision::Allow,
-        // Phase 1: always_allow 暂按 Allow 处理；本会话"总是允许"语义（PermissionStore 持久化）
-        // 留待后续增强，此处保持决定路由职责单一。
-        "always_allow" => PermissionDecision::Allow,
-        _ => PermissionDecision::Deny,
-    };
+    use atomcode_core::tool::parse_permission_decision;
+    let decision = parse_permission_decision(&req.decision);
     if state.pending_permissions.deliver(&req.session_id, decision) {
         Json(serde_json::json!({ "success": true }))
     } else {
