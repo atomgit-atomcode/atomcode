@@ -18,6 +18,7 @@ the proven production hot-paths into.
 | 7. Full LifecycleHooks surface — all 9 points wired & fire | `tests/spike_claims.rs::lifecycle_hooks_complete_surface_all_fire` |
 | 8. Execution-state recorded (Message.meta) + projected to LLM (tail reminder) + cache-safe | `tests/spike_claims.rs::execution_state_recorded_projected_to_llm_and_cache_safe` |
 | 9. Round budget projected to LLM ("round X/Y") + hard cap, recorded in meta.round, cache-safe | `tests/spike_claims.rs::round_budget_projected_to_llm_and_hard_capped` |
+| 10. on_model_response enrich path — hook-written meta.cost reaches both the Usage event and stored Message.meta | `tests/spike_claims.rs::on_model_response_enriches_meta_into_event_and_storage` |
 
 ## Driver model
 

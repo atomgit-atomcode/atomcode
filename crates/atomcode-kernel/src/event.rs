@@ -13,6 +13,8 @@ pub enum AgentCommand {
     SendMessage { text: String },
     /// Answer a pending AgentEvent::Request, correlated by id.
     Respond { id: RequestId, value: serde_json::Value },
+    /// Ask the agent to emit a snapshot of per-message execution stats.
+    Snapshot,
     Cancel,
     Shutdown,
 }
@@ -32,6 +34,8 @@ pub enum AgentEvent {
     Request { id: RequestId, kind: String, payload: serde_json::Value },
     /// Per-LLM-call execution stats (perception side; mirrors the message sidecar).
     Usage(MessageMeta),
+    /// Per-message execution stats for the whole conversation (reply to Snapshot).
+    Snapshot { metas: Vec<Option<MessageMeta>> },
     TurnComplete,
     Error { message: String },
 }

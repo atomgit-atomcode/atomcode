@@ -127,6 +127,10 @@ impl RunningAgent {
                 AgentCommand::Shutdown => break,
                 AgentCommand::Cancel => {}
                 AgentCommand::Respond { id, value } => self.rt.resolve(id, value),
+                AgentCommand::Snapshot => {
+                    let metas = convo.messages.iter().map(|m| m.meta.clone()).collect();
+                    self.rt.emit(AgentEvent::Snapshot { metas });
+                }
                 AgentCommand::SendMessage { mut text } => {
                     self.hooks.user_prompt_submit(&mut text).await;
                     convo.push(Message::user(text));
@@ -141,6 +145,7 @@ impl RunningAgent {
                                 Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
                                 Some(AgentCommand::Shutdown) => { shutdown = true; break; }
                                 Some(AgentCommand::Cancel) => {}
+                                Some(AgentCommand::Snapshot) => {}
                                 Some(AgentCommand::SendMessage { .. }) => {}
                                 None => { shutdown = true; break; }
                             }

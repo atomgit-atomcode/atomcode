@@ -221,3 +221,24 @@ impl LifecycleHooks for RoundBudgetHook {
         }
     }
 }
+
+/// Enriches `meta.cost` in on_model_response: cost = (prompt + completion) * per_token.
+/// Proves the on_model_response enrich path lands in BOTH the Usage event and the
+/// stored Message.meta.
+pub struct CostHook {
+    pub per_token: f64,
+}
+
+impl CostHook {
+    pub fn new(per_token: f64) -> Self {
+        Self { per_token }
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for CostHook {
+    async fn on_model_response(&self, meta: &mut MessageMeta) {
+        let billable = (meta.tokens.prompt + meta.tokens.completion) as f64;
+        meta.cost = billable * self.per_token;
+    }
+}
