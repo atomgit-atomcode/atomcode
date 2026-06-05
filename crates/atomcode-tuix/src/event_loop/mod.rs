@@ -7897,6 +7897,13 @@ fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
     }
+    // Reasoning-effort hint (deepseek-v4 high/max), mirroring CC's
+    // `… · thinking with high effort`. Kept at the tail so
+    // `spinner_meta_suffix` can strip it before forwarding the time/queue
+    // metadata onto an in-flight tool row (a tool isn't "thinking").
+    if let Some(effort) = state.reasoning_effort.as_deref() {
+        out.push_str(&format!(" · thinking with {} effort", effort));
+    }
     out
 }
 

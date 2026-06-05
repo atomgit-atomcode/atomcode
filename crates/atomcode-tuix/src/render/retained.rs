@@ -4142,6 +4142,13 @@ fn truncate_body_str(body_str: &str, max_cols: usize) -> String {
 /// concatenate it directly, or `""` if the label has no metadata yet
 /// (no phase clock has ticked).
 fn spinner_meta_suffix(label: &str) -> &str {
+    // The reasoning-effort hint (` · thinking with high effort`) is a
+    // thinking-phase tail — strip it before plucking the time/queue
+    // metadata so it doesn't ride onto an in-flight tool row.
+    let label = match label.find(" · thinking with ") {
+        Some(i) => &label[..i],
+        None => label,
+    };
     label.find(" · ").map(|i| &label[i..]).unwrap_or("")
 }
 
@@ -5321,6 +5328,21 @@ mod tests {
         // No metadata yet (no phase clock tick) → empty suffix.
         assert_eq!(spinner_meta_suffix("Pondering…"), "");
         assert_eq!(spinner_meta_suffix(""), "");
+        // The reasoning-effort tail must NOT ride onto an in-flight tool
+        // row — only the time/queue metadata forwards.
+        assert_eq!(
+            spinner_meta_suffix("Running Bash… · 12s · thinking with high effort"),
+            " · 12s"
+        );
+        assert_eq!(
+            spinner_meta_suffix("Running Bash… · 12s · 2 queued · thinking with max effort"),
+            " · 12s · 2 queued"
+        );
+        // Effort with no time/queue metadata before it → nothing forwards.
+        assert_eq!(
+            spinner_meta_suffix("Running Bash… · thinking with high effort"),
+            ""
+        );
     }
 
     /// Regression (screenshot 42.png): user reported a stray blinking
