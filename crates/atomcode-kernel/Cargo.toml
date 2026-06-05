@@ -1,0 +1,13 @@
+[package]
+name = "atomcode-kernel"
+version = "0.0.0"
+edition = "2021"
+description = "Spike: neutral agent kernel (Phase A0 — design validation, throwaway internals)"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
