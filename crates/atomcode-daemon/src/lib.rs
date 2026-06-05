@@ -3323,14 +3323,8 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
     // 绑定了非回环地址：给出访问 URL + 安全/作用域提示。
     if !is_loopback_authority(&bound_host) {
         if is_wildcard {
-            // 主 URL（local_url）已是局域网 IP（若探测到）；额外补一条本机回环地址
-            // 方便本机使用。两条都带 sync_suffix —— 之前局域网链接漏了它，手机/其它
-            // 设备打开后不会接入同步会话。
-            if open_host.as_str() != "127.0.0.1" {
-                msg.push_str(&format!(
-                    "\n本机访问：http://127.0.0.1:{actual_port}/?token={token}{sync_suffix}"
-                ));
-            }
+            // 主 URL（local_url）已是局域网 IP（若探测到），它在本机自身也可访问
+            // （0.0.0.0 监听所有接口，含回环），故无需再单列 127.0.0.1 那条冗余链接。
             msg.push_str(
                 "\n⚠️ 主地址为局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
             );
