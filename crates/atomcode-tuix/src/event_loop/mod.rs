@@ -844,6 +844,9 @@ pub struct LoopCtx {
     /// Shown as a red "⚠ BYPASS" badge in the status line so the
     /// user is always aware that all tool calls are auto-approved.
     pub dangerously_skip_permissions: bool,
+    /// When true, AtomCode is running with administrator/root privileges.
+    /// A warning banner is shown in scrollback on startup.
+    pub is_admin: bool,
     /// When `/guide <topic>` triggers auto-install of the "ask" skill,
     /// the topic is stashed here so `handle_plugin_job_event` can
     /// auto-invoke the skill once installation completes.
@@ -2866,6 +2869,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     if ctx.dangerously_skip_permissions {
         renderer.render(UiLine::CommandOutput(
             crate::i18n::t(crate::i18n::Msg::BypassWarningBanner).into_owned(),
+        ));
+    }
+    // Warn when running with admin/root privileges so the user is aware
+    // the model can access system files beyond the project directory.
+    if ctx.is_admin {
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::AdminWarningBanner).into_owned(),
         ));
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):

@@ -902,6 +902,8 @@ async fn async_main() {
 async fn run() -> Result<i32> {
     let cli = Cli::parse();
 
+    let is_admin = atomcode_core::process_utils::is_running_as_admin();
+
     // ── Telemetry init ────────────────────────────────────────────────────────
     // Load config early (before subcommand dispatch) so we can read the
     // [telemetry] section. Failure to load config is non-fatal; telemetry
@@ -955,6 +957,7 @@ async fn run() -> Result<i32> {
     // `fixissue` is an interactive-feeling structured workflow (the user
     // is watching progress, not piping output). Force verbose so they see
     // tool calls / edits instead of long silences while the agent works.
+
     let mut force_verbose = false;
     if let Some(cmd) = cli.command {
         match cmd {
@@ -1534,6 +1537,7 @@ async fn run() -> Result<i32> {
                 capture,
                 working_dir.clone(),
                 cli.dangerously_skip_permissions,
+                is_admin,
             )
             .await?;
 
@@ -1601,7 +1605,7 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions).await?;
+            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await?;
             Ok(0)
         };
 
@@ -1698,6 +1702,7 @@ async fn run_headless(
     capture: bool,
     working_dir: PathBuf,
     skip_permissions: bool,
+    is_admin: bool,
 ) -> Result<(i32, Option<String>)> {
     // Tell the panic hook / error path to skip TUI cleanup — raw mode was
     // never enabled here, so `disable_raw_mode` would be a wasted ioctl
@@ -1713,6 +1718,12 @@ async fn run_headless(
         eprintln!(
             "{}",
             atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless)
+        );
+    }
+    if is_admin {
+        eprintln!(
+            "{}",
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::AdminWarningHeadless)
         );
     }
 

@@ -915,6 +915,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::BypassBadge =>
             "\u{26a0} BYPASS".into(),
 
+        Msg::AdminWarningBanner =>
+            "\u{26a0} 警告：正在以管理员权限运行。\n   模型可能可以访问系统文件。\n   请在 /codingplan 中配置\"信任目录\"以限制文件访问。\n".into(),
+        Msg::AdminWarningHeadless =>
+            "[warning] 正在以管理员权限运行 — 模型可能可以访问系统文件。".into(),
+
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} 多行输入：在行尾加 `\\` 再按 Enter。\n    \

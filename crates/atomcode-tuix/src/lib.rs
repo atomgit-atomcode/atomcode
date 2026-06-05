@@ -178,6 +178,7 @@ pub async fn run(
     lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     dangerously_skip_permissions: bool,
+    is_admin: bool,
 ) -> Result<()> {
     let mut caps = TerminalCaps::probe();
 
@@ -582,6 +583,7 @@ pub async fn run(
         )),
         is_plain_renderer,
         dangerously_skip_permissions,
+        is_admin,
         pending_guide_topic: None,
         sync_session: None,
         sync_forwarder: None,

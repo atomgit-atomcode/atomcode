@@ -766,6 +766,13 @@ pub enum Msg<'a> {
     /// active. Typically "⚠ BYPASS" — kept short for the status row.
     BypassBadge,
 
+    // ── admin / root privilege warning ──
+    /// TUI scrollback warning when AtomCode is running as admin/root.
+    /// Includes leading "⚠ " and trailing "\n".
+    AdminWarningBanner,
+    /// Headless-mode stderr warning when running as admin/root.
+    AdminWarningHeadless,
+
     /// Confirmation hint after the first Ctrl+C on an empty buffer.
     /// "  (press Ctrl+C again to exit)\n" — leading indent + trailing
     /// newline are part of the template.

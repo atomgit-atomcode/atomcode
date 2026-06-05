@@ -123,6 +123,67 @@ pub fn decode_subprocess_output(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).to_string()
 }
 
+/// Detect whether the current process is running with administrator/root
+/// privileges.
+///
+/// - Windows: calls `CheckTokenMembership(NULL, BUILTIN\Administrators)`
+///   which correctly handles UAC split-token (returns `false` when NOT
+///   elevated). This is the recommended replacement for the deprecated
+///   `IsUserAnAdmin()`.
+/// - Unix: checks `geteuid() == 0` (root).
+/// - Other platforms: returns `false` (safe default — a missed warning is
+///   preferable to a false alarm).
+#[cfg(target_os = "windows")]
+pub fn is_running_as_admin() -> bool {
+    use windows_sys::Win32::Security::{
+        AllocateAndInitializeSid, CheckTokenMembership, FreeSid,
+        SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY, PSID,
+    };
+
+    unsafe {
+        let mut sid: PSID = std::ptr::null_mut();
+        let authority: SID_IDENTIFIER_AUTHORITY = SECURITY_NT_AUTHORITY;
+
+        // S-1-5-32-544: BUILTIN\Administrators group.
+        // Uses literal RIDs 32 (SECURITY_BUILTIN_DOMAIN_RID) and 544
+        // (DOMAIN_ALIAS_RID_ADMINS) to avoid pulling in the
+        // Win32_System_SystemServices feature flag.
+        let result = AllocateAndInitializeSid(
+            &authority,
+            2,     // nSubAuthorityCount
+            32,    // SECURITY_BUILTIN_DOMAIN_RID
+            544,   // DOMAIN_ALIAS_RID_ADMINS
+            0, 0, 0, 0, 0, 0,
+            &mut sid,
+        );
+
+        if result == 0 {
+            return false;
+        }
+
+        let mut is_member: i32 = 0;
+        // NULL token handle = current thread's effective token
+        if CheckTokenMembership(std::ptr::null_mut(), sid, &mut is_member) == 0 {
+            FreeSid(sid);
+            return false;
+        }
+
+        FreeSid(sid);
+
+        is_member != 0
+    }
+}
+
+#[cfg(unix)]
+pub fn is_running_as_admin() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
+pub fn is_running_as_admin() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
