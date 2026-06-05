@@ -15,12 +15,12 @@ the proven production hot-paths into.
 | 4. One primitive serves one-shot AND interactive drivers | `tests/...::one_shot_adapter_auto_answers_and_aggregates` + `examples/minimal_specialization.rs` |
 | 5. Wire-compatible (serde round-trip) → web/daemon can use the same seam | `tests/...::events_and_commands_are_wire_serializable` |
 | 6. LifecycleHooks — turn-level injection (turn_end continues loop) + TurnStarted observation | `tests/spike_claims.rs::lifecycle_hook_injects_and_continues_loop` |
-| 7. Full LifecycleHooks surface — all 9 points wired & fire | `tests/spike_claims.rs::lifecycle_hooks_complete_surface_all_fire` |
+| 7. Full LifecycleHooks surface — 8 turn-level points wired & fire | `tests/spike_claims.rs::lifecycle_hooks_complete_surface_all_fire` |
 | 8. Execution-state recorded (Message.meta) + projected to LLM (tail reminder) + cache-safe | `tests/spike_claims.rs::execution_state_recorded_projected_to_llm_and_cache_safe` |
 | 9. Round budget projected to LLM ("round X/Y") + hard cap, recorded in meta.round, cache-safe | `tests/spike_claims.rs::round_budget_projected_to_llm_and_hard_capped` |
 | 10. on_model_response gets `&mut Message` — can transform the response; transform lands in storage (via Snapshot) | `tests/spike_claims.rs::on_model_response_can_transform_response_into_storage` |
 | 11. on_model_response edits to tool_calls are honored (dropped call doesn't execute) | `tests/spike_claims.rs::dropping_tool_calls_in_on_model_response_prevents_execution` |
-| 12. pre_tool (`&mut ToolCall`) rewrites args + blocks before ToolStarted (no ghost row) | `tests/spike_claims.rs::pre_tool_rewrites_args_and_blocks_without_ghost_started` |
+| 12. ToolMiddleware `before` rewrites/blocks (no ghost ToolStarted) + `after` transforms result | `tests/spike_claims.rs::tool_middleware_rewrites_blocks_and_transforms` |
 | 13. Command-level approval — arg-aware `Tool::risk(args)`; ApprovalMiddleware gates dangerous commands, skips safe ones, caches session grants | `tests/spike_claims.rs::dangerous_command_requires_approval_safe_does_not_and_grant_is_cached` |
 
 ## Driver model
@@ -45,7 +45,7 @@ primitive:
 
 Two distinct mechanisms: **perceive** = the read-only `AgentEvent` stream
 (observers cannot change the loop); **inject** = the `LifecycleHooks` trait
-(runs inside the loop, can mutate/continue it). The trait declares all 10 points — `session_start`, `user_prompt_submit`, `turn_start`, `pre_request`, `on_model_response`, `pre_tool`, `post_tool`, `turn_end`, `on_error`, `session_end` — each wired into the loop (Claim 7 asserts every one fires). Out-of-process injection reuses the id-correlated
+(runs inside the loop, can mutate/continue it). The trait declares 8 turn-level points — `session_start`, `user_prompt_submit`, `turn_start`, `pre_request`, `on_model_response`, `turn_end`, `on_error`, `session_end` — each wired into the loop (Claim 7 asserts every one fires). TOOL-level concerns (rewrite/gate/transform a tool call) live in the composable `ToolMiddleware` (`before` + `after`), NOT in LifecycleHooks. Out-of-process injection reuses the id-correlated
 `Request`/`Respond` round-trip (a hook asks the remote driver and awaits).
 
 Execution-state feedback follows the rule: RECORD at `on_model_response` (kernel-native `Message.meta` sidecar), PROJECT to the LLM at `pre_request` as a tail reminder — never mutating historical bytes (prefix-cache safe). Hooks needing loop position get a `TurnCtx { round, max_rounds }`; `pre_request` uses it to project round budget to the LLM, and the kernel hard-caps the loop at `max_rounds` as a safety fuse.

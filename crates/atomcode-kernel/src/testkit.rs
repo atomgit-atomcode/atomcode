@@ -152,7 +152,7 @@ impl Default for ApprovalMiddleware {
 impl ToolMiddleware for ApprovalMiddleware {
     async fn before(
         &self,
-        call: &ToolCall,
+        call: &mut ToolCall,
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> Result<(), String> {
@@ -211,8 +211,6 @@ impl LifecycleHooks for RecorderHook {
     async fn turn_start(&self, _convo: &mut Conversation) { self.record("turn_start"); }
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) { self.record("pre_request"); }
     async fn on_model_response(&self, _response: &mut Message) { self.record("on_model_response"); }
-    async fn pre_tool(&self, _call: &mut ToolCall) -> Result<(), String> { self.record("pre_tool"); Ok(()) }
-    async fn post_tool(&self, _result: &mut ToolResult) { self.record("post_tool"); }
     async fn turn_end(&self, _convo: &Conversation) -> Option<String> { self.record("turn_end"); None }
     async fn on_error(&self, _error: &str) { self.record("on_error"); }
     async fn session_end(&self, _convo: &Conversation) { self.record("session_end"); }
@@ -305,24 +303,43 @@ impl LifecycleHooks for DropToolsHook {
     }
 }
 
-/// Rewrites a tool call's arguments in pre_tool — proves `&mut ToolCall` reaches
-/// execution.
-pub struct ArgRewriteHook;
+/// Rewrites a tool call's args in `before` — proves ToolMiddleware can mutate the call.
+pub struct ArgRewriteMiddleware;
 
 #[async_trait]
-impl LifecycleHooks for ArgRewriteHook {
-    async fn pre_tool(&self, call: &mut ToolCall) -> Result<(), String> {
+impl ToolMiddleware for ArgRewriteMiddleware {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> Result<(), String> {
         call.arguments = "{\"rewritten\":true}".to_string();
         Ok(())
     }
 }
 
-/// Blocks every tool in pre_tool — proves a blocked tool emits no ghost ToolStarted.
-pub struct BlockToolHook;
+/// Blocks every tool in `before` — proves a blocked tool emits no ghost ToolStarted.
+pub struct BlockToolMiddleware;
 
 #[async_trait]
-impl LifecycleHooks for BlockToolHook {
-    async fn pre_tool(&self, _call: &mut ToolCall) -> Result<(), String> {
+impl ToolMiddleware for BlockToolMiddleware {
+    async fn before(
+        &self,
+        _call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> Result<(), String> {
         Err("blocked by policy".to_string())
+    }
+}
+
+/// Transforms the tool result in `after` — proves the after-chain (absorbs post_tool).
+pub struct TruncateMiddleware;
+
+#[async_trait]
+impl ToolMiddleware for TruncateMiddleware {
+    async fn after(&self, result: &mut ToolResult) {
+        result.content = format!("[truncated] {}", result.content);
     }
 }

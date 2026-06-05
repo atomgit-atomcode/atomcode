@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, MessageSnapshot};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
-use atomcode_kernel::testkit::{ApprovalMiddleware, ArgRewriteHook, BlockToolHook, BudgetReminderHook, ContinueOnceHook, DangerousBashTool, DropToolsHook, EchoTool, MockProvider, RecorderHook, RedactHook, RiskyWriteTool, RoundBudgetHook};
+use atomcode_kernel::testkit::{ApprovalMiddleware, ArgRewriteMiddleware, BlockToolMiddleware, BudgetReminderHook, ContinueOnceHook, DangerousBashTool, DropToolsHook, EchoTool, MockProvider, RecorderHook, RedactHook, RiskyWriteTool, RoundBudgetHook, TruncateMiddleware};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -200,7 +200,7 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
     let fired = log.lock().unwrap().clone();
     for point in [
         "session_start", "user_prompt_submit", "turn_start", "pre_request",
-        "on_model_response", "pre_tool", "post_tool", "on_error", "turn_end", "session_end",
+        "on_model_response", "on_error", "turn_end", "session_end",
     ] {
         assert!(fired.contains(&point.to_string()), "hook '{point}' was never called; fired = {fired:?}");
     }
@@ -414,11 +414,12 @@ async fn dropping_tool_calls_in_on_model_response_prevents_execution() {
     assert!(completed, "turn completes since pending became empty");
 }
 
-// CLAIM 12 (fix #6): pre_tool can rewrite args (reaches execution) and a blocked
-// tool emits no ghost ToolStarted (only a blocked ToolResult).
+// CLAIM 12: tool-level concerns live in ToolMiddleware — `before` can rewrite the
+// call (args) and block without a ghost ToolStarted; `after` transforms the result.
+// (pre_tool/post_tool folded into ToolMiddleware.)
 #[tokio::test]
-async fn pre_tool_rewrites_args_and_blocks_without_ghost_started() {
-    // (a) rewrite args → reaches execution
+async fn tool_middleware_rewrites_blocks_and_transforms() {
+    // (a) before rewrites args → reaches execution
     {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
@@ -429,7 +430,7 @@ async fn pre_tool_rewrites_args_and_blocks_without_ghost_started() {
         let mut handle = Agent::builder()
             .provider(provider)
             .tools(reg.mount(&["echo"]))
-            .hooks(Arc::new(ArgRewriteHook))
+            .middleware(Arc::new(ArgRewriteMiddleware))
             .build()
             .spawn();
         handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
@@ -443,9 +444,9 @@ async fn pre_tool_rewrites_args_and_blocks_without_ghost_started() {
         }
         handle.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
-        assert!(echoed.contains("rewritten"), "pre_tool rewritten args must reach execution; got {echoed}");
+        assert!(echoed.contains("rewritten"), "before-rewritten args must reach execution; got {echoed}");
     }
-    // (b) block → no ghost ToolStarted, but a blocked ToolResult
+    // (b) before blocks → no ghost ToolStarted, blocked ToolResult
     {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
@@ -456,18 +457,18 @@ async fn pre_tool_rewrites_args_and_blocks_without_ghost_started() {
         let mut handle = Agent::builder()
             .provider(provider)
             .tools(reg.mount(&["echo"]))
-            .hooks(Arc::new(BlockToolHook))
+            .middleware(Arc::new(BlockToolMiddleware))
             .build()
             .spawn();
         handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
         let mut started = false;
-        let mut blocked_result = false;
+        let mut blocked = false;
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::ToolStarted { .. } => started = true,
                 AgentEvent::ToolResult { result } => {
                     if result.content.contains("blocked") {
-                        blocked_result = true;
+                        blocked = true;
                     }
                 }
                 AgentEvent::TurnComplete => break,
@@ -476,8 +477,35 @@ async fn pre_tool_rewrites_args_and_blocks_without_ghost_started() {
         }
         handle.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
-        assert!(!started, "a tool blocked by pre_tool must NOT emit a ghost ToolStarted");
-        assert!(blocked_result, "a blocked tool still yields a ToolResult");
+        assert!(!started, "a tool blocked by middleware must NOT emit a ghost ToolStarted");
+        assert!(blocked, "a blocked tool still yields a ToolResult");
+    }
+    // (c) after transforms the result
+    {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
+            vec![StreamEvent::Done],
+        ]));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["echo"]))
+            .middleware(Arc::new(TruncateMiddleware))
+            .build()
+            .spawn();
+        handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+        let mut content = String::new();
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::ToolResult { result } => content = result.content,
+                AgentEvent::TurnComplete => break,
+                _ => {}
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+        assert!(content.starts_with("[truncated]"), "after must transform the result; got {content}");
     }
 }
 

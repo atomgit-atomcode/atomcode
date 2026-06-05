@@ -235,26 +235,20 @@ impl RunningAgent {
                 return;
             }
             for mut call in pending_calls {
-                // Fix #6: pre_tool runs BEFORE lookup + before ToolStarted. It may
-                // rewrite the call (args/name) or block it (Err). Blocked/unknown
-                // tools never emit a ghost ToolStarted; ToolStarted fires only for a
-                // tool that actually executes.
-                let pre = self.hooks.pre_tool(&mut call).await;
-                let mut result = match (pre, self.tools.get(&call.name)) {
-                    (Err(reason), _) => ToolResult {
-                        call_id: call.id.clone(),
-                        content: format!("blocked: {reason}"),
-                        is_error: true,
-                    },
-                    (Ok(()), None) => ToolResult {
+                let mut result = match self.tools.get(&call.name) {
+                    None => ToolResult {
                         call_id: call.id.clone(),
                         content: format!("unknown or unmounted tool: {}", call.name),
                         is_error: true,
                     },
-                    (Ok(()), Some(tool)) => {
+                    Some(tool) => {
+                        // ToolMiddleware before-chain: may rewrite the call (&mut),
+                        // round-trip via rt (approval), or block via Err. Runs after
+                        // lookup; ToolStarted fires only for a tool that executes
+                        // (no ghost row for blocked tools).
                         let mut blocked: Option<String> = None;
                         for mw in &self.middlewares {
-                            if let Err(reason) = mw.before(&call, &tool, &self.rt).await {
+                            if let Err(reason) = mw.before(&mut call, &tool, &self.rt).await {
                                 blocked = Some(reason);
                                 break;
                             }
@@ -274,7 +268,10 @@ impl RunningAgent {
                         }
                     }
                 };
-                self.hooks.post_tool(&mut result).await;
+                // ToolMiddleware after-chain: transform / observe the result.
+                for mw in &self.middlewares {
+                    mw.after(&mut result).await;
+                }
                 if result.is_error {
                     self.hooks.on_error(&result.content).await;
                 }
