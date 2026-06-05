@@ -7131,6 +7131,19 @@ fn handle_agent_event(
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
+        AgentEvent::ProjectSwitched(new_dir) => {
+            // A webui /cd switched the project directory (delivered via the
+            // live-sync forwarder in sync mode). Follow it: change cwd like
+            // `/cd` (updates runtime_factory + @-file index + recent dirs +
+            // tells the running agent), THEN open a fresh session in the new
+            // dir like `/session`. Distinct from WorkingDirChanged (agent's own
+            // `cd`, conversation preserved). No-op when already there to avoid
+            // resetting on a redundant broadcast.
+            if ctx.working_dir != new_dir {
+                commands::apply_cd(ctx, new_dir);
+                commands::reset_to_new_session(ctx, state, renderer);
+            }
+        }
         AgentEvent::ContextStats {
             system_tokens,
             sent_tokens,

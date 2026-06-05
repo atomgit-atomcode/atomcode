@@ -1272,6 +1272,12 @@ async fn change_dir(
             error_data: None,
         });
 
+        // Broadcast to other in-process views (sync-mode TUI) so they follow the
+        // switch: change cwd + open a fresh session in the new dir. No-op when no
+        // LiveSession is attached (headless daemon). Cross-process clients are not
+        // covered — that would need a /live SSE wire event + client subscription.
+        crate::live_api::live_set_working_dir(new_path.clone());
+
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
 
         Json(ChangeDirResponse {

@@ -387,6 +387,15 @@ pub enum AgentEvent {
     },
     /// Working directory changed.
     WorkingDirChanged(PathBuf),
+    /// Another client (e.g. the webui) switched the project working directory.
+    /// Unlike `WorkingDirChanged` — which is an in-place cwd change from the
+    /// agent's own `cd`/`change_dir` tool and keeps the conversation — this
+    /// means "switch project, start fresh here": the receiving view changes cwd
+    /// AND opens a new session. Delivered over the live-sync channel
+    /// (`LiveEvent::WorkingDirChanged` → here) so a same-process TUI follows a
+    /// webui directory switch. Kept distinct from `WorkingDirChanged` precisely
+    /// so an agent-driven `cd` mid-task never wipes the conversation.
+    ProjectSwitched(PathBuf),
     /// Context budget stats — piped into datalog and cached by the TUI
     /// for `/context`. Emitted after every turn's `ctx.build_messages`
     /// call, so stats reflect the snapshot the model actually saw.

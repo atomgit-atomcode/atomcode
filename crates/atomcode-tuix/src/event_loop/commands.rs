@@ -574,43 +574,10 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "session" => {
-            // Start fresh: tell the agent to drop conversation history,
-            // clear the scrollback + type-ahead queue + UI state, and
-            // redraw the welcome screen so the user sees they're in a
-            // brand-new session. Ports `/session` from the legacy TUI.
-            ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
-            ctx.current_session_id = None;
-            state.total_tokens = 0;
-            state.prompt_tokens = 0;
-            state.completion_tokens = 0;
-            state.cached_tokens = 0;
-            state.last_context = None;
-            state.pending_context_render = None;
-            state.thinking_idx = 0;
-            state.on_turn_complete();
-            // New session = new session file on disk. Old session
-            // (already saved at its last TurnComplete) stays on disk so
-            // it can still be `/resume`d; we just stop writing into it.
-            ctx.current_session =
-                atomcode_core::session::Session::default_session(ctx.working_dir.clone());
-            ctx.bg_manager
-                .set_foreground_session(ctx.current_session.clone());
-            // Bind telemetry + agent session id to the new session's UUID
-            // (the ClearConversation above intentionally leaves the id alone;
-            // this is the single source of truth).
-            bind_telemetry_to_session(ctx, &ctx.current_session);
-            // `reset()` wipes the terminal AND the renderer's cached
-            // footer/stream state, so the next Welcome renders against
-            // a known (row 1, col 1) anchor. This is what makes
-            // /session behave like a fresh launch.
-            renderer.reset();
-            let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-            renderer.render(UiLine::Welcome {
-                model: ctx.model_name.clone(),
-                working_dir: dir_display,
-            });
-            renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
-            renderer.flush();
+            // Start fresh in the current directory. Ports `/session` from the
+            // legacy TUI. Shared with the webui-driven project switch via
+            // `reset_to_new_session`.
+            reset_to_new_session(ctx, state, renderer);
         }
         "model" => {
             if ctx.config.providers.is_empty() {
@@ -3049,6 +3016,53 @@ pub(crate) fn launch_fixissue(
 /// previous_dir on the shared context, push the new entry into the
 /// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
 /// DirPicker modal's Enter handler so both paths keep state coherent.
+/// Drop the current conversation and start a brand-new session in the current
+/// `ctx.working_dir`: tell the agent to clear history, reset token/context UI
+/// state, make a fresh `Session`, rebind telemetry, and redraw the welcome
+/// screen so it behaves like a fresh launch.
+///
+/// Shared by the `/session` command and the webui-driven project switch
+/// (`AgentEvent::ProjectSwitched`). For the project-switch case, call
+/// `apply_cd` FIRST so `ctx.working_dir` is the new dir before the new
+/// `Session` is bound to it.
+pub(crate) fn reset_to_new_session(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+) {
+    ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+    ctx.current_session_id = None;
+    state.total_tokens = 0;
+    state.prompt_tokens = 0;
+    state.completion_tokens = 0;
+    state.cached_tokens = 0;
+    state.last_context = None;
+    state.pending_context_render = None;
+    state.thinking_idx = 0;
+    state.on_turn_complete();
+    // New session = new session file on disk. Old session (already saved at its
+    // last TurnComplete) stays on disk so it can still be `/resume`d; we just
+    // stop writing into it.
+    ctx.current_session =
+        atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    // Bind telemetry + agent session id to the new session's UUID (the
+    // ClearConversation above intentionally leaves the id alone; this is the
+    // single source of truth).
+    bind_telemetry_to_session(ctx, &ctx.current_session);
+    // `reset()` wipes the terminal AND the renderer's cached footer/stream
+    // state, so the next Welcome renders against a known (row 1, col 1) anchor.
+    renderer.reset();
+    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    renderer.render(UiLine::Welcome {
+        model: ctx.model_name.clone(),
+        working_dir: dir_display,
+    });
+    renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
+    renderer.flush();
+}
+
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     ctx.agent
         .cmd_tx

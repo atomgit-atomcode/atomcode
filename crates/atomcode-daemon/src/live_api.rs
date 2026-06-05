@@ -61,6 +61,16 @@ pub fn live_set_provider(provider: String) {
     }
 }
 
+/// 把 webui 的 /cd 工作目录切换广播给所有视图。同进程 sync 模式下的 TUI live
+/// 转发器据此切目录并开一个全新会话。无活动 LiveSession 时静默跳过（如 headless
+/// daemon 无 TUI 附着）。跨进程（独立 daemon + 浏览器）不覆盖——那条路需要 TUI
+/// 作为 /live 网络客户端订阅。
+pub fn live_set_working_dir(dir: std::path::PathBuf) {
+    if let Some(s) = current_live_session() {
+        s.notify_working_dir_changed(dir);
+    }
+}
+
 /// 当前生效的 provider 名：优先进程级选择（LIVE_PROVIDER），回退 config 默认。
 /// 供 /live 快照在新 tab 连上时回显正确的选中模型。
 fn live_current_provider() -> String {
@@ -611,6 +621,10 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
             running: matches!(s, TurnState::Running),
         },
         LiveEvent::ProviderChanged(p) => LiveWireEvent::Provider { provider: p },
+        // Other webui tabs following a cwd switch is out of scope for now; the
+        // sync-mode TUI follows it directly via the in-process LiveEvent. Skip
+        // the SSE wire (would need a dedicated LiveWireEvent + frontend handler).
+        LiveEvent::WorkingDirChanged(_) => return None,
         LiveEvent::Turn(te) => match te {
             TE::TextDelta(content) => LiveWireEvent::TextDelta { content },
             TE::ReasoningDelta(content) => LiveWireEvent::ReasoningDelta { content },
