@@ -139,6 +139,125 @@ function abbreviateArgs(args: string, maxLen = 1000): string {
   return args.slice(0, maxLen) + '…';
 }
 
+// Mirror of the TUI's `display_tool_name` (event_loop/mod.rs): MCP wire names
+// `mcp__server__tool` render as `mcp · server · tool`; everything else is
+// snake_case → PascalCase (`read_file` → `ReadFile`). Keeps the webui's tool
+// headers identical to the terminal instead of showing raw `mcp__…` names.
+function displayToolName(name: string): string {
+  if (name.startsWith('mcp__')) {
+    const rest = name.slice('mcp__'.length);
+    const i = rest.indexOf('__');
+    if (i >= 0) return `mcp · ${rest.slice(0, i)} · ${rest.slice(i + 2)}`;
+  }
+  return name
+    .split('_')
+    .filter((w) => w.length > 0)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join('');
+}
+
+// Mirror of the TUI's `format_tool_detail`: a compact human-readable summary
+// of a call's arguments (e.g. MCP calls as `key: "value", …` instead of raw
+// JSON). `argsJson` is the stored arguments string; the full raw args stay
+// available by expanding the row. Returns '' when there's nothing useful to
+// show (the header then shows just the name, like the TUI).
+function formatToolDetail(name: string, argsJson: string): string {
+  let v: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(argsJson);
+    if (parsed === null || typeof parsed !== 'object') return '';
+    v = parsed as Record<string, unknown>;
+  } catch {
+    return argsJson; // not JSON — show as-is rather than nothing
+  }
+  const getStr = (k: string): string => (typeof v[k] === 'string' ? (v[k] as string) : '');
+  const basename = (p: string) => p.split('/').pop() || p;
+
+  switch (name) {
+    case 'read_file':
+    case 'edit_file':
+    case 'write_file':
+    case 'create_file':
+    case 'list_symbols':
+      return getStr('file_path') ? basename(getStr('file_path')) : '';
+    case 'read_symbol': {
+      const sym = getStr('symbol');
+      const file = getStr('file_path') ? basename(getStr('file_path')) : '';
+      if (!sym) return file;
+      if (!file) return sym;
+      return `${sym} in ${file}`;
+    }
+    case 'glob':
+    case 'grep':
+      return getStr('pattern');
+    case 'bash':
+      return getStr('command');
+    case 'list_directory':
+    case 'change_dir':
+      return getStr('path') || '.';
+    case 'web_fetch':
+      return getStr('url');
+    case 'web_search':
+      return getStr('query');
+    case 'find_references':
+    case 'trace_callees':
+    case 'trace_callers':
+    case 'trace_chain':
+      return getStr('symbol');
+    case 'blast_radius':
+    case 'file_dependencies':
+      return getStr('file') ? basename(getStr('file')) : '';
+    case 'search_replace': {
+      const s = getStr('search');
+      const r = getStr('replace');
+      if (s && r) {
+        const parts = [`${s} → ${r}`];
+        const glob = getStr('glob');
+        const path = getStr('path');
+        if (glob) parts.push(`glob: ${glob}`);
+        if (path && path !== '.') parts.push(`path: ${basename(path)}`);
+        return parts.join(', ');
+      }
+      return r || s || '';
+    }
+    case 'parallel_edit_files': {
+      const files = Array.isArray(v.files) ? (v.files as unknown[]) : null;
+      if (!files) return '';
+      return files
+        .map((e) => {
+          const p = (e as Record<string, unknown>)?.path;
+          return typeof p === 'string' ? basename(p) : null;
+        })
+        .filter((x): x is string => x !== null)
+        .join(', ');
+    }
+    case 'use_skill':
+      return getStr('name');
+    default: {
+      // MCP tools (`mcp__server__tool`): render args as `key: "value"` pairs.
+      if (name.startsWith('mcp__')) {
+        const pairs: string[] = [];
+        for (const [k, val] of Object.entries(v)) {
+          let s: string;
+          if (typeof val === 'string') s = val;
+          else if (typeof val === 'number' || typeof val === 'boolean') s = String(val);
+          else if (val && typeof val === 'object') s = JSON.stringify(val);
+          else continue;
+          if (!s) continue;
+          pairs.push(`${k}: "${s.replace(/"/g, '\\"')}"`);
+        }
+        if (pairs.length) return pairs.join(', ');
+      }
+      // Fallback: first present common single-key arg.
+      for (const key of ['file_path', 'path', 'file', 'pattern', 'query', 'url', 'name', 'symbol', 'command']) {
+        const s = getStr(key);
+        if (s) return s;
+      }
+      return '';
+    }
+  }
+}
+
 // 识别「技能/文档型」用户消息：首个非空字符是 markdown 标题、且内容较长。
 // TUI 调用 /skill 时会把整段 SKILL.md 模板塞进用户消息，webui 历史里会把它
 // 渲染成一大坨原文；命中则返回标题文本用作折叠徽章标签，否则返回 null（普通气泡）。
@@ -1391,8 +1510,8 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
   return (
     <div class="tool-body">
       <div class="tool-header" onClick={() => setExpanded((e) => !e)}>
-        <span class="tool-name">{tool.name}</span>
-        <span class="tool-name-secondary">{abbreviateArgs(tool.args)}</span>
+        <span class="tool-name">{displayToolName(tool.name)}</span>
+        <span class="tool-name-secondary">{abbreviateArgs(formatToolDetail(tool.name, tool.args))}</span>
         {annotation && (
           <span class={'tool-annotation ' + annotation.cls}>{annotation.label}</span>
         )}

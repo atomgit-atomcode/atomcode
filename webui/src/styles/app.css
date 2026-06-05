@@ -435,7 +435,8 @@ body {
 .tool-name {
   font-weight: 700;
   color: var(--app-primary-foreground);
-  text-transform: capitalize;
+  /* No text-transform: `displayToolName` already cases names correctly
+     (PascalCase for builtins, lowercase `mcp · server · tool` for MCP). */
   flex-shrink: 0;
 }
 
