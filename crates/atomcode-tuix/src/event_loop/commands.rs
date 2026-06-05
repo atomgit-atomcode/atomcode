@@ -281,7 +281,7 @@ fn attach_live_session(
                 (Role::Tool, MessageContent::ToolResult(r)) => {
                     renderer.render(UiLine::ToolResult {
                         success: r.success,
-                        summary: super::summarise(&r.output, r.success),
+                        summary: super::summarise(&r.output),
                     });
                 }
                 _ => {}

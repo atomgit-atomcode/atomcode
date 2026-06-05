@@ -505,13 +505,13 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
             (Role::Tool, MessageContent::ToolResult(r)) => {
                 renderer.render(UiLine::ToolResult {
                     success: r.success,
-                    summary: summarise(&r.output, r.success),
+                    summary: summarise(&r.output),
                 });
             }
             (Role::Tool, MessageContent::ToolResultRef(r)) => {
                 renderer.render(UiLine::ToolResult {
                     success: true,
-                    summary: summarise(&r.summary, true),
+                    summary: summarise(&r.summary),
                 });
             }
             _ => {}
