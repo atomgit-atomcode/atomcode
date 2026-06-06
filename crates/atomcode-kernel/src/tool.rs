@@ -42,9 +42,14 @@ pub struct ToolDef {
 /// services — proving the kernel needs none.
 ///
 /// `cancel` is the per-turn cooperative-cancellation token. A long-running tool
-/// MAY poll `ctx.cancel.is_cancelled()` or `select!` on `ctx.cancel.cancelled()`
-/// to bail out cleanly; tools that ignore it are unaffected (the kernel still
-/// drops the execute future as a backstop on cancel).
+/// SHOULD poll `ctx.cancel.is_cancelled()` or `select!` on `ctx.cancel.cancelled()`
+/// to bail out and RELEASE ITS RESOURCES. On cancel the kernel drops the execute
+/// future as a backstop, but dropping only STOPS POLLING — it is NOT cleanup: any
+/// subprocess / fd / partial write the tool spawned is the TOOL's responsibility
+/// to reclaim, via cooperative cancel-polling or an RAII `Drop` guard on the
+/// resource (e.g. a child-process handle that SIGKILLs on drop). A tool that does
+/// neither may leak on cancel, and a side effect already in flight when the future
+/// is dropped is reported to the model as cancelled even though it may have landed.
 pub struct ToolContext {
     pub working_dir: PathBuf,
     pub cancel: tokio_util::sync::CancellationToken,

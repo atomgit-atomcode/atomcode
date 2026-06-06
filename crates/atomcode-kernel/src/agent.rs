@@ -332,19 +332,21 @@ impl RunningAgent {
                             };
                             // INSIDE-EXECUTE backstop: poll cancel while the tool
                             // future runs so a long tool is interrupted mid-flight.
-                            // Carried from production runner.rs:1431. `biased` polls
-                            // execute FIRST: a tool that already completed wins (its
-                            // real result is kept, mirroring production where a tool
-                            // returning in the same poll as a cancel keeps its
-                            // result); a tool still pending when cancel fires is
-                            // dropped as a backstop, yielding "(cancelled)".
-                            // Cooperative tools that poll ctx.cancel clean up properly.
+                            // DEVIATES from production runner.rs:1431 (a FAIR select)
+                            // by being `biased` execute-first: a tool that already
+                            // completed deterministically keeps its real result,
+                            // rather than losing a coin-flip to the cancel branch.
+                            // Cooperative tools that poll ctx.cancel win this race and
+                            // clean up properly. A tool still PENDING when cancel fires
+                            // is dropped as a backstop — its side effects (if any) are
+                            // unknown, so the synthetic result says so (see ToolContext
+                            // doc: drop stops polling, it is NOT resource cleanup).
                             let mut r = tokio::select! {
                                 biased;
                                 r = tool.execute(&call.arguments, &ctx) => r,
                                 _ = cancel.cancelled() => ToolResult {
                                     call_id: call.id.clone(),
-                                    content: "(cancelled)".into(),
+                                    content: "(cancelled — side effects unknown)".into(),
                                     is_error: true,
                                 },
                             };
