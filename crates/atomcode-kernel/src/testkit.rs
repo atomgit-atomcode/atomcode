@@ -100,6 +100,69 @@ impl LlmProvider for ScriptedProvider {
     }
 }
 
+/// Scripted, RICH-recording provider for prefix-cache regression tests. Unlike
+/// `MockProvider` (which snapshots only `(role, text)` and discards tools /
+/// tool_calls), this records the FULL `(Vec<Message>, Vec<ToolDef>)` it received
+/// on every `chat_stream` call — so a test can byte-compare the exact wire prefix
+/// (history + tool block) the provider saw across rounds and turns.
+///
+/// Each call pops the next scripted `Vec<StreamEvent>`; an empty queue yields a
+/// bare `Done { truncated: false }`. This drives multi-round turns (call 1 → a
+/// ToolCall then Done; call 2 → TextDelta then Done → no calls → turn ends) and
+/// multi-turn sessions.
+pub struct RecordingProvider {
+    turns: Mutex<VecDeque<Vec<StreamEvent>>>,
+    calls: Arc<Mutex<Vec<(Vec<Message>, Vec<ToolDef>)>>>,
+    ctx_window: u32,
+}
+
+impl RecordingProvider {
+    pub fn new(turns: Vec<Vec<StreamEvent>>) -> Self {
+        Self {
+            turns: Mutex::new(turns.into_iter().collect()),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            ctx_window: 0,
+        }
+    }
+    pub fn with_ctx_window(mut self, w: u32) -> Self {
+        self.ctx_window = w;
+        self
+    }
+    /// Shared handle to the recorded calls; clone before moving the provider into
+    /// the builder so the test can inspect what the LLM saw afterwards.
+    pub fn calls(&self) -> Arc<Mutex<Vec<(Vec<Message>, Vec<ToolDef>)>>> {
+        self.calls.clone()
+    }
+    /// A point-in-time snapshot of every recorded `(messages, tools)` call.
+    pub fn recorded(&self) -> Vec<(Vec<Message>, Vec<ToolDef>)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RecordingProvider {
+    fn model_name(&self) -> &str {
+        "recording"
+    }
+    fn context_window(&self) -> u32 {
+        self.ctx_window
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        self.calls.lock().unwrap().push((messages.to_vec(), tools.to_vec()));
+        let events = self
+            .turns
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![StreamEvent::Done { truncated: false }]);
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
 /// A safe tool.
 pub struct EchoTool;
 
