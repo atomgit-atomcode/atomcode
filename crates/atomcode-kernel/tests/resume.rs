@@ -297,3 +297,62 @@ async fn resume_from_dangling_snapshot_is_repaired_to_api_valid() {
     assert!(backfilled.is_error, "backfilled cancelled result must be is_error");
     assert_eq!(backfilled.text, "(cancelled)");
 }
+
+// CLAIM 24 (resume side): resuming from a snapshot that contains an ORPHAN
+// tool_result (a tool_result with NO matching assistant tool_call — possible from
+// an externally-supplied or legacy/mid-compaction snapshot) must NOT produce an
+// API-invalid first request. The old append-only backfill could NOT remove an
+// orphan; the resume seeding path now uses `repair_pairing`, which DROPS it.
+#[tokio::test]
+async fn resume_heals_orphan_tool_result_snapshot() {
+    // A snapshot carrying an ORPHAN tool_result: "c_orphan" has no preceding
+    // assistant tool_call. (Also keep a well-formed pair to prove it survives.)
+    let with_orphan = SessionSnapshot::new(vec![
+        Message::system(PERSONA),
+        Message::user("read the file"),
+        Message::assistant("call good", vec![tool_call("c_good", "echo", "{}")]),
+        Message::tool_result("c_good", "good output", false),
+        Message::tool_result("c_orphan", "ORPHANED result with no call", false), // ORPHAN
+        Message::assistant("an answer", vec![]),
+    ]);
+
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::TextDelta("continuing".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+    let calls = provider.calls();
+
+    let mut handle = resumed_agent(provider, with_orphan).spawn();
+    drive_one_turn(&mut handle, "go").await;
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let calls = calls.lock().unwrap();
+    assert!(!calls.is_empty(), "the resumed turn must run");
+    let msgs = &calls[0].0;
+
+    // The orphan must be GONE from the first resumed request.
+    assert!(
+        !msgs.iter().any(|m| m.tool_call_id.as_deref() == Some("c_orphan")),
+        "orphan tool_result must be removed on resume (pair-validity)"
+    );
+    // PAIR-VALIDITY: every tool_result has a preceding assistant tool_call.
+    let call_ids: std::collections::HashSet<&str> = msgs
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().map(|tc| tc.id.as_str()))
+        .collect();
+    for m in msgs {
+        if let Some(id) = m.tool_call_id.as_deref() {
+            assert!(
+                call_ids.contains(id),
+                "tool_result {id} must have a matching tool_call (no orphan)"
+            );
+        }
+    }
+    // The well-formed pair survives untouched.
+    let good = msgs
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("c_good"))
+        .expect("the well-formed c_good result must survive");
+    assert_eq!(good.text, "good output");
+}

@@ -259,12 +259,15 @@ impl RunningAgent {
                 // Carry the snapshot's `cache_epoch` so a resume restores the same
                 // prefix generation (defaults to 0 for v1 snapshots via serde).
                 let mut c = Conversation { messages: snap.messages.clone(), cache_epoch: snap.cache_epoch };
-                // An externally-supplied or mid-turn-persisted snapshot may end in a
-                // DANGLING assistant tool_call (a tool_use with no tool_result). Seeding
-                // it verbatim would make the first resumed request an API-invalid payload.
-                // backfill is append-only + idempotent → a no-op for well-formed snapshots,
-                // a repair for malformed ones. (See backfill_cancelled_tool_results.)
-                c.backfill_cancelled_tool_results();
+                // An externally-supplied or mid-turn-persisted snapshot may be
+                // API-INVALID: a DANGLING assistant tool_call (a tool_use with no
+                // tool_result) OR an ORPHAN tool_result (a tool_result with no matching
+                // tool_call). Seeding either verbatim would make the first resumed request
+                // an illegal "messages" payload. `repair_pairing` is a strict superset of
+                // `backfill_cancelled_tool_results`: it DROPS orphans AND backfills
+                // danglings in place (a no-op for well-formed snapshots). A plain backfill
+                // could not remove an orphan, so use the full repair here.
+                Conversation::repair_pairing(&mut c.messages);
                 c
             }
             // FORWARD-COMPAT SEAM: a snapshot from an unknown (newer/older) kernel

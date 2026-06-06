@@ -141,6 +141,69 @@ impl Conversation {
         }
     }
 
+    /// Make a message vec API-VALID in place: every assistant `tool_call` is
+    /// paired with EXACTLY ONE following `tool_result`, and no `tool_result` is an
+    /// ORPHAN (a `Role::Tool` message whose `tool_call_id` matches no assistant
+    /// `tool_call`). The kernel — not a strategy — owns this invariant, so a buggy
+    /// strategy (or an externally-supplied/legacy snapshot) can never hand the
+    /// provider an illegal "messages" payload.
+    ///
+    /// This is a strict SUPERSET of `backfill_cancelled_tool_results`: it both
+    /// (a) DROPS orphan results AND (b) backfills danglings — and, crucially, it
+    /// inserts each missing result IMMEDIATELY AFTER its assistant message
+    /// (preserving the result-follows-call ordering), not appended at the end. (The
+    /// append-only cancel path keeps using `backfill_cancelled_tool_results`, whose
+    /// danglings are trailing so an end-append is fine there and existing tests stay
+    /// green.)
+    ///
+    /// Two passes, ordering-preserving:
+    ///   (a) ORPHAN SCRUB — collect the set of LIVE `tool_calls[].id` across all
+    ///       messages (as OWNED `String`s, to avoid a borrow conflict with the
+    ///       following rebuild), then `retain` only the `Role::Tool` messages whose
+    ///       `tool_call_id` is in that set.
+    ///   (b) DANGLING REPAIR — rebuild the Vec: push each message, then for any of
+    ///       its assistant `tool_calls` whose id has NO matching surviving result,
+    ///       push a synthetic `(cancelled)` result right after it.
+    pub fn repair_pairing(msgs: &mut Vec<Message>) {
+        // (a) ORPHAN SCRUB. Collect OWNED live call ids first to release the borrow
+        // before the mutating `retain`.
+        let live_call_ids: std::collections::HashSet<String> = msgs
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().map(|tc| tc.id.clone()))
+            .collect();
+        msgs.retain(|m| match (&m.role, &m.tool_call_id) {
+            // A tool RESULT survives only if its id matches a live tool_call.
+            (Role::Tool, Some(id)) => live_call_ids.contains(id),
+            // Non-result messages (and the degenerate Tool-without-id) pass through.
+            _ => true,
+        });
+
+        // The set of result ids that NOW survive (after the scrub) — these are the
+        // calls that are already paired.
+        let result_ids: std::collections::HashSet<String> = msgs
+            .iter()
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+
+        // (b) DANGLING REPAIR. Rebuild, inserting each missing result right after
+        // its assistant message so the result FOLLOWS its call.
+        let mut rebuilt: Vec<Message> = Vec::with_capacity(msgs.len());
+        for m in msgs.drain(..) {
+            let stubs: Vec<Message> = if m.role == Role::Assistant {
+                m.tool_calls
+                    .iter()
+                    .filter(|tc| !result_ids.contains(&tc.id))
+                    .map(|tc| Message::tool_result(tc.id.clone(), "(cancelled)", true))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            rebuilt.push(m);
+            rebuilt.extend(stubs);
+        }
+        *msgs = rebuilt;
+    }
+
     /// The number of LEADING messages that must NEVER be removed by compaction:
     /// a leading `Role::System` message (if present) PLUS up to and INCLUDING the
     /// FIRST NON-SYNTHETIC (`synthetic == false`) `Role::User` message. This keeps
@@ -215,8 +278,15 @@ impl Conversation {
         }
         candidate.extend_from_slice(&self.messages[drain_to..]);
         // Apply rewrites in place against the CANDIDATE (post-drain) indices.
-        // Out-of-range indices are skipped (never panic).
+        // Out-of-range indices are skipped (never panic). A rewrite index in the
+        // PROTECTED PREFIX (`< floor`) is SKIPPED too: the prefix `candidate[..floor]`
+        // equals `messages[..floor]` (drain_from >= floor), so a `< floor` rewrite
+        // would mutate the FROZEN system/first-real-user prefix — the sacred-floor
+        // guarantee must hold for rewrites just as it does for drains.
         for (i, new_text) in &plan.rewrites {
+            if *i < floor {
+                continue;
+            }
             if let Some(m) = candidate.get_mut(*i) {
                 m.text = new_text.clone();
             }
@@ -225,6 +295,16 @@ impl Conversation {
         if let Some(note) = &plan.resume_note {
             candidate.push(Message::synthetic_user(note.clone()));
         }
+
+        // Make the candidate API-VALID before measuring: drop any orphan tool_result
+        // left by splitting a tool_call/tool_result pair across the drain boundary,
+        // and backfill any dangling assistant tool_call with a `(cancelled)` result
+        // (inserted right after its call). The kernel owns this invariant so a buggy
+        // strategy cannot corrupt the conversation. Orphan removal counts toward the
+        // net-loss measurement (good); if dangling-repair growth makes the candidate
+        // not strictly smaller, the plan is correctly REFUSED below (leaving the
+        // original, which was valid).
+        Self::repair_pairing(&mut candidate);
 
         let bytes_after: usize = candidate.iter().map(|m| m.text.len()).sum();
 
@@ -736,13 +816,15 @@ mod tests {
     }
 
     // A rewrite of a tool_result's text → that message's text changes, others
-    // untouched, epoch bumps iff net smaller.
+    // untouched, epoch bumps iff net smaller. (Fixture is API-valid: the assistant
+    // carries the `c1` tool_call that the tool_result pairs with, so the kernel's
+    // pair-validity repair is a no-op here and the in-place rewrite is what's tested.)
     #[test]
     fn apply_plan_rewrites_in_place_are_applied() {
         let mut c = Conversation::new();
         c.push(Message::system("sys"));
         c.push(Message::user("task"));
-        c.push(Message::assistant("call", vec![]));
+        c.push(Message::assistant("call", vec![call("c1", "read_file")]));
         c.push(Message::tool_result("c1", "HUGE TOOL OUTPUT THAT IS LONG", false));
         c.push(Message::user("next"));
         let floor = c.sacred_floor();
@@ -807,6 +889,171 @@ mod tests {
         // `new` defaults epoch 0.
         let snap2 = SessionSnapshot::new(vec![Message::user("x")]);
         assert_eq!(snap2.cache_epoch, 0);
+    }
+
+    // ── BLOCKER 1 — pair-validity (orphan scrub + dangling repair) ───────────
+
+    /// Returns Err(reason) if `msgs` is NOT API-pair-valid: every assistant
+    /// `tool_call.id` must have exactly one following `tool_result` carrying that
+    /// `tool_call_id`, and every `tool_result`'s `tool_call_id` must have a
+    /// PRECEDING assistant `tool_call`.
+    fn check_pair_valid(msgs: &[Message]) -> Result<(), String> {
+        // Every assistant tool_call → exactly one FOLLOWING result with that id.
+        for (i, m) in msgs.iter().enumerate() {
+            if m.role == Role::Assistant {
+                for tc in &m.tool_calls {
+                    let following = msgs[i + 1..]
+                        .iter()
+                        .filter(|r| r.tool_call_id.as_deref() == Some(tc.id.as_str()))
+                        .count();
+                    if following != 1 {
+                        return Err(format!(
+                            "tool_call {} has {} following results (want exactly 1)",
+                            tc.id, following
+                        ));
+                    }
+                }
+            }
+        }
+        // Every tool_result → a PRECEDING assistant tool_call with that id.
+        for (i, m) in msgs.iter().enumerate() {
+            if m.role == Role::Tool {
+                let id = m.tool_call_id.as_deref().unwrap_or("");
+                let preceded = msgs[..i].iter().any(|a| {
+                    a.role == Role::Assistant && a.tool_calls.iter().any(|tc| tc.id == id)
+                });
+                if !preceded {
+                    return Err(format!("tool_result {id} is an ORPHAN (no preceding tool_call)"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // A history with interleaved tool_call/tool_result pairs: for EVERY keep_recent,
+    // SummarizeOldest's plan applied via apply_plan must leave PAIR-VALID messages —
+    // no orphan tool_result (pair split by the drain) and no dangling tool_call.
+    // (This is the probe the reviewer used against the real bug, made permanent.)
+    #[tokio::test]
+    async fn apply_plan_never_leaves_orphan_or_dangling_for_any_keep_recent() {
+        use crate::testkit::SummarizeOldestStrategy;
+        let base: Vec<Message> = vec![
+            Message::system("PERSONA"),
+            Message::user("the task"),
+            Message::assistant("call one", vec![call("c1", "echo")]),
+            Message::tool_result("c1", "result one is fairly long here", false),
+            Message::user("an interleaved user note"),
+            Message::assistant("call two", vec![call("c2", "echo")]),
+            Message::tool_result("c2", "result two is also fairly long", false),
+            Message::assistant("call three", vec![call("c3", "echo")]),
+            Message::tool_result("c3", "result three padding padding", false),
+            Message::assistant("final answer with some length to it", vec![]),
+        ];
+        let len = base.len();
+        for keep_recent in 0..=len {
+            let mut c = Conversation { messages: base.clone(), cache_epoch: 0 };
+            let floor = c.sacred_floor();
+            let view = CompactionView {
+                messages: &c.messages,
+                trigger: CompactTrigger::Manual { focus: None },
+                ctx_window: 1000,
+                used_tokens: 0,
+                utilization: 0.0,
+                sacred_floor: floor,
+            };
+            let plan = SummarizeOldestStrategy { keep_recent }.plan(&view).await;
+            c.apply_plan(plan, floor);
+            check_pair_valid(&c.messages).unwrap_or_else(|e| {
+                panic!("keep_recent={keep_recent} produced an INVALID pairing: {e}\n{:#?}", c.messages)
+            });
+        }
+    }
+
+    // repair_pairing in isolation: it DROPS an orphan tool_result and BACKFILLS a
+    // dangling tool_call (inserting the stub right AFTER its assistant call).
+    #[test]
+    fn repair_pairing_drops_orphan_and_backfills_dangling_in_order() {
+        // Orphan: a tool_result whose call was removed. Dangling: an assistant call
+        // with no result.
+        let mut msgs = vec![
+            Message::system("sys"),
+            Message::user("task"),
+            Message::tool_result("orphan", "leftover result", false), // ORPHAN
+            Message::assistant("calling", vec![call("dang", "echo")]), // DANGLING
+            Message::user("trailing"),
+        ];
+        Conversation::repair_pairing(&mut msgs);
+        check_pair_valid(&msgs).expect("must be pair-valid after repair");
+        // Orphan gone.
+        assert!(
+            !msgs.iter().any(|m| m.tool_call_id.as_deref() == Some("orphan")),
+            "orphan tool_result must be dropped"
+        );
+        // Dangling backfilled with a (cancelled) result RIGHT AFTER its call.
+        let dang_call_idx = msgs
+            .iter()
+            .position(|m| m.tool_calls.iter().any(|tc| tc.id == "dang"))
+            .unwrap();
+        let after = &msgs[dang_call_idx + 1];
+        assert_eq!(after.role, Role::Tool);
+        assert_eq!(after.tool_call_id.as_deref(), Some("dang"));
+        assert_eq!(after.text, "(cancelled)");
+        assert!(after.is_error);
+    }
+
+    // repair_pairing is a NO-OP on an already-valid history (the orphan scrub /
+    // dangling repair must not perturb well-formed pairs — claim 22/23 safety).
+    #[test]
+    fn repair_pairing_is_noop_on_valid_history() {
+        let valid = vec![
+            Message::system("sys"),
+            Message::user("task"),
+            Message::assistant("call", vec![call("c1", "echo")]),
+            Message::tool_result("c1", "out", false),
+            Message::assistant("done", vec![]),
+        ];
+        let mut msgs = valid.clone();
+        Conversation::repair_pairing(&mut msgs);
+        assert_eq!(msgs, valid, "repair_pairing must be a no-op on an already-valid history");
+    }
+
+    // ── BLOCKER 2 — rewrites respect the sacred floor ────────────────────────
+
+    // A rewrite targeting an index in the protected prefix (system idx 0 and the
+    // first real user idx 1) is IGNORED; an in-range rewrite still applies.
+    #[test]
+    fn apply_plan_rewrite_cannot_touch_sacred_prefix() {
+        let mut c = Conversation::new();
+        c.push(Message::system("SYSTEM-PERSONA"));
+        c.push(Message::user("THE-REAL-TASK"));
+        c.push(Message::assistant("middle that is long enough to shrink", vec![]));
+        c.push(Message::user("tail"));
+        let floor = c.sacred_floor(); // 2
+        let sys_before = c.messages[0].clone();
+        let user_before = c.messages[1].clone();
+        let epoch_before = c.cache_epoch;
+
+        // Rewrites at idx 0 (system) and idx 1 (first real user) MUST be ignored;
+        // the in-range rewrite at idx 2 (shrinking the middle) applies → commit.
+        let plan = CompactionPlan {
+            drain_from: 0,
+            drain_to: 0,
+            summary: None,
+            rewrites: vec![
+                (0, "HACKED".into()),
+                (1, "HACKED".into()),
+                (2, "short".into()),
+            ],
+            resume_note: None,
+        };
+        let report = c.apply_plan(plan, floor);
+        assert!(report.committed, "the in-range shrinking rewrite must commit");
+        assert_eq!(c.cache_epoch, epoch_before + 1);
+        // Sacred prefix BYTE-IDENTICAL (rewrites ignored).
+        assert_eq!(c.messages[0], sys_before, "system must be byte-identical");
+        assert_eq!(c.messages[1], user_before, "first real user must be byte-identical");
+        // The in-range rewrite applied.
+        assert_eq!(c.messages[2].text, "short");
     }
 
     // NoCompaction (the neutral default strategy) returns a noop plan.
