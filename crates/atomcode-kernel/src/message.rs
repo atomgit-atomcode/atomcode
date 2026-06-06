@@ -1,5 +1,6 @@
 use crate::stream::TokenUsage;
 use crate::tool::ToolCall;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,28 +45,55 @@ pub struct Message {
     /// Kernel-native execution stats (sidecar). Never implicitly rendered into
     /// `text` — projecting to the LLM is the renderer's explicit choice.
     pub meta: Option<MessageMeta>,
+    /// True iff this message was INJECTED BY THE KERNEL (a cold-compaction summary
+    /// or a resume note) rather than produced by the real model/user. ADDITIVE:
+    /// `#[serde(default)]` so a v1 snapshot (no `synthetic` field) still
+    /// deserializes (→ false). `sacred_floor` reads this to find the FIRST REAL
+    /// (non-synthetic) user message — so a synthetic resume/summary message that
+    /// precedes the real prompt is never mistaken for the sacred task anchor.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 impl Message {
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None }
+        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false }
     }
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None }
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false }
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, is_error: false, meta: None }
+        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, is_error: false, meta: None, synthetic: false }
     }
     /// A tool RESULT. `is_error` is now STORED (a real adapter must echo it to the
     /// provider) — it was previously dropped, losing tool failure state.
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
-        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), is_error, meta: None }
+        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), is_error, meta: None, synthetic: false }
+    }
+    /// A KERNEL-INJECTED synthetic `Role::User` message (compaction cold summary or
+    /// resume note). It carries `synthetic = true` so `sacred_floor` skips it when
+    /// locating the first REAL user prompt. The `Role::User` choice (not System)
+    /// is deliberate: a System-role injection would risk being folded into the
+    /// frozen system prefix by a downstream consecutive-system merger and rewrite
+    /// the whole cached prefix — see `ctx/render.rs` in production. Inserted
+    /// after the system message, it preserves the frozen system prefix.
+    pub fn synthetic_user(text: impl Into<String>) -> Self {
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: true }
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Conversation {
     pub messages: Vec<Message>,
+    /// The PREFIX-GENERATION marker (a SIDECAR, NEVER serialized into message text
+    /// and NEVER sent to the LLM). It records "the stored prefix bytes changed
+    /// here — a new cache epoch began", i.e. the one point where the append-only
+    /// prefix relation is allowed to break. Today ONLY a COMMITTED compaction bumps
+    /// it (see `apply_plan`); when future system/tool mutation seams land, those
+    /// would bump it too (out of scope now). A new `Conversation` starts at epoch
+    /// 0. ADDITIVE: `#[serde(default)]` so a v1 snapshot still deserializes (→ 0).
+    #[serde(default)]
+    pub cache_epoch: u64,
 }
 
 impl Conversation {
@@ -112,6 +140,207 @@ impl Conversation {
             self.messages.push(Message::tool_result(id, "(cancelled)", true));
         }
     }
+
+    /// The number of LEADING messages that must NEVER be removed by compaction:
+    /// a leading `Role::System` message (if present) PLUS up to and INCLUDING the
+    /// FIRST NON-SYNTHETIC (`synthetic == false`) `Role::User` message. This keeps
+    /// the persona + the original task prompt alive across every compaction so a
+    /// resumed timeline still opens on the human's ask.
+    ///
+    /// Returns an INDEX `floor` such that `messages[..floor]` is the protected
+    /// prefix. A synthetic user message that precedes the first real user is NOT
+    /// the anchor — only the real prompt anchors the floor. (Carried from
+    /// production `apply_compression`'s sacred carve-out, mapped to this flat Vec.)
+    pub fn sacred_floor(&self) -> usize {
+        // A leading System message is part of the protected prefix.
+        let lead_system =
+            usize::from(matches!(self.messages.first().map(|m| &m.role), Some(Role::System)));
+        // Find the FIRST REAL (non-synthetic) user message; the floor extends
+        // through it (index + 1). If none exists, the floor is just the lead
+        // system (or 0).
+        match self
+            .messages
+            .iter()
+            .position(|m| m.role == Role::User && !m.synthetic)
+        {
+            Some(idx) => idx + 1,
+            None => lead_system,
+        }
+    }
+
+    /// Apply a compaction [`CompactionPlan`] as the SOLE non-append history writer
+    /// (besides `backfill_cancelled_tool_results`). The kernel — not the strategy —
+    /// owns and enforces every invariant here, so a buggy strategy cannot corrupt
+    /// the conversation:
+    ///
+    /// 1. REVALIDATE/CLAMP against current state: `drain_from` is clamped up to
+    ///    `>= sacred_floor` (never drain the protected prefix); `drain_to` is
+    ///    clamped down to `<= messages.len()`; an inverted/empty range
+    ///    (`drain_from >= drain_to`) drains nothing (but rewrites / summary-insert /
+    ///    resume_note still apply). Out-of-range rewrite indices are SKIPPED
+    ///    (never panic).
+    /// 2. COMPUTE-THEN-COMMIT for the NET-LOSS GUARD: build the candidate `Vec`
+    ///    (drain the range; if `summary` is `Some`, insert ONE
+    ///    `Message::synthetic_user(summary)` at `drain_from`; apply rewrites;
+    ///    append `resume_note` as a trailing `synthetic_user`), then measure a
+    ///    DETERMINISTIC size proxy — the sum of `m.text.len()` over all messages —
+    ///    BEFORE vs AFTER. COMMIT only if AFTER is STRICTLY smaller than BEFORE.
+    /// 3. On COMMIT: replace `messages` with the candidate and bump
+    ///    `cache_epoch += 1` EXACTLY ONCE (decide commit FIRST, bump only after —
+    ///    never bump-then-rollback). On REFUSE (not strictly smaller, or noop):
+    ///    leave `messages` BYTE-IDENTICAL and do NOT bump `cache_epoch` — a
+    ///    refused/no-op compaction never burns a cache epoch.
+    ///
+    /// This is the append-aware cache contract: a COMMITTED compaction is the ONLY
+    /// allowed non-append history change and it opens a new epoch; a REFUSED one
+    /// leaves the prefix byte-stable and the epoch unchanged.
+    pub fn apply_plan(&mut self, plan: CompactionPlan, sacred_floor: usize) -> CompactReport {
+        let epoch_before = self.cache_epoch;
+        let bytes_before: usize = self.messages.iter().map(|m| m.text.len()).sum();
+        let len_before = self.messages.len();
+
+        // 1. Clamp the drain range against the protected prefix and current bounds.
+        let floor = sacred_floor.min(len_before);
+        let drain_from = plan.drain_from.max(floor).min(len_before);
+        let drain_to = plan.drain_to.min(len_before);
+        // Inverted/empty range → drain nothing.
+        let (drain_from, drain_to) =
+            if drain_from >= drain_to { (drain_from, drain_from) } else { (drain_from, drain_to) };
+
+        // 2. Build the candidate (compute-then-commit — never mutate self yet).
+        let mut candidate: Vec<Message> = Vec::with_capacity(len_before + 2);
+        candidate.extend_from_slice(&self.messages[..drain_from]);
+        if let Some(summary) = &plan.summary {
+            candidate.push(Message::synthetic_user(summary.clone()));
+        }
+        candidate.extend_from_slice(&self.messages[drain_to..]);
+        // Apply rewrites in place against the CANDIDATE (post-drain) indices.
+        // Out-of-range indices are skipped (never panic).
+        for (i, new_text) in &plan.rewrites {
+            if let Some(m) = candidate.get_mut(*i) {
+                m.text = new_text.clone();
+            }
+        }
+        // Append the resume note (if any) as a trailing synthetic user message.
+        if let Some(note) = &plan.resume_note {
+            candidate.push(Message::synthetic_user(note.clone()));
+        }
+
+        let bytes_after: usize = candidate.iter().map(|m| m.text.len()).sum();
+
+        // 3. Decide commit FIRST; bump epoch only after a real commit.
+        let committed = bytes_after < bytes_before;
+        let (epoch_after, removed) = if committed {
+            let removed = len_before.saturating_sub(candidate.len());
+            self.messages = candidate;
+            self.cache_epoch = epoch_before + 1;
+            (self.cache_epoch, removed)
+        } else {
+            // REFUSE: messages byte-identical, epoch unchanged.
+            (epoch_before, 0)
+        };
+
+        CompactReport {
+            epoch_before,
+            epoch_after,
+            removed,
+            bytes_before,
+            bytes_after,
+            committed,
+        }
+    }
+}
+
+/// The outcome of [`Conversation::apply_plan`] — a precise audit record of a
+/// compaction attempt. `committed == false` means the plan was REFUSED (net-loss
+/// guard or noop): `messages` are byte-identical and `epoch_before == epoch_after`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactReport {
+    pub epoch_before: u64,
+    pub epoch_after: u64,
+    pub removed: usize,
+    pub bytes_before: usize,
+    pub bytes_after: usize,
+    pub committed: bool,
+}
+
+/// Why a compaction is being attempted. (Overflow is deferred — no caller yet.)
+#[derive(Clone, Debug, PartialEq)]
+pub enum CompactTrigger {
+    /// Context-pressure driven: `utilization` of the window has been crossed.
+    Auto { utilization: f32 },
+    /// User-requested (e.g. `/compact`), optionally focused on a topic.
+    Manual { focus: Option<String> },
+}
+
+/// READ-ONLY view handed to a [`CompactionStrategy`]: a borrow of the current
+/// history plus the pressure facts the kernel already records, and the
+/// kernel-computed `sacred_floor`. A strategy reads these to PLAN a drain; it can
+/// never mutate the conversation (the kernel is the sole writer via `apply_plan`).
+pub struct CompactionView<'a> {
+    pub messages: &'a [Message],
+    pub trigger: CompactTrigger,
+    pub ctx_window: u32,
+    pub used_tokens: u32,
+    pub utilization: f32,
+    /// The number of leading messages the strategy must NOT propose draining (the
+    /// kernel re-enforces this anyway by clamping in `apply_plan`).
+    pub sacred_floor: usize,
+}
+
+/// A strategy's PROPOSAL for one compaction. The kernel REVALIDATES and applies it
+/// in [`Conversation::apply_plan`] (clamping, net-loss guard, epoch bump), so a
+/// malformed plan can never corrupt invariants.
+///
+/// Semantics: replace messages in range `[drain_from, drain_to)` with — if
+/// `summary` is `Some` — ONE synthetic `Role::User` summary message inserted at
+/// `drain_from`; apply `rewrites` as in-place `messages[i].text = new` (for
+/// stubbing a tool_result in place — a permanent microcompact), indices being
+/// post-drain positions; append `resume_note` (if `Some`) as a trailing synthetic
+/// `Role::User` message. A NOOP plan is an empty drain range + no summary + no
+/// rewrites + no resume_note.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct CompactionPlan {
+    pub drain_from: usize,
+    pub drain_to: usize,
+    pub summary: Option<String>,
+    pub rewrites: Vec<(usize, String)>,
+    pub resume_note: Option<String>,
+}
+
+impl CompactionPlan {
+    /// The neutral plan: drain nothing, no summary, no rewrites, no resume note.
+    pub fn noop() -> Self {
+        Self::default()
+    }
+    /// True iff this plan would change nothing: empty drain range AND no summary AND
+    /// no rewrites AND no resume note.
+    pub fn is_noop(&self) -> bool {
+        self.drain_from >= self.drain_to
+            && self.summary.is_none()
+            && self.rewrites.is_empty()
+            && self.resume_note.is_none()
+    }
+}
+
+/// The REPLACEABLE compaction POLICY injection point. A single-impl, PLAN-ONLY
+/// trait: a strategy only PROPOSES a [`CompactionPlan`] from a read-only
+/// [`CompactionView`]; the kernel remains the SOLE writer (via
+/// [`Conversation::apply_plan`]), so a buggy strategy cannot corrupt the sacred
+/// floor, net-loss, or cache-epoch invariants. Default = [`NoCompaction`] (no-op).
+#[async_trait]
+pub trait CompactionStrategy: Send + Sync {
+    async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan;
+}
+
+/// The neutral DEFAULT strategy: never compacts (always returns a noop plan).
+pub struct NoCompaction;
+
+#[async_trait]
+impl CompactionStrategy for NoCompaction {
+    async fn plan(&self, _view: &CompactionView<'_>) -> CompactionPlan {
+        CompactionPlan::noop()
+    }
 }
 
 /// On-disk/over-the-wire schema version for a persisted conversation. Bump it
@@ -133,16 +362,23 @@ pub const SNAPSHOT_VERSION: u32 = 1;
 pub struct SessionSnapshot {
     pub version: u32,
     pub messages: Vec<Message>,
+    /// The conversation's PREFIX-GENERATION marker, persisted so a resumed session
+    /// preserves which cache epoch it was on. ADDITIVE: `#[serde(default)]` keeps a
+    /// v1 snapshot (no `cache_epoch` field) loadable (→ 0). `new(messages)`
+    /// defaults it to 0; `from_conversation` copies the live value.
+    #[serde(default)]
+    pub cache_epoch: u64,
 }
 
 impl SessionSnapshot {
-    /// Stamp the current `SNAPSHOT_VERSION` over the given messages.
+    /// Stamp the current `SNAPSHOT_VERSION` over the given messages (epoch 0).
     pub fn new(messages: Vec<Message>) -> Self {
-        Self { version: SNAPSHOT_VERSION, messages }
+        Self { version: SNAPSHOT_VERSION, messages, cache_epoch: 0 }
     }
-    /// Snapshot a live conversation losslessly at the current version.
+    /// Snapshot a live conversation losslessly at the current version, carrying its
+    /// `cache_epoch` so a resume restores the same prefix generation.
     pub fn from_conversation(convo: &Conversation) -> Self {
-        Self::new(convo.messages.clone())
+        Self { version: SNAPSHOT_VERSION, messages: convo.messages.clone(), cache_epoch: convo.cache_epoch }
     }
 }
 
@@ -353,5 +589,240 @@ mod tests {
         let snap2 = SessionSnapshot::new(c.messages.clone());
         assert_eq!(snap2.version, SNAPSHOT_VERSION);
         assert_eq!(snap2.messages, c.messages);
+    }
+
+    // ── compaction MECHANISM (kernel L0) ──────────────────────────────────
+
+    // sacred_floor protects a leading System message PLUS up to and including the
+    // FIRST NON-SYNTHETIC user message. A synthetic user message that precedes the
+    // first real user is NOT the anchor — only the real prompt anchors the floor.
+    #[test]
+    fn sacred_floor_protects_system_and_first_real_user() {
+        let mut c = Conversation::new();
+        c.push(Message::system("persona"));
+        c.push(Message::user("task")); // first REAL user message → index 1
+        c.push(Message::assistant("ok", vec![]));
+        c.push(Message::user("more"));
+        // floor = system(1) + through first real user(idx 1) = count 2.
+        assert_eq!(c.sacred_floor(), 2);
+
+        // A synthetic user BEFORE the first real user must not be the anchor.
+        let mut c2 = Conversation::new();
+        c2.push(Message::system("persona"));
+        c2.push(Message::synthetic_user("[resume note]")); // synthetic, NOT anchor
+        c2.push(Message::user("real task")); // first REAL user → index 2
+        c2.push(Message::assistant("ok", vec![]));
+        // floor must extend through the first REAL user (index 2) → count 3.
+        assert_eq!(c2.sacred_floor(), 3);
+
+        // No system, real user first.
+        let mut c3 = Conversation::new();
+        c3.push(Message::user("hi"));
+        c3.push(Message::assistant("ho", vec![]));
+        assert_eq!(c3.sacred_floor(), 1);
+    }
+
+    // Draining a middle range with a summary: messages shrink, ONE synthetic
+    // Role::User summary appears at drain_from, system[0] byte-identical, epoch +1,
+    // committed.
+    #[test]
+    fn apply_plan_drains_and_inserts_synthetic_summary_and_bumps_epoch() {
+        let mut c = Conversation::new();
+        c.push(Message::system("PERSONA-FROZEN"));
+        c.push(Message::user("the task"));
+        c.push(Message::assistant("aaaaaaaaaa", vec![]));
+        c.push(Message::tool_result("c1", "bbbbbbbbbb", false));
+        c.push(Message::assistant("cccccccccc", vec![]));
+        c.push(Message::user("dddddddddd"));
+        let floor = c.sacred_floor(); // 2
+        let sys_before = c.messages[0].clone();
+        let epoch_before = c.cache_epoch;
+
+        // Drain [2,5): the three middle messages → replace with a short summary.
+        let plan = CompactionPlan {
+            drain_from: 2,
+            drain_to: 5,
+            summary: Some("summary".into()),
+            rewrites: vec![],
+            resume_note: None,
+        };
+        let report = c.apply_plan(plan, floor);
+
+        assert!(report.committed, "net-smaller plan must commit");
+        assert_eq!(c.cache_epoch, epoch_before + 1, "epoch bumps by exactly 1");
+        assert_eq!(report.epoch_before, epoch_before);
+        assert_eq!(report.epoch_after, epoch_before + 1);
+        // Was 6 messages; drained 3, inserted 1 summary → 4.
+        assert_eq!(c.messages.len(), 4);
+        // system unchanged byte-for-byte.
+        assert_eq!(c.messages[0], sys_before);
+        // sacred user prompt survives.
+        assert_eq!(c.messages[1].text, "the task");
+        // ONE synthetic Role::User summary at drain_from.
+        let s = &c.messages[2];
+        assert_eq!(s.role, Role::User);
+        assert!(s.synthetic, "summary must be synthetic");
+        assert_eq!(s.text, "summary");
+        // trailing real user message preserved.
+        assert_eq!(c.messages[3].text, "dddddddddd");
+        assert!(report.removed > 0);
+        assert!(report.bytes_after < report.bytes_before);
+    }
+
+    // A plan whose result is NOT smaller (summary longer than what it replaces, or
+    // noop) → messages byte-identical AND cache_epoch UNCHANGED AND committed=false.
+    #[test]
+    fn apply_plan_refuses_net_loss_and_does_not_bump_epoch() {
+        let mut c = Conversation::new();
+        c.push(Message::system("sys"));
+        c.push(Message::user("task"));
+        c.push(Message::assistant("x", vec![])); // tiny middle
+        c.push(Message::user("y"));
+        let floor = c.sacred_floor();
+        let before = c.messages.clone();
+        let epoch_before = c.cache_epoch;
+
+        // Summary far longer than the 1-byte "x" it replaces → NOT net smaller.
+        let plan = CompactionPlan {
+            drain_from: 2,
+            drain_to: 3,
+            summary: Some("a very long summary that is bigger".into()),
+            rewrites: vec![],
+            resume_note: None,
+        };
+        let report = c.apply_plan(plan, floor);
+        assert!(!report.committed, "net-loss plan must REFUSE");
+        assert_eq!(c.messages, before, "messages byte-identical on refuse");
+        assert_eq!(c.cache_epoch, epoch_before, "epoch UNCHANGED on refuse");
+
+        // A noop plan also refuses and never burns an epoch.
+        let report2 = c.apply_plan(CompactionPlan::noop(), floor);
+        assert!(!report2.committed);
+        assert_eq!(c.messages, before);
+        assert_eq!(c.cache_epoch, epoch_before, "noop never bumps epoch");
+    }
+
+    // A plan with drain_from=0 (trying to remove system/first-user) → clamped to
+    // sacred_floor; the protected prefix survives byte-identical.
+    #[test]
+    fn apply_plan_never_drains_below_sacred_floor() {
+        let mut c = Conversation::new();
+        c.push(Message::system("SYS-FROZEN"));
+        c.push(Message::user("TASK-FROZEN"));
+        c.push(Message::assistant("mmmmmmmmmm", vec![]));
+        c.push(Message::tool_result("c1", "nnnnnnnnnn", false));
+        c.push(Message::user("oooooooooo"));
+        let floor = c.sacred_floor(); // 2
+        let sys = c.messages[0].clone();
+        let task = c.messages[1].clone();
+
+        // Try to drain from 0 across the whole prefix — must be clamped to floor.
+        let plan = CompactionPlan {
+            drain_from: 0,
+            drain_to: 4,
+            summary: Some("s".into()),
+            rewrites: vec![],
+            resume_note: None,
+        };
+        let report = c.apply_plan(plan, floor);
+        assert!(report.committed);
+        // protected prefix survives byte-identical, still at indices 0,1.
+        assert_eq!(c.messages[0], sys);
+        assert_eq!(c.messages[1], task);
+        // summary inserted at the floor, not before it.
+        assert_eq!(c.messages[2].role, Role::User);
+        assert!(c.messages[2].synthetic);
+        assert_eq!(c.messages[2].text, "s");
+    }
+
+    // A rewrite of a tool_result's text → that message's text changes, others
+    // untouched, epoch bumps iff net smaller.
+    #[test]
+    fn apply_plan_rewrites_in_place_are_applied() {
+        let mut c = Conversation::new();
+        c.push(Message::system("sys"));
+        c.push(Message::user("task"));
+        c.push(Message::assistant("call", vec![]));
+        c.push(Message::tool_result("c1", "HUGE TOOL OUTPUT THAT IS LONG", false));
+        c.push(Message::user("next"));
+        let floor = c.sacred_floor();
+        let epoch_before = c.cache_epoch;
+
+        // Rewrite the tool_result (idx 3) in place to a short stub; no drain.
+        let plan = CompactionPlan {
+            drain_from: 0,
+            drain_to: 0,
+            summary: None,
+            rewrites: vec![(3, "[stubbed]".into())],
+            resume_note: None,
+        };
+        let report = c.apply_plan(plan, floor);
+        assert!(report.committed, "rewrite that shrinks bytes must commit");
+        assert_eq!(c.cache_epoch, epoch_before + 1);
+        assert_eq!(c.messages[3].text, "[stubbed]");
+        assert_eq!(c.messages[3].tool_call_id.as_deref(), Some("c1"), "other fields untouched");
+        // siblings untouched.
+        assert_eq!(c.messages[2].text, "call");
+        assert_eq!(c.messages[4].text, "next");
+        assert_eq!(c.messages.len(), 5, "rewrite does not change count");
+
+        // An out-of-range rewrite index is skipped (never panics) and, alone, is a
+        // no-op → refuse.
+        let mut c2 = c.clone();
+        let epoch2 = c2.cache_epoch;
+        let report2 = c2.apply_plan(
+            CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites: vec![(999, "x".into())], resume_note: None },
+            c2.sacred_floor(),
+        );
+        assert!(!report2.committed, "out-of-range rewrite that changes nothing must refuse");
+        assert_eq!(c2.cache_epoch, epoch2);
+    }
+
+    // Snapshot serde round-trip preserves cache_epoch and synthetic; and a v1-style
+    // JSON WITHOUT those fields still deserializes via serde default → epoch 0,
+    // synthetic false.
+    #[test]
+    fn snapshot_round_trips_cache_epoch_and_synthetic() {
+        let mut c = Conversation::new();
+        c.cache_epoch = 3;
+        c.push(Message::system("sys"));
+        c.push(Message::user("task"));
+        c.push(Message::synthetic_user("[cold summary]"));
+
+        let snap = SessionSnapshot::from_conversation(&c);
+        assert_eq!(snap.cache_epoch, 3, "from_conversation copies cache_epoch");
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cache_epoch, 3, "cache_epoch survives round-trip");
+        assert!(back.messages[2].synthetic, "synthetic survives round-trip");
+        assert!(!back.messages[0].synthetic);
+
+        // A v1-style JSON with NO cache_epoch / synthetic fields still loads
+        // (serde default → epoch 0, synthetic false).
+        let v1 = r#"{"version":1,"messages":[{"role":"User","text":"hi","tool_calls":[],"tool_call_id":null,"is_error":false,"meta":null}]}"#;
+        let loaded: SessionSnapshot = serde_json::from_str(v1).expect("v1 snapshot must still deserialize");
+        assert_eq!(loaded.cache_epoch, 0, "missing cache_epoch defaults to 0");
+        assert!(!loaded.messages[0].synthetic, "missing synthetic defaults to false");
+
+        // `new` defaults epoch 0.
+        let snap2 = SessionSnapshot::new(vec![Message::user("x")]);
+        assert_eq!(snap2.cache_epoch, 0);
+    }
+
+    // NoCompaction (the neutral default strategy) returns a noop plan.
+    #[tokio::test]
+    async fn no_compaction_plans_noop() {
+        let msgs = vec![Message::system("s"), Message::user("u")];
+        let view = CompactionView {
+            messages: &msgs,
+            trigger: CompactTrigger::Auto { utilization: 0.9 },
+            ctx_window: 1000,
+            used_tokens: 900,
+            utilization: 0.9,
+            sacred_floor: 2,
+        };
+        let plan = NoCompaction.plan(&view).await;
+        assert!(plan.is_noop(), "NoCompaction must return a noop plan");
+        assert_eq!(plan, CompactionPlan::noop());
     }
 }

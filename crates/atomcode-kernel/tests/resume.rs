@@ -198,6 +198,7 @@ async fn unsupported_snapshot_version_errors_and_starts_empty() {
     let bogus = SessionSnapshot {
         version: 9999,
         messages: vec![Message::system("should be ignored"), Message::user("ghost")],
+        cache_epoch: 0,
     };
 
     let provider = Arc::new(RecordingProvider::new(vec![vec![
