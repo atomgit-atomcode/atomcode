@@ -2950,15 +2950,25 @@ impl AgentLoop {
         // Tier 2: LLM-summarize older turns into the cold zone. This is
         // the most expensive tier (it makes a network round trip), so
         // we only reach it after Tier 1 already failed.
-        compression::maybe_compress_history(
-            &*self.ctx,
-            &mut self.conversation,
-            &*self.turn_runner.provider,
-            &self.turn_runner.tools,
-            system_prompt,
-            None, // emergency path — no post-compress state
-        )
-        .await;
+        // Use a minimal task-only hint — emergency compaction needs max
+        // compression rate; full file lists would consume precious tokens.
+        {
+            let minimal_state = if !self.current_task.is_empty() {
+                let task_short: String = self.current_task.chars().take(120).collect();
+                Some(format!("TASK: {}", task_short))
+            } else {
+                None
+            };
+            compression::maybe_compress_history(
+                &*self.ctx,
+                &mut self.conversation,
+                &*self.turn_runner.provider,
+                &self.turn_runner.tools,
+                system_prompt,
+                minimal_state.as_deref(),
+            )
+            .await;
+        }
         if estimate(&self.conversation) <= target_tokens {
             return true;
         }
@@ -3079,14 +3089,11 @@ impl AgentLoop {
     /// Thin wrapper around [`compression::run_llm_summary`] that adds
     /// provider/host/model attribution and tracks the call in telemetry.
     async fn run_llm_summary_with_telemetry(&self, prompt: &str) -> String {
-        let sys = "You are a conversation summarizer. Output ONLY the summary.";
+        let sys = compression::COMPRESSION_SYSTEM_PROMPT;
         let started = std::time::Instant::now();
 
-        let (summary, tel_input, tel_output) =
+        let (summary, tel_input, tel_output, tel_cached, had_error) =
             compression::run_llm_summary(&*self.turn_runner.provider, prompt).await;
-
-        let errored = summary.trim().is_empty();
-        let had_error = errored || (tel_input == 0 && tel_output == 0);
 
         // Build the same envelope context a normal turn would carry.
         let pcfg = self.config.providers.get(&self.config.default_provider);
@@ -3110,7 +3117,7 @@ impl AgentLoop {
             tool_calls_count: 0,
             input_tokens: tel_input,
             output_tokens: tel_output,
-            cached_tokens: 0,
+            cached_tokens: tel_cached,
             had_error,
             context_window: self.ctx.ctx_window() as u32,
             system_tokens: (sys.len() / 4 + 4) as u32,

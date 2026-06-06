@@ -20,6 +20,10 @@ use crate::ctx::CtxBuilder;
 use crate::provider::LlmProvider;
 use crate::tool::ToolRegistry;
 
+/// System prompt used when calling the LLM to summarize compression content.
+pub const COMPRESSION_SYSTEM_PROMPT: &str =
+    "You are a conversation summarizer. Output ONLY the summary.";
+
 /// Result of a compression attempt.
 #[derive(Debug, Clone, Copy)]
 pub struct CompressionOutcome {
@@ -76,24 +80,26 @@ pub async fn compaction_keep_ceiling(
 
 /// Run a lightweight LLM call to summarize content.
 ///
-/// Returns `(summary, prompt_tokens_estimate, completion_tokens_estimate)`.
-/// On failure, returns an empty string and logs the error via `tracing::warn!`.
-/// Callers should fall back to the mechanical summary when the returned string
-/// is empty.
+/// Returns `(summary, prompt_tokens_estimate, completion_tokens_estimate,
+/// cached_tokens_estimate, had_error)`.
+/// On failure, returns an empty string with `had_error = true` and logs the
+/// error via `tracing::warn!`. Callers should fall back to the mechanical
+/// summary when the returned string is empty.
 ///
 /// Telemetry is NOT handled here — callers that need telemetry (AgentLoop)
 /// should wrap this function with their own reporting logic.
 pub async fn run_llm_summary(
     provider: &dyn LlmProvider,
     prompt: &str,
-) -> (String, u32, u32) {
-    let sys = "You are a conversation summarizer. Output ONLY the summary.";
+) -> (String, u32, u32, u32, bool) {
+    let sys = COMPRESSION_SYSTEM_PROMPT;
     let mut mini_conv = Conversation::new();
     mini_conv.add_user_message(prompt);
     let msgs = mini_conv.to_provider_messages(sys);
 
     let mut input_estimate: u32 = 0;
     let mut output_estimate: u32 = 0;
+    let mut cached_estimate: u32 = 0;
     let mut got_usage = false;
     let mut errored = false;
 
@@ -124,6 +130,8 @@ pub async fn run_llm_summary(
                         input_estimate = input_estimate.saturating_add(u.prompt_tokens as u32);
                         output_estimate =
                             output_estimate.saturating_add(u.completion_tokens as u32);
+                        cached_estimate =
+                            cached_estimate.saturating_add(u.cached_tokens as u32);
                         got_usage = true;
                     }
                     Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
@@ -171,7 +179,7 @@ pub async fn run_llm_summary(
         );
     }
 
-    (summary, input_estimate, output_estimate)
+    (summary, input_estimate, output_estimate, cached_estimate, had_error)
 }
 
 /// Compute the on-wire token count for the current conversation + system prompt.
@@ -290,7 +298,8 @@ pub async fn maybe_compress_history(
 
     let summarize_prompt = default_summarize_prompt(&content);
 
-    let (summary, _in_tok, _out_tok) = run_llm_summary(provider, &summarize_prompt).await;
+    let (summary, _in_tok, _out_tok, _cached_tok, _had_error) =
+        run_llm_summary(provider, &summarize_prompt).await;
     let final_summary = if summary.trim().is_empty() {
         content
     } else {

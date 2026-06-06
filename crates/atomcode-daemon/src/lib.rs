@@ -2484,7 +2484,7 @@ async fn process_chat_request(
                 // Uses the same two-tier strategy as CLI (T1: tool_result stubs,
                 // T2: LLM summarization into cold zone).
                 {
-                    let task_hint = if user_message.len() > 200 {
+                    let task_hint = if user_message.chars().count() > 200 {
                         format!(
                             "TASK: {}...",
                             user_message.chars().take(197).collect::<String>()
