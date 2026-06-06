@@ -1,6 +1,9 @@
 use crate::event::{AgentCommand, AgentEvent};
 use crate::hook::{HookChain, LifecycleHooks, TurnCtx};
-use crate::message::{Conversation, Message, MessageMeta, SessionSnapshot, SNAPSHOT_VERSION};
+use crate::message::{
+    CompactTrigger, CompactionStrategy, CompactionView, Conversation, Message, MessageMeta,
+    NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
+};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
 use crate::request::RequestCtx;
@@ -102,6 +105,15 @@ pub struct Agent {
     /// Byte cap on a single tool result's `content` (the kernel's only built-in
     /// safety at this altitude; see `cap_tool_result`). `0` = unbounded.
     max_tool_result_bytes: usize,
+    /// The REPLACEABLE compaction policy. Default `NoCompaction` (always plans a
+    /// noop) → a neutral kernel never compacts. Swap it per scenario via
+    /// `AgentBuilder::compaction`.
+    compaction: Arc<dyn CompactionStrategy>,
+    /// Utilization fraction (0.0..=1.0) at/above which the AUTO task-boundary
+    /// trigger fires. `None` (default) = NEVER auto-compact. The concrete L2
+    /// thresholds (5K/13K, coding-mode, etc.) are policy, NOT a kernel default —
+    /// the neutral default is OFF.
+    compact_threshold: Option<f32>,
 }
 
 impl Agent {
@@ -123,6 +135,8 @@ impl Agent {
             max_rounds: self.max_rounds,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
+            compaction: self.compaction,
+            compact_threshold: self.compact_threshold,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -165,9 +179,78 @@ struct RunningAgent {
     max_rounds: Option<u32>,
     resume: Option<SessionSnapshot>,
     max_tool_result_bytes: usize,
+    compaction: Arc<dyn CompactionStrategy>,
+    compact_threshold: Option<f32>,
 }
 
 impl RunningAgent {
+    /// Decide whether the AUTO task-boundary trigger should fire for the CURRENT
+    /// stored history. Returns `Some(CompactTrigger::Auto{utilization})` iff a
+    /// `compact_threshold` is configured AND the LAST stored assistant message's
+    /// recorded `meta.utilization` (the prior turn's pressure) is `>= threshold`.
+    /// `None` if no threshold (default → never), or no assistant message yet (no
+    /// pressure fact to gauge), or pressure below the threshold. Pure read — never
+    /// mutates the conversation.
+    fn should_compact(&self, convo: &Conversation) -> Option<CompactTrigger> {
+        let thresh = self.compact_threshold?;
+        let utilization = convo
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::message::Role::Assistant)
+            .and_then(|m| m.meta.as_ref())
+            .map(|meta| meta.utilization)?;
+        if utilization >= thresh {
+            Some(CompactTrigger::Auto { utilization })
+        } else {
+            None
+        }
+    }
+
+    /// Run one compaction: build a read-only `CompactionView` over the current
+    /// history + the last assistant meta's pressure facts, ask the injected
+    /// strategy to PLAN, then let the kernel APPLY it (`apply_plan` owns clamping,
+    /// the net-loss guard, and the cache-epoch bump). Emits `AgentEvent::Compacted`
+    /// from the resulting `CompactReport` (committed=false on a refused/no-op plan).
+    ///
+    /// Borrow discipline: the immutable `&convo.messages` borrow held by the view
+    /// is confined to an inner block that ends BEFORE the `&mut convo.apply_plan`
+    /// call — so the strategy may await without holding a borrow across the mutable
+    /// apply.
+    async fn run_compaction(&self, convo: &mut Conversation, trigger: CompactTrigger) {
+        let floor = convo.sacred_floor();
+        // Pull the small pressure facts from the most recent assistant meta (default
+        // 0 if none recorded yet).
+        let (ctx_window, used_tokens, utilization) = convo
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::message::Role::Assistant)
+            .and_then(|m| m.meta.as_ref())
+            .map(|meta| (meta.ctx_window, meta.used_tokens, meta.utilization))
+            .unwrap_or((0, 0, 0.0));
+        // The view borrows `&convo.messages`; confine that borrow to this block so
+        // it is released before the &mut apply below.
+        let plan = {
+            let view = CompactionView {
+                messages: &convo.messages,
+                trigger,
+                ctx_window,
+                used_tokens,
+                utilization,
+                sacred_floor: floor,
+            };
+            self.compaction.plan(&view).await
+        };
+        let report = convo.apply_plan(plan, floor);
+        self.rt.emit(AgentEvent::Compacted {
+            epoch: report.epoch_after,
+            removed: report.removed,
+            bytes_before: report.bytes_before,
+            bytes_after: report.bytes_after,
+            committed: report.committed,
+        });
+    }
     async fn session_loop(self, mut cmd_rx: UnboundedReceiver<AgentCommand>) {
         let mut convo = match &self.resume {
             // RESUME: seed from the saved snapshot's messages. Those already
@@ -222,11 +305,28 @@ impl RunningAgent {
                         snapshot: SessionSnapshot::from_conversation(&convo),
                     });
                 }
+                // MANUAL compaction (idle): run the injected strategy regardless of
+                // any auto threshold. `apply_plan` still refuses a net-loss/no-op
+                // plan (no epoch burn).
+                AgentCommand::Compact { focus } => {
+                    self.run_compaction(&mut convo, CompactTrigger::Manual { focus }).await;
+                }
                 AgentCommand::SendMessage { mut text } => {
                     if let Err(reason) = self.hooks.user_prompt_submit(&mut text).await {
                         self.rt.emit(AgentEvent::Error { message: format!("prompt rejected: {reason}") });
                         self.rt.emit(AgentEvent::TurnComplete);
                         continue;
+                    }
+                    // ── TASK BOUNDARY auto-compaction ──
+                    // After the prompt is accepted but BEFORE the new user message
+                    // enters history and the turn runs, compact the PRIOR history
+                    // once (if pressure crossed the threshold). This is the
+                    // cache-safe trigger point: a committed compaction opens a NEW
+                    // epoch, then the fresh user message + turn run append-only on
+                    // the compacted history. NEVER fired inside run_turn's round
+                    // loop (that would reopen the within-turn cache break).
+                    if let Some(trigger) = self.should_compact(&convo) {
+                        self.run_compaction(&mut convo, trigger).await;
                     }
                     convo.push(Message::user(text));
                     // Per-turn cancellation token: Cancel fires it; run_turn polls
@@ -246,6 +346,11 @@ impl RunningAgent {
                                 Some(AgentCommand::Cancel) => turn_token.cancel(),
                                 Some(AgentCommand::Snapshot) => {}
                                 Some(AgentCommand::SendMessage { .. }) => {}
+                                // A Compact mid-turn is IGNORED: compacting inside a
+                                // running turn would reopen the within-turn cache
+                                // break (and `convo` is mutably borrowed by run_turn).
+                                // Manual compaction is honored at IDLE only.
+                                Some(AgentCommand::Compact { .. }) => {}
                                 None => { shutdown = true; break; }
                             }
                         }
@@ -274,7 +379,8 @@ impl RunningAgent {
                     return;
                 }
             }
-            let turn_ctx = TurnCtx { round, max_rounds: self.max_rounds };
+            let turn_ctx =
+                TurnCtx { round, max_rounds: self.max_rounds, cache_epoch: convo.cache_epoch };
             let start = Instant::now();
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
@@ -546,6 +652,8 @@ pub struct AgentBuilder {
     max_rounds: Option<u32>,
     resume: Option<SessionSnapshot>,
     max_tool_result_bytes: usize,
+    compaction: Arc<dyn CompactionStrategy>,
+    compact_threshold: Option<f32>,
 }
 
 impl Default for AgentBuilder {
@@ -561,6 +669,10 @@ impl Default for AgentBuilder {
             // BOUNDED by default — a mounted tool's content cannot blow the
             // context window / OOM the host unless the embedder opts into `0`.
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            // NEUTRAL default: no strategy injected → NoCompaction (always noop) and
+            // no threshold → the kernel NEVER auto-compacts unless an embedder opts in.
+            compaction: Arc::new(NoCompaction),
+            compact_threshold: None,
         }
     }
 }
@@ -627,6 +739,24 @@ impl AgentBuilder {
         self.resume = Some(snapshot);
         self
     }
+    /// INJECT a REPLACEABLE compaction strategy (the user's explicit requirement:
+    /// compaction must be pluggable, default no-op, swappable per scenario). The
+    /// strategy only PROPOSES a plan from a read-only view; the kernel remains the
+    /// sole history writer (`Conversation::apply_plan`). Without this call the
+    /// default is [`NoCompaction`] (always noop).
+    pub fn compaction(mut self, s: Arc<dyn CompactionStrategy>) -> Self {
+        self.compaction = s;
+        self
+    }
+    /// Set the AUTO task-boundary compaction threshold: a utilization fraction
+    /// (0.0..=1.0). When the prior turn's recorded utilization is `>= frac`, the
+    /// next user message triggers compaction at the task boundary (before the turn
+    /// runs). Without this call the default is `None` → NEVER auto-compact. (Manual
+    /// `AgentCommand::Compact` ignores the threshold entirely.)
+    pub fn compact_threshold(mut self, frac: f32) -> Self {
+        self.compact_threshold = Some(frac);
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -640,6 +770,8 @@ impl AgentBuilder {
             max_rounds: self.max_rounds,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
+            compaction: self.compaction,
+            compact_threshold: self.compact_threshold,
         }
     }
 }

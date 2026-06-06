@@ -15,6 +15,12 @@ pub enum AgentCommand {
     Respond { id: RequestId, value: serde_json::Value },
     /// Ask the agent to emit a snapshot of per-message execution stats.
     Snapshot,
+    /// MANUAL compaction (e.g. a user `/compact`). Runs the injected
+    /// `CompactionStrategy` REGARDLESS of any auto `compact_threshold` (a manual
+    /// request is always honored). `focus` optionally steers the strategy toward a
+    /// topic. A net-loss/no-op plan is still refused by `apply_plan` (no epoch
+    /// burn). Serializable so a web/daemon driver can request it over the wire.
+    Compact { focus: Option<String> },
     Cancel,
     Shutdown,
 }
@@ -49,4 +55,17 @@ pub enum AgentEvent {
     Reasoning(String),
     /// Non-fatal advisory (e.g. a truncated response). The turn still completes.
     Warning(String),
+    /// A compaction was ATTEMPTED (mirrors `message::CompactReport`). `committed`
+    /// distinguishes a real shrink (history rewritten, `epoch` bumped to the NEW
+    /// generation, `bytes_after < bytes_before`) from a REFUSED one (net-loss guard
+    /// or no-op plan: history byte-identical, `epoch` unchanged, `removed == 0`).
+    /// Emitted on BOTH the auto task-boundary trigger and the manual `Compact`
+    /// command. Serializable for web/daemon drivers.
+    Compacted {
+        epoch: u64,
+        removed: usize,
+        bytes_before: usize,
+        bytes_after: usize,
+        committed: bool,
+    },
 }

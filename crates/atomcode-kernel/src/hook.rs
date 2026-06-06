@@ -10,6 +10,11 @@ pub struct TurnCtx {
     pub round: u32,
     /// Optional hard cap on rounds per turn (None = unlimited).
     pub max_rounds: Option<u32>,
+    /// The conversation's current PREFIX-GENERATION marker (`Conversation::cache_epoch`).
+    /// Carried so a `pre_request` projection can be epoch-deterministic later (e.g.
+    /// only re-render an expensive view when the epoch changed). A committed
+    /// compaction bumps it; an append-only round does not.
+    pub cache_epoch: u64,
 }
 
 /// TURN-level lifecycle seam (session / turn / request / response / error). The

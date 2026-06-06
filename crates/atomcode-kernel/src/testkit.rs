@@ -1,7 +1,9 @@
 //! Spike-only test doubles. NOT part of the kernel's real API.
 
 use crate::hook::{LifecycleHooks, TurnCtx};
-use crate::message::{Conversation, Message};
+use crate::message::{
+    CompactionPlan, CompactionStrategy, CompactionView, Conversation, Message,
+};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
 use crate::request::RequestCtx;
@@ -604,6 +606,105 @@ impl LifecycleHooks for ObservingTurnEndHook {
             self.reply.clone()
         } else {
             None
+        }
+    }
+}
+
+// ── REPLACEABLE compaction strategy doubles (claim 23) ───────────────────────
+//
+// Two SAME-trait, DIFFERENT-behavior `CompactionStrategy` impls — the explicit
+// proof that the compaction seam is replaceable. Both only PROPOSE a
+// `CompactionPlan` from a read-only `CompactionView`; the kernel remains the sole
+// writer (`Conversation::apply_plan`), so neither can corrupt the sacred floor,
+// net-loss, or cache-epoch invariants. A third double (`NeverShrinks…`) proves
+// the net-loss guard refuses a non-shrinking plan.
+
+/// "Summarize old turns" shape: drain `[sacred_floor .. len - keep_recent)` into a
+/// single synthetic summary message. Carries the cold-summary compaction shape —
+/// it removes whole old messages and replaces them with one short summary, so a
+/// committed plan reduces the MESSAGE COUNT (and bytes).
+pub struct SummarizeOldestStrategy {
+    pub keep_recent: usize,
+}
+
+#[async_trait]
+impl CompactionStrategy for SummarizeOldestStrategy {
+    async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
+        let len = view.messages.len();
+        let floor = view.sacred_floor;
+        // Drain everything between the protected prefix and the most-recent
+        // `keep_recent` messages.
+        let drain_to = len.saturating_sub(self.keep_recent);
+        if drain_to <= floor {
+            // Nothing eligible to drain → noop.
+            return CompactionPlan::noop();
+        }
+        let n = drain_to - floor;
+        CompactionPlan {
+            drain_from: floor,
+            drain_to,
+            summary: Some(format!("[summary of {n} earlier messages]")),
+            rewrites: vec![],
+            resume_note: None,
+        }
+    }
+}
+
+/// "Microcompact tool results" shape: rewrite the text of OLDER tool-result
+/// messages (`tool_call_id.is_some()`) — every tool result EXCEPT the most recent
+/// one — to a short `[elided]` stub, IN PLACE (no drain). Carries the in-place
+/// microcompact shape — it keeps the MESSAGE COUNT unchanged but shrinks bytes by
+/// stubbing stale tool output.
+pub struct StubToolResultsStrategy;
+
+#[async_trait]
+impl CompactionStrategy for StubToolResultsStrategy {
+    async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
+        // Indices of all tool-result messages, in order.
+        let tool_idxs: Vec<usize> = view
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.tool_call_id.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        if tool_idxs.len() <= 1 {
+            // 0 or 1 tool result → nothing "older than the most recent" to stub.
+            return CompactionPlan::noop();
+        }
+        // Rewrite every tool result EXCEPT the last (most recent) one to a stub.
+        // No drain → post-drain indices equal current indices, so these indices
+        // are correct for `apply_plan`'s rewrite step.
+        let rewrites = tool_idxs[..tool_idxs.len() - 1]
+            .iter()
+            .map(|&i| (i, "[elided]".to_string()))
+            .collect();
+        CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites, resume_note: None }
+    }
+}
+
+/// A strategy whose plan NEVER shrinks the conversation: it proposes a drain whose
+/// inserted summary is LONGER than the bytes it removes (so `apply_plan`'s net-loss
+/// guard must REFUSE it → committed=false, epoch unchanged). Proves a bad/ineffective
+/// strategy cannot burn a cache epoch or mutate history.
+pub struct NeverShrinksStrategy;
+
+#[async_trait]
+impl CompactionStrategy for NeverShrinksStrategy {
+    async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
+        let len = view.messages.len();
+        let floor = view.sacred_floor;
+        if len <= floor {
+            return CompactionPlan::noop();
+        }
+        // Drain exactly ONE message past the floor, but insert a summary far larger
+        // than any plausible drained message → net BIGGER → refused.
+        CompactionPlan {
+            drain_from: floor,
+            drain_to: floor + 1,
+            summary: Some("X".repeat(100_000)),
+            rewrites: vec![],
+            resume_note: None,
         }
     }
 }
