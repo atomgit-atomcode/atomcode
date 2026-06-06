@@ -10,7 +10,7 @@ use crate::tool::{RiskLevel, Tool, ToolCall, ToolContext, ToolDef, ToolResult};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -175,6 +175,34 @@ impl Tool for EchoTool {
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         ToolResult { call_id: String::new(), content: format!("echo: {args}"), is_error: false }
+    }
+}
+
+/// A tool that COUNTS how many times its `execute` was actually invoked, into a
+/// shared `AtomicUsize`. Used by the dedup-gate tests to prove a suppressed
+/// duplicate call does NOT execute (the counter stays at the number of calls the
+/// gate let through, not the number the model emitted). Each execution also bumps
+/// the counter into its result content so the driver can see ordering.
+pub struct CountingTool {
+    pub count: Arc<AtomicUsize>,
+}
+
+impl CountingTool {
+    pub fn new(count: Arc<AtomicUsize>) -> Self {
+        Self { count }
+    }
+}
+
+#[async_trait]
+impl Tool for CountingTool {
+    fn name(&self) -> &str { "count" }
+    fn description(&self) -> &str { "Increments a shared counter each time it executes" }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {"k": {"type": "string"}}})
+    }
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+        let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        ToolResult { call_id: String::new(), content: format!("count#{n} args={args}"), is_error: false }
     }
 }
 

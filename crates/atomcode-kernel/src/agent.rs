@@ -363,6 +363,17 @@ impl RunningAgent {
                 self.rt.emit(AgentEvent::TurnComplete);
                 return;
             }
+            // ── Per-batch dedup state (claim 21 / A1 gap ⑨) ──
+            // `result_ids` = call_ids that have ALREADY produced a result THIS
+            // batch (real, stub, or blocked). `seen_calls` = `(name, arguments)`
+            // pairs that already EXECUTED this batch. Both reset per assistant
+            // message (per `pending_calls` loop), matching production's in-batch
+            // `is_dup` scope (runner.rs:917-942) — duplicates ACROSS turns are a
+            // separate concern (production's cross-turn loop_guard), out of scope
+            // for the kernel here.
+            let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_calls: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
             for mut call in pending_calls {
                 // BETWEEN-TOOLS cancel checkpoint: do not dispatch any remaining
                 // tool_call once cancelled. Carried from production runner.rs:916.
@@ -374,6 +385,52 @@ impl RunningAgent {
                     self.rt.emit(AgentEvent::TurnComplete);
                     return;
                 }
+
+                // ── DUPLICATE TOOL-CALL DEDUP GATE ──
+                // Some (esp. thinking-mode / weak) models emit the SAME tool_call
+                // multiple times in ONE assistant message. The dedup KEY is the
+                // ORIGINAL `(call.name, call.arguments)`, captured HERE — BEFORE the
+                // ToolMiddleware `before` chain (below) may rewrite `call.arguments`.
+                // Rationale: two calls the MODEL emitted identically are duplicates
+                // regardless of what middleware would later do to them; keying on
+                // post-middleware args could spuriously merge two model-distinct
+                // calls (if a rewrite collapses them) or fail to catch a true dup
+                // (if a rewrite is non-deterministic).
+                let dedup_key = (call.name.clone(), call.arguments.clone());
+
+                // (1) SAME call_id (mode A — the load-bearing API-validity fix):
+                // a second result for an already-resulted id would push TWO
+                // tool_result messages for one tool_use id → an illegal payload on
+                // the next request (each tool_use id must map to EXACTLY ONE
+                // tool_result). SKIP it ENTIRELY: no execute, no push, no events.
+                // The first occurrence's result already covers this id, so there is
+                // nothing dangling for backfill to repair either.
+                if result_ids.contains(&call.id) {
+                    continue;
+                }
+
+                // (2) SAME (name, arguments) with a NEW id (mode B — carry
+                // production runner.rs:933-942): do NOT re-execute. Push a stub
+                // result so this distinct id STILL gets exactly one result (parity
+                // → API-valid), emit its ToolResult, record the id, and continue.
+                if seen_calls.contains(&dedup_key) {
+                    let result = ToolResult {
+                        call_id: call.id.clone(),
+                        content: "[duplicate call — identical tool and arguments to an earlier \
+                                  call this turn; result already returned above]"
+                            .to_string(),
+                        is_error: false,
+                    };
+                    result_ids.insert(call.id.clone());
+                    self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
+                    convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
+                    continue;
+                }
+
+                // Whether the tool's `execute` ACTUALLY ran (not unknown-tool, not
+                // blocked-by-middleware). Gates whether we record `(name,args)` into
+                // the seen-executed set for mode-B dedup (see record block below).
+                let mut executed = false;
                 let mut result = match self.tools.get(&call.name) {
                     None => ToolResult {
                         call_id: call.id.clone(),
@@ -399,6 +456,7 @@ impl RunningAgent {
                                 is_error: true,
                             }
                         } else {
+                            executed = true;
                             self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
                             let ctx = ToolContext {
                                 working_dir: std::env::current_dir().unwrap_or_default(),
@@ -447,6 +505,21 @@ impl RunningAgent {
                 }
                 self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
                 convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
+
+                // (3) Record this id as "resulted" so a later SAME-id call (mode A)
+                // is skipped. Recorded for EVERY path that produces a result —
+                // including an unknown-tool error and a middleware-`blocked:` error
+                // (each still pushed exactly one tool_result for `call.id`, so a
+                // later same-id call would create the API-invalid duplicate we must
+                // skip). Record `(name, arguments)` (the ORIGINAL key captured at
+                // the top, before any middleware rewrite) only when the tool
+                // ACTUALLY ran — i.e. not for unknown-tool / blocked cases — so a
+                // later distinct id that the model intends to RETRY a previously
+                // failed/blocked call is not mistaken for a no-op duplicate.
+                result_ids.insert(call.id.clone());
+                if executed {
+                    seen_calls.insert(dedup_key);
+                }
             }
         }
     }
