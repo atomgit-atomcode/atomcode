@@ -1,5 +1,6 @@
 use crate::message::{Conversation, Message};
 use async_trait::async_trait;
+use std::sync::Arc;
 
 /// Per-LLM-call execution context handed to hooks that need to know where in the
 /// loop they are (e.g. to project round budget to the LLM).
@@ -66,3 +67,117 @@ pub trait LifecycleHooks: Send + Sync {
 pub struct NoopHooks;
 
 impl LifecycleHooks for NoopHooks {}
+
+/// Composes MANY `LifecycleHooks` into one by FANNING OUT each method over an
+/// ordered list. This is the seam that lets independent capabilities coexist —
+/// codeintel + compaction + redaction can each register a hook instead of fighting
+/// over a single slot. A `HookChain` itself implements `LifecycleHooks`, so the
+/// Agent still holds exactly one `Arc<dyn LifecycleHooks>` and every call site in
+/// the run loop stays unchanged.
+///
+/// COMPOSITION CONTRACT (per method) — the load-bearing part of this type:
+/// - `session_start`, `turn_start`: run ALL hooks in REGISTRATION ORDER; each
+///   mutates the conversation in turn (chained — later hooks see earlier hooks'
+///   edits).
+/// - `pre_request`: run ALL in registration order; each mutates the (ephemeral
+///   clone of) outgoing messages in turn. The kernel passes the per-request clone,
+///   NEVER stored history → prefix-cache discipline is preserved.
+/// - `on_model_response`: run ALL in registration order; each TRANSFORMS the
+///   response message in turn (e.g. redaction then truncation compose; a later
+///   hook sees the earlier hook's rewrite).
+/// - `user_prompt_submit`: run in registration order; SHORT-CIRCUIT on the FIRST
+///   `Err(reason)` (a block) — the remaining hooks are NOT run and the `Err`
+///   propagates. Text mutations from earlier hooks chain into later ones until/
+///   unless one blocks.
+/// - `turn_end`: run ALL hooks in registration order so each OBSERVES the turn end;
+///   the FIRST hook (in order) that returns `Some(text)` provides the continuation.
+///   Later `Some(_)` values are IGNORED this round (the loop injects exactly one
+///   follow-up). Returns that first `Some`, else `None`.
+/// - `on_error`, `session_end`: run ALL in registration order (pure observation).
+///
+/// An EMPTY `HookChain` behaves exactly like `NoopHooks`: every method is a no-op,
+/// `user_prompt_submit` → `Ok(())`, `turn_end` → `None`.
+pub struct HookChain {
+    hooks: Vec<Arc<dyn LifecycleHooks>>,
+}
+
+impl HookChain {
+    pub fn new(hooks: Vec<Arc<dyn LifecycleHooks>>) -> Self {
+        Self { hooks }
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for HookChain {
+    async fn session_start(&self, convo: &mut Conversation) {
+        for h in &self.hooks {
+            h.session_start(convo).await;
+        }
+    }
+
+    async fn user_prompt_submit(&self, text: &mut String) -> Result<(), String> {
+        // Registration order; SHORT-CIRCUIT on the first block. Earlier hooks'
+        // text rewrites have already landed in `text` when a later hook runs.
+        for h in &self.hooks {
+            h.user_prompt_submit(text).await?;
+        }
+        Ok(())
+    }
+
+    async fn turn_start(&self, convo: &mut Conversation) {
+        for h in &self.hooks {
+            h.turn_start(convo).await;
+        }
+    }
+
+    async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {
+        for h in &self.hooks {
+            h.pre_request(messages, ctx).await;
+        }
+    }
+
+    async fn on_model_response(&self, response: &mut Message) {
+        for h in &self.hooks {
+            h.on_model_response(response).await;
+        }
+    }
+
+    async fn turn_end(&self, convo: &Conversation) -> Option<String> {
+        // ALL hooks observe (in order); the FIRST `Some` wins, later `Some` ignored.
+        let mut continuation = None;
+        for h in &self.hooks {
+            let r = h.turn_end(convo).await;
+            if continuation.is_none() {
+                continuation = r;
+            }
+        }
+        continuation
+    }
+
+    async fn on_error(&self, error: &str) {
+        for h in &self.hooks {
+            h.on_error(error).await;
+        }
+    }
+
+    async fn session_end(&self, convo: &Conversation) {
+        for h in &self.hooks {
+            h.session_end(convo).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_hookchain_is_noop() {
+        let chain = HookChain::new(vec![]);
+        let mut text = "hi".to_string();
+        assert!(chain.user_prompt_submit(&mut text).await.is_ok(), "empty chain must not block");
+        assert_eq!(text, "hi", "empty chain must not mutate the prompt");
+        let convo = Conversation::new();
+        assert_eq!(chain.turn_end(&convo).await, None, "empty chain turn_end must be None");
+    }
+}

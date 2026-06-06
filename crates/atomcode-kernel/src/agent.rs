@@ -1,5 +1,5 @@
 use crate::event::{AgentCommand, AgentEvent};
-use crate::hook::{LifecycleHooks, NoopHooks, TurnCtx};
+use crate::hook::{HookChain, LifecycleHooks, TurnCtx};
 use crate::message::{Conversation, Message, MessageMeta, SessionSnapshot, SNAPSHOT_VERSION};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
@@ -397,7 +397,10 @@ pub struct AgentBuilder {
     tools: Option<MountedTools>,
     persona: String,
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
-    hooks: Option<Arc<dyn LifecycleHooks>>,
+    /// Composable lifecycle hooks, accumulated in REGISTRATION ORDER. `.build()`
+    /// wraps this Vec in a `HookChain` (which fans out per the documented contract);
+    /// an empty Vec yields an empty `HookChain` that behaves exactly like `NoopHooks`.
+    hooks: Vec<Arc<dyn LifecycleHooks>>,
     max_rounds: Option<u32>,
     resume: Option<SessionSnapshot>,
 }
@@ -415,13 +418,27 @@ impl AgentBuilder {
         self.persona = s.into();
         self
     }
+    /// Register a `ToolMiddleware`. Middlewares run in REGISTRATION ORDER — the
+    /// `before` chain forward (first-registered runs first) and the `after` chain
+    /// likewise. This order is LOAD-BEARING: e.g. an approval middleware that
+    /// round-trips the user MUST be registered BEFORE a redaction middleware that
+    /// rewrites args, or the user approves bytes different from what executes.
     pub fn middleware(mut self, m: Arc<dyn ToolMiddleware>) -> Self {
         self.middlewares.push(m);
         self
     }
-    pub fn hooks(mut self, h: Arc<dyn LifecycleHooks>) -> Self {
-        self.hooks = Some(h);
+    /// Append a lifecycle hook. Hooks COMPOSE: many may be registered and they fan
+    /// out per the `HookChain` contract (run in registration order; `turn_end`
+    /// first-`Some` wins; `user_prompt_submit` short-circuits on the first block).
+    pub fn hook(mut self, h: Arc<dyn LifecycleHooks>) -> Self {
+        self.hooks.push(h);
         self
+    }
+    /// Back-compat alias for `hook` (APPENDS — does not replace). Existing single-
+    /// hook call sites keep working; for the single-hook case `HookChain` is a
+    /// transparent passthrough.
+    pub fn hooks(self, h: Arc<dyn LifecycleHooks>) -> Self {
+        self.hook(h)
     }
     /// Hard cap on LLM rounds per turn (safety fuse; None = unlimited).
     pub fn max_rounds(mut self, n: u32) -> Self {
@@ -445,7 +462,10 @@ impl AgentBuilder {
             tools: self.tools.expect("tools are required"),
             persona: self.persona,
             middlewares: self.middlewares,
-            hooks: self.hooks.unwrap_or_else(|| Arc::new(NoopHooks)),
+            // Wrap the registered hooks in a HookChain (single `Arc<dyn
+            // LifecycleHooks>`); an empty Vec → an empty chain == NoopHooks. The
+            // run-loop call sites are unchanged — they still call one hook object.
+            hooks: Arc::new(HookChain::new(self.hooks)),
             max_rounds: self.max_rounds,
             resume: self.resume,
         }

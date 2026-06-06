@@ -453,3 +453,129 @@ impl ToolMiddleware for TruncateMiddleware {
         result.content = format!("[truncated] {}", result.content);
     }
 }
+
+/// On `session_start` AND `turn_start`, appends `marker` to a SHARED log and pushes
+/// a `[marker]` system message into the conversation. Two of these (sharing a log)
+/// prove a `HookChain` fans out to BOTH hooks in registration order — the case that
+/// was structurally impossible when the Agent held a single hook.
+pub struct MarkerHook {
+    marker: String,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl MarkerHook {
+    pub fn new(marker: impl Into<String>, log: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { marker: marker.into(), log }
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for MarkerHook {
+    async fn session_start(&self, convo: &mut Conversation) {
+        self.log.lock().unwrap().push(format!("session_start:{}", self.marker));
+        convo.push(Message::system(format!("[{}]", self.marker)));
+    }
+    async fn turn_start(&self, convo: &mut Conversation) {
+        self.log.lock().unwrap().push(format!("turn_start:{}", self.marker));
+        convo.push(Message::system(format!("[{}]", self.marker)));
+    }
+}
+
+/// `pre_request` appends ONE distinct tail reminder (`[tail]`) to the ephemeral
+/// outgoing messages. Two of these prove `pre_request` composes (both tails reach
+/// the provider, in registration order) while never mutating stored history.
+pub struct TailReminderHook {
+    tail: String,
+}
+
+impl TailReminderHook {
+    pub fn new(tail: impl Into<String>) -> Self {
+        Self { tail: tail.into() }
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for TailReminderHook {
+    async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
+        messages.push(Message::user(format!("[{}]", self.tail)));
+    }
+}
+
+/// `user_prompt_submit` APPENDS `suffix` to the prompt text and records that it
+/// ran into a shared log — proving text mutations chain into later hooks and that
+/// a hook AFTER a blocker is never reached (its name is absent from the log).
+pub struct RewritePromptHook {
+    name: String,
+    suffix: String,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl RewritePromptHook {
+    pub fn new(name: impl Into<String>, suffix: impl Into<String>, log: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { name: name.into(), suffix: suffix.into(), log }
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for RewritePromptHook {
+    async fn user_prompt_submit(&self, text: &mut String) -> Result<(), String> {
+        self.log.lock().unwrap().push(self.name.clone());
+        text.push_str(&self.suffix);
+        Ok(())
+    }
+}
+
+/// `user_prompt_submit` records it ran then BLOCKS with `Err(reason)`. Placed
+/// between a rewrite hook and a would-run hook, it proves the chain short-circuits.
+pub struct BlockingPromptHook {
+    name: String,
+    reason: String,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl BlockingPromptHook {
+    pub fn new(name: impl Into<String>, reason: impl Into<String>, log: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { name: name.into(), reason: reason.into(), log }
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for BlockingPromptHook {
+    async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> {
+        self.log.lock().unwrap().push(self.name.clone());
+        Err(self.reason.clone())
+    }
+}
+
+/// On `turn_end`, RECORDS it observed (into a shared log) and returns the
+/// configured continuation (`Some(text)` or `None`). Three of these prove every
+/// hook OBSERVES turn_end while only the FIRST `Some` (in registration order)
+/// provides the continuation.
+pub struct ObservingTurnEndHook {
+    name: String,
+    reply: Option<String>,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl ObservingTurnEndHook {
+    pub fn new(name: impl Into<String>, reply: Option<String>, log: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { name: name.into(), reply, log }
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for ObservingTurnEndHook {
+    async fn turn_end(&self, _convo: &Conversation) -> Option<String> {
+        let mut log = self.log.lock().unwrap();
+        log.push(self.name.clone());
+        // Reply only the FIRST time this hook observes, so the loop terminates after
+        // one continuation round (otherwise it would re-inject forever). "First" =
+        // this hook's name now appears exactly once in the log.
+        let first_time = log.iter().filter(|n| *n == &self.name).count() == 1;
+        if first_time {
+            self.reply.clone()
+        } else {
+            None
+        }
+    }
+}
