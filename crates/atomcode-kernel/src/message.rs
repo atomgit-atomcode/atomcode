@@ -28,7 +28,7 @@ pub struct MessageMeta {
 ///
 /// Derives `Serialize, Deserialize` so a conversation is LOSSLESSLY persistable
 /// and resumable: every field — `role`, `text`, `tool_calls`, `tool_call_id`,
-/// `meta` — survives a serde round-trip. (Contrast the retired, lossy
+/// `is_error`, `meta` — survives a serde round-trip. (Contrast the retired, lossy
 /// `MessageSnapshot`, which dropped `tool_calls`/`tool_call_id` and stringified
 /// `Role` via `Debug`.) `PartialEq` lets round-trip equality be asserted.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,6 +37,10 @@ pub struct Message {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
+    /// True iff this is a tool RESULT that failed — carried to the provider as the
+    /// tool_result `is_error` flag so a real adapter can tell the model the call
+    /// errored. Always false for non-result messages.
+    pub is_error: bool,
     /// Kernel-native execution stats (sidecar). Never implicitly rendered into
     /// `text` — projecting to the LLM is the renderer's explicit choice.
     pub meta: Option<MessageMeta>,
@@ -44,16 +48,18 @@ pub struct Message {
 
 impl Message {
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, meta: None }
+        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None }
     }
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, meta: None }
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None }
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, meta: None }
+        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, is_error: false, meta: None }
     }
-    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>, _is_error: bool) -> Self {
-        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), meta: None }
+    /// A tool RESULT. `is_error` is now STORED (a real adapter must echo it to the
+    /// provider) — it was previously dropped, losing tool failure state.
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), is_error, meta: None }
     }
 }
 
@@ -306,6 +312,9 @@ mod tests {
         let tr = &back.messages[3];
         assert_eq!(tr.tool_call_id.as_deref(), Some("call_1"), "tool_call_id must survive");
         assert_eq!(tr.text, "boom");
+        // is_error is a REAL semantic property (a real adapter echoes it to the
+        // provider). It was silently dropped before; assert it now survives.
+        assert!(tr.is_error, "tool_result is_error must survive the round-trip");
 
         assert!(back.messages[4].meta.is_some(), "meta sidecar must survive");
         assert_eq!(back.messages[4].meta.as_ref().unwrap().round, 2);

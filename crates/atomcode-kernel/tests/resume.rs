@@ -245,3 +245,54 @@ async fn unsupported_snapshot_version_errors_and_starts_empty() {
     assert_eq!(first.len(), 1, "started empty: only the new user message is present");
     assert_eq!(first[0].text, "go");
 }
+
+// CLAIM 18c: resuming from a snapshot that ENDS IN A DANGLING assistant tool_call
+// (a tool_use with no matching tool_result — possible from an externally-supplied
+// or mid-turn-persisted snapshot) must NOT produce an API-invalid first request.
+// The resume seeding path backfills a `(cancelled)` result so every tool_call is
+// paired (kernel invariant: exactly one tool_result per assistant tool_call).
+#[tokio::test]
+async fn resume_from_dangling_snapshot_is_repaired_to_api_valid() {
+    // A snapshot whose LAST message is an assistant tool_call with NO result.
+    let dangling = SessionSnapshot::new(vec![
+        Message::system(PERSONA),
+        Message::user("read the file"),
+        Message::assistant("", vec![tool_call("c_dangle", "echo", "{}")]),
+    ]);
+
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::TextDelta("continuing".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+    let calls = provider.calls();
+
+    let mut handle = resumed_agent(provider, dangling).spawn();
+    drive_one_turn(&mut handle, "go").await;
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let calls = calls.lock().unwrap();
+    assert!(!calls.is_empty(), "the resumed turn must run");
+    let msgs = &calls[0].0;
+
+    // API-VALIDITY: every assistant tool_call id must have a matching tool_result.
+    let result_ids: std::collections::HashSet<&str> =
+        msgs.iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+    for m in msgs {
+        for tc in &m.tool_calls {
+            assert!(
+                result_ids.contains(tc.id.as_str()),
+                "dangling tool_call {} must be backfilled with a result on resume",
+                tc.id
+            );
+        }
+    }
+    // Concretely: the dangling call got a (cancelled) result, and it is flagged
+    // is_error (the field that now survives) — proving the repair, not a real run.
+    let backfilled = msgs
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("c_dangle"))
+        .expect("c_dangle must have a backfilled result");
+    assert!(backfilled.is_error, "backfilled cancelled result must be is_error");
+    assert_eq!(backfilled.text, "(cancelled)");
+}

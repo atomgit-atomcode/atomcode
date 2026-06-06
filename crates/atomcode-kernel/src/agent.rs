@@ -173,7 +173,14 @@ impl RunningAgent {
             // RESUME: seed from the saved snapshot's messages. Those already
             // include the persona/system message, so we do NOT re-add persona.
             Some(snap) if snap.version == SNAPSHOT_VERSION => {
-                Conversation { messages: snap.messages.clone() }
+                let mut c = Conversation { messages: snap.messages.clone() };
+                // An externally-supplied or mid-turn-persisted snapshot may end in a
+                // DANGLING assistant tool_call (a tool_use with no tool_result). Seeding
+                // it verbatim would make the first resumed request an API-invalid payload.
+                // backfill is append-only + idempotent → a no-op for well-formed snapshots,
+                // a repair for malformed ones. (See backfill_cancelled_tool_results.)
+                c.backfill_cancelled_tool_results();
+                c
             }
             // FORWARD-COMPAT SEAM: a snapshot from an unknown (newer/older) kernel
             // version cannot be safely interpreted. Surface it and start EMPTY
