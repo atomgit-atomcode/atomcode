@@ -22,6 +22,7 @@ the proven production hot-paths into.
 | 11. on_model_response edits to tool_calls are honored (dropped call doesn't execute) | `tests/spike_claims.rs::dropping_tool_calls_in_on_model_response_prevents_execution` |
 | 12. ToolMiddleware `before` rewrites/blocks (no ghost ToolStarted) + `after` transforms result | `tests/spike_claims.rs::tool_middleware_rewrites_blocks_and_transforms` |
 | 13. Command-level approval — arg-aware `Tool::risk(args)`; ApprovalMiddleware gates dangerous commands, skips safe ones, caches session grants | `tests/spike_claims.rs::dangerous_command_requires_approval_safe_does_not_and_grant_is_cached` |
+| 14. user_prompt_submit can block a prompt (Err → prompt rejected, no turn, not stored) | `tests/spike_claims.rs::user_prompt_submit_can_block_a_prompt` |
 
 ## Driver model
 

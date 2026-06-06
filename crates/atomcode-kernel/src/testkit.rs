@@ -207,7 +207,7 @@ impl Default for RecorderHook {
 #[async_trait]
 impl LifecycleHooks for RecorderHook {
     async fn session_start(&self, _convo: &mut Conversation) { self.record("session_start"); }
-    async fn user_prompt_submit(&self, _text: &mut String) { self.record("user_prompt_submit"); }
+    async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> { self.record("user_prompt_submit"); Ok(()) }
     async fn turn_start(&self, _convo: &mut Conversation) { self.record("turn_start"); }
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) { self.record("pre_request"); }
     async fn on_model_response(&self, _response: &mut Message) { self.record("on_model_response"); }
@@ -331,6 +331,16 @@ impl ToolMiddleware for BlockToolMiddleware {
         _rt: &RequestCtx,
     ) -> Result<(), String> {
         Err("blocked by policy".to_string())
+    }
+}
+
+/// Blocks every prompt in user_prompt_submit — proves a prompt can be rejected.
+pub struct RejectPromptHook;
+
+#[async_trait]
+impl LifecycleHooks for RejectPromptHook {
+    async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> {
+        Err("policy violation".to_string())
     }
 }
 

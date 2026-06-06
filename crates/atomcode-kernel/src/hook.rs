@@ -24,9 +24,13 @@ pub trait LifecycleHooks: Send + Sync {
     /// context / persona. PERMANENT (stored).
     async fn session_start(&self, _convo: &mut Conversation) {}
 
-    /// A user message is about to enter the loop. Rewrite / augment the text.
-    /// PERMANENT (the rewritten text is stored).
-    async fn user_prompt_submit(&self, _text: &mut String) {}
+    /// A user message is about to enter the loop. Rewrite / augment the text, or
+    /// return `Err(reason)` to BLOCK the prompt — it never enters the conversation
+    /// and no turn runs (the driver gets an Error + TurnComplete). PERMANENT (the
+    /// rewritten text is stored when allowed).
+    async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Before a turn's first LLM call — fires ONCE per user message, not per round.
     /// Mutate the conversation. PERMANENT (stored).

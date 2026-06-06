@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, MessageSnapshot};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
-use atomcode_kernel::testkit::{ApprovalMiddleware, ArgRewriteMiddleware, BlockToolMiddleware, BudgetReminderHook, ContinueOnceHook, DangerousBashTool, DropToolsHook, EchoTool, MockProvider, RecorderHook, RedactHook, RiskyWriteTool, RoundBudgetHook, TruncateMiddleware};
+use atomcode_kernel::testkit::{ApprovalMiddleware, ArgRewriteMiddleware, BlockToolMiddleware, BudgetReminderHook, ContinueOnceHook, DangerousBashTool, DropToolsHook, EchoTool, MockProvider, RecorderHook, RedactHook, RejectPromptHook, RiskyWriteTool, RoundBudgetHook, TruncateMiddleware};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -594,4 +594,49 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
         assert_eq!(asked, 1, "an identical dangerous command must be approved once then cached; asked={asked}");
         assert_eq!(ran, 2, "both dangerous calls execute (first after approval, second from cache)");
     }
+}
+
+// CLAIM 14: user_prompt_submit can BLOCK a prompt (Err) — the prompt never enters
+// the conversation and no turn runs.
+#[tokio::test]
+async fn user_prompt_submit_can_block_a_prompt() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Done]])); // never reached
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[]))
+        .hooks(Arc::new(RejectPromptHook))
+        .build()
+        .spawn();
+    handle.commands.send(AgentCommand::SendMessage { text: "do something bad".into() }).unwrap();
+
+    let mut rejected = false;
+    let mut turn_started = false;
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::Error { message } if message.contains("rejected") => rejected = true,
+            AgentEvent::TurnStarted => turn_started = true,
+            AgentEvent::TurnComplete => break,
+            _ => {}
+        }
+    }
+
+    // the rejected prompt must not be stored in the conversation
+    handle.commands.send(AgentCommand::Snapshot).unwrap();
+    let mut snap: Vec<MessageSnapshot> = Vec::new();
+    while let Some(ev) = handle.events.recv().await {
+        if let AgentEvent::Snapshot { messages } = ev {
+            snap = messages;
+            break;
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    assert!(rejected, "a blocked prompt must emit a rejection Error");
+    assert!(!turn_started, "no turn runs for a blocked prompt");
+    assert!(
+        !snap.iter().any(|m| m.text.contains("do something bad")),
+        "a rejected prompt must not enter the conversation"
+    );
 }

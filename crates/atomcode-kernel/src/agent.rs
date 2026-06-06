@@ -140,7 +140,11 @@ impl RunningAgent {
                     self.rt.emit(AgentEvent::Snapshot { messages });
                 }
                 AgentCommand::SendMessage { mut text } => {
-                    self.hooks.user_prompt_submit(&mut text).await;
+                    if let Err(reason) = self.hooks.user_prompt_submit(&mut text).await {
+                        self.rt.emit(AgentEvent::Error { message: format!("prompt rejected: {reason}") });
+                        self.rt.emit(AgentEvent::TurnComplete);
+                        continue;
+                    }
                     convo.push(Message::user(text));
                     // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
                     // so a middleware blocked on approval can be answered out-of-band.
