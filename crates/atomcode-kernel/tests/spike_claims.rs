@@ -1,5 +1,6 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
-use atomcode_kernel::event::{AgentCommand, AgentEvent, MessageSnapshot};
+use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use atomcode_kernel::message::Message;
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
 use atomcode_kernel::testkit::{ApprovalMiddleware, ArgRewriteMiddleware, BlockToolMiddleware, BudgetReminderHook, ContinueOnceHook, DangerousBashTool, DropToolsHook, EchoTool, MockProvider, RecorderHook, RedactHook, RejectPromptHook, RiskyWriteTool, RoundBudgetHook, TruncateMiddleware};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
@@ -361,17 +362,18 @@ async fn on_model_response_can_transform_response_into_storage() {
     }
 
     handle.commands.send(AgentCommand::Snapshot).unwrap();
-    let mut snap: Vec<MessageSnapshot> = Vec::new();
+    let mut snap: Vec<Message> = Vec::new();
     while let Some(ev) = handle.events.recv().await {
-        if let AgentEvent::Snapshot { messages } = ev {
-            snap = messages;
+        if let AgentEvent::Snapshot { snapshot } = ev {
+            snap = snapshot.messages;
             break;
         }
     }
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    let assistant = snap.iter().find(|m| m.role == "Assistant").expect("assistant message stored");
+    use atomcode_kernel::message::Role;
+    let assistant = snap.iter().find(|m| m.role == Role::Assistant).expect("assistant message stored");
     // (1) the hook's transform of the response landed in storage
     assert_eq!(assistant.text, "my password is [redacted]", "on_model_response transform must land in storage");
     assert!(!assistant.text.contains("SECRET"), "secret must be gone");
@@ -623,10 +625,10 @@ async fn user_prompt_submit_can_block_a_prompt() {
 
     // the rejected prompt must not be stored in the conversation
     handle.commands.send(AgentCommand::Snapshot).unwrap();
-    let mut snap: Vec<MessageSnapshot> = Vec::new();
+    let mut snap: Vec<Message> = Vec::new();
     while let Some(ev) = handle.events.recv().await {
-        if let AgentEvent::Snapshot { messages } = ev {
-            snap = messages;
+        if let AgentEvent::Snapshot { snapshot } = ev {
+            snap = snapshot.messages;
             break;
         }
     }

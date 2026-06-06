@@ -1,6 +1,6 @@
 use crate::event::{AgentCommand, AgentEvent};
 use crate::hook::{LifecycleHooks, NoopHooks, TurnCtx};
-use crate::message::{Conversation, Message, MessageMeta};
+use crate::message::{Conversation, Message, MessageMeta, SessionSnapshot, SNAPSHOT_VERSION};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
 use crate::request::RequestCtx;
@@ -49,6 +49,9 @@ pub struct Agent {
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     hooks: Arc<dyn LifecycleHooks>,
     max_rounds: Option<u32>,
+    /// When set, the session SEEDS its conversation from this snapshot's messages
+    /// instead of `Conversation::new()` + persona (resume path).
+    resume: Option<SessionSnapshot>,
 }
 
 impl Agent {
@@ -68,6 +71,7 @@ impl Agent {
             hooks: self.hooks,
             rt: RequestCtx::new(ev_tx),
             max_rounds: self.max_rounds,
+            resume: self.resume,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -108,15 +112,40 @@ struct RunningAgent {
     hooks: Arc<dyn LifecycleHooks>,
     rt: RequestCtx,
     max_rounds: Option<u32>,
+    resume: Option<SessionSnapshot>,
 }
 
 impl RunningAgent {
     async fn session_loop(self, mut cmd_rx: UnboundedReceiver<AgentCommand>) {
-        let mut convo = Conversation::new();
-        // Persona is an INJECTION POINT. Empty by default → neutral kernel.
-        if !self.persona.is_empty() {
-            convo.push(Message::system(self.persona.clone()));
-        }
+        let mut convo = match &self.resume {
+            // RESUME: seed from the saved snapshot's messages. Those already
+            // include the persona/system message, so we do NOT re-add persona.
+            Some(snap) if snap.version == SNAPSHOT_VERSION => {
+                Conversation { messages: snap.messages.clone() }
+            }
+            // FORWARD-COMPAT SEAM: a snapshot from an unknown (newer/older) kernel
+            // version cannot be safely interpreted. Surface it and start EMPTY
+            // rather than panic or silently misread bytes. (When/if the schema
+            // bumps, a migration would live here.)
+            Some(snap) => {
+                self.rt.emit(AgentEvent::Error {
+                    message: format!(
+                        "unsupported snapshot version {} (kernel supports {})",
+                        snap.version, SNAPSHOT_VERSION
+                    ),
+                });
+                Conversation::new()
+            }
+            // FRESH: new conversation + persona injection point. Empty persona by
+            // default → neutral kernel.
+            None => {
+                let mut c = Conversation::new();
+                if !self.persona.is_empty() {
+                    c.push(Message::system(self.persona.clone()));
+                }
+                c
+            }
+        };
         self.hooks.session_start(&mut convo).await;
         loop {
             let cmd = match cmd_rx.recv().await {
@@ -128,16 +157,9 @@ impl RunningAgent {
                 AgentCommand::Cancel => {}
                 AgentCommand::Respond { id, value } => self.rt.resolve(id, value),
                 AgentCommand::Snapshot => {
-                    let messages = convo
-                        .messages
-                        .iter()
-                        .map(|m| crate::event::MessageSnapshot {
-                            role: format!("{:?}", m.role),
-                            text: m.text.clone(),
-                            meta: m.meta.clone(),
-                        })
-                        .collect();
-                    self.rt.emit(AgentEvent::Snapshot { messages });
+                    self.rt.emit(AgentEvent::Snapshot {
+                        snapshot: SessionSnapshot::from_conversation(&convo),
+                    });
                 }
                 AgentCommand::SendMessage { mut text } => {
                     if let Err(reason) = self.hooks.user_prompt_submit(&mut text).await {
@@ -377,6 +399,7 @@ pub struct AgentBuilder {
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     hooks: Option<Arc<dyn LifecycleHooks>>,
     max_rounds: Option<u32>,
+    resume: Option<SessionSnapshot>,
 }
 
 impl AgentBuilder {
@@ -405,6 +428,17 @@ impl AgentBuilder {
         self.max_rounds = Some(n);
         self
     }
+    /// RESUME a persisted session: SEED the conversation from `snapshot.messages`
+    /// instead of `Conversation::new()` + persona. The saved messages already
+    /// carry the persona/system message, so persona is NOT re-injected on resume.
+    /// History continues append-only across the resume boundary → the provider's
+    /// prefix cache survives. A snapshot whose `version` the kernel does not
+    /// support yields an `AgentEvent::Error` and an empty start (see
+    /// `session_loop`'s forward-compat seam).
+    pub fn resume(mut self, snapshot: SessionSnapshot) -> Self {
+        self.resume = Some(snapshot);
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -413,6 +447,7 @@ impl AgentBuilder {
             middlewares: self.middlewares,
             hooks: self.hooks.unwrap_or_else(|| Arc::new(NoopHooks)),
             max_rounds: self.max_rounds,
+            resume: self.resume,
         }
     }
 }

@@ -1,14 +1,6 @@
-use crate::message::MessageMeta;
+use crate::message::{MessageMeta, SessionSnapshot};
 use crate::tool::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
-
-/// Serializable per-message summary returned by Snapshot.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MessageSnapshot {
-    pub role: String,
-    pub text: String,
-    pub meta: Option<MessageMeta>,
-}
 
 pub type RequestId = u64;
 
@@ -42,8 +34,10 @@ pub enum AgentEvent {
     Request { id: RequestId, kind: String, payload: serde_json::Value },
     /// Per-LLM-call execution stats (perception side; mirrors the message sidecar).
     Usage(MessageMeta),
-    /// Whole-conversation snapshot (reply to Snapshot command).
-    Snapshot { messages: Vec<MessageSnapshot> },
+    /// Whole-conversation snapshot (reply to Snapshot command). Carries the
+    /// LOSSLESS, VERSIONED `SessionSnapshot` — full `Vec<Message>` (role / text /
+    /// tool_calls / tool_call_id / meta), suitable for persist + resume.
+    Snapshot { snapshot: SessionSnapshot },
     TurnComplete,
     Error { message: String },
     /// The turn was cooperatively cancelled (AgentCommand::Cancel mid-turn).

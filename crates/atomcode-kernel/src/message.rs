@@ -2,7 +2,7 @@ use crate::stream::TokenUsage;
 use crate::tool::ToolCall;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     System,
     User,
@@ -25,7 +25,13 @@ pub struct MessageMeta {
 }
 
 /// Provider-neutral message.
-#[derive(Clone, Debug)]
+///
+/// Derives `Serialize, Deserialize` so a conversation is LOSSLESSLY persistable
+/// and resumable: every field — `role`, `text`, `tool_calls`, `tool_call_id`,
+/// `meta` — survives a serde round-trip. (Contrast the retired, lossy
+/// `MessageSnapshot`, which dropped `tool_calls`/`tool_call_id` and stringified
+/// `Role` via `Debug`.) `PartialEq` lets round-trip equality be asserted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub text: String,
@@ -51,7 +57,7 @@ impl Message {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Conversation {
     pub messages: Vec<Message>,
 }
@@ -99,6 +105,38 @@ impl Conversation {
         for id in missing {
             self.messages.push(Message::tool_result(id, "(cancelled)", true));
         }
+    }
+}
+
+/// On-disk/over-the-wire schema version for a persisted conversation. Bump it
+/// whenever the serialized shape of `Message`/`Conversation` changes in a way an
+/// older kernel could not read. A reader checks this BEFORE interpreting
+/// `messages`, so a session written by one kernel version is never silently
+/// misread by another.
+pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// A versioned, LOSSLESS, resumable conversation snapshot — the durable contract
+/// for persisting and resuming a session.
+///
+/// `version` is the FORWARD-COMPAT SEAM: a resumer compares it against
+/// `SNAPSHOT_VERSION` and only interprets `messages` if it can. Carrying the full
+/// `Vec<Message>` (not a lossy summary) means `tool_calls`, `tool_call_id`, and
+/// `meta` all survive — so a resumed session continues append-only and the
+/// provider's prefix cache stays warm across the resume boundary.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub version: u32,
+    pub messages: Vec<Message>,
+}
+
+impl SessionSnapshot {
+    /// Stamp the current `SNAPSHOT_VERSION` over the given messages.
+    pub fn new(messages: Vec<Message>) -> Self {
+        Self { version: SNAPSHOT_VERSION, messages }
+    }
+    /// Snapshot a live conversation losslessly at the current version.
+    pub fn from_conversation(convo: &Conversation) -> Self {
+        Self::new(convo.messages.clone())
     }
 }
 
@@ -216,5 +254,95 @@ mod tests {
         assert_eq!(len, 2);
         c.backfill_cancelled_tool_results();
         assert_eq!(c.messages.len(), len, "no second (cancelled) for an already-paired call");
+    }
+
+    // A full Conversation — system + user + assistant-with-tool_calls + tool_result
+    // (with tool_call_id/is_error) + a message carrying `meta` — survives a
+    // serde_json round-trip BYTE-FOR-FIELD identically (PartialEq). This is the
+    // losslessness contract the OLD `MessageSnapshot` violated: it dropped
+    // `tool_calls` and `tool_call_id` and stringified `Role` via Debug.
+    #[test]
+    fn conversation_serde_roundtrip_is_lossless() {
+        let mut c = Conversation::new();
+        c.push(Message::system("you are neutral"));
+        c.push(Message::user("read the file then summarize"));
+        // assistant message carrying TWO tool_calls (id / name / arguments).
+        c.push(Message::assistant(
+            "calling tools",
+            vec![
+                ToolCall { id: "call_1".into(), name: "read_file".into(), arguments: "{\"path\":\"/x\"}".into() },
+                ToolCall { id: "call_2".into(), name: "grep".into(), arguments: "{\"q\":\"foo\"}".into() },
+            ],
+        ));
+        // a tool_result with tool_call_id set and is_error=true.
+        c.push(Message::tool_result("call_1", "boom", true));
+        // a message carrying a non-default `meta` sidecar.
+        let mut with_meta = Message::assistant("done", vec![]);
+        with_meta.meta = Some(MessageMeta {
+            tokens: TokenUsage { prompt: 50, completion: 7, cached: 3 },
+            elapsed_ms: 123,
+            ctx_window: 1000,
+            used_tokens: 50,
+            utilization: 0.05,
+            round: 2,
+        });
+        c.push(with_meta);
+
+        let json = serde_json::to_string(&c).expect("Conversation must serialize");
+        let back: Conversation = serde_json::from_str(&json).expect("Conversation must deserialize");
+
+        // Whole-conversation equality proves NOTHING was dropped or mangled.
+        assert_eq!(back, c, "round-trip must be lossless (Conversation PartialEq)");
+
+        // Spell out the bits the OLD lossy MessageSnapshot silently dropped, so a
+        // regression to a lossy projection fails LOUDLY here:
+        let asst = &back.messages[2];
+        assert_eq!(asst.tool_calls.len(), 2, "tool_calls must survive the round-trip");
+        assert_eq!(asst.tool_calls[0].id, "call_1");
+        assert_eq!(asst.tool_calls[0].name, "read_file");
+        assert_eq!(asst.tool_calls[0].arguments, "{\"path\":\"/x\"}");
+        assert_eq!(asst.tool_calls[1].id, "call_2");
+
+        let tr = &back.messages[3];
+        assert_eq!(tr.tool_call_id.as_deref(), Some("call_1"), "tool_call_id must survive");
+        assert_eq!(tr.text, "boom");
+
+        assert!(back.messages[4].meta.is_some(), "meta sidecar must survive");
+        assert_eq!(back.messages[4].meta.as_ref().unwrap().round, 2);
+    }
+
+    // `Role` serializes to its STABLE variant tag — the derived enum name is the
+    // wire contract now (NOT a `{:?}` Debug artifact) — and round-trips.
+    #[test]
+    fn role_serializes_to_stable_tag() {
+        assert_eq!(serde_json::to_string(&Role::Assistant).unwrap(), "\"Assistant\"");
+        assert_eq!(serde_json::to_string(&Role::System).unwrap(), "\"System\"");
+        assert_eq!(serde_json::to_string(&Role::User).unwrap(), "\"User\"");
+        assert_eq!(serde_json::to_string(&Role::Tool).unwrap(), "\"Tool\"");
+        let back: Role = serde_json::from_str("\"Assistant\"").unwrap();
+        assert_eq!(back, Role::Assistant);
+    }
+
+    // The versioned envelope stamps the current SNAPSHOT_VERSION and carries the
+    // full lossless messages; it round-trips and `from_conversation` mirrors the
+    // conversation's messages exactly.
+    #[test]
+    fn session_snapshot_is_versioned_and_round_trips() {
+        let mut c = Conversation::new();
+        c.push(Message::system("persona"));
+        c.push(Message::user("hi"));
+
+        let snap = SessionSnapshot::from_conversation(&c);
+        assert_eq!(snap.version, SNAPSHOT_VERSION, "constructor stamps the current version");
+        assert_eq!(snap.messages, c.messages, "from_conversation carries messages losslessly");
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap, "SessionSnapshot round-trips");
+
+        // `new` stamps the version too.
+        let snap2 = SessionSnapshot::new(c.messages.clone());
+        assert_eq!(snap2.version, SNAPSHOT_VERSION);
+        assert_eq!(snap2.messages, c.messages);
     }
 }
