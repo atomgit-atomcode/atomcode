@@ -770,29 +770,21 @@ async fn async_main() {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::Globalization::CP_UTF8;
-        use windows_sys::Win32::System::Console::{GetConsoleCP, SetConsoleCP, SetConsoleOutputCP};
+        use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP};
         unsafe {
             SetConsoleOutputCP(CP_UTF8);
             SetConsoleCP(CP_UTF8);
 
-            // SetConsoleCP(CP_UTF8) is best-effort — some IMEs ignore it and
-            // keep outputting in the system ANSI code page (e.g. CP936/GBK on
-            // Chinese Windows). When the console then interprets those bytes as
-            // UTF-8, CJK input renders as garbled mojibake. Detect the mismatch
-            // early so users know why their IME isn't working.
-            //
-            // We use eprintln! rather than a direct WriteConsoleW because at
-            // this early point in async_main the TUI has not yet taken over the
-            // terminal. stderr is still connected to the console and the
-            // message will be visible inline in PowerShell / conhost.
+            // Also check output code page, same best-effort as input.
             let actual_cp = GetConsoleCP();
-            if actual_cp != CP_UTF8 {
+            let actual_out_cp = GetConsoleOutputCP();
+            if actual_cp != CP_UTF8 || actual_out_cp != CP_UTF8 {
                 let _ = eprintln!(
-                    "\n⚠  Console input code page is {} (expected 65001/UTF-8).\n\
-                       Chinese/Japanese/Korean IME input may show garbled text.\n\
+                    "\n⚠  Console code pages — input: {} (expected 65001/UTF-8), output: {}.\n\
+                       Chinese/Japanese/Korean IME input/output may show garbled text.\n\
                        → Use Windows Terminal for native UTF-8 support.\n\
                        → Or enable Beta: Use Unicode UTF-8 in Region settings.\n",
-                    actual_cp,
+                    actual_cp, actual_out_cp,
                 );
             }
         }
@@ -1020,10 +1012,17 @@ async fn run() -> Result<i32> {
                     }
                     Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
                         eprintln!("{}", reason);
+                        // Flush telemetry before exiting, otherwise events are lost.
+                        telemetry
+                            .shutdown(std::time::Duration::from_millis(500))
+                            .await;
                         return Ok(0);
                     }
                     Err(e) => {
                         eprintln!("fixissue failed: {:#}", e);
+                        telemetry
+                            .shutdown(std::time::Duration::from_millis(500))
+                            .await;
                         return Ok(1);
                     }
                 }
@@ -1052,11 +1051,18 @@ async fn run() -> Result<i32> {
                             cmd.arg("--client").arg(c);
                         }
                         let status = cmd.status().context("Failed to start atomcode-daemon")?;
+                        // Flush telemetry events before handing over to daemon process.
+                        telemetry
+                            .shutdown(std::time::Duration::from_millis(500))
+                            .await;
                         return Ok(if status.success() { 0 } else { 1 });
                     }
                     None => {
                         eprintln!("Error: atomcode-daemon binary not found next to atomcode.");
                         eprintln!("Make sure both binaries are installed together.");
+                        telemetry
+                            .shutdown(std::time::Duration::from_millis(500))
+                            .await;
                         return Ok(1);
                     }
                 }
@@ -1067,6 +1073,10 @@ async fn run() -> Result<i32> {
                 eprintln!("{msg}");
                 // server 是后台 task；保持进程存活直到用户 Ctrl+C
                 let _ = tokio::signal::ctrl_c().await;
+                // Shutdown telemetry after Ctrl+C.
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
                 return Ok(0);
             }
             Commands::Telemetry { action } => {
@@ -1085,6 +1095,10 @@ async fn run() -> Result<i32> {
                     }
                     TelemetryAction::Clear => telemetry_cmd::clear(&atomcode_dir)?,
                 }
+                // Flush telemetry before exiting.
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
                 return Ok(0);
             }
             Commands::Setup { force } => {
@@ -1545,6 +1559,7 @@ async fn run() -> Result<i32> {
             // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
             // On non-zero we leave the issue alone — the user can retry.
             if let Some(issue_ref) = fixissue_ref {
+                let mut final_exit = ec;
                 if ec == 0 {
                     if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
                         match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
@@ -1552,10 +1567,14 @@ async fn run() -> Result<i32> {
                                 "[fixissue] ✓ posted summary + applied 'fixed' label to issue #{}",
                                 issue_ref.number
                             ),
-                            Err(e) => eprintln!(
-                                "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
-                                e
-                            ),
+                            Err(e) => {
+                                eprintln!(
+                                    "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
+                                    e
+                                );
+                                // Signal partial failure so CI/scripts can detect it.
+                                final_exit = 3;
+                            }
                         }
                     } else {
                         eprintln!(
@@ -1569,8 +1588,10 @@ async fn run() -> Result<i32> {
                         ec, issue_ref.number
                     );
                 }
+                Ok::<i32, anyhow::Error>(final_exit)
+            } else {
+                Ok::<i32, anyhow::Error>(ec)
             }
-            Ok::<i32, anyhow::Error>(ec)
         } else {
             // Fire-and-forget: spawn a setsid'd subprocess to stage the next
             // release if one is out. Detached so a Ctrl+C in this parent doesn't
