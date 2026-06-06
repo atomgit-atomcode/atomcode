@@ -146,9 +146,13 @@ impl RunningAgent {
                         continue;
                     }
                     convo.push(Message::user(text));
+                    // Per-turn cancellation token: Cancel fires it; run_turn polls
+                    // it at the stream, between tools, and inside execute. A CLONE
+                    // also rides into each ToolContext so cooperative tools can bail.
+                    let turn_token = tokio_util::sync::CancellationToken::new();
                     // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
                     // so a middleware blocked on approval can be answered out-of-band.
-                    let mut turn = Box::pin(self.run_turn(&mut convo));
+                    let mut turn = Box::pin(self.run_turn(&mut convo, turn_token.clone()));
                     let mut shutdown = false;
                     loop {
                         tokio::select! {
@@ -156,7 +160,7 @@ impl RunningAgent {
                             maybe = cmd_rx.recv() => match maybe {
                                 Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
                                 Some(AgentCommand::Shutdown) => { shutdown = true; break; }
-                                Some(AgentCommand::Cancel) => {}
+                                Some(AgentCommand::Cancel) => turn_token.cancel(),
                                 Some(AgentCommand::Snapshot) => {}
                                 Some(AgentCommand::SendMessage { .. }) => {}
                                 None => { shutdown = true; break; }
@@ -172,7 +176,7 @@ impl RunningAgent {
         self.hooks.session_end(&convo).await;
     }
 
-    async fn run_turn(&self, convo: &mut Conversation) {
+    async fn run_turn(&self, convo: &mut Conversation, cancel: tokio_util::sync::CancellationToken) {
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
@@ -206,7 +210,24 @@ impl RunningAgent {
             let mut pending_calls = Vec::new();
             let mut usage = TokenUsage::default();
             let mut truncated = false;
-            while let Some(ev) = stream.next().await {
+            loop {
+                // MID-STREAM cancel checkpoint: cancellation stops stream
+                // consumption immediately. Carried from production runner.rs:420.
+                // Cancel fires BEFORE any assistant message is built → there is
+                // nothing dangling to backfill: just emit Cancelled + TurnComplete
+                // and return (no bogus partial-success assistant message).
+                let ev = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        self.rt.emit(AgentEvent::Cancelled);
+                        self.rt.emit(AgentEvent::TurnComplete);
+                        return;
+                    }
+                    ev = stream.next() => match ev {
+                        Some(ev) => ev,
+                        None => break,
+                    },
+                };
                 match ev {
                     StreamEvent::TextDelta(t) => {
                         assistant_text.push_str(&t);
@@ -269,6 +290,16 @@ impl RunningAgent {
                 return;
             }
             for mut call in pending_calls {
+                // BETWEEN-TOOLS cancel checkpoint: do not dispatch any remaining
+                // tool_call once cancelled. Carried from production runner.rs:916.
+                // The skipped calls (this one + the rest) are paired with synthetic
+                // "(cancelled)" results by backfill on the cancel path below.
+                if cancel.is_cancelled() {
+                    convo.backfill_cancelled_tool_results();
+                    self.rt.emit(AgentEvent::Cancelled);
+                    self.rt.emit(AgentEvent::TurnComplete);
+                    return;
+                }
                 let mut result = match self.tools.get(&call.name) {
                     None => ToolResult {
                         call_id: call.id.clone(),
@@ -295,8 +326,28 @@ impl RunningAgent {
                             }
                         } else {
                             self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
-                            let ctx = ToolContext { working_dir: std::env::current_dir().unwrap_or_default() };
-                            let mut r = tool.execute(&call.arguments, &ctx).await;
+                            let ctx = ToolContext {
+                                working_dir: std::env::current_dir().unwrap_or_default(),
+                                cancel: cancel.clone(),
+                            };
+                            // INSIDE-EXECUTE backstop: poll cancel while the tool
+                            // future runs so a long tool is interrupted mid-flight.
+                            // Carried from production runner.rs:1431. `biased` polls
+                            // execute FIRST: a tool that already completed wins (its
+                            // real result is kept, mirroring production where a tool
+                            // returning in the same poll as a cancel keeps its
+                            // result); a tool still pending when cancel fires is
+                            // dropped as a backstop, yielding "(cancelled)".
+                            // Cooperative tools that poll ctx.cancel clean up properly.
+                            let mut r = tokio::select! {
+                                biased;
+                                r = tool.execute(&call.arguments, &ctx) => r,
+                                _ = cancel.cancelled() => ToolResult {
+                                    call_id: call.id.clone(),
+                                    content: "(cancelled)".into(),
+                                    is_error: true,
+                                },
+                            };
                             r.call_id = call.id.clone();
                             r
                         }

@@ -46,6 +46,11 @@ pub enum AgentEvent {
     Snapshot { messages: Vec<MessageSnapshot> },
     TurnComplete,
     Error { message: String },
+    /// The turn was cooperatively cancelled (AgentCommand::Cancel mid-turn).
+    /// Emitted immediately before the terminal TurnComplete on a cancel path;
+    /// any dangling tool_calls have been backfilled with synthetic results so
+    /// the conversation stays API-valid.
+    Cancelled,
     /// Model thinking/reasoning channel (perception side; not stored on Message).
     Reasoning(String),
     /// Non-fatal advisory (e.g. a truncated response). The turn still completes.

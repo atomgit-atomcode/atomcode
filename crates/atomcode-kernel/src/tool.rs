@@ -40,8 +40,14 @@ pub struct ToolDef {
 
 /// Execution context passed to tools. Deliberately minimal: NO semantic/graph/lsp
 /// services — proving the kernel needs none.
+///
+/// `cancel` is the per-turn cooperative-cancellation token. A long-running tool
+/// MAY poll `ctx.cancel.is_cancelled()` or `select!` on `ctx.cancel.cancelled()`
+/// to bail out cleanly; tools that ignore it are unaffected (the kernel still
+/// drops the execute future as a backstop on cancel).
 pub struct ToolContext {
     pub working_dir: PathBuf,
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 #[async_trait]
