@@ -191,20 +191,50 @@ impl RunningAgent {
             let start = Instant::now();
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
-            let mut stream = self.provider.chat_stream(&messages, &defs).await;
+            // A failed OPEN cleanly fails the turn — no bogus assistant message,
+            // no empty-success illusion.
+            let mut stream = match self.provider.chat_stream(&messages, &defs).await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.hooks.on_error(&e.message).await;
+                    self.rt.emit(AgentEvent::Error { message: e.message });
+                    self.rt.emit(AgentEvent::TurnComplete);
+                    return;
+                }
+            };
             let mut assistant_text = String::new();
             let mut pending_calls = Vec::new();
             let mut usage = TokenUsage::default();
+            let mut truncated = false;
             while let Some(ev) = stream.next().await {
                 match ev {
                     StreamEvent::TextDelta(t) => {
                         assistant_text.push_str(&t);
                         self.rt.emit(AgentEvent::TextDelta(t));
                     }
+                    StreamEvent::Reasoning(t) => self.rt.emit(AgentEvent::Reasoning(t)),
                     StreamEvent::ToolCall(c) => pending_calls.push(c),
                     StreamEvent::Usage(u) => usage = u,
-                    StreamEvent::Done => break,
+                    // A mid-stream error CLEANLY FAILS the turn: surface it and end —
+                    // do NOT fall through to a fake empty-success completion.
+                    StreamEvent::Error(e) => {
+                        self.hooks.on_error(&e.message).await;
+                        self.rt.emit(AgentEvent::Error { message: e.message });
+                        self.rt.emit(AgentEvent::TurnComplete);
+                        return;
+                    }
+                    StreamEvent::Done { truncated: t } => {
+                        truncated = t;
+                        break;
+                    }
                 }
+            }
+            // Truncation is observable via a Warning; the round still finishes
+            // normally (continuation is a separate follow-up task).
+            if truncated {
+                self.rt.emit(AgentEvent::Warning(
+                    "response truncated: finish_reason=length".into(),
+                ));
             }
             let ctx_window = self.provider.context_window();
             let used_tokens = usage.prompt;

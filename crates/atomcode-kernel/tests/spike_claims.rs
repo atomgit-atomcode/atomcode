@@ -14,9 +14,9 @@ async fn neutral_turn_runs_without_persona_or_middleware() {
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "echo".into(), arguments: "{\"text\":\"hi\"}".into() }),
-            StreamEvent::Done,
+            StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done],
+        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
     ]));
 
     let handle = Agent::builder()
@@ -50,9 +50,9 @@ async fn approval_middleware_gates_risky_tool_via_id_roundtrip() {
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "risky_write".into(), arguments: "{\"path\":\"/tmp/x\"}".into() }),
-            StreamEvent::Done,
+            StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::Done],
+        vec![StreamEvent::Done { truncated: false }],
     ]));
 
     let handle = Agent::builder()
@@ -91,9 +91,9 @@ async fn one_shot_adapter_auto_answers_and_aggregates() {
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "risky_write".into(), arguments: "{}".into() }),
-            StreamEvent::Done,
+            StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done],
+        vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done { truncated: false }],
     ]));
 
     let agent = Agent::builder()
@@ -131,12 +131,12 @@ async fn lifecycle_hook_injects_and_continues_loop() {
     // Step 1: model stops (no tool calls). Step 2 (after the injected reminder):
     // calls echo. Step 3: stops again → hook returns None → complete.
     let provider = Arc::new(MockProvider::new(vec![
-        vec![StreamEvent::TextDelta("stopping".into()), StreamEvent::Done],
+        vec![StreamEvent::TextDelta("stopping".into()), StreamEvent::Done { truncated: false }],
         vec![
             StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "echo".into(), arguments: "{}".into() }),
-            StreamEvent::Done,
+            StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("really done".into()), StreamEvent::Done],
+        vec![StreamEvent::TextDelta("really done".into()), StreamEvent::Done { truncated: false }],
     ]));
 
     let handle = Agent::builder()
@@ -173,9 +173,9 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
         vec![
             StreamEvent::ToolCall(ToolCall { id: "a".into(), name: "echo".into(), arguments: "{}".into() }),
             StreamEvent::ToolCall(ToolCall { id: "b".into(), name: "does_not_exist".into(), arguments: "{}".into() }),
-            StreamEvent::Done,
+            StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done],
+        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
     ]));
 
     let recorder = Arc::new(RecorderHook::new());
@@ -218,12 +218,12 @@ async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
             vec![
                 StreamEvent::Usage(TokenUsage { prompt: 100, completion: 5, cached: 0 }),
                 StreamEvent::TextDelta("reply A".into()),
-                StreamEvent::Done,
+                StreamEvent::Done { truncated: false },
             ],
             vec![
                 StreamEvent::Usage(TokenUsage { prompt: 300, completion: 5, cached: 0 }),
                 StreamEvent::TextDelta("reply B".into()),
-                StreamEvent::Done,
+                StreamEvent::Done { truncated: false },
             ],
         ])
         .with_ctx_window(1000),
@@ -290,11 +290,11 @@ async fn round_budget_projected_to_llm_and_hard_capped() {
     reg.register(Arc::new(EchoTool));
     // The model calls a tool EVERY round (never stops) — exercises the cap at max=3.
     let provider = Arc::new(MockProvider::new(vec![
-        vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
-        vec![StreamEvent::ToolCall(ToolCall { id: "2".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
-        vec![StreamEvent::ToolCall(ToolCall { id: "3".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
+        vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
+        vec![StreamEvent::ToolCall(ToolCall { id: "2".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
+        vec![StreamEvent::ToolCall(ToolCall { id: "3".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
         // a 4th is scripted but must NEVER be requested (hard-capped at 3)
-        vec![StreamEvent::ToolCall(ToolCall { id: "4".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
+        vec![StreamEvent::ToolCall(ToolCall { id: "4".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
     ]));
     let received = provider.received.clone();
 
@@ -343,7 +343,7 @@ async fn on_model_response_can_transform_response_into_storage() {
     let provider = Arc::new(MockProvider::new(vec![vec![
         StreamEvent::Usage(TokenUsage { prompt: 50, completion: 10, cached: 0 }),
         StreamEvent::TextDelta("my password is SECRET".into()),
-        StreamEvent::Done,
+        StreamEvent::Done { truncated: false },
     ]]));
 
     let mut handle = Agent::builder()
@@ -389,7 +389,7 @@ async fn dropping_tool_calls_in_on_model_response_prevents_execution() {
     reg.register(Arc::new(EchoTool));
     let provider = Arc::new(MockProvider::new(vec![vec![
         StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }),
-        StreamEvent::Done,
+        StreamEvent::Done { truncated: false },
     ]]));
     let mut handle = Agent::builder()
         .provider(provider)
@@ -424,8 +424,8 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
         let provider = Arc::new(MockProvider::new(vec![
-            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{\"x\":1}".into() }), StreamEvent::Done],
-            vec![StreamEvent::Done],
+            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{\"x\":1}".into() }), StreamEvent::Done { truncated: false }],
+            vec![StreamEvent::Done { truncated: false }],
         ]));
         let mut handle = Agent::builder()
             .provider(provider)
@@ -451,8 +451,8 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
         let provider = Arc::new(MockProvider::new(vec![
-            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
-            vec![StreamEvent::Done],
+            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
+            vec![StreamEvent::Done { truncated: false }],
         ]));
         let mut handle = Agent::builder()
             .provider(provider)
@@ -485,8 +485,8 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
         let provider = Arc::new(MockProvider::new(vec![
-            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done],
-            vec![StreamEvent::Done],
+            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
+            vec![StreamEvent::Done { truncated: false }],
         ]));
         let mut handle = Agent::builder()
             .provider(provider)
@@ -519,8 +519,8 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(DangerousBashTool));
         let provider = Arc::new(MockProvider::new(vec![
-            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "bash".into(), arguments: "{\"cmd\":\"ls\"}".into() }), StreamEvent::Done],
-            vec![StreamEvent::Done],
+            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "bash".into(), arguments: "{\"cmd\":\"ls\"}".into() }), StreamEvent::Done { truncated: false }],
+            vec![StreamEvent::Done { truncated: false }],
         ]));
         let mut handle = Agent::builder()
             .provider(provider)
@@ -550,10 +550,10 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(DangerousBashTool));
         let provider = Arc::new(MockProvider::new(vec![
-            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "bash".into(), arguments: "{\"cmd\":\"rm -rf /tmp/x\"}".into() }), StreamEvent::Done],
-            vec![StreamEvent::Done],
-            vec![StreamEvent::ToolCall(ToolCall { id: "2".into(), name: "bash".into(), arguments: "{\"cmd\":\"rm -rf /tmp/x\"}".into() }), StreamEvent::Done],
-            vec![StreamEvent::Done],
+            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "bash".into(), arguments: "{\"cmd\":\"rm -rf /tmp/x\"}".into() }), StreamEvent::Done { truncated: false }],
+            vec![StreamEvent::Done { truncated: false }],
+            vec![StreamEvent::ToolCall(ToolCall { id: "2".into(), name: "bash".into(), arguments: "{\"cmd\":\"rm -rf /tmp/x\"}".into() }), StreamEvent::Done { truncated: false }],
+            vec![StreamEvent::Done { truncated: false }],
         ]));
         let mut handle = Agent::builder()
             .provider(provider)
@@ -601,7 +601,7 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
 #[tokio::test]
 async fn user_prompt_submit_can_block_a_prompt() {
     let reg = ToolRegistry::new();
-    let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Done]])); // never reached
+    let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Done { truncated: false }]])); // never reached
     let mut handle = Agent::builder()
         .provider(provider)
         .tools(reg.mount(&[]))

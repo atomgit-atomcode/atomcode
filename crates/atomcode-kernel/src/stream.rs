@@ -9,11 +9,29 @@ pub struct TokenUsage {
     pub cached: u32,
 }
 
-/// Minimal provider stream surface.
-#[derive(Clone, Debug, PartialEq)]
+/// A streaming failure surfaced by the provider. `retryable=true` =
+/// 429/5xx/timeout (the loop MAY retry later); `false` = terminal
+/// (auth/400/bad-request). The kernel does not retry here — it only surfaces.
+#[derive(Clone, Debug)]
+pub struct ProviderError {
+    pub retryable: bool,
+    pub message: String,
+}
+
+/// Minimal provider stream surface. Fallible: a real streaming LLM can fail
+/// mid-stream, truncate on `finish_reason=length`, or emit reasoning content —
+/// each is first-class here so it never degrades into an empty SUCCESSFUL turn.
+#[derive(Clone, Debug)]
 pub enum StreamEvent {
     TextDelta(String),
+    /// Thinking/reasoning channel — kernel emits it; not stored on Message here.
+    Reasoning(String),
     ToolCall(ToolCall),
     Usage(TokenUsage),
-    Done,
+    /// Mid-stream failure (429/5xx/timeout/auth/…). Cleanly fails the turn.
+    Error(ProviderError),
+    /// End of stream. `truncated` = the response was cut by `finish_reason=length`.
+    Done {
+        truncated: bool,
+    },
 }

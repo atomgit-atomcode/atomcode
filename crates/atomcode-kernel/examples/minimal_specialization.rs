@@ -17,13 +17,13 @@ fn make_builder() -> AgentBuilder {
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{\"text\":\"hello\"}".into() }),
-            StreamEvent::Done,
+            StreamEvent::Done { truncated: false },
         ],
         vec![
             StreamEvent::ToolCall(ToolCall { id: "2".into(), name: "risky_write".into(), arguments: "{\"path\":\"notes.md\"}".into() }),
-            StreamEvent::Done,
+            StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done.".into()), StreamEvent::Done],
+        vec![StreamEvent::TextDelta("done.".into()), StreamEvent::Done { truncated: false }],
     ]));
     Agent::builder()
         .provider(provider)

@@ -5,7 +5,7 @@ use crate::message::{Conversation, Message};
 use crate::middleware::ToolMiddleware;
 use crate::provider::LlmProvider;
 use crate::request::RequestCtx;
-use crate::stream::StreamEvent;
+use crate::stream::{ProviderError, StreamEvent};
 use crate::tool::{RiskLevel, Tool, ToolCall, ToolContext, ToolDef, ToolResult};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -49,7 +49,7 @@ impl LlmProvider for MockProvider {
         &self,
         messages: &[Message],
         _tools: &[ToolDef],
-    ) -> BoxStream<'static, StreamEvent> {
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         let snapshot: Vec<(String, String)> =
             messages.iter().map(|m| (format!("{:?}", m.role), m.text.clone())).collect();
         self.received.lock().unwrap().push(snapshot);
@@ -58,8 +58,45 @@ impl LlmProvider for MockProvider {
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or_else(|| vec![StreamEvent::Done]);
-        Box::pin(futures::stream::iter(events))
+            .unwrap_or_else(|| vec![StreamEvent::Done { truncated: false }]);
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// One-shot scripted provider for the FALLIBLE-stream claims: it either fails to
+/// OPEN (returns `Err`) or yields a fixed event script ONCE (a single turn). A
+/// richer adversarial mock is a separate later task — this stays minimal.
+pub struct ScriptedProvider {
+    open_error: Option<ProviderError>,
+    events: Mutex<Option<Vec<StreamEvent>>>,
+}
+
+impl ScriptedProvider {
+    /// `chat_stream` returns `Err(e)` — a failed open.
+    pub fn open_error(e: ProviderError) -> Self {
+        Self { open_error: Some(e), events: Mutex::new(None) }
+    }
+    /// `chat_stream` opens OK and yields `events` once.
+    pub fn events(events: Vec<StreamEvent>) -> Self {
+        Self { open_error: None, events: Mutex::new(Some(events)) }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ScriptedProvider {
+    fn model_name(&self) -> &str {
+        "scripted"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        if let Some(e) = &self.open_error {
+            return Err(e.clone());
+        }
+        let events = self.events.lock().unwrap().take().unwrap_or_default();
+        Ok(Box::pin(futures::stream::iter(events)))
     }
 }
 

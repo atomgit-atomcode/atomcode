@@ -46,4 +46,8 @@ pub enum AgentEvent {
     Snapshot { messages: Vec<MessageSnapshot> },
     TurnComplete,
     Error { message: String },
+    /// Model thinking/reasoning channel (perception side; not stored on Message).
+    Reasoning(String),
+    /// Non-fatal advisory (e.g. a truncated response). The turn still completes.
+    Warning(String),
 }
