@@ -5,6 +5,7 @@
 pub mod background;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
+pub mod compression;
 pub mod parallel_edit;
 pub mod subtask_driver;
 
@@ -148,13 +149,7 @@ pub enum TurnStopReason {
     Error,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CompressionOutcome {
-    applied: bool,
-    before_tokens: usize,
-    after_tokens: usize,
-    removed_messages: usize,
-}
+pub use compression::CompressionOutcome;
 
 impl TurnStopReason {
     /// Short machine-parseable tag (snake_case) for logs / CLI output.
@@ -1746,11 +1741,24 @@ impl AgentLoop {
             // No LLM call — the compressed content is already
             // one-line-per-round summaries (DefaultCtx) compact enough
             // for cold zone.
-            let keep_ceiling = self.compaction_keep_ceiling(&system_prompt).await;
+            let keep_ceiling = compression::compaction_keep_ceiling(
+                &*self.ctx,
+                &system_prompt,
+                &self.turn_runner.tools,
+                &self.conversation.cold_summaries,
+            )
+            .await;
             if let Some((content, n_msgs)) =
                 self.ctx.compression_plan(&self.conversation, keep_ceiling)
             {
-                let _ = self.try_apply_compression(&system_prompt, n_msgs, content, false);
+                let _ = compression::try_apply_compression(
+                    &*self.ctx,
+                    &mut self.conversation,
+                    &system_prompt,
+                    n_msgs,
+                    content,
+                    None, // no post-compress state at task boundary
+                );
             }
         }
 
@@ -2000,7 +2008,22 @@ impl AgentLoop {
             // Context compression: when > 70% budget, pause and compress
             // old turns via LLM call. Keeps last 5 turns full, compressed
             // history goes to cold zone (FIFO, max 3 entries).
-            self.maybe_compress_history(&system_prompt).await;
+            {
+                let state = build_post_compress_state(
+                    &self.current_task,
+                    &self.files_edited_this_turn,
+                    &self.files_read_this_turn,
+                );
+                compression::maybe_compress_history(
+                    &*self.ctx,
+                    &mut self.conversation,
+                    &*self.turn_runner.provider,
+                    &self.turn_runner.tools,
+                    &system_prompt,
+                    state.as_deref(),
+                )
+                .await;
+            }
 
             // Batch reminder: REMOVED.
             // Was injecting fake user messages ("[Batch reminder: call MULTIPLE tools...]")
@@ -2835,78 +2858,6 @@ impl AgentLoop {
     /// it scales correctly from 128K to 1M — a fixed fraction would not
     /// (it would waste ~460K on a 1M model, the same class of bug as the
     /// old 60K drop cap).
-    async fn compaction_keep_ceiling(&self, system_prompt: &str) -> usize {
-        let window = self.ctx.ctx_window();
-        let system_tokens = system_prompt.len() / 4 + 4;
-        let tool_def_tokens: usize = self
-            .turn_runner
-            .tools
-            .get_definitions()
-            .await
-            .iter()
-            .map(|d| {
-                let params = serde_json::to_string(&d.parameters).unwrap_or_default();
-                (d.name.len() + d.description.len() + params.len()) / 4 + 4
-            })
-            .sum();
-        let cold_zone_tokens: usize = self
-            .conversation
-            .cold_summaries
-            .iter()
-            .map(|s| s.len() / 4 + 4)
-            .sum();
-        let output_reserve = (window / 4).clamp(8_000, 16_384);
-        window
-            .saturating_sub(system_tokens)
-            .saturating_sub(tool_def_tokens)
-            .saturating_sub(cold_zone_tokens)
-            .saturating_sub(output_reserve)
-            .max(window / 4) // defensive floor: tail never below 25% of window
-    }
-
-    async fn maybe_compress_history(&mut self, system_prompt: &str) {
-        let sys_tokens = system_prompt.len() / 4 + 4;
-        if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
-            return;
-        }
-
-        // ── Tier 1: collapse old tool_results (no LLM call) ──
-        // Keep the most recent 3 turns at full fidelity; older
-        // turns get their tool_result bodies replaced with the same
-        // generic stub microcompact uses at render time. One stub
-        // format, one place to maintain.
-        crate::ctx::render::compact_old_tool_results_in_place(
-            &mut self.conversation,
-            /* keep_recent_turns */ 3,
-        );
-
-        // Re-check: if Tier 1 was enough, stop here and skip the
-        // LLM summarization round-trip. This is the common case for
-        // sessions where the bulk of context is heavy bash/cargo
-        // outputs.
-        if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
-            return;
-        }
-
-        // ── Tier 2: LLM-summarize oldest turns into cold zone ──
-        let keep_ceiling = self.compaction_keep_ceiling(system_prompt).await;
-        let (content, n_turns) = match self.ctx.compression_plan(&self.conversation, keep_ceiling) {
-            Some(plan) => plan,
-            None => return,
-        };
-
-        let summarize_prompt = Self::default_summarize_prompt(&content);
-
-        let summary = self.run_llm_summary(&summarize_prompt).await;
-        let final_summary = if summary.trim().is_empty() {
-            content
-        } else {
-            summary
-        };
-
-        let _ = self.try_apply_compression(system_prompt, n_turns, final_summary, true);
-    }
-
     /// Emit a full ContextStats snapshot for the `/context` command.
     /// Callers pass the conversation and the already-built `msgs` (from
     /// `self.ctx.build_messages`) so the estimate reflects exactly what
@@ -2958,75 +2909,6 @@ impl AgentLoop {
         });
     }
 
-    /// Post-compression task state restoration. After compression the model
-    /// loses track of what it was doing — inject a short status so it can
-    /// resume without re-exploring. Shared by auto-compact (threshold-driven
-    /// in `maybe_compress_history`) and manual `/compact`.
-    fn inject_post_compress_state(&mut self) {
-        if let Some(msg) = build_post_compress_state(
-            &self.current_task,
-            &self.files_edited_this_turn,
-            &self.files_read_this_turn,
-        ) {
-            self.conversation.add_synthetic_user_message(&msg);
-        }
-    }
-
-    fn rendered_token_count(&self, system_prompt: &str) -> usize {
-        self.ctx
-            .build_messages(&self.conversation, system_prompt, "")
-            .0
-            .iter()
-            .map(|m| m.estimate_tokens())
-            .sum()
-    }
-
-    /// Apply a compression candidate only when it reduces the next request
-    /// payload. This is the single success criterion for all compression
-    /// entry points: manual `/compact`, threshold-driven auto-compression,
-    /// and task-boundary cleanup.
-    fn try_apply_compression(
-        &mut self,
-        system_prompt: &str,
-        remove_count: usize,
-        summary: String,
-        inject_state: bool,
-    ) -> CompressionOutcome {
-        let before_msg_count = self.conversation.messages.len();
-        let before_tokens = self.rendered_token_count(system_prompt);
-
-        let msgs_snapshot = self.conversation.messages.clone();
-        let cold_snapshot = self.conversation.cold_summaries.clone();
-        let turns_snapshot = self.conversation.turn_tracker.clone();
-
-        self.conversation.apply_compression(remove_count, summary);
-        if inject_state {
-            self.inject_post_compress_state();
-        }
-
-        let after_tokens = self.rendered_token_count(system_prompt);
-        let removed_messages = before_msg_count.saturating_sub(self.conversation.messages.len());
-
-        if after_tokens >= before_tokens {
-            self.conversation.messages = msgs_snapshot;
-            self.conversation.cold_summaries = cold_snapshot;
-            self.conversation.turn_tracker = turns_snapshot;
-            CompressionOutcome {
-                applied: false,
-                before_tokens,
-                after_tokens,
-                removed_messages: 0,
-            }
-        } else {
-            CompressionOutcome {
-                applied: true,
-                before_tokens,
-                after_tokens,
-                removed_messages,
-            }
-        }
-    }
-
     /// D2 emergency compact — layered, measured, never combines destructive
     /// ops. Replaces the previous "LLM-compress + blind truncate(len-4)"
     /// path that destroyed last-turn context (datalog atomgr-2d99b47d/
@@ -3068,7 +2950,15 @@ impl AgentLoop {
         // Tier 2: LLM-summarize older turns into the cold zone. This is
         // the most expensive tier (it makes a network round trip), so
         // we only reach it after Tier 1 already failed.
-        self.maybe_compress_history(system_prompt).await;
+        compression::maybe_compress_history(
+            &*self.ctx,
+            &mut self.conversation,
+            &*self.turn_runner.provider,
+            &self.turn_runner.tools,
+            system_prompt,
+            None, // emergency path — no post-compress state
+        )
+        .await;
         if estimate(&self.conversation) <= target_tokens {
             return true;
         }
@@ -3097,7 +2987,13 @@ impl AgentLoop {
     /// made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
         let system_prompt = self.build_system_prompt();
-        let keep_ceiling = self.compaction_keep_ceiling(&system_prompt).await;
+        let keep_ceiling = compression::compaction_keep_ceiling(
+            &*self.ctx,
+            &system_prompt,
+            &self.turn_runner.tools,
+            &self.conversation.cold_summaries,
+        )
+        .await;
         let Some((mechanical_content, n_msgs)) =
             self.ctx.compression_plan(&self.conversation, keep_ceiling)
         else {
@@ -3120,17 +3016,29 @@ impl AgentLoop {
                 custom, mechanical_content
             )
         } else {
-            Self::default_summarize_prompt(&mechanical_content)
+            compression::default_summarize_prompt(&mechanical_content)
         };
 
-        let summary = self.run_llm_summary(&summarize_prompt).await;
+        let summary = self.run_llm_summary_with_telemetry(&summarize_prompt).await;
         let content = if summary.trim().is_empty() {
             mechanical_content
         } else {
             summary
         };
 
-        let outcome = self.try_apply_compression(&system_prompt, n_msgs, content, true);
+        let state = build_post_compress_state(
+            &self.current_task,
+            &self.files_edited_this_turn,
+            &self.files_read_this_turn,
+        );
+        let outcome = compression::try_apply_compression(
+            &*self.ctx,
+            &mut self.conversation,
+            &system_prompt,
+            n_msgs,
+            content,
+            state.as_deref(),
+        );
 
         if !outcome.applied {
             let before = fmt_k_tokens(outcome.before_tokens);
@@ -3167,94 +3075,20 @@ impl AgentLoop {
             .await;
     }
 
-    fn default_summarize_prompt(content: &str) -> String {
-        format!(
-            "Summarize this conversation history in 3-5 concise sentences. \
-             Keep: file names, what was changed, key decisions, errors encountered. \
-             Drop: exact code content, tool arguments, line numbers.\n\n{}",
-            content
-        )
-    }
-
-    /// Run a lightweight LLM call to summarize content. Returns empty string on failure.
-    async fn run_llm_summary(&self, prompt: &str) -> String {
-        // System prompt kept in a local so the telemetry `system_tokens`
-        // estimate below matches exactly what is sent on the wire.
+    /// Run LLM summary with telemetry reporting.
+    /// Thin wrapper around [`compression::run_llm_summary`] that adds
+    /// provider/host/model attribution and tracks the call in telemetry.
+    async fn run_llm_summary_with_telemetry(&self, prompt: &str) -> String {
         let sys = "You are a conversation summarizer. Output ONLY the summary.";
-        let mut mini_conv = crate::conversation::Conversation::new();
-        mini_conv.add_user_message(prompt);
-        let msgs = mini_conv.to_provider_messages(sys);
-
         let started = std::time::Instant::now();
-        // Telemetry token counters: populated from StreamEvent::Usage when the
-        // provider reports it, estimated otherwise (mirrors TurnRunner's
-        // no-usage fallback). This summary/compaction call goes to the SAME
-        // provider/base_url as a normal turn, so the upstream proxy logs it —
-        // but it bypasses `run_with_filter`, so the `tel_return!` macro never
-        // fires and the request was previously invisible to our telemetry,
-        // making AtomCode under-report vs the proxy by exactly these calls.
-        let mut tel_input: u32 = 0;
-        let mut tel_output: u32 = 0;
-        let mut tel_cached: u32 = 0;
-        let mut got_usage = false;
-        let mut errored = false;
 
-        let mut summary = String::new();
-        match self.turn_runner.provider.chat_stream(&msgs, None) {
-            Ok(mut stream) => {
-                use futures::StreamExt;
-                let first_timeout = std::time::Duration::from_secs(30);
-                let stream_timeout = std::time::Duration::from_secs(30);
-                let mut got_token = false;
-                loop {
-                    let timeout = if got_token {
-                        stream_timeout
-                    } else {
-                        first_timeout
-                    };
-                    match tokio::time::timeout(timeout, stream.next()).await {
-                        Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
-                            got_token = true;
-                            let clean = text
-                                .replace("<think>", "")
-                                .replace("</think>", "")
-                                .replace("<|im_start|>", "")
-                                .replace("<|im_end|>", "");
-                            summary.push_str(&clean);
-                        }
-                        Ok(Some(Ok(crate::stream::StreamEvent::Usage(u)))) => {
-                            tel_input = tel_input.saturating_add(u.prompt_tokens as u32);
-                            tel_output = tel_output.saturating_add(u.completion_tokens as u32);
-                            tel_cached = tel_cached.saturating_add(u.cached_tokens as u32);
-                            got_usage = true;
-                        }
-                        Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
-                        Ok(Some(Ok(_))) => continue,
-                        Ok(Some(Err(_))) => {
-                            errored = true;
-                            break;
-                        }
-                        // timeout (Err) or end-of-stream (Ok(None))
-                        _ => break,
-                    }
-                }
-            }
-            Err(_) => {
-                errored = true;
-            }
-        }
+        let (summary, tel_input, tel_output) =
+            compression::run_llm_summary(&*self.turn_runner.provider, prompt).await;
 
-        // Estimate tokens when the provider didn't report usage (many
-        // OpenAI-compatible gateways ignore stream_options). ~4 chars/token in,
-        // ~3 out — same heuristic class as TurnRunner.
-        if !got_usage {
-            tel_input = ((sys.len() + prompt.len()) / 4) as u32;
-            tel_output = (summary.len() / 3) as u32;
-        }
-        let had_error = errored || (summary.trim().is_empty() && !got_usage);
+        let errored = summary.trim().is_empty();
+        let had_error = errored || (tel_input == 0 && tel_output == 0);
 
-        // Build the same envelope context a normal turn would carry, so this
-        // request is attributed to the right provider/host/model/session.
+        // Build the same envelope context a normal turn would carry.
         let pcfg = self.config.providers.get(&self.config.default_provider);
         let vendor = pcfg.map(|p| p.provider_type.clone());
         let host = pcfg.and_then(|p| {
@@ -3276,14 +3110,14 @@ impl AgentLoop {
             tool_calls_count: 0,
             input_tokens: tel_input,
             output_tokens: tel_output,
-            cached_tokens: tel_cached,
+            cached_tokens: 0,
             had_error,
             context_window: self.ctx.ctx_window() as u32,
             system_tokens: (sys.len() / 4 + 4) as u32,
             tool_def_tokens: 0,
             tool_result_tokens: 0,
             message_tokens: (prompt.len() / 4) as u32,
-            messages_count: msgs.len() as u32,
+            messages_count: 2, // system + user
             error_kind: None,
             error_data: None,
         };

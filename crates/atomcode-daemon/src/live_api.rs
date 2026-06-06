@@ -514,6 +514,19 @@ impl TurnExecutor for DaemonTurnExecutor {
             };
             atomcode_telemetry::CurrentContext::scope(scope_ctx, || async {
             loop {
+                // ── Context compression check before each turn ──
+                // TODO: pass user message from LiveSession as task hint
+                // for post-compress state restoration.
+                atomcode_core::agent::compression::maybe_compress_history(
+                    &*runner.ctx,
+                    &mut c,
+                    &*runner.provider,
+                    &runner.tools,
+                    &parts.system_prompt,
+                    None,
+                )
+                .await;
+
                 let result = runner
                     .run(&mut c, &parts.system_prompt, &turn_tx, cancel.clone())
                     .await;
