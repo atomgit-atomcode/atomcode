@@ -12,6 +12,53 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+/// Default kernel cap on a single tool result's `content` byte length.
+///
+/// 256 KiB, matched to production's per-tool-response byte budget
+/// (`atomcode-core` `crates/atomcode-core/src/tool/read.rs` `MAX_BYTES_PER_RESPONSE
+/// = 256 * 1024`), which is explicitly sized for AtomCode's bigger-context models.
+/// A mounted third-party tool may not self-cap, so the kernel applies this
+/// CENTRAL backstop regardless of any per-tool limit. `0` disables the cap
+/// (UNBOUNDED) — see `AgentBuilder::max_tool_result_bytes` — but the default is
+/// bounded.
+pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
+
+/// Enforce the kernel's tool-result size cap on `result.content`, IN PLACE.
+///
+/// Contract:
+/// * `max == 0` → UNBOUNDED: returns without touching the content.
+/// * `content.len() <= max` (byte length) → untouched, no marker.
+/// * `content.len() > max` → TRUNCATE the body to the largest UTF-8 char
+///   boundary `<= max` (never splits a multi-byte char → never panics), then
+///   APPEND a neutral marker `\n…[truncated: N of M bytes elided by kernel cap]`
+///   where `M` is the original byte length and `N = M - kept` is the elided
+///   count. The marker counts ON TOP of the cap, so the final stored length is
+///   `kept (<= max) + marker.len()` — i.e. it may slightly exceed `max` by the
+///   marker; this is intentional and keeps the math reported in the marker exact.
+///
+/// DETERMINISTIC: same content + same cap → byte-identical output, so the cap
+/// never breaks the append-only wire-prefix (prefix-cache) invariant.
+fn cap_tool_result(result: &mut ToolResult, max: usize) {
+    if max == 0 {
+        return; // unbounded
+    }
+    let total = result.content.len();
+    if total <= max {
+        return; // under cap: untouched
+    }
+    // Back off to the largest UTF-8 char boundary <= max so we never split a
+    // multi-byte char. `is_char_boundary(0)` is always true, so this terminates.
+    let mut keep = max;
+    while keep > 0 && !result.content.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let elided = total - keep;
+    result.content.truncate(keep);
+    result
+        .content
+        .push_str(&format!("\n…[truncated: {elided} of {total} bytes elided by kernel cap]"));
+}
+
 /// Bidirectional session handle: send AgentCommand, receive AgentEvent.
 pub struct AgentHandle {
     pub commands: UnboundedSender<AgentCommand>,
@@ -52,6 +99,9 @@ pub struct Agent {
     /// When set, the session SEEDS its conversation from this snapshot's messages
     /// instead of `Conversation::new()` + persona (resume path).
     resume: Option<SessionSnapshot>,
+    /// Byte cap on a single tool result's `content` (the kernel's only built-in
+    /// safety at this altitude; see `cap_tool_result`). `0` = unbounded.
+    max_tool_result_bytes: usize,
 }
 
 impl Agent {
@@ -72,6 +122,7 @@ impl Agent {
             rt: RequestCtx::new(ev_tx),
             max_rounds: self.max_rounds,
             resume: self.resume,
+            max_tool_result_bytes: self.max_tool_result_bytes,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -113,6 +164,7 @@ struct RunningAgent {
     rt: RequestCtx,
     max_rounds: Option<u32>,
     resume: Option<SessionSnapshot>,
+    max_tool_result_bytes: usize,
 }
 
 impl RunningAgent {
@@ -378,9 +430,18 @@ impl RunningAgent {
                     }
                 };
                 // ToolMiddleware after-chain: transform / observe the result.
+                // Middleware sees the RAW (uncapped) result.
                 for mw in &self.middlewares {
                     mw.after(&mut result).await;
                 }
+                // KERNEL TOOL-RESULT SIZE CAP — the kernel's only built-in safety
+                // at this altitude (it cannot sandbox). Applied AFTER the
+                // after-chain and BEFORE the push+emit, so the stored history, the
+                // model (next round), and the driver all see the CAPPED result —
+                // keeping context bounded and history growth predictable
+                // (deterministic → prefix-cache safe). The tiny `(cancelled)`/error
+                // stubs never reach the cap, so they pass through untouched.
+                cap_tool_result(&mut result, self.max_tool_result_bytes);
                 if result.is_error {
                     self.hooks.on_error(&result.content).await;
                 }
@@ -391,7 +452,6 @@ impl RunningAgent {
     }
 }
 
-#[derive(Default)]
 pub struct AgentBuilder {
     provider: Option<Arc<dyn LlmProvider>>,
     tools: Option<MountedTools>,
@@ -403,6 +463,24 @@ pub struct AgentBuilder {
     hooks: Vec<Arc<dyn LifecycleHooks>>,
     max_rounds: Option<u32>,
     resume: Option<SessionSnapshot>,
+    max_tool_result_bytes: usize,
+}
+
+impl Default for AgentBuilder {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            tools: None,
+            persona: String::new(),
+            middlewares: Vec::new(),
+            hooks: Vec::new(),
+            max_rounds: None,
+            resume: None,
+            // BOUNDED by default — a mounted tool's content cannot blow the
+            // context window / OOM the host unless the embedder opts into `0`.
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+        }
+    }
 }
 
 impl AgentBuilder {
@@ -445,6 +523,17 @@ impl AgentBuilder {
         self.max_rounds = Some(n);
         self
     }
+    /// Byte cap on a SINGLE tool result's `content`. This is the kernel's ONLY
+    /// built-in safety mechanism for mounted tools (it cannot sandbox — see the
+    /// trust-model contract on `crate::tool`). A result whose content exceeds `n`
+    /// bytes is truncated on a UTF-8 char boundary with a marker before it reaches
+    /// the model, the stored history, or the driver — bounding context growth.
+    /// Defaults to [`DEFAULT_MAX_TOOL_RESULT_BYTES`] (256 KiB). `0` DISABLES the
+    /// cap (UNBOUNDED) — only do this if every mounted tool self-caps.
+    pub fn max_tool_result_bytes(mut self, n: usize) -> Self {
+        self.max_tool_result_bytes = n;
+        self
+    }
     /// RESUME a persisted session: SEED the conversation from `snapshot.messages`
     /// instead of `Conversation::new()` + persona. The saved messages already
     /// carry the persona/system message, so persona is NOT re-injected on resume.
@@ -468,6 +557,86 @@ impl AgentBuilder {
             hooks: Arc::new(HookChain::new(self.hooks)),
             max_rounds: self.max_rounds,
             resume: self.resume,
+            max_tool_result_bytes: self.max_tool_result_bytes,
         }
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use crate::tool::ToolResult;
+
+    fn res(content: &str) -> ToolResult {
+        ToolResult { call_id: "c1".into(), content: content.into(), is_error: false }
+    }
+
+    #[test]
+    fn caps_oversized_result_on_char_boundary() {
+        let original = "a".repeat(1000);
+        let mut r = res(&original);
+        cap_tool_result(&mut r, 100);
+        // The marker is present.
+        assert!(r.content.contains("[truncated:"), "must carry a truncation marker: {}", r.content);
+        // The kept body (everything before the marker) is a valid byte prefix of
+        // the original — deterministic, append-only-safe truncation.
+        let body = r.content.split('\n').next().unwrap();
+        assert!(body.len() <= 100, "kept body must be <= cap; got {}", body.len());
+        assert!(original.as_bytes().starts_with(body.as_bytes()), "kept body must be a prefix of the original");
+        // Marker reports the right elided byte count: M=1000, kept=100 → 900.
+        assert!(r.content.contains("900 of 1000 bytes"), "marker math wrong: {}", r.content);
+    }
+
+    #[test]
+    fn does_not_touch_small_result() {
+        let mut r = res("small output");
+        cap_tool_result(&mut r, 65536);
+        assert_eq!(r.content, "small output", "content under cap must be byte-identical");
+        assert!(!r.content.contains("truncated"), "no marker on an un-capped result");
+    }
+
+    #[test]
+    fn cap_respects_multibyte_utf8_boundary() {
+        // '世' is 3 bytes; '🦀' is 4 bytes. Build a string whose byte length far
+        // exceeds the cap, then pick caps that land MID-CHAR.
+        let s = "世".repeat(100); // 300 bytes
+        let mut r = res(&s);
+        // cap=100 → 100 is NOT a multiple of 3, so the naive byte slice would split
+        // a '世'. Must back off to the nearest <= 100 boundary (99).
+        cap_tool_result(&mut r, 100);
+        let body = r.content.split('\n').next().unwrap();
+        assert!(body.len() <= 100, "body must be <= cap");
+        // Valid UTF-8 prefix → re-validates and is a prefix of original.
+        assert!(std::str::from_utf8(body.as_bytes()).is_ok(), "kept body must be valid UTF-8");
+        assert!(s.as_bytes().starts_with(body.as_bytes()), "kept body must be a prefix of the original");
+        assert_eq!(body.len() % 3, 0, "must truncate on a '世' (3-byte) boundary, not mid-char");
+
+        // Now a 4-byte char with a cap that lands mid-char → must not panic and
+        // must stay a valid prefix.
+        let crabs = "🦀".repeat(50); // 200 bytes
+        let mut r2 = res(&crabs);
+        cap_tool_result(&mut r2, 50); // 50 % 4 != 0 → mid-char
+        let body2 = r2.content.split('\n').next().unwrap();
+        assert!(std::str::from_utf8(body2.as_bytes()).is_ok(), "valid UTF-8");
+        assert_eq!(body2.len() % 4, 0, "must truncate on a '🦀' (4-byte) boundary");
+        assert!(body2.len() <= 50);
+    }
+
+    #[test]
+    fn unbounded_cap_zero_never_truncates() {
+        let huge = "x".repeat(5_000_000);
+        let mut r = res(&huge);
+        cap_tool_result(&mut r, 0);
+        assert_eq!(r.content.len(), 5_000_000, "cap=0 means unbounded — no truncation");
+    }
+
+    #[test]
+    fn cap_is_deterministic() {
+        let original = "δ".repeat(1000); // 2-byte chars
+        let mut a = res(&original);
+        let mut b = res(&original);
+        cap_tool_result(&mut a, 333);
+        cap_tool_result(&mut b, 333);
+        assert_eq!(a.content, b.content, "same content + same cap must yield byte-identical truncation");
     }
 }
