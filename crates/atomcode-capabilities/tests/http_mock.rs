@@ -260,6 +260,10 @@ async fn multi_round_tool_loop_executes_tool_and_logs_each_round() {
     // The PROVIDER's response id is captured onto Message.meta and shows in the response log.
     assert!(joined.contains("provider_response_id"), "provider response id must be recorded");
     assert!(joined.contains("resp-final"), "round-2 response carries the provider's id: {joined}");
+    // Message.meta now also carries session_id + finish_reason (the response's "code").
+    assert!(joined.contains("\"finish_reason\": \"tool_calls\""), "round-1 meta finish_reason: {joined}");
+    assert!(joined.contains("\"finish_reason\": \"stop\""), "round-2 meta finish_reason");
+    assert!(joined.contains("\"session_id\": \"sess-test\""), "meta carries session_id");
 }
 
 // ---------------------------------------------------------------------------

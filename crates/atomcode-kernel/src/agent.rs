@@ -728,6 +728,16 @@ impl RunningAgent {
             } else {
                 0.0
             };
+            // Derive the response's "code" from observed stream facts: tool calls present
+            // ⇒ tool_calls; else truncated ⇒ length; else stop.
+            let finish_reason = if !pending_calls.is_empty() {
+                "tool_calls"
+            } else if truncated {
+                "length"
+            } else {
+                "stop"
+            }
+            .to_string();
             let meta = MessageMeta {
                 tokens: usage,
                 elapsed_ms: start.elapsed().as_millis() as u64,
@@ -738,6 +748,8 @@ impl RunningAgent {
                 turn_id,
                 request_id,
                 provider_response_id: response_id,
+                session_id: self.session_id.as_deref().map(str::to_string),
+                finish_reason,
             };
             let mut assistant_msg = Message::assistant(assistant_text.clone(), pending_calls.clone());
             assistant_msg.meta = Some(meta);

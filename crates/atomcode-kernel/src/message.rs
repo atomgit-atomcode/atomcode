@@ -35,6 +35,17 @@ pub struct MessageMeta {
     /// ADDITIVE: `#[serde(default)]`.
     #[serde(default)]
     pub provider_response_id: Option<String>,
+    /// Injected session identity (mirrors `TurnCtx.session_id`) so a STORED message
+    /// carries the FULL correlation set (session → turn → round/request) on its own.
+    /// ADDITIVE.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// How the model ENDED this response — the response's "code": `"stop"` (text done),
+    /// `"tool_calls"` (wants tools), or `"length"` (truncated). Derived by the kernel
+    /// from the observed stream (tool calls present / truncated flag). ADDITIVE (empty
+    /// string for older snapshots).
+    #[serde(default)]
+    pub finish_reason: String,
 }
 
 /// Provider-neutral message.
@@ -729,6 +740,8 @@ mod tests {
             turn_id: 1,
             request_id: 2,
             provider_response_id: Some("resp_abc".into()),
+            session_id: Some("sess-1".into()),
+            finish_reason: "stop".into(),
         });
         with_meta.reasoning = Some("thinking…".to_string());
         c.push(with_meta);
