@@ -24,7 +24,9 @@ pub struct ProviderError {
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
     TextDelta(String),
-    /// Thinking/reasoning channel — kernel emits it; not stored on Message here.
+    /// Thinking/reasoning channel — the kernel emits it live (`AgentEvent::Reasoning`)
+    /// AND accumulates it onto the assistant `Message.reasoning` so a provider adapter
+    /// can echo the prior turn's reasoning back next turn (thinking models require it).
     Reasoning(String),
     ToolCall(ToolCall),
     Usage(TokenUsage),

@@ -1,6 +1,6 @@
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
-use atomcode_kernel::message::Message;
+use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
 use atomcode_kernel::testkit::{ApprovalMiddleware, ArgRewriteMiddleware, BlockToolMiddleware, BudgetReminderHook, ContinueOnceHook, DangerousBashTool, DropToolsHook, EchoTool, MockProvider, RecorderHook, RedactHook, RejectPromptHook, RiskyWriteTool, RoundBudgetHook, TruncateMiddleware};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
@@ -640,5 +640,110 @@ async fn user_prompt_submit_can_block_a_prompt() {
     assert!(
         !snap.iter().any(|m| m.text.contains("do something bad")),
         "a rejected prompt must not enter the conversation"
+    );
+}
+
+// CLAIM 29: the model's REASONING is STORED on the assistant Message (so a provider
+// adapter can echo the prior turn's thinking back next turn) AND the live
+// `AgentEvent::Reasoning` channel is PRESERVED. A scripted turn streams
+// `Reasoning("let me think")` then `TextDelta("answer")` then `Done`. Afterwards:
+//   * the live channel still emitted `AgentEvent::Reasoning("let me think")`, and
+//   * the stored assistant Message (visible via `AgentCommand::Snapshot`, whose
+//     `SessionSnapshot.messages` are FULL Messages) has
+//     `reasoning == Some("let me think")` AND `text == "answer"`.
+#[tokio::test]
+async fn model_reasoning_is_stored_on_assistant_message_and_still_emitted_live() {
+    let reg = ToolRegistry::new();
+    // One round: reasoning, then visible text, then end (no tool calls → turn ends).
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        StreamEvent::Reasoning("let me think".into()),
+        StreamEvent::TextDelta("answer".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[]))
+        .build()
+        .spawn();
+    handle.commands.send(AgentCommand::SendMessage { text: "think then answer".into() }).unwrap();
+
+    // The LIVE reasoning channel must STILL fire (storage did not replace it).
+    let mut live_reasoning_seen = false;
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::Reasoning(t) if t == "let me think" => live_reasoning_seen = true,
+            AgentEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(live_reasoning_seen, "AgentEvent::Reasoning must STILL be emitted live");
+
+    // The STORED assistant Message must carry the reasoning + the answer text.
+    handle.commands.send(AgentCommand::Snapshot).unwrap();
+    let mut messages: Vec<Message> = Vec::new();
+    while let Some(ev) = handle.events.recv().await {
+        if let AgentEvent::Snapshot { snapshot } = ev {
+            messages = snapshot.messages;
+            break;
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let last_assistant = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .expect("there must be a stored assistant message");
+    assert_eq!(
+        last_assistant.reasoning.as_deref(),
+        Some("let me think"),
+        "the prior turn's reasoning must be STORED on the assistant message"
+    );
+    assert_eq!(last_assistant.text, "answer", "the visible answer text is stored too");
+}
+
+// CLAIM 29 (negative): a turn with NO reasoning stream stores `reasoning == None`
+// (None for a non-thinking response — the field is absent, not an empty string).
+#[tokio::test]
+async fn no_reasoning_stream_stores_none() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        StreamEvent::TextDelta("just answer".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[]))
+        .build()
+        .spawn();
+    handle.commands.send(AgentCommand::SendMessage { text: "answer".into() }).unwrap();
+    while let Some(ev) = handle.events.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            break;
+        }
+    }
+
+    handle.commands.send(AgentCommand::Snapshot).unwrap();
+    let mut messages: Vec<Message> = Vec::new();
+    while let Some(ev) = handle.events.recv().await {
+        if let AgentEvent::Snapshot { snapshot } = ev {
+            messages = snapshot.messages;
+            break;
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let last_assistant = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .expect("there must be a stored assistant message");
+    assert_eq!(
+        last_assistant.reasoning, None,
+        "a non-thinking response stores reasoning == None (not Some(\"\"))"
     );
 }

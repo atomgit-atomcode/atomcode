@@ -53,22 +53,33 @@ pub struct Message {
     /// precedes the real prompt is never mistaken for the sacred task anchor.
     #[serde(default)]
     pub synthetic: bool,
+    /// The model's REASONING/THINKING output for an ASSISTANT message — `None` for
+    /// non-assistant messages and for assistant responses from non-thinking models.
+    /// A purely STORED field: thinking models (Anthropic extended thinking,
+    /// DeepSeek) require the PRIOR turn's reasoning to be echoed back alongside the
+    /// tool calls or the request is rejected / the prompt cache breaks. The kernel
+    /// only STORES it losslessly here (so it survives serde, resume, and compaction
+    /// of surviving messages); a provider adapter (L1) decides the wire echo-back
+    /// format — OUT OF SCOPE here. ADDITIVE: `#[serde(default)]` so a v1 snapshot
+    /// (no `reasoning` field) still deserializes (→ None).
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 impl Message {
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false }
+        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None }
     }
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false }
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None }
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, is_error: false, meta: None, synthetic: false }
+        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None }
     }
     /// A tool RESULT. `is_error` is now STORED (a real adapter must echo it to the
     /// provider) — it was previously dropped, losing tool failure state.
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
-        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), is_error, meta: None, synthetic: false }
+        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), is_error, meta: None, synthetic: false, reasoning: None }
     }
     /// A KERNEL-INJECTED synthetic `Role::User` message (compaction cold summary or
     /// resume note). It carries `synthetic = true` so `sacred_floor` skips it when
@@ -78,7 +89,7 @@ impl Message {
     /// the whole cached prefix — see `ctx/render.rs` in production. Inserted
     /// after the system message, it preserves the frozen system prefix.
     pub fn synthetic_user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: true }
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: true, reasoning: None }
     }
 }
 
@@ -652,7 +663,9 @@ mod tests {
         ));
         // a tool_result with tool_call_id set and is_error=true.
         c.push(Message::tool_result("call_1", "boom", true));
-        // a message carrying a non-default `meta` sidecar.
+        // a message carrying a non-default `meta` sidecar AND stored `reasoning`
+        // (a thinking model's prior-turn thinking, which a provider adapter echoes
+        // back next turn — the kernel stores it losslessly here).
         let mut with_meta = Message::assistant("done", vec![]);
         with_meta.meta = Some(MessageMeta {
             tokens: TokenUsage { prompt: 50, completion: 7, cached: 3 },
@@ -662,6 +675,7 @@ mod tests {
             utilization: 0.05,
             round: 2,
         });
+        with_meta.reasoning = Some("thinking…".to_string());
         c.push(with_meta);
 
         let json = serde_json::to_string(&c).expect("Conversation must serialize");
@@ -688,6 +702,38 @@ mod tests {
 
         assert!(back.messages[4].meta.is_some(), "meta sidecar must survive");
         assert_eq!(back.messages[4].meta.as_ref().unwrap().round, 2);
+
+        // The stored reasoning survives the round-trip (a provider adapter echoes
+        // it back next turn; the kernel only stores it). It was DROPPED before
+        // `Message.reasoning` existed.
+        assert_eq!(
+            back.messages[4].reasoning.as_deref(),
+            Some("thinking…"),
+            "stored reasoning must survive the round-trip"
+        );
+        // A non-thinking / non-assistant message has no reasoning.
+        assert_eq!(back.messages[1].reasoning, None, "user message has no reasoning");
+        assert_eq!(back.messages[2].reasoning, None, "assistant w/o thinking has None");
+    }
+
+    // ADDITIVE serde-default: a v1-style assistant message JSON WITHOUT a
+    // `reasoning` field still deserializes (serde default → None), so an older
+    // snapshot written before `Message.reasoning` existed is still readable.
+    #[test]
+    fn message_without_reasoning_field_defaults_to_none() {
+        // No "reasoning" key — exactly what a v1 kernel wrote.
+        let v1 = r#"{"role":"Assistant","text":"answer","tool_calls":[],"tool_call_id":null,"is_error":false,"meta":null,"synthetic":false}"#;
+        let m: Message = serde_json::from_str(v1).expect("v1 message (no reasoning) must deserialize");
+        assert_eq!(m.reasoning, None, "missing reasoning field defaults to None");
+        assert_eq!(m.text, "answer");
+
+        // And a stored Some(..) reasoning serializes + round-trips standalone.
+        let mut a = Message::assistant("ans", vec![]);
+        a.reasoning = Some("let me think".into());
+        let json = serde_json::to_string(&a).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reasoning.as_deref(), Some("let me think"));
+        assert_eq!(back, a, "Message with reasoning round-trips losslessly");
     }
 
     // `Role` serializes to its STABLE variant tag — the derived enum name is the

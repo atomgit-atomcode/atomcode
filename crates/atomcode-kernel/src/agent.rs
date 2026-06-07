@@ -510,6 +510,12 @@ impl RunningAgent {
                 }
             };
             let mut assistant_text = String::new();
+            // ACCUMULATE the model's reasoning/thinking across the stream alongside
+            // the visible text. It is STORED on the assistant Message (the live
+            // `AgentEvent::Reasoning` channel below is kept too) so a provider
+            // adapter can echo the PRIOR turn's reasoning back next turn (thinking
+            // models require it alongside tool calls). The kernel only stores it.
+            let mut reasoning = String::new();
             let mut pending_calls = Vec::new();
             let mut usage = TokenUsage::default();
             let mut truncated = false;
@@ -554,7 +560,12 @@ impl RunningAgent {
                         assistant_text.push_str(&t);
                         self.rt.emit(AgentEvent::TextDelta(t));
                     }
-                    StreamEvent::Reasoning(t) => self.rt.emit(AgentEvent::Reasoning(t)),
+                    StreamEvent::Reasoning(t) => {
+                        // STORE it on the message (accumulate) AND keep the live
+                        // channel — the kernel no longer drops the reasoning text.
+                        reasoning.push_str(&t);
+                        self.rt.emit(AgentEvent::Reasoning(t));
+                    }
                     StreamEvent::ToolCall(c) => pending_calls.push(c),
                     StreamEvent::Usage(u) => usage = u,
                     // A mid-stream error CLEANLY FAILS the turn: surface it and end —
@@ -595,6 +606,12 @@ impl RunningAgent {
             };
             let mut assistant_msg = Message::assistant(assistant_text.clone(), pending_calls.clone());
             assistant_msg.meta = Some(meta);
+            // STORE the accumulated reasoning losslessly: Some(..) iff the model
+            // streamed any thinking this round, else None. It rides on the Message
+            // (so it survives serde, resume, and compaction of surviving messages);
+            // a provider adapter echoes it back next turn. Set after construction so
+            // the `on_model_response` hook can observe/transform it.
+            assistant_msg.reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
             self.hooks.on_model_response(&mut assistant_msg).await;
             self.rt.emit(AgentEvent::Usage(assistant_msg.meta.clone().unwrap_or_default()));
             // Fix #5: the hook may have transformed the response (e.g. dropped a tool
