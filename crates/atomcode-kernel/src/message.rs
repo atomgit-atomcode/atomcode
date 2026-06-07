@@ -23,6 +23,13 @@ pub struct MessageMeta {
     pub used_tokens: u32,
     pub utilization: f32,
     pub round: u32,
+    /// Correlation IDs (observability): `turn_id` = which user turn produced this
+    /// message; `request_id` = which LLM request (session-global, monotonic). ADDITIVE:
+    /// `#[serde(default)]` so an older snapshot (no these fields) still deserializes (→ 0).
+    #[serde(default)]
+    pub turn_id: u64,
+    #[serde(default)]
+    pub request_id: u64,
 }
 
 /// Provider-neutral message.
@@ -714,6 +721,8 @@ mod tests {
             used_tokens: 50,
             utilization: 0.05,
             round: 2,
+            turn_id: 1,
+            request_id: 2,
         });
         with_meta.reasoning = Some("thinking…".to_string());
         c.push(with_meta);

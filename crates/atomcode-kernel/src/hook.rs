@@ -4,11 +4,29 @@ use crate::tool::ToolDef;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-/// Per-LLM-call execution context handed to hooks that need to know where in the
-/// loop they are (e.g. to project round budget to the LLM).
-#[derive(Clone, Copy, Debug, Default)]
+/// Per-LLM-call execution context handed to hooks that need to know where in the loop
+/// they are (e.g. to project round budget to the LLM, or to stamp correlation IDs into
+/// logs/telemetry).
+///
+/// CORRELATION IDS (observability): `session_id` is INJECTED (the driver owns session
+/// identity — see `AgentBuilder::session_id`); `turn_id` and `request_id` are
+/// kernel-minted MONOTONIC COUNTERS (deterministic — NOT clock/random — so log
+/// stitching stays reproducible). The hierarchy is session → turn → round/request:
+/// one user message = one `turn_id`; each LLM call within it bumps `round` (1-based,
+/// resets per turn) AND `request_id` (1-based, unique across the whole session).
+#[derive(Clone, Debug, Default)]
 pub struct TurnCtx {
-    /// 1-based index of the LLM call about to execute this turn.
+    /// Injected session identity. `None` when the driver supplied none. The kernel
+    /// NEVER mints this — it only forwards what `AgentBuilder::session_id` was given.
+    pub session_id: Option<Arc<str>>,
+    /// Kernel-minted monotonic id of the current turn (one user message → one turn),
+    /// 1-based within the session. Stays constant across all rounds (incl. `turn_end`
+    /// continuations) of the same turn.
+    pub turn_id: u64,
+    /// Kernel-minted monotonic id of THIS LLM request, 1-based and unique across the
+    /// whole session (bumps every round).
+    pub request_id: u64,
+    /// 1-based index of the LLM call WITHIN the current turn (resets each turn).
     pub round: u32,
     /// Optional hard cap on rounds per turn (None = unlimited).
     pub max_rounds: Option<u32>,

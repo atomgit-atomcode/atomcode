@@ -192,6 +192,7 @@ async fn multi_round_tool_loop_executes_tool_and_logs_each_round() {
 
     let outcome = Agent::builder()
         .provider(provider)
+        .session_id("sess-test")
         .tools(tools)
         .hook(Arc::new(hooks))
         .max_rounds(5)
@@ -214,8 +215,15 @@ async fn multi_round_tool_loop_executes_tool_and_logs_each_round() {
 
     // The general WireLogHooks logged a request for EACH round (round 1 and round 2).
     let logs = log.lock().unwrap();
-    let request_logs = logs.iter().filter(|l| l.contains("request (round")).count();
-    assert_eq!(request_logs, 2, "WireLogHooks must observe both rounds: {logs:?}");
+    let request_lines: Vec<&String> = logs.iter().filter(|l| l.contains("[wire] request")).collect();
+    assert_eq!(request_lines.len(), 2, "WireLogHooks must observe both rounds: {logs:?}");
+
+    // IDs threaded through the real loop: injected session_id present; both rounds share
+    // ONE turn_id (same user message); request_id bumps per round.
+    let joined = logs.join("\n");
+    assert!(joined.contains("sess-test"), "injected session_id must appear in the log");
+    assert!(request_lines.iter().all(|l| l.contains("turn=1")), "both rounds share turn_id=1");
+    assert!(joined.contains("req=1") && joined.contains("req=2"), "request_id must bump per round");
 }
 
 // ---------------------------------------------------------------------------

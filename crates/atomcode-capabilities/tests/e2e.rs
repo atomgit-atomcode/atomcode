@@ -206,7 +206,7 @@ async fn e2e_multi_round_reasoning_roundtrip_does_not_400() {
     let counter = rounds.clone();
     let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| {
         eprintln!("{s}");
-        if s.contains("request (round") {
+        if s.contains("[wire] request") {
             *counter.lock().unwrap() += 1;
         }
     }));
@@ -217,6 +217,7 @@ async fn e2e_multi_round_reasoning_roundtrip_does_not_400() {
 
     let outcome = Agent::builder()
         .provider(provider)
+        .session_id("sess-e2e-demo")
         .tools(tools)
         .hook(Arc::new(hooks))
         .max_rounds(6)

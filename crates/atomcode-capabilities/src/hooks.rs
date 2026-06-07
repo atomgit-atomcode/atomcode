@@ -84,6 +84,10 @@ impl LifecycleHooks for WireLogHooks {
         ctx: &TurnCtx,
     ) {
         let req = serde_json::json!({
+            // Arc<str> isn't serde-Serialize by default; serialize the &str deref.
+            "session_id": ctx.session_id.as_deref(),
+            "turn_id": ctx.turn_id,
+            "request_id": ctx.request_id,
             "round": ctx.round,
             "max_rounds": ctx.max_rounds,
             "cache_epoch": ctx.cache_epoch,
@@ -91,7 +95,13 @@ impl LifecycleHooks for WireLogHooks {
             "tools": tools,
             "options": options,
         });
-        self.emit(&format!(">>> [wire] request (round {})", ctx.round), &req);
+        self.emit(
+            &format!(
+                ">>> [wire] request — session={:?} turn={} round={} req={}",
+                ctx.session_id, ctx.turn_id, ctx.round, ctx.request_id
+            ),
+            &req,
+        );
     }
 
     async fn on_model_response(&self, response: &mut Message) {
@@ -120,7 +130,14 @@ mod tests {
             description: "d".into(),
             parameters: serde_json::json!({"type": "object"}),
         }];
-        let ctx = TurnCtx { round: 2, max_rounds: Some(5), cache_epoch: 7 };
+        let ctx = TurnCtx {
+            session_id: Some(Arc::from("sess-x")),
+            turn_id: 3,
+            request_id: 9,
+            round: 2,
+            max_rounds: Some(5),
+            cache_epoch: 7,
+        };
         hooks.on_request(&msgs, &tools, &ChatOptions::default(), &ctx).await;
 
         let mut resp = Message::assistant(
@@ -131,7 +148,10 @@ mod tests {
 
         let log = buf.lock().unwrap().join("\n");
         // request side
-        assert!(log.contains("request (round 2)"), "log: {log}");
+        assert!(log.contains("[wire] request"), "log: {log}");
+        assert!(log.contains("sess-x"), "request must include session_id");
+        assert!(log.contains("\"turn_id\": 3"), "request must include turn_id");
+        assert!(log.contains("\"request_id\": 9"), "request must include request_id");
         assert!(log.contains("\"hi there\""), "request must include the user message");
         assert!(log.contains("\"get_time\""), "request must include the tool name");
         assert!(log.contains("\"cache_epoch\": 7"), "request must include the epoch");
@@ -148,14 +168,21 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let hooks = WireLogHooks::to_file(&path).expect("open temp log file");
-            let ctx = TurnCtx { round: 1, max_rounds: None, cache_epoch: 0 };
+            let ctx = TurnCtx {
+                session_id: None,
+                turn_id: 1,
+                request_id: 1,
+                round: 1,
+                max_rounds: None,
+                cache_epoch: 0,
+            };
             hooks
                 .on_request(&[Message::user("file-test-msg")], &[], &ChatOptions::default(), &ctx)
                 .await;
         }
         let contents = std::fs::read_to_string(&path).expect("read log file");
         assert!(contents.contains("file-test-msg"), "log must contain request: {contents}");
-        assert!(contents.contains("request (round 1)"));
+        assert!(contents.contains("[wire] request"));
         let _ = std::fs::remove_file(&path);
     }
 

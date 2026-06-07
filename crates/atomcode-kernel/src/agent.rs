@@ -10,6 +10,7 @@ use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
 use crate::tool::{MountedTools, ToolContext, ToolResult};
 use futures::StreamExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
@@ -171,6 +172,10 @@ pub struct Agent {
     /// stop a running child is the cancel TOKEN propagating IN. See
     /// `AgentBuilder::cancel_token`.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Injected session identity for observability (driver-owned; see
+    /// `AgentBuilder::session_id`). Threaded into `TurnCtx`/`MessageMeta` so hooks and
+    /// logs can correlate by session. The kernel never mints it.
+    session_id: Option<Arc<str>>,
 }
 
 impl Agent {
@@ -199,6 +204,9 @@ impl Agent {
             chat_options: self.chat_options,
             working_dir: self.working_dir,
             cancel_token: self.cancel_token,
+            session_id: self.session_id,
+            turn_counter: AtomicU64::new(0),
+            request_counter: AtomicU64::new(0),
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -272,6 +280,14 @@ struct RunningAgent {
     /// SEAM 2: external cancel source the per-turn tokens derive from (see
     /// `Agent::cancel_token`). `None` = fresh independent token per turn.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Injected session identity (see `Agent::session_id`); cloned into each `TurnCtx`.
+    session_id: Option<Arc<str>>,
+    /// Monotonic turn counter (one user message → one turn). `fetch_add`ed once per
+    /// `run_turn`. Deterministic — not clock/random — so log stitching stays reproducible.
+    turn_counter: AtomicU64,
+    /// Monotonic request counter (one LLM call). `fetch_add`ed once per round, unique
+    /// across the whole session.
+    request_counter: AtomicU64,
 }
 
 impl RunningAgent {
@@ -549,6 +565,9 @@ impl RunningAgent {
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
+        // Mint this turn's id ONCE — constant across all rounds (incl. turn_end
+        // continuations) of this turn. Monotonic counter ⇒ deterministic.
+        let turn_id = self.turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let mut round: u32 = 0;
         // SAFETY FUSE counter (FAILURE PERCEPTION): how many times a `turn_end` hook
         // has CONTINUED this turn (injected a synthetic user message and looped). A
@@ -566,8 +585,16 @@ impl RunningAgent {
                     return;
                 }
             }
-            let turn_ctx =
-                TurnCtx { round, max_rounds: self.max_rounds, cache_epoch: convo.cache_epoch };
+            // Mint this request's id (one per LLM call, unique across the session).
+            let request_id = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let turn_ctx = TurnCtx {
+                session_id: self.session_id.clone(),
+                turn_id,
+                request_id,
+                round,
+                max_rounds: self.max_rounds,
+                cache_epoch: convo.cache_epoch,
+            };
             let start = Instant::now();
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
@@ -706,6 +733,8 @@ impl RunningAgent {
                 used_tokens,
                 utilization,
                 round,
+                turn_id,
+                request_id,
             };
             let mut assistant_msg = Message::assistant(assistant_text.clone(), pending_calls.clone());
             assistant_msg.meta = Some(meta);
@@ -936,6 +965,8 @@ pub struct AgentBuilder {
     working_dir: Option<std::path::PathBuf>,
     /// SEAM 2: optional external cancel source (see `Agent::cancel_token`).
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Optional injected session identity for observability (see `Agent::session_id`).
+    session_id: Option<Arc<str>>,
 }
 
 impl Default for AgentBuilder {
@@ -975,6 +1006,7 @@ impl Default for AgentBuilder {
             // per-turn cancel token). An embedder opts in via the builder methods.
             working_dir: None,
             cancel_token: None,
+            session_id: None,
         }
     }
 }
@@ -1162,6 +1194,14 @@ impl AgentBuilder {
         self.cancel_token = Some(t);
         self
     }
+    /// Inject the session identity used for observability. The DRIVER owns "what a
+    /// session is" — the kernel only forwards this into `TurnCtx` (so hooks/logs can
+    /// correlate) and stamps it nowhere else. On resume, pass the SAME id to keep one
+    /// session's logs together. `turn_id`/`request_id` are then minted by the kernel.
+    pub fn session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = Some(Arc::from(id.into()));
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -1183,6 +1223,7 @@ impl AgentBuilder {
             chat_options: self.chat_options,
             working_dir: self.working_dir,
             cancel_token: self.cancel_token,
+            session_id: self.session_id,
         }
     }
 }
