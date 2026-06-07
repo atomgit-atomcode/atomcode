@@ -368,6 +368,8 @@ struct SseDecoder {
     last_usage: Option<TokenUsage>,
     truncated: bool,
     done: bool,
+    /// True once the provider's response id has been emitted (emit it exactly once).
+    response_id_seen: bool,
 }
 
 impl SseDecoder {
@@ -378,6 +380,7 @@ impl SseDecoder {
             last_usage: None,
             truncated: false,
             done: false,
+            response_id_seen: false,
         }
     }
 
@@ -438,6 +441,13 @@ impl SseDecoder {
             Ok(c) => c,
             Err(_) => return, // ignore keepalive / unparseable lines
         };
+        // Surface the provider's own response id ONCE (cross-ref upstream logs).
+        if !self.response_id_seen {
+            if let Some(id) = chunk.id.as_deref().filter(|s| !s.is_empty()) {
+                self.response_id_seen = true;
+                out.push(StreamEvent::ResponseId(id.to_string()));
+            }
+        }
         if let Some(u) = chunk.usage {
             self.last_usage = Some(map_usage(u));
         }
@@ -513,6 +523,9 @@ fn map_usage(u: ChunkUsage) -> TokenUsage {
 
 #[derive(Deserialize)]
 struct ChunkResponse {
+    /// The provider's own response/completion id (same across all chunks).
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     choices: Vec<Choice>,
     #[serde(default)]
@@ -755,6 +768,7 @@ mod tests {
                 StreamEvent::TextDelta(_) => "text",
                 StreamEvent::ToolCall(_) => "tool",
                 StreamEvent::Usage(_) => "usage",
+                StreamEvent::ResponseId(_) => "response_id",
                 StreamEvent::Done { .. } => "done",
                 StreamEvent::Error(_) => "error",
             })
@@ -889,6 +903,20 @@ mod tests {
             .find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None })
             .unwrap();
         assert_eq!(u.cached, 2);
+    }
+
+    #[test]
+    fn sse_emits_provider_response_id_once() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(line(json!({"id":"resp_xyz","choices":[{"delta":{"content":"a"}}]})).as_bytes()));
+        // same id repeats on later chunks — must NOT re-emit.
+        ev.extend(d.feed(line(json!({"id":"resp_xyz","choices":[{"delta":{"content":"b"}}]})).as_bytes()));
+        let ids: Vec<String> = ev
+            .iter()
+            .filter_map(|e| if let StreamEvent::ResponseId(id) = e { Some(id.clone()) } else { None })
+            .collect();
+        assert_eq!(ids, vec!["resp_xyz".to_string()], "response id emitted exactly once, with value");
     }
 
     #[test]

@@ -23,12 +23,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const CHAT_PATH: &str = "/chat/completions";
 
 /// A final-answer SSE response (text + stop + usage + [DONE]).
-const FINAL_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"It is noon.\"}}]}\n\
+const FINAL_SSE: &str = "data: {\"id\":\"resp-final\",\"choices\":[{\"delta\":{\"content\":\"It is noon.\"}}]}\n\
 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":4}}\n\
 data: [DONE]\n";
 
 /// A tool-call SSE response (assembles one whole ToolCall + finish_reason=tool_calls).
-const TOOL_CALL_SSE: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]}}]}\n\
+const TOOL_CALL_SSE: &str = "data: {\"id\":\"resp-tool\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]}}]}\n\
 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
 data: [DONE]\n";
 
@@ -225,6 +225,9 @@ async fn multi_round_tool_loop_executes_tool_and_logs_each_round() {
     assert!(joined.contains("sess-test"), "injected session_id must appear in the log");
     assert!(request_lines.iter().all(|l| l.contains("turn=1")), "both rounds share turn_id=1");
     assert!(joined.contains("req=1") && joined.contains("req=2"), "request_id must bump per round");
+    // The PROVIDER's response id is captured onto Message.meta and shows in the response log.
+    assert!(joined.contains("provider_response_id"), "provider response id must be recorded");
+    assert!(joined.contains("resp-final"), "round-2 response carries the provider's id: {joined}");
 }
 
 // ---------------------------------------------------------------------------

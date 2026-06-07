@@ -30,6 +30,11 @@ pub struct MessageMeta {
     pub turn_id: u64,
     #[serde(default)]
     pub request_id: u64,
+    /// The PROVIDER's own response id (opaque upstream handle), for cross-referencing
+    /// the provider's server-side logs. `None` if the provider/adapter surfaced none.
+    /// ADDITIVE: `#[serde(default)]`.
+    #[serde(default)]
+    pub provider_response_id: Option<String>,
 }
 
 /// Provider-neutral message.
@@ -723,6 +728,7 @@ mod tests {
             round: 2,
             turn_id: 1,
             request_id: 2,
+            provider_response_id: Some("resp_abc".into()),
         });
         with_meta.reasoning = Some("thinking…".to_string());
         c.push(with_meta);

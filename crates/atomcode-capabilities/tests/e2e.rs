@@ -53,6 +53,7 @@ async fn live_smoke_streams_text_and_done() {
                 eprintln!("[live] Done(truncated={truncated})");
             }
             StreamEvent::ToolCall(tc) => eprintln!("[live] unexpected ToolCall: {}", tc.name),
+            StreamEvent::ResponseId(id) => eprintln!("[live] provider response_id={id}"),
             StreamEvent::Error(e) => panic!("[live] stream error: {}", e.message),
         }
     }

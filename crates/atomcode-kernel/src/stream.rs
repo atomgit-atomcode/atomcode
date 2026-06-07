@@ -30,6 +30,12 @@ pub enum StreamEvent {
     Reasoning(String),
     ToolCall(ToolCall),
     Usage(TokenUsage),
+    /// The provider's OWN response/completion id (opaque upstream handle, e.g. the
+    /// OpenAI/DeepSeek `id`). Emitted ONCE when first seen, for cross-referencing the
+    /// provider's server-side logs / support tickets. The kernel stores it on
+    /// `Message.meta.provider_response_id`. Optional — a provider/adapter that surfaces
+    /// no id simply never emits this.
+    ResponseId(String),
     /// Mid-stream failure (429/5xx/timeout/auth/…). Cleanly fails the turn.
     Error(ProviderError),
     /// End of stream. `truncated` = the response was cut by `finish_reason=length`.

@@ -626,6 +626,7 @@ impl RunningAgent {
             let mut pending_calls = Vec::new();
             let mut usage = TokenUsage::default();
             let mut truncated = false;
+            let mut response_id: Option<String> = None;
             loop {
                 // MID-STREAM cancel checkpoint: cancellation stops stream
                 // consumption immediately. Carried from production runner.rs:420.
@@ -698,6 +699,7 @@ impl RunningAgent {
                     }
                     StreamEvent::ToolCall(c) => pending_calls.push(c),
                     StreamEvent::Usage(u) => usage = u,
+                    StreamEvent::ResponseId(id) => response_id = Some(id),
                     // A mid-stream error CLEANLY FAILS the turn: surface it and end —
                     // do NOT fall through to a fake empty-success completion.
                     StreamEvent::Error(e) => {
@@ -735,6 +737,7 @@ impl RunningAgent {
                 round,
                 turn_id,
                 request_id,
+                provider_response_id: response_id,
             };
             let mut assistant_msg = Message::assistant(assistant_text.clone(), pending_calls.clone());
             assistant_msg.meta = Some(meta);
