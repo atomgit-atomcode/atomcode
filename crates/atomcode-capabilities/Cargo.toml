@@ -18,18 +18,29 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false, optional = true }
 bytes = { version = "1", optional = true }
 async-stream = { version = "0.3", optional = true }
+# `tools` capability deps. gitignore-aware file walking (grep/glob), regex (grep),
+# glob matching (glob). Optional so a provider-only embedder skips them.
+ignore = { version = "0.4", optional = true }
+regex = { version = "1", optional = true }
+globset = { version = "0.4", optional = true }
 
 [features]
-default = ["provider"]
+default = ["provider", "tools"]
 # Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …).
 provider = ["dep:reqwest", "dep:bytes", "dep:async-stream"]
+# Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
+# approval middleware. Pulls fs/process/io tokio features + the search stack.
+tools = ["dep:ignore", "dep:regex", "dep:globset", "tokio/fs", "tokio/process", "tokio/io-util"]
 # E2E tests that hit a REAL provider (network + API key). Separate from the default
 # suite; run on demand: `cargo test -p atomcode-capabilities --features e2e --test e2e`.
 e2e = ["provider"]
 # Future capabilities land as their own features:
-#   tools = [...]   mcp = [...]   skills = [...]   codeintel = [...]
+#   mcp = [...]   skills = [...]   codeintel = [...]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }
 # Local mock HTTP server for deterministic provider tests (retry / multi-round).
 wiremock = "0.6"
+# Temp dirs for the tool tests; cancellation token construction in tests.
+tempfile = "3"
+tokio-util = "0.7"

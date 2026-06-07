@@ -24,3 +24,10 @@ pub mod hooks;
 
 #[cfg(feature = "provider")]
 pub mod provider;
+
+/// Real, NEUTRAL coding [`Tool`](atomcode_kernel::tool::Tool)s — fs `read`/`write`/
+/// `edit`/`list` + `bash` + `grep`/`glob` — plus a generic
+/// [`ApprovalMiddleware`](tools::ApprovalMiddleware). Each runs against the kernel's
+/// minimal `ToolContext` with NO coding enrichments; see [`tools`] for the trust model.
+#[cfg(feature = "tools")]
+pub mod tools;
