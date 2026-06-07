@@ -150,7 +150,7 @@ async fn wire_prefix_is_byte_stable_and_append_only_across_rounds() {
             "history must be append-only (strict byte prefix).\n  prev = {prev:?}\n  next = {next:?}"
         );
     }
-    for (i, (msgs, tools)) in calls.iter().enumerate() {
+    for (i, (msgs, tools, _opts)) in calls.iter().enumerate() {
         // (c) tool block frozen byte-for-byte every call.
         assert_eq!(
             tool_block_repr(tools),
@@ -213,7 +213,7 @@ async fn wire_prefix_append_only_across_turns() {
             "session-wide history must be append-only (strict byte prefix).\n  prev = {prev:?}\n  next = {next:?}"
         );
     }
-    for (i, (msgs, tools)) in calls.iter().enumerate() {
+    for (i, (msgs, tools, _opts)) in calls.iter().enumerate() {
         assert_eq!(tool_block_repr(tools), frozen_tools, "tool block must be frozen across turns on call {i}");
         assert_eq!(history_repr(&msgs[..1]), persona0, "persona must be byte-identical across turns on call {i}");
     }
@@ -248,7 +248,7 @@ async fn tool_block_is_frozen_byte_for_byte_every_call() {
     // sanity: the tool block is non-empty (we mounted two tools) so "frozen" is meaningful.
     assert!(!first.is_empty(), "tool block must be non-empty (two tools mounted)");
     assert!(first.contains("echo") && first.contains("bash"), "both tools must be in the block");
-    for (i, (_msgs, tools)) in calls.iter().enumerate() {
+    for (i, (_msgs, tools, _opts)) in calls.iter().enumerate() {
         assert_eq!(
             tool_block_repr(tools),
             first,

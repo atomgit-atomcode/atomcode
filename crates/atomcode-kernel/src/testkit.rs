@@ -6,7 +6,7 @@ use crate::message::{
     CompactionPlan, CompactionStrategy, CompactionView, Conversation, Message,
 };
 use crate::middleware::ToolMiddleware;
-use crate::provider::LlmProvider;
+use crate::provider::{ChatOptions, LlmProvider};
 use crate::request::RequestCtx;
 use crate::stream::{ProviderError, StreamEvent};
 use crate::tool::{RiskLevel, Tool, ToolCall, ToolContext, ToolDef, ToolResult};
@@ -54,6 +54,7 @@ impl LlmProvider for MockProvider {
         &self,
         messages: &[Message],
         _tools: &[ToolDef],
+        _options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         let snapshot: Vec<(String, String)> =
             messages.iter().map(|m| (format!("{:?}", m.role), m.text.clone())).collect();
@@ -96,6 +97,7 @@ impl LlmProvider for ScriptedProvider {
         &self,
         _messages: &[Message],
         _tools: &[ToolDef],
+        _options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         if let Some(e) = &self.open_error {
             return Err(e.clone());
@@ -107,9 +109,10 @@ impl LlmProvider for ScriptedProvider {
 
 /// Scripted, RICH-recording provider for prefix-cache regression tests. Unlike
 /// `MockProvider` (which snapshots only `(role, text)` and discards tools /
-/// tool_calls), this records the FULL `(Vec<Message>, Vec<ToolDef>)` it received
-/// on every `chat_stream` call — so a test can byte-compare the exact wire prefix
-/// (history + tool block) the provider saw across rounds and turns.
+/// tool_calls), this records the FULL `(Vec<Message>, Vec<ToolDef>, ChatOptions)`
+/// it received on every `chat_stream` call — so a test can byte-compare the exact
+/// wire prefix (history + tool block) the provider saw across rounds and turns,
+/// AND assert which neutral `ChatOptions` reached the provider on each call.
 ///
 /// Each call pops the next scripted `Vec<StreamEvent>`; an empty queue yields a
 /// bare `Done { truncated: false }`. This drives multi-round turns (call 1 → a
@@ -117,7 +120,7 @@ impl LlmProvider for ScriptedProvider {
 /// multi-turn sessions.
 pub struct RecordingProvider {
     turns: Mutex<VecDeque<Vec<StreamEvent>>>,
-    calls: Arc<Mutex<Vec<(Vec<Message>, Vec<ToolDef>)>>>,
+    calls: Arc<Mutex<Vec<(Vec<Message>, Vec<ToolDef>, ChatOptions)>>>,
     ctx_window: u32,
 }
 
@@ -134,13 +137,20 @@ impl RecordingProvider {
         self
     }
     /// Shared handle to the recorded calls; clone before moving the provider into
-    /// the builder so the test can inspect what the LLM saw afterwards.
-    pub fn calls(&self) -> Arc<Mutex<Vec<(Vec<Message>, Vec<ToolDef>)>>> {
+    /// the builder so the test can inspect what the LLM saw afterwards. Each entry
+    /// is `(messages, tools, options)` — the `.0`/`.1` history/tool-block view is
+    /// unchanged; `.2` is the neutral `ChatOptions` that reached the provider.
+    pub fn calls(&self) -> Arc<Mutex<Vec<(Vec<Message>, Vec<ToolDef>, ChatOptions)>>> {
         self.calls.clone()
     }
-    /// A point-in-time snapshot of every recorded `(messages, tools)` call.
-    pub fn recorded(&self) -> Vec<(Vec<Message>, Vec<ToolDef>)> {
+    /// A point-in-time snapshot of every recorded `(messages, tools, options)` call.
+    pub fn recorded(&self) -> Vec<(Vec<Message>, Vec<ToolDef>, ChatOptions)> {
         self.calls.lock().unwrap().clone()
+    }
+    /// Just the `ChatOptions` received on each call, in call order — convenience
+    /// for tests that only assert which options reached the provider.
+    pub fn recorded_options(&self) -> Vec<ChatOptions> {
+        self.calls.lock().unwrap().iter().map(|(_, _, o)| o.clone()).collect()
     }
 }
 
@@ -156,8 +166,9 @@ impl LlmProvider for RecordingProvider {
         &self,
         messages: &[Message],
         tools: &[ToolDef],
+        options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
-        self.calls.lock().unwrap().push((messages.to_vec(), tools.to_vec()));
+        self.calls.lock().unwrap().push((messages.to_vec(), tools.to_vec(), options.clone()));
         let events = self
             .turns
             .lock()
@@ -200,6 +211,7 @@ impl LlmProvider for SilentStreamProvider {
         &self,
         _messages: &[Message],
         _tools: &[ToolDef],
+        _options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         let prefix = self.prefix.lock().unwrap().take().unwrap_or_default();
         // The scripted prefix, then a stream that is forever Pending and never

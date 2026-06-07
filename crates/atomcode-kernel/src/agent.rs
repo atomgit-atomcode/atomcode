@@ -5,7 +5,7 @@ use crate::message::{
     NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
 };
 use crate::middleware::ToolMiddleware;
-use crate::provider::LlmProvider;
+use crate::provider::{ChatOptions, LlmProvider};
 use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
 use crate::tool::{MountedTools, ToolContext, ToolResult};
@@ -145,6 +145,13 @@ pub struct Agent {
     /// driver's `Respond` before degrading to `Value::Null`. `None` (default) =
     /// unbounded. See `AgentBuilder::request_timeout`.
     request_timeout: Option<std::time::Duration>,
+    /// NEUTRAL per-call provider request knobs (reasoning effort, tool_choice,
+    /// max_tokens, temperature) forwarded to `chat_stream` every round. This is the
+    /// SLOT (kernel mechanism); the VALUES are policy set by a specialization via
+    /// `AgentBuilder::chat_options`. Default `ChatOptions::default()` = a neutral
+    /// request (no opinion). Per-round variation is a deliberate follow-up — these
+    /// session-level options are forwarded UNCHANGED on every round.
+    chat_options: ChatOptions,
 }
 
 impl Agent {
@@ -170,6 +177,7 @@ impl Agent {
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
             stream_timeout: self.stream_timeout,
+            chat_options: self.chat_options,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -224,6 +232,9 @@ struct RunningAgent {
     compact_threshold: Option<f32>,
     /// LIVENESS: per-stream-event wait bound. `None` = unbounded (no timer arm).
     stream_timeout: Option<std::time::Duration>,
+    /// NEUTRAL per-call provider request knobs forwarded to `chat_stream` every
+    /// round (see `Agent::chat_options`). Default = a neutral request.
+    chat_options: ChatOptions,
 }
 
 impl RunningAgent {
@@ -499,8 +510,10 @@ impl RunningAgent {
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
             // A failed OPEN cleanly fails the turn — no bogus assistant message,
-            // no empty-success illusion.
-            let mut stream = match self.provider.chat_stream(&messages, &defs).await {
+            // no empty-success illusion. The session-level `chat_options` (the
+            // neutral SLOT) ride along as a sideband request param — NOT part of
+            // `messages`, so they never perturb the append-only wire prefix.
+            let mut stream = match self.provider.chat_stream(&messages, &defs, &self.chat_options).await {
                 Ok(s) => s,
                 Err(e) => {
                     self.hooks.on_error(&e.message).await;
@@ -821,6 +834,7 @@ pub struct AgentBuilder {
     compact_threshold: Option<f32>,
     stream_timeout: Option<std::time::Duration>,
     request_timeout: Option<std::time::Duration>,
+    chat_options: ChatOptions,
 }
 
 impl Default for AgentBuilder {
@@ -851,6 +865,10 @@ impl Default for AgentBuilder {
             // never park forever on a stalled provider or a silent driver.
             stream_timeout: None,
             request_timeout: None,
+            // NEUTRAL default: a no-opinion request (all None + ToolChoice::Auto).
+            // The provider receives `ChatOptions::default()` unless a specialization
+            // sets values via `AgentBuilder::chat_options`.
+            chat_options: ChatOptions::default(),
         }
     }
 }
@@ -986,6 +1004,24 @@ impl AgentBuilder {
         self.request_timeout = Some(d);
         self
     }
+    /// Set the NEUTRAL per-call provider request knobs (reasoning effort,
+    /// tool_choice, max_tokens, temperature) forwarded to the provider on EVERY
+    /// round of EVERY turn this session. This is the kernel SLOT (mechanism); the
+    /// values are POLICY a specialization sets here. The kernel forwards them
+    /// verbatim — it is the L1 provider ADAPTER's job to MAP each neutral knob onto
+    /// its wire format (e.g. `reasoning_effort` → OpenAI's string vs Anthropic's
+    /// thinking `budget_tokens`), and an adapter MAY IGNORE any option it does not
+    /// support. Without this call the default is [`ChatOptions::default()`] = a
+    /// neutral request (all `None` + `ToolChoice::Auto`, i.e. "no opinion").
+    ///
+    /// These are a SIDEBAND request param — NOT part of the messages/tool block —
+    /// so they never perturb the append-only wire prefix the provider's prefix
+    /// cache keys on. (Per-round/per-call variation is a deliberate follow-up;
+    /// session-level options are the scope here.)
+    pub fn chat_options(mut self, o: ChatOptions) -> Self {
+        self.chat_options = o;
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -1004,6 +1040,7 @@ impl AgentBuilder {
             compact_threshold: self.compact_threshold,
             stream_timeout: self.stream_timeout,
             request_timeout: self.request_timeout,
+            chat_options: self.chat_options,
         }
     }
 }

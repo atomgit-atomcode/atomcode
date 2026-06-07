@@ -82,7 +82,7 @@ async fn drive_and_collect_results(
     // ALSO be capped — assert via the recorded provider calls.
     let recorded = calls.lock().unwrap();
     // The 2nd recorded call (round 2) carries the stored tool-result message.
-    if let Some((messages, _)) = recorded.get(1) {
+    if let Some((messages, _, _)) = recorded.get(1) {
         let tool_msg = messages
             .iter()
             .find(|m| matches!(m.role, atomcode_kernel::message::Role::Tool))
