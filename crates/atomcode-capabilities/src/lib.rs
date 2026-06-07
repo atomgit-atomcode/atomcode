@@ -17,5 +17,10 @@
 //!     adapters — OpenAI-compatible (GLM / DeepSeek / …).
 //!   - (future) `tools`, `mcp`, `skills`, `codeintel`.
 
+/// Reusable, provider-agnostic [`atomcode_kernel::hook::LifecycleHooks`]
+/// implementations (e.g. [`hooks::WireLogHooks`]). Depends only on the kernel, so it
+/// is always available regardless of which capability features are enabled.
+pub mod hooks;
+
 #[cfg(feature = "provider")]
 pub mod provider;

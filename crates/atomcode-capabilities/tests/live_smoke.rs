@@ -65,6 +65,41 @@ async fn live_smoke_streams_text_and_done() {
     assert!(!text.trim().is_empty(), "expected some text content, got empty");
 }
 
+/// Run a real Agent turn-loop with the provider-agnostic `WireLogHooks` attached —
+/// proving the GENERAL logging hook fires through the kernel loop (request via
+/// on_request, response via on_model_response), not via any adapter-specific code.
+#[tokio::test]
+async fn live_agent_turn_loop_logs_via_hook() {
+    use atomcode_capabilities::hooks::WireLogHooks;
+    use atomcode_kernel::agent::{Agent, AutoRespond};
+    use atomcode_kernel::tool::ToolRegistry;
+    use std::sync::Arc;
+
+    let cfg = OpenAiCompatConfig::new(
+        env("ATOMCODE_LIVE_API_KEY"),
+        env("ATOMCODE_LIVE_BASE_URL"),
+        env("ATOMCODE_LIVE_MODEL"),
+    );
+    let provider = Arc::new(OpenAiCompatProvider::new(cfg).expect("build provider"));
+    let tools = ToolRegistry::new().mount(&[]); // no tools for this demo
+
+    let outcome = Agent::builder()
+        .provider(provider)
+        .tools(tools)
+        .hook(Arc::new(WireLogHooks::stderr())) // general, provider-agnostic wire log
+        .max_rounds(3)
+        .build()
+        .run_to_completion("Reply with exactly the single word: pong", AutoRespond::AllowAll)
+        .await;
+
+    eprintln!(
+        "[live] outcome: stop={:?} error={:?} text={:?}",
+        outcome.stop, outcome.error, outcome.text
+    );
+    assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+    assert!(!outcome.text.trim().is_empty(), "expected assistant text from the turn loop");
+}
+
 /// Open a real stream WITH a tool and assert a whole ToolCall assembles.
 /// Best run against a model that reliably calls tools (e.g. deepseek-chat).
 #[tokio::test]

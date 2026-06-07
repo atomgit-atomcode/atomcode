@@ -49,10 +49,6 @@ pub struct OpenAiCompatConfig {
     pub connect_timeout: Duration,
     /// Retry policy for the OPEN call only (mid-stream errors are never retried).
     pub retry: RetryPolicy,
-    /// When true (or env `ATOMCODE_WIRE_LOG` is set), dump the full request body and
-    /// the raw streamed response to stderr. The API key is NEVER logged (it rides the
-    /// `Authorization` header, not the body).
-    pub log_wire: bool,
 }
 
 impl OpenAiCompatConfig {
@@ -71,7 +67,6 @@ impl OpenAiCompatConfig {
             idle_timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
-            log_wire: false,
         }
     }
 }
@@ -117,17 +112,6 @@ impl LlmProvider for OpenAiCompatProvider {
         options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg, self.policy);
-
-        // Optional full wire dump (config flag OR `ATOMCODE_WIRE_LOG` env). The body
-        // carries no secret — the API key is in the Authorization header, never logged.
-        let log_wire = self.cfg.log_wire || std::env::var_os("ATOMCODE_WIRE_LOG").is_some();
-        if log_wire {
-            eprintln!(
-                ">>> [wire] request: POST {}\n{}\n>>> [wire] --- end request ---",
-                self.url,
-                serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
-            );
-        }
 
         // Retry the OPEN only (transient status / transport). Once bytes flow, any
         // mid-stream error surfaces as StreamEvent::Error and is never retried.
@@ -178,15 +162,11 @@ impl LlmProvider for OpenAiCompatProvider {
         let s = async_stream::stream! {
             let mut dec = SseDecoder::new();
             futures::pin_mut!(byte_stream);
-            if log_wire {
-                eprintln!("<<< [wire] response (raw SSE):");
-            }
             loop {
                 match tokio::time::timeout(idle, byte_stream.next()).await {
                     Err(_elapsed) => {
                         // Mid-stream idle: non-recoverable (partial deltas may already
                         // have reached the consumer), so not retryable.
-                        if log_wire { eprintln!("\n<<< [wire] --- idle timeout ---"); }
                         yield StreamEvent::Error(ProviderError {
                             retryable: false,
                             message: "stream idle timeout".to_string(),
@@ -194,12 +174,10 @@ impl LlmProvider for OpenAiCompatProvider {
                         return;
                     }
                     Ok(None) => {
-                        if log_wire { eprintln!("\n<<< [wire] --- end response (eof) ---"); }
                         for ev in dec.finish() { yield ev; }
                         return;
                     }
                     Ok(Some(Err(e))) => {
-                        if log_wire { eprintln!("\n<<< [wire] --- stream read error: {e} ---"); }
                         yield StreamEvent::Error(ProviderError {
                             retryable: false,
                             message: format!("stream read error: {e}"),
@@ -207,9 +185,6 @@ impl LlmProvider for OpenAiCompatProvider {
                         return;
                     }
                     Ok(Some(Ok(chunk))) => {
-                        if log_wire {
-                            eprint!("{}", String::from_utf8_lossy(chunk.as_ref()));
-                        }
                         let mut saw_done = false;
                         for ev in dec.feed(chunk.as_ref()) {
                             if matches!(ev, StreamEvent::Done { .. }) {
@@ -217,10 +192,7 @@ impl LlmProvider for OpenAiCompatProvider {
                             }
                             yield ev;
                         }
-                        if saw_done {
-                            if log_wire { eprintln!("\n<<< [wire] --- end response ---"); }
-                            return;
-                        }
+                        if saw_done { return; }
                     }
                 }
             }
