@@ -108,6 +108,13 @@ impl LifecycleHooks for WireLogHooks {
         let resp = serde_json::to_value(&*response).unwrap_or(serde_json::Value::Null);
         self.emit("<<< [wire] response", &resp);
     }
+
+    /// Errors (failed open / mid-stream provider error / tool error) — carries the
+    /// provider's error code + reason as formatted by the adapter. Logged so failures
+    /// are diagnosable alongside the request/response trail.
+    async fn on_error(&self, error: &str) {
+        (self.sink)(&format!("<<< [wire] error: {error}"));
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +191,17 @@ mod tests {
         assert!(contents.contains("file-test-msg"), "log must contain request: {contents}");
         assert!(contents.contains("[wire] request"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn logs_errors_to_sink() {
+        let buf = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = buf.clone();
+        let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| captured.lock().unwrap().push(s.to_string())));
+        hooks.on_error("HTTP 400: [invalid_request_error/model_not_found] no such model").await;
+        let log = buf.lock().unwrap().join("\n");
+        assert!(log.contains("[wire] error"), "log: {log}");
+        assert!(log.contains("model_not_found"), "error code+reason must be logged: {log}");
     }
 
     #[tokio::test]

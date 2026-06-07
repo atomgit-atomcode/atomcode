@@ -120,6 +120,38 @@ async fn retry_exhausts_on_persistent_500_returns_err() {
 }
 
 #[tokio::test]
+async fn open_failure_parses_provider_error_code_and_reason() {
+    let server = MockServer::start().await;
+    let body = serde_json::json!({
+        "error": {
+            "message": "The model `x` does not exist",
+            "type": "invalid_request_error",
+            "code": "model_not_found"
+        }
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(400).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server.uri(), "glm-test");
+    let err = provider
+        .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+        .await
+        .err()
+        .expect("a 400 must surface an Err");
+
+    assert!(!err.retryable, "400 is fatal");
+    // Records HTTP status code + the provider's error type, code, AND reason.
+    assert!(err.message.contains("400"), "status: {}", err.message);
+    assert!(err.message.contains("invalid_request_error"), "type: {}", err.message);
+    assert!(err.message.contains("model_not_found"), "code: {}", err.message);
+    assert!(err.message.contains("does not exist"), "reason: {}", err.message);
+}
+
+#[tokio::test]
 async fn auth_4xx_is_not_retried() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

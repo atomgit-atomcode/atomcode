@@ -137,9 +137,11 @@ impl LlmProvider for OpenAiCompatProvider {
                             continue;
                         }
                         let text = resp.text().await.unwrap_or_default();
+                        // Prefer the parsed provider error (code + reason); fall back to raw.
+                        let detail = parse_provider_error(&text).unwrap_or_else(|| truncate_msg(&text));
                         return Err(ProviderError {
                             retryable: retry::is_retryable_status(code),
-                            message: format!("HTTP {code}: {}", truncate_msg(&text)),
+                            message: format!("HTTP {code}: {detail}"),
                         });
                     }
                     break resp;
@@ -353,6 +355,37 @@ fn truncate_msg(s: &str) -> String {
     format!("{}…", &s[..end])
 }
 
+/// Format an OpenAI-compatible error OBJECT (`{"message","type","code"}`) as a readable
+/// "[type/code] message" one-liner carrying BOTH the error CODE and the REASON.
+fn parse_error_obj(err: &serde_json::Value) -> String {
+    let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("").trim();
+    let typ = err.get("type").and_then(|t| t.as_str()).filter(|s| !s.is_empty());
+    // `code` may be a string OR a number (vendors differ) — normalize to a string.
+    let code = err.get("code").and_then(|c| match c {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    });
+    let tag = match (typ, code) {
+        (Some(t), Some(c)) => format!("[{t}/{c}] "),
+        (Some(t), None) => format!("[{t}] "),
+        (None, Some(c)) => format!("[{c}] "),
+        (None, None) => String::new(),
+    };
+    truncate_msg(&format!("{tag}{msg}"))
+}
+
+/// Parse an OpenAI-compatible error envelope `{"error":{...}}`. `None` if not that shape.
+fn parse_provider_error(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let s = parse_error_obj(v.get("error")?);
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SSE decoding (unit-testable, no network)
 // ---------------------------------------------------------------------------
@@ -448,6 +481,16 @@ impl SseDecoder {
                 out.push(StreamEvent::ResponseId(id.to_string()));
             }
         }
+        // A mid-stream provider error chunk: surface it (code + reason) and TERMINATE —
+        // mid-stream is non-recoverable. (Previously such chunks were silently dropped.)
+        if let Some(err) = &chunk.error {
+            out.push(StreamEvent::Error(ProviderError {
+                retryable: false,
+                message: format!("provider error: {}", parse_error_obj(err)),
+            }));
+            self.done = true;
+            return;
+        }
         if let Some(u) = chunk.usage {
             self.last_usage = Some(map_usage(u));
         }
@@ -530,6 +573,10 @@ struct ChunkResponse {
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<ChunkUsage>,
+    /// A mid-stream provider error envelope: `data: {"error":{...}}`. Some
+    /// OpenAI-compatible gateways send this instead of (or before) closing the stream.
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -917,6 +964,34 @@ mod tests {
             .filter_map(|e| if let StreamEvent::ResponseId(id) = e { Some(id.clone()) } else { None })
             .collect();
         assert_eq!(ids, vec!["resp_xyz".to_string()], "response id emitted exactly once, with value");
+    }
+
+    #[test]
+    fn sse_mid_stream_error_chunk_surfaces_code_and_reason() {
+        let mut d = SseDecoder::new();
+        let ev = d.feed(
+            line(json!({"error":{"message":"the model is overloaded","type":"server_error","code":"overloaded"}}))
+                .as_bytes(),
+        );
+        let err = ev
+            .iter()
+            .find_map(|e| if let StreamEvent::Error(e) = e { Some(e.clone()) } else { None })
+            .expect("a mid-stream error chunk must surface a StreamEvent::Error");
+        assert!(err.message.contains("server_error"), "must carry error type: {}", err.message);
+        assert!(err.message.contains("overloaded"), "must carry error code: {}", err.message);
+        assert!(err.message.contains("the model is overloaded"), "must carry reason: {}", err.message);
+        assert!(!err.retryable, "mid-stream errors are non-retryable");
+    }
+
+    #[test]
+    fn parse_provider_error_extracts_type_code_reason() {
+        let body = r#"{"error":{"message":"The model `x` does not exist","type":"invalid_request_error","code":"model_not_found"}}"#;
+        let parsed = parse_provider_error(body).expect("should parse");
+        assert!(parsed.contains("invalid_request_error"));
+        assert!(parsed.contains("model_not_found"));
+        assert!(parsed.contains("does not exist"));
+        // non-envelope bodies return None (caller falls back to raw)
+        assert!(parse_provider_error("plain text 500").is_none());
     }
 
     #[test]
