@@ -16,6 +16,16 @@ use std::sync::Arc;
 /// middleware that rewrites the call's args — otherwise the user approves bytes
 /// different from what actually executes. Register the user-facing / gating
 /// middleware first, arg-rewriting / transforming middleware after.
+///
+/// # PANIC CONTRACT (must-not-panic)
+///
+/// An implementation **MUST NOT panic**. The kernel does **NOT** isolate panics:
+/// under the workspace `panic = "abort"` profile a panic ABORTS THE HOST PROCESS
+/// (and `catch_unwind` is a no-op there), and under an unwind profile a panicking
+/// middleware is not currently caught either — so a panicking `before`/`after`
+/// takes down the whole session / process. Treat all injected code as
+/// must-not-panic (the SAME trust posture as the tool-sandbox contract — see
+/// [`crate::tool`]): to BLOCK a call, return `Err(reason)` from `before`; never panic.
 #[async_trait]
 pub trait ToolMiddleware: Send + Sync {
     /// Before a tool executes (after lookup). May REWRITE the call (`&mut` — change

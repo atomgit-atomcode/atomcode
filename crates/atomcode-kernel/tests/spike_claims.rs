@@ -201,7 +201,8 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
     let fired = log.lock().unwrap().clone();
     for point in [
         "session_start", "user_prompt_submit", "turn_start", "pre_request",
-        "on_model_response", "on_error", "turn_end", "session_end",
+        "on_request", "on_text_delta", "on_model_response", "on_error", "turn_end",
+        "session_end",
     ] {
         assert!(fired.contains(&point.to_string()), "hook '{point}' was never called; fired = {fired:?}");
     }

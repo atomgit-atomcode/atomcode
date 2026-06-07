@@ -447,10 +447,12 @@ impl Default for RecorderHook {
 
 #[async_trait]
 impl LifecycleHooks for RecorderHook {
-    async fn session_start(&self, _convo: &mut Conversation) { self.record("session_start"); }
+    async fn session_start(&self, _convo: &mut Conversation, _resumed: bool) { self.record("session_start"); }
     async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> { self.record("user_prompt_submit"); Ok(()) }
     async fn turn_start(&self, _convo: &mut Conversation) { self.record("turn_start"); }
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) { self.record("pre_request"); }
+    async fn on_request(&self, _messages: &[Message], _tools: &[ToolDef], _options: &ChatOptions, _ctx: &TurnCtx) { self.record("on_request"); }
+    async fn on_text_delta(&self, _delta: &mut String) { self.record("on_text_delta"); }
     async fn on_model_response(&self, _response: &mut Message) { self.record("on_model_response"); }
     async fn turn_end(&self, _convo: &Conversation) -> Option<String> { self.record("turn_end"); None }
     async fn on_error(&self, _error: &str) { self.record("on_error"); }
@@ -612,7 +614,7 @@ impl MarkerHook {
 
 #[async_trait]
 impl LifecycleHooks for MarkerHook {
-    async fn session_start(&self, convo: &mut Conversation) {
+    async fn session_start(&self, convo: &mut Conversation, _resumed: bool) {
         self.log.lock().unwrap().push(format!("session_start:{}", self.marker));
         convo.push(Message::system(format!("[{}]", self.marker)));
     }

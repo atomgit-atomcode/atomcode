@@ -396,7 +396,17 @@ impl RunningAgent {
                 c
             }
         };
-        self.hooks.session_start(&mut convo).await;
+        // `resumed` is true ONLY when an actual snapshot seeding happened (a
+        // supported-version `.resume`): the conversation was re-hydrated from
+        // history, so a seeding hook must NOT re-inject (double-seed). A fresh
+        // session, or an unsupported-version snapshot that fell back to empty, is
+        // NOT a resume.
+        let resumed = self
+            .resume
+            .as_ref()
+            .map(|s| s.version == SNAPSHOT_VERSION)
+            .unwrap_or(false);
+        self.hooks.session_start(&mut convo, resumed).await;
         // FIFO queue for commands that arrive MID-TURN and must NOT be dropped: a
         // `Snapshot` (a driver waiting on its reply would otherwise hang) and a
         // `SendMessage` (the user's next prompt would otherwise vanish). They are
@@ -561,6 +571,11 @@ impl RunningAgent {
             let start = Instant::now();
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
+            // READ-ONLY wire observation of the FINAL outgoing request (post
+            // pre_request projection, pre chat_stream): telemetry/datalog/cache-RCA
+            // sees the exact bytes about to hit the provider. It gets `&` — it
+            // cannot mutate the wire (mutation is pre_request's job above).
+            self.hooks.on_request(&messages, &defs, &self.chat_options, &turn_ctx).await;
             // A failed OPEN cleanly fails the turn — no bogus assistant message,
             // no empty-success illusion. The session-level `chat_options` (the
             // neutral SLOT) ride along as a sideband request param — NOT part of
@@ -621,7 +636,14 @@ impl RunningAgent {
                     },
                 };
                 match ev {
-                    StreamEvent::TextDelta(t) => {
+                    StreamEvent::TextDelta(mut t) => {
+                        // STREAMED-OUTPUT transform seam: run the hook on EACH chunk
+                        // BEFORE emit, and accumulate the POST-hook bytes — so the
+                        // live stream (driver/UI) AND the stored assistant message
+                        // are CONSISTENTLY transformed (e.g. redacted). Closes the
+                        // on_model_response leak where un-redacted bytes streamed
+                        // before the post-stream message scrub ran.
+                        self.hooks.on_text_delta(&mut t).await;
                         assistant_text.push_str(&t);
                         self.rt.emit(AgentEvent::TextDelta(t));
                     }

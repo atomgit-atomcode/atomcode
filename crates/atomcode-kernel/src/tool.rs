@@ -96,6 +96,16 @@ pub struct ToolContext {
 /// model / history / driver see it, so a runaway tool cannot blow the context
 /// window. A tool MAY also self-cap, but need not — the kernel cap is a central
 /// backstop for third-party tools that do not.
+///
+/// # PANIC CONTRACT (must-not-panic)
+///
+/// An `execute` (or any trait method) **MUST NOT panic**. The kernel does **NOT**
+/// isolate panics: under the workspace `panic = "abort"` profile a panic ABORTS
+/// THE HOST PROCESS (and `catch_unwind` is a no-op there), and under an unwind
+/// profile a panicking tool is not currently caught either — so a panicking tool
+/// takes down the whole session / process. This is the SAME trust posture as the
+/// sandbox contract above: treat all injected code as must-not-panic. A tool that
+/// can fail must return `ToolResult { is_error: true, .. }`, never panic.
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;

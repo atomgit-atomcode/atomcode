@@ -1,4 +1,6 @@
 use crate::message::{Conversation, Message};
+use crate::provider::ChatOptions;
+use crate::tool::ToolDef;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -24,11 +26,27 @@ pub struct TurnCtx {
 ///
 /// Each method states whether a mutation is PERMANENT (written into stored
 /// conversation history) or EPHEMERAL (affects only the current request).
+///
+/// # PANIC CONTRACT (must-not-panic)
+///
+/// An implementation **MUST NOT panic**. The kernel does **NOT** isolate panics:
+/// under the workspace `panic = "abort"` profile a panic ABORTS THE HOST PROCESS
+/// (and `catch_unwind` is a no-op there), and under an unwind profile a panicking
+/// hook is not currently caught either — so a panicking hook takes down the whole
+/// session / process. Treat all injected code as must-not-panic — the SAME trust
+/// posture as the tool-sandbox contract (see [`crate::tool`]): the kernel hosts
+/// your code with full ambient authority and does not confine its failures.
 #[async_trait]
 pub trait LifecycleHooks: Send + Sync {
     /// Session begins, before any turn. Mutate the conversation to inject seed
     /// context / persona. PERMANENT (stored).
-    async fn session_start(&self, _convo: &mut Conversation) {}
+    ///
+    /// `resumed` is `true` iff this session was SEEDED FROM A SNAPSHOT (a `.resume`
+    /// whose version the kernel supports actually re-hydrated history) — `false` for
+    /// a fresh session. A SEEDING hook (one that injects context the snapshot would
+    /// already carry) MUST early-return `if resumed` to avoid DOUBLE-SEEDING on top
+    /// of the restored snapshot: `if resumed { return; }`.
+    async fn session_start(&self, _convo: &mut Conversation, _resumed: bool) {}
 
     /// A user message is about to enter the loop. Rewrite / augment the text, or
     /// return `Err(reason)` to BLOCK the prompt — it never enters the conversation
@@ -47,10 +65,44 @@ pub trait LifecycleHooks: Send + Sync {
     /// poison the prefix cache. `ctx` carries round / max_rounds.
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) {}
 
+    /// READ-ONLY wire observation, fired AFTER `pre_request` projects and just
+    /// BEFORE the provider call — so the observer sees the EXACT FINAL outgoing
+    /// request: post-projection `messages`, the frozen `tools` block, the sideband
+    /// `options`, and round/epoch via `ctx`. This is the kernel HOME for the
+    /// project's telemetry / datalog / prefix-cache-RCA discipline (e.g. hash the
+    /// prefix, dump the bytes). It is `&` (read-only) ON PURPOSE: it MUST NOT mutate
+    /// the outgoing wire — mutation is `pre_request`'s job (the ephemeral clone),
+    /// which keeps the prefix-cache contract owned by exactly one seam.
+    async fn on_request(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+        _ctx: &TurnCtx,
+    ) {
+    }
+
+    /// Transform EACH streamed text chunk IN PLACE just before it is emitted to the
+    /// driver AND accumulated into the stored assistant message. EPHEMERAL per call
+    /// but the post-hook bytes flow to BOTH the live stream and storage, so a
+    /// redaction here is CONSISTENT (unlike `on_model_response`, which transforms
+    /// only the already-assembled STORED message AFTER the un-redacted bytes have
+    /// already streamed to the driver/UI).
+    ///
+    /// DELIVERY GUARANTEE: a hook sees ONE chunk at a time. Cross-chunk redaction (a
+    /// secret SPLIT across two deltas) is the HOOK's responsibility — it must buffer
+    /// internally, or clear a chunk (`delta.clear()`) to suppress it — the kernel
+    /// guarantees only per-chunk delivery before emit, nothing about chunk boundaries.
+    async fn on_text_delta(&self, _delta: &mut String) {}
+
     /// After the model response: the assistant message (text + tool_calls +
     /// kernel-filled `meta`) is built but not yet stored. Observe or TRANSFORM it —
     /// including dropping/rewriting `tool_calls`, which the kernel HONORS.
     /// PERMANENT (stored). `meta` is kernel-owned — don't fabricate it.
+    ///
+    /// This transforms STORAGE ONLY (it runs POST-stream, after every delta has
+    /// already been emitted live). To transform the STREAMED output (so the
+    /// redaction reaches the driver/UI too, not just history), use `on_text_delta`.
     async fn on_model_response(&self, _response: &mut Message) {}
 
     /// The model produced no tool calls (wants to stop). Return `Some(text)` to
@@ -83,10 +135,15 @@ impl LifecycleHooks for NoopHooks {}
 /// COMPOSITION CONTRACT (per method) — the load-bearing part of this type:
 /// - `session_start`, `turn_start`: run ALL hooks in REGISTRATION ORDER; each
 ///   mutates the conversation in turn (chained — later hooks see earlier hooks'
-///   edits).
+///   edits). `session_start` FORWARDS the `resumed` flag UNCHANGED to every hook.
 /// - `pre_request`: run ALL in registration order; each mutates the (ephemeral
 ///   clone of) outgoing messages in turn. The kernel passes the per-request clone,
 ///   NEVER stored history → prefix-cache discipline is preserved.
+/// - `on_request`: run ALL in registration order (pure read-only observation of the
+///   FINAL outgoing wire). Cannot mutate (it gets `&`) → cache discipline intact.
+/// - `on_text_delta`: run ALL in registration order; each TRANSFORMS the streamed
+///   chunk in turn (a later hook sees the earlier hook's rewrite), then the
+///   post-chain bytes are emitted AND accumulated.
 /// - `on_model_response`: run ALL in registration order; each TRANSFORMS the
 ///   response message in turn (e.g. redaction then truncation compose; a later
 ///   hook sees the earlier hook's rewrite).
@@ -114,9 +171,9 @@ impl HookChain {
 
 #[async_trait]
 impl LifecycleHooks for HookChain {
-    async fn session_start(&self, convo: &mut Conversation) {
+    async fn session_start(&self, convo: &mut Conversation, resumed: bool) {
         for h in &self.hooks {
-            h.session_start(convo).await;
+            h.session_start(convo, resumed).await;
         }
     }
 
@@ -138,6 +195,24 @@ impl LifecycleHooks for HookChain {
     async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {
         for h in &self.hooks {
             h.pre_request(messages, ctx).await;
+        }
+    }
+
+    async fn on_request(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+        ctx: &TurnCtx,
+    ) {
+        for h in &self.hooks {
+            h.on_request(messages, tools, options, ctx).await;
+        }
+    }
+
+    async fn on_text_delta(&self, delta: &mut String) {
+        for h in &self.hooks {
+            h.on_text_delta(delta).await;
         }
     }
 

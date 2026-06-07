@@ -473,6 +473,16 @@ impl CompactionPlan {
 /// [`CompactionView`]; the kernel remains the SOLE writer (via
 /// [`Conversation::apply_plan`]), so a buggy strategy cannot corrupt the sacred
 /// floor, net-loss, or cache-epoch invariants. Default = [`NoCompaction`] (no-op).
+///
+/// # PANIC CONTRACT (must-not-panic)
+///
+/// An implementation **MUST NOT panic**. The kernel does **NOT** isolate panics:
+/// under the workspace `panic = "abort"` profile a panic ABORTS THE HOST PROCESS
+/// (and `catch_unwind` is a no-op there), and under an unwind profile a panicking
+/// strategy is not currently caught either — so a panicking `plan` takes down the
+/// whole session / process. Treat all injected code as must-not-panic (the SAME
+/// trust posture as the tool-sandbox contract — see [`crate::tool`]): to decline a
+/// compaction, return `CompactionPlan::noop()`; never panic.
 #[async_trait]
 pub trait CompactionStrategy: Send + Sync {
     async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan;
