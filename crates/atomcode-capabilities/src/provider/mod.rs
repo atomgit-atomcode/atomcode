@@ -14,6 +14,8 @@
 
 mod openai_compat;
 mod reasoning;
+mod retry;
 
 pub use openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 pub use reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
+pub use retry::RetryPolicy;

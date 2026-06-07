@@ -36,17 +36,30 @@ pub enum ReasoningPolicy {
 }
 
 impl ReasoningPolicy {
-    /// Derive the default policy from a model name. An explicit
+    /// Derive the default policy from the model name + base URL (some vendors are only
+    /// identifiable by host, e.g. Moonshot/MiMo gateways). An explicit
     /// [`OpenAiCompatConfig::reasoning_policy`](super::OpenAiCompatConfig) override takes
-    /// precedence over this.
-    pub fn derive(model: &str) -> Self {
+    /// precedence over this. Faithfully ports `atomcode-core`'s `derive_reasoning_policy`.
+    pub fn derive(model: &str, base_url: &str) -> Self {
         let m = model.to_ascii_lowercase();
-        if m.contains("deepseek-v4") {
-            ReasoningPolicy::Include
-        } else if m.contains("deepseek-r1") || m.contains("deepseek-reasoner") {
+        let u = base_url.to_ascii_lowercase();
+        if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") {
+            // DeepSeek V3 family: rejects echoed reasoning_content (400).
             ReasoningPolicy::Exclude
+        } else if m.contains("deepseek-v4") {
+            // DeepSeek V4 thinking mode: REQUIRES reasoning_content on tool-call turns.
+            ReasoningPolicy::Include
+        } else if m.starts_with("kimi-")
+            || m.starts_with("moonshot")
+            || u.contains("moonshot")
+            || u.contains("kimi")
+            || u.contains("xiaomimimo")
+            || u.contains("mimo")
+        {
+            // Moonshot/Kimi/MiMo: require reasoning_content on every assistant tool_call.
+            ReasoningPolicy::Include
         } else {
-            // GLM and everything else.
+            // GLM and normal OpenAI models: safe default — nothing to echo.
             ReasoningPolicy::Exclude
         }
     }
@@ -58,20 +71,40 @@ mod tests {
 
     #[test]
     fn deepseek_v4_includes() {
-        assert_eq!(ReasoningPolicy::derive("deepseek-v4-flash"), ReasoningPolicy::Include);
-        assert_eq!(ReasoningPolicy::derive("DeepSeek-V4"), ReasoningPolicy::Include);
+        assert_eq!(ReasoningPolicy::derive("deepseek-v4-flash", ""), ReasoningPolicy::Include);
+        assert_eq!(ReasoningPolicy::derive("DeepSeek-V4", ""), ReasoningPolicy::Include);
     }
 
     #[test]
     fn deepseek_r1_excludes() {
-        assert_eq!(ReasoningPolicy::derive("deepseek-r1"), ReasoningPolicy::Exclude);
-        assert_eq!(ReasoningPolicy::derive("deepseek-reasoner"), ReasoningPolicy::Exclude);
+        assert_eq!(ReasoningPolicy::derive("deepseek-r1", ""), ReasoningPolicy::Exclude);
+        assert_eq!(ReasoningPolicy::derive("deepseek-reasoner", ""), ReasoningPolicy::Exclude);
+        // r1 wins even if the URL looks like a moonshot host.
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-r1", "https://api.moonshot.cn/v1"),
+            ReasoningPolicy::Exclude
+        );
+    }
+
+    #[test]
+    fn moonshot_kimi_mimo_include() {
+        assert_eq!(ReasoningPolicy::derive("kimi-k2", ""), ReasoningPolicy::Include);
+        assert_eq!(ReasoningPolicy::derive("moonshot-v1-8k", ""), ReasoningPolicy::Include);
+        // identifiable only by host:
+        assert_eq!(
+            ReasoningPolicy::derive("some-model", "https://api.moonshot.cn/v1"),
+            ReasoningPolicy::Include
+        );
+        assert_eq!(
+            ReasoningPolicy::derive("some-model", "https://api-inference.xiaomimimo.com/v1"),
+            ReasoningPolicy::Include
+        );
     }
 
     #[test]
     fn glm_and_default_exclude() {
-        assert_eq!(ReasoningPolicy::derive("glm-5.1"), ReasoningPolicy::Exclude);
-        assert_eq!(ReasoningPolicy::derive("gpt-4o"), ReasoningPolicy::Exclude);
-        assert_eq!(ReasoningPolicy::derive(""), ReasoningPolicy::Exclude);
+        assert_eq!(ReasoningPolicy::derive("glm-5.1", "https://open.bigmodel.cn/api/paas/v4"), ReasoningPolicy::Exclude);
+        assert_eq!(ReasoningPolicy::derive("gpt-4o", "https://api.openai.com/v1"), ReasoningPolicy::Exclude);
+        assert_eq!(ReasoningPolicy::derive("", ""), ReasoningPolicy::Exclude);
     }
 }

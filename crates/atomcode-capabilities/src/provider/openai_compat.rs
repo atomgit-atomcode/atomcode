@@ -16,6 +16,7 @@
 //!     kernel stores reasoning, this adapter decides Include/Exclude.
 
 use super::reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
+use super::retry::{self, RetryPolicy};
 use async_trait::async_trait;
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort, ToolChoice};
@@ -46,6 +47,8 @@ pub struct OpenAiCompatConfig {
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
     pub idle_timeout: Duration,
     pub connect_timeout: Duration,
+    /// Retry policy for the OPEN call only (mid-stream errors are never retried).
+    pub retry: RetryPolicy,
 }
 
 impl OpenAiCompatConfig {
@@ -63,6 +66,7 @@ impl OpenAiCompatConfig {
             reasoning_policy: None,
             idle_timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(30),
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -78,7 +82,7 @@ impl OpenAiCompatProvider {
     pub fn new(cfg: OpenAiCompatConfig) -> Result<Self, ProviderError> {
         let policy = cfg
             .reasoning_policy
-            .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model));
+            .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model, &cfg.base_url));
         let client = reqwest::Client::builder()
             .connect_timeout(cfg.connect_timeout)
             .build()
@@ -109,24 +113,48 @@ impl LlmProvider for OpenAiCompatProvider {
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg, self.policy);
 
-        let resp = self
-            .client
-            .post(&self.url)
-            .bearer_auth(&self.cfg.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(open_error)?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let retryable = classify_status(status.as_u16());
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError {
-                retryable,
-                message: format!("HTTP {}: {}", status.as_u16(), truncate_msg(&text)),
-            });
-        }
+        // Retry the OPEN only (transient status / transport). Once bytes flow, any
+        // mid-stream error surfaces as StreamEvent::Error and is never retried.
+        let policy = &self.cfg.retry;
+        let mut attempt = 1u32;
+        let resp = loop {
+            let send = self
+                .client
+                .post(&self.url)
+                .bearer_auth(&self.cfg.api_key)
+                .json(&body)
+                .send()
+                .await;
+            match send {
+                Ok(resp) => {
+                    let code = resp.status().as_u16();
+                    if !resp.status().is_success() {
+                        if retry::is_retryable_status(code) && attempt < policy.max_attempts {
+                            let wait = retry::parse_retry_after(resp.headers())
+                                .unwrap_or_else(|| retry::compute_backoff(attempt, policy));
+                            tokio::time::sleep(wait).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(ProviderError {
+                            retryable: retry::is_retryable_status(code),
+                            message: format!("HTTP {code}: {}", truncate_msg(&text)),
+                        });
+                    }
+                    break resp;
+                }
+                Err(e) => {
+                    if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
+                        let wait = retry::compute_backoff(attempt, policy);
+                        tokio::time::sleep(wait).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(open_error(e));
+                }
+            }
+        };
 
         let idle = self.cfg.idle_timeout;
         let byte_stream = resp.bytes_stream();
@@ -305,13 +333,6 @@ fn effort_str(e: ReasoningEffort) -> &'static str {
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
-
-/// HTTP status ⇒ retryable, for an OPEN failure (a non-2xx response). Mid-stream
-/// failures are classified non-retryable at the call site (once bytes have flowed the
-/// request is not safely re-drivable).
-fn classify_status(code: u16) -> bool {
-    matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
-}
 
 fn open_error(e: reqwest::Error) -> ProviderError {
     ProviderError {
@@ -722,18 +743,6 @@ mod tests {
         for _ in 0..100 {
             let again = serde_json::to_string(&build_request_body("deepseek-v4-flash", &msgs, &tools, &opts, &cfg, ReasoningPolicy::Include)).unwrap();
             assert_eq!(first, again, "request body serialization must be deterministic");
-        }
-    }
-
-    // ---- error classification ----
-
-    #[test]
-    fn status_classification() {
-        for c in [408, 425, 429, 500, 502, 503, 504, 529] {
-            assert!(classify_status(c), "{c} should be retryable");
-        }
-        for c in [400, 401, 403, 404, 422] {
-            assert!(!classify_status(c), "{c} should be fatal");
         }
     }
 
