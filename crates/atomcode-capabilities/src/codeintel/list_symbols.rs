@@ -69,7 +69,9 @@ fn render(path: &Path, display: &str) -> ToolResult {
         Some(syms) => {
             let mut out = format!("Symbols in {display} ({} total):\n\n", syms.len());
             for s in &syms {
-                out.push_str(&format!("  {:>4}-{:<4} {}  ({})\n", s.start_line, s.end_line, s.name, s.kind));
+                // Both line numbers right-aligned (matches production) so the columns
+                // stay aligned across rows for easy scanning.
+                out.push_str(&format!("  {:>4}-{:>4}  {}  ({})\n", s.start_line, s.end_line, s.name, s.kind));
             }
             out.push_str("\n[Use read_symbol to read any symbol's full source.]");
             ok(out)
