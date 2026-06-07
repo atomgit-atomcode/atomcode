@@ -2,7 +2,7 @@
 //! dependent files + total. `Safe`.
 
 use super::index::CodeIndex;
-use super::{display_path, err, ok, resolve_path};
+use super::{canonical, display_path, err, ok, resolve_path};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
@@ -62,6 +62,10 @@ impl Tool for BlastRadiusTool {
 
 fn render(index: &CodeIndex, root: &Path, file: &Path, display: &str) -> ToolResult {
     let g = index.get(root);
+    let croot = canonical(root);
+    let root: &Path = &croot;
+    let cfile = canonical(file);
+    let file: &Path = &cfile;
     let symbols = match g.symbols_in_file(file) {
         Some(s) if !s.is_empty() => s.clone(),
         _ => return err(format!("File '{display}' not found in the code graph (no indexed symbols).")),

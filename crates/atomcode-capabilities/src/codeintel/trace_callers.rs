@@ -1,7 +1,7 @@
 //! `trace_callers` — reverse call graph (who calls a symbol), BFS to a depth. `Safe`.
 
 use super::index::CodeIndex;
-use super::{display_path, err, ok};
+use super::{canonical, display_path, err, ok};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
@@ -62,6 +62,8 @@ impl Tool for TraceCallersTool {
 
 fn render(index: &CodeIndex, root: &Path, symbol: &str, depth: usize) -> ToolResult {
     let g = index.get(root);
+    let croot = canonical(root);
+    let root: &Path = &croot;
     let matches = g.find_by_name(symbol);
     if matches.is_empty() {
         return err(format!("Symbol '{symbol}' not found in code graph ({} symbols indexed).", g.node_count()));

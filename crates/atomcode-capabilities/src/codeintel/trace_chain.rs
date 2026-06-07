@@ -1,7 +1,7 @@
 //! `trace_chain` — shortest call chain between two symbols (BFS, ≤10 hops). `Safe`.
 
 use super::index::CodeIndex;
-use super::{display_path, err, ok};
+use super::{canonical, display_path, err, ok};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
@@ -60,6 +60,8 @@ impl Tool for TraceChainTool {
 
 fn render(index: &CodeIndex, root: &Path, from: &str, to: &str) -> ToolResult {
     let g = index.get(root);
+    let croot = canonical(root);
+    let root: &Path = &croot;
     let from_matches = g.find_by_name(from);
     let to_matches = g.find_by_name(to);
     if from_matches.is_empty() {

@@ -86,6 +86,14 @@ pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
     }
 }
 
+/// Canonicalize a path (resolve symlinks / `.`/`..`), falling back to the original on
+/// error. The graph build AND the tool lookups both canonicalize, so a file referenced
+/// via a different alias (e.g. macOS `/var` vs `/private/var`) still matches the graph's
+/// stored paths instead of a false "not found".
+pub(crate) fn canonical(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Display a path relative to `root` when possible, else shortened to `.../last3`.
 pub(crate) fn display_path(p: &Path, root: &Path) -> String {
     if let Ok(rel) = p.strip_prefix(root) {

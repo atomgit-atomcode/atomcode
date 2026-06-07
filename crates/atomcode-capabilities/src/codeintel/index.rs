@@ -119,7 +119,19 @@ fn parse_file(path: &Path, source: &str) -> Option<(Vec<SymbolNode>, Vec<RawCall
 const INDEXED_EXTS: &[&str] =
     &["rs", "py", "js", "jsx", "mjs", "cjs", "ts", "mts", "tsx", "go", "java", "c", "h", "cc", "cpp", "cxx", "hpp", "hh"];
 
-fn collect_files(root: &Path) -> Vec<(PathBuf, u64)> {
+/// A walked source file + the inputs to its staleness fingerprint.
+struct Walked {
+    path: PathBuf,
+    /// mtime in NANOSECONDS — coarse whole seconds would miss a same-second edit and
+    /// serve a stale graph.
+    mtime_ns: u128,
+    /// file length — defends against a same-instant edit whose mtime didn't move (content
+    /// length almost always changes on a real edit).
+    len: u64,
+}
+
+/// Walk `root` (assumed already canonical) for indexable source files + staleness inputs.
+fn collect_files(root: &Path) -> Vec<Walked> {
     let mut out = Vec::new();
     for entry in WalkBuilder::new(root)
         .hidden(true)
@@ -137,24 +149,26 @@ fn collect_files(root: &Path) -> Vec<(PathBuf, u64)> {
         if !ext_ok {
             continue;
         }
-        let mtime = entry
-            .metadata()
-            .ok()
+        let md = entry.metadata().ok();
+        let mtime_ns = md
+            .as_ref()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
+            .map(|d| d.as_nanos())
             .unwrap_or(0);
-        out.push((p.to_path_buf(), mtime));
+        let len = md.as_ref().map(|m| m.len()).unwrap_or(0);
+        out.push(Walked { path: p.to_path_buf(), mtime_ns, len });
     }
-    out.sort();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-fn fingerprint(files: &[(PathBuf, u64)]) -> u64 {
+fn fingerprint(files: &[Walked]) -> u64 {
     let mut h = DefaultHasher::new();
-    for (p, m) in files {
-        p.hash(&mut h);
-        m.hash(&mut h);
+    for w in files {
+        w.path.hash(&mut h);
+        w.mtime_ns.hash(&mut h);
+        w.len.hash(&mut h);
     }
     h.finish()
 }
@@ -166,41 +180,53 @@ fn top_component(p: &Path, root: &Path) -> Option<std::ffi::OsString> {
 /// Resolve a callee name to a symbol id, preferring closer candidates (production
 /// scoring): same file (4) > same dir (2) > same top-level component (1) > any (0).
 /// (Import-based score 3 is omitted — like production, we do not parse imports yet.)
+/// Ties are broken DETERMINISTICALLY by the smallest (file, start_line) — production's
+/// tie-break depends on HashMap iteration order, which is not reproducible.
 fn resolve_callee(g: &CodeGraph, callee: &str, caller_file: &Path, root: &Path) -> Option<SymbolId> {
-    let candidates = g.find_by_name(callee);
-    candidates
-        .iter()
-        .max_by_key(|n| {
-            if n.file == caller_file {
-                4
-            } else if n.file.parent().is_some() && n.file.parent() == caller_file.parent() {
-                2
+    let score = |n: &SymbolNode| -> i32 {
+        if n.file == caller_file {
+            4
+        } else if n.file.parent().is_some() && n.file.parent() == caller_file.parent() {
+            2
+        } else {
+            let a = top_component(&n.file, root);
+            if a.is_some() && a == top_component(caller_file, root) {
+                1
             } else {
-                let a = top_component(&n.file, root);
-                if a.is_some() && a == top_component(caller_file, root) {
-                    1
-                } else {
-                    0
-                }
+                0
             }
-        })
-        .map(|n| n.id)
+        }
+    };
+    let mut best: Option<&SymbolNode> = None;
+    let mut best_score = i32::MIN;
+    for n in g.find_by_name(callee) {
+        let s = score(n);
+        let better = match best {
+            None => true,
+            Some(b) => s > best_score || (s == best_score && (n.file.as_path(), n.start_line) < (b.file.as_path(), b.start_line)),
+        };
+        if better {
+            best = Some(n);
+            best_score = s;
+        }
+    }
+    best.map(|n| n.id)
 }
 
-fn build_from_files(root: &Path, files: Vec<(PathBuf, u64)>) -> CodeGraph {
+fn build_from_files(root: &Path, files: Vec<Walked>) -> CodeGraph {
     let mut g = CodeGraph::new();
     let mut raw_calls: Vec<(PathBuf, RawCall)> = Vec::new();
-    for (path, mtime) in &files {
-        let Ok(source) = std::fs::read_to_string(path) else {
+    for w in &files {
+        let Ok(source) = std::fs::read_to_string(&w.path) else {
             continue;
         };
-        if let Some((nodes, calls)) = parse_file(path, &source) {
+        if let Some((nodes, calls)) = parse_file(&w.path, &source) {
             for n in nodes {
                 g.add_symbol(n);
             }
-            g.file_mtimes.insert(path.clone(), *mtime);
+            g.file_mtimes.insert(w.path.clone(), (w.mtime_ns / 1_000_000_000) as u64);
             for c in calls {
-                raw_calls.push((path.clone(), c));
+                raw_calls.push((w.path.clone(), c));
             }
         }
     }
@@ -218,7 +244,8 @@ fn build_from_files(root: &Path, files: Vec<(PathBuf, u64)>) -> CodeGraph {
 
 /// Build a fresh code graph for `root` (walk → parse → resolve). O(repo), CPU-bound.
 pub fn build_graph(root: &Path) -> CodeGraph {
-    build_from_files(root, collect_files(root))
+    let root = super::canonical(root);
+    build_from_files(&root, collect_files(&root))
 }
 
 /// Shared, lazily-built code index the graph tools hold. `get` returns a cached graph
@@ -234,14 +261,15 @@ impl CodeIndex {
         Self::default()
     }
     pub fn get(&self, root: &Path) -> Arc<CodeGraph> {
-        let files = collect_files(root);
+        let root = super::canonical(root);
+        let files = collect_files(&root);
         let fp = fingerprint(&files);
         if let Some((cfp, g)) = self.cache.lock().unwrap().as_ref() {
             if *cfp == fp {
                 return g.clone();
             }
         }
-        let g = Arc::new(build_from_files(root, files));
+        let g = Arc::new(build_from_files(&root, files));
         *self.cache.lock().unwrap() = Some((fp, g.clone()));
         g
     }
@@ -283,6 +311,40 @@ mod tests {
         let g = build_graph(d.path());
         let recur = g.find_by_name("recur").into_iter().next().expect("recur");
         assert!(g.callees(recur.id).map(|e| e.is_empty()).unwrap_or(true), "self-call must be skipped");
+    }
+
+    #[test]
+    fn same_second_edit_triggers_rebuild() {
+        // Overwriting the SAME file (likely the same wall-clock second) must rebuild —
+        // the fingerprint uses nanos + length, not coarse seconds.
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.rs");
+        std::fs::write(&f, "fn one() {}\n").unwrap();
+        let idx = CodeIndex::new();
+        let g1 = idx.get(d.path());
+        assert!(g1.find_by_name("two").is_empty());
+        std::fs::write(&f, "fn one() {}\nfn two() {}\n").unwrap();
+        let g2 = idx.get(d.path());
+        assert!(!g2.find_by_name("two").is_empty(), "same-second edit must rebuild (nanos/len changed)");
+    }
+
+    #[test]
+    fn tie_break_resolution_is_deterministic() {
+        // Two same-named fns in the same dir → equal score for a same-dir caller → tie,
+        // resolved deterministically to the smallest (file, line) = a_util.rs.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a_util.rs"), "pub fn dup() {}\n").unwrap();
+        std::fs::write(d.path().join("z_util.rs"), "pub fn dup() {}\n").unwrap();
+        std::fs::write(d.path().join("main.rs"), "fn run() { dup(); }\n").unwrap();
+        let g = build_graph(d.path());
+        let run = g.find_by_name("run").into_iter().next().unwrap();
+        let target = g.callees(run.id).and_then(|e| e.first()).and_then(|e| g.node(e.to)).map(|n| n.file.clone());
+        assert!(target.as_ref().map(|f| f.ends_with("a_util.rs")).unwrap_or(false), "tie → a_util.rs, got {target:?}");
+        // stable across a rebuild
+        let g2 = build_graph(d.path());
+        let run2 = g2.find_by_name("run").into_iter().next().unwrap();
+        let t2 = g2.callees(run2.id).and_then(|e| e.first()).and_then(|e| g2.node(e.to)).map(|n| n.file.clone());
+        assert_eq!(target, t2);
     }
 
     #[test]

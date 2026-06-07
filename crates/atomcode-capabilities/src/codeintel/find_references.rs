@@ -75,7 +75,10 @@ fn line_has_word(line: &str, word: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        from = start + 1;
+        // Advance past the first char of this match — a CHAR-boundary step (a raw +1 byte
+        // could land inside a multibyte char and panic on the next `line[from..]` slice).
+        let step = line[start..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        from = start + step;
     }
     false
 }
@@ -139,6 +142,16 @@ mod tests {
         assert!(!line_has_word("let foobar = 1", "foo"));
         assert!(!line_has_word("food()", "foo"));
         assert!(line_has_word("a.foo.b", "foo"));
+    }
+
+    #[test]
+    fn word_match_is_utf8_safe() {
+        // Regression: a raw byte+1 advance panicked when a multibyte char abutted a match.
+        let _ = line_has_word("fnété", "é");
+        let _ = line_has_word("café_bar é x", "é");
+        let _ = line_has_word("aéaéaé", "x");
+        assert!(line_has_word("foo 计算 bar", "计算"));
+        assert!(!line_has_word("xé", "x")); // 'é' is a word char → 'x' not a whole word
     }
 
     #[tokio::test]
