@@ -1,0 +1,32 @@
+[package]
+name = "atomcode-capabilities"
+version = "0.0.0"
+edition = "2021"
+description = "L1 capabilities layered on atomcode-kernel (L0): real provider adapters, tools, mcp, skills. Depends ONLY on the kernel."
+publish = false
+
+[dependencies]
+# L0 only. NEVER add atomcode-core or any L2/L3 crate here (layering is compile-enforced).
+atomcode-kernel = { path = "../atomcode-kernel" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# `provider` capability deps (HTTP + SSE). Optional so a downstream embedder that
+# only wants other capabilities does not pull in the TLS/HTTP stack.
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false, optional = true }
+bytes = { version = "1", optional = true }
+async-stream = { version = "0.3", optional = true }
+
+[features]
+default = ["provider"]
+# Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …).
+provider = ["dep:reqwest", "dep:bytes", "dep:async-stream"]
+# Gated live smoke test that hits a real endpoint (needs an API key in env).
+live = ["provider"]
+# Future capabilities land as their own features:
+#   tools = [...]   mcp = [...]   skills = [...]   codeintel = [...]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }

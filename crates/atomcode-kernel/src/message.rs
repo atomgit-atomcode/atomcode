@@ -62,6 +62,36 @@ pub struct Message {
     /// of surviving messages); a provider adapter (L1) decides the wire echo-back
     /// format — OUT OF SCOPE here. ADDITIVE: `#[serde(default)]` so a v1 snapshot
     /// (no `reasoning` field) still deserializes (→ None).
+    ///
+    /// FUTURE: when an L1 adapter for thinking-block providers (Anthropic extended
+    /// thinking / OpenAI Responses / Gemini) actually PRODUCES opaque tokens, upgrade
+    /// this representation to carry, per reasoning unit:
+    ///
+    /// ```text
+    /// text:     Option<String>   human-readable thinking (may be empty/redacted);
+    ///                            today's flat `reasoning` IS this.
+    /// opaque:   Option<String>   OPAQUE round-trip payload, stored & echoed VERBATIM:
+    ///                            Anthropic `signature` / OpenAI `encrypted_content`
+    ///                            (or `rs_` id) / Gemini `thoughtSignature`. The kernel
+    ///                            NEVER parses or re-serializes it (any re-encode
+    ///                            invalidates the signature).
+    /// provider: Option<String>   attribution (which provider produced `opaque`).
+    ///                            INVARIANT: opaque.is_some() => provider.is_some().
+    ///                            REQUIRED: an opaque token is PROVIDER-BOUND; replaying
+    ///                            it to a different provider / after a model swap fails
+    ///                            hard (OpenAI invalid_encrypted_content, Gemini
+    ///                            missing/invalid signature). An L1 adapter uses it to
+    ///                            echo a signature back ONLY to the same provider, and
+    ///                            to avoid stripping another vendor's block.
+    /// ```
+    ///
+    /// For interleaved multi-block thinking (one turn -> several signed blocks), lift
+    /// the unit to a `Vec<ReasoningBlock>` to preserve order + per-block signatures.
+    /// Add it the same additive way (`#[serde(default)]`) so old snapshots still load.
+    /// The ECHO policy (when/whether/to-whom) stays in L1; the kernel only stores the
+    /// mechanism (lossless text + opaque + attribution). The CURRENT GLM/DeepSeek
+    /// OpenAI-compatible path needs NONE of this — its reasoning is plain text with no
+    /// signature, fully served by the flat `reasoning` below.
     #[serde(default)]
     pub reasoning: Option<String>,
 }

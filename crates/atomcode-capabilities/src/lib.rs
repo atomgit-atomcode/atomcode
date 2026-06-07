@@ -1,0 +1,21 @@
+//! atomcode-capabilities — **L1 capabilities** layered on the neutral
+//! `atomcode-kernel` (L0).
+//!
+//! # Layering rule (compile-enforced)
+//!
+//! This crate depends ONLY on `atomcode-kernel` (L0) + third-party crates. It must
+//! NEVER depend on `atomcode-core` or any L2/L3 crate. That one-directional edge is
+//! what keeps the kernel neutral: every *concrete* capability (a real provider, a
+//! real tool, an MCP client, a skill loader) lives up here, never down in the
+//! kernel. `cargo tree -p atomcode-capabilities` must not contain `atomcode-core`.
+//!
+//! # Capabilities are cargo-feature-gated
+//!
+//! A downstream embedder pulls in only what it needs, so e.g. a build that only
+//! wants providers never compiles the (future) MCP/skills transitive deps:
+//!   - `provider` (default): real [`LlmProvider`](atomcode_kernel::provider::LlmProvider)
+//!     adapters — OpenAI-compatible (GLM / DeepSeek / …).
+//!   - (future) `tools`, `mcp`, `skills`, `codeintel`.
+
+#[cfg(feature = "provider")]
+pub mod provider;
