@@ -100,6 +100,7 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
+          <tr><td><code>/view &lt;文件路径&gt;</code></td><td>以只读浮层打开文件内容（支持方向键翻页、PageUp/Down、g/G 跳转到首/末行）</td></tr>
           <tr><td><code>/undo</code> · <code>/undo N</code></td><td>把对话记忆回退到上一轮(或第 N 轮)之前,并把那一轮的 prompt 还原回输入框;只回退记忆,不恢复磁盘文件</td></tr>
           <tr><td><code>/diff</code></td><td>显示当前工作目录未提交改动的 git diff</td></tr>
           <tr><td><code>/cost</code></td><td>展示当前会话输出 token 数。不支持 usage 报告的 API 会自动估算</td></tr>
