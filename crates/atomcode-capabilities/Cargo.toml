@@ -52,6 +52,8 @@ codeintel = [
     "dep:tree-sitter-javascript", "dep:tree-sitter-typescript", "dep:tree-sitter-go",
     "dep:tree-sitter-java", "dep:tree-sitter-c", "dep:tree-sitter-cpp",
     "dep:tree-sitter-c-sharp", "dep:tree-sitter-html", "dep:tree-sitter-php",
+    # the cross-file graph layer (build_graph) walks the repo gitignore-aware
+    "dep:ignore",
 ]
 # E2E tests that hit a REAL provider (network + API key). Separate from the default
 # suite; run on demand: `cargo test -p atomcode-capabilities --features e2e --test e2e`.

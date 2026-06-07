@@ -60,6 +60,28 @@ impl Lang {
         }
     }
 
+    /// The tree-sitter query that captures call expressions (`@callee`). `None` for
+    /// languages without a calls query (no call edges built for them).
+    pub fn calls_query(&self) -> Option<&'static str> {
+        Some(match self {
+            Lang::Rust => include_str!("queries/rust_calls.scm"),
+            Lang::Python => include_str!("queries/python_calls.scm"),
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => include_str!("queries/javascript_calls.scm"),
+            Lang::Java => include_str!("queries/java_calls.scm"),
+            Lang::Go => include_str!("queries/go_calls.scm"),
+            _ => return None,
+        })
+    }
+
+    /// Whether this language is walked into the cross-file code graph (`build_graph`).
+    /// Matches the production indexed-extension set (code languages; HTML/C# excluded).
+    pub fn is_indexed(&self) -> bool {
+        matches!(
+            self,
+            Lang::Rust | Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Tsx | Lang::Go | Lang::Java | Lang::C | Lang::Cpp
+        )
+    }
+
     /// Detect the language from a file path's extension. `None` = unsupported.
     pub fn detect(path: &Path) -> Option<Lang> {
         let ext = path.extension()?.to_str()?;
