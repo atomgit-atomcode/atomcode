@@ -83,10 +83,20 @@ async fn live_agent_turn_loop_logs_via_hook() {
     let provider = Arc::new(OpenAiCompatProvider::new(cfg).expect("build provider"));
     let tools = ToolRegistry::new().mount(&[]); // no tools for this demo
 
+    // Log to a file if ATOMCODE_WIRE_LOG_FILE is set, else to stderr.
+    let log_hook: Arc<dyn atomcode_kernel::hook::LifecycleHooks> =
+        match std::env::var("ATOMCODE_WIRE_LOG_FILE") {
+            Ok(p) => {
+                eprintln!("[live] wire log → file: {p}");
+                Arc::new(WireLogHooks::to_file(&p).expect("open wire log file"))
+            }
+            Err(_) => Arc::new(WireLogHooks::stderr()),
+        };
+
     let outcome = Agent::builder()
         .provider(provider)
         .tools(tools)
-        .hook(Arc::new(WireLogHooks::stderr())) // general, provider-agnostic wire log
+        .hook(log_hook) // general, provider-agnostic wire log
         .max_rounds(3)
         .build()
         .run_to_completion("Reply with exactly the single word: pong", AutoRespond::AllowAll)

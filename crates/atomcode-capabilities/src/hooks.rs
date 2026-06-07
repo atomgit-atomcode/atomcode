@@ -5,7 +5,10 @@ use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::ChatOptions;
 use atomcode_kernel::tool::ToolDef;
-use std::sync::Arc;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// A provider-**agnostic** wire logger. It rides the kernel's hook seam, so a single
 /// instance logs the request/response for ANY provider or agent — not one adapter:
@@ -44,6 +47,20 @@ impl WireLogHooks {
     pub fn compact(mut self) -> Self {
         self.pretty = false;
         self
+    }
+
+    /// Append log entries to a FILE (created if missing, opened in append mode). Each
+    /// request/response entry is written as a block followed by a blank line. This is
+    /// just `with_sink` wired to a file handle — the injectable-sink design means a new
+    /// destination costs a few lines, no change to the hook itself.
+    pub fn to_file(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path.into())?;
+        let file = Arc::new(Mutex::new(file));
+        Ok(Self::with_sink(Arc::new(move |s: &str| {
+            if let Ok(mut f) = file.lock() {
+                let _ = writeln!(f, "{s}\n");
+            }
+        })))
     }
 
     fn emit(&self, label: &str, value: &serde_json::Value) {
@@ -122,6 +139,24 @@ mod tests {
         assert!(log.contains("response"));
         assert!(log.contains("\"calling tool\""), "response must include assistant text");
         assert!(log.contains("\"c1\""), "response must include the tool call");
+    }
+
+    #[tokio::test]
+    async fn to_file_appends_entries() {
+        let path = std::env::temp_dir()
+            .join(format!("atomcode_wirelog_test_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let hooks = WireLogHooks::to_file(&path).expect("open temp log file");
+            let ctx = TurnCtx { round: 1, max_rounds: None, cache_epoch: 0 };
+            hooks
+                .on_request(&[Message::user("file-test-msg")], &[], &ChatOptions::default(), &ctx)
+                .await;
+        }
+        let contents = std::fs::read_to_string(&path).expect("read log file");
+        assert!(contents.contains("file-test-msg"), "log must contain request: {contents}");
+        assert!(contents.contains("request (round 1)"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
