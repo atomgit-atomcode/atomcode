@@ -12,6 +12,7 @@ use crate::stream::{ProviderError, StreamEvent};
 use crate::tool::{RiskLevel, Tool, ToolCall, ToolContext, ToolDef, ToolResult};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::HashSet;
@@ -164,6 +165,47 @@ impl LlmProvider for RecordingProvider {
             .pop_front()
             .unwrap_or_else(|| vec![StreamEvent::Done { truncated: false }]);
         Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// A provider whose stream OPENS OK, optionally yields a FIXED prefix of events,
+/// then PENDS FOREVER (never resolves, never ends) — modelling a TCP half-open /
+/// model stall where the connection is alive but no further tokens arrive. Used
+/// by the stream-timeout liveness test: without a `stream_timeout` the kernel's
+/// `stream.next().await` parks the turn forever; with one it cleanly fails.
+///
+/// Implemented by chaining the scripted prefix with `futures::stream::pending()`,
+/// which is a stream that NEVER yields (its `poll_next` is always `Poll::Pending`)
+/// and never terminates — so the consumer's `next()` await never completes.
+pub struct SilentStreamProvider {
+    prefix: Mutex<Option<Vec<StreamEvent>>>,
+}
+
+impl SilentStreamProvider {
+    /// Open OK, emit `prefix` once, then pend forever. Pass `vec![]` for a stream
+    /// that is silent from the very first token (bounds first-token latency); pass
+    /// e.g. `vec![StreamEvent::TextDelta("hi".into())]` to go silent AFTER some
+    /// output (bounds inter-token latency).
+    pub fn new(prefix: Vec<StreamEvent>) -> Self {
+        Self { prefix: Mutex::new(Some(prefix)) }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for SilentStreamProvider {
+    fn model_name(&self) -> &str {
+        "silent-stream"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let prefix = self.prefix.lock().unwrap().take().unwrap_or_default();
+        // The scripted prefix, then a stream that is forever Pending and never
+        // ends → the consumer's next await after the prefix parks forever.
+        let stream = futures::stream::iter(prefix).chain(futures::stream::pending());
+        Ok(Box::pin(stream))
     }
 }
 

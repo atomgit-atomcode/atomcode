@@ -6,7 +6,7 @@ description = "Spike: neutral agent kernel (Phase A0 — design validation, thro
 publish = false
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tokio-util = "0.7"
 async-trait = "0.1"
 futures = "0.3"

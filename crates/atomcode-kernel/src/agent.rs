@@ -114,6 +114,14 @@ pub struct Agent {
     /// thresholds (5K/13K, coding-mode, etc.) are policy, NOT a kernel default —
     /// the neutral default is OFF.
     compact_threshold: Option<f32>,
+    /// LIVENESS: max time to wait for the NEXT stream event (bounds both
+    /// first-token and inter-token latency). `None` (default) = unbounded. See
+    /// `AgentBuilder::stream_timeout`.
+    stream_timeout: Option<std::time::Duration>,
+    /// LIVENESS: max time a mid-turn `rt.request(...)` round-trip waits for the
+    /// driver's `Respond` before degrading to `Value::Null`. `None` (default) =
+    /// unbounded. See `AgentBuilder::request_timeout`.
+    request_timeout: Option<std::time::Duration>,
 }
 
 impl Agent {
@@ -131,12 +139,13 @@ impl Agent {
             persona: self.persona,
             middlewares: self.middlewares,
             hooks: self.hooks,
-            rt: RequestCtx::new(ev_tx),
+            rt: RequestCtx::new(ev_tx, self.request_timeout),
             max_rounds: self.max_rounds,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
+            stream_timeout: self.stream_timeout,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -181,6 +190,8 @@ struct RunningAgent {
     max_tool_result_bytes: usize,
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
+    /// LIVENESS: per-stream-event wait bound. `None` = unbounded (no timer arm).
+    stream_timeout: Option<std::time::Duration>,
 }
 
 impl RunningAgent {
@@ -469,10 +480,28 @@ impl RunningAgent {
                 // Cancel fires BEFORE any assistant message is built → there is
                 // nothing dangling to backfill: just emit Cancelled + TurnComplete
                 // and return (no bogus partial-success assistant message).
+                //
+                // LIVENESS stream timeout: when `stream_timeout` is Some(d), a THIRD
+                // arm races EACH `stream.next()` await against `sleep(d)` — bounding
+                // BOTH first-token AND inter-token latency (every await of the next
+                // event is bounded). The arm is GUARDED by `if .. .is_some()`: when
+                // None the arm is disabled and `sleep` is never even constructed, so
+                // the None path polls NO timer (unbounded, exactly as today). On
+                // timeout we take the EXISTING clean-fail path — identical to a
+                // mid-stream StreamEvent::Error: on_error + Error + TurnComplete +
+                // return (no partial assistant pushed, no fake success). `biased`
+                // keeps cancel first; the timer is tried before the (silent) stream.
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
                         self.rt.emit(AgentEvent::Cancelled);
+                        self.rt.emit(AgentEvent::TurnComplete);
+                        return;
+                    }
+                    _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
+                        let msg = "stream timeout".to_string();
+                        self.hooks.on_error(&msg).await;
+                        self.rt.emit(AgentEvent::Error { message: msg });
                         self.rt.emit(AgentEvent::TurnComplete);
                         return;
                     }
@@ -718,6 +747,8 @@ pub struct AgentBuilder {
     max_tool_result_bytes: usize,
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
+    stream_timeout: Option<std::time::Duration>,
+    request_timeout: Option<std::time::Duration>,
 }
 
 impl Default for AgentBuilder {
@@ -737,6 +768,11 @@ impl Default for AgentBuilder {
             // no threshold → the kernel NEVER auto-compacts unless an embedder opts in.
             compaction: Arc::new(NoCompaction),
             compact_threshold: None,
+            // NEUTRAL default: no liveness timeout → the kernel never adds a timer.
+            // Production SHOULD set both (see the builder methods) so a turn can
+            // never park forever on a stalled provider or a silent driver.
+            stream_timeout: None,
+            request_timeout: None,
         }
     }
 }
@@ -821,6 +857,33 @@ impl AgentBuilder {
         self.compact_threshold = Some(frac);
         self
     }
+    /// LIVENESS: bound how long the turn waits for the NEXT stream event. When set,
+    /// EACH `stream.next()` is raced against this duration, so it bounds BOTH
+    /// first-token latency (a provider that opens the stream then goes silent) AND
+    /// inter-token latency (a model that stalls mid-response / a TCP half-open). On
+    /// a timeout the turn CLEANLY FAILS — exactly like a mid-stream provider error
+    /// (`on_error` hook + `AgentEvent::Error{"stream timeout"}` + `TurnComplete`),
+    /// with NO partial assistant message and NO fake success. Without this call the
+    /// default is `None` → UNBOUNDED (no timer is added). This is a neutral kernel,
+    /// so the value is policy; PRODUCTION SHOULD set this so a stalled provider can
+    /// never park a turn forever.
+    pub fn stream_timeout(mut self, d: std::time::Duration) -> Self {
+        self.stream_timeout = Some(d);
+        self
+    }
+    /// LIVENESS: bound how long a mid-turn `rt.request(...)` round-trip (e.g. an
+    /// approval middleware awaiting the driver) waits for the driver's `Respond`.
+    /// When set and the driver does not answer within `d` (a crashed/silent/
+    /// disconnected driver), the round-trip DEGRADES to `Value::Null` — the SAME
+    /// degraded value as a dropped sender — so the awaiting middleware proceeds
+    /// (e.g. ApprovalMiddleware treats Null as deny → blocks the tool) instead of
+    /// parking the turn forever. Without this call the default is `None` →
+    /// UNBOUNDED (only a DROPPED sender unblocks). Policy value on a neutral kernel;
+    /// PRODUCTION SHOULD set this so a silent driver can never park a turn forever.
+    pub fn request_timeout(mut self, d: std::time::Duration) -> Self {
+        self.request_timeout = Some(d);
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -836,6 +899,8 @@ impl AgentBuilder {
             max_tool_result_bytes: self.max_tool_result_bytes,
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
+            stream_timeout: self.stream_timeout,
+            request_timeout: self.request_timeout,
         }
     }
 }
