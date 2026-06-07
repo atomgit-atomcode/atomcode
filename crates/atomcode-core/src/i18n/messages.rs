@@ -600,6 +600,10 @@ pub enum Msg<'a> {
     CmdDescPaste,
     /// Description for the `/guide` slash command — asks atomcode-guide a question.
     CmdDescGuide,
+    /// Description for the `/view` slash command — opens an overlay modal showing file content.
+    CmdDescView,
+    /// Error shown when `/view` is used without a filepath argument.
+    ViewUsage,
     /// `/guide` menu header: "📖 AtomCode Guide — type /guide <question>"
     GuideMenuHeader,
     /// `/guide` menu: "Common topics:" section label
