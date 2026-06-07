@@ -1,14 +1,17 @@
-//! Gated LIVE smoke test — hits a real OpenAI-compatible endpoint.
+//! END-TO-END tests against a REAL provider (network). SEPARATE from the default
+//! suite: the whole file is gated behind the `e2e` cargo feature, so it neither
+//! compiles nor runs on a plain `cargo test`. Run ON DEMAND:
 //!
-//! Excluded from the default build/test; only compiles + runs under `--features live`.
-//! Run:
 //!   ATOMCODE_LIVE_API_KEY=sk-... \
 //!   ATOMCODE_LIVE_BASE_URL=https://api.deepseek.com \
-//!   ATOMCODE_LIVE_MODEL=deepseek-chat \
-//!   cargo test -p atomcode-capabilities --features live --test live_smoke -- --nocapture
+//!   ATOMCODE_LIVE_MODEL=deepseek-v4-flash \
+//!   cargo test -p atomcode-capabilities --features e2e --test e2e -- --nocapture
 //!
 //! GLM example: BASE_URL=https://open.bigmodel.cn/api/paas/v4  MODEL=glm-4-flash
-#![cfg(feature = "live")]
+//!
+//! (Deterministic, network-free integration tests live in tests/http_mock.rs and DO
+//! run by default — those are NOT e2e.)
+#![cfg(feature = "e2e")]
 
 use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_kernel::message::Message;
@@ -151,4 +154,88 @@ async fn live_smoke_tool_call_assembles() {
     let parsed: serde_json::Value =
         serde_json::from_str(&calls[0].arguments).expect("tool arguments must be valid JSON");
     assert!(parsed.get("city").is_some(), "expected a city argument");
+}
+
+/// REAL multi-round reasoning round-trip against a THINKING model (DeepSeek-V4 family).
+///
+/// Proves end-to-end against the LIVE API that when a V4 model returns reasoning + a
+/// tool call in round 1, the kernel stores the reasoning and the adapter ECHOES it back
+/// as `reasoning_content` in round 2 — and the API ACCEPTS it (no HTTP 400 "the
+/// reasoning_content in the thinking mode must be passed back"). Surviving a >=2-round
+/// loop with no error IS the proof the round-trip held; a missing/wrong echo would 400
+/// the second round.
+///
+/// Requires ATOMCODE_LIVE_MODEL to be a `deepseek-v4*` model (Include policy).
+#[tokio::test]
+async fn e2e_multi_round_reasoning_roundtrip_does_not_400() {
+    use atomcode_capabilities::hooks::WireLogHooks;
+    use atomcode_kernel::agent::{Agent, AutoRespond};
+    use atomcode_kernel::tool::{Tool, ToolContext, ToolRegistry, ToolResult};
+    use std::sync::{Arc, Mutex};
+
+    struct GetTimeTool;
+    #[async_trait::async_trait]
+    impl Tool for GetTimeTool {
+        fn name(&self) -> &str {
+            "get_time"
+        }
+        fn description(&self) -> &str {
+            "Get the current time in a given city."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "city": { "type": "string", "description": "City name" } },
+                "required": ["city"]
+            })
+        }
+        async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+            ToolResult { call_id: String::new(), content: "12:00 (noon)".into(), is_error: false }
+        }
+    }
+
+    let cfg = OpenAiCompatConfig::new(
+        env("ATOMCODE_LIVE_API_KEY"),
+        env("ATOMCODE_LIVE_BASE_URL"),
+        env("ATOMCODE_LIVE_MODEL"),
+    );
+    let provider = Arc::new(OpenAiCompatProvider::new(cfg).expect("build provider"));
+
+    // Count rounds via the general hook so we KNOW the loop went multi-round.
+    let rounds = Arc::new(Mutex::new(0usize));
+    let counter = rounds.clone();
+    let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| {
+        eprintln!("{s}");
+        if s.contains("request (round") {
+            *counter.lock().unwrap() += 1;
+        }
+    }));
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(GetTimeTool));
+    let tools = registry.mount(&["get_time"]);
+
+    let outcome = Agent::builder()
+        .provider(provider)
+        .tools(tools)
+        .hook(Arc::new(hooks))
+        .max_rounds(6)
+        .build()
+        .run_to_completion(
+            "Call the get_time tool for the city Paris, then tell me the time in one short sentence.",
+            AutoRespond::AllowAll,
+        )
+        .await;
+
+    let n = *rounds.lock().unwrap();
+    eprintln!(
+        "[e2e] rounds={n} stop={:?} error={:?} text={:?}",
+        outcome.stop, outcome.error, outcome.text
+    );
+
+    // THE proof: a multi-round loop with a thinking model did NOT 400 on the echoed
+    // reasoning_content fed back in round 2.
+    assert!(outcome.error.is_none(), "reasoning round-trip likely 400'd in round 2: {:?}", outcome.error);
+    assert!(n >= 2, "expected the model to call the tool (>=2 rounds); got {n} — rerun, or model didn't use the tool");
+    assert!(!outcome.text.trim().is_empty(), "expected a final answer after the tool round");
 }
