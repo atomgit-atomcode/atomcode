@@ -11,7 +11,7 @@
 //!   * a NEW agent built with `.resume(snapshot)` continues the SAME history
 //!     append-only — the resumed provider's FIRST call is a strict byte
 //!     prefix-EXTENSION of the saved snapshot (prefix cache survives resume), and
-//!   * an UNSUPPORTED snapshot version yields an `AgentEvent::Error` and an empty
+//!   * an UNSUPPORTED snapshot version yields an `AgentEvent::Warning` and an empty
 //!     start (no panic) — the forward-compat seam.
 
 use atomcode_kernel::agent::{Agent, AgentHandle};
@@ -219,11 +219,13 @@ async fn unsupported_snapshot_version_errors_and_starts_empty() {
         .spawn();
 
     handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
-    let mut errored = false;
+    let mut warned = false;
     while let Some(ev) = handle.events.recv().await {
         match ev {
-            AgentEvent::Error { message } if message.contains("unsupported snapshot version 9999") => {
-                errored = true;
+            // Non-fatal degradation → Warning (not Error): an Error here would be
+            // captured into Outcome.error and make a later clean turn look failed.
+            AgentEvent::Warning(message) if message.contains("unsupported snapshot version 9999") => {
+                warned = true;
             }
             AgentEvent::TurnComplete { .. } => break,
             _ => {}
@@ -232,7 +234,7 @@ async fn unsupported_snapshot_version_errors_and_starts_empty() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    assert!(errored, "an unsupported snapshot version must emit an Error event");
+    assert!(warned, "an unsupported snapshot version must emit a Warning event");
 
     let calls = calls.lock().unwrap();
     assert!(!calls.is_empty(), "the turn still runs (started empty, not panicked)");

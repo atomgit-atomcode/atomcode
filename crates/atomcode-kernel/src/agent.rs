@@ -316,14 +316,15 @@ impl RunningAgent {
             // FORWARD-COMPAT SEAM: a snapshot from an unknown (newer/older) kernel
             // version cannot be safely interpreted. Surface it and start EMPTY
             // rather than panic or silently misread bytes. (When/if the schema
-            // bumps, a migration would live here.)
+            // bumps, a migration would live here.) Emitted as a WARNING, not an
+            // Error: starting empty is a non-fatal degradation, and an Error here
+            // would be captured by `run_to_completion` into `Outcome.error`, making
+            // a subsequent CLEAN turn look failed (stop=Stopped + error=Some).
             Some(snap) => {
-                self.rt.emit(AgentEvent::Error {
-                    message: format!(
-                        "unsupported snapshot version {} (kernel supports {})",
-                        snap.version, SNAPSHOT_VERSION
-                    ),
-                });
+                self.rt.emit(AgentEvent::Warning(format!(
+                    "unsupported snapshot version {} (kernel supports {}); starting empty",
+                    snap.version, SNAPSHOT_VERSION
+                )));
                 Conversation::new()
             }
             // FRESH: new conversation + persona injection point. Empty persona by
