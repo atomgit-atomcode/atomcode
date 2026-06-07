@@ -30,3 +30,5 @@ live = ["provider"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+# Local mock HTTP server for deterministic provider tests (retry / multi-round).
+wiremock = "0.6"
