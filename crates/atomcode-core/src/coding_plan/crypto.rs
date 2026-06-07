@@ -113,6 +113,23 @@ pub fn signer() -> &'static dyn RequestSigner {
     &REAL_SIGNER
 }
 
+/// True iff this build can actually produce a signature. Lets callers
+/// fail-fast with `CpOfficialBuildRequired` BEFORE walking auth state
+/// or hitting the network, instead of either (a) discovering it only
+/// after `sign()` returns `Unavailable` (current `build_codingplan_headers`
+/// — but its error is then swallowed by `resign`'s `unwrap_or_default`)
+/// or (b) surfacing the misleading `CpAuthRequired` to an open-source
+/// user whose auth is empty.
+#[cfg(feature = "codingplan-crypto")]
+pub fn signer_available() -> bool {
+    true
+}
+
+#[cfg(not(feature = "codingplan-crypto"))]
+pub fn signer_available() -> bool {
+    false
+}
+
 /// True iff the given base URL points at an AtomGit-operated LLM
 /// gateway that REQUIRES per-request signing.
 ///
@@ -120,13 +137,13 @@ pub fn signer() -> &'static dyn RequestSigner {
 /// HTTP(S) schemes and subdomain spoofs.
 ///
 /// Both production hostnames sign:
-///   * `llm-api.atomgit.com` — current dedicated host.
+///   * `pre-llm-api-cce.atomgit.com` — current dedicated host.
 ///   * `api-ai.gitcode.com`  — pre-P3 host. Kept signing-enforced
 ///     so any legacy provider config silently upgraded to signing
 ///     after the P3 cutover; users with `api-ai.gitcode.com` in their
-///     config get the same protection as `llm-api.atomgit.com` users
+///     config get the same protection as `pre-llm-api-cce.atomgit.com` users
 ///     and don't need to edit their config to migrate.
-pub(crate) fn is_atomgit_gateway(base_url: &str) -> bool {
+pub fn is_atomgit_gateway(base_url: &str) -> bool {
     let url = match url::Url::parse(base_url) {
         Ok(u) => u,
         Err(_) => return false,
@@ -169,6 +186,18 @@ mod tests {
 
     #[cfg(not(feature = "codingplan-crypto"))]
     #[test]
+    fn signer_available_reports_false_in_open_source_build() {
+        assert!(!signer_available());
+    }
+
+    #[cfg(feature = "codingplan-crypto")]
+    #[test]
+    fn signer_available_reports_true_in_official_build() {
+        assert!(signer_available());
+    }
+
+    #[cfg(not(feature = "codingplan-crypto"))]
+    #[test]
     fn default_signer_in_open_source_build_is_unavailable() {
         let input = SignInput {
             method: "POST",
@@ -185,8 +214,8 @@ mod tests {
 
     #[test]
     fn is_atomgit_gateway_matches_official_host() {
-        assert!(is_atomgit_gateway("https://llm-api.atomgit.com/v1"));
-        assert!(is_atomgit_gateway("https://llm-api.atomgit.com/v1/chat/completions"));
+        assert!(is_atomgit_gateway("https://pre-llm-api-cce.atomgit.com/v1"));
+        assert!(is_atomgit_gateway("https://pre-llm-api-cce.atomgit.com/v1/chat/completions"));
     }
 
     #[test]
@@ -208,8 +237,8 @@ mod tests {
 
     #[test]
     fn is_atomgit_gateway_rejects_subdomains_and_lookalikes() {
-        assert!(!is_atomgit_gateway("https://llm-api.atomgit.com.evil.example"));
-        assert!(!is_atomgit_gateway("https://evil.llm-api.atomgit.com"));
+        assert!(!is_atomgit_gateway("https://pre-llm-api-cce.atomgit.com.evil.example"));
+        assert!(!is_atomgit_gateway("https://evil.pre-llm-api-cce.atomgit.com"));
         assert!(!is_atomgit_gateway("https://atomgit.com"));
     }
 
@@ -217,6 +246,6 @@ mod tests {
     fn is_atomgit_gateway_rejects_malformed_input() {
         assert!(!is_atomgit_gateway(""));
         assert!(!is_atomgit_gateway("not a url"));
-        assert!(!is_atomgit_gateway("ftp://llm-api.atomgit.com"));
+        assert!(!is_atomgit_gateway("ftp://pre-llm-api-cce.atomgit.com"));
     }
 }

@@ -32,7 +32,9 @@ impl Client {
         let http = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
             .user_agent(crate::ATOMCODE_USER_AGENT)
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            // No `Client::new()` fallback — it panics on TLS/resolver init
+            // failure and `panic = "abort"` turns that into a process kill.
+            .context("failed to build AtomGit HTTP client")?;
         Ok(Self { http, token })
     }
 

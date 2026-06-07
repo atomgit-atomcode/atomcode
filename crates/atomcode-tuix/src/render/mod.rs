@@ -1,5 +1,6 @@
 // crates/atomcode-tuix/src/render/mod.rs
-pub mod alt_screen;
+#[cfg(windows)]
+pub mod conhost;
 pub mod cell;
 pub mod plain;
 pub mod qr;
@@ -9,6 +10,25 @@ pub mod theme;
 pub mod worker;
 
 use std::time::Duration;
+
+/// Boundary marker for an originated message in the body buffer. Drives
+/// "jump to prev/next message" navigation keys. Marked at push time;
+/// kept in sync when body_lines drains from the front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    User,
+    Assistant,
+    ToolCall,
+    ToolResult,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MessageMark {
+    /// Index into the renderer's visible body buffer (`Vec<Vec<Cell>>`).
+    /// Drives "jump to message" — viewport_top is compared against this.
+    pub line_idx: usize,
+    pub kind: MarkKind,
+}
 
 /// Semantic line to render. Renderer implementations translate this to bytes.
 ///
@@ -237,23 +257,17 @@ pub trait Renderer: Send {
     /// stdout (plain/pipe mode) can't retract them.
     fn pop_approval_prompt(&mut self) {}
 
-    /// Terminal window was resized to `(cols, rows)`. DECSTBM-based
-    /// renderers must re-issue the scroll region (`\x1b[1;H-N r`) so
-    /// the fixed footer stays pinned to the new bottom. Non-DECSTBM
-    /// renderers can treat this as a redraw hint or a no-op.
-    ///
-    /// Default is no-op — backends that don't care about geometry
-    /// (Plain, tests) don't need to override.
+    /// Terminal window was resized to `(cols, rows)`. The retained
+    /// backend uses this to re-flow body width and reposition the
+    /// pinned footer; non-geometry-sensitive backends (Plain, tests)
+    /// keep the no-op default.
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
 
     /// Scroll the body viewport up (negative `delta`) or down
-    /// (positive `delta`) by `delta` rows. Used by AltScreenRenderer
-    /// to support PageUp / PageDown / arrow-up scrollback navigation
-    /// inside the alt-screen (where the host terminal's native
-    /// scrollback is unavailable).
+    /// (positive `delta`) by `delta` rows.
     ///
     /// Default no-op for renderers that delegate scrollback to the
-    /// host terminal (RetainedRenderer's DECSTBM path; PlainRenderer
+    /// host terminal (RetainedRenderer's append-only path; PlainRenderer
     /// streaming to stdout).
     fn scroll_body(&mut self, _delta: i32) {}
 
@@ -261,26 +275,6 @@ pub trait Renderer: Send {
     /// scrollback. Used for Home / End key handling.
     fn scroll_body_to_top(&mut self) {}
     fn scroll_body_to_bottom(&mut self) {}
-
-    /// Mouse text-selection hooks. Backends that own mouse capture can
-    /// override these; streaming/native-scrollback backends keep host
-    /// terminal selection behavior and no-op here.
-    fn begin_selection(&mut self, _col: u16, _row: u16) {}
-    fn update_selection(&mut self, _col: u16, _row: u16) {}
-    fn end_selection(&mut self) {}
-
-    /// Copy the current mouse-selection text to the system clipboard
-    /// (using arboard, not OSC 52) and clear the selection highlight.
-    /// Returns `true` if a non-empty selection was copied.
-    ///
-    /// This is the Ctrl+C fallback for terminals (Windows Terminal,
-    /// conhost) that ignore OSC 52 — the user selects text with the
-    /// mouse, then presses Ctrl+C to copy it. AltScreenRenderer
-    /// implements this; other backends return `false` (they use the
-    /// host terminal's native selection).
-    fn copy_selection(&mut self) -> bool {
-        false
-    }
 
     /// Update the cached welcome banner's model / working_dir fields in
     /// place and trigger a repaint of the banner rows. Used after the
@@ -294,6 +288,13 @@ pub trait Renderer: Send {
     /// Default no-op: renderers without a retained body buffer can't
     /// edit already-emitted rows in place.
     fn refresh_welcome_banner(&mut self, _model: &str, _working_dir: &str) {}
+
+    /// Jump body viewport to the prev/next message boundary. No-op when no
+    /// such boundary exists in the configured direction.
+    fn scroll_to_prev_message(&mut self) {}
+    fn scroll_to_next_message(&mut self) {}
+    fn scroll_to_prev_user_message(&mut self) {}
+    fn scroll_to_next_user_message(&mut self) {}
 }
 
 /// Visual style for the menu popup. Drives whether the renderer prefixes
@@ -307,6 +308,37 @@ pub enum MenuKind {
     /// `@`-mention popup: rows shown as `+ <path>`, no slash prefix.
     /// Selected row uses reverse-video only (no extra arrow).
     AtMention,
+    /// `$`-trigger skills picker. Rows show the bare skill name + description,
+    /// no `/`, `/skills`, or `$` prefix; selection marked with `▸`.
+    Skill,
+    /// Two-column list: name left-aligned, desc right-aligned,
+    /// selected row uses reverse-video (no prefix, no arrow).
+    /// Used by session picker.
+    /// `row_prefix` is prepended before the name (e.g. `/`).
+    /// `selected_marker` is shown before the prefix for the selected row;
+    /// unselected rows get `display_width(marker)` spaces.
+    TwoColumn {
+        row_prefix: &'static str,
+        selected_marker: &'static str,
+    },
+}
+
+impl MenuKind {
+    /// Max visible rows for this menu kind. Both `paint_footer` and
+    /// `current_footer_rows` use this so the estimate matches actual
+    /// rendering.
+    pub fn max_visible_rows(&self, screen_height: usize, item_count: usize) -> usize {
+        match self {
+            MenuKind::SlashCommand | MenuKind::AtMention | MenuKind::Skill => item_count.min(4),
+            // Window cap is `max(h/2, 4)`, but never reserve more rows than
+            // there are items — `paint_footer` only paints `item_count`
+            // rows when there are fewer than the cap, so `.max(4)` MUST
+            // apply to the cap, not the final value, or `current_footer_rows`
+            // over-estimates the footer height for short lists (< 4 items)
+            // and desyncs from the actual paint.
+            MenuKind::TwoColumn { .. } => item_count.min((screen_height / 2).max(4)),
+        }
+    }
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.
@@ -360,12 +392,23 @@ pub struct StatusLine {
     /// the eye — switching modes changes whether file edits and shell
     /// run, so the user wants this prominent.
     pub mode_indicator: Option<String>,
+    /// Right-aligned bypass indicator, appended after `hint` on the
+    /// right side of the status row. Shown when
+    /// `--dangerously-skip-permissions / -y` is active, rendering a
+    /// yellow warning badge so the user is always aware that all tool
+    /// calls are auto-approved. Kept separate from `mode_indicator`
+    /// (left-aligned PLAN/Build badge) so BYPASS does not displace
+    /// the mode indicator.
+    pub bypass_indicator: Option<String>,
     /// Current session display name, shown as a right-aligned cyan
     /// pill overlaid on the input box's top rule. `Some` only after
     /// the user has explicitly run `/rename` (Session::user_renamed) —
     /// auto-named / default sessions leave this `None` to keep the
     /// chrome quiet on fresh conversations.
     pub session_name: Option<String>,
+    /// Current reasoning_effort for the active provider's model.
+    /// None = not set (API uses its own default). Cycled via Ctrl+T.
+    pub reasoning_effort: Option<String>,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.
@@ -393,5 +436,57 @@ pub fn fmt_dur(d: Duration) -> String {
         format!("{}ms", ms)
     } else {
         format!("{:.1}s", d.as_secs_f64())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_column() -> MenuKind {
+        MenuKind::TwoColumn {
+            row_prefix: "",
+            selected_marker: "▸",
+        }
+    }
+
+    // `current_footer_rows` reserves `max_visible_rows` rows while
+    // `paint_footer` only paints `min(item_count, cap)` rows. For the two
+    // to agree, `max_visible_rows` must never exceed `item_count`.
+    #[test]
+    fn two_column_never_reserves_more_than_item_count() {
+        let k = two_column();
+        // Short lists: must equal item_count, NOT the 4-row floor.
+        assert_eq!(k.max_visible_rows(40, 0), 0);
+        assert_eq!(k.max_visible_rows(40, 1), 1);
+        assert_eq!(k.max_visible_rows(40, 2), 2);
+        assert_eq!(k.max_visible_rows(40, 3), 3);
+    }
+
+    #[test]
+    fn two_column_caps_at_half_screen_for_long_lists() {
+        let k = two_column();
+        // 50 items, height 40 → window cap = max(20, 4) = 20.
+        assert_eq!(k.max_visible_rows(40, 50), 20);
+        // At the cap boundary.
+        assert_eq!(k.max_visible_rows(40, 20), 20);
+        assert_eq!(k.max_visible_rows(40, 19), 19);
+    }
+
+    #[test]
+    fn two_column_floor_keeps_at_least_four_on_tiny_screens() {
+        let k = two_column();
+        // Tiny screen (h/2 = 3) with plenty of items → floor lifts cap to 4.
+        assert_eq!(k.max_visible_rows(6, 50), 4);
+        // ...but still never more than the item count.
+        assert_eq!(k.max_visible_rows(6, 2), 2);
+    }
+
+    #[test]
+    fn fixed_kinds_cap_at_four() {
+        for k in [MenuKind::SlashCommand, MenuKind::AtMention, MenuKind::Skill] {
+            assert_eq!(k.max_visible_rows(40, 2), 2);
+            assert_eq!(k.max_visible_rows(40, 10), 4);
+        }
     }
 }

@@ -82,6 +82,19 @@ pub struct TerminalCaps {
     ///   * `TERM=dumb`
     ///   * `LC_ALL`/`LANG` being `C` / `POSIX` / `ANSI_X3.4-1968`
     pub unicode_symbols: bool,
+    /// Classic Windows console host (conhost.exe), as opposed to Windows
+    /// Terminal / a modern emulator. Detected as: Windows AND neither
+    /// `WT_SESSION` nor `TERM_PROGRAM` present (same heuristic as the
+    /// legacy-console ASCII fallback below).
+    ///
+    /// Why it matters: the conhost shipped on Win10 2004/20H2
+    /// (10.0.19041) fastfails (`0xc0000409`) when we repaint on a window
+    /// resize using a per-row `CUP+EL` wipe across the whole viewport
+    /// while its buffer is mid-resize — the user sees the entire terminal
+    /// window vanish during a drag. On this host we emit a single `ED2`
+    /// clear on resize instead of the row-by-row burst (see
+    /// `RetainedRenderer::on_resize`). Always `false` off Windows.
+    pub legacy_conhost: bool,
 }
 
 impl TerminalCaps {
@@ -126,6 +139,7 @@ impl TerminalCaps {
             raw_mode: tty && !is_dumb,
             scroll_region: tty && !is_dumb,
             unicode_symbols,
+            legacy_conhost: windows_legacy_console,
         }
     }
 
@@ -179,6 +193,30 @@ mod tests {
         assert!(!caps.colors);
         assert!(caps.tty);
         assert!(caps.spinner); // 非 dumb + 是 tty 仍保留 spinner
+    }
+
+    #[test]
+    fn legacy_conhost_only_on_bare_windows() {
+        // Windows with no Windows-Terminal / modern-emulator markers → classic
+        // conhost → resize must use the ED2-clear path, not the per-row burst.
+        let conhost = TerminalCaps::from_env(EnvView {
+            is_windows: true,
+            wt_session: None,
+            term_program: None,
+            ..env()
+        });
+        assert!(conhost.legacy_conhost);
+
+        // Windows Terminal sets WT_SESSION → modern engine → not legacy.
+        let wt = TerminalCaps::from_env(EnvView {
+            is_windows: true,
+            wt_session: Some("abc".to_string()),
+            ..env()
+        });
+        assert!(!wt.legacy_conhost);
+
+        // Non-Windows is never legacy conhost.
+        assert!(!TerminalCaps::from_env(EnvView { is_windows: false, ..env() }).legacy_conhost);
     }
 
     #[test]

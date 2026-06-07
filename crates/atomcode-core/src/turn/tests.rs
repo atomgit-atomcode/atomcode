@@ -24,6 +24,7 @@ use crate::tool::{
 use super::event::{TurnEvent, TurnResult};
 use super::permission::{AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider};
 use super::runner::TurnRunner;
+use crate::hook::HookEngine;
 
 // ---------------------------------------------------------------------------
 // Test helpers: Mock LlmProvider
@@ -281,6 +282,7 @@ fn test_config() -> Config {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -330,6 +332,7 @@ fn make_runner(
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        reasoning_effort: None,
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -346,11 +349,10 @@ fn make_runner(
         config: test_config(),
         ctx: test_ctx,
         permission,
+        hook_engine: std::sync::Arc::new(crate::hook::HookEngine::new()),
         recently_edited_files: Vec::new(),
-        hook_executor: std::sync::Arc::new(
-            crate::hook::executor::HookExecutor::empty()
-        ),
         loop_guard: Default::default(),
+        current_turn_number: 0,
     }
 }
 
@@ -536,7 +538,7 @@ async fn test_turn_runner_loop_guard_blocks_third_identical_call() {
     // this time will differ" chances on real flakes), the third must
     // be short-circuited with a synthetic Loop guard ToolResult — no
     // EchoTool output should appear in the third result.
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
     let mut runner = make_runner(provider, tools, auto_bypass());
@@ -1323,7 +1325,7 @@ fn test_rules_no_dynamic_content() {
 #[tokio::test]
 async fn malformed_write_file_args_short_circuit_without_approval() {
     use crate::tool::write::WriteFileTool;
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(WriteFileTool)).await;
 
     // 2026-05-02 datalog `atomgr/2026-05-02_20-23-21.md` line 330:
@@ -1483,6 +1485,7 @@ mod telemetry_tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -1499,11 +1502,10 @@ mod telemetry_tests {
             config: test_config(),
             ctx: test_ctx,
             permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
+            hook_engine: std::sync::Arc::new(HookEngine::new()),
             recently_edited_files: Vec::new(),
-            hook_executor: std::sync::Arc::new(
-                crate::hook::executor::HookExecutor::empty()
-            ),
             loop_guard: Default::default(),
+            current_turn_number: 0,
         };
         (runner, captured)
     }
@@ -1676,7 +1678,7 @@ mod telemetry_tests {
     #[tokio::test]
     async fn tool_call_failure_emits_execution_failed_error_kind() {
         let tools = {
-            let mut t = ToolRegistry::new();
+            let t = ToolRegistry::new();
             t.register(Box::new(FailingTool)).await;
             t
         };
@@ -1723,7 +1725,7 @@ mod telemetry_tests {
     #[tokio::test]
     async fn tool_call_warning_with_stderr_emits_warning_error_kind() {
         let tools = {
-            let mut t = ToolRegistry::new();
+            let t = ToolRegistry::new();
             t.register(Box::new(WarningTool)).await;
             t
         };
@@ -1769,7 +1771,7 @@ mod telemetry_tests {
     #[tokio::test]
     async fn tool_call_success_without_stderr_emits_no_error_fields() {
         let tools = {
-            let mut t = ToolRegistry::new();
+            let t = ToolRegistry::new();
             t.register(Box::new(EchoTool { name: "bash" })).await;
             t
         };
@@ -1813,7 +1815,7 @@ mod telemetry_tests {
 
 #[tokio::test]
 async fn sub_agent_normal_path_completes_one_turn() {
-    use crate::agent::sub_agent::SubAgentTask;
+    use crate::agent::parallel_edit::SubAgentTask;
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1831,7 +1833,7 @@ async fn sub_agent_normal_path_completes_one_turn() {
     ]));
 
     let tools = {
-        let mut tools = ToolRegistry::new();
+        let tools = ToolRegistry::new();
         tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
         tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         Arc::new(tools)
@@ -1864,7 +1866,7 @@ async fn sub_agent_normal_path_completes_one_turn() {
 
 #[tokio::test]
 async fn sub_agent_hallucinating_mock_breaks_after_nudge_unheeded() {
-    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use crate::agent::parallel_edit::{SubAgentFailure, SubAgentTask};
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1882,7 +1884,7 @@ async fn sub_agent_hallucinating_mock_breaks_after_nudge_unheeded() {
     ]));
 
     let tools = {
-        let mut tools = ToolRegistry::new();
+        let tools = ToolRegistry::new();
         tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
         tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         Arc::new(tools)
@@ -1919,7 +1921,7 @@ async fn sub_agent_hallucinating_mock_breaks_after_nudge_unheeded() {
 
 #[tokio::test]
 async fn sub_agent_recovers_from_first_timeout_then_succeeds() {
-    use crate::agent::sub_agent::SubAgentTask;
+    use crate::agent::parallel_edit::SubAgentTask;
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1938,7 +1940,7 @@ async fn sub_agent_recovers_from_first_timeout_then_succeeds() {
     ]));
 
     let tools = {
-        let mut tools = ToolRegistry::new();
+        let tools = ToolRegistry::new();
         tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
         Arc::new(tools)
@@ -1962,7 +1964,7 @@ async fn sub_agent_recovers_from_first_timeout_then_succeeds() {
 
 #[tokio::test]
 async fn sub_agent_provider_hard_error_breaks_immediately_no_retry() {
-    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use crate::agent::parallel_edit::{SubAgentFailure, SubAgentTask};
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1976,7 +1978,7 @@ async fn sub_agent_provider_hard_error_breaks_immediately_no_retry() {
     ]));
 
     let tools = {
-        let mut tools = ToolRegistry::new();
+        let tools = ToolRegistry::new();
         tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         Arc::new(tools)
     };
@@ -2004,7 +2006,7 @@ async fn sub_agent_provider_hard_error_breaks_immediately_no_retry() {
 
 #[tokio::test]
 async fn sub_agent_blocked_tool_redirects_via_validate_args() {
-    use crate::agent::sub_agent::SubAgentTask;
+    use crate::agent::parallel_edit::SubAgentTask;
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2026,7 +2028,7 @@ async fn sub_agent_blocked_tool_redirects_via_validate_args() {
     ]));
 
     let tools = {
-        let mut tools = ToolRegistry::new();
+        let tools = ToolRegistry::new();
         tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
         tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         Arc::new(tools)
@@ -2052,7 +2054,7 @@ async fn sub_agent_blocked_tool_redirects_via_validate_args() {
 
 #[tokio::test]
 async fn sub_agent_failed_edit_doesnt_burn_progress_signal() {
-    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use crate::agent::parallel_edit::{SubAgentFailure, SubAgentTask};
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2074,7 +2076,7 @@ async fn sub_agent_failed_edit_doesnt_burn_progress_signal() {
     ]));
 
     let tools = {
-        let mut tools = ToolRegistry::new();
+        let tools = ToolRegistry::new();
         tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
         Arc::new(tools)
@@ -2109,7 +2111,7 @@ async fn sub_agent_failed_edit_doesnt_burn_progress_signal() {
 
 #[tokio::test]
 async fn sub_agent_pool_one_failure_doesnt_affect_others() {
-    use crate::agent::sub_agent::{SubAgentPool, SubAgentTask};
+    use crate::agent::parallel_edit::{SubAgentPool, SubAgentTask};
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2135,7 +2137,7 @@ async fn sub_agent_pool_one_failure_doesnt_affect_others() {
     ]));
 
     let tools = {
-        let mut tools = ToolRegistry::new();
+        let tools = ToolRegistry::new();
         tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
         tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
         Arc::new(tools)

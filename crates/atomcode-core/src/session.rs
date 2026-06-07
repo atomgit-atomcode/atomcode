@@ -41,6 +41,32 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+/// Per-turn summary stats, recorded at each completed turn so `/resume` can
+/// re-render the same `✓ … 工具 · tokens` divider the live turn showed
+/// (token/duration are otherwise lost — only `messages` is persisted).
+///
+/// `after_message` anchors the divider to a position in `messages`: it is the
+/// conversation message count at the moment the turn completed, so on replay
+/// the divider is emitted right after that many messages have been rendered.
+/// Anchoring by count (rather than a turn ordinal) stays correct even if some
+/// turns were cancelled and produced no stat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnStat {
+    /// Number of messages in the conversation when this turn completed.
+    pub after_message: usize,
+    /// LLM round-trips in the turn.
+    pub turn_count: usize,
+    /// Tool calls executed in the turn.
+    pub tool_call_count: usize,
+    /// Wall-clock duration of the turn, milliseconds.
+    pub duration_ms: u64,
+    /// Total tokens the turn consumed.
+    pub total_tokens: usize,
+    /// The turn ended in an error (render the ✗ "stopped" variant).
+    #[serde(default)]
+    pub errored: bool,
+}
+
 /// A session represents an independent conversation context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -65,6 +91,12 @@ pub struct Session {
     /// load as `false` (i.e., behave like auto-named).
     #[serde(default)]
     pub user_renamed: bool,
+    /// Per-turn summary stats (one per completed turn), so `/resume` can
+    /// re-render the `✓ … 工具 · tokens` divider between turns. `#[serde(default)]`
+    /// keeps sessions saved before this field loading — they replay with plain
+    /// inter-turn dividers (no stats numbers) instead.
+    #[serde(default)]
+    pub turn_stats: Vec<TurnStat>,
 }
 
 impl Session {
@@ -79,6 +111,7 @@ impl Session {
             updated_at: now,
             messages: Vec::new(),
             user_renamed: false,
+            turn_stats: Vec::new(),
         }
     }
 
@@ -92,6 +125,7 @@ impl Session {
             updated_at: current_timestamp(),
             messages: Vec::new(),
             user_renamed: false,
+            turn_stats: Vec::new(),
         }
     }
 
@@ -114,11 +148,16 @@ impl Session {
             return;
         }
 
+        // Primary: filter by the `synthetic` flag — accurate for sessions
+        // written after the field landed. Secondary: bracket-prefix
+        // heuristic (`[Context was compressed]` / `[System meta...]`)
+        // for legacy session files whose messages were saved before the
+        // field existed and so default to `synthetic = false`.
         let first_real_user = self
             .messages
             .iter()
-            .filter(|m| matches!(m.role, Role::User))
-            .find_map(|m| m.text().filter(|t| !is_synthetic_user_text(t)));
+            .filter(|m| matches!(m.role, Role::User) && !m.synthetic)
+            .find_map(|m| m.text().filter(|t| !is_synthetic_user_text_legacy(t)));
 
         if let Some(text) = first_real_user {
             let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
@@ -140,10 +179,20 @@ impl Session {
 }
 
 fn should_auto_name_session(name: &str) -> bool {
+    // Names starting with `[` are legacy auto-names derived from a
+    // synthetic user message (pre-`Message.synthetic`-field heuristic).
+    // Treat them like default / session-<ts>: candidates for re-naming
+    // once a real user message is found.
     name == "default" || name.starts_with("session-") || name.trim_start().starts_with('[')
 }
 
-fn is_synthetic_user_text(text: &str) -> bool {
+/// Legacy synthetic-message detector kept as a defensive fallback for
+/// session JSONs saved before `Message.synthetic` existed. Such messages
+/// load with `synthetic = false` (serde default), so the bracket-prefix
+/// convention is the only signal we have for them. New code should rely
+/// on the `synthetic` field directly; only `auto_name_from_messages`
+/// retains this heuristic so legacy `/resume` picker titles stay sane.
+fn is_synthetic_user_text_legacy(text: &str) -> bool {
     text.trim_start().starts_with('[')
 }
 
@@ -222,7 +271,7 @@ impl SessionManager {
 
         // Perform migration
         if let Err(e) = std::fs::create_dir_all(&new_dir) {
-            eprintln!("[session] Failed to create sessions dir: {}", e);
+            tracing::warn!("[session] Failed to create sessions dir: {}", e);
             return;
         }
 
@@ -234,7 +283,7 @@ impl SessionManager {
                     let dst = new_dir.join(entry.file_name());
                     if src.is_dir() {
                         if let Err(e) = std::fs::create_dir_all(&dst) {
-                            eprintln!("[session] Failed to create {:?}: {}", dst, e);
+                            tracing::warn!("[session] Failed to create {:?}: {}", dst, e);
                             continue;
                         }
                         if let Ok(files) = std::fs::read_dir(&src) {
@@ -242,7 +291,7 @@ impl SessionManager {
                                 let src_file = file.path();
                                 let dst_file = dst.join(file.file_name());
                                 if let Err(e) = std::fs::copy(&src_file, &dst_file) {
-                                    eprintln!("[session] Failed to copy {:?}: {}", src_file, e);
+                                    tracing::warn!("[session] Failed to copy {:?}: {}", src_file, e);
                                 } else {
                                     migrated += 1;
                                 }
@@ -251,14 +300,14 @@ impl SessionManager {
                     }
                 }
                 if migrated > 0 {
-                    eprintln!(
+                    tracing::info!(
                         "[session] Migrated {} session(s) from legacy location",
                         migrated
                     );
                 }
             }
             Err(e) => {
-                eprintln!("[session] Failed to read legacy sessions dir: {}", e);
+                tracing::warn!("[session] Failed to read legacy sessions dir: {}", e);
             }
         }
     }
@@ -421,6 +470,31 @@ mod tests {
         let id1 = SessionId::new();
         let id2 = SessionId::new();
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn turn_stats_round_trip_and_default_empty_for_old_sessions() {
+        let mut s = Session::new(PathBuf::from("/tmp/x"));
+        s.turn_stats.push(TurnStat {
+            after_message: 4,
+            turn_count: 3,
+            tool_call_count: 5,
+            duration_ms: 6800,
+            total_tokens: 1651,
+            errored: false,
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.turn_stats.len(), 1);
+        assert_eq!(back.turn_stats[0].after_message, 4);
+        assert_eq!(back.turn_stats[0].total_tokens, 1651);
+
+        // A session saved before this field existed (no `turn_stats` key) must
+        // still load — `#[serde(default)]` → empty vec, replay falls back to
+        // plain dividers.
+        let old = r#"{"id":"abc","name":"x","working_dir":"/tmp/x","created_at":0,"updated_at":0,"messages":[]}"#;
+        let loaded: Session = serde_json::from_str(old).unwrap();
+        assert!(loaded.turn_stats.is_empty());
     }
 
     #[test]

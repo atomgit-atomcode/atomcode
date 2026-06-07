@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.1</span>
+    <span class="dhdr-ver">v4.25.0</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -56,11 +56,14 @@
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
     <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
     <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
     <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
   </div>
 
   <div class="dside-group">
@@ -79,8 +82,7 @@
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/codingplan</code></td><td><strong>Recommended</strong> — one command logs you in, claims AtomGit CodingPlan free tokens, and auto-configures a provider from the granted model list. The lowest-friction entry point for first-time users</td></tr>
-          <tr><td><code>/login</code></td><td>Only performs AtomGit OAuth identity auth, <strong>does not change provider config</strong> (for users who already have an API key but want AtomGit integrations like <code>/issue</code>)</td></tr>
+          <tr><td><code>/login</code></td><td><strong>Recommended</strong> — one command runs AtomGit OAuth + claims CodingPlan free tokens + auto-configures a provider from the granted model list. The lowest-friction entry point for first-time users; re-running after you're already signed in idempotently re-syncs the model list. <em>As of v4.25.0 <code>/codingplan</code> has been folded into <code>/login</code>; the standalone entry has been removed</em></td></tr>
           <tr><td><code>/resume</code></td><td>Open the session picker to restore any previously persisted session (messages, directory, and model state)</td></tr>
           <tr><td><code>/session</code></td><td>Start a fresh, clean session</td></tr>
           <tr><td><code>/bg</code></td><td>Send the current session to the background and open a new foreground; subcommands: <code>/bg list</code>, <code>/bg &lt;N&gt;</code>, <code>/bg drop &lt;N&gt;</code>, <code>/bg help</code>. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
@@ -98,7 +100,7 @@
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/undo</code></td><td>Roll back every AI file edit from the last turn, using file-history snapshots</td></tr>
+          <tr><td><code>/undo</code> · <code>/undo N</code></td><td>Roll conversation memory back to before the last turn (or turn N) and restore that prompt into the input box; rewinds memory only — does not revert files on disk</td></tr>
           <tr><td><code>/diff</code></td><td>Show the git diff of uncommitted changes in the working directory</td></tr>
           <tr><td><code>/cost</code></td><td>Show output tokens for the current session. APIs without usage reporting are estimated automatically</td></tr>
           <tr><td><code>/context</code></td><td>Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage</td></tr>
@@ -146,10 +148,12 @@
         <tbody>
           <tr><td><code>/setup</code></td><td>On first run, install the bundled <code>atomcode-automation-recommender</code> skill into <code>~/.atomcode/skills/</code>, append <code>.atomcode/local/</code> to project <code>.gitignore</code>, and write <code>.atomcode/setup-state.json</code> (signals hash + atomcode version + installed list) under a project-level lock. Then invoke the recommender skill — it scans the project (languages, frameworks, hooks already in use), searches the web, and proposes additional atomcode skills to install for this codebase. Subsequent runs skip the seed install and re-invoke the skill directly. Extra text after the command is forwarded to the skill as a steering hint, e.g. <code>/setup focus on testing</code>. The CLI form <code>atomcode setup --force</code> forces a clean reinstall of seed files even when their content hash matches</td></tr>
           <tr><td><code>/skills</code></td><td>Browse loaded skills (project- and user-level). Each skill also appears as a standalone slash command in the menu — trigger with <code>/&lt;skill-name&gt;</code></td></tr>
-          <tr><td><code>/plugin marketplace</code></td><td>Open the plugin marketplace browser to pick and install from a registered marketplace</td></tr>
+          <tr><td><code>/plugin</code></td><td>Open the interactive plugin manager — browse marketplaces, install/uninstall plugins, add/remove marketplaces from one screen</td></tr>
+          <tr><td><code>/plugin marketplace add|remove|update|list</code></td><td>Manage marketplace registrations (add clones a git repo, remove deletes, update pulls latest, list shows all)</td></tr>
           <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>Install a plugin from the named marketplace</td></tr>
           <tr><td><code>/plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>Uninstall an installed plugin (the marketplace registration is kept)</td></tr>
           <tr><td><code>/plugin list</code></td><td>List locally installed plugins</td></tr>
+          <tr><td><code>/plugin reload</code></td><td>Reload all plugins (re-scan disk, refresh skill/hook registration)</td></tr>
         </tbody>
       </table>
       <p>See <a href="./skills.html">Skills</a> and <a href="./plugins.html">Plugin System</a> for details.</p>
@@ -167,6 +171,21 @@
       </table>
       <p>Full configuration and usage at <a href="./mcp.html">MCP Integration</a>.</p>
 
+      <h2>Web UI &amp; sync</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>What it does</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/webui</code></td><td>Launch the browser interface and open it (binds <code>127.0.0.1:13457</code> by default — local only). The current TUI session is attached to live sync automatically</td></tr>
+          <tr><td><code>/webui --host &lt;addr&gt;</code></td><td>Bind the server to a given address; <code>/webui lan</code> equals <code>--host 0.0.0.0</code> (exposes it to the LAN). Pair with a 蒲公英 virtual IP for remote access — see <a href="./webui-remote-access.html">Remote Access</a></td></tr>
+          <tr><td><code>/webui stop</code></td><td>Stop the webui server</td></tr>
+          <tr><td><code>/sync</code></td><td>Attach the current TUI to a running webui session (run <code>/webui</code> first). Both ends sync live in both directions; multiple browsers / terminals can watch the same session</td></tr>
+          <tr><td><code>/sync off</code></td><td>Leave sync and return to a standalone session</td></tr>
+        </tbody>
+      </table>
+      <p>More in <a href="./webui.html">Web UI</a>.</p>
+
       <h2>Config &amp; help</h2>
       <table>
         <thead>
@@ -176,11 +195,12 @@
           <tr><td><code>/status</code></td><td>Show login status, current provider, model, context budget, CodingPlan usage and reset time</td></tr>
           <tr><td><code>/whoami</code></td><td>Show the username / email of the current AtomGit-logged-in user</td></tr>
           <tr><td><code>/config</code></td><td>Show the path of <code>~/.atomcode/config.toml</code></td></tr>
-          <tr><td><code>/reload</code></td><td>Hot-reload <code>~/.atomcode/config.toml</code> from disk — external edits (or changes from another terminal's <code>/codingplan</code>) take effect without restarting atomcode</td></tr>
+          <tr><td><code>/reload</code></td><td>Hot-reload <code>~/.atomcode/config.toml</code> from disk — external edits (or changes from another terminal's <code>/login</code>) take effect without restarting atomcode</td></tr>
           <tr><td><code>/language</code></td><td>Switch UI language: auto-detect (<code>LC_ALL</code> / <code>LANG</code>), English, or Simplified Chinese. Takes effect immediately and is written back to <code>~/.atomcode/config.toml</code></td></tr>
           <tr><td><code>/welcome</code></td><td>Re-open the 3-step first-run wizard (welcome → language → setup). Non-empty sessions are confirmed with a <code>y/N</code> before clearing the screen. Both language and default onboarding path can be revisited here</td></tr>
           <tr><td><code>/logout</code></td><td>Clear the AtomGit OAuth token</td></tr>
           <tr><td><code>/upgrade</code></td><td>Auto-upgrade to the latest version; <code>/upgrade rollback</code> reverts to the previous version</td></tr>
+          <tr><td><code>/guide</code></td><td>Built-in onboarding guide: <code>/guide</code> lists topics you can ask about (quickstart, switch model, MCP, Skills, memory, background tasks, context, keybindings, config); <code>/guide &lt;topic&gt;</code> explains it right in the chat (first run auto-installs the <code>atomcode-skills</code> plugin)</td></tr>
           <tr><td><code>/help</code></td><td>List every available slash command</td></tr>
           <tr><td><code>/keys</code></td><td>Show the keyboard-shortcut reference (grouped by input / history / session / modal navigation, with per-terminal compatibility notes for <code>Shift+Enter</code> and <code>Alt+Enter</code>). See <a href="./keybindings.html">Keybindings</a></td></tr>
           <tr><td><code>/quit</code></td><td>Exit atomcode (or hit <code>Ctrl+C</code> twice)</td></tr>
@@ -198,7 +218,7 @@
       <h2>Typical workflows</h2>
 
       <h3>First launch — one-click onboarding</h3>
-      <pre><code>&gt; /codingplan
+      <pre><code>&gt; /login
   ✔ Logged in as alice (alice, alice@example.com)
   ✔ CodingPlan claimed — CodingPlan Free · expires 2026-05-22 (29d / 30d)
   ✔ 3 models registered as AtomGit-* providers
@@ -214,11 +234,13 @@ Session token usage
 - Current turn tokens: 2156
 - Context: 42K / 128K</code></pre>
 
-      <h3>Roll back when the result isn't what you wanted</h3>
+      <h3>Rewind and re-ask when the answer goes sideways</h3>
       <pre><code>&gt; add JSDoc to every function
-... (AI edited 12 files)
+... (the reply went off the rails)
 &gt; /undo
-Rolled back 12 file edits from the last turn.</code></pre>
+Rolled back to turn 3 of 3.
+⚠ Only conversation memory was rewound; files on disk were not restored. Revert code manually or check /diff.
+(your last prompt is back in the input box — edit and resend)</code></pre>
 
       <h3>Swap the model when it underperforms</h3>
       <pre><code>&gt; /model

@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.1</span>
+    <span class="dhdr-ver">v4.25.0</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -56,11 +56,14 @@
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
     <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
     <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
     <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
   </div>
 
   <div class="dside-group">
@@ -94,6 +97,16 @@
       <div class="callout callout-info">
         <strong>敏感路径</strong>
         <p>写入 <code>/etc</code>、<code>~/.ssh</code>、shell 配置文件等路径会强制触发权限对话框,无法用"始终允许"一次性跳过。源码文件的 <code>rm</code> 删除同样需要显式确认。</p>
+      </div>
+
+      <div class="callout callout-info">
+        <strong>后台运行长任务</strong>
+        <p>给 <code>bash</code> 传 <code>run_in_background: true</code>,命令会以独立进程在后台启动并<strong>立即返回</strong> PID 与日志文件路径,进程在多轮对话间持续存活 —— 适合开发服务器、文件监听、隧道等长跑任务,不必阻塞会话。</p>
+      </div>
+
+      <div class="callout callout-warn">
+        <strong>破坏性命令拦截</strong>
+        <p><code>rm -rf</code>、<code>dd</code>、<code>mkfs</code>、<code>sudo</code> 等高危命令,以及会清库重建表的数据库迁移(如 <code>migrate:fresh</code>、<code>db:reset</code>)都会强制弹出权限确认。这类确认<strong>始终</strong>触发 —— 即便之前对 <code>bash</code> 选过"始终允许"也不能跳过。</p>
       </div>
 
       <h2>代码图谱(8 个)</h2>

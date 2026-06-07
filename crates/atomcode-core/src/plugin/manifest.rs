@@ -24,17 +24,24 @@ pub struct PluginEntry {
 
 /// Plugin source spec. Mirrors Claude Code's marketplace schema.
 ///
-/// Two wire forms are accepted via untagged deserialization:
+/// Three wire forms are accepted via untagged deserialization:
 ///   1. A plain string → inline path inside the marketplace clone (e.g. "./",
 ///      "plugins/foo"). This is the historical AtomCode form.
-///   2. A tagged object `{"source": "url"|"git"|"github"|"local", ...}`
-///      describing an external location that must be cloned/copied into the
-///      plugin's own install directory.
+///   2. A tagged object `{"source": "url"|"git"|"github"|"git-subdir"|"local",
+///      ...}` describing an external location to clone/copy into the plugin's
+///      own install directory.
+///   3. Anything else (e.g. a future `{"source":"npm",...}`) → `Unknown`. This
+///      keeps one unrecognised entry from failing the whole catalog parse
+///      (see anthropics/claude-plugins-official#585, where a `git-subdir`
+///      entry broke clients that only knew the older tags).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum PluginSource {
     Inline(String),
     External(ExternalSource),
+    /// Unrecognised source object. Consumers skip it (with a warning) instead
+    /// of aborting the entire marketplace.
+    Unknown(serde_json::Value),
 }
 
 impl Default for PluginSource {
@@ -44,7 +51,7 @@ impl Default for PluginSource {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "source", rename_all = "lowercase")]
+#[serde(tag = "source", rename_all = "kebab-case")]
 pub enum ExternalSource {
     /// Arbitrary git URL. Cloned with `git clone`.
     Url {
@@ -61,6 +68,16 @@ pub enum ExternalSource {
     /// GitHub shorthand. Expanded to `https://github.com/<repo>.git`.
     Github {
         repo: String,
+        #[serde(flatten)]
+        pin: GitPin,
+    },
+    /// Plugin living in a SUBDIRECTORY of a git repo (Claude Code's
+    /// `git-subdir`). `url` is a git URL or `owner/repo` shorthand; `path` is
+    /// the subdirectory within the repo. The ref/commit pin rides in `GitPin`
+    /// (`ref`). Realised by a sparse + partial clone of just that subtree.
+    GitSubdir {
+        url: String,
+        path: String,
         #[serde(flatten)]
         pin: GitPin,
     },
@@ -374,6 +391,64 @@ mod tests {
         assert!(matches!(
             m.plugins[0].source,
             PluginSource::External(ExternalSource::Git { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_git_subdir_shorthand_with_ref() {
+        // The real official-catalog shape: owner/repo shorthand + path + ref.
+        let raw = r#"{"name":"mp","plugins":[{"name":"p","source":{
+            "source":"git-subdir","url":"openclaw/openclaw",
+            "path":".agents/skills/autoreview","ref":"main"}}]}"#;
+        let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
+        match &m.plugins[0].source {
+            PluginSource::External(ExternalSource::GitSubdir { url, path, pin }) => {
+                assert_eq!(url, "openclaw/openclaw");
+                assert_eq!(path, ".agents/skills/autoreview");
+                assert_eq!(pin.git_ref.as_deref(), Some("main"));
+            }
+            other => panic!("expected External::GitSubdir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_git_subdir_full_url() {
+        let raw = r#"{"name":"mp","plugins":[{"name":"p","source":{
+            "source":"git-subdir","url":"https://example.com/r.git",
+            "path":"plugins/foo"}}]}"#;
+        let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
+        assert!(matches!(
+            m.plugins[0].source,
+            PluginSource::External(ExternalSource::GitSubdir { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_source_type_becomes_unknown_variant() {
+        // A future/unsupported tag (e.g. `npm`) must not error — it lands in
+        // PluginSource::Unknown so the catalog still parses.
+        let raw = r#"{"name":"p","source":{"source":"npm","package":"@x/y"}}"#;
+        let e: PluginEntry = serde_json::from_str(raw).unwrap();
+        assert!(matches!(e.source, PluginSource::Unknown(_)));
+    }
+
+    /// Regression for anthropics/claude-plugins-official#585: one unrecognised
+    /// entry must NOT fail the whole catalog. A mix of inline + git-subdir +
+    /// an unknown `npm` entry parses, yielding all three (the npm one Unknown).
+    #[test]
+    fn catalog_with_one_unknown_entry_still_parses() {
+        let raw = r#"{"name":"mp","plugins":[
+            {"name":"a","source":"plugins/a"},
+            {"name":"b","source":{"source":"npm","package":"@x/y"}},
+            {"name":"c","source":{"source":"git-subdir","url":"o/r","path":"sub","ref":"main"}}
+        ]}"#;
+        let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.plugins.len(), 3);
+        assert!(matches!(m.plugins[0].source, PluginSource::Inline(_)));
+        assert!(matches!(m.plugins[1].source, PluginSource::Unknown(_)));
+        assert!(matches!(
+            m.plugins[2].source,
+            PluginSource::External(ExternalSource::GitSubdir { .. })
         ));
     }
 

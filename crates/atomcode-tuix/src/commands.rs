@@ -70,11 +70,15 @@ impl CommandRegistry {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
-    Command { name: "codingplan", desc: "Claim CodingPlan + set up models from the plan's model list", needs_args: false },
+    Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false },
+    // needs_args=true so selecting it only completes to `/webui ` (does NOT
+    // launch) — lets the user append a subcommand (stop / lan / --host <addr>)
+    // before Enter. A bare `/webui ` + Enter still launches on 127.0.0.1.
+    Command { name: "webui",   desc: "Launch the browser webui (subcommands: stop, lan, --host <addr>)", needs_args: true },
+    Command { name: "sync",    desc: "Attach to live webui session (/sync off to detach)", needs_args: false },
     Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
     Command { name: "rename",  desc: "Rename current session", needs_args: true },
-    Command { name: "login",   desc: "Sign in with AtomGit OAuth", needs_args: false },
     Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false },
     Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false },
     Command { name: "model",   desc: "Switch provider / model", needs_args: false },
@@ -97,14 +101,20 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "forget", desc: "Remove matching memories", needs_args: true },
     Command { name: "memory", desc: "Show all saved memories", needs_args: false },
     Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout)", needs_args: false },
-    Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
+    Command { name: "undo",    desc: "Undo a turn (memory rollback): /undo or /undo N", needs_args: true },
     Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
     Command { name: "issue",   desc: "Report a bug / request a feature for AtomCode itself (interactive wizard)", needs_args: false },
     Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false },
     Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
+    // Gateway entry: opens a second-level palette (high / max / off).
+    // needs_args=true so Enter rewrites the buffer to `/effort ` and the
+    // sub-mode menu renders the three choices. Selecting one commits as
+    // `/effort <choice>` → dispatched by the `effort` arm.
+    Command { name: "effort",  desc: "DeepSeek reasoning effort control (high / max / off)", needs_args: true },
     Command { name: "help",    desc: "Show this help", needs_args: false },
+    Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true },
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
     Command { name: "language", desc: "Switch display language", needs_args: false },
     Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false },
@@ -115,7 +125,11 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // skill list. Selecting a skill commits as `/skills <name>` →
     // dispatched by the `skills` arm in execute_slash_command.
     Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
-    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: true },
+    // needs_args=false so selecting `/plugin` opens the manager modal on the
+    // first Enter (like /model, /provider, /session). Subcommands
+    // (`/plugin install x@mp`, `uninstall`, `marketplace`, `list`) still work
+    // by typing the full line — needs_args only changes the menu-Enter behavior.
+    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: false },
     // Windows fallback for Ctrl+V: Windows Terminal / conhost
     // intercept Ctrl+V as their own `paste` action (which forwards
     // only `CF_UNICODETEXT`) before the keystroke reaches atomcode,
@@ -132,8 +146,8 @@ const BUILTIN_COMMANDS: &[Command] = &[
 pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
     use crate::i18n::{t, Msg};
     let msg = match name {
+        "webui" => Msg::CmdDescWebui,
         "setup" => Msg::CmdDescSetup,
-        "codingplan" => Msg::CmdDescCodingplan,
         "resume" => Msg::CmdDescResume,
         "rename" => Msg::CmdDescRename,
         "login" => Msg::CmdDescLogin,
@@ -165,7 +179,9 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "plan" => Msg::CmdDescPlan,
         "build" => Msg::CmdDescBuild,
         "think" => Msg::CmdDescThink,
+        "effort" => Msg::CmdDescEffort,
         "help" => Msg::CmdDescHelp,
+        "guide" => Msg::CmdDescGuide,
         "keys" => Msg::CmdDescKeys,
         "language" => Msg::CmdDescLanguage,
         "welcome" => Msg::CmdWelcomeDescription,
@@ -254,9 +270,41 @@ pub fn parse_slash_line(s: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Detect a `!cmd` bash-mode line. Returns the trimmed command when the
+/// line begins (strictly at column 0) with `!` and has a non-empty body.
+/// `!` alone, whitespace-only, or a non-leading `!` returns None.
+pub fn parse_bash_command(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('!')?;
+    let cmd = rest.trim();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_prefix_extracts_command() {
+        assert_eq!(parse_bash_command("!ls"), Some("ls"));
+        assert_eq!(parse_bash_command("!  echo hi"), Some("echo hi"));
+        assert_eq!(parse_bash_command("!git status"), Some("git status"));
+    }
+
+    #[test]
+    fn bare_bang_is_none() {
+        assert_eq!(parse_bash_command("!"), None);
+        assert_eq!(parse_bash_command("!   "), None);
+    }
+
+    #[test]
+    fn leading_space_not_bash() {
+        assert_eq!(parse_bash_command(" !ls"), None);
+        assert_eq!(parse_bash_command("echo !x"), None);
+    }
 
     #[test]
     fn registry_lookup_by_name() {

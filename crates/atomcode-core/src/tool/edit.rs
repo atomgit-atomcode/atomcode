@@ -124,7 +124,10 @@ async fn validate_write_check(
     // is a silent no-op and a stale `store_id` keeps serving pre-edit
     // bytes to the next peek_file call.
     let raw_path = std::path::Path::new(file_path);
-    let canon_path = std::fs::canonicalize(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
+    // tokio::fs so a hung filesystem doesn't block the async worker.
+    let canon_path = tokio::fs::canonicalize(raw_path)
+        .await
+        .unwrap_or_else(|_| raw_path.to_path_buf());
 
     // Notify LSP that file changed (if LSP is enabled).
     ctx.notify_lsp_file_changed(&canon_path, &validated.fixed_content)
@@ -339,21 +342,47 @@ impl Tool for EditFileTool {
     }
 
     fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        // Same merge contract as `write.rs::approval_with_context`. Two checks
+        // need to combine: `approval()` flags sensitive targets (.env, id_rsa,
+        // *.pem, /etc/*, ~/.ssh/*) regardless of workspace; `approval_for_path`
+        // flags out-of-workspace writes. When the path is in-workspace but
+        // sensitive, `approval_for_path` returns AutoApprove and the base's
+        // `RequireApproval` MUST be upgraded to `RequireApprovalAlways` —
+        // otherwise a prior session [A] on edit_file would let the model edit
+        // an in-workspace `.env` without prompting (same class of bypass as
+        // the bash rmdir incident; see bash.rs:115).
+        let base = self.approval(args);
         let parsed = match serde_json::from_str::<EditFileArgs>(args) {
             Ok(parsed) => parsed,
-            Err(_) => return self.approval(args),
+            Err(_) => return base,
         };
         let working_dir = match ctx.working_dir.try_read() {
             Ok(wd) => wd.clone(),
-            Err(_) => return self.approval(args),
+            Err(_) => return base,
         };
         match super::approval_for_path(
             &parsed.file_path,
             &working_dir,
             super::ExternalPathAction::Write,
         ) {
-            Ok(approval) => approval,
-            Err(_) => self.approval(args),
+            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => {
+                ApprovalRequirement::RequireApprovalAlways(reason)
+            }
+            Ok(ApprovalRequirement::RequireApproval(reason)) => {
+                ApprovalRequirement::RequireApproval(reason)
+            }
+            // Writes never path-scope; treat a scoped result (the Write action
+            // doesn't produce one today) as the strictest always-ask.
+            Ok(ApprovalRequirement::RequireApprovalScoped { reason, .. }) => {
+                ApprovalRequirement::RequireApprovalAlways(reason)
+            }
+            Ok(ApprovalRequirement::AutoApprove) => match base {
+                ApprovalRequirement::RequireApproval(reason) => {
+                    ApprovalRequirement::RequireApprovalAlways(reason)
+                }
+                other => other,
+            },
+            Err(_) => base,
         }
     }
 
@@ -1699,6 +1728,62 @@ mod security_tests {
             tool.approval("{not valid json"),
             ApprovalRequirement::RequireApproval(_)
         ));
+    }
+
+    // Regression: a single `[A]` on edit_file for a safe edit must NOT
+    // silently disarm the sensitive-path guard for later calls. Pre-fix
+    // `approval_with_context` only ran the workspace-boundary check and
+    // dropped the `is_sensitive_input_path` result from `approval()`, so
+    // editing a workspace-local `.env` came back as AutoApprove — worse
+    // than the bash session-grant bypass (no prompt at all). Fix contract:
+    // sensitive in-workspace paths upgrade to RequireApprovalAlways so
+    // PermissionStore::check routes to Ask regardless of session grants.
+    // Mirrors `bash_destructive_command_through_store_with_session_grant_asks`.
+    #[test]
+    fn edit_file_sensitive_in_workspace_path_returns_require_approval_always() {
+        let workspace = TempDir::new().unwrap();
+        let dotenv = workspace.path().join(".env");
+        let args = serde_json::json!({
+            "file_path": dotenv.to_string_lossy(),
+            "old_string": "old",
+            "new_string": "new"
+        })
+        .to_string();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        assert!(
+            matches!(
+                EditFileTool.approval_with_context(&args, &ctx),
+                ApprovalRequirement::RequireApprovalAlways(_)
+            ),
+            "sensitive in-workspace path (.env) must return RequireApprovalAlways so a \
+             session grant on edit_file cannot bypass approval",
+        );
+    }
+
+    // Cross-layer integration: edit_file on a sensitive in-workspace path
+    // with an existing `grant_session("edit_file")` must still Ask. Pins
+    // the contract end-to-end against a future refactor of either layer.
+    #[test]
+    fn edit_file_sensitive_path_through_store_with_session_grant_asks() {
+        use crate::tool::{PermissionDecision, PermissionStore};
+        let workspace = TempDir::new().unwrap();
+        let dotenv = workspace.path().join(".env");
+        let args = serde_json::json!({
+            "file_path": dotenv.to_string_lossy(),
+            "old_string": "old",
+            "new_string": "new"
+        })
+        .to_string();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let mut store = PermissionStore::new();
+        store.grant_session("edit_file"); // simulate prior [A] on a safe edit
+        let approval = EditFileTool.approval_with_context(&args, &ctx);
+        let decision = store.check("edit_file", &approval);
+        assert!(
+            matches!(decision, PermissionDecision::Ask(_)),
+            "edit on sensitive in-workspace path (.env) must prompt the user even with a \
+             session grant, got {decision:?}",
+        );
     }
 
     #[tokio::test]

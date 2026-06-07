@@ -33,6 +33,10 @@ pub struct SessionPicker {
     pub rename_editing: bool,
     /// The new name being edited for rename.
     pub rename_buffer: String,
+    /// Index into `sessions` awaiting delete confirmation, or None.
+    pub confirm_delete: Option<usize>,
+    /// Status message shown in the footer (overwrites previous status).
+    pub delete_status: Option<String>,
 }
 
 impl SessionPicker {
@@ -45,6 +49,8 @@ impl SessionPicker {
             selected: 0,
             rename_editing: false,
             rename_buffer: String::new(),
+            confirm_delete: None,
+            delete_status: None,
         }
     }
 
@@ -66,6 +72,7 @@ impl SessionPicker {
             return;
         }
         self.selected = self.selected.saturating_sub(1);
+        self.confirm_delete = None;
     }
 
     pub fn down(&mut self) {
@@ -77,6 +84,7 @@ impl SessionPicker {
         if self.selected < max {
             self.selected += 1;
         }
+        self.confirm_delete = None;
     }
 
     pub fn chosen_id(&self) -> Option<atomcode_core::session::SessionId> {
@@ -170,23 +178,29 @@ impl Modal for SessionPicker {
         match code {
             KeyCode::Up => {
                 self.up();
+                self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             KeyCode::Down => {
                 self.down();
+                self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             KeyCode::Backspace => {
                 self.query.pop();
                 self.update_filter();
+                self.confirm_delete = None;
+                self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
                 self.query.push(c);
                 self.update_filter();
+                self.confirm_delete = None;
+                self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
@@ -196,6 +210,8 @@ impl Modal for SessionPicker {
                     if let Some(session) = self.sessions.get(idx) {
                         self.rename_buffer = session.name.clone();
                         self.rename_editing = true;
+                        self.confirm_delete = None;
+                        self.delete_status = None;
                         self.draw(buf, state, ctx, renderer);
                     }
                 } else {
@@ -204,6 +220,62 @@ impl Modal for SessionPicker {
                     ));
                     renderer.flush();
                 }
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Char(c) if mods.contains(KeyModifiers::CONTROL) && c == 'd' => {
+                // Ctrl+D: delete selected session (with confirmation)
+                let Some(idx) = self.filtered.get(self.selected).copied() else {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionNoneSelected).into_owned(),
+                    ));
+                    renderer.flush();
+                    return Ok(ModalAction::Continue);
+                };
+                if self.confirm_delete == Some(idx) {
+                    // Second Ctrl+D: confirm delete
+                    if let Some(session) = self.sessions.get(idx) {
+                        let id = session.id.clone();
+                        match ctx.session_manager.delete(&id) {
+                            Ok(()) => {
+                                let name = session.name.clone();
+                                self.sessions.remove(idx);
+                                self.confirm_delete = None;
+                                self.update_filter();
+                                // Point to the session that shifted into the deleted slot.
+                                // If that's out of bounds, go to the last one.
+                                self.selected = self
+                                    .filtered
+                                    .iter()
+                                    .position(|&fi| fi >= idx)
+                                    .unwrap_or(self.filtered.len().saturating_sub(1));
+                                self.delete_status = Some(
+                                    crate::i18n::t(crate::i18n::Msg::SessionDeleted {
+                                        name: &name,
+                                    }).into_owned(),
+                                );
+                            }
+                            Err(e) => {
+                                self.confirm_delete = None;
+                                self.delete_status = Some(
+                                    crate::i18n::t(crate::i18n::Msg::SessionDeleteFailed {
+                                        error: &e.to_string(),
+                                    }).into_owned(),
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    // First Ctrl+D: ask for confirmation
+                    self.confirm_delete = Some(idx);
+                    if let Some(session) = self.sessions.get(idx) {
+                        self.delete_status = Some(
+                            crate::i18n::t(crate::i18n::Msg::SessionDeleteConfirm {
+                                name: &session.name,
+                            }).into_owned(),
+                        );
+                    }
+                }
+                self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             KeyCode::Enter => {
@@ -219,14 +291,12 @@ impl Modal for SessionPicker {
                             .cmd_tx
                             .send(AgentCommand::SetMessages(session.messages.clone()))
                             .ok();
-                        // Continue accumulating into the same session
-                        // file — future TurnComplete saves overwrite it
-                        // instead of leaving the old snapshot + creating
-                        // a new one beside it.
-                        // Bind telemetry session_id to the resumed session's UUID.
-                        if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
-                            ctx.telemetry.set_session_id(uuid);
-                        }
+                        // Continue accumulating into the same session file —
+                        // future TurnComplete saves overwrite it. Bind
+                        // telemetry + agent (header/datalog) to the resumed
+                        // session's persistent id so /resume reuses its
+                        // original id (gateway routes back to the warm upstream).
+                        crate::event_loop::commands::bind_telemetry_to_session(ctx, &session);
                         ctx.current_session = session;
                         ctx.bg_manager
                             .set_foreground_session(ctx.current_session.clone());
@@ -247,18 +317,30 @@ impl Modal for SessionPicker {
                     }
                 }
             }
-            KeyCode::Esc => Ok(ModalAction::Close),
+            KeyCode::Esc => {
+                if self.confirm_delete.is_some() {
+                    self.confirm_delete = None;
+                    self.draw(buf, state, ctx, renderer);
+                    Ok(ModalAction::Continue)
+                } else {
+                    Ok(ModalAction::Close)
+                }
+            }
             _ => Ok(ModalAction::Continue),
         }
     }
 
     fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self);
+        let mut status = build_status(state, ctx);
+        if let Some(msg) = &self.delete_status {
+            status.hint = Some((msg.clone(), crate::render::HintSeverity::Info));
+        }
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),
             cursor_byte: buf.cursor,
             menu: Some(payload),
-            status: build_status(state, ctx),
+            status,
             attachments: Vec::new(),
         });
         renderer.flush();
@@ -280,7 +362,7 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
         return MenuPayload {
             items: vec![(label, String::new())],
             selected: 0,
-            kind: crate::render::MenuKind::SlashCommand,
+            kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
         };
     }
     let items: Vec<(String, String)> = p
@@ -307,7 +389,7 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
     MenuPayload {
         items,
         selected: p.selected,
-        kind: crate::render::MenuKind::SlashCommand,
+        kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
     }
 }
 
@@ -339,6 +421,31 @@ fn humanize_age(ts: u64) -> String {
 /// per-keystroke latency). `reset = false` appends to existing scrollback
 /// — used by the CLI auto-continue path at startup, which has the welcome
 /// banner above the replay and shouldn't wipe it.
+/// Build the inter-turn divider label from a persisted turn stat. `None`
+/// (old session, or a cancelled turn that recorded no stat) → empty label,
+/// which renders as a plain horizontal rule so the visual interval is still
+/// restored. `done` is fixed on replay (the live rotation is cosmetic).
+fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String {
+    match stat {
+        Some(s) if s.errored => crate::i18n::t(crate::i18n::Msg::TurnSummaryError {
+            turn_count: s.turn_count,
+            tool_call_count: s.tool_call_count,
+            duration: &crate::render::fmt_dur(std::time::Duration::from_millis(s.duration_ms)),
+            total_tokens: s.total_tokens,
+        })
+        .into_owned(),
+        Some(s) => crate::i18n::t(crate::i18n::Msg::TurnSummary {
+            done: "Done",
+            turn_count: s.turn_count,
+            tool_call_count: s.tool_call_count,
+            duration: &crate::render::fmt_dur(std::time::Duration::from_millis(s.duration_ms)),
+            total_tokens: s.total_tokens,
+        })
+        .into_owned(),
+        None => String::new(),
+    }
+}
+
 pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, reset: bool) {
     use atomcode_core::conversation::message::{MessageContent, Role};
     if reset {
@@ -348,7 +455,24 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
     renderer.render(UiLine::TurnSeparator {
         label: resumed.clone(),
     });
-    for m in &session.messages {
+    // Per-turn dividers: the live session draws a `✓ … 工具 · tokens` rule at
+    // every turn end, but only `messages` is persisted. `turn_stats` is anchored
+    // by "message count at turn end" — so as we replay, a divider goes before
+    // each new-turn user message (turn boundary), carrying the stored stats when
+    // present (None → plain rule, which still restores the interval for old
+    // sessions). Without this the previous turn's last output butts straight
+    // against the next user input.
+    let mut seen_user = false;
+    for (i, m) in session.messages.iter().enumerate() {
+        if matches!(m.role, Role::User) {
+            if seen_user {
+                let stat = session.turn_stats.iter().find(|s| s.after_message == i);
+                renderer.render(UiLine::TurnSeparator {
+                    label: turn_divider_label(stat),
+                });
+            }
+            seen_user = true;
+        }
         match (&m.role, &m.content) {
             (Role::User, MessageContent::Text(s)) => {
                 renderer.render(UiLine::User(s.clone()));
@@ -381,17 +505,28 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
             (Role::Tool, MessageContent::ToolResult(r)) => {
                 renderer.render(UiLine::ToolResult {
                     success: r.success,
-                    summary: summarise(&r.output, r.success),
+                    summary: summarise(&r.output),
                 });
             }
             (Role::Tool, MessageContent::ToolResultRef(r)) => {
                 renderer.render(UiLine::ToolResult {
                     success: true,
-                    summary: summarise(&r.summary, true),
+                    summary: summarise(&r.summary),
                 });
             }
             _ => {}
         }
+    }
+    // Final turn's divider (anchored at the end), mirroring the live view which
+    // showed a stats rule after the last turn too.
+    if let Some(stat) = session
+        .turn_stats
+        .iter()
+        .find(|s| s.after_message == session.messages.len())
+    {
+        renderer.render(UiLine::TurnSeparator {
+            label: turn_divider_label(Some(stat)),
+        });
     }
     renderer.render(UiLine::TurnComplete);
     renderer.render(UiLine::TurnSeparator {
@@ -416,6 +551,29 @@ mod tests {
             message_count: msgs,
             file_size: 0,
         }
+    }
+
+    #[test]
+    fn turn_divider_label_renders_stats_or_plain_rule() {
+        use atomcode_core::session::TurnStat;
+        let s = TurnStat {
+            after_message: 4,
+            turn_count: 3,
+            tool_call_count: 5,
+            duration_ms: 6800,
+            total_tokens: 1651,
+            errored: false,
+        };
+        // Persisted stat → the same `✓ … 工具 · tokens` line the live turn showed
+        // (locale-independent: digits + glyph appear in both en/zh templates).
+        let normal = super::turn_divider_label(Some(&s));
+        assert!(normal.contains('✓'), "got {normal:?}");
+        assert!(normal.contains('3') && normal.contains('5') && normal.contains("1651"), "got {normal:?}");
+        // Errored turn → ✗ variant.
+        let err = TurnStat { errored: true, ..s.clone() };
+        assert!(super::turn_divider_label(Some(&err)).contains('✗'));
+        // No stat (old session / cancelled turn) → empty label → plain rule.
+        assert_eq!(super::turn_divider_label(None), "");
     }
 
     #[test]

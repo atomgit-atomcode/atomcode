@@ -41,13 +41,23 @@ fn build_codingplan_headers(
         return Ok(Vec::new());
     }
 
-    // `CpAuthRequired` (no stored auth, or empty user.id /
-    // access_token) is a separate failure mode from
-    // `CpOfficialBuildRequired` (open-source build / unavailable
-    // signer). Users on an official build with no `~/.atomcode/auth.toml`
-    // would otherwise see the misleading "need official build"
-    // message — the build IS official, they just haven't logged in
-    // yet. Steer them to `/codingplan` instead.
+    // Order matters: signer availability is checked FIRST.
+    //
+    // An open-source build (no `codingplan-crypto` feature) can never
+    // produce a valid signature — `/login` will not fix that. If we
+    // checked auth first, an open-source user with empty auth.toml
+    // would be told "run /codingplan", they'd log in successfully,
+    // and STILL hit `Unavailable` on the next chat. The signer-first
+    // order gives them the actionable hint (`CpOfficialBuildRequired`)
+    // immediately.
+    //
+    // Official builds (`signer_available() == true`) fall through to
+    // the auth check, so an official user with no `~/.atomcode/auth.toml`
+    // still sees `CpAuthRequired` (the originally-intended UX).
+    if !crypto::signer_available() {
+        return Err(anyhow::anyhow!("{}", t(Msg::CpOfficialBuildRequired)));
+    }
+
     let (user_id_string, token_string);
     let (user_id, oauth_token) = match override_auth {
         Some((uid, tok)) => (uid, tok),
@@ -127,12 +137,23 @@ pub struct OpenAiProvider {
     /// `ProviderConfig::reasoning_history` at construction so bad values
     /// fail early at load time with a clear error, not silently mid-turn.
     reasoning_history_override: Option<ReasoningPolicy>,
+    /// DeepSeek V4 reasoning effort control (high / max / off).
+    reasoning_effort: Option<String>,
     /// Whether the active model accepts image inputs. Drives `MultiPart`
     /// serialisation: vision-capable → OpenAI image_url schema, text-only
     /// → flat string. Computed once from `ProviderConfig::accepts_images()`
     /// at construction; a `/model` switch rebuilds the provider so this
     /// stays in sync with the live config.
     supports_vision: bool,
+    /// Stable per-conversation id, set once via `set_session_id` after the
+    /// owning agent generates it. Sent as the `x-atomcode-session-id` header
+    /// on every request so a forwarding gateway (LiteLLM) can pin the
+    /// conversation to one upstream account/replica for prefix-cache
+    /// affinity. Empty (the default) → header omitted (e.g. summary / sub-
+    /// agent calls that never had an id attached). `std::sync::RwLock`: set
+    /// once at startup, read (cheaply cloned, never held across `.await`)
+    /// per request.
+    session_id: std::sync::Arc<std::sync::RwLock<String>>,
 }
 
 impl OpenAiProvider {
@@ -154,6 +175,22 @@ impl OpenAiProvider {
                 ),
             },
         };
+        // Validate at load time (like `reasoning_history`) so a typo fails
+        // fast with a clear error instead of silently 400-ing mid-turn.
+        // Normalised to lowercase so config casing ("High") doesn't matter.
+        let reasoning_effort = match config.reasoning_effort.as_deref() {
+            None => None,
+            Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "high" => Some("high".to_string()),
+                "max" => Some("max".to_string()),
+                other => anyhow::bail!(
+                    "Invalid `reasoning_effort` value {:?} for provider type '{}' — \
+                     expected \"high\" or \"max\" (unset = use API default)",
+                    other,
+                    config.provider_type,
+                ),
+            },
+        };
         Ok(Self {
             client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify),
             api_key: std::sync::Arc::new(tokio::sync::RwLock::new(api_key)),
@@ -170,7 +207,9 @@ impl OpenAiProvider {
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
+            reasoning_effort,
             supports_vision: config.accepts_images(),
+            session_id: std::sync::Arc::new(std::sync::RwLock::new(String::new())),
         })
     }
 
@@ -207,6 +246,15 @@ impl OpenAiProvider {
             return ReasoningPolicy::Include;
         }
         ReasoningPolicy::Exclude
+    }
+
+    /// Check whether the model supports DeepSeek's `reasoning_effort` field.
+    /// Only DeepSeek V4 (and V4-derived, e.g. `deepseek-v4-pro`) models accept
+    /// it. Single source of truth for the gate — the TUI's
+    /// `reasoning_effort_applicable_on_provider` delegates here so the
+    /// "applicable" hint and the actual send stay in lock-step.
+    pub fn reason_effort_applicable(model: &str) -> bool {
+        model.to_ascii_lowercase().contains("deepseek-v4")
     }
 
     /// Build Kimi's `thinking` request-body object from the two flat
@@ -530,6 +578,13 @@ impl LlmProvider for OpenAiProvider {
             body["thinking"] = th;
         }
 
+        // DeepSeek V4 reasoning_effort: only emitted when applicable
+        if let Some(ref effort) = self.reasoning_effort {
+            if Self::reason_effort_applicable(&self.model) {
+                body["reasoning_effort"] = json!(effort);
+            }
+        }
+
         let policy = crate::provider::retry::RetryPolicy::default_policy();
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -554,6 +609,17 @@ impl LlmProvider for OpenAiProvider {
                 if let Ok(serialized) = serde_json::to_string_pretty(&body) {
                     let _ = std::fs::write(&path, serialized);
                 }
+                // Sidecar: the `x-atomcode-session-id` header value sent with
+                // THIS request (header isn't part of the body dump). Lets us
+                // correlate a wire-dump request to the session id the gateway
+                // sees: `grep -rl <uuid> ~/.atomcode/wire-dump/*.session`.
+                let sid = self
+                    .session_id
+                    .read()
+                    .ok()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let _ = std::fs::write(dir.join(format!("{}.session", ts)), &sid);
             }
         }
         // ────────────────────────────────────────────────────────────────
@@ -572,8 +638,30 @@ impl LlmProvider for OpenAiProvider {
         let api_key = self.api_key.clone();
         let provider_label = self.model.clone();
         let base_url_for_signing = self.base_url.clone();
+        // Stable per-conversation routing key for the forwarding gateway.
+        // Read once here (never held across `.await`); empty → header omitted.
+        let session_id_hdr = self
+            .session_id
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
 
         tokio::spawn(async move {
+            // Upfront signing precheck. Without this, the retry factory
+            // below silently `.unwrap_or_default()`s any signing error
+            // (open-source build → empty headers → 403 from gateway with
+            // an unhelpful raw body), so users on an open-source build
+            // pointed at the AtomGit gateway would never see the
+            // actionable `CpOfficialBuildRequired` hint. Run it here
+            // (signer availability + auth state don't depend on body
+            // content, so a zero-byte probe is sufficient) so the
+            // friendly error surfaces BEFORE the first network call.
+            if let Err(e) = build_codingplan_headers(&base_url_for_signing, &[], None) {
+                let _ = tx.send(Ok(StreamEvent::Error(e.to_string())));
+                return;
+            }
+
             // Mid-stream retry: when the provider opens the stream but the
             // chunked body errors out BEFORE any SSE `data:` line is parsed,
             // it's safe to redo the whole request — no text/tool-call has
@@ -596,6 +684,10 @@ impl LlmProvider for OpenAiProvider {
             let mut auth_retry_used = false;
             'retry: loop {
                 attempt += 1;
+                // Serialize once per outer-loop iteration. The body content
+                // does NOT change between inner retries — only the signing
+                // headers do (fresh nonce/ts/sig per attempt to avoid
+                // SIG_REPLAY / SIG_STALE from the atomgit-gateway).
                 let body_bytes = match serde_json::to_vec(&body) {
                     Ok(b) => b,
                     Err(e) => {
@@ -605,27 +697,55 @@ impl LlmProvider for OpenAiProvider {
                         return;
                     }
                 };
-                let extra_headers = match build_codingplan_headers(&base_url_for_signing, &body_bytes, None) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        let _ = tx.send(Ok(StreamEvent::Error(format!("{e:#}"))));
-                        return;
-                    }
-                };
                 // Snapshot the current token. After a successful auth
                 // refresh below, the shared `api_key` will hold the new
                 // value and the next iteration picks it up here.
                 let current_token = api_key.read().await.clone();
-                let mut request = client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {}", current_token))
-                    .header("Content-Type", "application/json")
-                    .body(body_bytes);
-                for (name, value) in extra_headers {
-                    request = request.header(name, value);
-                }
 
-                let response = match crate::provider::retry::send_with_retry(request, &policy).await
+                // Build a factory closure that re-signs on every inner
+                // retry attempt. Each call to the factory generates a
+                // fresh nonce + timestamp + HMAC signature via
+                // `build_codingplan_headers`, preventing SIG_REPLAY
+                // (server's nonce cache holds the first attempt's nonce)
+                // and SIG_STALE (cumulative backoff pushes ts past the
+                // 300 s freshness window).
+                //
+                // On signing failure during a retry we fall back to
+                // empty extra headers (no panic, worst case we get a
+                // fresh 403 which the caller already handles). The
+                // initial request has already been signed successfully
+                // at this point, so retries are the only code path that
+                // can reach the fallback.
+                let url_for_factory = url.clone();
+                let body_for_factory = body_bytes.clone();
+                let base_url_clone = base_url_for_signing.clone();
+                let client_for_factory = client.clone();
+                let token_for_factory = current_token.clone();
+                let session_id_for_factory = session_id_hdr.clone();
+                let resign = move || -> reqwest::RequestBuilder {
+                    let extra_headers = build_codingplan_headers(
+                        &base_url_clone,
+                        &body_for_factory,
+                        None,
+                    )
+                    .unwrap_or_default();
+                    let mut req = client_for_factory
+                        .post(&url_for_factory)
+                        .header("Authorization", format!("Bearer {}", token_for_factory))
+                        .header("Content-Type", "application/json")
+                        .body(body_for_factory.clone());
+                    for (name, value) in extra_headers {
+                        req = req.header(name, value);
+                    }
+                    // Stable session id → lets the forwarding gateway pin this
+                    // conversation to one upstream for prefix-cache affinity.
+                    if !session_id_for_factory.is_empty() {
+                        req = req.header("x-atomcode-session-id", session_id_for_factory.clone());
+                    }
+                    req
+                };
+
+                let response = match crate::provider::retry::send_with_retry_resign(resign, &policy).await
                 {
                     Ok(resp) => resp,
                     Err(e) => {
@@ -732,7 +852,18 @@ impl LlmProvider for OpenAiProvider {
                         None
                     };
                 // ────────────────────────────────────────────────────────
+                // (id, name, accumulated_args) per tool-call index.
                 let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+                // Tracks whether StreamEvent::ToolCallStart has already
+                // been emitted for each index. Some providers (GPT-5
+                // family — confirmed via wire-dump 2026-05-27) repeat
+                // the SAME non-empty id on EVERY chunk but only send
+                // function.name on the first chunk. Without an "emitted
+                // once" guard we'd fire ToolCallStart on every chunk;
+                // without a "don't clobber name with empty" guard we'd
+                // overwrite the captured name with `""` from subsequent
+                // chunks where func.name is None.
+                let mut tool_start_emitted: Vec<bool> = Vec::new();
                 let mut last_usage: Option<crate::stream::TokenUsage> = None;
                 let mut saw_data_line = false;
                 let mut saw_valid_chunk = false;
@@ -920,30 +1051,60 @@ impl LlmProvider for OpenAiProvider {
                                                 String::new(),
                                                 String::new(),
                                             ));
+                                            tool_start_emitted.push(false);
                                         }
                                         let entry = &mut tool_calls[idx];
+                                        // 1) Capture id only when present + non-empty.
+                                        //    ModelScope sends empty-string id on
+                                        //    increment chunks — skipping keeps the
+                                        //    earlier non-empty value.
                                         if let Some(id) = &tc.id {
-                                            // Some providers (e.g., ModelScope) send empty string id
-                                            // in incremental tool call chunks. Only emit ToolCallStart
-                                            // for non-empty ids.
                                             if !id.is_empty() {
                                                 entry.0 = id.clone();
-                                                if let Some(func) = &tc.function {
-                                                    entry.1 = func.name.clone().unwrap_or_default();
-                                                }
-                                                let _ = tx.send(Ok(StreamEvent::ToolCallStart {
-                                                    id: entry.0.clone(),
-                                                    name: entry.1.clone(),
-                                                }));
                                             }
                                         }
+                                        // 2) Accumulate name + args INDEPENDENTLY of
+                                        //    id presence.
+                                        //    * GPT-5 family (confirmed via wire-dump):
+                                        //      repeats same non-empty id on EVERY chunk
+                                        //      but only sends function.name on chunk 1.
+                                        //      Old code did `entry.1 = func.name.clone()
+                                        //      .unwrap_or_default()` which clobbered the
+                                        //      captured "use_skill" with "" on every
+                                        //      subsequent chunk — final ToolCallDone had
+                                        //      empty name → dropped as malformed.
+                                        //    * Guard `!name.is_empty()` also protects
+                                        //      against any provider that ever sends
+                                        //      `name: ""` placeholder.
                                         if let Some(func) = &tc.function {
+                                            if let Some(name) = &func.name {
+                                                if !name.is_empty() {
+                                                    entry.1 = name.clone();
+                                                }
+                                            }
                                             if let Some(args) = &func.arguments {
                                                 entry.2.push_str(args);
                                                 let _ = tx.send(Ok(StreamEvent::ToolCallDelta(
                                                     args.clone(),
                                                 )));
                                             }
+                                        }
+                                        // 3) Emit ToolCallStart EXACTLY ONCE per index
+                                        //    — as soon as both id AND name are known.
+                                        //    Old code emitted on every chunk where id
+                                        //    was non-empty (N events for an N-chunk
+                                        //    stream); downstream UI handles the
+                                        //    duplicates but it's wasted work + log
+                                        //    noise.
+                                        if !tool_start_emitted[idx]
+                                            && !entry.0.is_empty()
+                                            && !entry.1.is_empty()
+                                        {
+                                            tool_start_emitted[idx] = true;
+                                            let _ = tx.send(Ok(StreamEvent::ToolCallStart {
+                                                id: entry.0.clone(),
+                                                name: entry.1.clone(),
+                                            }));
                                         }
                                     }
                                 }
@@ -968,6 +1129,7 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
+                                            tool_start_emitted.clear();
                                             pending_finish =
                                                 Some(StreamEvent::Done { truncated: false });
                                         }
@@ -987,6 +1149,7 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
+                                            tool_start_emitted.clear();
                                             pending_finish =
                                                 Some(StreamEvent::Done { truncated: true });
                                         }
@@ -1134,6 +1297,7 @@ impl LlmProvider for OpenAiProvider {
                     )));
                 }
                 tool_calls.clear();
+                tool_start_emitted.clear();
                 let _ = tx.send(Ok(StreamEvent::Delta(
                     "\n[stream ended without close marker — response above may be incomplete]\n"
                         .to_string(),
@@ -1150,6 +1314,19 @@ impl LlmProvider for OpenAiProvider {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+
+    fn set_session_id(&self, session_id: &str) {
+        if let Ok(mut g) = self.session_id.write() {
+            *g = session_id.to_string();
+        }
+    }
+
+    fn session_id(&self) -> String {
+        self.session_id
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     fn reasoning_history_policy(&self) -> ReasoningPolicy {
@@ -1399,6 +1576,7 @@ mod tests {
                     data: "AAAA".to_string(),
                 }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         assert_eq!(out.len(), 1, "one message in, one out");
@@ -1431,6 +1609,7 @@ mod tests {
                     ImagePart { media_type: "image/jpeg".into(), data: "SECOND".into() },
                 ],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         let content = out[0]["content"].as_array().unwrap();
@@ -1451,6 +1630,7 @@ mod tests {
                 text: None,
                 images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         let content = out[0]["content"].as_array().unwrap();
@@ -1477,6 +1657,7 @@ mod tests {
                 text: Some("[Image #1] 这是什么图啊".into()),
                 images: vec![ImagePart { media_type: "image/png".into(), data: "AAAA".into() }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
         assert_eq!(out.len(), 1);
@@ -1516,6 +1697,7 @@ mod tests {
                 text: None,
                 images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
         let content = out[0]["content"].as_str().expect("string content");
@@ -1630,6 +1812,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("exclude".into()),
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -1669,6 +1852,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("always".into()),
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -1683,6 +1867,59 @@ mod tests {
         assert!(
             msg.contains("reasoning_history") && msg.contains("always"),
             "error must name the bad field and value, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reason_effort_applicable_only_for_deepseek_v4() {
+        use super::OpenAiProvider;
+        // V4 family (case-insensitive) → applicable.
+        assert!(OpenAiProvider::reason_effort_applicable("deepseek-v4"));
+        assert!(OpenAiProvider::reason_effort_applicable("deepseek-v4-pro"));
+        assert!(OpenAiProvider::reason_effort_applicable("DeepSeek-V4-Flash"));
+        // Everything else → no effect (must match the `ReasoningEffortNoEffect`
+        // hint, which advertises DeepSeek V4 only — NOT reasoner/chat).
+        assert!(!OpenAiProvider::reason_effort_applicable("deepseek-chat"));
+        assert!(!OpenAiProvider::reason_effort_applicable("deepseek-reasoner"));
+        assert!(!OpenAiProvider::reason_effort_applicable("gpt-4o"));
+    }
+
+    #[test]
+    fn reasoning_effort_config_validates_and_normalises() {
+        use super::OpenAiProvider;
+        use crate::config::provider::ProviderConfig;
+        let mut cfg = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-test".into()),
+            model: "deepseek-v4-pro".into(),
+            base_url: Some("https://api.deepseek.com".into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: Some("ultra".into()),
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        };
+        // Bad value rejected at load with a naming error (no silent mid-turn 400).
+        let msg = match OpenAiProvider::new(&cfg) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("bad reasoning_effort value must reject"),
+        };
+        assert!(
+            msg.contains("reasoning_effort") && msg.contains("ultra"),
+            "error must name field+value, got: {msg}"
+        );
+        // Valid value, any casing, loads (and normalises to lowercase).
+        cfg.reasoning_effort = Some("HIGH".into());
+        assert!(
+            OpenAiProvider::new(&cfg).is_ok(),
+            "HIGH should normalise and load"
         );
     }
 
@@ -1717,6 +1954,7 @@ mod tests {
                 reasoning_content: reasoning.map(|s| s.to_string()),
                 thinking_blocks: Vec::new(),
             },
+            synthetic: false,
         }
     }
 
@@ -1778,6 +2016,7 @@ mod tests {
         let msgs = vec![Message {
             role: Role::Assistant,
             content: MessageContent::Text("当前系统时间是 …".into()),
+                    synthetic: false,
         }];
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
@@ -1815,6 +2054,64 @@ mod tests {
             !rc.is_empty(),
             "placeholder must replace empty-string reasoning"
         );
+    }
+
+    #[test]
+    fn format_messages_is_deterministic_and_prefix_stable() {
+        // Part-2 lock (assistant prefix-cache stability): a historical
+        // assistant message must serialize to BYTE-IDENTICAL JSON every turn,
+        // and growing the conversation must NOT change the serialization of the
+        // earlier (prefix) messages — otherwise the provider prefix cache
+        // breaks at that assistant message. This already holds because we reuse
+        // the stored tool_call `arguments` string verbatim (no per-turn
+        // re-stringify) and serde_json key order is deterministic; this test
+        // pins it against regressions (someone re-encoding args, reordering
+        // keys, or trimming reasoning_content off old messages).
+        use super::{OpenAiProvider, ReasoningPolicy};
+        use crate::conversation::message::{Message, MessageContent, Role};
+        use crate::tool::ToolResult;
+
+        let history = vec![
+            atc_message(Some("thought about it")),
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "c1".into(),
+                    output: "done".into(),
+                    success: true,
+                }),
+                synthetic: false,
+            },
+        ];
+
+        // Same input rendered on two turns → identical bytes.
+        let a = serde_json::to_string(&OpenAiProvider::format_messages(
+            &history,
+            ReasoningPolicy::Include,
+            false,
+        ))
+        .unwrap();
+        let b = serde_json::to_string(&OpenAiProvider::format_messages(
+            &history,
+            ReasoningPolicy::Include,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(a, b, "assistant/tool serialization must be deterministic");
+
+        // Next turn appends a new assistant message; the ORIGINAL prefix
+        // messages must serialize byte-for-byte the same (cache grows at tail).
+        let mut grown = history.clone();
+        grown.push(atc_message(Some("second thought")));
+        let out_prefix = OpenAiProvider::format_messages(&history, ReasoningPolicy::Include, false);
+        let out_grown = OpenAiProvider::format_messages(&grown, ReasoningPolicy::Include, false);
+        for (i, m) in out_prefix.iter().enumerate() {
+            assert_eq!(
+                serde_json::to_string(m).unwrap(),
+                serde_json::to_string(&out_grown[i]).unwrap(),
+                "prefix message {i} re-serialized differently after the conversation grew"
+            );
+        }
     }
 
     #[test]
@@ -2022,6 +2319,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -2034,6 +2332,7 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: MessageContent::Text("hi".into()),
+                    synthetic: false,
         };
         let mut stream = p.chat_stream(&[msg], None).expect("stream");
         let mut out = Vec::new();
@@ -2090,6 +2389,106 @@ mod tests {
             !has_marker_delta,
             "abrupt close on tiny error blob must NOT emit the [stream ended …] marker delta: {:?}",
             events
+        );
+    }
+
+    const CLEAN_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+         data: [DONE]\n\n";
+
+    /// Once `set_session_id` is called, every request must carry the
+    /// `x-atomcode-session-id` header so the forwarding gateway can pin the
+    /// conversation to one upstream for prefix-cache affinity.
+    #[tokio::test]
+    async fn sends_x_atomcode_session_id_header_when_set() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(CLEAN_SSE),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        p.set_session_id("affinity-key-xyz");
+        let _ = collect_stream(&p).await;
+
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("requests recorded");
+        assert_eq!(reqs.len(), 1, "exactly one request");
+        let hdr = reqs[0].headers.get("x-atomcode-session-id");
+        assert!(hdr.is_some(), "header must be present when session id set");
+        assert_eq!(hdr.unwrap().to_str().unwrap(), "affinity-key-xyz");
+    }
+
+    /// `reset_session_id` (on /clear, /session, resume) re-calls
+    /// `set_session_id`; the header must reflect the LATEST value so a new
+    /// conversation gets its new id, not the process's first one.
+    #[tokio::test]
+    async fn set_session_id_is_resettable_latest_wins() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(CLEAN_SSE),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        p.set_session_id("old-session");
+        p.set_session_id("new-session"); // simulates reset_session_id
+        let _ = collect_stream(&p).await;
+
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("requests recorded");
+        assert_eq!(
+            reqs[0]
+                .headers
+                .get("x-atomcode-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "new-session"
+        );
+    }
+
+    /// Without a session id attached (e.g. summary / sub-agent calls), the
+    /// header must be omitted entirely — an empty value would pin all such
+    /// calls together on the gateway, which is wrong.
+    #[tokio::test]
+    async fn omits_session_header_when_unset() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(CLEAN_SSE),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        // no set_session_id call
+        let _ = collect_stream(&p).await;
+
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("requests recorded");
+        assert!(
+            reqs[0].headers.get("x-atomcode-session-id").is_none(),
+            "header must be absent when no session id attached"
         );
     }
 
@@ -2230,7 +2629,7 @@ mod codingplan_signing_tests {
         // Open-source build: signer() is UnavailableSigner, so an
         // atomgit-bound request must error with the localised hint.
         let err = build_codingplan_headers(
-            "https://llm-api.atomgit.com/v1",
+            "https://pre-llm-api-cce.atomgit.com/v1",
             b"{}",
             Some(("dummy-user-id", "dummy-token")),
         )
@@ -2245,11 +2644,32 @@ mod codingplan_signing_tests {
     #[test]
     fn build_signed_headers_errors_when_atomgit_host_with_empty_auth() {
         let err = build_codingplan_headers(
-            "https://llm-api.atomgit.com/v1",
+            "https://pre-llm-api-cce.atomgit.com/v1",
             b"{}",
             Some(("", "")),
         )
         .expect_err("empty auth must error");
         assert!(!format!("{:#}", err).is_empty());
+    }
+
+    #[cfg(not(feature = "codingplan-crypto"))]
+    #[test]
+    fn open_source_build_errors_official_build_required_before_auth_check() {
+        // Regression guard: when reordering build_codingplan_headers,
+        // the signer-availability check MUST run before any auth lookup
+        // so an open-source user with empty auth gets the actionable
+        // "need official build" hint instead of a misleading "/login"
+        // prompt that would never succeed.
+        let err = build_codingplan_headers(
+            "https://llm-api.atomgit.com/v1",
+            b"{}",
+            Some(("", "")), // empty auth
+        )
+        .expect_err("must error");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("official") || msg.contains("官方"),
+            "open-source + empty-auth must surface the official-build hint, not the auth hint. got: {msg}",
+        );
     }
 }

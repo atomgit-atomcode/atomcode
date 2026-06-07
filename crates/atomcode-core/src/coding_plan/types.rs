@@ -47,6 +47,30 @@ impl PlanType {
     /// `Max → Pro → Lite` and stop at the first successful claim.
     pub const CASCADE_ORDER: &'static [PlanType] =
         &[PlanType::Max, PlanType::Pro, PlanType::Lite];
+
+    /// Best-effort map of a `StatusResponse.codingplan_free.plan_name`
+    /// (e.g. `"CodingPlan Lite"` / `"CodingPlan Pro"` / `"CodingPlan Max"`)
+    /// back to the tier. Used so the drift monitor can query
+    /// `models-v2?plan_type=` with the user's **actual** tier — `plan_available`
+    /// is computed relative to the requested tier (see `ModelEntry`), so
+    /// querying `Max` for a Lite user wrongly marks higher-tier models
+    /// available and fires a permanent "list updated" false positive.
+    ///
+    /// Checked most-specific first; `Max`/`Pro`/`Lite` don't overlap as
+    /// substrings. Returns `None` for unrecognised names (e.g. `"CodingPlan
+    /// Free"`) so the caller can skip rather than guess a tier.
+    pub fn from_plan_name(plan_name: &str) -> Option<PlanType> {
+        let lower = plan_name.to_ascii_lowercase();
+        if lower.contains("max") {
+            Some(PlanType::Max)
+        } else if lower.contains("pro") {
+            Some(PlanType::Pro)
+        } else if lower.contains("lite") {
+            Some(PlanType::Lite)
+        } else {
+            None
+        }
+    }
 }
 
 /// `POST /api/v5/coding-plan/claim-v2` response.
@@ -123,6 +147,40 @@ pub struct ModelEntry {
     pub plan_available: bool,
 }
 
+/// One rate-limit window entry from the new `rate_limit_windows`
+/// schema. Multiple windows can be active (e.g. 5h rolling + 30d
+/// monthly); only those with `show_enable == 1` should be rendered.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitWindow {
+    #[serde(default)]
+    pub rule_index: i32,
+    /// 1 = render this window to the user; 0 = hide.
+    #[serde(default)]
+    pub show_enable: i32,
+    #[serde(default)]
+    pub window_size_seconds: i64,
+    #[serde(default)]
+    pub window_hours: i32,
+    #[serde(default)]
+    pub call_limit: i64,
+    #[serde(default)]
+    pub calls_used: i64,
+    #[serde(default)]
+    pub usage_percent: f64,
+    #[serde(default)]
+    pub quota_exhausted: bool,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub reset_at: String,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub reset_at_display: String,
+    #[serde(default)]
+    pub seconds_until_reset: i64,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub reset_label: String,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub usage_status_desc: String,
+}
+
 /// `GET /api/v5/coding-plan/status` response envelope.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StatusResponse {
@@ -140,6 +198,11 @@ pub struct StatusResponse {
     pub window_quota_exhausted: bool,
     #[serde(default)]
     pub window_quota_hint: Option<String>,
+    /// New per-window rate-limit schema. When non-empty, the renderer
+    /// prefers this over `current_usage` / `window_quota_*`. When
+    /// empty (old server), falls back to the legacy fields for compat.
+    #[serde(default)]
+    pub rate_limit_windows: Vec<RateLimitWindow>,
 }
 
 /// CodingPlan entitlement summary (inside `StatusResponse`).
@@ -283,6 +346,22 @@ mod tests {
         );
     }
 
+    /// Drift monitor maps the status plan_name back to the tier so it can
+    /// query models-v2 with the user's ACTUAL tier (not Max), avoiding the
+    /// permanent "list updated" false positive on Lite/Pro.
+    #[test]
+    fn plan_type_from_plan_name() {
+        assert_eq!(PlanType::from_plan_name("CodingPlan Lite"), Some(PlanType::Lite));
+        assert_eq!(PlanType::from_plan_name("CodingPlan Pro"), Some(PlanType::Pro));
+        assert_eq!(PlanType::from_plan_name("CodingPlan Max"), Some(PlanType::Max));
+        // Case-insensitive.
+        assert_eq!(PlanType::from_plan_name("codingplan lite"), Some(PlanType::Lite));
+        // Unrecognised tiers (Free / empty / junk) → None so the caller skips
+        // rather than defaulting to Max and re-introducing the false positive.
+        assert_eq!(PlanType::from_plan_name("CodingPlan Free"), None);
+        assert_eq!(PlanType::from_plan_name(""), None);
+    }
+
     #[test]
     fn status_response_parses_docs_example() {
         let body = r#"{
@@ -399,6 +478,59 @@ mod tests {
         let c: ClaimResponse = serde_json::from_str(body).unwrap();
         assert!(!c.success);
         assert!(c.duplicate);
+    }
+
+    #[test]
+    fn status_parses_rate_limit_windows_field() {
+        let body = r#"{
+            "codingplan_free": null,
+            "current_usage": null,
+            "rate_limit_windows": [
+                {
+                    "rule_index": 0,
+                    "show_enable": 1,
+                    "window_size_seconds": 18000,
+                    "window_hours": 5,
+                    "call_limit": 1000,
+                    "calls_used": 20,
+                    "usage_percent": 2,
+                    "quota_exhausted": false,
+                    "reset_at": "2026-05-26T18:09:30",
+                    "reset_at_display": "18:09",
+                    "seconds_until_reset": 16080,
+                    "reset_label": "当前窗口结束即重置额度（每 5 小时一个窗口）",
+                    "usage_status_desc": "当前时间窗口用量约 2%"
+                },
+                {
+                    "rule_index": 1,
+                    "show_enable": 0,
+                    "window_size_seconds": 2592000,
+                    "window_hours": 720,
+                    "call_limit": 16000,
+                    "calls_used": 5216,
+                    "usage_percent": 32,
+                    "quota_exhausted": false,
+                    "reset_at": "2026-06-20T23:09:30",
+                    "reset_at_display": "23:09",
+                    "seconds_until_reset": 2194080,
+                    "reset_label": "用量按约 30 天周期统计，窗口结束即重置",
+                    "usage_status_desc": "当前时间窗口用量约 32%"
+                }
+            ]
+        }"#;
+        let r: StatusResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(r.rate_limit_windows.len(), 2);
+        assert_eq!(r.rate_limit_windows[0].show_enable, 1);
+        assert_eq!(r.rate_limit_windows[0].window_size_seconds, 18000);
+        assert_eq!(r.rate_limit_windows[1].show_enable, 0);
+        assert_eq!(r.rate_limit_windows[1].window_hours, 720);
+    }
+
+    #[test]
+    fn status_rate_limit_windows_defaults_empty_when_absent() {
+        let body = r#"{"codingplan_free":null,"current_usage":null}"#;
+        let r: StatusResponse = serde_json::from_str(body).unwrap();
+        assert!(r.rate_limit_windows.is_empty());
     }
 
     /// Regression: when a fresh claim hasn't propagated to the status

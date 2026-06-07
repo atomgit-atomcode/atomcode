@@ -53,6 +53,51 @@ impl Conversation {
         Self::default()
     }
 
+    /// Number of real (non-synthetic) user prompts. This is the maximum `N`
+    /// accepted by `/undo N`, and what bare `/undo` targets (the last prompt).
+    ///
+    /// NOTE: `N` counts only real prompts so it matches the prompts the user
+    /// actually typed. The scrollback dividers drawn by `replay_session`
+    /// (`modals/session_picker.rs`) go before EVERY `Role::User` message,
+    /// including synthetic injections (compaction markers, plan-mode notes) —
+    /// so in the rare case of a standalone synthetic user message, the visible
+    /// divider count can run one ahead of `N` for later turns. This is the
+    /// intentional Phase A trade-off; tighter alignment is deferred to Phase B.
+    pub fn prompt_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User) && !m.synthetic)
+            .count()
+    }
+
+    /// Roll conversation memory back to just before the `nth` (1-based) real
+    /// user prompt, removing that prompt and every message after it, then
+    /// rebuilding the turn tracker. Synthetic user injections (compaction
+    /// markers, plan-mode notes) are ignored when counting but ARE removed
+    /// when they fall after the cut. Any leading non-user messages before the
+    /// first prompt are preserved. In-flight stream/tool buffers are cleared.
+    ///
+    /// Returns the removed prompt's text (for the UI to restore into the input
+    /// box), or `None` if `nth == 0` or `nth > prompt_count()`.
+    pub fn undo_to_prompt(&mut self, nth: usize) -> Option<String> {
+        if nth == 0 {
+            return None;
+        }
+        let start_idx = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.role, Role::User) && !m.synthetic)
+            .map(|(i, _)| i)
+            .nth(nth - 1)?;
+        let restored = self.messages[start_idx].text().unwrap_or("").to_string();
+        self.stream_buffer = None;
+        self.tool_call_buffer = None;
+        self.messages.truncate(start_idx);
+        self.turn_tracker = TurnTracker::rebuild(&self.messages);
+        Some(restored)
+    }
+
     /// Load conversation history from disk. Never fails — returns empty on any error.
     pub fn load(path: &std::path::Path) -> Self {
         let data = match std::fs::read_to_string(path) {
@@ -113,6 +158,32 @@ impl Conversation {
         }
         let idx = self.messages.len();
         self.messages.push(Message::new(Role::User, content));
+        self.turn_tracker.on_user_message(idx);
+    }
+
+    /// Add an agent-authored synthetic message through the `Role::User`
+    /// channel — `[Additional context from user]`, `Output limit hit`
+    /// self-prompts, `[Context was compressed]` state summaries, etc.
+    /// See `Message.synthetic` doc for the full rationale.
+    ///
+    /// Same API-compat merge behavior as `add_user_message` (avoids two
+    /// consecutive `Role::User` messages which break OpenAI-compatible
+    /// providers), BUT the merge preserves the EXISTING message's
+    /// `synthetic` flag — appending synthetic content to a real user
+    /// prompt doesn't reclassify the real prompt as synthetic. Only a
+    /// freshly-pushed message carries `synthetic = true`.
+    pub fn add_synthetic_user_message(&mut self, content: &str) {
+        if let Some(last) = self.messages.last_mut() {
+            if matches!(last.role, Role::User) {
+                if let MessageContent::Text(ref mut text) = last.content {
+                    text.push('\n');
+                    text.push_str(content);
+                    return;
+                }
+            }
+        }
+        let idx = self.messages.len();
+        self.messages.push(Message::synthetic_user(content));
         self.turn_tracker.on_user_message(idx);
     }
 
@@ -180,6 +251,7 @@ impl Conversation {
                     output: "(cancelled)".into(),
                     success: false,
                 }),
+                            synthetic: false,
             });
             self.turn_tracker.on_message_added(idx);
         }
@@ -260,6 +332,7 @@ impl Conversation {
                 reasoning_content: reasoning.map(|s| s.to_string()),
                 thinking_blocks,
             },
+                    synthetic: false,
         });
         self.turn_tracker.on_message_added(idx);
     }
@@ -269,6 +342,7 @@ impl Conversation {
         self.messages.push(Message {
             role: Role::Tool,
             content: MessageContent::ToolResult(result),
+                    synthetic: false,
         });
         self.turn_tracker.on_message_added(idx);
     }
@@ -386,8 +460,51 @@ impl Conversation {
             self.cold_summaries.remove(0);
         }
 
-        // Remove old messages from the front
         let remove_end = remove_count.min(self.messages.len());
+
+        // ── Original-prompt preservation (af3d1ac7 follow-up) ──
+        // The first non-synthetic User message anchors the session;
+        // /resume renders the timeline as "User asked X → assistant did
+        // Y …". If compression drains across that message, /resume
+        // opens on the agent's tool_call instead of the human prompt
+        // and the model has no anchor for what it was supposed to do.
+        //
+        // af3d1ac7 protected this in `hard_truncate_to_target` (tier 3
+        // fallback) only. Task-boundary cleanup and `/compact` go
+        // through this `apply_compression`, which used to do a blind
+        // `drain(..remove_end)` — and was therefore the DOMINANT path
+        // that still ate the original prompt. Mirrors the sacred-set
+        // treatment in `agent/mod.rs:3189-3232`.
+        let first_real_user_idx = self
+            .messages
+            .iter()
+            .position(|m| m.role == message::Role::User && !m.synthetic);
+
+        if let Some(fr_idx) = first_real_user_idx {
+            if fr_idx < remove_end {
+                // Sacred message lives inside the drain window. Carve
+                // it out: drain everything in the window EXCEPT the
+                // sacred message. Drain high-to-low so the lower index
+                // stays valid through the first removal.
+                if fr_idx + 1 < remove_end {
+                    self.messages.drain(fr_idx + 1..remove_end);
+                }
+                if fr_idx > 0 {
+                    self.messages.drain(0..fr_idx);
+                }
+                // Turn re-index after a non-contiguous drain is
+                // brittle in the in-place form below; rebuild from
+                // scratch — TurnTracker::rebuild walks the messages
+                // and yields the same shape `hard_truncate_to_target`
+                // uses for the equivalent sacred-set drain.
+                self.turn_tracker =
+                    turn::TurnTracker::rebuild(&self.messages);
+                return;
+            }
+        }
+
+        // No sacred message inside the drain window — drain contiguously
+        // and re-index turns in place (the well-tested fast path).
         self.messages.drain(..remove_end);
 
         let new_msg_len = self.messages.len();
@@ -1026,29 +1143,39 @@ mod tests {
         assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
         assert_eq!(conv.turn_tracker.turns[1].msg_count, 2);
 
-        // Compress: remove first 2 messages (covers first complete turn)
+        // Compress: remove first 2 messages (covers first complete turn).
+        // Post-fix contract: the FIRST non-synthetic User message ("task
+        // 1" at msg 0) is sacred — apply_compression carves it out of
+        // the drain window. So instead of [user2, asst2] (2 msgs), we
+        // get [user1, user2, asst2] (3 msgs) with user1 still anchoring
+        // the timeline for /resume.
         conv.apply_compression(2, "Turn 1 summary".to_string());
 
-        // Verify compression result
-        assert_eq!(conv.messages.len(), 2);
-        assert_eq!(conv.turn_tracker.turns.len(), 1);
+        // Verify compression result. user1 is preserved; asst1 dropped.
+        assert_eq!(conv.messages.len(), 3);
+        assert_eq!(conv.messages[0].role, Role::User);
+        // turn_tracker is rebuilt from messages on carve-out: 2 user
+        // messages → 2 turns. turn0 has just user1 (asst1 was dropped);
+        // turn1 has user2 + asst2.
+        assert_eq!(conv.turn_tracker.turns.len(), 2);
         assert_eq!(conv.turn_tracker.turns[0].start_idx, 0);
-        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
+        assert_eq!(conv.turn_tracker.turns[0].msg_count, 1);
+        assert_eq!(conv.turn_tracker.turns[1].start_idx, 1);
+        assert_eq!(conv.turn_tracker.turns[1].msg_count, 2);
 
         // CRITICAL: Add a new user message. This should NOT panic with underflow.
         // Before the fix, this could panic if Turn indices were corrupted.
         conv.add_user_message("task 3");
 
-        // Verify final state
-        assert_eq!(conv.messages.len(), 3);
-        assert_eq!(conv.turn_tracker.turns.len(), 2);
+        // Verify final state — 4 msgs, 3 turns, no panic.
+        assert_eq!(conv.messages.len(), 4);
+        assert_eq!(conv.turn_tracker.turns.len(), 3);
         assert_eq!(
             conv.turn_tracker.turns[0].status,
             turn::TurnStatus::Completed
         );
-        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
-        assert_eq!(conv.turn_tracker.turns[1].status, turn::TurnStatus::Active);
-        assert_eq!(conv.turn_tracker.turns[1].start_idx, 2);
+        assert_eq!(conv.turn_tracker.turns[2].status, turn::TurnStatus::Active);
+        assert_eq!(conv.turn_tracker.turns[2].start_idx, 3);
     }
 
     /// Test partial turn compression (a turn spans the compression boundary).
@@ -1082,27 +1209,32 @@ mod tests {
         assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
         assert_eq!(conv.turn_tracker.turns[1].msg_count, 3);
 
-        // Compress: remove first 3 messages
-        // This removes Turn 1 entirely and partially overlaps Turn 2
-        // (Turn 2 starts at 2, ends at 5, so 1 message survives at index 0)
+        // Compress: remove first 3 messages.
+        // Post-fix contract: user1 (msg 0) is sacred — carved out of
+        // the drain window. Result: [user1, asst2, tool_result] = 3
+        // msgs. user2's continuation (asst2 + tool_result) survives;
+        // user2 itself was the one we dropped between user1 (kept) and
+        // remove_end.
         conv.apply_compression(3, "Old history".to_string());
 
         // Verify compression result
-        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages.len(), 3);
+        assert_eq!(conv.messages[0].role, Role::User); // preserved user1
+        // Rebuild yields one Active turn (only user1, no following User
+        // message to close it before EOF).
         assert_eq!(conv.turn_tracker.turns.len(), 1);
-        let surviving_turn = &conv.turn_tracker.turns[0];
-        assert_eq!(surviving_turn.start_idx, 0);
-        assert_eq!(surviving_turn.msg_count, 2); // (5 - 3) messages remain
-        assert_eq!(surviving_turn.end_idx(), 2);
+        let surviving = &conv.turn_tracker.turns[0];
+        assert_eq!(surviving.start_idx, 0);
+        assert_eq!(surviving.msg_count, 3);
 
         // Add a new user message: should not panic
         conv.add_user_message("task 3");
 
-        // Verify invariants hold
-        assert_eq!(conv.messages.len(), 3);
+        // Verify invariants hold — 2 turns now, no panic.
+        assert_eq!(conv.messages.len(), 4);
         assert_eq!(conv.turn_tracker.turns.len(), 2);
-        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
-        assert_eq!(conv.turn_tracker.turns[1].start_idx, 2);
+        assert_eq!(conv.turn_tracker.turns[0].start_idx, 0);
+        assert_eq!(conv.turn_tracker.turns[1].start_idx, 3);
     }
 
     /// Test aggressive compression that removes almost everything.
@@ -1121,21 +1253,26 @@ mod tests {
         assert_eq!(conv.messages.len(), 6);
         assert_eq!(conv.turn_tracker.turns.len(), 3);
 
-        // Aggressively compress: keep only the last message
+        // Aggressively compress: drain everything except the last
+        // assistant message. Post-fix contract: user1 (msg 0) is the
+        // original prompt and gets carved out of the drain window, so
+        // we end up with [user1, last_asst] = 2 messages, not 1.
         conv.apply_compression(5, "Entire history summarized".to_string());
 
-        // Only the last assistant message (msg 5) should remain
-        assert_eq!(conv.messages.len(), 1);
+        // user1 + last asst survive.
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[0].role, Role::User); // preserved user1
+        // Rebuild: one Active turn containing both messages.
         assert_eq!(conv.turn_tracker.turns.len(), 1);
         assert_eq!(conv.turn_tracker.turns[0].start_idx, 0);
-        assert_eq!(conv.turn_tracker.turns[0].msg_count, 1);
+        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
 
         // Add a new user message: should not crash
         conv.add_user_message("new task");
 
-        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.turn_tracker.turns.len(), 2);
-        assert_eq!(conv.turn_tracker.turns[1].start_idx, 1);
+        assert_eq!(conv.turn_tracker.turns[1].start_idx, 2);
     }
 
     /// Test edge case: compression amount exceeds total messages.
@@ -1150,17 +1287,134 @@ mod tests {
 
         assert_eq!(conv.messages.len(), 2);
 
-        // Try to remove 100 messages (more than exist)
+        // Try to remove 100 messages (more than exist).
+        // Post-fix contract: even with remove_count >> message count,
+        // the first non-synthetic User message is preserved. The drain
+        // clamps to messages.len() and carves out msg 0.
         conv.apply_compression(100, "Summary".to_string());
 
-        // Should remove all messages
-        assert_eq!(conv.messages.is_empty(), true);
-        assert_eq!(conv.turn_tracker.turns.is_empty(), true);
+        // user1 survives, asst dropped.
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].role, Role::User);
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
 
-        // Add a new user message after clearing: should work
+        // Add a new user message after compression. `add_user_message`
+        // merges into the last User msg when one already exists (API
+        // compat: providers reject two consecutive User msgs). So the
+        // count stays at 1, just the body grows.
         conv.add_user_message("new message");
         assert_eq!(conv.messages.len(), 1);
         assert_eq!(conv.turn_tracker.turns.len(), 1);
+    }
+
+    // ── Original-prompt preservation across compression (P0-A) ──
+    //
+    // af3d1ac7 protected `hard_truncate_to_target` (tier 3 fallback);
+    // these tests pin the same invariant for `apply_compression`, which
+    // is the dominant path hit by task-boundary cleanup + `/compact`
+    // and was where the original-prompt-drained bug still triggered.
+
+    /// Contract: after `apply_compression` with `remove_count` that
+    /// would otherwise consume the first non-synthetic User message,
+    /// that message survives at the new index 0. /resume re-renders
+    /// the timeline starting from the human's original prompt, NOT
+    /// from a stray tool_call.
+    #[test]
+    fn apply_compression_preserves_first_real_user_message() {
+        let mut conv = Conversation::new();
+        // Build 4 turns × ~2 messages = 8 messages.
+        for i in 1..=4 {
+            conv.add_user_message(&format!("task {}", i));
+            conv.push_delta(&format!("response {}", i));
+            conv.finalize_stream();
+            conv.turn_tracker.complete_current();
+        }
+        assert_eq!(conv.messages.len(), 8);
+        let original_prompt = match &conv.messages[0].content {
+            MessageContent::Text(s) => s.clone(),
+            _ => panic!("msg 0 must be User text"),
+        };
+        assert_eq!(original_prompt, "task 1");
+
+        // Drain the first 6 messages — old behavior would consume the
+        // original prompt at index 0 and shift "task 4" to position 0.
+        conv.apply_compression(6, "Cold-zone summary".to_string());
+
+        // msg[0] must STILL be the original prompt, not a tool_call /
+        // assistant continuation.
+        assert_eq!(conv.messages[0].role, Role::User);
+        match &conv.messages[0].content {
+            MessageContent::Text(s) => assert_eq!(s, "task 1"),
+            other => panic!("msg 0 must remain the original Text prompt; got {:?}", other),
+        }
+    }
+
+    /// Negative control: when the first non-synthetic User message is
+    /// OUTSIDE the drain window (because there are leading synthetic
+    /// context injects), the fast in-place re-index path runs as
+    /// before — no needless carve-out.
+    #[test]
+    fn apply_compression_no_carve_out_when_real_user_after_drain_window() {
+        let mut conv = Conversation::new();
+        // We want a layout: [synthetic, asst, real_user, asst]. Put an
+        // Assistant between the synthetic and the real user so that
+        // add_user_message doesn't merge them (the merge fires when
+        // the previous message is also User, regardless of `synthetic`).
+        conv.messages
+            .push(Message::synthetic_user("[synthetic context]")); // idx 0
+        conv.messages
+            .push(Message::new(Role::Assistant, "ack")); // idx 1
+        conv.add_user_message("real prompt"); // idx 2
+        conv.push_delta("response"); // streamed into idx 3
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+        assert_eq!(conv.messages.len(), 4);
+
+        // Drain first 2 messages (the synthetic context + ack asst).
+        // first_real_user_idx (2) == remove_end (2), so the sacred
+        // anchor is AT the boundary, not INSIDE the drain window —
+        // carve-out doesn't trigger and the fast in-place path runs.
+        conv.apply_compression(2, "trim leading synthetic".to_string());
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[0].role, Role::User);
+        assert!(!conv.messages[0].synthetic);
+        match &conv.messages[0].content {
+            MessageContent::Text(s) => assert_eq!(s, "real prompt"),
+            other => panic!("expected the real prompt at idx 0; got {:?}", other),
+        }
+    }
+
+    /// Synthetic User messages don't count as sacred. They were injected
+    /// by the agent (`[Context was compressed]`, `[Output limit hit]`,
+    /// etc.) and have no value as conversation anchors. Compression must
+    /// be free to drain across them.
+    #[test]
+    fn apply_compression_drains_synthetic_user_messages() {
+        let mut conv = Conversation::new();
+        conv.messages
+            .push(Message::synthetic_user("[Context was compressed]"));
+        conv.messages
+            .push(Message::synthetic_user("[Output limit hit]"));
+        conv.messages
+            .push(Message::new(Role::Assistant, "old response"));
+        conv.add_user_message("real prompt");
+        conv.push_delta("real response");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+        assert_eq!(conv.messages.len(), 5);
+
+        // Drain the first 3 (all synthetic / pre-real-prompt).
+        // No carve-out needed: first_real_user_idx (3) >= remove_end (3).
+        conv.apply_compression(3, "summary".to_string());
+
+        // Real prompt is now at idx 0.
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[0].role, Role::User);
+        assert!(!conv.messages[0].synthetic);
+        match &conv.messages[0].content {
+            MessageContent::Text(s) => assert_eq!(s, "real prompt"),
+            other => panic!("real prompt must be at idx 0; got {:?}", other),
+        }
     }
 
     // ── looks_corrupted: garbage detection ──
@@ -1578,6 +1832,7 @@ mod tests {
                 byte_size: 20_000,
                 success: true,
             }),
+                    synthetic: false,
         });
         conv.turn_tracker.on_message_added(idx);
 
@@ -1767,6 +2022,7 @@ mod tests {
                     byte_size: 10_000,
                     success: true,
                 }),
+                            synthetic: false,
             });
             conv.turn_tracker.on_message_added(idx);
         }
@@ -1827,6 +2083,7 @@ mod tests {
                 byte_size: 50_000,
                 success: true,
             }),
+                    synthetic: false,
         });
         conv.turn_tracker.on_message_added(idx);
 
@@ -2035,5 +2292,152 @@ mod tests {
         // Only the previous turn survives
         assert_eq!(conv.turn_tracker.turns.len(), 1);
         assert_eq!(conv.turn_tracker.turns[0].status, TurnStatus::Completed);
+    }
+
+    // ── add_synthetic_user_message tests ──────────────────────────────
+
+    /// `add_synthetic_user_message` pushes a Message with `synthetic =
+    /// true`, distinguishable from real user messages. Compaction relies
+    /// on this distinction to find the original prompt.
+    #[test]
+    fn add_synthetic_user_message_marks_message_synthetic() {
+        let mut conv = Conversation::new();
+        // First add an assistant message so add_synthetic_user_message
+        // doesn't try to merge into a User predecessor.
+        conv.messages.push(Message::new(Role::Assistant, "ack"));
+        conv.add_synthetic_user_message("[Context was compressed.] state");
+        assert_eq!(conv.messages.len(), 2);
+        let last = conv.messages.last().unwrap();
+        assert!(
+            last.synthetic,
+            "synthetic injection must carry synthetic=true"
+        );
+        assert!(matches!(last.role, Role::User));
+    }
+
+    /// Critical: `add_synthetic_user_message` invoked when the previous
+    /// message is a real user message MUST merge into it (API-compat
+    /// against consecutive User messages) AND keep the existing
+    /// `synthetic=false` flag. Otherwise a real prompt would be
+    /// reclassified as synthetic just because synthetic content was
+    /// appended — exactly the failure mode `synthetic` is meant to
+    /// prevent.
+    #[test]
+    fn synthetic_merge_into_real_user_preserves_real_flag() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("real original prompt");
+        conv.add_synthetic_user_message("[Additional context]: synthetic appended");
+
+        assert_eq!(conv.messages.len(), 1, "merge collapses into one message");
+        let m = &conv.messages[0];
+        assert!(
+            !m.synthetic,
+            "merged message keeps existing `synthetic=false` — origin is real"
+        );
+        assert!(
+            m.text().unwrap().contains("real original prompt"),
+            "real text preserved"
+        );
+        assert!(
+            m.text().unwrap().contains("[Additional context]"),
+            "synthetic body still appended"
+        );
+    }
+
+    /// Symmetric merge case: synthetic-into-synthetic. When the last
+    /// message is already synthetic and we add another synthetic, the
+    /// merge collapses them and the flag stays true (no real authorship
+    /// was introduced).
+    #[test]
+    fn synthetic_merge_into_synthetic_keeps_flag_true() {
+        let mut conv = Conversation::new();
+        // Need a non-User predecessor so the FIRST synthetic creates a
+        // new message, not merges.
+        conv.messages.push(Message::new(Role::Assistant, "ack"));
+        conv.add_synthetic_user_message("[Output limit hit]");
+        conv.add_synthetic_user_message("[Context was compressed]");
+        assert_eq!(conv.messages.len(), 2);
+        assert!(
+            conv.messages[1].synthetic,
+            "two synthetics merged stays synthetic"
+        );
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::*;
+    use crate::conversation::message::{Message, MessageContent, Role};
+
+    fn convo(msgs: Vec<Message>) -> Conversation {
+        let mut c = Conversation::new();
+        c.turn_tracker = TurnTracker::rebuild(&msgs);
+        c.messages = msgs;
+        c
+    }
+    fn user(s: &str) -> Message { Message::new(Role::User, s) }
+    fn asst(s: &str) -> Message { Message::new(Role::Assistant, s) }
+    fn synthetic_user(s: &str) -> Message {
+        Message { role: Role::User, content: MessageContent::Text(s.into()), synthetic: true }
+    }
+
+    #[test]
+    fn prompt_count_ignores_synthetic() {
+        let c = convo(vec![user("p1"), asst("a1"), synthetic_user("[ctx]"), user("p2"), asst("a2")]);
+        assert_eq!(c.prompt_count(), 2);
+    }
+
+    #[test]
+    fn undo_last_prompt_truncates_and_returns_text() {
+        let mut c = convo(vec![user("p1"), asst("a1"), user("p2"), asst("a2")]);
+        let restored = c.undo_to_prompt(2);
+        assert_eq!(restored.as_deref(), Some("p2"));
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.messages[0].text(), Some("p1"));
+        assert_eq!(c.turn_tracker.turns.len(), 1);
+    }
+
+    #[test]
+    fn undo_earlier_prompt_removes_following_turns() {
+        let mut c = convo(vec![user("p1"), asst("a1"), user("p2"), asst("a2"), user("p3"), asst("a3")]);
+        let restored = c.undo_to_prompt(2);
+        assert_eq!(restored.as_deref(), Some("p2"));
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.prompt_count(), 1);
+    }
+
+    #[test]
+    fn undo_counts_real_prompts_only() {
+        // real prompts: p1@0, p2@3. nth=2 must cut at idx 3, keeping the synthetic.
+        let mut c = convo(vec![user("p1"), asst("a1"), synthetic_user("[ctx]"), user("p2"), asst("a2")]);
+        let restored = c.undo_to_prompt(2);
+        assert_eq!(restored.as_deref(), Some("p2"));
+        assert_eq!(c.messages.len(), 3);
+    }
+
+    #[test]
+    fn undo_first_prompt_keeps_leading_non_user() {
+        let mut c = convo(vec![asst("sys"), user("p1"), asst("a1")]);
+        let restored = c.undo_to_prompt(1);
+        assert_eq!(restored.as_deref(), Some("p1"));
+        assert_eq!(c.messages.len(), 1);
+        assert_eq!(c.messages[0].text(), Some("sys"));
+    }
+
+    #[test]
+    fn undo_out_of_range_returns_none_and_no_mutation() {
+        let mut c = convo(vec![user("p1"), asst("a1")]);
+        assert!(c.undo_to_prompt(0).is_none());
+        assert!(c.undo_to_prompt(2).is_none());
+        assert_eq!(c.messages.len(), 2);
+    }
+
+    #[test]
+    fn undo_clears_inflight_buffers() {
+        let mut c = convo(vec![user("p1"), asst("a1"), user("p2")]);
+        c.stream_buffer = Some("partial".into());
+        c.undo_to_prompt(2);
+        assert!(c.stream_buffer.is_none());
+        assert!(c.tool_call_buffer.is_none());
     }
 }

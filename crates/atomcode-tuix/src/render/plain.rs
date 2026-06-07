@@ -15,9 +15,9 @@ const SGR_GREEN: &str = "\x1b[32m";
 const SGR_CYAN: &str = "\x1b[36m";
 const SGR_DIM: &str = "\x1b[2m";
 
-/// Plain-text renderer for pipes, CI, dumb terminals, and TUI-incompatible
-/// terminals (e.g. JetBrains JediTerm — see `lib.rs` JediTerm fallback).
-/// No raw-mode dependencies, no DECSTBM, no cursor positioning.
+/// Plain-text renderer for pipes, CI, dumb terminals, and the
+/// `ATOMCODE_PLAIN=1` user opt-in. No raw-mode dependencies, no
+/// DECSTBM, no cursor positioning.
 ///
 /// Plain mode does support a few low-effort UX wins on top of bare
 /// printf, all gated by `TerminalCaps`:
@@ -371,8 +371,10 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             UiLine::CommandOutput(text) => {
                 self.drop_transient();
                 // CommandOutput is trusted internal text — keep SGR so
-                // colours / bold reach the terminal. See the matching
-                // alt_screen note for why this is safe.
+                // colours / bold reach the terminal. The sanitizer
+                // strips C0 controls but lets SGR through; downstream
+                // consumers (other terminals, pipes) handle the bytes
+                // unchanged.
                 let safe = crate::sanitize::scrub_controls_keep_sgr(&text);
                 let _ = self.out.write_all(safe.as_bytes());
                 if !safe.ends_with('\n') {
@@ -446,6 +448,7 @@ mod tests {
             raw_mode: false,
             scroll_region: false,
             unicode_symbols: false,
+            legacy_conhost: false,
         }
     }
 
@@ -462,6 +465,7 @@ mod tests {
             raw_mode: false,
             scroll_region: false,
             unicode_symbols: true,
+            legacy_conhost: false,
         }
     }
 

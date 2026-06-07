@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Web UI · AtomCode Docs</title>
+<meta name="description" content="AtomCode's browser interface: launch with /webui, chat and manage sessions and model config in the browser, and mirror a session live across devices with /sync.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="webui">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.25.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Web UI</h1>
+      <p class="lede">Besides the terminal TUI, AtomCode ships a built-in <strong>browser interface</strong>: type <code>/webui</code> in the TUI to launch it, then chat, browse session history, add/edit/delete model providers, and upload images in the browser — and use <code>/sync</code> to mirror one session <strong>live</strong> between the terminal and the browser. It reuses this machine's login, models, and session history, so there's nothing extra to configure.</p>
+
+      <h2>Start &amp; stop</h2>
+      <p>Run these in the AtomCode TUI input box:</p>
+      <pre><code># Launch the webui and open the browser (binds 127.0.0.1:13457 by default — local only)
+/webui
+
+# Stop the webui server
+/webui stop</code></pre>
+      <p>On launch, AtomCode starts a local HTTP server and opens your browser to a URL like <code>http://127.0.0.1:13457/?token=&lt;one-time token&gt;</code>. The <code>token</code> in the URL is the credential — it's <strong>equivalent to a password</strong>, so don't share it. The current TUI session is also attached to live sync automatically (see <a href="#live-sync">Live sync across devices</a> below).</p>
+
+      <div class="callout callout-warn">
+        <strong>Localhost only by default</strong>
+        <p>The webui binds <code>127.0.0.1</code>, reachable only from this machine. To open it from a phone, do <strong>not</strong> expose it with <code>--host 0.0.0.0</code>; use the 蒲公英 virtual-LAN approach instead — see <a href="./webui-remote-access.html">Remote Access</a>.</p>
+      </div>
+
+      <h2>What the interface offers</h2>
+      <p>The browser UI brings the terminal's capabilities into a graphical interface:</p>
+      <table>
+        <thead>
+          <tr><th>Area</th><th>What you can do</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Sidebar</td><td>Session history grouped by project, search sessions, start a new chat, rename / delete sessions; collapses to an icon rail (a drawer on mobile).</td></tr>
+          <tr><td>Model selector</td><td>Switch provider / model right under the input box; same-named models are disambiguated with a provider tag.</td></tr>
+          <tr><td>Model config</td><td>Add / edit / delete providers in settings: name, type (openai / claude / ollama), model, Base URL, API key, context window, and set-as-default.</td></tr>
+          <tr><td>Settings</td><td>Theme (light / dark), language (中 / EN), model config, and the remote-access entry.</td></tr>
+          <tr><td>Image attachments</td><td>Paste or pick images to send with a message (2&nbsp;MB each); non-vision models fall back to VL; thumbnails show in history.</td></tr>
+          <tr><td>Tool execution</td><td>Tool calls show their arguments and output inline, expandable line by line, both live and in history.</td></tr>
+          <tr><td>Attach menu (+)</td><td>Upload an image, pick a file for context, or insert a Skill.</td></tr>
+          <tr><td>Working directory</td><td>Switch the working dir, browse folders, create a new folder, set a default working dir.</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="live-sync">Live sync across devices</h2>
+      <p>Behind the webui is a <strong>LiveSession</strong>: one session can be open in the terminal and multiple browser tabs at once, and every input, streamed AI reply, and tool result is <strong>broadcast live</strong> to all connected views — a viewer that joins late first receives a snapshot replay.</p>
+      <ul>
+        <li>When you run <code>/webui</code>, the current TUI session is <strong>attached automatically</strong> — messages you send in the terminal appear in the browser, and vice versa.</li>
+        <li>In <strong>another</strong> TUI, run <code>/sync</code> to attach to the running webui session (a <code>/webui</code> must already be running).</li>
+        <li><code>/sync off</code> — leave sync and return to a standalone session.</li>
+      </ul>
+      <p>This makes "start in the terminal, watch progress on a phone / tablet" — or several people watching the same agent session — possible.</p>
+
+      <h2>Remote access</h2>
+      <p>Want to open the webui from a phone without exposing it publicly? Use a 蒲公英 (Oray PGY) virtual LAN: bind the server to the virtual IP with <code>/webui --host &lt;virtual IP&gt;</code>, then scan the QR in the Remote Access panel. Full walkthrough in <a href="./webui-remote-access.html">Remote Access</a>.</p>
+
+      <h2>Next</h2>
+      <ul>
+        <li><a href="./webui-remote-access.html">Remote Access</a> — open the webui from a phone over 蒲公英, safely</li>
+        <li><a href="./headless-daemon.html">Headless &amp; Daemon</a> — the daemon and HTTP/SSE API behind the webui</li>
+        <li><a href="./slash-commands.html">Slash Commands</a> — quick reference for <code>/webui</code>, <code>/sync</code> and more</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

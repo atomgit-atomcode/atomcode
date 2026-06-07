@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use super::config::matching_hooks;
 use super::{
@@ -13,6 +12,9 @@ use super::{
 /// hook-injected context blocks visually distinct when multiple hooks
 /// each contribute a chunk.
 fn push_context(acc: &mut String, extra: &str) {
+    if extra.is_empty() {
+        return;
+    }
     if !acc.is_empty() {
         acc.push_str("\n\n");
     }
@@ -123,21 +125,36 @@ impl HookExecutor {
         let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
 
         let mut injected = String::new();
+        let mut warnings = Vec::new();
         for hook in matched {
             match self.execute_hook_with_stdin(hook, &payload_json).await {
                 Ok((exit_ok, stdout, stderr)) => {
                     if !exit_ok {
-                        // Non-zero exit → block. Prefer stderr for the user
-                        // message (CC convention: scripts use stderr for
-                        // human-readable rejection text).
+                        // Non-zero exit: check if the hook explicitly blocked
+                        // via structured JSON before treating it as an
+                        // environment failure.
+                        let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty());
+                        let json_action = last_line.and_then(|l| {
+                            serde_json::from_str::<UserPromptSubmitOutput>(l.trim()).ok()
+                        });
+                        if let Some(parsed) = json_action {
+                            if matches!(parsed.decision.as_deref(), Some("block")) {
+                                let reason = parsed
+                                    .reason
+                                    .unwrap_or_else(|| "user prompt blocked by hook".into());
+                                return UserPromptHookResult::Block(reason);
+                            }
+                        }
+                        // No structured block — environment failure, warn.
                         let reason = if !stderr.trim().is_empty() {
                             stderr.trim().to_string()
                         } else if !stdout.trim().is_empty() {
                             stdout.trim().to_string()
                         } else {
-                            "user prompt blocked by hook".into()
+                            "hook exited with error".into()
                         };
-                        return UserPromptHookResult::Block(reason);
+                        warnings.push(reason);
+                        continue;
                     }
                     // CC parity: hooks routinely log debug noise on
                     // earlier lines and emit the structured decision as
@@ -186,6 +203,9 @@ impl HookExecutor {
             }
         }
 
+        if !warnings.is_empty() {
+            return UserPromptHookResult::Warning(warnings.join("; "));
+        }
         if injected.is_empty() {
             UserPromptHookResult::Continue
         } else {
@@ -203,12 +223,14 @@ impl HookExecutor {
     ) -> anyhow::Result<(bool, String, String)> {
         use std::process::Stdio;
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&hook.command)
-            .stdin(Stdio::piped())
+        let mut cmd = crate::process_utils::shell_command(&hook.command);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Hook timeout drops the inner future; without kill_on_drop
+            // the sh subprocess (and anything it spawned) keeps running
+            // detached. Set the flag BEFORE spawn so it propagates.
+            .kill_on_drop(true);
         if let Some(ref root) = hook.plugin_root {
             let s = root.as_os_str();
             cmd.env("CLAUDE_PLUGIN_ROOT", s);
@@ -231,8 +253,8 @@ impl HookExecutor {
             let output = child.wait_with_output().await?;
             anyhow::Ok((
                 output.status.success(),
-                String::from_utf8_lossy(&output.stdout).to_string(),
-                String::from_utf8_lossy(&output.stderr).to_string(),
+                crate::process_utils::decode_subprocess_output(&output.stdout),
+                crate::process_utils::decode_subprocess_output(&output.stderr),
             ))
         };
 
@@ -263,11 +285,12 @@ impl HookExecutor {
         let ctx_json =
             serde_json::to_string(ctx).unwrap_or_else(|_| "{}".to_string());
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&hook.command)
-            .env("ATOMCODE_HOOK_EVENT", &ctx.event)
-            .env("ATOMCODE_HOOK_CONTEXT", &ctx_json);
+        let mut cmd = crate::process_utils::shell_command(&hook.command);
+        cmd.env("ATOMCODE_HOOK_EVENT", &ctx.event)
+            .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
+            // Hook timeout drops the cmd.output() future; without
+            // kill_on_drop the sh subprocess keeps running detached.
+            .kill_on_drop(true);
 
         if let Some(ref name) = ctx.tool_name {
             cmd.env("ATOMCODE_TOOL_NAME", name);
@@ -367,6 +390,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hook_returning_modify_json() {
+        let hook = make_hook(
+            HookEvent::PreToolUse,
+            Some("bash"),
+            r#"echo '{"action":"modify","args":{"command":"ls -la"}}'"#,
+        );
+        let exec = HookExecutor::new(vec![hook]);
+        let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
+        assert_eq!(
+            result,
+            PreHookResult::Modify {
+                args: json!({"command": "ls -la"})
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_multiple_modify_last_wins() {
+        let hooks = vec![
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                r#"echo '{"action":"modify","args":{"command":"first"}}'"#,
+            ),
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                r#"echo '{"action":"allow"}'"#,
+            ),
+        ];
+        let exec = HookExecutor::new(hooks);
+        let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
+        // The second hook returns Allow, but the first hook's Modify should
+        // still be the accumulated result.
+        assert_eq!(
+            result,
+            PreHookResult::Modify {
+                args: json!({"command": "first"})
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_multiple_block_short_circuits() {
+        let hooks = vec![
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                r#"echo '{"action":"allow"}'"#,
+            ),
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                r#"echo '{"action":"block","reason":"second blocks"}'"#,
+            ),
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                // This hook should NEVER run because Block short-circuits.
+                r#"echo 'should-not-be-called'"#,
+            ),
+        ];
+        let exec = HookExecutor::new(hooks);
+        let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
+        assert_eq!(
+            result,
+            PreHookResult::Block {
+                reason: "second blocks".into()
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn hook_returning_non_json_allows() {
         let hook = make_hook(
             HookEvent::PreToolUse,
@@ -391,6 +487,40 @@ mod tests {
         let exec = HookExecutor::new(vec![hook]);
         let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
         assert_eq!(result, PreHookResult::Allow);
+    }
+
+    // ── PreToolUse 边界场景 ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn hook_returns_empty_stdout_allows() {
+        let hook = make_hook(HookEvent::PreToolUse, Some("bash"), "true"); // no output
+        let exec = HookExecutor::new(vec![hook]);
+        let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
+        assert_eq!(result, PreHookResult::Allow);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_two_modifys_last_wins() {
+        let hooks = vec![
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                r#"echo '{"action":"modify","args":{"command":"first"}}'"#,
+            ),
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                r#"echo '{"action":"modify","args":{"command":"second"}}'"#,
+            ),
+        ];
+        let exec = HookExecutor::new(hooks);
+        let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
+        assert_eq!(
+            result,
+            PreHookResult::Modify {
+                args: json!({"command": "second"})
+            }
+        );
     }
 
     // ── UserPromptSubmit ─────────────────────────────────────────
@@ -447,7 +577,7 @@ mod tests {
         );
         let exec = HookExecutor::new(vec![hook]);
         let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
-        assert_eq!(r, UserPromptHookResult::Block("bad".into()));
+        assert_eq!(r, UserPromptHookResult::Warning("bad".into()));
     }
 
     /// Regression: stdout that mixes debug logging with a trailing JSON
@@ -527,6 +657,61 @@ mod tests {
         exec.run_post_tool_use("bash", &test_ctx()).await;
     }
 
+    #[tokio::test]
+    async fn post_tool_multiple_all_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let m1 = dir.path().join("h1");
+        let m2 = dir.path().join("h2");
+        let (p1, p2) = (m1.to_string_lossy().to_string(), m2.to_string_lossy().to_string());
+        let hooks = vec![
+            make_hook(HookEvent::PostToolUse, Some("bash"), &format!("touch {}", p1)),
+            make_hook(HookEvent::PostToolUse, Some("bash"), &format!("touch {}", p2)),
+        ];
+        let exec = HookExecutor::new(hooks);
+        exec.run_post_tool_use("bash", &test_ctx()).await;
+        assert!(m1.exists(), "first post-tool hook should have run");
+        assert!(m2.exists(), "second post-tool hook should have run");
+    }
+
+    #[tokio::test]
+    async fn post_tool_crash_does_not_affect_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survivor");
+        let p = marker.to_string_lossy().to_string();
+        let hooks = vec![
+            make_hook(HookEvent::PostToolUse, Some("bash"), "exit 1"),
+            make_hook(HookEvent::PostToolUse, Some("bash"), &format!("touch {}", p)),
+        ];
+        let exec = HookExecutor::new(hooks);
+        exec.run_post_tool_use("bash", &test_ctx()).await;
+        assert!(marker.exists(), "subsequent hook should fire after crash");
+    }
+
+    #[tokio::test]
+    async fn post_tool_matcher_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("post_matched");
+        let p = marker.to_string_lossy().to_string();
+        let hooks = vec![
+            make_hook(HookEvent::PostToolUse, Some("grep"), &format!("touch {}", p)),
+        ];
+        let exec = HookExecutor::new(hooks);
+        // Should not run for "bash" (matcher doesn't match)
+        exec.run_post_tool_use("bash", &test_ctx()).await;
+        assert!(!marker.exists(), "non-matching hook should not fire");
+        // Should run for "grep" (matcher matches)
+        exec.run_post_tool_use("grep", &test_ctx()).await;
+        assert!(marker.exists(), "matching hook should fire");
+    }
+
+    #[tokio::test]
+    async fn post_tool_no_matching_noop() {
+        let hook = make_hook(HookEvent::PostToolUse, Some("grep"), "echo should-not-run");
+        let exec = HookExecutor::new(vec![hook]);
+        exec.run_post_tool_use("bash", &test_ctx()).await;
+        // Should not panic — no hooks match, fire-and-forget is a no-op.
+    }
+
     // ── Matcher integration ──────────────────────────────────────
 
     #[tokio::test]
@@ -573,5 +758,371 @@ mod tests {
         assert_eq!(parsed["event"], "pre_tool_use");
         assert_eq!(parsed["tool"], "bash");
         assert_eq!(parsed["has_ctx"], "yes");
+    }
+
+    // -- UserPromptSubmit multiple hooks / edge cases --
+
+    #[tokio::test]
+    async fn user_prompt_multiple_hooks_first_blocks() {
+        let hooks = vec![
+            make_hook(HookEvent::UserPromptSubmit, None,
+                r#"echo '{"decision":"block","reason":"blocked by first"}'"#),
+            make_hook(HookEvent::UserPromptSubmit, None,
+                r#"echo 'plain inject from second'"#),
+        ];
+        let exec = HookExecutor::new(hooks);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Block("blocked by first".into()));
+    }
+
+    #[tokio::test]
+    async fn user_prompt_all_inject_combined() {
+        let hooks = vec![
+            make_hook(HookEvent::UserPromptSubmit, None, r#"echo 'context from first'"#),
+            make_hook(HookEvent::UserPromptSubmit, None, r#"echo 'context from second'"#),
+        ];
+        let exec = HookExecutor::new(hooks);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Inject("context from first
+
+context from second".into()));
+    }
+
+    #[tokio::test]
+    async fn user_prompt_nonzero_exit_no_stderr() {
+        let hook = make_hook(HookEvent::UserPromptSubmit, None, "exit 1");
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Warning("hook exited with error".into()));
+    }
+
+    #[tokio::test]
+    async fn user_prompt_json_empty_object_continues() {
+        let hook = make_hook(HookEvent::UserPromptSubmit, None, r#"echo '{}'"#);
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Continue);
+    }
+
+    #[tokio::test]
+    async fn user_prompt_decision_allow_continues() {
+        // JSON with decision="allow" should be treated as continue (not block).
+        let hook = make_hook(HookEvent::UserPromptSubmit, None,
+            r#"echo '{"decision":"allow"}'"#);
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Continue);
+    }
+
+    #[tokio::test]
+    async fn user_prompt_json_block_with_trailing_debug_falls_through() {
+        // When the LAST non-empty line is debug noise (not JSON), the hook
+        // falls through to plain-text inject even if an earlier line
+        // contained a valid block JSON. The entire stdout is injected.
+        let hook = make_hook(HookEvent::UserPromptSubmit, None,
+            r#"echo '{"decision":"block","reason":"missed"}'; echo 'some trailing log'"#);
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert!(matches!(r, UserPromptHookResult::Inject(_)),
+            "expected Inject, got {:?}", r);
+        if let UserPromptHookResult::Inject(ctx) = r {
+            assert!(ctx.contains("some trailing log"), "ctx: {ctx}");
+            assert!(ctx.contains("missed"), "ctx: {ctx}");
+        }
+    }
+
+    #[tokio::test]
+    async fn user_prompt_json_decision_allow_with_context_injects() {
+        let hook = make_hook(HookEvent::UserPromptSubmit, None,
+            r#"echo '{"decision":"allow","hookSpecificOutput":{"additionalContext":"extra"}}'"#);
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Inject("extra".into()));
+    }
+
+    #[tokio::test]
+    async fn user_prompt_whitespace_only_continues() {
+        let hook = make_hook(HookEvent::UserPromptSubmit, None, "echo '   '");
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Continue);
+    }
+
+    #[tokio::test]
+    async fn user_prompt_timeout_degrades_to_continue() {
+        let mut hook = make_hook(HookEvent::UserPromptSubmit, None, "sleep 3600");
+        hook.timeout_ms = 50;
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Continue);
+    }
+
+    #[tokio::test]
+    async fn user_prompt_block_after_inject_still_blocks() {
+        let hooks = vec![
+            make_hook(HookEvent::UserPromptSubmit, None, r#"echo 'injected'"#),
+            make_hook(HookEvent::UserPromptSubmit, None,
+                r#"echo '{"decision":"block","reason":"second blocks"}'"#),
+        ];
+        let exec = HookExecutor::new(hooks);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Block("second blocks".into()));
+    }
+
+    #[tokio::test]
+    async fn user_prompt_stderr_preferred_over_stdout_for_block() {
+        let hook = make_hook(HookEvent::UserPromptSubmit, None,
+            r#"echo 'stdout msg' && echo 'stderr reason' >&2 && exit 1"#);
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Warning("stderr reason".into()));
+    }
+
+    #[tokio::test]
+    async fn user_prompt_payload_fields_echoed_by_python() {
+        // Hook uses python3 to extract fields from stdin JSON and
+        // print them as plain text (non-JSON → Inject path).
+        let hook = make_hook(HookEvent::UserPromptSubmit, None,
+            r#"python3 -c 'import json,sys;d=json.load(sys.stdin);print("sid="+d["session_id"]+" prompt_len="+str(len(d["prompt"])))'"#);
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hello-world", "s-42", "/tmp").await;
+        match r {
+            UserPromptHookResult::Inject(ctx) => {
+                assert!(ctx.contains("s-42"), "ctx: {ctx}");
+                assert!(ctx.contains("prompt_len=11"), "ctx: {ctx}");
+            }
+            _ => panic!("expected Inject, got {:?}", r),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_prompt_spawn_failure_continues() {
+        // A command that triggers a real OS-level spawn failure (not a
+        // shell-detected missing-command error) degrades to Continue.
+        // Real spawn failures are extremely rare; the shell itself
+        // always starts, and "command not found" is a non-zero exit
+        // (→ Block), not a spawn error.
+        //
+        // We verify the Err path of execute_hook_with_stdin by using
+        // a timeout: the sleep hook times out, which returns Err and
+        // the caller treats it as Continue.
+        let mut hook = make_hook(HookEvent::UserPromptSubmit, None, "sleep 10");
+        hook.timeout_ms = 100;
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Continue);
+    }
+
+    #[tokio::test]
+    async fn user_prompt_three_injects_combined() {
+        let hooks = vec![
+            make_hook(HookEvent::UserPromptSubmit, None, "echo first"),
+            make_hook(HookEvent::UserPromptSubmit, None, "echo second"),
+            make_hook(HookEvent::UserPromptSubmit, None, "echo third"),
+        ];
+        let exec = HookExecutor::new(hooks);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Inject("first\n\nsecond\n\nthird".into()));
+    }
+
+    // -- Session events --
+
+    fn session_ctx(event: &str) -> HookContext {
+        HookContext {
+            event: event.into(),
+            tool_name: None,
+            tool_args: None,
+            tool_result: None,
+            tool_success: None,
+            session_id: "sess-1".into(),
+            working_dir: "/tmp".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_start_runs_matching_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("session_started");
+        let p = marker.to_string_lossy().to_string();
+        let hook = make_hook(HookEvent::SessionStart, None, &format!("touch {}", p));
+        let exec = HookExecutor::new(vec![hook]);
+        exec.run_session_event(HookEvent::SessionStart, &session_ctx("session_start")).await;
+        assert!(marker.exists(), "SessionStart hook should have run");
+    }
+
+    #[tokio::test]
+    async fn session_end_runs_matching_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("session_ended");
+        let p = marker.to_string_lossy().to_string();
+        let hook = make_hook(HookEvent::SessionEnd, None, &format!("touch {}", p));
+        let exec = HookExecutor::new(vec![hook]);
+        exec.run_session_event(HookEvent::SessionEnd, &session_ctx("session_end")).await;
+        assert!(marker.exists(), "SessionEnd hook should have run");
+    }
+
+    #[tokio::test]
+    async fn session_event_no_matching_hooks_noop() {
+        let hook = make_hook(HookEvent::PostToolUse, None, "echo should-not-run");
+        let exec = HookExecutor::new(vec![hook]);
+        exec.run_session_event(HookEvent::SessionStart, &session_ctx("session_start")).await;
+    }
+
+    #[tokio::test]
+    async fn session_event_tool_matcher_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("session_matcher_ignored");
+        let p = marker.to_string_lossy().to_string();
+        let hook = make_hook(HookEvent::SessionStart, Some("grep"),
+            &format!("touch {}", p));
+        let exec = HookExecutor::new(vec![hook]);
+        exec.run_session_event(HookEvent::SessionStart, &session_ctx("session_start")).await;
+        assert!(marker.exists(), "SessionStart hook ignores tool matcher");
+    }
+
+    #[tokio::test]
+    async fn session_event_crash_does_not_panic() {
+        let hook = make_hook(HookEvent::SessionStart, None, "exit 1");
+        let exec = HookExecutor::new(vec![hook]);
+        exec.run_session_event(HookEvent::SessionStart, &session_ctx("session_start")).await;
+    }
+
+    #[tokio::test]
+    async fn session_event_multiple_hooks_all_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("ev1");
+        let f2 = dir.path().join("ev2");
+        let p1 = f1.to_string_lossy().to_string();
+        let p2 = f2.to_string_lossy().to_string();
+        let hooks = vec![
+            make_hook(HookEvent::SessionEnd, None, &format!("touch {}", p1)),
+            make_hook(HookEvent::SessionEnd, None, &format!("touch {}", p2)),
+        ];
+        let exec = HookExecutor::new(hooks);
+        exec.run_session_event(HookEvent::SessionEnd, &session_ctx("session_end")).await;
+        assert!(f1.exists(), "first SessionEnd hook should run");
+        assert!(f2.exists(), "second SessionEnd hook should run");
+    }
+
+    #[tokio::test]
+    async fn session_notification_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("notified");
+        let p = marker.to_string_lossy().to_string();
+        let hook = make_hook(HookEvent::Notification, None, &format!("touch {}", p));
+        let exec = HookExecutor::new(vec![hook]);
+        exec.run_session_event(HookEvent::Notification, &session_ctx("notification")).await;
+        assert!(marker.exists(), "Notification hook should run");
+    }
+
+    #[tokio::test]
+    async fn session_event_timeout_does_not_panic() {
+        let mut hook = make_hook(HookEvent::SessionStart, None, "sleep 10");
+        hook.timeout_ms = 100;
+        let exec = HookExecutor::new(vec![hook]);
+        // Should not panic; timeout is silently swallowed.
+        exec.run_session_event(HookEvent::SessionStart, &session_ctx("session_start")).await;
+    }
+
+    // -- execute_hook edge cases --
+
+    #[tokio::test]
+    async fn execute_hook_without_tool_name_does_not_set_env() {
+        let hook = make_hook(HookEvent::SessionStart, None,
+            r#"printf '%s' "${ATOMCODE_TOOL_NAME-unset}""#);
+        let exec = HookExecutor::new(vec![hook]);
+        let ctx = HookContext {
+            event: "session_start".into(),
+            tool_name: None,
+            tool_args: None,
+            tool_result: None,
+            tool_success: None,
+            session_id: "s".into(),
+            working_dir: "/tmp".into(),
+        };
+        let stdout = exec.execute_hook(&exec.hooks[0], &ctx).await.unwrap();
+        assert_eq!(stdout, "unset");
+    }
+
+    #[tokio::test]
+    async fn execute_hook_with_plugin_root_sets_both_env_vars() {
+        let mut hook = make_hook(HookEvent::PreToolUse, Some("bash"),
+            r#"printf '%s:%s' "$CLAUDE_PLUGIN_ROOT" "$ATOMCODE_PLUGIN_ROOT""#);
+        hook.plugin_root = Some(std::path::PathBuf::from("/opt/p"));
+        let exec = HookExecutor::new(vec![hook]);
+        let stdout = exec.execute_hook(&exec.hooks[0], &test_ctx()).await.unwrap();
+        assert_eq!(stdout, "/opt/p:/opt/p");
+    }
+    #[tokio::test]
+    async fn execute_hook_with_positive_timeout_runs_successfully() {
+        let mut hook = make_hook(HookEvent::PreToolUse, None, "echo ok");
+        hook.timeout_ms = 5000;
+        let exec = HookExecutor::new(vec![hook]);
+        let stdout = exec.execute_hook(&exec.hooks[0], &test_ctx()).await.unwrap();
+        assert_eq!(stdout.trim(), "ok");
+    }
+
+    #[tokio::test]
+    async fn execute_hook_nonzero_exit_returns_error() {
+        let hook = make_hook(HookEvent::PreToolUse, None, "exit 2");
+        let exec = HookExecutor::new(vec![hook]);
+        let result = exec.execute_hook(&exec.hooks[0], &test_ctx()).await;
+        assert!(result.is_err(), "expected Err for non-zero exit, got {:?}", result);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exited with status"), "unexpected error: {}", err);
+    }
+
+    #[tokio::test]
+    async fn execute_hook_with_stdin_echoes_payload() {
+        let hook = make_hook(HookEvent::UserPromptSubmit, None, r#"cat"#);
+        let exec = HookExecutor::new(vec![hook]);
+        let (ok, stdout, _) = exec.execute_hook_with_stdin(
+            &exec.hooks[0], r#"{"hello":"world"}"#).await.unwrap();
+        assert!(ok);
+        assert!(stdout.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn execute_hook_with_stdin_nonzero_exit() {
+        // Non-zero exit returns ok=false but still captures stderr.
+        let hook = make_hook(HookEvent::UserPromptSubmit, None, r#"echo 'reason on stderr' >&2; exit 1"#);
+        let exec = HookExecutor::new(vec![hook]);
+        let (ok, _stdout, stderr) = exec.execute_hook_with_stdin(
+            &exec.hooks[0], r#"{"k":"v"}"#).await.unwrap();
+        assert!(!ok);
+        assert!(stderr.trim() == "reason on stderr",
+            "stderr should contain the error message, got: '{stderr}'");
+    }
+
+    // -- push_context helper --
+
+    #[test]
+    fn push_context_empty_acc() {
+        let mut acc = String::new();
+        push_context(&mut acc, "hello");
+        assert_eq!(acc, "hello");
+    }
+
+    #[test]
+    fn push_context_non_empty_acc() {
+        let mut acc = "first".to_string();
+        push_context(&mut acc, "second");
+        assert_eq!(acc, "first\n\nsecond");
+    }
+
+    #[test]
+    fn push_context_empty_extra() {
+        let mut acc = "first".to_string();
+        push_context(&mut acc, "");
+        assert_eq!(acc, "first");
+    }
+
+    #[test]
+    fn push_context_multiple_appends() {
+        let mut acc = String::new();
+        push_context(&mut acc, "a");
+        push_context(&mut acc, "b");
+        push_context(&mut acc, "c");
+        assert_eq!(acc, "a\n\nb\n\nc");
     }
 }

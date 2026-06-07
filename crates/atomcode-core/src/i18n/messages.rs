@@ -9,14 +9,14 @@ pub enum Msg<'a> {
     WelcomeOptionSkip,
     WelcomeOptionSkipHint,
 
-    // ── /codingplan ──
+    // ── /login (full setup flow) ──
     CodingPlanSetupFailed { error: &'a str },
-    /// Emitted inline by /codingplan and `atomcode codingplan` when the
-    /// stored OAuth token comes back 401 from the CodingPlan API
-    /// mid-flow. We re-run the same OAuth dance `/login` uses, save the
-    /// fresh token, and retry the whole setup once — this line tells
-    /// the user that's what's about to happen so the second
-    /// "Open this URL in any browser…" block isn't a surprise.
+    /// Emitted inline by `/login` and `atomcode login` when the stored
+    /// OAuth token comes back 401 from the CodingPlan API mid-flow.
+    /// We re-run the OAuth dance, save the fresh token, and retry the
+    /// whole setup once — this line tells the user that's what's about
+    /// to happen so the second "Open this URL in any browser…" block
+    /// isn't a surprise.
     CpReauthAfter401,
     /// Emitted by the OpenAI provider when an AtomGit-gateway chat
     /// request returns 401 and our one automatic refresh_token attempt
@@ -36,6 +36,12 @@ pub enum Msg<'a> {
     CpClaimSuccessFallback,
     CpAlreadyClaimed { reason: &'a str },
     CpClaimFailed { error: &'a str },
+    /// Same as `CpClaimFailed` but with no trailing detail body.
+    /// Used in the rare edge case where every tier returned success=
+    /// false with an empty server message AND no transport error
+    /// text — there's nothing to put after `— `, so the line stops
+    /// at the prefix.
+    CpClaimFailedBare,
     /// Per-tier cascade row — winning tier, fresh claim.
     /// Example (zh-CN): `  ✓ CodingPlan Lite 领取成功`
     CpClaimTierSucceeded { tier: &'a str },
@@ -70,6 +76,7 @@ pub enum Msg<'a> {
         total_days: i32,
     },
     CpUsageLine { usage: &'a str, reset_at: &'a str, duration: &'a str },
+    CpMonthlyQuotaExhausted { duration: &'a str },
     CpWindowQuotaExhausted,
     CpWindowQuotaHint { hint: &'a str },
     CpStatusFetchSkipped { reason: &'a str },
@@ -108,7 +115,15 @@ pub enum Msg<'a> {
 
     // ── Status bar (build_status) ──
     StatusNoProvider,
+    /// Open-source build with an AtomGit-gateway provider configured.
+    /// Sending any chat will fail with `CpOfficialBuildRequired`; this
+    /// hint surfaces the same diagnosis up-front so the user doesn't
+    /// have to type a message to discover the dead-end.
+    StatusOfficialBuildRequired,
     StatusUpgradeHint { version: &'a str },
+    /// Right-aligned status-row hint, HarmonyBrew variant: a newer version
+    /// exists, upgrade via the package manager rather than `/upgrade`.
+    StatusUpgradeHintPm { version: &'a str },
     StatusModelNotConfigured,
     /// macOS / Linux variant: "Image in clipboard · ctrl+v to paste".
     /// Ctrl+V is intercepted by Windows Terminal / conhost before
@@ -119,6 +134,10 @@ pub enum Msg<'a> {
     /// user to fall back on the `/paste` slash command, which works
     /// in every terminal regardless of host keybinds.
     StatusClipboardImageHintSlash,
+    /// Lowest-priority status-row fallback: nudge the user toward the
+    /// `/webui` command (browser UI) when no higher-priority hint
+    /// (warnings / usage / upgrade) is competing for the slot.
+    StatusWebuiHint,
 
     // ── /status command body ──
     StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },
@@ -131,15 +150,13 @@ pub enum Msg<'a> {
         remaining_days: i32,
         total_days: i32,
     },
-    StatusCpUsage { usage: &'a str, reset_at: &'a str, seconds: i64 },
+    StatusCpUsage { usage: &'a str, reset_at: &'a str, duration: &'a str },
+    StatusCpMonthlyExhausted { duration: &'a str },
     StatusCpWindowExhausted,
     StatusCpWindowHint { hint: &'a str },
     StatusInstructionFilesHeader,
     StatusInstructionPresent { path: &'a str, label: &'a str },
     StatusInstructionMissing { label: &'a str },
-
-    // ── /login completion ──
-    LoginSignedInWithCpHint { name: &'a str, username: &'a str },
 
     // ── Help / commands ──
     HelpAvailableCommands,
@@ -160,6 +177,9 @@ pub enum Msg<'a> {
     ProviderMenuDeleteDesc,
     ProviderMenuSetDefault,
     ProviderMenuSetDefaultDesc,
+    ProviderImportPrompt,
+    ProviderImportParsed { base_url: &'a str, type_name: &'a str, model: &'a str },
+    ProviderImportFailed,
     ProviderNoProviders,
     ProviderDeleteConfirm { name: &'a str },
     ProviderDeleted { name: &'a str },
@@ -180,10 +200,14 @@ pub enum Msg<'a> {
     ProviderStepModel,
     ProviderStepModelWithHint { current: &'a str },
     ProviderNameEmpty,
+    ProviderBaseUrlEmpty,
     ProviderUnknownType,
     ProviderUnknownTypeEdit,
     ProviderModelEmpty,
     ProviderEditKeep,
+    ProviderTypeInferred { type_name: &'a str },
+    ProviderStepNameDefault { default: &'a str },
+    ProviderStepProgress { current: usize, total: usize },
 
     // ── Model picker ──
     ModelSwitched { provider: &'a str, model: &'a str },
@@ -202,6 +226,9 @@ pub enum Msg<'a> {
     SessionListFailed { error: &'a str },
     SessionRenamed { old: &'a str, new: &'a str },
     SessionSaveFailed { error: &'a str },
+    SessionDeleted { name: &'a str },
+    SessionDeleteConfirm { name: &'a str },
+    SessionDeleteFailed { error: &'a str },
     SessionNoneSelected,
     SessionRenameEditing { buffer: &'a str },
 
@@ -250,6 +277,12 @@ pub enum Msg<'a> {
     IdleHintCodingplanSuffix,
     /// Complete plain-text version: "/codingplan  to claim a free token quota"
     IdleHintCodingplanFull,
+    /// "/webui" command label
+    IdleHintWebui,
+    /// "open a synced session in the browser" (text after /webui)
+    IdleHintWebuiSuffix,
+    /// Complete plain-text version: "/webui  open a synced session in the browser"
+    IdleHintWebuiFull,
 
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,
@@ -265,6 +298,12 @@ pub enum Msg<'a> {
     CmdReloadDone { provider: &'a str, model: &'a str },
     CmdReloadFailed { error: &'a str },
     CmdUndoNotSupported,
+    CmdUndoDone { target: usize, last: usize },
+    CmdUndoDiskWarning,
+    CmdUndoNoTurns,
+    CmdUndoOutOfRange { requested: usize, available: usize },
+    CmdUndoBusy,
+    CmdUndoBadArg,
     CmdNoChanges,
     CmdCheckingUpdate,
     CmdNoActiveProvider,
@@ -294,10 +333,6 @@ pub enum Msg<'a> {
     // ── Terminal keyboard hints ──
     KbdHintMacos,
     KbdHintOther,
-
-    // ── JediTerm / conhost fallback ──
-    JediTermFallback,
-    LegacyConhostFallback,
 
     // ── Background task ──
     BackgroundComplete { turns: usize },
@@ -345,6 +380,9 @@ pub enum Msg<'a> {
     DiffFailed { error: &'a str },
 
     // ── /upgrade ──
+    /// Shown when `/upgrade` (or rollback) is invoked in a HarmonyBrew-managed
+    /// build: self-update is disabled, point the user at `brew upgrade`.
+    UpgradePackageManaged,
     UpgradeUnknownArg { arg: &'a str },
 
     // ── /skills ──
@@ -421,7 +459,7 @@ pub enum Msg<'a> {
     SetupInstalledRow { kind: &'a str, slug: &'a str, path: &'a str },
     /// Per-item skipped row: "  - skill:xyz (hash match)"
     SetupSkippedRow { kind: &'a str, slug: &'a str, reason: &'a str },
-    /// Per-item failed row: "  ✗ mcp:xyz — error message"
+    /// Per-item failed row: "  × mcp:xyz — error message"
     SetupFailedRow { kind: &'a str, slug: &'a str, error: &'a str },
     /// "💡 Tip: Run /setup …" — first-run hint shown above the prompt
     /// when the project has no setup state yet.
@@ -441,7 +479,11 @@ pub enum Msg<'a> {
     PluginUsage,
     PluginMarketplaceUsage,
     PluginInstallUsage,
+    PluginInstallNotFound { plugin: &'a str },
+    PluginInstallAmbiguous { plugin: &'a str },
     PluginUninstallUsage,
+    PluginUninstallNotFound { plugin: &'a str },
+    PluginUninstallAmbiguous { plugin: &'a str },
     PluginNoMarketplaces,
     PluginMarketplacesHeader,
     PluginNoInstalled,
@@ -452,13 +494,67 @@ pub enum Msg<'a> {
     PluginMarketplaceUpdating { name: &'a str },
     PluginMarketplaceListFailed { error: &'a str },
     PluginInstalling { plugin: &'a str, marketplace: &'a str },
+    PluginInstallingByName { plugin: &'a str },
+    PluginAlreadyInstalled { id: &'a str },
+    // Interactive `/plugin` manager modal.
+    PluginMgrBrowse,
+    PluginMgrAdd,
+    PluginMgrRemove,
+    PluginMgrInstalled { count: usize },
+    PluginMgrInstalledMark,
+    PluginMgrHintNav,
+    PluginMgrHintToggle,
+    PluginMgrHintRemove,
+    PluginMgrHintUninstall,
+    PluginMgrHintUrl,
+    PluginMgrHintPending,
+    PluginMgrInstallingLabel,
+    PluginMgrEmptyMarketplaces,
+    PluginMgrEmptyPlugins,
+    PluginMgrEmptyInstalled,
+    PluginMgrCloning,
+    PluginMgrInstalling { plugin: &'a str },
+    PluginMgrEscToCancel,
+    // Scope selection screen.
+    PluginScopeUser,
+    PluginScopeUserDesc,
+    PluginScopeProject,
+    PluginScopeProjectDesc,
+    PluginScopeLocal,
+    PluginScopeLocalDesc,
+    PluginScopeHint,
     PluginUninstalled { plugin: &'a str, marketplace: &'a str },
     PluginUninstallFailed { error: &'a str },
     PluginListFailed { error: &'a str },
+    PluginReloadDone { skills: usize, warnings: usize },
+    /// Git not found on the system — marketplace auto-install and auto-update
+    /// are disabled. Shown as a friendly hint (not an error) at startup.
+    PluginGitNotFound,
+    /// Marketplace `add` completion toast. Emitted by `handle_plugin_job_event`
+    /// for both manual `/plugin marketplace add` and the detached
+    /// startup-bootstrap auto-install. `count` is the number of plugins the
+    /// marketplace exposes after cloning.
+    PluginMarketplaceAdded { name: &'a str, commit: &'a str, count: usize },
+    /// Marketplace `update` completion toast — HEAD actually moved. No-op
+    /// pulls (HEAD unchanged) emit no toast at all so a quiet `git pull`
+    /// doesn't spam the body region.
+    PluginMarketplaceUpdated { name: &'a str, commit: &'a str },
+    /// Plugin `install` completion toast. `skipped` counts skills that the
+    /// loader rejected (bad SKILL.md frontmatter, namespace collision, etc.);
+    /// `show_details_hint` flips on the trailing "(Ctrl+O for details)"
+    /// nudge when warnings exist and verbose mode is off.
+    PluginInstallDone {
+        plugin: &'a str,
+        marketplace: &'a str,
+        loaded: usize,
+        skipped: usize,
+        show_details_hint: bool,
+    },
+    SetupAutoReloaded { skills: usize, warnings: usize },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
+    CmdDescWebui,
     CmdDescSetup,
-    CmdDescCodingplan,
     CmdDescResume,
     CmdDescRename,
     CmdDescLogin,
@@ -490,6 +586,7 @@ pub enum Msg<'a> {
     CmdDescPlan,
     CmdDescBuild,
     CmdDescThink,
+    CmdDescEffort,
     CmdDescHelp,
     CmdDescKeys,
     CmdDescLanguage,
@@ -501,10 +598,53 @@ pub enum Msg<'a> {
     /// users whose Ctrl+V is swallowed by Windows Terminal / conhost
     /// before reaching the app, but works on every platform.
     CmdDescPaste,
+    /// Description for the `/guide` slash command — asks atomcode-guide a question.
+    CmdDescGuide,
+    /// `/guide` menu header: "📖 AtomCode Guide — type /guide <question>"
+    GuideMenuHeader,
+    /// `/guide` menu: "Common topics:" section label
+    GuideMenuTopics,
+    /// `/guide` menu topic: getting started
+    GuideMenuGettingStarted,
+    /// `/guide` menu topic: switching models
+    GuideMenuSwitchModel,
+    /// `/guide` menu topic: using MCP
+    GuideMenuMcp,
+    /// `/guide` menu topic: skills and plugins
+    GuideMenuSkills,
+    /// `/guide` menu topic: memory feature
+    GuideMenuMemory,
+    /// `/guide` menu topic: background tasks
+    GuideMenuBackground,
+    /// `/guide` menu topic: context management
+    GuideMenuContext,
+    /// `/guide` menu topic: keyboard shortcuts
+    GuideMenuKeybindings,
+    /// `/guide` menu topic: configuration
+    GuideMenuConfig,
+    /// /guide menu tip: hint for users to type a question
+    GuideMenuTip,
+    /// /guide menu: documentation URL
+    GuideMenuDocUrl,
+    /// `/guide`: ask skill install already in progress, please wait
+    CmdGuideInstalling,
+    /// `/guide`: ask skill not installed, triggering auto-install
+    CmdGuideAutoInstall,
+    /// `/guide`: auto-invoke completed, now answering
+    CmdGuideAutoInvoke { topic: &'a str },
+    /// `/guide`: install succeeded but ask skill still not found
+    CmdGuideSkillNotFound,
+    /// `/guide`: install failed, suggest manual install
+    CmdGuideInstallFailed { error: &'a str },
     /// `/paste` failed because the clipboard holds no image. Shown
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.
     CmdPasteNoImage,
+
+    // ── reasoning effort ──
+    /// Rendered when the user tries to set reasoning_effort on a
+    /// model that doesn't support it (only DeepSeek V4 / reasoner).
+    ReasoningEffortNoEffect,
 
     // ── config save failed ──
     ConfigSaveFailed { error: &'a str },
@@ -557,6 +697,18 @@ pub enum Msg<'a> {
         total_tokens: usize,
     },
 
+    /// Turn-end summary when the turn terminated in an error (the red
+    /// error line is rendered separately, just above this). Same stats
+    /// as `TurnSummary` but with a ✗ marker and a neutral "stopped"
+    /// label instead of a celebratory verb — otherwise an errored turn
+    /// reads as `✓ Nailed it` right under its own error message.
+    TurnSummaryError {
+        turn_count: usize,
+        tool_call_count: usize,
+        duration: &'a str,
+        total_tokens: usize,
+    },
+
     // ── OAuth login chrome (/login + /codingplan share these) ──
     /// Header above the QR block when scanning with WeChat is the
     /// expected flow. Includes the leading "  " indent and trailing
@@ -603,6 +755,23 @@ pub enum Msg<'a> {
     /// model can't accept images AND no `vision_preprocessor_provider`
     /// is configured. `model` is the current model identifier.
     ModelNoImageSupport { model: &'a str },
+
+    // ── --dangerously-skip-permissions / -y ──
+    /// Scrollback warning banner when --dangerously-skip-permissions is active
+    /// in TUI mode. Includes leading "⚠ " and trailing "\n".
+    BypassWarningBanner,
+    /// Headless-mode stderr warning when --dangerously-skip-permissions is active.
+    BypassWarningHeadless,
+    /// Status-bar badge text shown when --dangerously-skip-permissions is
+    /// active. Typically "⚠ BYPASS" — kept short for the status row.
+    BypassBadge,
+
+    // ── admin / root privilege warning ──
+    /// TUI scrollback warning when AtomCode is running as admin/root.
+    /// Includes leading "⚠ " and trailing "\n".
+    AdminWarningBanner,
+    /// Headless-mode stderr warning when running as admin/root.
+    AdminWarningHeadless,
 
     /// Confirmation hint after the first Ctrl+C on an empty buffer.
     /// "  (press Ctrl+C again to exit)\n" — leading indent + trailing

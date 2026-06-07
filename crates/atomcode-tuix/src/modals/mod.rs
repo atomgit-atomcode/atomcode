@@ -24,6 +24,7 @@ pub mod issue_wizard;
 pub mod language_picker;
 pub mod model_picker;
 pub mod onboarding_wizard;
+pub mod plugin_manager;
 pub mod provider_wizard;
 pub mod proxy_picker;
 mod qr;
@@ -33,6 +34,7 @@ pub use issue_wizard::IssueWizard;
 pub use language_picker::LanguagePicker;
 pub use model_picker::ModelPicker;
 pub use onboarding_wizard::OnboardingWizard;
+pub use plugin_manager::PluginManager;
 pub use provider_wizard::ProviderWizard;
 pub use proxy_picker::ProxyPicker;
 pub use session_picker::SessionPicker;
@@ -89,4 +91,10 @@ pub trait Modal: Send {
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
     }
+
+    /// Notify the modal that an async plugin job finished, so it can refresh
+    /// any cached lists it is displaying. Default: ignore. Only the
+    /// interactive `/plugin` manager overrides this. The event loop calls it
+    /// before rendering the job result and before redrawing the modal.
+    fn on_plugin_event(&mut self, _ev: &atomcode_core::plugin::PluginJobEvent) {}
 }

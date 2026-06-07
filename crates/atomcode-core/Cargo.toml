@@ -13,6 +13,7 @@ anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
+http = "1"
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "blocking"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -70,10 +71,14 @@ tar = "0.4"
 # default — the stub crate is linked only when this feature is enabled,
 # never in standard `cargo build`.
 atomcode-codingplan-crypto = { path = "../atomcode-codingplan-crypto", optional = true }
+htmd = "0.5.4"
 
 [features]
 default = []
 codingplan-crypto = ["dep:atomcode-codingplan-crypto"]
+# Built by the HarmonyBrew formula (`cargo build --features distro-pm`).
+# Disables in-app binary self-update so the package manager owns upgrades.
+distro-pm = []
 
 # Non-blocking poll on stdin in the OAuth callback path so the stdin
 # reader thread can exit cleanly when the HTTP listener wins — otherwise
@@ -84,7 +89,7 @@ libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55"
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Foundation"] }
 
 [dev-dependencies]
 tempfile = "3"

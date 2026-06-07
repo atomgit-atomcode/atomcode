@@ -11,13 +11,15 @@ use uuid::Uuid;
 
 // ---------- SessionMode ----------
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
     Headless,
     Tui,
     Ide,
     Vscode,
+    #[serde(rename = "webui")]
+    Webui,
     AtomcodeAir,
 }
 
@@ -164,7 +166,12 @@ pub enum CodingplanResult {
 pub enum Event {
     /// Fired when AtomCode is launched (interactive CLI, oneshot, or TUI entry).
     /// Not fired for --version / --help / telemetry subcommands.
-    OpenAtomcode,
+    OpenAtomcode {
+        /// True when --dangerously-skip-permissions / -y was passed,
+        /// meaning all tool calls are auto-approved without prompting.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        dangerously_skip_permissions: bool,
+    },
 
     /// One LLM turn completed (success or failure).
     LlmChat {
@@ -240,7 +247,20 @@ pub enum Event {
     },
 
     /// OAuth login completed successfully.
-    LoginSuccess,
+    LoginSuccess {
+        /// Invite code from pending_invite (None for organic installs or legacy clients).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        invite_code: Option<String>,
+        /// Install UUID from pending_invite (None for organic installs or legacy clients).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        install_uuid: Option<Uuid>,
+    },
+
+    /// First launch after install — fired once when a pending_invite file is detected.
+    InstallCompleted {
+        invite_code: String,
+        install_uuid: Uuid,
+    },
 
     /// A coding plan run finished.
     TakeCodingplan {
@@ -343,13 +363,30 @@ mod tests {
     fn record_flattens_envelope_and_event() {
         let r = Record {
             envelope: sample_envelope(),
-            event: Event::OpenAtomcode,
+            event: Event::OpenAtomcode {
+                dangerously_skip_permissions: false,
+            },
         };
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["event_id"], "open_atomcode");
         assert_eq!(v["schema_version"], 1);
         // Envelope flatten: device_id must be at the top level.
         assert!(v.get("device_id").is_some());
+        // dangerously_skip_permissions=false is skipped by skip_serializing_if.
+        assert!(v.get("dangerously_skip_permissions").is_none());
+    }
+
+    #[test]
+    fn open_atomcode_includes_dangerously_skip_permissions_when_true() {
+        let r = Record {
+            envelope: sample_envelope(),
+            event: Event::OpenAtomcode {
+                dangerously_skip_permissions: true,
+            },
+        };
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["event_id"], "open_atomcode");
+        assert_eq!(v["dangerously_skip_permissions"], true);
     }
 
     #[test]
@@ -516,7 +553,8 @@ mod tests {
                         "tool_name": "edit_file",
                         "reason": "User rejected file write",
                         "resolution": "Confirm the edit when prompted"
-                    }).to_string(),
+                    })
+                    .to_string(),
                 ),
             },
         };
@@ -560,8 +598,14 @@ mod tests {
         assert_eq!(v["error_kind"], "warning");
         let ed: serde_json::Value =
             serde_json::from_str(v["error_data"].as_str().unwrap()).unwrap();
-        assert_eq!(ed["reason"], "Command succeeded (exit 0) but produced stderr output");
-        assert_eq!(ed["resolution"], "Review stderr for potential issues; the command may not have had the intended effect");
+        assert_eq!(
+            ed["reason"],
+            "Command succeeded (exit 0) but produced stderr output"
+        );
+        assert_eq!(
+            ed["resolution"],
+            "Review stderr for potential issues; the command may not have had the intended effect"
+        );
     }
 
     #[test]
@@ -603,7 +647,8 @@ mod tests {
                         "transport": "sse",
                         "reason": "Connection timed out after 5s",
                         "resolution": "Check MCP server URL and network connectivity"
-                    }).to_string(),
+                    })
+                    .to_string(),
                 ),
             },
         };
@@ -616,7 +661,10 @@ mod tests {
         let ed: serde_json::Value =
             serde_json::from_str(v["error_data"].as_str().unwrap()).unwrap();
         assert_eq!(ed["reason"], "Connection timed out after 5s");
-        assert_eq!(ed["resolution"], "Check MCP server URL and network connectivity");
+        assert_eq!(
+            ed["resolution"],
+            "Check MCP server URL and network connectivity"
+        );
     }
 
     #[test]
@@ -656,7 +704,8 @@ mod tests {
                         "turns_completed": 5,
                         "last_tool_name": "bash",
                         "last_event": "llm_chat"
-                    }).to_string(),
+                    })
+                    .to_string(),
                 ),
             },
         };
@@ -672,7 +721,9 @@ mod tests {
     #[test]
     fn all_variants_have_event_id_tag() {
         let cases = [
-            Event::OpenAtomcode,
+            Event::OpenAtomcode {
+                dangerously_skip_permissions: false,
+            },
             Event::LlmChat {
                 duration_ms: 0,
                 tool_calls_count: 0,
@@ -710,7 +761,10 @@ mod tests {
                 error_kind: None,
                 error_data: None,
             },
-            Event::LoginSuccess,
+            Event::LoginSuccess {
+                invite_code: None,
+                install_uuid: None,
+            },
             Event::TakeCodingplan {
                 type_: CodingplanResult::Success,
                 error_kind: None,
@@ -745,10 +799,12 @@ mod tests {
 
     #[test]
     fn session_mode_ide_serializes_as_ide() {
-        assert_eq!(
-            serde_json::to_string(&SessionMode::Ide).unwrap(),
-            "\"ide\""
-        );
+        assert_eq!(serde_json::to_string(&SessionMode::Ide).unwrap(), "\"ide\"");
+    }
+
+    #[test]
+    fn session_mode_webui_serializes_as_webui() {
+        assert_eq!(serde_json::to_string(&SessionMode::Webui).unwrap(), "\"webui\"");
     }
 }
 

@@ -20,7 +20,9 @@ pub mod sync_marker;
 pub mod types;
 
 pub use client::{api_base_url, is_auth_expired, AuthExpired, Client};
-pub use crypto::{signer, RequestSigner, SignError, SignInput, SignOutput};
+pub use crypto::{
+    is_atomgit_gateway, signer, signer_available, RequestSigner, SignError, SignInput, SignOutput,
+};
 pub use setup::{run, SetupReport, StepResult};
 pub use sync_marker::{read_last_sync, write_last_sync_now};
 pub use types::{ClaimResponse, ModelEntry, PlanInfo, PlanType, StatusResponse, UsageInfo};

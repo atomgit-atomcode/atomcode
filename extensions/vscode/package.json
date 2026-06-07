@@ -2,7 +2,7 @@
   "name": "atomcode-tools",
   "displayName": "AtomCode for VS Code",
   "description": "AI coding agent powered by AtomCode — terminal-grade AI inside VS Code",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "publisher": "atomcode-tools",
   "license": "MIT",
   "repository": {
@@ -72,6 +72,11 @@
         "icon": "$(rocket)"
       },
       {
+        "command": "atomcode.addToChat",
+        "title": "AtomCode: Add to Chat",
+        "icon": "$(comment-add)"
+      },
+      {
         "command": "atomcode.stop",
         "title": "AtomCode: Stop Generation",
         "icon": "$(stop-circle)"
@@ -111,6 +116,11 @@
         {
           "command": "atomcode.optimize",
           "group": "atomcode@3",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "atomcode.addToChat",
+          "group": "atomcode@4",
           "when": "editorHasSelection"
         }
       ]

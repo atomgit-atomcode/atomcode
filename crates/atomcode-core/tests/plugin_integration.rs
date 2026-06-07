@@ -17,7 +17,9 @@ fn add_install_reload_flow() {
     // Set + unset on drop via this guard mirrors the in-tree
     // `plugin::test_support::isolated_home`. Test files outside the crate
     // can't see `pub(crate)` items so we inline the small guard here.
-    struct Guard(tempfile::TempDir);
+    // Held only for its `Drop` (removes ATOMCODE_HOME); the TempDir field is
+    // never read directly.
+    struct Guard(#[allow(dead_code)] tempfile::TempDir);
     impl Drop for Guard {
         fn drop(&mut self) {
             std::env::remove_var("ATOMCODE_HOME");
@@ -70,7 +72,7 @@ fn add_install_reload_flow() {
 
     let url = format!("file://{}", repo.display());
     atomcode_core::plugin::marketplace::add_marketplace(&url).unwrap();
-    atomcode_core::plugin::installer::install("e2e", "e2e").unwrap();
+    atomcode_core::plugin::installer::install("e2e", "e2e", atomcode_core::plugin::InstallScope::User).unwrap();
 
     // Verify SkillRegistry sees `e2e:sk`.
     let working = tempfile::tempdir().unwrap();

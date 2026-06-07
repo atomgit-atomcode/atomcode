@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.0-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -84,7 +84,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 |----------|:---:|---|
 | Claude（Anthropic） | 支持 | Claude Sonnet 4.5/4.6、Opus 4.6 |
 | OpenAI | 支持 | GPT-4o、GPT-4.1 |
-| DeepSeek | 支持 | DeepSeek V3、DeepSeek R1 |
+| DeepSeek | 支持 | DeepSeek V3、DeepSeek R1、DeepSeek V4 |
 | 智谱（GLM） | 支持 | GLM-4、GLM-5 |
 | 通义千问（阿里） | 支持 | Qwen-Plus、Qwen-Max |
 | SiliconFlow | 支持 | 多种开源模型 |
@@ -110,6 +110,12 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **文件附加** —— 粘贴文件路径即可把内容作为上下文带入
 - **Bracketed paste** —— 长文本粘贴自动折叠为紧凑的指示器
 - **Skills** —— 从 skill 目录加载的用户自定义命令，像普通斜杠命令一样调用
+
+### Web UI
+
+- **`/webui`**（TUI 内）或 **`atomcode webui`**（命令行）会在浏览器里打开一个本地 Web 界面，作为终端界面之外的另一种选择——同一个 agent、同一份会话，渲染在浏览器中
+- **仅本地回环** —— server 绑定 `127.0.0.1` 并使用一次性 token，不对网络暴露
+- **`/webui stop`** 停止进程内 server（之后再次 `/webui` 会重新启动）
 
 ### 安全性
 
@@ -149,6 +155,18 @@ cargo build --release
 
 编译产物会在 `target/release/atomcode` 生成。
 
+### 包管理器安装
+
+除了从源码构建外，AtomCode CLI 也可以通过以下包管理器安装：
+
+```bash
+# 使用 npm 安装
+npm install -g @atomgit.com/atomcode
+
+# 使用 Homebrew 安装
+brew install --cask atomcode
+```
+
 ### 依赖
 
 - Rust 1.88+（用于构建；更旧的 Cargo 无法解析当前 lock 文件）
@@ -168,9 +186,9 @@ atomcode uninstall --dry-run      # 仅打印计划，不实际删除
 二进制已损坏或丢失时使用兜底脚本：
 
 ```bash
-curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.sh | sh
+curl -fsSL https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/uninstall.sh | sh
 # Windows:
-irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.ps1 | iex
+irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/uninstall.ps1 | iex
 ```
 
 默认保留凭据（`auth.toml`、`mcp.json`、`config.toml`、`ATOMCODE.md`），传 `--purge` 才会一起清除。
@@ -316,6 +334,8 @@ atomcode --prompt-file task.md
 | `/config` | 编辑配置文件 |
 | `/status` | 查看登录状态和模型信息 |
 | `/logout` | 退出 AtomGit 登录 |
+| `/think` | 控制深度思考（on/off/budget N） |
+| `/effort` | DeepSeek 推理努力控制（high / max / off） |
 | `/help` | 查看命令与快捷键 |
 | `/quit` | 退出程序（或连按 Ctrl+C） |
 
@@ -372,7 +392,7 @@ atomcode/
 - 编辑 .vue/.ts 文件后运行 `npm run lint`
 ```
 
-AtomCode 会自动读取这个文件并注入到系统提示中。
+AtomCode 会自动读取这个文件并注入到系统提示中。AtomCode 也支持 `AGENTS.md`（AI 编程代理的[开放标准](https://agents.md/)）作为替代——如果两个文件同时存在，`.atomcode.md` 优先。
 
 ## 开发
 

@@ -359,7 +359,7 @@ mod tests {
                 repo_origin: None,
                 mode: None,
             },
-            event: Event::OpenAtomcode,
+            event: Event::OpenAtomcode { dangerously_skip_permissions: false },
         }
     }
 

@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.1</span>
+    <span class="dhdr-ver">v4.25.0</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -56,11 +56,14 @@
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
     <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
     <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
     <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
   </div>
 
   <div class="dside-group">
@@ -79,8 +82,7 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/codingplan</code></td><td><strong>推荐</strong> — 一条命令登录 + 申领 AtomGit CodingPlan 免费额度 + 自动根据额度模型列表写好 provider 配置。首次启动最省事的入口</td></tr>
-          <tr><td><code>/login</code></td><td>仅完成 AtomGit OAuth 身份认证,<strong>不动 provider 配置</strong>(给已有 API Key 但想用 <code>/issue</code> 等 AtomGit 集成的用户)</td></tr>
+          <tr><td><code>/login</code></td><td><strong>推荐</strong> — 一条命令完成 AtomGit OAuth + 申领 CodingPlan 免费额度 + 自动根据额度模型列表写好 provider 配置。首次启动最省事的入口;已登录后重跑会幂等地同步最新模型列表。<em>v4.25.0 起 <code>/codingplan</code> 已折进 <code>/login</code>,旧入口已移除</em></td></tr>
           <tr><td><code>/resume</code></td><td>打开会话选择器,恢复任意一个之前的持久化会话(含消息、目录和模型状态)</td></tr>
           <tr><td><code>/session</code></td><td>创建一个全新的、干净的会话</td></tr>
           <tr><td><code>/bg</code></td><td>将当前会话放到后台并打开新的前台会话;子命令: <code>/bg list</code>、<code>/bg &lt;N&gt;</code>、<code>/bg drop &lt;N&gt;</code>、<code>/bg help</code>。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
@@ -98,7 +100,7 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/undo</code></td><td>回滚上一轮 AI 对本地文件的所有编辑,基于 file-history 快照</td></tr>
+          <tr><td><code>/undo</code> · <code>/undo N</code></td><td>把对话记忆回退到上一轮(或第 N 轮)之前,并把那一轮的 prompt 还原回输入框;只回退记忆,不恢复磁盘文件</td></tr>
           <tr><td><code>/diff</code></td><td>显示当前工作目录未提交改动的 git diff</td></tr>
           <tr><td><code>/cost</code></td><td>展示当前会话输出 token 数。不支持 usage 报告的 API 会自动估算</td></tr>
           <tr><td><code>/context</code></td><td>显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用</td></tr>
@@ -146,10 +148,12 @@
         <tbody>
           <tr><td><code>/setup</code></td><td>第一次执行时,把内置的 <code>atomcode-automation-recommender</code> skill 解压到 <code>~/.atomcode/skills/</code>,在项目 <code>.gitignore</code> 追加 <code>.atomcode/local/</code>,并写 <code>.atomcode/setup-state.json</code>(signals 哈希 + atomcode 版本 + 已安装列表),全程持项目级锁。然后自动调用 recommender skill — 它会扫描项目(语言、框架、已有 hook 等)、联网检索并推荐适合该代码库的其他 atomcode skill 安装。后续执行会跳过 seed 安装、直接重跑 skill。命令后跟的文字会作为 steering 传给 skill,例如 <code>/setup 重点关注测试</code>。CLI 形式 <code>atomcode setup --force</code> 会按内容哈希强制重装 seed 文件</td></tr>
           <tr><td><code>/skills</code></td><td>浏览当前已加载的 skills(项目级 + 用户级)。每个 skill 也会以独立的斜杠命令形式出现在补全菜单里,可以直接 <code>/&lt;skill-name&gt;</code> 触发</td></tr>
-          <tr><td><code>/plugin marketplace</code></td><td>打开插件市场浏览器,从已注册的 marketplace 中挑选并安装</td></tr>
+          <tr><td><code>/plugin</code></td><td>打开交互式插件管理器,可浏览 marketplace、安装/卸载插件、添加/移除 marketplace</td></tr>
+          <tr><td><code>/plugin marketplace add|remove|update|list</code></td><td>管理 marketplace 注册(add 克隆 git 仓库,remove 移除,update 拉最新,list 列出)</td></tr>
           <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>从指定 marketplace 安装插件</td></tr>
           <tr><td><code>/plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>卸载已安装的插件(保留 marketplace 注册)</td></tr>
           <tr><td><code>/plugin list</code></td><td>列出本地已安装的插件</td></tr>
+          <tr><td><code>/plugin reload</code></td><td>重新加载所有插件(扫描磁盘变更、刷新 skill/hook 注册)</td></tr>
         </tbody>
       </table>
       <p>详细配置与使用见 <a href="./skills.html">Skills 扩展</a> 和 <a href="./plugins.html">Plugin 系统</a>。</p>
@@ -167,6 +171,21 @@
       </table>
       <p>详细配置与使用见 <a href="./mcp.html">MCP 集成</a>。</p>
 
+      <h2>WebUI 与同步</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/webui</code></td><td>启动浏览器界面并自动打开浏览器(默认绑定 <code>127.0.0.1:13457</code>,仅本机)。当前 TUI 会话会自动接入实时同步</td></tr>
+          <tr><td><code>/webui --host &lt;addr&gt;</code></td><td>把服务绑定到指定地址;<code>/webui lan</code> 等价于 <code>--host 0.0.0.0</code>(暴露到局域网)。配合蒲公英虚拟 IP 可远程访问,见 <a href="./webui-remote-access.html">远程访问指南</a></td></tr>
+          <tr><td><code>/webui stop</code></td><td>关闭 webui 服务</td></tr>
+          <tr><td><code>/sync</code></td><td>把当前 TUI 接入正在运行的 webui 会话(需先 <code>/webui</code>)。两端实时双向同步,多个浏览器 / 终端可同时围观同一会话</td></tr>
+          <tr><td><code>/sync off</code></td><td>退出同步,回到独立会话</td></tr>
+        </tbody>
+      </table>
+      <p>详细见 <a href="./webui.html">WebUI 界面</a>。</p>
+
       <h2>配置与帮助</h2>
       <table>
         <thead>
@@ -176,11 +195,12 @@
           <tr><td><code>/status</code></td><td>显示登录状态、当前 provider、模型、上下文预算、CodingPlan 用量和重置时间</td></tr>
           <tr><td><code>/whoami</code></td><td>显示当前 AtomGit 登录用户的用户名 / 邮箱</td></tr>
           <tr><td><code>/config</code></td><td>显示 <code>~/.atomcode/config.toml</code> 的路径</td></tr>
-          <tr><td><code>/reload</code></td><td>从磁盘热加载 <code>~/.atomcode/config.toml</code>,不需要重启 atomcode 就能让外部修改(或另一个终端的 <code>/codingplan</code> 带来的变更)生效</td></tr>
+          <tr><td><code>/reload</code></td><td>从磁盘热加载 <code>~/.atomcode/config.toml</code>,不需要重启 atomcode 就能让外部修改(或另一个终端的 <code>/login</code> 带来的变更)生效</td></tr>
           <tr><td><code>/language</code></td><td>切换界面语言:自动检测(<code>LC_ALL</code> / <code>LANG</code>)、English、或 简体中文。立即生效并写回 <code>~/.atomcode/config.toml</code></td></tr>
           <tr><td><code>/welcome</code></td><td>重新打开 3 步首次启动向导(欢迎页 → 语言 → 接入方式)。会话非空时会先弹 <code>y/N</code> 二次确认,确认后清屏。语言和默认接入方式都可以从这里再调一次</td></tr>
           <tr><td><code>/logout</code></td><td>清除 AtomGit OAuth token</td></tr>
           <tr><td><code>/upgrade</code></td><td>自动升级到最新版本;子命令 <code>/upgrade rollback</code> 回滚到上一个版本</td></tr>
+          <tr><td><code>/guide</code></td><td>内置上手向导:<code>/guide</code> 列出可问的主题(快速开始、换模型、MCP、Skills、记忆、后台任务、上下文、快捷键、配置),<code>/guide &lt;主题&gt;</code> 直接在对话里讲解(首次会自动安装 <code>atomcode-skills</code> 插件)</td></tr>
           <tr><td><code>/help</code></td><td>展示所有可用斜杠命令的列表</td></tr>
           <tr><td><code>/keys</code></td><td>展示键盘快捷键参考(分组列出输入 / 历史 / 会话 / 弹层导航,并标注 <code>Shift+Enter</code>、<code>Alt+Enter</code> 在不同终端的兼容性)。详见 <a href="./keybindings.html">键盘快捷键</a></td></tr>
           <tr><td><code>/quit</code></td><td>退出 atomcode(也可以连按两次 <code>Ctrl+C</code>)</td></tr>
@@ -198,7 +218,7 @@
       <h2>典型工作流</h2>
 
       <h3>第一次启动 — 一键接入</h3>
-      <pre><code>&gt; /codingplan
+      <pre><code>&gt; /login
   ✔ Logged in as alice (alice, alice@example.com)
   ✔ CodingPlan claimed — CodingPlan Free · expires 2026-05-22 (29d / 30d)
   ✔ 3 models registered as AtomGit-* providers
@@ -214,11 +234,13 @@ Session token usage
 - Current turn tokens: 2156
 - Context: 42K / 128K</code></pre>
 
-      <h3>改完不满意就回滚</h3>
+      <h3>问歪了就回退重问</h3>
       <pre><code>&gt; 给所有函数加 JSDoc
-... (AI 编辑了 12 个文件)
+... (回复跑偏了)
 &gt; /undo
-Rolled back 12 file edits from the last turn.</code></pre>
+已回退到第 3 轮(共 3 轮)。
+⚠ 仅回滚了对话记忆,磁盘文件未恢复。如需还原代码,请手动处理或用 /diff 查看。
+(刚才那条 prompt 已还原到输入框,可改完重发)</code></pre>
 
       <h3>模型表现不好换一个再试</h3>
       <pre><code>&gt; /model

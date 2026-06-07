@@ -75,6 +75,12 @@ Use tables for structured data.
 Tables MUST use `|`-pipe markdown form (`| col1 | col2 |` with `|---|---|` separator). NEVER pre-draw tables with Unicode box-drawing characters (┌ ─ ┐ │ ├ ┼ ┤ └ ┴ ┘) — the renderer relies on the `|` form to detect the table and re-flow it for narrow terminals; pre-drawn box tables overflow on small screens and break alignment.
 Match the user's language. If the user writes in Chinese, respond in Chinese. If in English, respond in English.
 
+## CONTENT-TRANSFORMATION TASKS:
+When the user asks you to translate, format, convert, rewrite, refactor, or otherwise transform their input into output content (NOT summarize, NOT explain), output every line of the result in full.
+NEVER use placeholders like `...`, `(以下省略)`, `(rest unchanged)`, `(此处继续 ...)`, `(continue similarly)`, `(略)`, `(其余类似)`, or `/* ... */` to skip content the user asked you to produce. These are bugs, not brevity. The user wants the artifact, not a sketch of it.
+If the full output would exceed your token budget, write it to a file with `write_file` and report the path — do NOT inline-abbreviate. A file with every line is always better than a chat reply with `(...)`.
+The brevity rule in OUTPUT above applies to your commentary on the work, not to the transformed content itself.
+
 ## CHINESE CODE SUPPORT:
 When working with Chinese codebases:
 - Chinese comments (单行注释 //中文, 多行注释 /* 中文 */) should be understood and preserved.
@@ -146,6 +152,54 @@ mod tests {
         assert!(
             p.contains("DEPENDS on step N's output"),
             "must explain when sequential is actually correct"
+        );
+    }
+
+    /// Lock the anti-abbreviation guidance into the prompt. Small/fast
+    /// models (e.g. deepseek-v4-flash) on long transformation tasks
+    /// (translate a full doc, refactor a long function, output a long
+    /// diff) skip the middle with placeholders like "(此处继续 ...)" /
+    /// "(rest unchanged)" / "...". The OUTPUT section's "keep text brief"
+    /// rule is upstream of this and was being mis-applied to the
+    /// transformed content itself. This test locks both the section and
+    /// a representative subset of the forbidden placeholder list — a
+    /// future edit that drops the section or softens it (removes the
+    /// `NEVER use placeholders` clause, or the `write_file` escape
+    /// hatch) will fail here.
+    #[test]
+    fn unified_prompt_forbids_placeholder_abbreviation() {
+        let p = build_rules();
+        assert!(
+            p.contains("CONTENT-TRANSFORMATION TASKS"),
+            "must keep the anti-abbreviation section header"
+        );
+        assert!(
+            p.contains("output every line of the result in full"),
+            "must keep the full-output mandate"
+        );
+        // Representative subset of the forbidden placeholder list.
+        // Covers both Chinese and English variants since the issue
+        // first surfaced on a Chinese-language translation task.
+        for token in &[
+            "(以下省略)",
+            "(rest unchanged)",
+            "(此处继续 ...)",
+            "(continue similarly)",
+            "(略)",
+        ] {
+            assert!(
+                p.contains(token),
+                "must explicitly forbid placeholder `{}`",
+                token
+            );
+        }
+        assert!(
+            p.contains("write_file") && p.contains("token budget"),
+            "must offer write_file as escape hatch when over token budget"
+        );
+        assert!(
+            p.contains("applies to your commentary"),
+            "must distinguish brevity-of-commentary from brevity-of-content"
         );
     }
 

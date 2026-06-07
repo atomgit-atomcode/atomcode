@@ -51,19 +51,25 @@ use atomcode_telemetry::{
 };
 
 /// Set to `true` at the start of `run_headless` so the panic hook and the
-/// top-level error handler can skip TUI cleanup. In headless mode we never
-/// entered the alternate screen, so calling `LeaveAlternateScreen` would
-/// emit `\x1b[?1049l` to stdout and corrupt pipe-friendly output.
+/// top-level error handler can skip TUI cleanup. In headless mode raw mode
+/// was never enabled, so calling `disable_raw_mode` would be a wasted ioctl
+/// and on Windows can panic if the console handle isn't a real TTY.
 static HEADLESS_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Restore terminal state if (and only if) we ever entered TUI mode.
 /// No-op in headless mode — see [`HEADLESS_MODE`].
+///
+/// TUI mode (v4.23.2+) runs entirely in the primary screen via the
+/// append-only RetainedRenderer — we never emit `\x1b[?1049h`, so there
+/// is no `LeaveAlternateScreen` counterpart to issue here. Mouse mode,
+/// cursor visibility, autowrap and DECSTBM are restored by
+/// `RetainedRenderer::Drop` / `shutdown()`; this hook only owns the
+/// raw-mode toggle.
 fn restore_terminal_if_tui() {
     if HEADLESS_MODE.load(Ordering::Relaxed) {
         return;
     }
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen,);
 }
 
 /// Resolve the working directory at startup. **Always** uses the current
@@ -216,6 +222,7 @@ fn should_try_sync_upgrade() -> bool {
                 | "status"
                 | "upgrade"
                 | "rollback"
+                | "uninstall"
                 | "mcp"
                 | "telemetry"
                 | "--version"
@@ -487,11 +494,21 @@ struct Cli {
     /// Disable telemetry for this invocation.
     #[arg(long = "no-telemetry", default_value_t = false, global = true)]
     pub no_telemetry: bool,
+
+    /// Skip all permission prompts — auto-approve every tool call (bash,
+    /// file edits, MCP, etc.). Equivalent to Claude Code's
+    /// --dangerously-skip-permissions. The TUI shows a red ⚠ BYPASS
+    /// badge while active. Use in CI/CD, eval harnesses, or when you
+    /// trust the agent's built-in safety constraints.
+    #[arg(short = 'y', long = "dangerously-skip-permissions", default_value_t = false)]
+    pub dangerously_skip_permissions: bool,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Login to AtomCode using AtomGit OAuth
+    /// Sign in with AtomGit OAuth and claim CodingPlan models in one
+    /// flow: OAuth (if needed) → claim → fetch models → register
+    /// providers → fetch status. Reports each step and exits.
     Login,
     /// Logout from AtomCode
     Logout,
@@ -511,9 +528,10 @@ enum Commands {
         /// Full issue URL, e.g. https://atomgit.com/owner/repo/issues/42
         url: String,
     },
-    /// Claim CodingPlan and set up provider/model config from its model list.
-    /// Runs: login (if not already) → claim → fetch models → write providers
-    /// → fetch status. Reports each step and exits.
+    /// Hidden alias for `atomcode login` — kept so existing scripts /
+    /// muscle memory don't break after `/codingplan` and `atomcode
+    /// codingplan` were folded into the unified `/login` flow.
+    #[command(hide = true)]
     Codingplan,
     /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
     #[command(subcommand)]
@@ -526,6 +544,15 @@ enum Commands {
         /// Client identifier for telemetry (e.g. "vscode", "atomcode-air")
         #[arg(long)]
         client: Option<String>,
+    },
+    /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
+    Webui {
+        /// 端口（默认 13457，刻意错开 VSCode 守护进程的 13456，避免抢端口导致扩展 401/无响应）
+        #[arg(long, default_value_t = atomcode_daemon::WEBUI_DEFAULT_PORT)]
+        port: u16,
+        /// 绑定地址（默认 127.0.0.1；用 0.0.0.0 暴露到局域网/外网，注意仅 token 保护、无 TLS）
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
     },
     /// Telemetry controls
     Telemetry {
@@ -561,6 +588,23 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Manage hooks (list, test, enable/disable)
+    #[command(subcommand)]
+    Hooks(HookCommands),
+}
+
+/// Subcommands for hooks management
+#[derive(Subcommand)]
+enum HookCommands {
+    /// List all loaded hooks with their status
+    List,
+    /// Test a specific hook by name
+    Test {
+        /// Hook name to test
+        name: String,
+    },
+    /// Show hook configuration paths
+    Paths,
 }
 
 #[derive(Subcommand)]
@@ -685,17 +729,72 @@ const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
 /// parent can be Ctrl+C'd without cancelling the download.
 const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Run the entire program on a thread with a large, explicit stack.
+    // Rust gives the *main* OS thread the platform-default stack — on
+    // Windows that's only ~1 MB (vs 8 MB on Linux/macOS). The TUI event
+    // loop, the synchronous codingplan/OAuth work, and the rustls TLS
+    // handshakes all run on it via `block_on`, and a deep call chain there
+    // can overflow 1 MB. A stack overflow on Windows kills the process via
+    // an OS exception (STATUS_STACK_OVERFLOW) WITHOUT a Rust panic — so it
+    // never reaches the crash-log hook and looks like a silent exit. A
+    // 16 MB stack removes that platform asymmetry. (See the Windows
+    // post-scan onboarding crash investigation.)
+    let child = std::thread::Builder::new()
+        .name("atomcode-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("failed to spawn atomcode main thread");
+    // Under `panic = "abort"` a panic in the child already aborts the whole
+    // process, so `join` only returns an error on an abnormal thread exit;
+    // mirror Rust's conventional panic exit code in that case.
+    if child.join().is_err() {
+        std::process::exit(101);
+    }
+}
+
+fn real_main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        // Worker threads (for `tokio::spawn`ed tasks) get a generous stack
+        // too — same rationale as the main thread above.
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("failed to build tokio runtime");
+    rt.block_on(async_main());
+}
+
+async fn async_main() {
     // Set Windows console to UTF-8 so CJK and other multi-byte characters
     // render correctly instead of showing garbled output (mojibake).
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::Globalization::CP_UTF8;
-        use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+        use windows_sys::Win32::System::Console::{GetConsoleCP, SetConsoleCP, SetConsoleOutputCP};
         unsafe {
             SetConsoleOutputCP(CP_UTF8);
             SetConsoleCP(CP_UTF8);
+
+            // SetConsoleCP(CP_UTF8) is best-effort — some IMEs ignore it and
+            // keep outputting in the system ANSI code page (e.g. CP936/GBK on
+            // Chinese Windows). When the console then interprets those bytes as
+            // UTF-8, CJK input renders as garbled mojibake. Detect the mismatch
+            // early so users know why their IME isn't working.
+            //
+            // We use eprintln! rather than a direct WriteConsoleW because at
+            // this early point in async_main the TUI has not yet taken over the
+            // terminal. stderr is still connected to the console and the
+            // message will be visible inline in PowerShell / conhost.
+            let actual_cp = GetConsoleCP();
+            if actual_cp != CP_UTF8 {
+                let _ = eprintln!(
+                    "\n⚠  Console input code page is {} (expected 65001/UTF-8).\n\
+                       Chinese/Japanese/Korean IME input may show garbled text.\n\
+                       → Use Windows Terminal for native UTF-8 support.\n\
+                       → Or enable Beta: Use Unicode UTF-8 in Region settings.\n",
+                    actual_cp,
+                );
+            }
         }
     }
 
@@ -776,6 +875,7 @@ async fn main() {
 
     // Set a minimal pre-telemetry panic hook (replaced after telemetry init in run()).
     std::panic::set_hook(Box::new(|info| {
+        write_crash_log(info);
         restore_terminal_if_tui();
         eprintln!("\nAtomCode crashed: {}", info);
         if let Some(location) = info.location() {
@@ -801,6 +901,8 @@ async fn main() {
 
 async fn run() -> Result<i32> {
     let cli = Cli::parse();
+
+    let is_admin = atomcode_core::process_utils::is_running_as_admin();
 
     // ── Telemetry init ────────────────────────────────────────────────────────
     // Load config early (before subcommand dispatch) so we can read the
@@ -832,15 +934,21 @@ async fn run() -> Result<i32> {
         }
     }
 
-    let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
+    let telemetry = Telemetry::init(resolved.clone(), env!("CARGO_PKG_VERSION").into());
     install_panic_hook(telemetry.clone());
+
+    // Emit install_completed if this is the first launch after a referral install
+    telemetry
+        .maybe_emit_install_completed(&resolved.atomcode_dir)
+        .await;
     // ── End telemetry init ────────────────────────────────────────────────────
 
     // Handle subcommands. Most are self-contained (`handle_command` runs
-    // and exits); `Login` falls through to the TUI, and `Fixissue` is
-    // like headless `-p` but with the prompt synthesised from a remote
-    // issue payload — so we resolve it here and hand it to the agent
-    // loop via `fixissue_prompt` below.
+    // and exits); `Login` (and its hidden alias `Codingplan`) run the
+    // full OAuth + CodingPlan setup flow and then fall through to the
+    // TUI. `Fixissue` is like headless `-p` but with the prompt
+    // synthesised from a remote issue payload — so we resolve it here
+    // and hand it to the agent loop via `fixissue_prompt` below.
     let mut fixissue_prompt: Option<String> = None;
     // Saved when fixissue is parsed, so after the agent finishes we can
     // POST the summary back to AtomGit as a comment + add the `fixed`
@@ -849,24 +957,18 @@ async fn run() -> Result<i32> {
     // `fixissue` is an interactive-feeling structured workflow (the user
     // is watching progress, not piping output). Force verbose so they see
     // tool calls / edits instead of long silences while the agent works.
+
     let mut force_verbose = false;
     if let Some(cmd) = cli.command {
         match cmd {
-            Commands::Login => {
-                HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let auth = auth::login(Some(&telemetry))?;
-                auth::save_auth(&auth)?;
-                println!("  Login successful! Starting AtomCode...\n");
-                HEADLESS_MODE.store(false, Ordering::Relaxed);
-                // Fall through to TUI startup below
-            }
-            Commands::Codingplan => {
-                // Run the codingplan setup flow, then fall through to TUI
-                // startup regardless of outcome — mirrors `Commands::Login`.
-                // On success the freshly saved config.toml is picked up by
-                // `Config::load` further down. On failure the TUI opens in
-                // onboarding mode (no providers) so the user can retry via
-                // `/codingplan` or `/login` without re-launching the binary.
+            Commands::Login | Commands::Codingplan => {
+                // Unified login flow: OAuth (if needed) → claim → fetch
+                // models → register providers → fetch status. Falls
+                // through to TUI startup regardless of outcome. On
+                // success the freshly saved config.toml is picked up by
+                // `Config::load` further down. On failure the TUI opens
+                // in onboarding mode (no providers) so the user can
+                // retry via `/login` without re-launching the binary.
                 // Emits open_atomcode (mode=headless) then take_codingplan
                 // (emitted internally by run_codingplan_core via coding_plan::run).
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -880,7 +982,9 @@ async fn run() -> Result<i32> {
                     ..CurrentContext::current()
                 };
                 let outcome = CurrentContext::scope(scope_ctx, || async {
-                    telemetry.track(Event::OpenAtomcode);
+                    telemetry.track(Event::OpenAtomcode {
+                        dangerously_skip_permissions: cli.dangerously_skip_permissions,
+                    });
                     run_codingplan_core(Some(&telemetry))
                 })
                 .await;
@@ -889,7 +993,7 @@ async fn run() -> Result<i32> {
                         print!("{}", report);
                     }
                     Err(e) => {
-                        eprintln!("codingplan failed: {:#}", e);
+                        eprintln!("login setup failed: {:#}", e);
                     }
                 }
                 println!("\n  Starting AtomCode...\n");
@@ -947,9 +1051,7 @@ async fn run() -> Result<i32> {
                         if let Some(ref c) = client {
                             cmd.arg("--client").arg(c);
                         }
-                        let status = cmd
-                            .status()
-                            .context("Failed to start atomcode-daemon")?;
+                        let status = cmd.status().context("Failed to start atomcode-daemon")?;
                         return Ok(if status.success() { 0 } else { 1 });
                     }
                     None => {
@@ -958,6 +1060,14 @@ async fn run() -> Result<i32> {
                         return Ok(1);
                     }
                 }
+            }
+            Commands::Webui { port, host } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let msg = atomcode_daemon::ensure_server_and_open(&host, port, false).await;
+                eprintln!("{msg}");
+                // server 是后台 task；保持进程存活直到用户 Ctrl+C
+                let _ = tokio::signal::ctrl_c().await;
+                return Ok(0);
             }
             Commands::Telemetry { action } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -1020,7 +1130,7 @@ async fn run() -> Result<i32> {
                 vision_preprocessor_provider: None,
                 language: None,
                 ui: Default::default(),
-            plugin: Default::default(),
+                plugin: Default::default(),
             }
         })
     } else {
@@ -1046,31 +1156,21 @@ async fn run() -> Result<i32> {
     atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // ── i18n locale ──
-    let locale = atomcode_tuix::i18n::resolve_initial_locale(
-        cli.lang.as_deref(),
-        config.language,
-    );
+    let locale = atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
     atomcode_tuix::i18n::set_locale(locale);
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
     //
-    // Two best-effort hooks fire here (after config load, before any
-    // network-bound LLM activity):
-    //
-    //   1. First-startup auto-install of the default skills
-    //      marketplace. One-shot, marker-file gated; respects later
-    //      `/plugin uninstall`. Config: `plugin.auto_install_default_skills`.
-    //   2. Post-self-upgrade `git pull` of every installed
-    //      marketplace. Gated on `ATOMCODE_UPGRADED_FROM` being set
-    //      (which `self_update::re_exec_self` does on success), so a
-    //      plain `cargo build` invocation never triggers it. Config:
-    //      `plugin.auto_update_marketplaces`.
-    //
-    // Both are non-blocking from a UX standpoint (worst case ~1-3 s
-    // of `git` subprocess time on a warm path; longer for the first
-    // clone). Failures are logged to stderr and swallowed — the user
-    // gets a usable atomcode either way.
-    atomcode_core::plugin::bootstrap::run_startup_hooks(&config);
+    // Two best-effort hooks (auto-install default skills marketplace
+    // on first startup, `git pull` every installed marketplace after a
+    // self-upgrade) used to fire here synchronously, blocking the
+    // input box for 1–3s on a warm path (and 5–10s on first clone).
+    // Both now run as a detached `spawn_blocking` from inside
+    // `atomcode_tuix::run` after the skill registry is constructed —
+    // see lib.rs near `spawn_plugin_bootstrap`. Newly-installed skills
+    // are picked up by a `skill_registry.reload()` + wake pulse the
+    // background task fires on completion, so the slash menu refreshes
+    // without a restart.
 
     let unavailable_reason = if config.providers.is_empty() {
         Some(atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::CmdNoActiveProvider).into_owned())
@@ -1080,7 +1180,7 @@ async fn run() -> Result<i32> {
 
     /// Build the placeholder `ProviderConfig` used when no real provider is
     /// available.  The TUI still boots — the Welcome wizard / status-row
-    /// hints nudge the user to `/login` or `/codingplan`, and a successful
+    /// hints nudge the user to `/login`, and a successful
     /// auth flow rebuilds the real provider via `rebuild_provider`.
     fn dummy_provider_config() -> (ProviderConfig, String) {
         (
@@ -1096,6 +1196,7 @@ async fn run() -> Result<i32> {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -1130,7 +1231,7 @@ async fn run() -> Result<i32> {
             Err(e) => {
                 eprintln!(
                     "Warning: could not resolve active provider ({}). \
-                     Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                     Launching TUI in onboarding mode — use /login to set up.",
                     e
                 );
                 dummy_provider_config()
@@ -1149,7 +1250,7 @@ async fn run() -> Result<i32> {
     // Graceful fallback: if provider construction fails because the
     // token is unavailable, swap in the same dummy used on first-run
     // so the TUI boots. The Welcome-wizard / status-row hints will
-    // nudge the user to `/login` or `/codingplan`, and a successful
+    // nudge the user to `/login`, and a successful
     // auth flow rebuilds the real provider via `rebuild_provider`.
     let (provider, model_name) = if let Some(reason) = unavailable_reason {
         (unavailable_provider(reason), model_name)
@@ -1158,18 +1259,15 @@ async fn run() -> Result<i32> {
             Ok(p) => (p, model_name),
             Err(e) => {
                 let msg = format!("{:#}", e);
-                let is_auth_gap = msg.contains("Not logged in")
-                    || msg.contains("Invalid auth.toml")
-                    || msg.contains("Token expired");
-                if is_auth_gap {
+                if is_auth_gap_error(&msg) {
                     eprintln!(
                         "Note: provider credentials not available ({}). \
-                         Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                         Launching TUI in onboarding mode — use /login to set up.",
                         msg
                     );
                     (
                         unavailable_provider(format!(
-                            "Provider 凭证不可用：{}。请使用 /login 或 /codingplan 完成配置后再试。",
+                            "Provider 凭证不可用：{}。请使用 /login 完成配置后再试。",
                             msg
                         )),
                         String::new(),
@@ -1338,12 +1436,13 @@ async fn run() -> Result<i32> {
     // Bare `atomcode` (no `-c`) starts completely fresh.
     let conversation = Conversation::new();
 
-    let (mut agent_loop, agent_handle) = AgentLoop::new(
+    let (mut agent_loop, agent_handle) = AgentLoop::new_with_skip_permissions(
         config.clone(),
         provider,
         tool_registry,
         tool_context.clone(),
         conversation,
+        cli.dangerously_skip_permissions,
     );
     agent_loop.set_max_turns(cli.max_turns);
     let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
@@ -1389,12 +1488,26 @@ async fn run() -> Result<i32> {
     } else {
         SessionMode::Tui
     };
-    // Bind telemetry session_id to the AtomCode session's UUID (if a session is available).
-    // This means events from this process run are correlated to the actual session file.
-    // If no session exists yet, session_id stays as launch_id (the default).
+    // Launch-level fallback: any telemetry emitted outside a mode-bearing
+    // CurrentContext scope (e.g. an un-scoped spawned task) attributes to this
+    // process mode instead of `null`. Per-scope mode still overrides it.
+    telemetry.set_default_mode(Some(session_mode));
+    // Bind telemetry to the continued session's id (if any). A fresh run needs
+    // nothing here: the agent bootstraps telemetry + header + datalog from its
+    // own session id. The TUI manages its own binding via
+    // `bind_telemetry_to_session`.
     if let Some(ref s) = session_to_continue {
         if let Ok(uuid) = uuid::Uuid::parse_str(s.id.as_str()) {
             telemetry.set_session_id(uuid);
+        }
+        // Headless `-c`: the TUI rebinds itself, so only push to the agent
+        // here, so the continued session's id reaches the header + datalog.
+        if effective_prompt.is_some() {
+            agent_handle
+                .client
+                .cmd_tx
+                .send(AgentCommand::SetSessionId(s.id.as_str().to_string()))
+                .ok();
         }
     }
     let scope_ctx = CurrentContext {
@@ -1408,7 +1521,7 @@ async fn run() -> Result<i32> {
         // (--version, --help, --update, login, logout, status, upgrade,
         // rollback, telemetry) return via handle_command before reaching
         // this point and must NOT emit open_atomcode.
-        telemetry.track(Event::OpenAtomcode);
+        telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: cli.dangerously_skip_permissions });
 
         // Headless mode: -p / --prompt-file triggers non-interactive execution.
         // `fixissue` also sets `force_verbose` so tool activity is visible — the
@@ -1426,6 +1539,8 @@ async fn run() -> Result<i32> {
                 verbose,
                 capture,
                 working_dir.clone(),
+                cli.dangerously_skip_permissions,
+                is_admin,
             )
             .await?;
 
@@ -1467,15 +1582,33 @@ async fn run() -> Result<i32> {
             // the user hasn't opted out via `auto_update = false` AND we're not
             // running as `atomcode.bak` (backup should stay pinned; see the
             // `is_running_as_backup` guard up top).
-            if config.auto_update && !is_running_as_backup() && !cli.dev {
+            // In distro-pm (HarmonyBrew) builds the package manager owns
+            // upgrades, so skip spawning the detached prep process entirely —
+            // `prepare_deferred_upgrade` would no-op anyway.
+            if config.auto_update
+                && !is_running_as_backup()
+                && !cli.dev
+                && !atomcode_core::self_update::is_package_managed()
+            {
                 spawn_detached_upgrade_prep();
             }
+
+            // Redirect fd 2 → $ATOMCODE_HOME/stderr.log before the TUI takes
+            // ownership of the terminal. NSPasteboard deprecation warnings
+            // (arboard clipboard polling, ~1.5 s interval) and any other
+            // rogue C-lib stderr writes would otherwise land at the raw-mode
+            // cursor position, painting into the input box.
+            //
+            // Only fires here — the TUI branch. Headless (-p/--prompt-file)
+            // leaves stderr pointing at the real terminal so the user sees
+            // actual errors in their shell/CI output.
+            redirect_stderr_to_log_file();
 
             let ctx = atomcode_telemetry::CurrentContext::current();
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone()).await?;
+            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await?;
             Ok(0)
         };
 
@@ -1487,10 +1620,75 @@ async fn run() -> Result<i32> {
     result
 }
 
+/// On macOS the NSPasteboard runtime prints deprecation warnings to
+/// stderr when arboard calls into AppKit (via clipboard polling for
+/// the "ctrl+v to paste image" hint). In raw mode, stderr shares the
+/// TTY with the TUI paint stream, so those warnings paint into the
+/// input box at whatever cursor row happens to be active. Other libs
+/// (LSP, MCP shells) can leak the same way.
+///
+/// Redirect fd 2 to `$ATOMCODE_HOME/stderr.log` once we know we're
+/// entering interactive TUI mode. plain / headless / piped paths
+/// don't call this — they want stderr to reach the terminal so the
+/// user sees real errors.
+///
+/// Best-effort: if the home dir can't be created or the file can't
+/// be opened, do nothing and let stderr leak (the original bug); we
+/// don't want to take down atomcode startup because logging failed.
+#[cfg(unix)]
+fn redirect_stderr_to_log_file() {
+    use std::os::unix::io::AsRawFd;
+    let Some(home) = std::env::var_os("ATOMCODE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".atomcode")))
+    else {
+        return;
+    };
+    if std::fs::create_dir_all(&home).is_err() {
+        return;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.join("stderr.log"))
+    else {
+        return;
+    };
+    // Write a session marker so users can see in stderr.log where
+    // each atomcode session starts — helps separate one run's noise
+    // from another's when grepping for actual problems.
+    // Use epoch seconds (std::time only — no chrono dep needed).
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let marker = format!("\n--- atomcode session start (unix={epoch_secs}) ---\n");
+    let _ = std::io::Write::write_all(&mut std::io::BufWriter::new(&file), marker.as_bytes());
+    // SAFETY: dup2 swaps the file descriptor table entry for fd 2
+    // to point at `file`'s underlying fd. This is a standard, safe
+    // operation; the worst case (dup2 fails) is the redirect doesn't
+    // happen and we log nothing — same as the no-redirect baseline.
+    unsafe {
+        libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+    }
+    // Intentionally keep `file` alive via the dup2 — the kernel
+    // holds a reference to the underlying inode, so even after
+    // `file` is dropped, fd 2 stays pointing at the same file.
+    // No need to std::mem::forget.
+}
+
+#[cfg(not(unix))]
+fn redirect_stderr_to_log_file() {
+    // Windows: NSPasteboard is mac-only; arboard on Windows uses
+    // OpenClipboard which doesn't NSLog. Not a known leak path.
+    // No-op for now; revisit if a similar Windows issue surfaces.
+}
+
 /// Run agent in headless mode (pipe-friendly: stdout = LLM text only,
 /// logs/diagnostics → stderr). Non-interactive: `bash` approvals are
 /// auto-allowed (stderr logs the reason); other tools that require approval
-/// are still denied.
+/// are still denied — **unless** `--dangerously-skip-permissions` was
+/// passed, in which case all tool calls are auto-approved.
 ///
 /// `verbose=false` (default): Claude Code -p style — only the assistant reply
 /// reaches the user. Tool calls, token usage, and turn summary are silent.
@@ -1506,10 +1704,31 @@ async fn run_headless(
     verbose: bool,
     capture: bool,
     working_dir: PathBuf,
+    skip_permissions: bool,
+    is_admin: bool,
 ) -> Result<(i32, Option<String>)> {
-    // Tell the panic hook / error path to skip TUI cleanup — we never enter
-    // the alternate screen here, so LeaveAlternateScreen would corrupt stdout.
+    // Tell the panic hook / error path to skip TUI cleanup — raw mode was
+    // never enabled here, so `disable_raw_mode` would be a wasted ioctl
+    // (and on Windows can panic when stdin isn't a real console handle).
     HEADLESS_MODE.store(true, Ordering::Relaxed);
+
+    // Emit a warning when --dangerously-skip-permissions is active.
+    // The actual permission bypass is handled by InteractivePermissionDecider
+    // (will_auto_approve always returns true), so ApprovalNeeded events
+    // should never reach this loop — but the log line gives the user a
+    // clear signal that the flag is in effect.
+    if skip_permissions {
+        eprintln!(
+            "{}",
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless)
+        );
+    }
+    if is_admin {
+        eprintln!(
+            "{}",
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::AdminWarningHeadless)
+        );
+    }
 
     let notifications = agent_loop.config.notifications.clone();
     let (cmd_tx, mut event_rx) = {
@@ -1632,7 +1851,16 @@ async fn run_headless(
                 tool_name, reason, ..
             } => {
                 close_thinking_line(&mut thinking_line_open);
-                if tool_name == "bash" {
+                if skip_permissions {
+                    // --dangerously-skip-permissions: auto-approve everything.
+                    // This branch should rarely be reached because
+                    // InteractivePermissionDecider.will_auto_approve()
+                    // returns true, preventing ApprovalRequested from being
+                    // emitted in the first place. But if it does reach here
+                    // (e.g. a race), honor the flag.
+                    eprintln!("[headless] auto-approved {}: {}", tool_name, reason);
+                    cmd_tx.send(AgentCommand::ApproveTool)?;
+                } else if tool_name == "bash" {
                     // -p / headless cannot prompt; user opts in by using non-interactive mode.
                     eprintln!("[headless] auto-approved bash: {}", reason);
                     cmd_tx.send(AgentCommand::ApproveTool)?;
@@ -1723,6 +1951,9 @@ async fn run_headless(
                 // meant to be loud). No exit-code change, no shutdown —
                 // we expect the turn to keep running.
                 eprintln!("[warning] {}", w);
+            }
+            AgentEvent::HookWarningHint(msg) => {
+                eprintln!("[hook-warning] {}", msg);
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 if verbose {
@@ -1821,10 +2052,21 @@ async fn run_headless(
             // still see that VL ran. Char count helps spot degenerate
             // outputs.
             AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
-                eprintln!("[vl-preprocess ok provider={} chars={}]", vl_key, char_count);
+                eprintln!(
+                    "[vl-preprocess ok provider={} chars={}]",
+                    vl_key, char_count
+                );
             }
-            AgentEvent::MessagesSync { .. } => {
-                // Only used by TUI for /bg session persistence; ignore in CLI.
+            AgentEvent::ConversationTruncated { .. }
+            | AgentEvent::UndoFailed { .. }
+            | AgentEvent::MessagesSync { .. } => {
+                // Only used by TUI for /bg or /undo; ignore in headless CLI.
+            }
+            AgentEvent::UserEcho(_)
+            | AgentEvent::PeerBusy(_)
+            | AgentEvent::ProviderChanged(_)
+            | AgentEvent::ProjectSwitched(_) => {
+                // Live-sync only — not applicable in headless CLI.
             }
         }
     }
@@ -1874,13 +2116,11 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
 
     match cmd {
         Commands::Login => {
-            // Pass the telemetry handle through so login() can both stamp the
-            // handle's account_id AND emit login_success. The caller flushes
-            // telemetry on return so the event actually leaves the process.
-            let auth = auth::login(Some(telemetry))?;
-            auth::save_auth(&auth)?;
-            println!("  Login successful! You can now use AtomCode.");
-            Ok(())
+            // `run()` intercepts Login (and its Codingplan alias) before
+            // handle_command is called, running the full OAuth + setup
+            // flow and falling through to the TUI. This arm is
+            // unreachable in normal execution but kept defensive.
+            unreachable!("Login is handled inline in run() before handle_command")
         }
         Commands::Logout => {
             auth::logout()?;
@@ -1924,8 +2164,8 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("Fixissue is handled inline in run() before handle_command")
         }
         Commands::Codingplan => {
-            // `run()` intercepts Codingplan before handle_command is called,
-            // so this arm is effectively unreachable in normal execution.
+            // Hidden alias for Login — `run()` intercepts both before
+            // handle_command is called, so this arm is unreachable.
             unreachable!("Codingplan is handled inline in run() before handle_command")
         }
         Commands::Telemetry { .. } => {
@@ -1933,6 +2173,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Daemon { .. } => {
             unreachable!("Daemon is handled inline in run() before handle_command")
+        }
+        Commands::Webui { .. } => {
+            unreachable!("Webui is handled inline in run() before handle_command")
         }
         Commands::Setup { .. } => {
             unreachable!("Setup is handled inline in run() before handle_command")
@@ -2036,12 +2279,141 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             }
             Ok(())
         }
+        Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
+    }
+}
+
+/// Handle hooks subcommands
+async fn handle_hooks(cmd: HookCommands) -> Result<()> {
+    HEADLESS_MODE.store(true, Ordering::Relaxed);
+
+    match cmd {
+        HookCommands::List => {
+            let mut engine = atomcode_core::hook::HookEngine::new();
+            engine.load_all(&std::env::current_dir().unwrap_or_default());
+
+            let stats = engine.stats();
+            let total = stats.pre_tool_hooks
+                + stats.post_tool_hooks
+                + stats.post_turn_hooks
+                + stats.system_prompt_hooks
+                + stats.on_session_start_hooks
+                + stats.on_session_end_hooks
+                + stats.on_error_hooks
+                + stats.on_user_prompt_submit_hooks
+                + stats.on_tool_call_start_hooks
+                + stats.on_model_response_hooks;
+
+            println!("\nLoaded Hooks:");
+            println!("─────────────────────────────────────────────");
+
+            if total == 0 {
+                println!("  (No hooks loaded)");
+            } else {
+                println!("  {:<30} {:>5}", "Type", "Count");
+                println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
+
+                if stats.pre_tool_hooks > 0 {
+                    println!("  {:<30} {:>5}", "PreToolExecution", stats.pre_tool_hooks);
+                }
+                if stats.post_tool_hooks > 0 {
+                    println!("  {:<30} {:>5}", "PostToolExecution", stats.post_tool_hooks);
+                }
+                if stats.on_tool_call_start_hooks > 0 {
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnToolCallStart", stats.on_tool_call_start_hooks
+                    );
+                }
+                if stats.post_turn_hooks > 0 {
+                    println!("  {:<30} {:>5}", "PostTurn (legacy)", stats.post_turn_hooks);
+                }
+                if stats.on_model_response_hooks > 0 {
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnModelResponse", stats.on_model_response_hooks
+                    );
+                }
+                if stats.on_session_start_hooks > 0 {
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnSessionStart", stats.on_session_start_hooks
+                    );
+                }
+                if stats.on_session_end_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnSessionEnd", stats.on_session_end_hooks);
+                }
+                if stats.on_error_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnError", stats.on_error_hooks);
+                }
+                if stats.system_prompt_hooks > 0 {
+                    println!("  {:<30} {:>5}", "SystemPrompt", stats.system_prompt_hooks);
+                }
+
+                println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
+                println!("  {:<30} {:>5}", "Total", total);
+            }
+
+            println!();
+
+            // 显示 hooks 目录
+            println!("Hook Directories:");
+            println!("─────────────────────────────────────────────");
+            if let Some(home) = dirs::home_dir() {
+                let global_dir = home.join(".atomcode").join("hooks");
+                let exists = if global_dir.exists() { "✓" } else { "✗" };
+                println!("  {} Global:   {}", exists, global_dir.display());
+            }
+
+            if let Ok(cwd) = std::env::current_dir() {
+                let project_dir = cwd.join(".atomcode").join("hooks");
+                let exists = if project_dir.exists() { "✓" } else { "✗" };
+                println!("  {} Project:  {}", exists, project_dir.display());
+            }
+
+            println!();
+            Ok(())
+        }
+        HookCommands::Test { name } => {
+            println!("Testing hook: {}", name);
+            println!("(TODO: Implement hook testing)");
+            Ok(())
+        }
+        HookCommands::Paths => {
+            println!("\nHook Configuration Paths:");
+            println!("─────────────────────────────────────────────");
+
+            if let Some(home) = dirs::home_dir() {
+                let global_config = home.join(".atomcode").join("hooks").join("hooks.toml");
+                let exists = if global_config.exists() { "✓" } else { "✗" };
+                println!("  {} Global config:   {}", exists, global_config.display());
+            }
+
+            if let Ok(cwd) = std::env::current_dir() {
+                let project_config = cwd.join(".atomcode").join("hooks").join("hooks.toml");
+                let exists = if project_config.exists() {
+                    "✓"
+                } else {
+                    "✗"
+                };
+                println!("  {} Project config:  {}", exists, project_config.display());
+            }
+
+            println!("\nDocumentation:");
+            println!("─────────────────────────────────────────────");
+            println!("  docs/hooks.md - Hook usage guide");
+            println!("  docs/hook-timing-complete.md - Complete timing list");
+            println!("  docs/hook-expansion-summary.md - Expansion summary");
+            println!();
+
+            Ok(())
+        }
     }
 }
 
 /// Dispatch `atomcode plugin ...` subcommands. Each branch calls the same
 /// `atomcode_core::plugin::*` API the TUI's `/plugin` slash command uses, so
-    /// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
+/// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
 fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
     use atomcode_core::plugin::{installer, marketplace};
     match sub {
@@ -2091,14 +2463,14 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
         }
         PluginCli::Install { spec } => {
             let (plugin, mp) = parse_plugin_spec(&spec)?;
-            let info = installer::install(&plugin, &mp)
+            let info = installer::install(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
                 .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
             println!("  installed `{}@{}`", info.plugin, info.marketplace);
             Ok(())
         }
         PluginCli::Uninstall { spec } => {
             let (plugin, mp) = parse_plugin_spec(&spec)?;
-            installer::uninstall(&plugin, &mp)
+            installer::uninstall(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
                 .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
             println!("  uninstalled `{}@{}`", plugin, mp);
             Ok(())
@@ -2189,7 +2561,16 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
             // (not a Failed event) — these arms exist only to keep the
             // match exhaustive if the TUI path ever reuses this code.
             UpgradeEvent::Failed(msg) => {
-                eprintln!("\nupgrade failed: {}", msg);
+                if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                    println!(
+                        "\n{}",
+                        atomcode_core::i18n::t(
+                            atomcode_core::i18n::Msg::UpgradePackageManaged
+                        )
+                    );
+                } else {
+                    eprintln!("\nupgrade failed: {}", msg);
+                }
             }
             UpgradeEvent::RolledBack { exe, backup } => {
                 println!(
@@ -2205,7 +2586,13 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
         Ok(Ok(_summary)) => Ok(()),
         Ok(Err(e)) => {
             let msg = format!("{:#}", e);
-            if msg.contains(ALREADY_LATEST) {
+            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                println!(
+                    "{}",
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                );
+                Ok(())
+            } else if msg.contains(ALREADY_LATEST) {
                 // Friendly path — not an error, just "nothing to do".
                 println!("  {}", msg.replace(&format!("{}: ", ALREADY_LATEST), ""));
                 Ok(())
@@ -2218,7 +2605,20 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
 }
 
 fn run_rollback_cli() -> Result<()> {
-    let summary = atomcode_core::self_update::run_rollback()?;
+    let summary = match atomcode_core::self_update::run_rollback() {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                println!(
+                    "{}",
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                );
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
     println!(
         "✓ Rolled back. Previous binary is now at {}, other version saved at {}",
         summary.exe.display(),
@@ -2310,12 +2710,73 @@ fn run_codingplan_core(
     Ok(report.render())
 }
 
+/// Guard so the two-link panic-hook chain (pre-telemetry hook + telemetry-aware
+/// hook that chains to it) writes the crash log exactly once.
+static CRASH_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Synchronously append a panic's location + message + backtrace to
+/// `~/.atomcode/logs/panic.log`, then `flush` + `sync_all` so the bytes are
+/// durable **before** the hook returns and the runtime calls `abort()`
+/// (`panic = "abort"` in the release profile).
+///
+/// Why this exists: with `abort`, neither of the existing report paths
+/// survives a crash — stderr is lost when the terminal window closes (Windows
+/// resize crash), and `Telemetry::track` is async (mpsc → background tokio
+/// writer), so abort kills the writer mid-segment and the `.partial` queue file
+/// is discarded. A blocking, fsync'd file write is the only sink that survives.
+/// Best-effort: every step swallows errors so the hook never re-panics.
+fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    if CRASH_LOGGED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(home) = atomcode_core::tool::real_home_dir() else {
+        return;
+    };
+    let dir = home.join(".atomcode").join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("panic.log"))
+    else {
+        return;
+    };
+    let loc = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| "unknown".into());
+    let msg = info
+        .payload()
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    let thread = std::thread::current().name().unwrap_or("unknown").to_string();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // `force_capture` ignores RUST_BACKTRACE and always resolves frames.
+    let bt = std::backtrace::Backtrace::force_capture();
+    let _ = writeln!(f, "\n==== AtomCode panic @ unix:{ts} thread:{thread} ====");
+    let _ = writeln!(f, "location: {loc}");
+    let _ = writeln!(f, "message : {msg}");
+    let _ = writeln!(f, "backtrace:\n{bt}");
+    let _ = f.flush();
+    let _ = f.sync_all();
+}
+
 /// Install the telemetry-aware panic hook. Replaces the minimal pre-init hook
 /// set in `main()` so panics are both reported cleanly to the terminal AND
 /// sent as a `Panic` telemetry event before the process exits.
 fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Durable crash log FIRST — before restore_terminal / async telemetry /
+        // abort, any of which can lose the panic on Windows (see write_crash_log).
+        write_crash_log(info);
         restore_terminal_if_tui();
         let home = atomcode_core::tool::real_home_dir();
         let cwd = std::env::current_dir().ok();
@@ -2344,21 +2805,61 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
             error_kind: Some("panic".to_string()),
-            error_data: Some(serde_json::json!({
-                "session_duration_secs": telemetry.uptime().as_secs() as u32,
-                "turns_completed": null,
-                "last_tool_name": null,
-                "last_event": null,
-            }).to_string()),
+            error_data: Some(
+                serde_json::json!({
+                    "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                    "turns_completed": null,
+                    "last_tool_name": null,
+                    "last_event": null,
+                })
+                .to_string(),
+            ),
         });
         default_hook(info);
     }));
 }
 
+/// Classify a `create_provider` error display string as an "auth gap" —
+/// i.e. the user has no usable OAuth token (file missing, malformed,
+/// access_token expired, refresh_token expired/missing, refresh network
+/// error, etc.). Auth-gap errors must NOT abort startup; they should
+/// fall back to the onboarding TUI so the user can run `/login` from
+/// within the app.
+///
+/// Implementation note — substring matching, not typed errors:
+///
+/// `create_provider` returns `anyhow::Error` and the auth-gap producers
+/// live in three modules (`provider::mod::load_auth_token`,
+/// `provider::mod::refresh_and_save`, `auth::oauth::get_valid_token`).
+/// Threading a typed sentinel through all of them is invasive; instead
+/// we match on a stable convention: **every auth-gap error message in
+/// the codebase ends with the substring `"/login"`** (either
+/// `"please /login"` or `"please use /login"`). That hint is part of
+/// the user-facing contract — any future auth-gap producer that wants
+/// graceful fallback simply has to follow the same convention.
+///
+/// The three legacy substrings (`Not logged in` / `Invalid auth.toml`
+/// / `Token expired`) are retained as belt-and-braces: they were the
+/// original matches before the `"/login"` rule was extracted, and
+/// keeping them ensures the test for the historical contract stays
+/// green even if some future refactor temporarily strips the `/login`
+/// suffix from a specific message.
+///
+/// Non-auth errors (config parse failure, network issues unrelated to
+/// the refresh endpoint, provider validation rejects model name, etc.)
+/// fall through to `return Err(e)` and abort startup as designed.
+fn is_auth_gap_error(msg: &str) -> bool {
+    msg.contains("/login")
+        || msg.contains("Not logged in")
+        || msg.contains("Invalid auth.toml")
+        || msg.contains("Token expired")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        close_thinking_chunk, format_thinking_chunk, resolve_working_dir, truncate_log_line,
+        close_thinking_chunk, format_thinking_chunk, is_auth_gap_error, resolve_working_dir,
+        truncate_log_line,
     };
     use std::path::PathBuf;
 
@@ -2543,6 +3044,92 @@ mod tests {
         // Now a non-reasoning event arrives → close, then emit it.
         close_thinking_chunk(&mut buf, &mut open);
         buf.push_str("[tool→ read_file]\n");
-        assert_eq!(buf, "[thinking] I should check the file\n[tool→ read_file]\n");
+        assert_eq!(
+            buf,
+            "[thinking] I should check the file\n[tool→ read_file]\n"
+        );
+    }
+
+    // ── is_auth_gap_error ────────────────────────────────────────────
+    //
+    // Regression set for the "both access_token AND refresh_token
+    // expired → CLI bails before TUI loads" bug. Pre-fix catch list
+    // only matched `Not logged in` / `Invalid auth.toml` / `Token
+    // expired`, missing the 4 paths below — user landed in an
+    // unrecoverable startup error because they couldn't get into the
+    // TUI to run `/login`. Post-fix every auth-gap error's `/login`
+    // suffix triggers graceful fallback to onboarding mode.
+
+    #[test]
+    fn auth_gap_catches_historical_three() {
+        // Pre-existing matches — must stay green.
+        assert!(is_auth_gap_error("Not logged in — please use /login"));
+        assert!(is_auth_gap_error("Invalid auth.toml — please use /login"));
+        assert!(is_auth_gap_error("Token expired — please use /login"));
+    }
+
+    #[test]
+    fn auth_gap_catches_refresh_http_failure() {
+        // The actual user-reported scenario: access_token expired,
+        // `refresh_and_save` POSTs the (also-expired) refresh_token to
+        // the broker, broker returns 401, `provider::mod::refresh_and_save`
+        // bails with this message. Pre-fix catch list MISSED this —
+        // none of the 3 historical substrings appeared, so CLI fell
+        // through to `return Err(e)` and aborted startup.
+        assert!(is_auth_gap_error(
+            "Token refresh failed (401 Unauthorized) — please /login"
+        ));
+        assert!(is_auth_gap_error(
+            "Token refresh failed (400 Bad Request) — please /login"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_catches_refresh_network_failure() {
+        // `refresh_and_save` network-layer error path (broker host
+        // unreachable, DNS failure, TLS error, etc.). Same root cause
+        // as the HTTP path — token can't be refreshed → user needs
+        // `/login`. Onboarding TUI is the only way they can run it.
+        assert!(is_auth_gap_error(
+            "Token refresh failed: connection refused — please /login"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_catches_refresh_parse_failure() {
+        // Broker returned 200 but body wasn't valid refresh-token
+        // JSON. Treated as auth gap because there's no usable token
+        // either way.
+        assert!(is_auth_gap_error(
+            "Token refresh parse error: missing field `access_token` — please /login"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_catches_missing_refresh_token() {
+        // `auth/oauth.rs::refresh_access_token` when stored auth.toml
+        // has access_token but no refresh_token field. Suffix is
+        // "please /login again" — still ends in `/login`, so the new
+        // substring rule catches it.
+        assert!(is_auth_gap_error(
+            "No refresh_token available — please /login again"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_does_not_swallow_non_auth_errors() {
+        // Non-auth errors must NOT trigger the onboarding fallback —
+        // the user should see the real failure, not a generic "please
+        // /login" prompt that doesn't apply.
+        assert!(!is_auth_gap_error(
+            "Config parse error: invalid TOML at line 12"
+        ));
+        assert!(!is_auth_gap_error(
+            "Provider rejected model name 'foo-bar-9000': unknown model"
+        ));
+        assert!(!is_auth_gap_error(
+            "HTTP request to https://api.example.com failed: timeout"
+        ));
+        assert!(!is_auth_gap_error(""));
     }
 }

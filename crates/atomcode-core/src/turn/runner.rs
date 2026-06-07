@@ -8,6 +8,7 @@ use atomcode_telemetry::{CurrentContext, Event as TelemetryEvent, LlmErrorKind, 
 
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::hook::{HookCtx, HookEngine, ToolResultContext};
 use crate::provider::LlmProvider;
 use crate::stream::StreamEvent;
 use crate::tool::{
@@ -41,16 +42,20 @@ pub struct TurnRunner {
     /// clone.
     pub ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder>,
     pub permission: Box<dyn PermissionDecider>,
+    /// 统一 Hook 引擎 (Arc, 由 AgentLoop 管理)
+    pub hook_engine: std::sync::Arc<HookEngine>,
     /// Files edited during the current session (tracked for context awareness).
     pub recently_edited_files: Vec<String>,
-    /// Hook executor — runs user-configured lifecycle hooks at tool execution boundaries.
-    pub hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
     /// Cross-batch tool-call loop guard. Cleared per user-message by the
     /// agent (see `handle_send_message`); records every executed tool's
     /// `(name, args, output_hash)` triple and short-circuits the third
     /// identical attempt. See `loop_guard.rs` for the full rationale.
     pub loop_guard: LoopGuardState,
-}
+    /// Current turn number, set by AgentLoop before each turn.
+    /// Propagated to ToolCallStartContext so built-in hooks (e.g.
+    /// ToolAuditLogHook) see the correct turn index.
+    pub current_turn_number: u32,
+ }
 
 impl TurnRunner {
     /// Execute one LLM turn: stream response, execute any tool calls, return result.
@@ -230,6 +235,7 @@ impl TurnRunner {
                 context_window,
                 0, // step — always 0 in calls.log today; step param
                 // kept for future per-tool-call correlation.
+                &self.provider.session_id(),
                 self.config.datalog.enabled,
             )
         };
@@ -255,6 +261,14 @@ impl TurnRunner {
         // pattern</arg_key>...</tool_call>` mid-prose, polluting A/B
         // analysis.
         let mut visible_text_buf = String::new();
+        // Runaway-stream guard: if a degenerate model gets stuck in an
+        // autoregressive loop emitting the same character forever, we
+        // abort the turn rather than burning the user's quota waiting
+        // for the upstream max_tokens cap (#225). The detector keeps
+        // running across all visible Delta text in this turn — tool
+        // call boundaries reset stream_filter but not this; a real
+        // runaway will still trip on the per-segment text alone.
+        let mut runaway_detector = crate::stream::RunawayDetector::with_default_threshold();
         // Reasoning-model thinking content collected separately — not emitted
         // to scrollback by default (users don't want to read the thinking).
         // If `text_buf` ends up empty at `Done` but this is non-empty, we
@@ -433,6 +447,23 @@ impl TurnRunner {
                                             // blocks (Qwen/GLM XML leak suppression).
                                             let visible = stream_filter.feed(&text);
                                             if !visible.is_empty() {
+                                                // Runaway guard runs on the visible stream
+                                                // only — XML scaffolding inside <tool_call>
+                                                // blocks legitimately runs long, and we
+                                                // don't want to false-positive on it (#225).
+                                                if let Some(reason) =
+                                                    runaway_detector.feed(&visible)
+                                                {
+                                                    conversation.push_delta(&visible);
+                                                    visible_text_buf.push_str(&visible);
+                                                    let _ = event_tx
+                                                        .send(TurnEvent::TextDelta(visible));
+                                                    conversation.finalize_stream();
+                                                    tel_return!(
+                                                        TurnResult::Failed(reason),
+                                                        0u32
+                                                    );
+                                                }
                                                 conversation.push_delta(&visible);
                                                 visible_text_buf.push_str(&visible);
                                                 let _ = event_tx.send(TurnEvent::TextDelta(visible));
@@ -767,6 +798,22 @@ impl TurnRunner {
         //    Use the FILTERED accumulator so downstream consumers
         //    (datalog `log_text`, ATLAS plan extraction, telemetry)
         //    see clean prose, not raw text_buf with leaked XML
+        //    tool_call blocks.
+        if tool_calls_buf.is_empty() {
+            // Trigger post-turn hooks for Responded
+            self.trigger_post_turn_hooks("Responded").await;
+            
+            return TurnResult::Responded {
+                text: visible_text_buf,
+                tokens: total_tokens,
+                truncated: was_truncated,
+            };
+        }
+
+        // 5. If no tool calls, we're done — LLM produced text only.
+        //    Use the FILTERED accumulator so downstream consumers
+        //    (datalog `log_text`, ATLAS plan extraction, telemetry)
+        //    see clean prose, not raw text_buf with leaked XML
         //    tool_call blocks. Earlier bug: 5-7 atomgr datalog
         //    20-14-23 Turn 5 logged `### 3. 传输层安全<tool_call>grep
         //    <arg_key>...` because Responded.text was raw.
@@ -998,6 +1045,9 @@ impl TurnRunner {
             });
         }
 
+        // Trigger post-turn hooks
+        self.trigger_post_turn_hooks("UsedTools").await;
+
         // Truncate oversized tool outputs before returning. Without this,
         // a single `ls -la node_modules` / wide `find` dump (multi-MB)
         // stays raw in `conversation.messages` and the NEXT LLM call
@@ -1028,6 +1078,17 @@ impl TurnRunner {
             },
             tool_count
         );
+    }
+
+    /// Helper to trigger post-turn hooks with proper context
+    async fn trigger_post_turn_hooks(&self, turn_result: &str) {
+        let working_dir = self.context.working_dir.read().await.clone();
+        let hook_ctx = HookCtx::new(
+            "".to_string(),
+            "".to_string(),
+            working_dir.to_string_lossy().to_string(),
+        );
+        self.hook_engine.trigger_post_turn(&hook_ctx, turn_result).await;
     }
 
     /// EXECUTE mode: run one LLM turn with minimal context.
@@ -1199,10 +1260,11 @@ impl TurnRunner {
         // payloads recover first) but BEFORE approval — the unrecoverable
         // remainder is what gets bounced.
         if let Err(reason) = tool.validate_args(&call.arguments) {
-            let msg = format!(
-                "Error: {}. Re-issue {} with a complete JSON object containing all required fields.",
-                reason, call.name
-            );
+            // `reason` already comes from `diagnose_args` (or a sibling
+            // helper) carrying a "Re-issue: <example>" tail. Appending
+            // another "Re-issue {tool} with..." here produced the
+            // double-Re-issue the user saw on the failed WriteFile call.
+            let msg = format!("Error: {}", reason);
             let _ = event_tx.send(TurnEvent::ToolCallResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -1238,7 +1300,8 @@ impl TurnRunner {
         // the decider which handles interactive prompts or automatic policy.
         let approval = tool.approval_with_context(&call.arguments, &self.context);
         if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
-        | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
+        | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason)
+        | crate::tool::ApprovalRequirement::RequireApprovalScoped { ref reason, .. } = approval
         {
             // Only emit the ApprovalRequested event (which triggers the
             // TUI approval prompt) when the decider actually needs user
@@ -1293,49 +1356,56 @@ impl TurnRunner {
             }
         }
 
-        // --- PreToolUse Hook ---
-        if self.hook_executor.has_hooks() {
-            let hook_ctx = self.build_hook_context(
-                "pre_tool_use",
-                Some(&call.name),
-                Some(&call.arguments),
-                None,
-                None,
-            );
-            let pre_result = self.hook_executor.run_pre_tool_use(&call.name, &hook_ctx).await;
-            match pre_result {
-                crate::hook::PreHookResult::Block { reason } => {
-                    let output = format!("Blocked by hook: {}", reason);
-                    let _ = event_tx.send(TurnEvent::ToolCallResult {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        output: output.clone(),
-                        success: false,
-                        duration: std::time::Duration::ZERO,
-                    });
-                    self.context.telemetry.track(TelemetryEvent::ToolCall {
-                        name: corrected_name.clone(),
-                        success: false,
-                        duration_ms: 0,
-                        error_kind: Some(ToolErrorKind::BlockedByHook),
-                        error_data: Some(serde_json::json!({
-                            "tool_name": corrected_name,
-                            "duration_ms": 0,
-                            "args_summary": build_args_summary(&corrected_name, &call.arguments),
-                            "hook_reason": reason,
-                            "reason": "Tool call blocked by PreToolUse hook",
-                        }).to_string()),
-                    });
-                    return ToolResult {
-                        call_id: call.id.clone(),
-                        output,
-                        success: false,
-                    };
-                }
-                crate::hook::PreHookResult::Modify { .. } => {
-                    // Modify support deferred — treat as Allow
-                }
-                crate::hook::PreHookResult::Allow => {}
+        // --- 统一 PreToolUse Hook ---
+        let working_dir = self.context.working_dir.read().await.clone();
+        let pr_hook_ctx = HookCtx::new(
+            call.name.clone(),
+            call.arguments.clone(),
+            working_dir.to_string_lossy().to_string(),
+        );
+
+        // --- 统一 ToolCallStart Hook (fire-and-forget) ---
+        let tc_start_ctx = crate::hook::ToolCallStartContext {
+            tool_name: call.name.clone(),
+            tool_args: call.arguments.clone(),
+            call_id: call.id.clone(),
+            turn_number: self.current_turn_number,
+        };
+        self.hook_engine.trigger_on_tool_call_start(&tc_start_ctx).await;
+
+        let mut final_args = call.arguments.clone();
+        match self.hook_engine.trigger_pre_tool_use(&pr_hook_ctx).await {
+            Ok(Some(new_args)) => {
+                final_args = new_args;
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                let output = format!("Tool '{}' was blocked by hook: {}", call.name, reason);
+                let _ = event_tx.send(TurnEvent::ToolCallResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    output: output.clone(),
+                    success: false,
+                    duration: std::time::Duration::ZERO,
+                });
+                self.context.telemetry.track(TelemetryEvent::ToolCall {
+                    name: corrected_name.clone(),
+                    success: false,
+                    duration_ms: 0,
+                    error_kind: Some(ToolErrorKind::BlockedByHook),
+                    error_data: Some(serde_json::json!({
+                        "tool_name": corrected_name,
+                        "duration_ms": 0,
+                        "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                        "hook_reason": reason,
+                        "reason": "Tool call blocked by PreToolUse hook",
+                    }).to_string()),
+                });
+                return ToolResult {
+                    call_id: call.id.clone(),
+                    output,
+                    success: false,
+                };
             }
         }
 
@@ -1357,9 +1427,14 @@ impl TurnRunner {
         // bash) finish fast enough that interrupting them mid-execution
         // is acceptable — user pressed Ctrl+C knowing they want to stop.
         let start = Instant::now();
+        crate::ctrace!("RNR", "execute_single_tool start name={} cancel_already={}", call.name, cancel.is_cancelled());
         let result = tokio::select! {
-            r = tool.execute(&call.arguments, &self.context) => r,
+            r = tool.execute(&call.arguments, &self.context) => {
+                crate::ctrace!("RNR", "execute_single_tool tool returned name={} elapsed_ms={} cancel_now={}", call.name, start.elapsed().as_millis(), cancel.is_cancelled());
+                r
+            },
             _ = cancel.cancelled() => {
+                crate::ctrace!("RNR", "execute_single_tool cancel branch fired name={} elapsed_ms={}", call.name, start.elapsed().as_millis());
                 // Clean up event sender
                 self.context.event_tx = None;
                 self.context.current_call_id = None;
@@ -1421,17 +1496,15 @@ impl TurnRunner {
             },
         };
 
-        // --- PostToolUse Hook ---
-        if self.hook_executor.has_hooks() {
-            let hook_ctx = self.build_hook_context(
-                "post_tool_use",
-                Some(&call.name),
-                Some(&call.arguments),
-                Some(&tool_result.output),
-                Some(tool_result.success),
-            );
-            self.hook_executor.run_post_tool_use(&call.name, &hook_ctx).await;
-        }
+        // --- 统一 PostToolUse Hook ---
+        let result_ctx = ToolResultContext {
+            tool_name: call.name.clone(),
+            tool_args: final_args.clone(),
+            result: tool_result.output.clone(),
+            success: tool_result.success,
+            duration_ms: duration.as_millis() as u64,
+        };
+        self.hook_engine.trigger_post_tool_use(&pr_hook_ctx, &result_ctx).await;
 
         let _ = event_tx.send(TurnEvent::ToolCallResult {
             call_id: call.id.clone(),
@@ -1484,30 +1557,6 @@ impl TurnRunner {
         tool_result
     }
 
-    fn build_hook_context(
-        &self,
-        event: &str,
-        tool_name: Option<&str>,
-        tool_args: Option<&str>,
-        tool_result: Option<&str>,
-        tool_success: Option<bool>,
-    ) -> crate::hook::HookContext {
-        let wd = self
-            .context
-            .working_dir
-            .try_read()
-            .map(|g| g.display().to_string())
-            .unwrap_or_default();
-        crate::hook::HookContext {
-            event: event.into(),
-            tool_name: tool_name.map(String::from),
-            tool_args: tool_args.and_then(|a| serde_json::from_str(a).ok()),
-            tool_result: tool_result.map(String::from),
-            tool_success,
-            session_id: String::new(),
-            working_dir: wd,
-        }
-    }
 }
 
 /// Canonicalise a tool-call `arguments` string for in-batch dedup keying.
@@ -1619,11 +1668,13 @@ fn strip_model_tags(text: &str) -> String {
     result
 }
 
-/// Rescue tool calls embedded as text in the model's response. Three variants:
+/// Rescue tool calls embedded as text in the model's response. Four variants:
 ///   1. `<tool_call>name(json)</tool_call>` — paren+JSON
 ///   2. `<tool_call>name(k=v, k=v)</tool_call>` — paren+kv (legacy single-line)
 ///   3. `<tool_call><tool_name>name</tool_name><arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`
-///      — Qwen/GLM XML format (multi-line, args may span newlines)
+///      — Qwen2.5 / GLM XML format
+///   4. `<tool_call><function=name><parameter=k>v</parameter>...</function></tool_call>`
+///      — OpenHands / Qwen3+ "function-tag" format (attribute-style)
 /// Returns rescued ToolCalls, empty vec if nothing found.
 fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut calls = Vec::new();
@@ -1644,7 +1695,9 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
         };
         let body = body.trim();
 
-        if let Some((name, args_json)) = parse_xml_tool_call(body) {
+        if let Some((name, args_json)) = parse_xml_tool_call(body)
+            .or_else(|| parse_xml_attr_style_tool_call(body))
+        {
             let call_id = format!("rescued_{}", calls.len());
             calls.push(ToolCall {
                 id: call_id,
@@ -1697,7 +1750,7 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
     calls
 }
 
-/// Parse Qwen/GLM XML-style tool call body:
+/// Parse Qwen2.5 / GLM XML-style tool call body:
 ///   `<tool_name>NAME</tool_name><arg_key>K1</arg_key><arg_value>V1</arg_value>...`
 /// Returns `(name, args_as_json_object)` or None when the format doesn't match.
 fn parse_xml_tool_call(body: &str) -> Option<(String, String)> {
@@ -1724,6 +1777,61 @@ fn parse_xml_tool_call(body: &str) -> Option<(String, String)> {
         let raw_value = &v_after[..v_end];
         map.insert(key, coerce_xml_value(raw_value));
         rest = &v_after[v_end + "</arg_value>".len()..];
+    }
+
+    if map.is_empty() {
+        return None;
+    }
+    Some((name, serde_json::Value::Object(map).to_string()))
+}
+
+/// Parse OpenHands / Qwen3+ "function-tag" XML-style tool call body:
+///   `<function=NAME><parameter=K1>V1</parameter><parameter=K2>V2</parameter></function>`
+/// Returns `(name, args_as_json_object)` or None when the format doesn't match.
+///
+/// Differs from `parse_xml_tool_call` in two ways:
+///   * the function name rides on the opening tag's attribute slot
+///     (`<function=read_file>`), not inside a `<tool_name>` wrapper
+///   * each parameter is one `<parameter=KEY>VALUE</parameter>` element,
+///     not two separate `<arg_key>` / `<arg_value>` pairs
+///
+/// This format is what Qwen3 / Qwen3-Coder / Qwen3.6 / GLM-Z1-Agent emit
+/// when the inference gateway doesn't parse them out into the OpenAI
+/// `tool_calls` field — they were SFT-trained on OpenHands-style data.
+/// Without this rescue, the XML leaks into the visible assistant text
+/// and the tool never executes.
+fn parse_xml_attr_style_tool_call(body: &str) -> Option<(String, String)> {
+    let fn_marker = body.find("<function=")?;
+    let after_marker = &body[fn_marker + "<function=".len()..];
+    let close_bracket = after_marker.find('>')?;
+    let name = after_marker[..close_bracket].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let inner_start = close_bracket + 1;
+    let inner_end = after_marker[inner_start..].find("</function>")? + inner_start;
+    let inner = &after_marker[inner_start..inner_end];
+
+    let mut map = serde_json::Map::new();
+    let mut rest = inner;
+    while let Some(p_marker) = rest.find("<parameter=") {
+        let after_p = &rest[p_marker + "<parameter=".len()..];
+        let cb = after_p.find('>')?;
+        let key = after_p[..cb].trim().to_string();
+        if key.is_empty() {
+            return None;
+        }
+        let val_start = cb + 1;
+        let val_end = after_p[val_start..].find("</parameter>")? + val_start;
+        let raw = &after_p[val_start..val_end];
+        // Function-tag format puts every value on its own line(s); strip a
+        // single leading and trailing newline that's there purely for layout.
+        // Don't `.trim()` — `old_string` for edit_file may legitimately need
+        // its internal whitespace preserved for the file-match to land.
+        let value = raw.strip_prefix('\n').unwrap_or(raw);
+        let value = value.strip_suffix('\n').unwrap_or(value);
+        map.insert(key, coerce_xml_value(value));
+        rest = &after_p[val_end + "</parameter>".len()..];
     }
 
     if map.is_empty() {
@@ -2194,6 +2302,128 @@ mod tool_call_text_rescue_tests {
         assert_eq!(v["n"], 42);
         assert!((v["f"].as_f64().unwrap() - 3.14).abs() < 1e-9);
         assert_eq!(v["s"], "hello");
+    }
+
+    #[test]
+    fn rescues_qwen3_function_tag_format() {
+        // Qwen3 / Qwen3-Coder / Qwen3.6 (and other OpenHands-trained agents)
+        // emit tool calls as `<function=NAME><parameter=K>V</parameter>...
+        // </function>`. Mirrors the exact shape captured in the 21:17 Qwen3.6
+        // screenshot: two sequential read_file calls with int + path params.
+        let text = r#"Let me look at the exact code structure more carefully.
+
+<tool_call>
+<function=read_file>
+<parameter=limit>
+30
+</parameter>
+<parameter=offset>
+147
+</parameter>
+<parameter=file_path>
+/tmp/cc-switch-src/src-tauri/src/proxy/response_processor.rs
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=read_file>
+<parameter=limit>
+20
+</parameter>
+<parameter=offset>
+530
+</parameter>
+<parameter=file_path>
+/tmp/cc-switch-src/src-tauri/src/proxy/providers/streaming.rs
+</parameter>
+</function>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert_eq!(calls.len(), 2, "two sequential blocks must rescue two calls");
+
+        let v0: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(v0["limit"], 30);
+        assert_eq!(v0["offset"], 147);
+        // File path must NOT carry the layout newlines that wrapped the value
+        // inside the `<parameter>` element — file dispatch on a `"\n/tmp/...\n"`
+        // arg would 404.
+        assert_eq!(
+            v0["file_path"],
+            "/tmp/cc-switch-src/src-tauri/src/proxy/response_processor.rs"
+        );
+
+        let v1: serde_json::Value = serde_json::from_str(&calls[1].arguments).unwrap();
+        assert_eq!(calls[1].name, "read_file");
+        assert_eq!(v1["limit"], 20);
+        assert_eq!(v1["offset"], 530);
+        assert_eq!(
+            v1["file_path"],
+            "/tmp/cc-switch-src/src-tauri/src/proxy/providers/streaming.rs"
+        );
+    }
+
+    #[test]
+    fn function_tag_preserves_internal_whitespace_for_edit_file_old_string() {
+        // edit_file's `old_string` is matched against the file verbatim, so
+        // internal whitespace MUST round-trip. The layout-newline strip should
+        // only peel ONE leading and ONE trailing `\n`, leaving multi-line
+        // bodies intact.
+        let text = r#"<tool_call>
+<function=edit_file>
+<parameter=file_path>
+src/main.rs
+</parameter>
+<parameter=old_string>
+        attrs
+      }
+  }
+</parameter>
+<parameter=new_string>
+        attrs.push(x);
+        attrs
+      }
+  }
+</parameter>
+</function>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "edit_file");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(v["file_path"], "src/main.rs");
+        assert_eq!(v["old_string"], "        attrs\n      }\n  }");
+        assert_eq!(
+            v["new_string"],
+            "        attrs.push(x);\n        attrs\n      }\n  }"
+        );
+    }
+
+    #[test]
+    fn function_tag_without_close_function_tag_skips() {
+        // Missing `</function>` close — better to drop the rescue than guess
+        // where the call body ended. Matches the existing safety posture in
+        // `parse_xml_tool_call` (returns None on missing tags rather than
+        // making things up).
+        let text = r#"<tool_call>
+<function=read_file>
+<parameter=file_path>x.rs</parameter>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert!(calls.is_empty(), "missing </function> must yield zero calls");
+    }
+
+    #[test]
+    fn function_tag_without_any_parameter_skips() {
+        // A `<function=...>` with no `<parameter=...>` children means we'd
+        // dispatch with empty args — usually broken intent. Skip rather than
+        // guess (mirrors `xml_without_tool_name_is_skipped`).
+        let text = r#"<tool_call>
+<function=list_files>
+</function>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert!(calls.is_empty(), "no <parameter> children → no rescue");
     }
 
     #[test]

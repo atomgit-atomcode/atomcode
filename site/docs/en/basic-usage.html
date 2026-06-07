@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.1</span>
+    <span class="dhdr-ver">v4.25.0</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -56,11 +56,14 @@
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
     <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
     <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
     <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
   </div>
 
   <div class="dside-group">
@@ -88,7 +91,11 @@ atomcode -c
 atomcode --continue
 
 # Use a specific config file
-atomcode --config ./custom.toml</code></pre>
+atomcode --config ./custom.toml
+
+# Skip all permission prompts, auto-approve every tool call
+atomcode -y
+atomcode --dangerously-skip-permissions</code></pre>
 
       <h2>CLI flag reference</h2>
       <table>
@@ -106,12 +113,23 @@ atomcode --config ./custom.toml</code></pre>
           <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>In non-interactive mode, print tool calls and token usage to stderr</td></tr>
           <tr><td><code>--max-turns N</code></td><td>—</td><td>Cap the number of agent loop iterations; prevents runaway loops</td></tr>
           <tr><td><code>--disable-tools LIST</code></td><td>—</td><td>Comma-separated tools to disable, e.g. <code>--disable-tools bash,web_fetch</code></td></tr>
+          <tr><td><code>--dangerously-skip-permissions</code></td><td><code>-y</code></td><td>Skip all permission prompts — auto-approve every tool call (bash, file edits, MCP, etc.). A ⚠ BYPASS badge is shown in the TUI status bar while active</td></tr>
         </tbody>
       </table>
 
       <div class="callout callout-tip">
         <strong>Tip</strong>
         <p><code>--disable-tools</code> makes disabled tools completely invisible to the model (they don't appear in the schemas), so the model won't keep trying to call them. Useful for sandbox evals, offline environments, and CI without network.</p>
+      </div>
+
+      <div class="callout callout-warning">
+        <strong>Warning</strong>
+        <p><code>-y</code> / <code>--dangerously-skip-permissions</code> bypasses all permission prompts, including bash execution, file writes, and MCP tool calls. The agent can execute arbitrary actions without confirmation. Only use this flag when:</p>
+        <ul>
+          <li>Running in CI/CD pipelines or other automated environments</li>
+          <li>Executing benchmarks inside a sandbox or container</li>
+          <li>Working on non-critical projects where you trust the agent's built-in safety constraints</li>
+        </ul>
       </div>
 
       <h2>How to phrase tasks</h2>
@@ -208,7 +226,7 @@ atomcode --config ./custom.toml</code></pre>
       <p>When the active provider can't take image input (text-only models like DeepSeek-V3 / Kimi), AtomCode doesn't refuse — it routes the image to a separate <strong>VL preprocessor</strong> (a vision model like Qwen3-VL / GLM-4V) for OCR + description, then splices the result into the user message as text before sending to the main model. So you can "drop a screenshot and ask" regardless of the main model.</p>
       <ul>
         <li>Which model does the preprocessor use? Controlled by <code>vision_preprocessor_provider</code> in the config — see <a href="./configuration.html#vision-preprocessor">Configuration · Vision preprocessor</a>.</li>
-        <li>The <code>/codingplan</code> flow auto-picks a VL/OCR model from the granted list and sets the field for you.</li>
+        <li>The <code>/login</code> flow auto-picks a VL/OCR model from the granted list and sets the field for you.</li>
         <li>VL calls use an <strong>idle timeout</strong>: as long as the stream keeps producing chunks there's no total cap; it only times out after 30 seconds of silence. On failure you get a <em>VL preprocess failed</em> warning — image recognition fails but the message still goes through.</li>
       </ul>
       <div class="callout callout-tip">

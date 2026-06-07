@@ -49,7 +49,7 @@ pub fn platform_rules() -> &'static str {
 }
 
 /// Sub-agent execution policy (enable + resilience knobs).
-/// Drives `agent::sub_agent::SubAgentTask::execute` and the
+/// Drives `agent::parallel_edit::SubAgentTask::execute` and the
 /// `try_sub_agent_dispatch` config gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -149,9 +149,9 @@ pub struct Config {
     /// Plugin marketplace bootstrap + auto-update behaviour. Missing
     /// from older configs → both knobs default to `true`, matching the
     /// "ship batteries included" UX: first-startup auto-installs the
-    /// default `atomcode-skills` marketplace, and an in-place version
-    /// upgrade silently `git pull`s every installed marketplace so
-    /// skills track the binary.
+    /// official `atomcode-plugins-official` marketplace, and an in-place
+    /// version upgrade silently `git pull`s every installed marketplace so
+    /// plugins track the binary.
     #[serde(default)]
     pub plugin: PluginConfig,
 }
@@ -161,22 +161,20 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// First-startup behaviour: when true (default), atomcode runs a
-    /// one-time `git clone` of the default `atomcode-skills`
+    /// one-time `git clone` of the official `atomcode-plugins-official`
     /// marketplace into `$ATOMCODE_HOME/plugins/marketplaces/`. A marker
-    /// file (`~/.atomcode/.plugin_bootstrap_v1`) is touched after the
+    /// file (`~/.atomcode/.plugin_bootstrap_v2`) is touched after the
     /// first attempt — set or unset — so the install fires exactly
-    /// once per user. A subsequent `/plugin uninstall` is respected;
-    /// the marker stays in place and the directory is NOT recreated.
-    /// To force a re-bootstrap, delete the marker.
+    /// once per user. A subsequent `/plugin marketplace remove` is
+    /// respected; the marker stays in place and the directory is NOT
+    /// recreated. To force a re-bootstrap, delete the marker.
     #[serde(default = "default_true")]
     pub auto_install_default_skills: bool,
-    /// Self-update follow-up: when true (default), after
-    /// `apply_pending_upgrade` actually applies a new atomcode binary
-    /// (`ATOMCODE_UPGRADED_FROM` env var set on re-exec), the new
-    /// session runs `git pull --ff-only` on every installed marketplace
-    /// so skills stay in lockstep with the binary. Failures (no
-    /// network, fast-forward conflict from local edits) are warned
-    /// and ignored — never block startup.
+    /// Per-startup sync: when true (default), every startup runs
+    /// `git pull --ff-only` on all installed marketplaces so plugins
+    /// stay in sync with the remote. Failures (no network, fast-forward
+    /// conflict from local edits) are warned and ignored — never block
+    /// startup.
     #[serde(default = "default_true")]
     pub auto_update_marketplaces: bool,
 }
@@ -528,6 +526,7 @@ fn render_instructions_section() -> String {
         "#   2. <project>/.atomcode.md            (project — team-shared, commit to git)\n",
     );
     out.push_str("#      or <project>/ATOMCODE.md\n");
+    out.push_str("#      or <project>/AGENTS.md           (AGENTS.md open standard)\n");
     out.push_str("#      or <project>/CLAUDE.md / claude.md (Claude Code compat)\n");
     out.push_str(
         "#   3. <project>/.atomcode.user.md       (user — personal per-project, .gitignore)\n",
@@ -646,7 +645,7 @@ impl Config {
                 .min()
                 .map(String::as_str)
                 .ok_or_else(|| {
-                    anyhow::anyhow!("No providers configured — run /codingplan or /provider")
+                    anyhow::anyhow!("No providers configured — run /login or /provider")
                 })
         };
         let name: &str = if name.is_empty() { fallback()? } else { name };
@@ -982,6 +981,7 @@ mod tests {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -1205,6 +1205,7 @@ mod tests {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -1270,6 +1271,7 @@ mod tests {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -1341,6 +1343,7 @@ mod tests {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,

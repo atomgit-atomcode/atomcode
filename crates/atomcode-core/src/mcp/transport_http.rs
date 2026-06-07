@@ -128,7 +128,10 @@ impl HttpClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::UNAUTHORIZED && self.auth.is_some() {
+            if (status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN)
+                && self.auth.is_some()
+            {
                 bail!(
                     "MCP server {} requires OAuth; run `atomcode mcp login {}` or `/mcp login {}`",
                     self.server_name,

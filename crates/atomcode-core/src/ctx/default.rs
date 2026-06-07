@@ -52,8 +52,12 @@ impl CtxBuilder for DefaultCtx {
         crate::ctx::render::needs_compression(conv, system_tokens, self.ctx_window)
     }
 
-    fn compression_plan(&self, conv: &Conversation) -> Option<(String, usize)> {
-        let (content, n) = crate::ctx::render::build_compression_content(conv);
+    fn compression_plan(
+        &self,
+        conv: &Conversation,
+        keep_ceiling: usize,
+    ) -> Option<(String, usize)> {
+        let (content, n) = crate::ctx::render::build_compression_content(conv, keep_ceiling);
         if content.is_empty() || n == 0 {
             None
         } else {
@@ -92,6 +96,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -132,6 +137,6 @@ mod tests {
     fn compression_plan_none_below_threshold() {
         let d = DefaultCtx::new(&test_provider(128_000));
         let conv = Conversation::new();
-        assert!(d.compression_plan(&conv).is_none());
+        assert!(d.compression_plan(&conv, usize::MAX).is_none());
     }
 }

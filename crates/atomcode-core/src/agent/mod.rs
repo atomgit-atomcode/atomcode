@@ -5,12 +5,13 @@
 pub mod background;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
-pub mod sub_agent;
+pub mod parallel_edit;
 pub mod subtask_driver;
 
 mod diagnose;
 mod discipline;
 pub mod execute;
+mod local_shell;
 mod prompt;
 mod services;
 mod tool_dispatch;
@@ -25,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::hook::HookEngine;
 use crate::provider::LlmProvider;
 use crate::skill::SkillRegistry;
 use crate::tool::use_skill::UseSkillTool;
@@ -68,6 +70,13 @@ pub enum AgentCommand {
     ClearConversation,
     /// Set messages from a resumed session.
     SetMessages(Vec<crate::conversation::message::Message>),
+    /// Bind the per-conversation session id (the session file's id) so the
+    /// `x-atomcode-session-id` header tracks the persistent conversation
+    /// identity. Sent by the UI whenever the current session is established
+    /// or switched (startup, /session, /resume, -c continue), so resuming a
+    /// saved session reuses its original id for gateway prefix-cache
+    /// affinity.
+    SetSessionId(String),
     /// Set plan mode (read-only exploration, no edits).
     SetPlanMode(bool),
     /// Manually compact conversation history. `prompt` is accepted for
@@ -106,6 +115,18 @@ pub enum AgentCommand {
     /// the session has up-to-date message history even when a turn is
     /// still in progress (e.g. waiting for tool approval).
     SyncMessages,
+    /// Roll conversation memory back to just before the `nth` real user
+    /// prompt (1-based). `None` targets the last prompt (bare `/undo`). The
+    /// agent replies with `AgentEvent::ConversationTruncated` on success or
+    /// `AgentEvent::UndoFailed` when `nth` is out of range.
+    UndoToPrompt { nth: Option<usize> },
+    /// User invoked `!cmd` bash mode. Runs the shell command locally and
+    /// injects `<bash-input>/<bash-stdout>/<bash-stderr>` into the
+    /// conversation as a User message — WITHOUT starting an LLM turn.
+    /// The model sees it on the user's next real message.
+    LocalShell {
+        cmd: String,
+    },
     /// Shutdown the agent.
     Shutdown,
 }
@@ -251,6 +272,19 @@ pub enum AgentEvent {
     TurnCancelled {
         messages: Vec<crate::conversation::message::Message>,
     },
+    /// Conversation memory was rolled back by `/undo`. Carries the truncated
+    /// message list (for the TUI to persist + replay), the removed prompt's
+    /// text (to restore into the input box), and turn numbers for the
+    /// confirmation line (`target_n..=prompts_before` were removed).
+    ConversationTruncated {
+        messages: Vec<crate::conversation::message::Message>,
+        restored_prompt: String,
+        target_n: usize,
+        prompts_before: usize,
+    },
+    /// `/undo` could not be honored: `requested` turn is out of range.
+    /// `available` real prompts exist (0 = nothing to undo).
+    UndoFailed { requested: usize, available: usize },
     /// Response to `AgentCommand::SyncMessages`. Carries a snapshot of
     /// `conversation.messages` at the time the agent processed the command.
     /// Used by the TUI to sync session state before backgrounding a session
@@ -276,6 +310,11 @@ pub enum AgentEvent {
     /// Currently sourced from the OpenAI provider's truncation detector
     /// when the proxy reports implausibly few prompt_tokens.
     Warning(String),
+    /// A UserPromptSubmit hook failed due to an environment issue (missing
+    /// dependency, crash, etc.) rather than an explicit block. The turn
+    /// continues but the status-bar hint should surface the error so the
+    /// user can fix their hook configuration.
+    HookWarningHint(String),
     /// VL preprocessing failed; the agent is returning the user's pending
     /// images so the TUI can re-attach them to the input state. Lets the
     /// user retry the same image without re-pasting from clipboard. Hashes
@@ -348,6 +387,15 @@ pub enum AgentEvent {
     },
     /// Working directory changed.
     WorkingDirChanged(PathBuf),
+    /// Another client (e.g. the webui) switched the project working directory.
+    /// Unlike `WorkingDirChanged` — which is an in-place cwd change from the
+    /// agent's own `cd`/`change_dir` tool and keeps the conversation — this
+    /// means "switch project, start fresh here": the receiving view changes cwd
+    /// AND opens a new session. Delivered over the live-sync channel
+    /// (`LiveEvent::WorkingDirChanged` → here) so a same-process TUI follows a
+    /// webui directory switch. Kept distinct from `WorkingDirChanged` precisely
+    /// so an agent-driven `cd` mid-task never wipes the conversation.
+    ProjectSwitched(PathBuf),
     /// Context budget stats — piped into datalog and cached by the TUI
     /// for `/context`. Emitted after every turn's `ctx.build_messages`
     /// call, so stats reflect the snapshot the model actually saw.
@@ -377,6 +425,12 @@ pub enum AgentEvent {
         /// `handle_send_message` fills this.
         system_prompt: String,
     },
+    /// 另一视图（webui/其他 TUI）发起的用户消息回显，用于同步模式下本端渲染用户气泡。
+    UserEcho(String),
+    /// 同步会话的对端正在进行 turn（true=进行中），用于禁用/恢复本端输入。
+    PeerBusy(bool),
+    /// 同步会话的另一视图（webui 下拉框）切换了模型。TUI 据此更新头部显示与活动 provider。
+    ProviderChanged(String),
 }
 
 /// The current phase of the agent (for UI display).
@@ -447,6 +501,10 @@ pub struct AgentLoop {
     pub turn_tokens: usize,
     pub total_tokens: usize,
     pub turn_start: Option<Instant>,
+
+    /// Session identifier for hook context.
+    /// Generated once at construction and survives ReloadConfig.
+    pub session_id: String,
 
     // Per-turn counters
     tool_call_count: usize,
@@ -549,14 +607,23 @@ pub struct AgentLoop {
     // Skill registry — provides descriptions for system prompt and powers use_skill tool
     skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 
-    /// Hook executor for lifecycle events.
-    hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
-
     // Code graph background indexer channel
     reindex_tx: Option<mpsc::UnboundedSender<PathBuf>>,
 
     // Datalog writer — writes per-turn markdown logs to datalog/ directory.
     datalog: crate::turn::datalog::DatalogWriter,
+
+    /// SystemPrompt hook extensions cached before each turn.
+    /// Populated by `refresh_hook_extensions` before calling `build_system_prompt`.
+    /// Vec<String> — empty means no extensions. Reset at session start and on reload.
+    cached_system_prompt_extensions: Vec<String>,
+
+    /// Session-frozen system prompt (LLM prefix-cache stability — the system
+    /// message is messages[0], so any byte change zeroes the whole cache).
+    /// Built once via `build_system_prompt`, reused verbatim every turn.
+    /// `None` = needs (re)build. Invalidated only at explicit contract
+    /// boundaries: SetPlanMode, ClearConversation, ReloadConfig, change_dir.
+    cached_system_prompt: Option<String>,
 
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
@@ -701,14 +768,36 @@ impl AgentRuntimeFactory {
     }
 }
 
+
 impl AgentLoop {
     /// Create a new agent loop and its corresponding UI handle.
     pub fn new(
         config: Config,
         provider: Box<dyn LlmProvider>,
+        tool_registry: ToolRegistry,
+        tool_context: ToolContext,
+        conversation: Conversation,
+    ) -> (Self, AgentHandle) {
+        Self::new_with_skip_permissions(
+            config,
+            provider,
+            tool_registry,
+            tool_context,
+            conversation,
+            false,
+        )
+    }
+
+    /// Create a new agent loop with an optional `--dangerously-skip-permissions`
+    /// flag. When `skip_permissions` is true, all tool calls are auto-approved
+    /// without prompting the user.
+    pub fn new_with_skip_permissions(
+        config: Config,
+        provider: Box<dyn LlmProvider>,
         mut tool_registry: ToolRegistry,
         tool_context: ToolContext,
         conversation: Conversation,
+        skip_permissions: bool,
     ) -> (Self, AgentHandle) {
         // Load skills from disk and register the use_skill tool.
         let working_dir = tool_context
@@ -779,6 +868,7 @@ impl AgentLoop {
             None,
             tool_context,
             conversation,
+            skip_permissions,
         )
     }
 
@@ -802,6 +892,7 @@ impl AgentLoop {
             runtime_label,
             tool_context,
             conversation,
+            false,
         )
     }
 
@@ -814,6 +905,7 @@ impl AgentLoop {
         runtime_label: Option<String>,
         mut tool_context: ToolContext,
         conversation: Conversation,
+        skip_permissions: bool,
     ) -> (Self, AgentHandle) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -837,10 +929,11 @@ impl AgentLoop {
         let permission_store = std::sync::Arc::new(std::sync::RwLock::new(PermissionStore::new()));
 
         let interactive_permission =
-            Box::new(crate::turn::permission::InteractivePermissionDecider::new(
+            Box::new(crate::turn::permission::InteractivePermissionDecider::new_with_skip_permissions(
                 approval_req_tx,
                 approval_resp_rx,
                 permission_store.clone(),
+                skip_permissions,
             ));
 
         // Hand the registry handle to ToolContext so active-dispatch tools
@@ -851,7 +944,7 @@ impl AgentLoop {
         let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::from(provider);
 
         // Build the datalog writer before `config` is moved into the agent below.
-        let datalog = match runtime_label.as_deref() {
+        let mut datalog = match runtime_label.as_deref() {
             Some(label) => crate::turn::datalog::DatalogWriter::new_with_filename_tag(
                 &working_dir,
                 &config.datalog,
@@ -882,6 +975,7 @@ impl AgentLoop {
                     thinking_type: None,
                     thinking_keep: None,
                     reasoning_history: None,
+                    reasoning_effort: None,
                     thinking_enabled: None,
                     thinking_budget: None,
                     skip_tls_verify: false,
@@ -890,8 +984,10 @@ impl AgentLoop {
 }),
             };
 
-        let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
-        let hook_executor = std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
+        // Initialize unified HookEngine
+        let mut hook_engine = HookEngine::new();
+        hook_engine.load_all(&working_dir);
+        let hook_engine = std::sync::Arc::new(hook_engine);
 
         let turn_runner = TurnRunner {
             provider,
@@ -900,9 +996,10 @@ impl AgentLoop {
             config: config.clone(),
             ctx: ctx.clone(),
             permission: interactive_permission,
+            hook_engine: hook_engine.clone(),
             recently_edited_files: Vec::new(),
-            hook_executor: hook_executor.clone(),
             loop_guard: Default::default(),
+            current_turn_number: 0,
         };
 
         // Capture session-start env snapshot (git status, branch, HEAD).
@@ -910,6 +1007,23 @@ impl AgentLoop {
         // capture is ~tens of ms for typical repos, and it's required
         // before the first turn's system prompt is assembled.
         let env_snapshot = crate::ctx::EnvSnapshot::capture(&working_dir);
+
+        // Bootstrap session id. Reuses the single id generator
+        // (`SessionId::new`, the same one Session/telemetry use) rather than
+        // minting a second raw uuid here. This is only the value used before
+        // the UI sends `SetSessionId` with the actual session-file id (the
+        // agent is constructed before the Session exists); from then on every
+        // consumer — header, datalog, telemetry, hooks — shares that id.
+        let session_id = crate::session::SessionId::new().as_str().to_string();
+        turn_runner.provider.set_session_id(&session_id);
+        // Bootstrap the datalog + telemetry with the same id (UI's
+        // SetSessionId updates all three once the real session is
+        // established). This is what keeps header / datalog / event-reporting
+        // on ONE id even in headless, where there's no UI bind.
+        datalog.set_session_id(&session_id);
+        if let Ok(uuid) = uuid::Uuid::parse_str(&session_id) {
+            turn_runner.context.telemetry.set_session_id(uuid);
+        }
 
         let agent = Self {
             conversation,
@@ -923,6 +1037,7 @@ impl AgentLoop {
             turn_tokens: 0,
             total_tokens: 0,
             turn_start: None,
+            session_id,
             tool_call_count: 0,
             turn_count: 0,
             max_turns: None,
@@ -951,9 +1066,10 @@ impl AgentLoop {
             plan_text: None,
             session_files: std::collections::HashMap::new(),
             skill_registry,
-            hook_executor,
             reindex_tx: None,
             datalog,
+            cached_system_prompt_extensions: Vec::new(),
+            cached_system_prompt: None,
             cmd_rx,
             event_tx,
         };
@@ -1023,34 +1139,38 @@ impl AgentLoop {
         }
 
         // --- SessionStart Hook ---
-        if self.hook_executor.has_hooks() {
-            let wd = self
+        let session_ctx = crate::hook::SessionContext {
+            session_id: self.session_id.clone(),
+            working_dir: self
                 .turn_runner
                 .context
                 .working_dir
                 .try_read()
-                .map(|g| g.display().to_string())
-                .unwrap_or_default();
-            let ctx = crate::hook::HookContext {
-                event: "session_start".into(),
-                tool_name: None,
-                tool_args: None,
-                tool_result: None,
-                tool_success: None,
-                session_id: String::new(),
-                working_dir: wd,
-            };
-            self.hook_executor
-                .run_session_event(crate::hook::HookEvent::SessionStart, &ctx)
-                .await;
+                .map(|g| g.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            model_name: self.turn_runner.provider.model_name().to_string(),
+            provider_name: self.config.default_provider.clone(),
+        };
+        let session_msgs = self.turn_runner.hook_engine.trigger_session_start(&session_ctx).await;
+        if !session_msgs.is_empty() {
+            // SessionStart hook Modified(msg) are collected and merged into the
+            // cached system-prompt extensions so the LLM sees them.  Unlike
+            // SystemPromptHook (which runs every turn), these are injected once
+            // at session start and persist for the session lifetime.
+            self.cached_system_prompt_extensions.extend(session_msgs);
         }
 
         while let Some(cmd) = self.cmd_rx.recv().await {
+            crate::ctrace!("AGT", "outer cmd_rx pop: {:?}", std::mem::discriminant(&cmd));
             match cmd {
                 AgentCommand::SendMessage { text, images, image_markers } => {
                     self.handle_send_message(text, images, image_markers).await;
                 }
+                AgentCommand::LocalShell { cmd } => {
+                    self.handle_local_shell(cmd).await;
+                }
                 AgentCommand::Cancel => {
+                    crate::ctrace!("AGT", "outer Cancel -> cancel_token.cancel() (was_cancelled={})", self.cancel_token.is_cancelled());
                     self.cancel_token.cancel();
                     self.cancel_token = CancellationToken::new();
                     self.phase = AgentPhase::Idle;
@@ -1078,7 +1198,10 @@ impl AgentLoop {
                         .get(&old_provider_name)
                         .map(|p| p.provider_type.clone());
                     self.config = new_config;
-                    // Rebuild hook executor from JSON config files.
+                    // Config/instructions/model may have changed → rebuild the
+                    // frozen system prompt on the next turn.
+                    self.cached_system_prompt = None;
+                    // Rebuild hook engine from config files.
                     let wd = self
                         .turn_runner
                         .context
@@ -1086,10 +1209,9 @@ impl AgentLoop {
                         .try_read()
                         .map(|g| g.clone())
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
-                    self.hook_executor =
-                        std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
-                    self.turn_runner.hook_executor = self.hook_executor.clone();
+                    let mut new_engine = HookEngine::new();
+                    new_engine.load_all(&wd);
+                    self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
                     let new_provider_name = self.config.default_provider.clone();
                     let new_type = self
                         .config
@@ -1134,7 +1256,7 @@ impl AgentLoop {
                                 if is_auth_gap {
                                     self.turn_runner.provider = std::sync::Arc::from(
                                         crate::provider::unavailable_provider(format!(
-                                            "Provider 凭证不可用：{}。请使用 /login 或 /codingplan 完成配置后再试。",
+                                            "Provider 凭证不可用：{}。请使用 /login 完成配置后再试。",
                                             msg
                                         )),
                                     );
@@ -1171,6 +1293,21 @@ impl AgentLoop {
                     // Clear the conversation history in the agent loop.
                     self.conversation = Conversation::new();
                     self.datalog.clear();
+                    // New session → re-snapshot the system prompt next turn.
+                    self.cached_system_prompt = None;
+                    // session_id is NOT reset here: /session pairs this with
+                    // a SetSessionId carrying the new session file's id, and
+                    // that's the single source of truth for the header.
+                }
+                AgentCommand::SetSessionId(id) => {
+                    self.session_id = id;
+                    self.turn_runner
+                        .provider
+                        .set_session_id(&self.session_id);
+                    self.datalog.set_session_id(&self.session_id);
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&self.session_id) {
+                        self.turn_runner.context.telemetry.set_session_id(uuid);
+                    }
                 }
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.
@@ -1180,9 +1317,54 @@ impl AgentLoop {
                         crate::conversation::turn::TurnTracker::rebuild(&messages);
                     self.conversation.messages = messages;
                     self.conversation.turn_tracker = turn_tracker;
+                    // NOTE: deliberately do NOT regenerate session_id here.
+                    // SetMessages also fires on `-c`/`--continue` auto-restore
+                    // and `/resume` of the current session — those CONTINUE an
+                    // existing conversation, so a new id would fragment one
+                    // logical session into two on the gateway. Only an explicit
+                    // fresh start (ClearConversation: /session, /clear) resets.
+                }
+                AgentCommand::UndoToPrompt { nth } => {
+                    let available = self.conversation.prompt_count();
+                    let target = nth.unwrap_or(available);
+                    match self.conversation.undo_to_prompt(target) {
+                        Some(restored_prompt) => {
+                            let _ = self.event_tx.send(AgentEvent::ConversationTruncated {
+                                messages: self.conversation.messages.clone(),
+                                restored_prompt,
+                                target_n: target,
+                                prompts_before: available,
+                            });
+                        }
+                        None => {
+                            let _ = self.event_tx.send(AgentEvent::UndoFailed {
+                                requested: target,
+                                available,
+                            });
+                        }
+                    }
                 }
                 AgentCommand::SetPlanMode(enabled) => {
+                    let changed = self.plan_mode != enabled;
                     self.plan_mode = enabled;
+                    // Plan mode is communicated to the model via a ONE-TIME
+                    // synthetic history message, NOT the system prompt — keeping
+                    // it out of messages[0] is what stops a plan-mode toggle from
+                    // zeroing the whole prefix cache. The read-only tool gating
+                    // (see `use_read_only`) enforces the constraint every turn
+                    // regardless. We do NOT touch cached_system_prompt here.
+                    if changed {
+                        let note = if enabled {
+                            "[PLAN MODE ACTIVATED] You are now in plan mode. Only read-only \
+                             tools are available — you MUST NOT edit, create, or delete any \
+                             files. Explore and analyze the codebase, then present a detailed \
+                             implementation plan for the user to review before making any changes."
+                        } else {
+                            "[PLAN MODE ENDED] Plan mode is off. You may now edit files and \
+                             carry out the plan."
+                        };
+                        self.conversation.add_synthetic_user_message(note);
+                    }
                 }
                 AgentCommand::Compact { prompt } => {
                     self.run_compact(prompt).await;
@@ -1381,10 +1563,9 @@ impl AgentLoop {
                         .try_read()
                         .map(|g| g.clone())
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
-                    self.hook_executor =
-                        std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
-                    self.turn_runner.hook_executor = self.hook_executor.clone();
+                    let mut new_engine = HookEngine::new();
+                    new_engine.load_all(&wd);
+                    self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
                 }
                 AgentCommand::SyncMessages => {
                     let messages = self.conversation.messages.clone();
@@ -1392,27 +1573,19 @@ impl AgentLoop {
                 }
                 AgentCommand::Shutdown => {
                     // --- SessionEnd Hook ---
-                    if self.hook_executor.has_hooks() {
-                        let wd = self
+                    let session_ctx = crate::hook::SessionContext {
+                        session_id: self.session_id.clone(),
+                        working_dir: self
                             .turn_runner
                             .context
                             .working_dir
                             .try_read()
-                            .map(|g| g.display().to_string())
-                            .unwrap_or_default();
-                        let ctx = crate::hook::HookContext {
-                            event: "session_end".into(),
-                            tool_name: None,
-                            tool_args: None,
-                            tool_result: None,
-                            tool_success: None,
-                            session_id: String::new(),
-                            working_dir: wd,
-                        };
-                        self.hook_executor
-                            .run_session_event(crate::hook::HookEvent::SessionEnd, &ctx)
-                            .await;
-                    }
+                            .map(|g| g.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        model_name: self.turn_runner.provider.model_name().to_string(),
+                        provider_name: self.config.default_provider.clone(),
+                    };
+                    self.turn_runner.hook_engine.trigger_session_end(&session_ctx).await;
                     break;
                 }
             }
@@ -1445,38 +1618,42 @@ impl AgentLoop {
         // input. A hook can either block the turn (CC `decision: "block"`
         // or non-zero exit) or inject extra context that we splice into
         // the user message before the LLM sees it.
-        if self.hook_executor.has_hooks() {
-            let cwd = self
-                .turn_runner
-                .context
-                .working_dir
-                .try_read()
-                .map(|g| g.display().to_string())
-                .unwrap_or_default();
-            match self
-                .hook_executor
-                .run_user_prompt_submit(&content, "", &cwd)
-                .await
-            {
-                crate::hook::UserPromptHookResult::Continue => {}
-                crate::hook::UserPromptHookResult::Inject(extra) => {
-                    // Append rather than prepend so the user's wording stays
-                    // at the top of the message — the hook context reads as
-                    // supplementary, not as a rewrite.
-                    content.push_str("\n\n");
-                    content.push_str(&extra);
-                }
-                crate::hook::UserPromptHookResult::Block(reason) => {
-                    let _ = self.event_tx.send(AgentEvent::Error {
-                        error: format!("hook blocked: {}", reason),
-                        messages: self.conversation.messages.clone(),
-                    });
-                    self.finish_turn(TurnStopReason::Error);
-                    return;
-                }
+        let cwd = self
+            .turn_runner
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.display().to_string())
+            .unwrap_or_default();
+        match self
+            .turn_runner
+            .hook_engine
+            .trigger_user_prompt_submit(&content, &self.session_id, &cwd)
+            .await
+        {
+            crate::hook::UserPromptHookResult::Continue => {}
+            crate::hook::UserPromptHookResult::Inject(extra) => {
+                content.push_str("\n\n");
+                content.push_str(&extra);
+            }
+            crate::hook::UserPromptHookResult::Block(reason) => {
+                let _ = self.event_tx.send(AgentEvent::Error {
+                    error: format!("hook blocked: {}", reason),
+                    messages: self.conversation.messages.clone(),
+                });
+                self.finish_turn(TurnStopReason::Error);
+                return;
+            }
+            crate::hook::UserPromptHookResult::Warning(msg) => {
+                // Non-fatal: show inline warning + status-bar hint, continue turn.
+                let _ = self.event_tx.send(AgentEvent::Warning(
+                    format!("Hook skipped (error): {}", msg),
+                ));
+                let _ = self.event_tx.send(AgentEvent::HookWarningHint(
+                    format!("Hook error: {}", msg),
+                ));
             }
         }
-
         // Detect negative feedback — user is unhappy with previous turn's work.
         let lower = content.to_lowercase();
         let negative_keywords = [
@@ -1550,19 +1727,29 @@ impl AgentLoop {
         };
 
         // ── Task boundary cleanup ──
-        // New user message = new task. If there's old context from the
-        // previous task (>12 messages), compress it unconditionally.
-        // This prevents dirty-start degradation where 20K+ of stale
-        // conversation dilutes the batch prompt for the new task.
-        // Unlike maybe_compress_history (which checks the 50% threshold),
-        // this fires at every task boundary regardless of token count.
-        if self.conversation.messages.len() > 12 {
+        // New user message = new task. Compress stale context from the
+        // previous task ONLY under real budget pressure — gauged by the
+        // same threshold as auto-compaction (`needs_compression`), which
+        // tracks `ctx_window()`.
+        //
+        // This used to fire unconditionally whenever messages exceeded
+        // KEEP_MESSAGES, ignoring the window. On a large (e.g. 1M) window
+        // that has ample room, every follow-up message then rewrote the
+        // prompt prefix — collapsing provider prompt-prefix cache to ~10%
+        // on the first request of each follow-up — and discarded context
+        // the model could still use. Gating on budget keeps the prefix
+        // byte-stable across follow-ups when there's room to spare.
+        let system_prompt = self.build_system_prompt();
+        let sys_tokens = system_prompt.len() / 4 + 4;
+        if self.ctx.needs_compression(&self.conversation, sys_tokens) {
             // Task-boundary compression goes through the active ctx strategy.
             // No LLM call — the compressed content is already
             // one-line-per-round summaries (DefaultCtx) compact enough
             // for cold zone.
-            if let Some((content, n_msgs)) = self.ctx.compression_plan(&self.conversation) {
-                let system_prompt = self.build_system_prompt();
+            let keep_ceiling = self.compaction_keep_ceiling(&system_prompt).await;
+            if let Some((content, n_msgs)) =
+                self.ctx.compression_plan(&self.conversation, keep_ceiling)
+            {
                 let _ = self.try_apply_compression(&system_prompt, n_msgs, content, false);
             }
         }
@@ -1633,6 +1820,7 @@ impl AgentLoop {
                     text: if clean.is_empty() { None } else { Some(clean.clone()) },
                     images,
                 },
+                synthetic: false,
             };
             let idx = self.conversation.messages.len();
             self.conversation.messages.push(msg);
@@ -1739,6 +1927,25 @@ impl AgentLoop {
             }
             self.turn_count += 1;
 
+            // --- 统一 TurnStart Hook (fire-and-forget) ---
+            {
+                let wd = self
+                    .turn_runner
+                    .context
+                    .working_dir
+                    .try_read()
+                    .map(|g| g.display().to_string())
+                    .unwrap_or_default();
+                let turn_ctx = crate::hook::TurnStartContext {
+                    turn_number: self.turn_count as u32,
+                    session_id: Some(self.session_id.clone()),
+                    working_dir: wd,
+                    phase: format!("{:?}", self.phase).to_lowercase(),
+                    has_file_context: !self.files_edited_this_turn.is_empty(),
+                };
+                self.turn_runner.hook_engine.trigger_on_turn_start(&turn_ctx).await;
+            }
+
             // Decrement diagnosis read-only counter each turn.
             if self.diagnosis_read_only_turns > 0 {
                 self.diagnosis_read_only_turns -= 1;
@@ -1747,7 +1954,7 @@ impl AgentLoop {
             // Inject any pending user input appended during streaming.
             if let Some(input) = self.pending_input.take() {
                 self.conversation
-                    .add_user_message(&format!("[Additional context from user]: {}", input));
+                    .add_synthetic_user_message(&format!("[Additional context from user]: {}", input));
             }
 
             // Planning phase: inject planning reminder on turn 3.
@@ -1769,6 +1976,20 @@ impl AgentLoop {
             // no edits), preventing it from stopping. The warning was interpreted
             // as "keep working" by the model. Stagnation detection was harmful —
             // the prompt guides the model to work efficiently.
+
+            // Refresh hook system-prompt extensions before building the prompt.
+            // NOTE: this still runs every turn (unchanged), but once the
+            // session-level system prompt is frozen (see build_system_prompt)
+            // the refreshed value is only consumed on a cold cache — i.e. the
+            // first build and after an explicit invalidation. Keeping the
+            // refresh unconditional avoids an ordering hazard where a
+            // build_system_prompt call on another path (e.g. RefreshContextStats)
+            // could freeze a prompt before SystemPromptHook output was collected.
+            self.cached_system_prompt_extensions = self
+                .turn_runner
+                .hook_engine
+                .collect_system_prompt_extensions()
+                .await;
 
             let system_prompt = self.build_system_prompt();
             // Per-turn reminder removed: verbatim task now rides on the cadence
@@ -1877,6 +2098,10 @@ impl AgentLoop {
                 } else {
                     None // Full tool access — model can read, edit, bash, search_replace
                 };
+                // Sync current turn number to TurnRunner so ToolCallStartContext
+                // gets the correct turn index (not a 0 placeholder).
+                runner.current_turn_number = self.turn_count as u32;
+
                 let turn_fut = runner.run_with_filter(
                     &mut conv,
                     &system_prompt,
@@ -2141,8 +2366,10 @@ impl AgentLoop {
                         }
 
                         Some(cmd) = cmd_rx.recv() => {
+                            crate::ctrace!("AGT", "inner cmd_rx pop: {:?}", std::mem::discriminant(&cmd));
                             match cmd {
                                 AgentCommand::Cancel => {
+                                    crate::ctrace!("AGT", "inner Cancel -> cancel_token.cancel() (was_cancelled={})", cancel_token.is_cancelled());
                                     cancel_token.cancel();
                                     *cancel_token = CancellationToken::new();
                                 }
@@ -2154,7 +2381,16 @@ impl AgentLoop {
                                 AgentCommand::ApproveToolAlways => {
                                     if let Some(ref req) = last_approval_request {
                                         if let Ok(mut store) = permission_store.write() {
-                                            store.grant_session(&req.call.name);
+                                            // Path-scoped approvals (sensitive
+                                            // reads) remember only this exact
+                                            // resource, so re-reading the same
+                                            // file stops re-prompting while
+                                            // other sensitive paths stay gated.
+                                            // Everything else grants the tool.
+                                            match &req.scope {
+                                                Some(scope) => store.grant_session_scope(scope),
+                                                None => store.grant_session(&req.call.name),
+                                            }
                                         }
                                     }
                                     *phase = AgentPhase::Thinking;
@@ -2216,6 +2452,24 @@ impl AgentLoop {
                     tokens,
                     truncated,
                 } => {
+                    // Trigger model response hooks (fire-and-forget)
+                    {
+                        let wd = self
+                            .turn_runner
+                            .context
+                            .working_dir
+                            .try_read()
+                            .map(|g| g.display().to_string())
+                            .unwrap_or_default();
+                        let mctx = crate::hook::TurnStartContext {
+                            turn_number: self.turn_count as u32,
+                            session_id: Some(self.session_id.clone()),
+                            working_dir: wd,
+                            phase: format!("{:?}", self.phase).to_lowercase(),
+                            has_file_context: !self.files_edited_this_turn.is_empty(),
+                        };
+                        self.turn_runner.hook_engine.trigger_on_model_response(text, &mctx).await;
+                    }
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
                     // Log the final assistant text to datalog (TUI used to do this —
@@ -2342,7 +2596,7 @@ impl AgentLoop {
                     // Reverting to the principled state machine.
                     if truncated && self.retry_count < 1 {
                         self.retry_count += 1;
-                        self.conversation.add_user_message(
+                        self.conversation.add_synthetic_user_message(
                             "Output limit hit. If the task is already complete, just output a \
                              short summary and stop (no tool calls). Otherwise resume where you left off."
                         );
@@ -2396,6 +2650,12 @@ impl AgentLoop {
                 TurnResult::Failed(e) => {
                     // Retry logic for transient errors
                     let is_rate_limited = is_rate_limited_error(&e);
+                    // A 429 whose quota only resets at a fixed future time
+                    // (monthly / period quota exhausted) can't recover by
+                    // retrying — fail fast and show the upstream reason as-is,
+                    // instead of the 5-shot rate-limit backoff (which just
+                    // delays the same error by ~45s and re-hammers the gateway).
+                    let is_quota_exhausted = crate::provider::is_non_retryable_rate_limit(&e);
                     let is_auth_error = is_auth_error(&e);
                     let is_messages_illegal = e.contains("illegal") || e.contains("messages");
                     // Upstream context-length overflow (OpenRouter 400, OpenAI
@@ -2414,6 +2674,7 @@ impl AgentLoop {
 
                     if is_official_build_required {
                         self.datalog.log_error(&e);
+                        self.report_error("codingplan_unavailable", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -2449,9 +2710,32 @@ impl AgentLoop {
                         };
                         let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
                         continue;
+                    } else if is_quota_exhausted {
+                        // Non-retryable: surface the upstream message verbatim
+                        // (e.g. "当前月度额度已用完，请于 … 后继续使用。") so the
+                        // user sees the real reason and reset time, not a
+                        // generic "请稍后再试".
+                        self.datalog.log_error(&e);
+                        self.report_error("rate_limit_exhausted", &e).await;
+                        let shown = e.strip_prefix("[429] ").unwrap_or(&e).to_string();
+                        let _ = self.event_tx.send(AgentEvent::Error {
+                            error: shown,
+                            messages: self.conversation.messages.clone(),
+                        });
+                        self.finish_turn(TurnStopReason::Error);
+                        return;
                     } else if is_rate_limited && self.retry_count < 5 {
                         self.retry_count += 1;
-                        let wait = (self.retry_count as u64 * 3).min(30);
+                        // 指数退避基线（3/6/9/12/15s）。但若网关在错误体里明确给了冷却
+                        // 时长（如 litellm 的 "No deployments available… Try again in 10
+                        // seconds"），就采纳它——否则更早重试只会打到仍在冷却的部署池，
+                        // 反而再次触发/延长冷却（用户侧表现为"明明有额度却一直 429"）。
+                        // 取二者较大值并封顶 30s。
+                        let computed = (self.retry_count as u64 * 3).min(30);
+                        let wait = parse_retry_after_hint(&e)
+                            .unwrap_or(0)
+                            .max(computed)
+                            .min(30);
                         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
                             "\n[Rate limited — retrying in {}s...]\n",
                             wait
@@ -2460,6 +2744,7 @@ impl AgentLoop {
                         continue;
                     } else if is_auth_error {
                         self.datalog.log_error(&e);
+                        self.report_error("auth_error", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -2478,6 +2763,7 @@ impl AgentLoop {
                         continue;
                     } else {
                         self.datalog.log_error(&e);
+                        self.report_error("api_error", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -2542,6 +2828,42 @@ impl AgentLoop {
     /// catastrophically. With proactive Tier 1 firing 5K below the
     /// wall, expected pattern is 3-4 mild Tier 1 events dropping
     /// 5-10K each, model retains skeleton + recent turns.
+    /// Max tokens the kept conversation tail may occupy after compaction:
+    /// the window minus the per-request overhead that shares it (system
+    /// prompt, tool definitions, cold-zone summaries, output reservation).
+    /// This overhead is roughly CONSTANT w.r.t. window size, so subtracting
+    /// it scales correctly from 128K to 1M — a fixed fraction would not
+    /// (it would waste ~460K on a 1M model, the same class of bug as the
+    /// old 60K drop cap).
+    async fn compaction_keep_ceiling(&self, system_prompt: &str) -> usize {
+        let window = self.ctx.ctx_window();
+        let system_tokens = system_prompt.len() / 4 + 4;
+        let tool_def_tokens: usize = self
+            .turn_runner
+            .tools
+            .get_definitions()
+            .await
+            .iter()
+            .map(|d| {
+                let params = serde_json::to_string(&d.parameters).unwrap_or_default();
+                (d.name.len() + d.description.len() + params.len()) / 4 + 4
+            })
+            .sum();
+        let cold_zone_tokens: usize = self
+            .conversation
+            .cold_summaries
+            .iter()
+            .map(|s| s.len() / 4 + 4)
+            .sum();
+        let output_reserve = (window / 4).clamp(8_000, 16_384);
+        window
+            .saturating_sub(system_tokens)
+            .saturating_sub(tool_def_tokens)
+            .saturating_sub(cold_zone_tokens)
+            .saturating_sub(output_reserve)
+            .max(window / 4) // defensive floor: tail never below 25% of window
+    }
+
     async fn maybe_compress_history(&mut self, system_prompt: &str) {
         let sys_tokens = system_prompt.len() / 4 + 4;
         if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
@@ -2567,7 +2889,8 @@ impl AgentLoop {
         }
 
         // ── Tier 2: LLM-summarize oldest turns into cold zone ──
-        let (content, n_turns) = match self.ctx.compression_plan(&self.conversation) {
+        let keep_ceiling = self.compaction_keep_ceiling(system_prompt).await;
+        let (content, n_turns) = match self.ctx.compression_plan(&self.conversation, keep_ceiling) {
             Some(plan) => plan,
             None => return,
         };
@@ -2645,7 +2968,7 @@ impl AgentLoop {
             &self.files_edited_this_turn,
             &self.files_read_this_turn,
         ) {
-            self.conversation.add_user_message(&msg);
+            self.conversation.add_synthetic_user_message(&msg);
         }
     }
 
@@ -2774,7 +3097,9 @@ impl AgentLoop {
     /// made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
         let system_prompt = self.build_system_prompt();
-        let Some((mechanical_content, n_msgs)) = self.ctx.compression_plan(&self.conversation)
+        let keep_ceiling = self.compaction_keep_ceiling(&system_prompt).await;
+        let Some((mechanical_content, n_msgs)) =
+            self.ctx.compression_plan(&self.conversation, keep_ceiling)
         else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 crate::i18n::t(crate::i18n::Msg::CompactNothingShort).into_owned(),
@@ -2853,39 +3178,121 @@ impl AgentLoop {
 
     /// Run a lightweight LLM call to summarize content. Returns empty string on failure.
     async fn run_llm_summary(&self, prompt: &str) -> String {
+        // System prompt kept in a local so the telemetry `system_tokens`
+        // estimate below matches exactly what is sent on the wire.
+        let sys = "You are a conversation summarizer. Output ONLY the summary.";
         let mut mini_conv = crate::conversation::Conversation::new();
         mini_conv.add_user_message(prompt);
-        let msgs = mini_conv
-            .to_provider_messages("You are a conversation summarizer. Output ONLY the summary.");
+        let msgs = mini_conv.to_provider_messages(sys);
+
+        let started = std::time::Instant::now();
+        // Telemetry token counters: populated from StreamEvent::Usage when the
+        // provider reports it, estimated otherwise (mirrors TurnRunner's
+        // no-usage fallback). This summary/compaction call goes to the SAME
+        // provider/base_url as a normal turn, so the upstream proxy logs it —
+        // but it bypasses `run_with_filter`, so the `tel_return!` macro never
+        // fires and the request was previously invisible to our telemetry,
+        // making AtomCode under-report vs the proxy by exactly these calls.
+        let mut tel_input: u32 = 0;
+        let mut tel_output: u32 = 0;
+        let mut tel_cached: u32 = 0;
+        let mut got_usage = false;
+        let mut errored = false;
 
         let mut summary = String::new();
-        if let Ok(mut stream) = self.turn_runner.provider.chat_stream(&msgs, None) {
-            use futures::StreamExt;
-            let first_timeout = std::time::Duration::from_secs(30);
-            let stream_timeout = std::time::Duration::from_secs(30);
-            let mut got_token = false;
-            loop {
-                let timeout = if got_token {
-                    stream_timeout
-                } else {
-                    first_timeout
-                };
-                match tokio::time::timeout(timeout, stream.next()).await {
-                    Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
-                        got_token = true;
-                        let clean = text
-                            .replace("<think>", "")
-                            .replace("</think>", "")
-                            .replace("<|im_start|>", "")
-                            .replace("<|im_end|>", "");
-                        summary.push_str(&clean);
+        match self.turn_runner.provider.chat_stream(&msgs, None) {
+            Ok(mut stream) => {
+                use futures::StreamExt;
+                let first_timeout = std::time::Duration::from_secs(30);
+                let stream_timeout = std::time::Duration::from_secs(30);
+                let mut got_token = false;
+                loop {
+                    let timeout = if got_token {
+                        stream_timeout
+                    } else {
+                        first_timeout
+                    };
+                    match tokio::time::timeout(timeout, stream.next()).await {
+                        Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
+                            got_token = true;
+                            let clean = text
+                                .replace("<think>", "")
+                                .replace("</think>", "")
+                                .replace("<|im_start|>", "")
+                                .replace("<|im_end|>", "");
+                            summary.push_str(&clean);
+                        }
+                        Ok(Some(Ok(crate::stream::StreamEvent::Usage(u)))) => {
+                            tel_input = tel_input.saturating_add(u.prompt_tokens as u32);
+                            tel_output = tel_output.saturating_add(u.completion_tokens as u32);
+                            tel_cached = tel_cached.saturating_add(u.cached_tokens as u32);
+                            got_usage = true;
+                        }
+                        Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
+                        Ok(Some(Ok(_))) => continue,
+                        Ok(Some(Err(_))) => {
+                            errored = true;
+                            break;
+                        }
+                        // timeout (Err) or end-of-stream (Ok(None))
+                        _ => break,
                     }
-                    Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
-                    Ok(Some(Ok(_))) => continue,
-                    _ => break,
                 }
             }
+            Err(_) => {
+                errored = true;
+            }
         }
+
+        // Estimate tokens when the provider didn't report usage (many
+        // OpenAI-compatible gateways ignore stream_options). ~4 chars/token in,
+        // ~3 out — same heuristic class as TurnRunner.
+        if !got_usage {
+            tel_input = ((sys.len() + prompt.len()) / 4) as u32;
+            tel_output = (summary.len() / 3) as u32;
+        }
+        let had_error = errored || (summary.trim().is_empty() && !got_usage);
+
+        // Build the same envelope context a normal turn would carry, so this
+        // request is attributed to the right provider/host/model/session.
+        let pcfg = self.config.providers.get(&self.config.default_provider);
+        let vendor = pcfg.map(|p| p.provider_type.clone());
+        let host = pcfg.and_then(|p| {
+            atomcode_telemetry::resolve_provider_host(&p.provider_type, p.base_url.as_deref())
+        });
+        let parent = atomcode_telemetry::CurrentContext::current();
+        let scope_ctx = atomcode_telemetry::CurrentContext {
+            turn_id: Some(uuid::Uuid::new_v4()),
+            provider: parent.provider.clone().or(vendor),
+            provider_host: parent.provider_host.clone().or(host),
+            model: parent
+                .model
+                .clone()
+                .or_else(|| Some(self.turn_runner.provider.model_name().to_string())),
+            ..parent
+        };
+        let event = atomcode_telemetry::Event::LlmChat {
+            duration_ms: started.elapsed().as_millis() as u32,
+            tool_calls_count: 0,
+            input_tokens: tel_input,
+            output_tokens: tel_output,
+            cached_tokens: tel_cached,
+            had_error,
+            context_window: self.ctx.ctx_window() as u32,
+            system_tokens: (sys.len() / 4 + 4) as u32,
+            tool_def_tokens: 0,
+            tool_result_tokens: 0,
+            message_tokens: (prompt.len() / 4) as u32,
+            messages_count: msgs.len() as u32,
+            error_kind: None,
+            error_data: None,
+        };
+        let tel = self.turn_runner.context.telemetry.clone();
+        atomcode_telemetry::CurrentContext::scope(scope_ctx, || async move {
+            tel.track(event);
+        })
+        .await;
+
         summary
     }
 
@@ -2946,6 +3353,27 @@ impl AgentLoop {
         let duration = self.turn_start.map(|t| t.elapsed()).unwrap_or_default();
         self.turn_start = None;
         self.phase = AgentPhase::Idle;
+
+        // --- 统一 TurnComplete Hook (fire-and-forget) ---
+        {
+            let stop_str = format!("{:?}", stop_reason).to_lowercase();
+            let turn_complete_ctx = crate::hook::TurnCompleteContext {
+                turn_number: self.turn_count as u32,
+                result_type: stop_str,
+                tokens_used: self.turn_tokens,
+                tool_calls: self.tool_call_count,
+                duration_ms: duration.as_millis() as u64,
+                truncated: false,
+                edited_files: self.files_edited_this_turn.clone(),
+            };
+            // fire-and-forget: spawn to avoid blocking the sync finish_turn
+            let engine = self.turn_runner.hook_engine.clone();
+            let ctx = turn_complete_ctx.clone();
+            tokio::spawn(async move {
+                engine.trigger_on_turn_complete(&ctx).await;
+            });
+        }
+
         let _ = self.event_tx.send(AgentEvent::TurnComplete {
             duration,
             total_tokens: self.turn_tokens,
@@ -2972,6 +3400,19 @@ impl AgentLoop {
     // intent-keywords across two iterations of failed gate logic, and
     // an entire class of mis-fire failures (read-only turns dispatching
     // 6 fork sub-agents that fake edits or no-op).
+
+    /// Fire-and-forget error reporting through the unified hook engine.
+    /// Consolidates ErrorContext construction for terminal error paths
+    /// (auth, api, codingplan_unavailable) to avoid duplication.
+    async fn report_error(&self, error_type: &str, error_message: &str) {
+        let ctx = crate::hook::ErrorContext {
+            error_type: error_type.into(),
+            error_message: error_message.into(),
+            phase: format!("{:?}", self.phase).to_lowercase(),
+            turn_number: Some(self.turn_count as u32),
+        };
+        self.turn_runner.hook_engine.trigger_on_error(&ctx).await;
+    }
 }
 
 
@@ -3160,35 +3601,43 @@ fn reload_should_clear_conversation(
 /// messages, since that's how `truncate(len - 4)` corrupted state.
 ///
 /// Sacred invariants (won't violate even if it means staying over budget):
-/// 1. The last `User` message is kept (current task anchor).
-/// 2. The drop boundary snaps to a turn boundary so we never split a
+/// 1. The FIRST real user message is kept — it's the conversation
+///    anchor that `/resume` display starts from. Dropping it leaves
+///    the user with a session that opens on a tool_call with no
+///    visible reason for it.
+/// 2. The LAST real user message is kept — it's the current question
+///    the model is answering. Dropping it breaks the in-flight turn.
+/// 3. Both filters skip `synthetic` user messages — agent-authored
+///    injections like `[Context was compressed]` / `Output limit hit`
+///    / `[Additional context]` are plumbing, NOT user anchors. The
+///    pre-`synthetic`-field code matched any `Role::User` here and
+///    routinely picked a synthetic injection as the "last user",
+///    leaving the original prompt unprotected for the drain.
+/// 4. The drop boundary snaps to a turn boundary so we never split a
 ///    `tool_call` from its paired `tool_result`.
 fn hard_truncate_to_target(
     conv: &mut crate::conversation::Conversation,
     target_tokens: usize,
     sys_tokens: usize,
 ) {
-    use crate::conversation::message::{MessageContent, Role};
+    use crate::conversation::message::{Message, MessageContent, Role};
     if conv.messages.is_empty() {
         return;
     }
     let total_budget = target_tokens.saturating_sub(sys_tokens);
 
-    // Find the last User message — it must survive.
-    let last_user_idx = conv
-        .messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, m)| m.role == Role::User)
-        .map(|(i, _)| i);
+    let is_real_user = |m: &Message| m.role == Role::User && !m.synthetic;
+    let first_real_user_idx = conv.messages.iter().position(|m| is_real_user(m));
+    let last_real_user_idx = conv.messages.iter().rposition(|m| is_real_user(m));
 
     let mut kept_tokens = 0usize;
     let mut keep_from = conv.messages.len();
     for i in (0..conv.messages.len()).rev() {
         let mt = conv.messages[i].estimate_tokens();
-        // Always keep the last user message regardless of budget.
-        let is_sacred = Some(i) == last_user_idx;
+        // Sacred set: first AND last real user messages. Both pass
+        // through regardless of remaining budget.
+        let is_sacred =
+            Some(i) == first_real_user_idx || Some(i) == last_real_user_idx;
         if !is_sacred && kept_tokens + mt > total_budget && keep_from < conv.messages.len() {
             break;
         }
@@ -3207,11 +3656,13 @@ fn hard_truncate_to_target(
             _ => break,
         }
     }
-    // Don't skip past the sacred last-user index even if the boundary
-    // walker would have taken us there — better to ship one stub
-    // tool_result than to drop the user msg.
-    if let Some(lu) = last_user_idx {
+    // Don't skip past either sacred anchor. Better to ship over budget
+    // than to drop the original prompt or the current question.
+    if let Some(lu) = last_real_user_idx {
         keep_from = keep_from.min(lu);
+    }
+    if let Some(fr) = first_real_user_idx {
+        keep_from = keep_from.min(fr);
     }
 
     if keep_from > 0 {
@@ -3294,6 +3745,24 @@ fn is_rate_limited_error(e: &str) -> bool {
         || e.contains("请求过于频繁")
         || e.contains("服务繁忙")
         || e.contains("限流")
+}
+
+/// Parse a gateway-suggested cooldown (in seconds) out of a rate-limit error
+/// body, e.g. litellm's `"No deployments available for selected model. Try
+/// again in 10 seconds."` Returns `None` when no explicit hint is present, in
+/// which case the caller falls back to its exponential backoff. ASCII-only
+/// lowercasing keeps byte offsets aligned with the original so the digit slice
+/// is valid even when the message contains earlier multibyte (e.g. Chinese)
+/// text.
+fn parse_retry_after_hint(e: &str) -> Option<u64> {
+    let lower = e.to_ascii_lowercase();
+    let idx = lower.find("try again in ")?;
+    let rest = &e[idx + "try again in ".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
 }
 
 fn is_auth_error(e: &str) -> bool {
@@ -3507,6 +3976,99 @@ mod agent_handle_tests {
         assert_eq!(factory.working_dir, std::path::PathBuf::from("/tmp/new"));
     }
 
+    /// Part-2 regression (system-prompt prefix-cache stability): the system
+    /// prompt is messages[0], so any byte change zeroes the entire prefix
+    /// cache. It must stay byte-identical across turns even when the model
+    /// changes the working directory (the most common mid-session mutation).
+    /// Only an explicit cache invalidation (plan-mode toggle, /clear, reload,
+    /// /cd) may rebuild it.
+    #[tokio::test]
+    async fn system_prompt_is_frozen_across_model_cwd_change() {
+        let old_wd =
+            std::path::PathBuf::from(format!("/tmp/atomcode_sysfreeze_old_{}", std::process::id()));
+        let new_wd =
+            std::path::PathBuf::from(format!("/tmp/atomcode_sysfreeze_new_{}", std::process::id()));
+
+        let tool_context = crate::tool::ToolContext::new(old_wd.clone());
+        let (mut loop_, _handle) = super::AgentLoop::new_with_shared_parts(
+            crate::config::Config::default(),
+            crate::provider::unavailable_provider("test"),
+            std::sync::Arc::new(crate::tool::ToolRegistry::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+            Some("test".to_string()),
+            tool_context,
+            crate::conversation::Conversation::new(),
+        );
+
+        // Turn 1: build + freeze.
+        let sys1 = loop_.build_system_prompt();
+        assert!(
+            sys1.contains(&old_wd.display().to_string()),
+            "sanity: the working directory IS interpolated into the system prompt"
+        );
+
+        // Model runs its `cd` tool — writes working_dir directly, exactly like
+        // tool/cd.rs / tool/bash.rs do (does NOT go through change_dir).
+        *loop_.turn_runner.context.working_dir.write().await = new_wd.clone();
+
+        // Turn 2+: system prompt MUST be byte-identical despite the cwd change.
+        let sys2 = loop_.build_system_prompt();
+        assert_eq!(
+            sys1, sys2,
+            "system prompt must be frozen across a model cwd change (prefix cache)"
+        );
+        assert!(
+            !sys2.contains(&new_wd.display().to_string()),
+            "the frozen prompt must NOT pick up the new cwd"
+        );
+
+        // Explicit boundary: invalidating the cache (as plan-mode toggle,
+        // /clear, reload, or /cd do) rebuilds and DOES reflect the new cwd —
+        // proving the freeze above was real, not a coincidence.
+        loop_.cached_system_prompt = None;
+        let sys3 = loop_.build_system_prompt();
+        assert_ne!(sys1, sys3, "after invalidation the prompt should rebuild");
+        assert!(
+            sys3.contains(&new_wd.display().to_string()),
+            "the rebuilt prompt should reflect the new cwd"
+        );
+    }
+
+    /// Part-2 (systemA): plan mode must NOT live in the system prompt. Toggling
+    /// it would otherwise rewrite messages[0] and zero the prefix cache. It's
+    /// announced via a synthetic history message instead (see SetPlanMode) and
+    /// enforced by read-only tool gating.
+    #[tokio::test]
+    async fn plan_mode_is_not_in_system_prompt() {
+        let wd = std::path::PathBuf::from(format!("/tmp/atomcode_planmode_{}", std::process::id()));
+        let (mut loop_, _handle) = super::AgentLoop::new_with_shared_parts(
+            crate::config::Config::default(),
+            crate::provider::unavailable_provider("test"),
+            std::sync::Arc::new(crate::tool::ToolRegistry::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+            Some("test".to_string()),
+            crate::tool::ToolContext::new(wd),
+            crate::conversation::Conversation::new(),
+        );
+
+        loop_.plan_mode = false;
+        let sys_off = loop_.build_system_prompt();
+
+        // Toggle plan mode ON and rebuild from a cold cache.
+        loop_.cached_system_prompt = None;
+        loop_.plan_mode = true;
+        let sys_on = loop_.build_system_prompt();
+
+        assert!(
+            !sys_on.contains("PLAN MODE"),
+            "plan mode must NOT appear in the system prompt"
+        );
+        assert_eq!(
+            sys_off, sys_on,
+            "plan_mode must not change the system prompt at all (it's frozen; mode rides in history)"
+        );
+    }
+
     #[test]
     fn cloned_runtime_factories_allocate_unique_labels() {
         let factory = AgentRuntimeFactory::new_for_test(
@@ -3526,8 +4088,8 @@ mod agent_handle_tests {
 mod classifier_tests {
     use super::{
         extract_provider_ctx_limit, is_auth_error, is_codingplan_unavailable_error,
-        is_context_overflow_error, is_rate_limited_error, public_error_message,
-        public_error_reason, reload_should_clear_conversation,
+        is_context_overflow_error, is_rate_limited_error, parse_retry_after_hint,
+        public_error_message, public_error_reason, reload_should_clear_conversation,
     };
 
     // ── reload_should_clear_conversation ──
@@ -3942,6 +4504,25 @@ mod classifier_tests {
     }
 
     #[test]
+    fn retry_after_hint_parsed_from_litellm_no_deployments_body() {
+        // The exact shape elegant001 hit: litellm "No deployments available"
+        // with an embedded cooldown hint. The retry must honour the 10s so it
+        // doesn't hammer the still-cold pool at 3s.
+        let e = "[429] No deployments available for selected model, Try again in 10 seconds. \
+                 Passed model=deepseek-v4-flash. pre-call-checks=True, cooldown_list=['b5cb...']";
+        assert_eq!(parse_retry_after_hint(e), Some(10));
+        // Capital-T phrasing + a multibyte prefix must still parse (byte offsets
+        // stay aligned under ASCII-only lowercasing).
+        assert_eq!(
+            parse_retry_after_hint("模型繁忙：Try again in 30 seconds."),
+            Some(30)
+        );
+        // No hint → None (caller keeps its exponential backoff).
+        assert_eq!(parse_retry_after_hint("429 Too Many Requests"), None);
+        assert_eq!(parse_retry_after_hint("try again in soon"), None);
+    }
+
+    #[test]
     fn invalid_request_is_summarized_without_raw_body() {
         let old = std::env::var("ATOMCODE_SHOW_RAW_API_ERROR").ok();
         unsafe { std::env::set_var("ATOMCODE_SHOW_RAW_API_ERROR", "0") };
@@ -4128,6 +4709,193 @@ mod bash_deleted_file_tracking_tests {
                 "/tmp/project/b.rs".to_string()
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod hard_truncate_tests {
+    use super::hard_truncate_to_target;
+    use crate::conversation::Conversation;
+    use crate::conversation::message::{Message, MessageContent, Role};
+    use crate::tool::{ToolCall, ToolResult};
+
+    /// Build a "real prompt → many tool calls → synthetic injection"
+    /// conversation matching the production bug scenario: user asks a
+    /// question, agent explores a codebase across many tool calls (each
+    /// chewing tokens), then the agent self-injects a synthetic
+    /// `[Context was compressed.]` user message before continuing.
+    /// Before this fix, `hard_truncate_to_target` would identify the
+    /// SYNTHETIC injection as "last user" and drop the original prompt.
+    fn build_real_then_synthetic_conv() -> Conversation {
+        let mut conv = Conversation::new();
+        conv.messages
+            .push(Message::new(Role::User, "ORIGINAL PROMPT: please explore the codebase and explain"));
+        // Pad with 10 turns of assistant tool_call + tool_result, each
+        // ~80-100 chars so total est ≥ ~300 tokens.
+        for i in 0..10 {
+            conv.messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: format!("c{}", i),
+                        name: "read_file".into(),
+                        arguments: format!(r#"{{"file_path":"src/module_{}.rs"}}"#, i),
+                    }],
+                    reasoning_content: None,
+                    thinking_blocks: Vec::new(),
+                },
+                synthetic: false,
+            });
+            conv.messages.push(Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: format!("c{}", i),
+                    output: format!(
+                        "lots of file contents here for module {}, including \
+                         many lines of code that the agent had to read",
+                        i
+                    ),
+                    success: true,
+                }),
+                synthetic: false,
+            });
+        }
+        // The synthetic injection that triggered the bug. Role::User,
+        // synthetic=true, [...]-bracketed text.
+        conv.messages.push(Message::synthetic_user(
+            "[Context was compressed. Here is your current state:]\nTASK: explore the codebase",
+        ));
+        conv
+    }
+
+    /// Regression for the bug reported on /resume (2026-05-25): a
+    /// session that triggered hard_truncate would lose the original
+    /// user prompt because `last_user_idx` matched the synthetic
+    /// `[Context was compressed]` injection instead of the real prompt
+    /// at index 0. Resume then opened on a tool_call with no visible
+    /// reason for it and the JSON had no prompt to display.
+    ///
+    /// Post-fix: BOTH the first AND last real user messages are sacred.
+    /// The synthetic injection is filtered out by `!m.synthetic`, so
+    /// the only real user message (at index 0) is now both first AND
+    /// last real-user and is preserved no matter how tight the budget.
+    #[test]
+    fn hard_truncate_preserves_original_prompt_over_synthetic_injection() {
+        let mut conv = build_real_then_synthetic_conv();
+
+        // Tight budget: well below the conversation's total tokens. Pre-
+        // fix, `last_user_idx` would land on the synthetic injection
+        // (because it had Role::User), leaving messages[0] unprotected
+        // and the drain would silently delete the original prompt.
+        hard_truncate_to_target(&mut conv, /* target */ 80, /* sys */ 0);
+
+        // ── Primary assertion: messages[0] is still the real prompt. ──
+        let first = &conv.messages[0];
+        assert!(
+            !first.synthetic,
+            "messages[0] must be the REAL user prompt, not the synthetic injection"
+        );
+        assert!(
+            matches!(first.role, Role::User),
+            "messages[0] must be Role::User, got {:?}",
+            first.role
+        );
+        assert!(
+            first.text().unwrap_or("").contains("ORIGINAL PROMPT"),
+            "messages[0] must literally be the original prompt, got: {:?}",
+            first.text()
+        );
+        // ── Trade-off documented: with the original prompt at index 0
+        // both first_real_user AND last_real_user point there, so the
+        // sacred set forces `keep_from = 0` — compaction stays over
+        // budget in this scenario rather than dropping the anchor. We
+        // accept this: tier 1/2 (tool-result stubbing, LLM summary) are
+        // already non-destructive ways to reduce tokens; tier 3 only
+        // exists to drop OLD TURNS, and a single-turn conversation has
+        // none. Better to leave the convo intact than silently lose the
+        // prompt. The pre-fix behavior would have shrunk here — at the
+        // cost of breaking /resume display, which is the bug.
+    }
+
+    /// `last_user_idx` must also filter synthetics: in a multi-turn
+    /// conversation where the user sent two real prompts AND the agent
+    /// later injected a synthetic, the "last real user" should be the
+    /// second human prompt, not the post-synthetic injection. Verifies
+    /// the symmetric pole of the sacred set.
+    #[test]
+    fn hard_truncate_last_real_user_skips_trailing_synthetic() {
+        let mut conv = Conversation::new();
+        conv.messages.push(Message::new(Role::User, "first real prompt"));
+        for i in 0..6 {
+            conv.messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: format!("a{}", i),
+                        name: "bash".into(),
+                        arguments: r#"{"command":"echo ok"}"#.into(),
+                    }],
+                    reasoning_content: None,
+                    thinking_blocks: Vec::new(),
+                },
+                synthetic: false,
+            });
+            conv.messages.push(Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: format!("a{}", i),
+                    output: "ok and lots of output filler bytes for token weight".into(),
+                    success: true,
+                }),
+                synthetic: false,
+            });
+        }
+        conv.messages
+            .push(Message::new(Role::User, "second real follow-up prompt"));
+        conv.messages.push(Message::synthetic_user(
+            "[Context was compressed.] dropped a bunch of stale state",
+        ));
+
+        hard_truncate_to_target(&mut conv, /* target */ 80, /* sys */ 0);
+
+        // Find what survived as the LAST user-role message — it should
+        // be the second REAL prompt, not the trailing synthetic.
+        let last_user = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::User))
+            .expect("at least one user message must survive");
+        // We may also see the trailing synthetic if it survived, so
+        // iterate further to find the most recent REAL one.
+        let last_real = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::User) && !m.synthetic)
+            .expect("a real user message must survive");
+        assert!(
+            last_real
+                .text()
+                .unwrap_or("")
+                .contains("second real follow-up"),
+            "last real user must be the second real prompt, got: {:?}",
+            last_real.text()
+        );
+        // The trailing synthetic might or might not have survived
+        // depending on budget — what matters is that `last_user` (if it
+        // happens to be the synthetic) doesn't shadow the real one.
+        let _ = last_user;
+    }
+
+    /// Empty conversation: no-op, no panic. Covers the early-return.
+    #[test]
+    fn hard_truncate_empty_convo_is_noop() {
+        let mut conv = Conversation::new();
+        hard_truncate_to_target(&mut conv, 100, 0);
+        assert_eq!(conv.messages.len(), 0);
     }
 }
 

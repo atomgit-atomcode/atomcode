@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="referrer" content="strict-origin-when-cross-origin">
 <title>AtomCode · 在你的终端中运行的 AI 编程助手</title>
 <meta name="description" content="AtomCode — Claude Code 的开源平替。连接任意大模型，自主多步执行，30 秒上手。">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
@@ -42,8 +43,8 @@
   .hdr-logo img{width:24px;height:24px;border-radius:6px;flex-shrink:0}
   .ver{display:inline-flex;align-items:center;padding:2px 7px;margin-left:6px;font-family:var(--mono);font-size:10px;letter-spacing:.5px;color:var(--accent);border:1px solid rgba(232,160,80,.4);border-radius:3px;font-weight:500;background:rgba(232,160,80,.08);transition:all .25s}
   .ver:hover{background:var(--accent);color:#000;border-color:var(--accent)}
-  .hdr-nav{display:flex;gap:22px;font-family:var(--mono);font-size:12px;letter-spacing:1.5px;text-transform:uppercase}
-  .hdr-nav a{position:relative;padding:6px 2px;color:rgba(255,255,255,.65);transition:color .2s}
+  .hdr-nav{display:flex;align-items:center;gap:22px;font-family:var(--mono);font-size:12px;letter-spacing:1.5px;text-transform:uppercase}
+  .hdr-nav a{position:relative;padding:6px 2px;line-height:1;color:rgba(255,255,255,.65);transition:color .2s}
   .hdr-nav a::after{content:"";position:absolute;bottom:0;left:0;right:0;height:1px;background:var(--accent);transform:scaleX(0);transform-origin:left;transition:transform .25s}
   .hdr-nav a:hover,.hdr-nav a.active{color:#fff}
   .hdr-nav a.active::after{transform:scaleX(1)}
@@ -88,7 +89,25 @@
   .install-tab .ind{font-size:10px;color:var(--green);opacity:0;transition:opacity .2s}
   .install-tab.active .ind{opacity:1}
   .install-body{padding:18px 18px 14px;position:relative}
-  .install-cmd{font-size:13px;color:#e8e8e8;white-space:pre;overflow-x:auto;line-height:1.5}
+  /* `pre-wrap` + `break-word` lets long install URLs (Windows
+     `irm https://…/install.ps1 | iex` is ~94 chars vs ~520 px
+     container) wrap visually instead of triggering Windows' chunky
+     10-12 px default horizontal scrollbar. JS copy uses the
+     underlying string verbatim, so the wrap is purely visual.
+     `overflow-x:auto` + the thin scrollbar style below stay as a
+     belt-and-suspenders for any pathological token that's longer
+     than the container with no break-opportunity. */
+  /* `overflow-y:hidden` explicit: when only `overflow-x:auto` is
+     set, CSS spec promotes the default `overflow-y:visible` to
+     `auto` (can't mix visible with non-visible on the other axis),
+     which silently spawned a vertical scrollbar on any sub-pixel
+     content overhang. Also zero the default `<pre>` margin so the
+     element fits its container snugly. */
+  .install-cmd{font-size:13px;color:#e8e8e8;white-space:pre-wrap;word-break:break-word;overflow-x:auto;overflow-y:hidden;margin:0;line-height:1.5;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.2) transparent}
+  .install-cmd::-webkit-scrollbar{height:6px}
+  .install-cmd::-webkit-scrollbar-track{background:transparent}
+  .install-cmd::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:3px}
+  .install-cmd::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.3)}
   .install-cmd .accent{color:var(--accent)}
   .install-cmd .str{color:#9ecbff}
   .install-cmd .com{color:rgba(255,255,255,.4)}
@@ -204,6 +223,42 @@
   .plugin-row .p{flex:1;padding:8px 10px;border:1px solid var(--line);font-family:var(--mono);font-size:10px;color:rgba(255,255,255,.7);letter-spacing:.3px;background:rgba(255,255,255,.02)}
   .plugin-row .p b{color:#fff;display:block;font-size:11px;font-weight:500}
 
+  /* ---------- plugins ---------- */
+  .plugins{padding:60px 30px 100px;background:linear-gradient(180deg,rgba(255,255,255,.015),transparent)}
+  .plugin-wrap{width:min(1180px,100%);margin:0 auto}
+  .plugin-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+  .plugin-grid>.plugin-install{height:100%}
+  .plugin-features{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .plugin-feat{padding:22px 18px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,0));transition:border-color .25s,transform .3s cubic-bezier(.22,1,.36,1)}
+  .plugin-feat:hover{border-color:rgba(232,160,80,.45);transform:translateY(-1px)}
+  .plugin-feat .icon{width:32px;height:32px;border-radius:6px;background:rgba(232,160,80,.15);color:var(--accent);display:flex;align-items:center;justify-content:center;margin-bottom:10px;font-size:15px;font-weight:700}
+  .plugin-feat h3{margin:0 0 6px;font-family:Inter,sans-serif;font-size:15px;font-weight:600;color:#fff}
+  .plugin-feat p{margin:0;font-size:12px;line-height:1.6;color:rgba(255,255,255,.55)}
+  .plugin-install{background:#000;border:1px solid var(--line);border-radius:10px;overflow:hidden;font-family:var(--mono);flex:1;display:flex;flex-direction:column}
+  .plugin-install .pi-head{padding:12px 16px;background:rgba(255,255,255,.03);border-bottom:1px solid var(--line);font-size:11px;letter-spacing:1.5px;color:var(--accent)}
+  .plugin-install .pi-body{padding:18px;display:flex;flex-direction:column;gap:14px;flex:1}
+  .plugin-install .pi-item{border:1px solid rgba(255,255,255,.06);border-radius:6px;background:rgba(255,255,255,.015);overflow:hidden}
+  .plugin-install .pi-item .pi-label{padding:5px 12px;background:rgba(255,255,255,.025);border-bottom:1px solid rgba(255,255,255,.05);font-size:10.5px;letter-spacing:.5px;color:rgba(255,255,255,.5)}
+  .plugin-install .pi-item .pi-url{display:block;padding:10px 12px;font-size:12px;color:var(--accent);text-decoration:none;line-height:1.5;word-break:break-all}
+  .plugin-install .pi-item .pi-url:hover{text-decoration:underline}
+  .plugin-install .pi-item .pi-cmd{margin:0;padding:10px 12px;font-size:12px;color:#e8e8e8;white-space:pre-wrap;line-height:1.5}
+  .pi-steps{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;padding:8px 12px;font-size:11px;color:rgba(255,255,255,.65)}
+  .pi-steps+.pi-steps{padding-top:0}
+  .pi-step-num{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;background:rgba(232,160,80,.18);color:var(--accent);font-size:7px;font-weight:600;flex-shrink:0}
+  .pi-steps .pi-url{display:block;width:100%;margin-top:4px;padding:0 0 0 24px;font-size:12px;color:var(--accent);text-decoration:none;word-break:break-all}
+  .pi-steps .pi-url:hover{text-decoration:underline}
+  .pi-steps .pi-cmd{width:100%;margin:4px 0 0 24px;font-size:12px;color:#e8e8e8;white-space:pre-wrap;line-height:1.5;font-family:var(--mono)}
+  .pi-item .cp-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 6px 4px 12px;background:rgba(255,255,255,.025);border-bottom:1px solid rgba(255,255,255,.05)}
+  .pi-item .cp-bar .label{font-family:var(--mono);font-size:10.5px;letter-spacing:.5px;color:rgba(255,255,255,.5);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pi-item .cp-btn{opacity:.85}
+  .pi-item:hover .cp-btn{opacity:1}
+  .pi-steps .cp-btn{flex-shrink:0;margin-left:auto}
+  .plugin-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:32px}
+  .plugin-stat{padding:24px 20px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,0));text-align:center;transition:border-color .25s,transform .3s}
+  .plugin-stat:hover{border-color:rgba(232,160,80,.45);transform:translateY(-3px)}
+  .plugin-stat .v{font-family:Inter,sans-serif;font-size:40px;font-weight:600;color:#fff}
+  .plugin-stat .v .suf{font-size:18px;color:var(--accent);margin-left:2px}
+  .plugin-stat .l{margin-top:6px;font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.5);letter-spacing:1.5px;text-transform:uppercase}
   /* ---------- comparison ---------- */
   .compare{padding:60px 30px 100px;background:linear-gradient(180deg,rgba(255,255,255,.015),transparent)}
   .cmp-wrap{width:min(1180px,100%);margin:0 auto}
@@ -262,7 +317,7 @@
   .install-grid{display:grid;grid-template-columns:1.1fr 1fr;gap:32px;align-items:flex-start}
   .install-grid > *{min-width:0}
   .install-block{background:#000;border:1px solid var(--line);border-radius:10px;overflow:hidden}
-  .stepper{display:grid;grid-template-columns:repeat(3,1fr);gap:0;font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.6);letter-spacing:1px;margin-top:24px;border:1px solid var(--line)}
+  .stepper{display:grid;grid-template-columns:repeat(3,1fr);gap:0;font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.6);letter-spacing:1px;margin-top:0;margin-bottom:24px;border:1px solid var(--line)}
   .step{padding:18px 20px;border-right:1px solid var(--line);position:relative}
   .step:last-child{border-right:none}
   .step .n{font-size:24px;color:var(--accent);font-weight:600;font-family:Inter,sans-serif;letter-spacing:-.5px}
@@ -362,6 +417,27 @@
   html.light .vis-drop{color:#c87618;background:rgba(232,160,80,.06);border-color:rgba(200,118,24,.45)}
   html.light .plugin-row .p{background:#fff;border-color:rgba(0,0,0,.10);color:rgba(0,0,0,.7)}
   html.light .plugin-row .p b{color:#0d0d0d}
+  html.light .plugin-feat{border-color:rgba(0,0,0,.10);background:#fff}
+  html.light .plugin-feat:hover{border-color:rgba(200,118,24,.45)}
+  html.light .plugin-feat .icon{background:rgba(200,118,24,.12);color:#c87618}
+  html.light .plugin-feat h3{color:#0d0d0d}
+  html.light .plugin-feat p{color:rgba(0,0,0,.55)}
+  html.light .plugin-install{background:#fff;border-color:rgba(0,0,0,.10)}
+  html.light .plugin-install .pi-head{color:#c87618;background:rgba(0,0,0,.02);border-bottom-color:rgba(0,0,0,.08)}
+  html.light .plugin-install .pi-item{border-color:rgba(0,0,0,.08);background:rgba(0,0,0,.01)}
+  html.light .plugin-install .pi-item .pi-label{background:rgba(0,0,0,.025);border-bottom-color:rgba(0,0,0,.05);color:rgba(0,0,0,.5)}
+  html.light .plugin-install .pi-item .pi-url{color:#c87618}
+  html.light .plugin-install .pi-item .pi-cmd{color:#0d0d0d}
+  html.light .pi-step-num{background:rgba(200,118,24,.12);color:#c87618}
+  html.light .pi-steps{color:rgba(0,0,0,.55)}
+  html.light .pi-steps .pi-url{color:#c87618}
+  html.light .pi-item .cp-bar{background:rgba(0,0,0,.025);border-bottom-color:rgba(0,0,0,.05)}
+  html.light .pi-item .cp-bar .label{color:rgba(0,0,0,.5)}
+  html.light .plugin-stat{border-color:rgba(0,0,0,.10);background:#fff}
+  html.light .plugin-stat:hover{border-color:rgba(200,118,24,.45)}
+  html.light .plugin-stat .v{color:#0d0d0d}
+  html.light .plugin-stat .v .suf{color:#c87618}
+  html.light .plugin-stat .l{color:rgba(0,0,0,.5)}
   html.light .gitcmd .l1{color:#c87618}
   html.light .gitcmd .l2{color:#2e8a4e}
 
@@ -531,6 +607,10 @@
     html.light .mb-drawer a.cp{color:#c87618}
     html.light .mb-drawer a.cta{background:#c87618;color:#fff;border-color:#c87618}
     html.light .mb-drawer a.cta:hover,html.light .mb-drawer a.cta:active{background:#0d0d0d;color:#fff}
+    .plugin-grid{grid-template-columns:1fr}
+    .plugin-features{grid-template-columns:1fr}
+    .plugins{padding:40px 16px 60px}
+    .plugin-stats{grid-template-columns:1fr}
   }
   @media (max-width:380px){
     .install-tabs{flex-direction:column}
@@ -551,16 +631,16 @@
   <a class="hdr-logo" href="#top">
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span data-scramble>AtomCode</span>
-    <span class="ver" id="verBadge" title="当前版本">v4.23.1</span>
+    <span class="ver" id="verBadge" title="当前版本">v4.25.0</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="#features" data-section="features" data-i18n="nav.features">功能</a>
-    <a href="#compare" data-section="compare" data-i18n="nav.compare">对比</a>
+    <a href="#editor-plugins" data-section="editor-plugins" data-i18n="nav.plugins">IDE插件</a>
     <a href="#install" data-section="install" data-i18n="nav.install">安装</a>
     <a href="./docs/index.html" target="_blank" rel="noopener" data-i18n="nav.docs">文档</a>
+    <a href="https://atomcode-plugin.atomgit.com" target="_blank" rel="noopener" data-i18n="nav.marketplace">Skills</a>
     <a class="nav-cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">
-      <span data-i18n="nav.codingplan">CodingPlan</span>
-      <span class="free-badge">FREE</span>
+      <span data-i18n="nav.codingplan">Coding Plan</span>
     </a>
   </nav>
   <div class="hdr-right">
@@ -577,12 +657,12 @@
 <!-- mobile drawer -->
 <nav class="mb-drawer" id="mbDrawer" aria-label="移动端导航">
   <a href="#features" data-i18n="nav.features">功能</a>
-  <a href="#compare" data-i18n="nav.compare">对比</a>
+  <a href="#editor-plugins" data-i18n="nav.plugins">IDE插件</a>
   <a href="#install" data-i18n="nav.install">安装</a>
   <a href="./docs/index.html" target="_blank" rel="noopener" data-i18n="nav.docs">文档</a>
+  <a href="https://atomcode-plugin.atomgit.com" target="_blank" rel="noopener" data-i18n="nav.marketplace">Skills</a>
   <a class="cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">
-    <span data-i18n="nav.codingplan">CodingPlan</span>
-    <span class="free-badge">FREE</span>
+    <span data-i18n="nav.codingplan">Coding Plan</span>
   </a>
   <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="btn.repo">开源仓库</a>
   <a class="cta" href="#install" data-i18n="btn.start.arrow">立即开始 →</a>
@@ -756,10 +836,116 @@
   </div>
 </section>
 
+<!-- editor plugins -->
+<section class="plugins" id="editor-plugins">
+  <div class="section-head">
+    <h2><span class="mono" data-i18n="sec.plug.tag">// 02 · 插件</span><span data-i18n="sec.plug.title">终端之外，在 IDE 里也能用</span></h2>
+    <div class="hint" data-i18n="sec.plug.hint">VS Code 插件已上架 · 终端级 AI 能力无缝接入编辑器</div>
+  </div>
+
+  <div class="plugin-wrap">
+    <div class="plugin-grid">
+
+      <!-- left: feature cards (3x2) -->
+      <div class="plugin-features">
+
+        <article class="plugin-feat">
+          <div class="icon">▣</div>
+          <h3 data-i18n="plug.sidebar.t">侧边栏聊天</h3>
+          <p data-i18n="plug.sidebar.d">在 Activity Bar 中打开 AtomCode 面板，不离开编辑器即可与 AI 对话</p>
+        </article>
+
+        <article class="plugin-feat">
+          <div class="icon">☰</div>
+          <h3 data-i18n="plug.context.t">右键菜单</h3>
+          <p data-i18n="plug.context.d">选中代码 → 右键 Explain / Fix / Optimize / Add to Chat，全语言支持</p>
+        </article>
+
+        <article class="plugin-feat">
+          <div class="icon">⇅</div>
+          <h3 data-i18n="plug.diff.t">Diff 代码预览</h3>
+          <p data-i18n="plug.diff.d">所有代码变更以 VS Code 原生 diff 视图展示，确认后才写入文件</p>
+        </article>
+
+        <article class="plugin-feat">
+          <div class="icon">⚙</div>
+          <h3 data-i18n="plug.model.t">多模型 + Thinking</h3>
+          <p data-i18n="plug.model.d">Claude / OpenAI / DeepSeek / GLM / Qwen / Ollama，支持 thinking 参数配置</p>
+        </article>
+
+        <article class="plugin-feat">
+          <div class="icon">💬</div>
+          <h3 data-i18n="plug.session.t">会话管理</h3>
+          <p data-i18n="plug.session.d">按时间分组的历史会话，支持搜索、重命名、删除、恢复</p>
+        </article>
+
+        <article class="plugin-feat">
+          <div class="icon">★</div>
+          <h3 data-i18n="plug.atomgit.t">AtomGit 集成</h3>
+          <p data-i18n="plug.atomgit.d">OAuth 一键登录，CodingPlan 免费额度，/login /codingplan 命令</p>
+        </article>
+
+      </div>
+
+      <!-- right: install -->
+      <div class="plugin-install">
+          <div class="pi-head">●●● <span data-i18n="plug.install.head">安装 AtomCode for VS Code</span></div>
+          <div class="pi-body">
+            <div class="pi-item">
+              <div class="pi-label" data-i18n="plug.install.mkt"># 从 Marketplace 安装（推荐）</div>
+              <a class="pi-url" href="https://marketplace.visualstudio.com/items?itemName=atomcode-tools.atomcode-tools" target="_blank" rel="noopener">marketplace.visualstudio.com/items?itemName=atomcode-tools.atomcode-tools</a>
+            </div>
+            <div class="pi-item">
+              <div class="cp-bar">
+                <span class="label" data-i18n="plug.install.cmd"># 或通过命令行安装</span>
+                <button class="cp-btn pi-cp" type="button" data-i18n="install.copy.short">📋 复制</button>
+              </div>
+              <pre class="pi-cmd">code --install-extension atomcode-tools.atomcode-tools</pre>
+            </div>
+            <div class="pi-item">
+              <div class="cp-bar">
+                <span class="label" data-i18n="plug.install.vsix"># 或下载 .vsix 手动安装</span>
+              </div>
+              <div class="pi-steps">
+                <span class="pi-step-num">1</span>
+                <span data-i18n="plug.install.download">下载 .vsix 文件</span>
+                <a class="pi-url" href="https://marketplace.visualstudio.com/_apis/public/gallery/publishers/atomcode-tools/vsextensions/atomcode-tools/0.0.8/vspackage" target="_blank" rel="noopener" data-i18n="plug.install.dl-link">点击下载 atomcode-tools-0.0.8.vsix</a>
+              </div>
+              <div class="pi-steps">
+                <span class="pi-step-num">2</span>
+                <span data-i18n="plug.install.run">运行安装命令</span>
+                <button class="cp-btn pi-cp" type="button" data-i18n="install.copy.short">📋 复制</button>
+                <pre class="pi-cmd">code --install-extension atomcode-tools-0.0.8.vsix</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+
+    </div>
+
+    <!-- stats -->
+    <div class="plugin-stats">
+      <div class="plugin-stat">
+        <div class="v">10</div>
+        <div class="l" data-i18n="plug.stat.cmds">内置命令</div>
+      </div>
+      <div class="plugin-stat">
+        <div class="v">8</div>
+        <div class="l" data-i18n="plug.stat.slash">斜杠命令</div>
+      </div>
+      <div class="plugin-stat">
+        <div class="v">1.85<span class="suf">+</span></div>
+        <div class="l" data-i18n="plug.stat.vscode">VS Code 版本</div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
 <!-- comparison -->
 <section class="compare" id="compare">
   <div class="section-head">
-    <h2><span class="mono" data-i18n="sec.cmp.tag">// 02 · 对比</span><span data-i18n="sec.cmp.title">AtomCode 与 Claude Code 对比</span></h2>
+    <h2><span class="mono" data-i18n="sec.cmp.tag">// 03 · 对比</span><span data-i18n="sec.cmp.title">AtomCode 与 Claude Code 对比</span></h2>
     <div class="hint" data-i18n="sec.cmp.hint">相同模型基准测试 · 基于真实编程任务测量</div>
   </div>
 
@@ -817,7 +1003,7 @@
 <!-- install full -->
 <section class="install" id="install">
   <div class="section-head">
-    <h2><span class="mono" data-i18n="sec.inst.tag">// 03 · 安装</span><span data-i18n="sec.inst.title">30 秒快速开始</span></h2>
+    <h2><span class="mono" data-i18n="sec.inst.tag">// 04 · 安装</span><span data-i18n="sec.inst.title">30 秒快速开始</span></h2>
     <div class="hint" data-i18n="sec.inst.hint">一条命令完成安装 · 就这么简单</div>
   </div>
 
@@ -842,6 +1028,11 @@
           </div>
         </div>
 
+        <div class="download-row" id="downloadRow"></div>
+      </div>
+
+      <!-- right: 3 步骤（置顶）+ 首次运行向导 -->
+      <div>
         <div class="stepper" id="stepper">
           <div class="step">
             <div class="ch">›</div>
@@ -861,12 +1052,6 @@
             <div class="d" data-i18n="step3.d">第一次会进 3 步启动向导</div>
           </div>
         </div>
-
-        <div class="download-row" id="downloadRow"></div>
-      </div>
-
-      <!-- right: 3-step wizard -->
-      <div>
         <div class="wiz" id="wiz">
           <div class="wiz-head">
             <span>●●●</span>&nbsp;<span data-i18n="wiz.head">atomcode · 首次运行 — 3 步启动向导</span>
@@ -874,7 +1059,7 @@
           <div class="wiz-body">
             <div class="wiz-step active" data-step="1">
               <div class="tt" data-i18n="wiz.s1.tt">第 1/3 步 · 欢迎</div>
-              <div class="qq" data-i18n="wiz.s1.qq">版本 v4.23.1 · 在终端里运行的 AI 编程代理</div>
+              <div class="qq" data-i18n="wiz.s1.qq">版本 v4.25.0 · 在终端里运行的 AI 编程代理</div>
               <ul class="intro-list">
                 <li data-i18n="wiz.s1.b1">多步骤 agent loop · 内置代码图工具</li>
                 <li data-i18n="wiz.s1.b2">兼容所有 OpenAI 风格 API</li>
@@ -931,14 +1116,16 @@ try{
   else LANG=(navigator.language||'').toLowerCase().startsWith('zh')?'zh':'en';
 }catch(e){}
 
-const VERSION='v4.23.1';
+const VERSION='v4.25.0';
 
 const T={
   'nav.features':{zh:'功能',en:'Features'},
   'nav.compare':{zh:'对比',en:'Compare'},
   'nav.install':{zh:'安装',en:'Install'},
-  'nav.docs':{zh:'文档',en:'Docs'},
-  'nav.codingplan':{zh:'CodingPlan',en:'CodingPlan'},
+'nav.docs':{zh:'文档',en:'Docs'},
+'nav.marketplace':{zh:'Skills',en:'Skills'},
+'nav.plugins':{zh:'IDE插件',en:'IDE Plugins'},
+  'nav.codingplan':{zh:'Coding Plan',en:'Coding Plan'},
   'btn.repo':{zh:'开源仓库',en:'Repository'},
   'btn.start':{zh:'立即开始',en:'Get Started'},
   'btn.start.arrow':{zh:'立即开始 →',en:'Get Started →'},
@@ -972,10 +1159,13 @@ const T={
   'sec.cap.tag':{zh:'// 01 · 能力',en:'// 01 · Capabilities'},
   'sec.cap.title':{zh:'为开发者而生的能力组合',en:'Capabilities built for developers'},
   'sec.cap.hint':{zh:'为需要 Claude Code 强大能力但想用任意大模型的开发者打造',en:'For developers who want Claude Code-level capability with any LLM'},
-  'sec.cmp.tag':{zh:'// 02 · 对比',en:'// 02 · Compare'},
+  'sec.plug.tag':{zh:'// 02 · 插件',en:'// 02 · Plugins'},
+  'sec.plug.title':{zh:'终端之外，在 IDE 里也能用',en:'Beyond the terminal, inside your IDE'},
+  'sec.plug.hint':{zh:'VS Code 插件已上架 · 终端级 AI 能力无缝接入编辑器',en:'VS Code extension available · terminal-grade AI inside your editor'},
+  'sec.cmp.tag':{zh:'// 03 · 对比',en:'// 03 · Compare'},
   'sec.cmp.title':{zh:'AtomCode 与 Claude Code 对比',en:'AtomCode vs Claude Code'},
   'sec.cmp.hint':{zh:'相同模型基准测试 · 基于真实编程任务测量',en:'Same-model benchmarks · measured on real coding tasks'},
-  'sec.inst.tag':{zh:'// 03 · 安装',en:'// 03 · Install'},
+  'sec.inst.tag':{zh:'// 04 · 安装',en:'// 04 · Install'},
   'sec.inst.title':{zh:'30 秒快速开始',en:'30-second quickstart'},
   'sec.inst.hint':{zh:'一条命令完成安装 · 就这么简单',en:'One command. That simple.'},
   'feat.agent.t':{zh:'智能 Agent 循环',en:'Smart Agent Loop'},
@@ -997,6 +1187,29 @@ const T={
   'feat.eco.t':{zh:'Skills + Plugin 生态',en:'Skills + Plugin Ecosystem'},
   'feat.eco.d':{zh:'Skills 写你自己的斜杠命令；/plugin install <git-repo> 一键拿别人的命令、hook、skill —— 与 Claude Code 生态兼容。',
                 en:'Write your own slash commands as Skills; /plugin install <git-repo> grabs packs of commands, hooks, skills — Claude Code ecosystem compatible.'},
+  'plug.sidebar.t':{zh:'侧边栏聊天',en:'Sidebar Chat'},
+  'plug.sidebar.d':{zh:'在 Activity Bar 中打开 AtomCode 面板，不离开编辑器即可与 AI 对话',en:'Open AtomCode in the Activity Bar and chat with AI without leaving the editor'},
+  'plug.context.t':{zh:'右键菜单',en:'Context Menu'},
+  'plug.context.d':{zh:'选中代码 → 右键 Explain / Fix / Optimize / Add to Chat，全语言支持',en:'Select code → right-click Explain / Fix / Optimize / Add to Chat, all languages'},
+  'plug.diff.t':{zh:'Diff 代码预览',en:'Diff Preview'},
+  'plug.diff.d':{zh:'所有代码变更以 VS Code 原生 diff 视图展示，确认后才写入文件',en:'All code changes shown as VS Code native diffs, written only after approval'},
+  'plug.model.t':{zh:'多模型 + Thinking',en:'Multi-Model + Thinking'},
+  'plug.model.d':{zh:'Claude / OpenAI / DeepSeek / GLM / Qwen / Ollama，支持 thinking 参数配置',en:'Claude / OpenAI / DeepSeek / GLM / Qwen / Ollama, with thinking parameter support'},
+  'plug.session.t':{zh:'会话管理',en:'Session Management'},
+  'plug.session.d':{zh:'按时间分组的历史会话，支持搜索、重命名、删除、恢复',en:'Time-grouped session history with search, rename, delete, and restore'},
+  'plug.atomgit.t':{zh:'AtomGit 集成',en:'AtomGit Integration'},
+  'plug.atomgit.d':{zh:'OAuth 一键登录，CodingPlan 免费额度，/login /codingplan 命令',en:'OAuth one-click login, CodingPlan free tier, /login /codingplan commands'},
+  'plug.install.head':{zh:'安装 AtomCode for VS Code',en:'Install AtomCode for VS Code'},
+  'plug.install.mkt':{zh:'# 从 Marketplace 安装（推荐）',en:'# Install from Marketplace (recommended)'},
+  'plug.install.cmd':{zh:'# 或通过命令行安装',en:'# Or install via command line'},
+  'plug.install.vsix':{zh:'# 或下载 .vsix 手动安装',en:'# Or download .vsix to install manually'},
+  'plug.install.download':{zh:'下载 .vsix 文件',en:'Download .vsix file'},
+  'plug.install.dl-link':{zh:'点击下载 atomcode-tools-0.0.8.vsix',en:'Download atomcode-tools-0.0.8.vsix'},
+  'plug.install.run':{zh:'运行安装命令',en:'Run install command'},
+
+  'plug.stat.cmds':{zh:'内置命令',en:'Built-in Commands'},
+  'plug.stat.slash':{zh:'斜杠命令',en:'Slash Commands'},
+  'plug.stat.vscode':{zh:'VS Code 版本',en:'VS Code Version'},
   'plugin.review':{zh:'代码审阅',en:'Code review'},
   'plugin.test':{zh:'跑测试',en:'Run tests'},
   'plugin.security':{zh:'安全审查',en:'Security audit'},
@@ -1085,16 +1298,29 @@ function applyI18n(){
 
 /* ========== data ========== */
 const RELEASE_BASE='https://atomgit.com/atomgit_atomcode/atomcode/releases/download/'+VERSION;
+// Install scripts are served version-free from the repo (raw host); the scripts
+// auto-detect the latest release themselves, so no version is pinned in the URL.
+const SCRIPT_BASE='https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts';
+const INVITE_PARAM=new URLSearchParams(window.location.search).get('invite')||'';
+const INVITE_CODE=/^[A-Za-z0-9]{8}$/.test(INVITE_PARAM)?INVITE_PARAM:'';
+function unixInstallCmd(){
+  return `curl -fsSL ${SCRIPT_BASE}/install.sh | sh${INVITE_CODE?` -s -- --invite=${INVITE_CODE}`:''}`;
+}
+function winInstallCmd(){
+  return INVITE_CODE
+    ? `$env:ATOMCODE_INVITE='${INVITE_CODE}'; irm ${SCRIPT_BASE}/install.ps1 | iex`
+    : `irm ${SCRIPT_BASE}/install.ps1 | iex`;
+}
 const OS_CMDS={
-  mac:`curl -fsSL ${RELEASE_BASE}/install.sh | sh`,
-  linux:`curl -fsSL ${RELEASE_BASE}/install.sh | sh`,
-  win:`irm ${RELEASE_BASE}/install.ps1 | iex`,
-  harmony:`curl -fsSL ${RELEASE_BASE}/install.sh | sh`,
+  mac:unixInstallCmd(),
+  linux:unixInstallCmd(),
+  win:winInstallCmd(),
+  harmony:unixInstallCmd(),
 };
 function osHint(os){return t('os.'+os);}
 const METHOD_CMDS={
-  oneclick:{zh:`# macOS / Linux / HarmonyOS PC\ncurl -fsSL ${RELEASE_BASE}/install.sh | sh\n\n# Windows · PowerShell\nirm ${RELEASE_BASE}/install.ps1 | iex`,
-            en:`# macOS / Linux / HarmonyOS PC\ncurl -fsSL ${RELEASE_BASE}/install.sh | sh\n\n# Windows · PowerShell\nirm ${RELEASE_BASE}/install.ps1 | iex`},
+  oneclick:{zh:`# macOS / Linux / HarmonyOS PC\n${unixInstallCmd()}\n\n# Windows · PowerShell\n${winInstallCmd()}`,
+            en:`# macOS / Linux / HarmonyOS PC\n${unixInstallCmd()}\n\n# Windows · PowerShell\n${winInstallCmd()}`},
   source:{zh:`# 需要 Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # 验证安装`,
           en:`# Requires Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # verify install`},
   binary:{zh:`# 从 Releases 页面下载\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# 或直接 curl 取对应平台\ncurl -L -o atomcode \\\n  ${RELEASE_BASE}/atomcode-${VERSION}-darwin-arm64\nchmod +x atomcode && mv atomcode /usr/local/bin/`,
@@ -1180,6 +1406,35 @@ const FEAT=[
   {cat:'price',     catL:{zh:'价格',en:'Price'},   f:{zh:'费用',en:'Pricing'},              a:{zh:'CodingPlan 限免 · 自带 API',en:'CodingPlan free tier · BYO API'}, c:{zh:'订阅 + API',en:'Subscription + API'}, win:'a'},
 ];
 
+/* ========== robust clipboard copy ========== */
+/* The async Clipboard API only exists in a secure context (https / localhost).
+   HarmonyOS ArkWeb, plain http:// pages, and some embedded browsers don't
+   expose `navigator.clipboard`, so the old `navigator.clipboard && writeText`
+   silently no-opped while the UI still flashed "✓ Copied" — paste yielded
+   nothing. Fall back to a hidden <textarea> + execCommand so copy works there. */
+function legacyCopy(text){
+  try{
+    const ta=document.createElement('textarea');
+    ta.value=text;
+    ta.setAttribute('readonly','');
+    ta.style.position='fixed';
+    ta.style.left='-9999px';
+    ta.style.top='0';
+    document.body.appendChild(ta);
+    ta.focus();ta.select();
+    try{ta.setSelectionRange(0,text.length);}catch(e){}
+    const ok=document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  }catch(e){return false;}
+}
+function copyText(text){
+  if(navigator.clipboard&&window.isSecureContext){
+    return navigator.clipboard.writeText(text).catch(()=>legacyCopy(text));
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+
 /* ========== hero install — auto-detect OS ========== */
 let HERO_AUTO=true,HERO_OS='mac';
 (function(){
@@ -1189,9 +1444,13 @@ let HERO_AUTO=true,HERO_OS='mac';
   const toast=document.getElementById('toast');
   function detect(){
     const ua=navigator.userAgent||'';
-    if(/Win/.test(ua)) return 'win';
-    if(/Mac/.test(ua)) return 'mac';
-    if(/Harmony|OpenHarmony/i.test(ua)) return 'harmony';
+    // HarmonyOS FIRST: its ArkWeb-based browser sends a UA that also carries a
+    // Windows/Chromium compat token, so testing /Win/ first misdetects ohos as
+    // Windows. Match the HarmonyOS-specific tokens (incl. the ArkWeb engine)
+    // before the looser Win/Mac checks.
+    if(/OpenHarmony|HarmonyOS|Harmony|ArkWeb/i.test(ua)) return 'harmony';
+    if(/Mac/i.test(ua)) return 'mac';
+    if(/Win/i.test(ua)) return 'win';
     return 'linux';
   }
   function highlight(text){
@@ -1208,7 +1467,7 @@ let HERO_AUTO=true,HERO_OS='mac';
   HERO_OS=detect();HERO_AUTO=true;applyHeroInstall();
   tabs.addEventListener('click',e=>{const tb=e.target.closest('.install-tab');if(!tb)return;HERO_OS=tb.dataset.os;HERO_AUTO=false;applyHeroInstall();});
   document.getElementById('copyInstall').addEventListener('click',()=>{
-    navigator.clipboard&&navigator.clipboard.writeText(OS_CMDS[HERO_OS]).catch(()=>{});
+    copyText(OS_CMDS[HERO_OS]);
     const btn=document.getElementById('copyInstall');btn.classList.add('copied');btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
     toast.textContent=t('toast.install.copied');toast.classList.add('show');
     setTimeout(()=>{toast.classList.remove('show')},1800);
@@ -1443,13 +1702,31 @@ window.applyWizardNav=null;
     const btn=e.target.closest('.cp-section');
     if(!btn)return;
     const text=btn.__copy||'';
-    if(navigator.clipboard)navigator.clipboard.writeText(text).catch(()=>{});
+    copyText(text);
     btn.classList.add('copied');
     btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
     toast.textContent=t('toast.copied');toast.classList.add('show');
     setTimeout(()=>{toast.classList.remove('show')},1600);
     setTimeout(()=>{btn.classList.remove('copied');btn.textContent=t('install.copy.short')},1600);
   });
+
+  // Plugin install copy buttons — delegated click on .pi-cp
+  (function(){
+    const toast=document.getElementById('toast');
+    document.addEventListener('click',e=>{
+      const btn=e.target.closest('.pi-cp');
+      if(!btn)return;
+      const pre=btn.closest('.pi-item, .pi-steps')?.querySelector('pre');
+      if(!pre)return;
+      const text=pre.textContent||'';
+      copyText(text);
+      btn.classList.add('copied');
+      btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
+      toast.textContent=t('toast.copied');toast.classList.add('show');
+      setTimeout(()=>{toast.classList.remove('show')},1600);
+      setTimeout(()=>{btn.classList.remove('copied');btn.textContent=t('install.copy.short')},1600);
+    });
+  })();
 
   // downloads — actual release URLs
   document.getElementById('downloadRow').innerHTML=DOWNLOADS.map(d=>`
@@ -1490,7 +1767,7 @@ window.applyWizardNav=null;
 /* ========== scroll progress + header scrolled + active nav ========== */
 (function(){
   const bar=document.getElementById('progressBar'),hdr=document.getElementById('hdr');
-  const sections=['features','compare','install'];
+  const sections=['features','editor-plugins','compare','install'];
   function tick(){
     const max=Math.max(1,document.documentElement.scrollHeight-innerHeight);
     bar.style.width=(scrollY/max*100).toFixed(2)+'%';

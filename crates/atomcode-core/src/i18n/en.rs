@@ -14,9 +14,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeOptionSkip => "Skip for now".into(),
         Msg::WelcomeOptionSkipHint => "explore first".into(),
 
-        // ── /codingplan ──
+        // ── /login (full setup flow) ──
         Msg::CodingPlanSetupFailed { error } =>
-            format!("codingplan setup failed: {error}").into(),
+            format!("/login setup failed: {error}").into(),
         Msg::CpReauthAfter401 =>
             "  ⚠ Stored login expired — re-authenticating...\n".into(),
         Msg::ChatAuthExpired =>
@@ -28,20 +28,22 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpStepSkipped { reason } =>
             format!("  ✓ {}\n", reason).into(),
         Msg::CpLoginFailed { error } =>
-            format!("  ✗ Login failed — {}\n", error).into(),
+            format!("  × Login failed — {}\n", error).into(),
         Msg::CpClaimed { message, plan_type } =>
             format!("  ✓ CodingPlan claimed — {} (CodingPlan {})\n", message, plan_type).into(),
         Msg::CpClaimSuccessFallback => "success".into(),
         Msg::CpAlreadyClaimed { reason } =>
             format!("  ✓ CodingPlan already claimed — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  ✗ CodingPlan claim failed — {}\n", error).into(),
+            format!("  × CodingPlan tier setup failed — {}\n", error).into(),
+        Msg::CpClaimFailedBare =>
+            "  × CodingPlan tier setup failed\n".into(),
         Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✓ CodingPlan {} claimed\n", tier).into(),
+            format!("  ✓ CodingPlan {} active\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✓ CodingPlan {} already claimed\n", tier).into(),
+            format!("  ✓ CodingPlan {} active\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  ✗ CodingPlan {} claim failed — {}\n", tier, reason).into(),
+            format!("  × CodingPlan {} tier setup failed — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s } =>
             format!("  ✓ Added {} provider{}:\n", count, plural_s).into(),
         Msg::CpLocked { name } =>
@@ -50,11 +52,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             // theme palette decides the exact shade — Solarized,
             // Dracula, light-mode, etc. all map this onto their
             // own "red" rather than a hard-coded RGB the user can't
-            // tune. The `✗ … (requires Pro plan or higher)` text inside is
+            // tune. The `× … (requires Pro plan or higher)` text inside is
             // a redundant signal so retained-mode terminals (which
             // strip SGR via the strict sanitizer path) still get
             // the meaning, just without the colour.
-            format!("      \x1b[31m✗ {}  (requires Pro plan or higher)\x1b[39m\n", name).into(),
+            format!("      \x1b[31m× {}  (requires Pro plan or higher)\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  (default)".into(),
@@ -67,7 +69,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpModelsSkipped { reason } =>
             format!("  ✓ Models step skipped — {}\n", reason).into(),
         Msg::CpModelsFailed { error } =>
-            format!("  ✗ Models step failed — {}\n", error).into(),
+            format!("  × Models step failed — {}\n", error).into(),
         Msg::CpStatusHeader =>
             "  ✓ CodingPlan status:\n".into(),
         Msg::CpPlanPending { plan } =>
@@ -79,6 +81,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::CpUsageLine { usage, reset_at, duration } =>
             format!("      Usage: {}  ·  resets {} (in {})\n", usage, reset_at, duration).into(),
+        Msg::CpMonthlyQuotaExhausted { duration } =>
+            format!("      Usage: monthly quota exhausted, available again in {}\n", duration).into(),
         Msg::CpWindowQuotaExhausted =>
             "      ⚠ Current window quota exhausted\n".into(),
         Msg::CpWindowQuotaHint { hint } =>
@@ -92,7 +96,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
              https://atomgit.com/atomgit_atomcode/atomcode/releases.",
         ),
         Msg::CpAuthRequired => Cow::Borrowed(
-            "Not signed in to AtomCode CodingPlan. Run /codingplan to log in \
+            "Not signed in to AtomCode CodingPlan. Run /login to sign in \
              before sending a request.",
         ),
         Msg::CpSignStaleClockSkew => Cow::Borrowed(
@@ -117,14 +121,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── Status bar ──
         Msg::StatusNoProvider =>
             "no provider · /provider to configure".into(),
+        Msg::StatusOfficialBuildRequired =>
+            "CodingPlan needs the official build".into(),
         Msg::StatusUpgradeHint { version } =>
             format!("↑ {version} available · /upgrade").into(),
+        Msg::StatusUpgradeHintPm { version } =>
+            format!("↑ {version} available · brew upgrade atomcode").into(),
         Msg::StatusModelNotConfigured =>
             "(not configured)".into(),
         Msg::StatusClipboardImageHint =>
             "Image in clipboard · ctrl+v to paste".into(),
         Msg::StatusClipboardImageHintSlash =>
             "Image in clipboard · /paste".into(),
+        Msg::StatusWebuiHint =>
+            "Tips: Use /webui to open AtomCode in your browser".into(),
 
         // ── /status command body ──
         Msg::StatusBody { model, dir, config, tokens } =>
@@ -133,18 +143,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 model, dir, config, tokens,
             ).into(),
         Msg::StatusCpNotSignedIn =>
-            "  CodingPlan: (not signed in — run /codingplan to set up)\n".into(),
+            "  CodingPlan: (not signed in — run /login to set up)\n".into(),
         Msg::StatusCpFetchFailed { error } =>
             format!("  CodingPlan: (status fetch failed — {})\n", error).into(),
         Msg::StatusCpNoActive =>
-            "  CodingPlan: (no active plan — run /codingplan)\n".into(),
+            "  CodingPlan: (no active plan — run /login)\n".into(),
         Msg::StatusCpLine { plan, expires_at, remaining_days, total_days } =>
             format!(
                 "  CodingPlan: {}  ·  expires {} ({}d/{}d)\n",
                 plan, expires_at, remaining_days, total_days,
             ).into(),
-        Msg::StatusCpUsage { usage, reset_at, seconds } =>
-            format!("  Usage: {}  ·  resets {} (in {}s)\n", usage, reset_at, seconds).into(),
+        Msg::StatusCpUsage { usage, reset_at, duration } =>
+            format!("  Usage: {}  ·  resets {} (in {})\n", usage, reset_at, duration).into(),
+        Msg::StatusCpMonthlyExhausted { duration } =>
+            format!("  ⚠ Monthly quota exhausted, available again in {}\n", duration).into(),
         Msg::StatusCpWindowExhausted =>
             "  ⚠ Current window quota exhausted\n".into(),
         Msg::StatusCpWindowHint { hint } =>
@@ -154,14 +166,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusInstructionPresent { path, label } =>
             format!("    ✓ {} ({})\n", path, label).into(),
         Msg::StatusInstructionMissing { label } =>
-            format!("    ✗ {} — not found\n", label).into(),
-
-        // ── /login completion ──
-        Msg::LoginSignedInWithCpHint { name, username } =>
-            format!(
-                "  Signed in as {} ({}). You can chat now; run /codingplan to sync the latest model access.\n",
-                name, username,
-            ).into(),
+            format!("    × {} — not found\n", label).into(),
 
         // ── Help ──
         Msg::HelpAvailableCommands =>
@@ -188,6 +193,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
   ── History ──
     Up                               Previous input
     Down                             Next input
+
+  ── Scrollback ──
+    Use the host terminal's native scrollback (cmd+↑/↓, mouse wheel,
+    tmux copy-mode — whatever your terminal already provides).
+    Drag + Ctrl+C                    Copy text (atomcode does not capture the mouse)
 
   ── Session ──
     Ctrl+C                           Cancel current turn / dismiss modal
@@ -228,6 +238,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderMenuDeleteDesc => "Remove a provider".into(),
         Msg::ProviderMenuSetDefault => "set-default".into(),
         Msg::ProviderMenuSetDefaultDesc => "Switch the default provider".into(),
+        Msg::ProviderImportPrompt =>
+            "Paste a template to auto-detect (curl / JSON / TOML), or Enter to fill manually:".into(),
+        Msg::ProviderImportParsed { base_url, type_name, model } =>
+            format!("Detected: {base_url} · {type_name} · {model}").into(),
+        Msg::ProviderImportFailed =>
+            "Not recognized as a template. Paste curl / JSON / TOML, or Enter to fill manually.".into(),
         Msg::ProviderNoProviders =>
             "No providers configured yet.".into(),
         Msg::ProviderDeleteConfirm { name } =>
@@ -246,7 +262,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepTypeWithHint { current } =>
             format!("Type? [{current}] (openai / claude / ollama, blank to keep)").into(),
         Msg::ProviderStepBaseUrl =>
-            "Base URL? (blank to use provider default)".into(),
+            "Base URL? (e.g. https://api.deepseek.com/v1)".into(),
         Msg::ProviderStepBaseUrlWithHint { current } =>
             format!("Base URL? [{current}] (blank to keep)").into(),
         Msg::ProviderDefaultHint => "provider default".into(),
@@ -260,12 +276,19 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepModelWithHint { current } =>
             format!("Model? [{current}] (blank to keep)").into(),
         Msg::ProviderNameEmpty => "Name cannot be empty.".into(),
+        Msg::ProviderBaseUrlEmpty => "Base URL cannot be empty.".into(),
         Msg::ProviderUnknownType =>
             "Unknown type. Choose openai / claude / ollama.".into(),
         Msg::ProviderUnknownTypeEdit =>
             "Unknown type. Choose openai / claude / ollama or leave blank.".into(),
         Msg::ProviderModelEmpty => "Model cannot be empty.".into(),
         Msg::ProviderEditKeep => "(keep)".into(),
+        Msg::ProviderTypeInferred { type_name } =>
+            format!("Detected type: {type_name}").into(),
+        Msg::ProviderStepNameDefault { default } =>
+            format!("Provider name? [{default}] (blank to use this)").into(),
+        Msg::ProviderStepProgress { current, total } =>
+            format!("({current}/{total})").into(),
 
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
@@ -296,6 +319,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Failed to save session: {error}. The name was not persisted.").into(),
         Msg::SessionNoneSelected =>
             "No session selected".into(),
+        Msg::SessionDeleted { name } =>
+            format!("\"{name}\" deleted").into(),
+        Msg::SessionDeleteConfirm { name } =>
+            format!("Press Ctrl+D again to delete \"{name}\"").into(),
+        Msg::SessionDeleteFailed { error } =>
+            format!("Failed to delete session: {error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: confirm, Esc: cancel]").into(),
 
@@ -321,7 +350,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueCreated { number, title, url } =>
             format!("  [issue] ✓ created #{number}: {title}\n  {url}\n").into(),
         Msg::IssueCreateFailed { error } =>
-            format!("  [issue] ✗ create failed: {error}\n").into(),
+            format!("  [issue] × create failed: {error}\n").into(),
         Msg::IssueRequiredField { field } =>
             format!("(required — type a {field} or Esc to cancel)").into(),
 
@@ -342,11 +371,16 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "to add a custom model".into(),
         Msg::IdleHintProviderFull =>
             "/provider  to add a custom model".into(),
-        Msg::IdleHintCodingplan => "/codingplan".into(),
+        Msg::IdleHintCodingplan => "/login".into(),
         Msg::IdleHintCodingplanSuffix =>
             "to claim a free token quota".into(),
         Msg::IdleHintCodingplanFull =>
-            "/codingplan  to claim a free token quota".into(),
+            "/login  to claim a free token quota".into(),
+        Msg::IdleHintWebui => "/webui".into(),
+        Msg::IdleHintWebuiSuffix =>
+            "open a synced session in the browser".into(),
+        Msg::IdleHintWebuiFull =>
+            "/webui  open a synced session in the browser".into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>
@@ -375,6 +409,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("reload failed: {error} (kept previous config)").into(),
         Msg::CmdUndoNotSupported =>
             "  Undo is not yet supported.\n".into(),
+        Msg::CmdUndoDone { target, last } =>
+            format!("  ↩ Rolled back to before turn {target} (removed turns {target}–{last}). Your prompt is back in the input box.\n").into(),
+        Msg::CmdUndoDiskWarning =>
+            "  ⚠ Only conversation memory was rolled back — files on disk were NOT restored. Use /diff to review.\n".into(),
+        Msg::CmdUndoNoTurns =>
+            "  Nothing to undo (no prompts yet).\n".into(),
+        Msg::CmdUndoOutOfRange { requested, available } =>
+            format!("  Invalid turn {requested} (conversation has {available} turn(s)).\n").into(),
+        Msg::CmdUndoBusy =>
+            "  Can't undo while the agent is working — press Esc to cancel first.\n".into(),
+        Msg::CmdUndoBadArg =>
+            "  Usage: /undo  or  /undo N  (N = turn number).\n".into(),
         Msg::CmdNoChanges =>
             "  (no changes)\n".into(),
         Msg::CmdCheckingUpdate =>
@@ -424,23 +470,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
         Msg::KbdHintOther =>
             "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
-
-        // ── JediTerm / conhost fallback ──
-        Msg::JediTermFallback =>
-            "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs;\n    \
-            on exit your host terminal restores its pre-atomcode state.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
-            ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n".into(),
-        Msg::LegacyConhostFallback =>
-            "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs.\n    \
-            For full host-terminal scrollback support, install Windows Terminal\n    \
-            (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
-            bypass this fallback (may show duplicated content on scroll).\n\n".into(),
 
         // ── Background task ──
         Msg::BackgroundComplete { turns } =>
@@ -509,6 +538,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("git diff failed: {}", error).into(),
 
         // ── /upgrade ──
+        Msg::UpgradePackageManaged =>
+            "This build is managed by HarmonyBrew. Run `brew upgrade atomcode` to upgrade.".into(),
         Msg::UpgradeUnknownArg { arg } =>
             format!("unknown /upgrade argument: {}\n  usage: /upgrade [rollback|--force]", arg).into(),
 
@@ -568,11 +599,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpServerConnected { name } =>
             format!("✓ MCP server '{name}' connected").into(),
         Msg::McpServerFailed { name, error } =>
-            format!("✗ MCP server '{name}' failed: {error}").into(),
+            format!("× MCP server '{name}' failed: {error}").into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP server '{name}' started for .{ext}").into(),
         Msg::LspServerFailed { name, ext, error } =>
-            format!("✗ LSP server '{name}' for .{ext} failed: {error}").into(),
+            format!("× LSP server '{name}' for .{ext} failed: {error}").into(),
 
         // ── /worktree ──
         Msg::WorktreeUsage =>
@@ -633,9 +664,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SetupSkippedRow { kind, slug, reason } =>
             format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
         Msg::SetupFailedRow { kind, slug, error } =>
-            format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+            format!("  × {}:{} — {}\n", kind, slug, error).into(),
         Msg::CmdSetupTip =>
-            "\u{1f4a1} Tip: Run \x1b[1;96m/setup\x1b[0m to auto-configure hooks, skills, and MCP for this project.".into(),
+            // No leading emoji: U+1F4A1 has terminal/font-dependent display
+            // width (1 vs 2 cells), which desynced this line's cell layout
+            // on some terminals (garbled "TTip:RRun…" over SSH). ASCII-only
+            // prefix keeps the width unambiguous.
+            "Tip: Run \x1b[1;96m/setup\x1b[0m to auto-configure hooks, skills, and MCP for this project.".into(),
         Msg::CmdSetupRunning =>
             "Running atomcode setup...".into(),
         Msg::CmdSetupSkillsReloaded { count } =>
@@ -649,13 +684,21 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── /plugin ──
         Msg::PluginUsage =>
-            "usage: /plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]".into(),
+            "usage: /plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | reload | list]".into(),
         Msg::PluginMarketplaceUsage =>
             "usage: /plugin marketplace [add|remove|update|list] <args>".into(),
         Msg::PluginInstallUsage =>
-            "usage: /plugin install <plugin>@<marketplace>".into(),
+            "usage: /plugin install <plugin> or <plugin>@<marketplace>".into(),
+        Msg::PluginInstallNotFound { plugin } =>
+            format!("plugin `{plugin}` not found in any marketplace. Use /plugin marketplace list to see registered marketplaces.").into(),
+        Msg::PluginInstallAmbiguous { plugin } =>
+            format!("plugin `{plugin}` exists in multiple marketplaces, please specify one:").into(),
         Msg::PluginUninstallUsage =>
-            "usage: /plugin uninstall <plugin>@<marketplace>".into(),
+            "usage: /plugin uninstall <plugin> or <plugin>@<marketplace>".into(),
+        Msg::PluginUninstallNotFound { plugin } =>
+            format!("plugin `{plugin}` is not installed. Use /plugin list to see installed plugins.").into(),
+        Msg::PluginUninstallAmbiguous { plugin } =>
+            format!("plugin `{plugin}` is installed from multiple marketplaces, please specify:\n").into(),
         Msg::PluginNoMarketplaces =>
             "no marketplaces registered".into(),
         Msg::PluginMarketplacesHeader =>
@@ -676,21 +719,63 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list marketplaces: {error}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),
+        Msg::PluginInstallingByName { plugin } =>
+            format!("installing `{plugin}`…").into(),
+        Msg::PluginAlreadyInstalled { id } =>
+            format!("  plugin `{id}` is already installed.\n  PS: To reinstall, first run `/plugin uninstall {id}` then `/plugin install {id}`\n").into(),
+        Msg::PluginMgrBrowse => "Browse & install".into(),
+        Msg::PluginMgrAdd => "Add marketplace…".into(),
+        Msg::PluginMgrRemove => "Remove marketplace…".into(),
+        Msg::PluginMgrInstalled { count } => format!("Installed ({count})").into(),
+        Msg::PluginMgrInstalledMark => "✓ installed".into(),
+        Msg::PluginMgrHintNav => "↑/↓ select · ⏎ open · esc back".into(),
+        Msg::PluginMgrHintToggle => "⏎ install/uninstall · esc back".into(),
+        Msg::PluginMgrHintRemove => "⏎ remove · esc back".into(),
+        Msg::PluginMgrHintUninstall => "⏎ uninstall · esc back".into(),
+        Msg::PluginMgrHintUrl => "type/paste git URL · ⏎ add · esc cancel".into(),
+Msg::PluginMgrHintPending => "Installing, please wait… · esc back".into(),
+Msg::PluginMgrInstallingLabel => "Installing…".into(),
+        Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…” · esc back".into(),
+        Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace · esc back".into(),
+        Msg::PluginMgrEmptyInstalled => "No plugins installed · esc back".into(),
+        Msg::PluginMgrCloning => "Cloning marketplace…".into(),
+        Msg::PluginMgrInstalling { plugin } => format!("Installing {plugin}…").into(),
+        Msg::PluginMgrEscToCancel => "Esc to cancel".into(),
+        Msg::PluginScopeUser => "Install for you (user scope)".into(),
+        Msg::PluginScopeUserDesc => "~/.atomcode/plugins — all projects".into(),
+        Msg::PluginScopeProject => "Install for all collaborators (project scope)".into(),
+        Msg::PluginScopeProjectDesc => ".atomcode/plugins — shared via git".into(),
+        Msg::PluginScopeLocal => "Install for you, in this repo only (local scope)".into(),
+        Msg::PluginScopeLocalDesc => ".atomcode/plugins/local — not committed".into(),
+        Msg::PluginScopeHint => "↑↓ Select scope · Enter confirm · Esc back".into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("uninstalled `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
             format!("uninstall: {error}").into(),
         Msg::PluginListFailed { error } =>
             format!("list plugins: {error}").into(),
+        Msg::PluginReloadDone { skills, warnings } =>
+            format!("Plugins reloaded: {skills} skill(s), {warnings} warning(s)").into(),
+        Msg::PluginGitNotFound =>
+            "💡 git is not installed or not on PATH. Plugin marketplace auto-install and auto-update are disabled. Install git (e.g. `xcode-select --install` on macOS, `sudo apt install git` on Ubuntu) and restart AtomCode.".into(),
+        Msg::PluginMarketplaceAdded { name, commit, count } =>
+            format!("✓ marketplace `{name}` added at {commit} ({count} plugins)").into(),
+        Msg::PluginMarketplaceUpdated { name, commit } =>
+            format!("✓ marketplace `{name}` updated to {commit}").into(),
+        Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
+            let hint = if show_details_hint { "  (Ctrl+O for details)" } else { "" };
+            format!("✓ installed `{plugin}@{marketplace}` — {loaded} skills loaded, {skipped} skipped{hint}").into()
+        }
+        Msg::SetupAutoReloaded { skills, warnings } =>
+            format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),
 
         // ── Command descriptions ──
+        Msg::CmdDescWebui => "Launch the browser webui (subcommands: stop, lan, --host <addr>)".into(),
 Msg::CmdDescSetup =>
 "Scan project, install seeds, and run setup skill [hooks|mcp|skills|all]".into(),
-        Msg::CmdDescCodingplan =>
-            "Claim CodingPlan + set up models from the plan's model list".into(),
         Msg::CmdDescResume => "Resume a previous session".into(),
         Msg::CmdDescRename => "Rename current session".into(),
-        Msg::CmdDescLogin => "Sign in with AtomGit OAuth".into(),
+        Msg::CmdDescLogin => "Sign in with AtomGit OAuth and claim CodingPlan models".into(),
         Msg::CmdDescLogout => "Sign out of AtomGit".into(),
         Msg::CmdDescWhoami => "Show current logged-in user".into(),
         Msg::CmdDescModel => "Switch provider / model".into(),
@@ -712,21 +797,50 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescForget => "Remove matching memories".into(),
         Msg::CmdDescMemory => "Show all saved memories".into(),
         Msg::CmdDescMcp => "Show MCP server status (subcommand: reload)".into(),
-        Msg::CmdDescUndo => "Undo last change (not yet supported)".into(),
+        Msg::CmdDescUndo => "Undo: roll conversation memory back a turn (/undo or /undo N)".into(),
         Msg::CmdDescWorktree => "Git worktree isolation (create/list/done/cleanup)".into(),
         Msg::CmdDescUpgrade => "Upgrade atomcode to latest (subcommand: rollback)".into(),
         Msg::CmdDescIssue => "Report a bug / request a feature for AtomCode itself (interactive wizard)".into(),
         Msg::CmdDescPlan => "Switch to Plan mode (read-only exploration)".into(),
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
+        Msg::CmdDescEffort => "DeepSeek reasoning effort control (high / max / off)".into(),
         Msg::CmdDescHelp => "Show this help".into(),
         Msg::CmdDescKeys => "Show keyboard shortcuts".into(),
         Msg::CmdDescLanguage => "Switch display language".into(),
         Msg::CmdDescQuit => "Exit AtomCode".into(),
         Msg::CmdDescSkills => "Browse loaded skills".into(),
-        Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, list)".into(),
+        Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
+        Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
+        Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
+        Msg::GuideMenuTopics => "Common topics:".into(),
+        Msg::GuideMenuGettingStarted => "Getting started          First install, login, config".into(),
+        Msg::GuideMenuSwitchModel => "Switch models            /model /provider usage".into(),
+        Msg::GuideMenuMcp => "Using MCP                MCP server config & management".into(),
+        Msg::GuideMenuSkills => "Skills and plugins       /skills /plugin usage".into(),
+        Msg::GuideMenuMemory => "Memory feature           /remember /forget /memory".into(),
+        Msg::GuideMenuBackground => "Background tasks         /bg background execution".into(),
+        Msg::GuideMenuContext => "Context management       /compact /context /cost".into(),
+        Msg::GuideMenuKeybindings => "Keyboard shortcuts       Keyboard shortcut reference".into(),
+        Msg::GuideMenuConfig => "Configuration            config.toml reference".into(),
+        Msg::GuideMenuTip => "
+  Tip: type /guide <your question> for a specific answer.
+  Example: /guide How to switch models
+".into(),
+        Msg::GuideMenuDocUrl => "  Full docs: https://atomcode.atomgit.com/docs/en/".into(),
+        Msg::CmdGuideInstalling => "Installing ask skill, please wait...".into(),
+        Msg::CmdGuideAutoInstall => "ask skill not installed — auto-installing atomcode@atomcode-skills...".into(),
+        Msg::CmdGuideAutoInvoke { topic } =>
+            format!("ask skill installed, now answering: {}", topic).into(),
+        Msg::CmdGuideSkillNotFound =>
+            "Installation complete but ask skill not found — run /plugin reload and try again".into(),
+        Msg::CmdGuideInstallFailed { error } =>
+            format!("ask skill install failed: {}. Run /plugin install atomcode@atomcode-skills manually", error).into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
+
+        // ── reasoning effort ──
+        Msg::ReasoningEffortNoEffect => "reasoning_effort has no effect on the current model (only DeepSeek V4)".into(),
 
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>
@@ -767,6 +881,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("✓ VL recognised image, returned {char_count} chars").into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
             format!("✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {total_tokens} tokens").into(),
+        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
+            format!("✗ Stopped · {turn_count} rounds · {tool_call_count} tools · {duration} · {total_tokens} tokens").into(),
         Msg::LoginQrHeader =>
             "  Sign in to AtomGit — scan the QR code with your WeChat:\n\n".into(),
         Msg::LoginUrlAfterQr =>
@@ -808,6 +924,19 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             model
         )
         .into(),
+        // ── --dangerously-skip-permissions / -y ──
+        Msg::BypassWarningBanner =>
+            "\u{26a0} --dangerously-skip-permissions is active: all tool calls are auto-approved (no permission prompts)\n".into(),
+        Msg::BypassWarningHeadless =>
+            "[headless] --dangerously-skip-permissions: all tool calls are auto-approved".into(),
+        Msg::BypassBadge =>
+            "\u{26a0} BYPASS".into(),
+
+        Msg::AdminWarningBanner =>
+            "\x1b[33m\u{26a0} Warning: Running with Administrator privileges.\n   The model may have access to system files.\n   Use \"Trusted Directories\" in /codingplan to restrict file access.\x1b[39m\n".into(),
+        Msg::AdminWarningHeadless =>
+            "[warning] Running with Administrator privileges — model may have access to system files.".into(),
+
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \

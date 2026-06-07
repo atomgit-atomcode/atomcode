@@ -8,6 +8,37 @@ impl AgentLoop {
     // `agent::discipline::reflection_prompt`.
 
     pub(crate) fn build_system_prompt(&mut self) -> String {
+        // ── Session-level immutability (LLM prefix-cache stability) ──
+        // The system prompt is messages[0]; a single byte change zeroes the
+        // ENTIRE prefix cache for the whole conversation. Measured: ~20% of
+        // long-session cache collapses started right here, because the prompt
+        // was rebuilt every turn from live inputs that drift mid-session —
+        // chiefly the working directory (rewritten on every model `cd`, see
+        // tool/cd.rs + tool/bash.rs) and the plan-mode block, plus memory /
+        // layered-instructions re-read from disk each turn.
+        //
+        // So build it ONCE per session and reuse the exact same bytes every
+        // turn. The cache is invalidated (set to None) only at explicit,
+        // user-initiated contract boundaries — plan-mode toggle, /clear,
+        // config reload, explicit /cd — each rare and each a legitimate
+        // one-time reset. The model's OWN `cd` tool does NOT invalidate:
+        // live cwd still reaches the model through the cd/bash tool RESULTS,
+        // so freezing the cwd line here never blinds it. See
+        // `system_prompt_is_frozen_across_model_cwd_change`.
+        if let Some(ref cached) = self.cached_system_prompt {
+            return cached.clone();
+        }
+        let prompt = self.assemble_system_prompt();
+        self.cached_system_prompt = Some(prompt.clone());
+        prompt
+    }
+
+    /// Assemble the system prompt from scratch. Called by
+    /// `build_system_prompt` only on a cold cache. Every mid-session-variable
+    /// input it reads (cwd, plan_mode, on-disk memory/instructions, skills,
+    /// hook extensions) is snapshotted HERE and frozen until the next
+    /// explicit cache invalidation — that is the whole point.
+    fn assemble_system_prompt(&self) -> String {
         // Dynamic rules: select prompt sections based on task type.
         // If user has a custom system_prompt in config, use that instead (override).
         let rules = if let Some(custom) = self
@@ -49,11 +80,21 @@ impl AgentLoop {
             .map(|p| p.model.as_str())
             .unwrap_or("unknown");
 
+        // AtomCode's own config home (~/.atomcode or $ATOMCODE_HOME). Injected
+        // so the model writes skills / commands / memory / hook rules HERE
+        // instead of defaulting to ~/.claude (which it learned from training
+        // and which belongs to a different product). See the CONFIG line below.
+        let config_dir = crate::config::Config::config_dir();
+
         // Assemble prompt: identity + env → rules LAST (recency effect).
         let mut prompt = format!(
-            "You are AtomCode. When asked who you are, say you are AtomCode (an AI coding agent by AtomGit) running the {} model. Never claim to be another product.\n\
-             Working directory: {wd}\nAll file paths in tool calls must be absolute, resolved under {wd}. Verify file existence before editing.\n{env_info}\n",
-            model_display, wd = wd.display(), env_info = env_info,
+            "You are AtomCode. When asked who you are, say you are AtomCode (an AI coding agent by AtomGit) running the {model} model. Never claim to be another product.\n\
+             Working directory: {wd}\n\
+             All file paths in tool calls must be absolute, resolved under {wd}. Verify file existence before editing.\n\
+             SCOPE: stay inside {wd}. Do not read, write, scan, or `cd` into directories outside it — sibling projects, parent directories, or anywhere else on the machine — unless the user explicitly names a path outside it. The lone exception is AtomCode's own config dir below. Reaching into neighbouring directories on your own initiative is almost never what the user wants.\n\
+             CONFIG: AtomCode's own config — skills, commands, memory, hook rules — lives in {config_dir} (global) and {wd}/.atomcode (project); read and write it there. NEVER create or edit files under ~/.claude: that directory belongs to a different product, not AtomCode.\n\
+             {env_info}\n",
+            model = model_display, wd = wd.display(), config_dir = config_dir.display(), env_info = env_info,
         );
 
         // Git commit attribution. Mirrors Claude Code's convention:
@@ -151,7 +192,9 @@ impl AgentLoop {
             if !skills.is_empty() {
                 prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
                 prompt.push_str(
-                    "Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
+                    "This is the COMPLETE list of available skills. Skills NOT listed here do NOT exist — do NOT fabricate or assume skills that are not in this list.\n\
+To MODIFY a skill, edit its SKILL.md file directly (e.g. .atomcode/skills/<name>/SKILL.md or ~/.atomcode/skills/<name>/SKILL.md), NOT the project instructions file.\n\
+Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
                 );
                 prompt.push_str(&skills.join("\n"));
                 prompt.push('\n');
@@ -163,19 +206,14 @@ impl AgentLoop {
         // See `ctx::env` for the snapshot / disclaimer rationale.
         prompt.push_str(&self.env_snapshot.as_prompt_section());
 
-        // Plan mode: inject planning-only instructions before rules.
-        if self.plan_mode {
-            prompt.push_str(
-                "\n=== PLAN MODE (ACTIVE) ===\n\
-                 You are in PLAN MODE. You can explore, read files, run commands, and analyze the codebase.\n\
-                 You MUST NOT edit, create, or delete any files. Only read-only tools are available.\n\
-                 Your job is to:\n\
-                 1. Analyze the codebase and understand the current state\n\
-                 2. Create a detailed implementation plan with specific files, functions, and changes\n\
-                 3. Present the plan clearly so the user can review before executing\n\
-                 Do NOT attempt to make any changes. Focus on analysis and planning only.\n\n"
-            );
-        }
+        // NOTE: the PLAN MODE block used to be injected into the system prompt
+        // here. It was moved OUT — toggling plan mode mid-session rewrote
+        // messages[0] and zeroed the ENTIRE prefix cache (~12% of system-prompt
+        // cache breaks in the line-data). Plan mode is now announced ONCE via a
+        // synthetic history message when it is toggled (see
+        // `AgentCommand::SetPlanMode`), and enforced structurally by read-only
+        // tool gating (`use_read_only`). The system prompt stays a session-level
+        // constant. See `plan_mode_is_not_in_system_prompt`.
 
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.
@@ -196,6 +234,19 @@ impl AgentLoop {
         // CtxBuilder impl in `build_messages`. Keeping them out of this
         // function keeps agent::prompt free of `if model_id.contains(...)`
         // branches — per-model customization now lives in ctx.
+
+        // --- SystemPrompt hook extensions ---
+        // SystemPromptHook 允许用户（通过脚本/webhook）在 system prompt 末尾注入
+        // 自定义内容（如安全策略、命名约定等）。这些扩展由 HookEngine 统一收集。
+        // 此方法为同步（fn build_system_prompt），依赖调用方在调用之前预先调用
+        // refresh_hook_extensions() 收集并缓存扩展。
+        if !self.cached_system_prompt_extensions.is_empty() {
+            prompt.push_str("\n=== HOOK SYSTEM PROMPT EXTENSIONS ===\n");
+            for ext in &self.cached_system_prompt_extensions {
+                prompt.push_str(ext);
+                prompt.push('\n');
+            }
+        }
 
         prompt
     }

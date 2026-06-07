@@ -1,4 +1,24 @@
 use anyhow::{anyhow, bail, Context, Result};
+
+/// Error returned by [`install`] when the plugin is already present in
+/// `installed_plugins.json`. Carries the canonical plugin id so the
+/// caller can render a friendly reinstall hint.
+#[derive(Debug)]
+pub struct AlreadyInstalledError {
+    pub id: String,
+}
+
+impl std::fmt::Display for AlreadyInstalledError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "plugin `{}` is already installed.\nPS: To reinstall, first run `/plugin uninstall {}` then `/plugin install {}`",
+            self.id, self.id, self.id
+        )
+    }
+}
+
+impl std::error::Error for AlreadyInstalledError {}
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -7,7 +27,7 @@ use super::marketplace::sanitize_name;
 use super::paths;
 use super::state::{
     load_installed_plugins_file, load_marketplaces_file, plugin_id, save_installed_plugins_file,
-    InstalledPluginEntry,
+    InstallScope, InstalledPluginEntry,
 };
 use super::url::validate_git_url;
 
@@ -16,6 +36,8 @@ pub struct InstalledPluginInfo {
     pub plugin: String,
     pub marketplace: String,
     pub plugin_dir: String,
+    /// Installation scope.
+    pub scope: InstallScope,
 }
 
 /// Resolve an inline (relative-to-marketplace-root) source string into the
@@ -43,25 +65,50 @@ fn install_external(
     let target_rel = format!("installed/{}/{}", marketplace, plugin_key);
     let target_abs = plugins_root.join(&target_rel);
     if target_abs.exists() {
-        bail!(
-            "plugin install dir already exists: {}",
-            target_abs.display()
-        );
+        // The directory already exists. This can happen when a previous
+        // install was cancelled (Esc) after the clone succeeded but before
+        // the state file was updated, or when the install failed partway
+        // through. If the plugin is NOT recorded in installed_plugins.json,
+        // treat the directory as a stale leftover and remove it so the
+        // install can proceed. Otherwise, bail out.
+        let id = plugin_id(plugin_key, marketplace);
+        let installed_path = paths::installed_plugins_file().unwrap();
+        let is_registered = load_installed_plugins_file(&installed_path)
+            .map(|f| f.plugins.contains_key(&id))
+            .unwrap_or(false);
+        if is_registered {
+            bail!(
+                "plugin install dir already exists and is registered: {}",
+                target_abs.display()
+            );
+        }
+        // Stale leftover — remove and continue.
+        std::fs::remove_dir_all(&target_abs).with_context(|| {
+            format!("failed to remove stale install dir {}", target_abs.display())
+        })?;
     }
     if let Some(parent) = target_abs.parent() {
         std::fs::create_dir_all(parent).ok();
     }
 
+    let git = super::marketplace::find_git()?;
     match ext {
         ExternalSource::Url { url, pin } | ExternalSource::Git { url, pin } => {
             validate_git_url(url)?;
-            git_clone_with_pin(url, &target_abs, pin)
+            git_clone_with_pin(&git, url, &target_abs, pin)
                 .with_context(|| format!("clone {}", url))?;
         }
         ExternalSource::Github { repo, pin } => {
             let url = expand_github_repo(repo)?;
-            git_clone_with_pin(&url, &target_abs, pin)
+            git_clone_with_pin(&git, &url, &target_abs, pin)
                 .with_context(|| format!("clone {}", url))?;
+        }
+        ExternalSource::GitSubdir { url, path, pin } => {
+            // The recorded plugin_dir points INTO the subtree, so return early
+            // with the subdir-qualified path rather than the clone root.
+            return git_subdir_clone(&git, url, path, pin, &target_abs)
+                .map(|_| format!("{}/{}", target_rel, normalize_rel_subdir(path)))
+                .with_context(|| format!("git-subdir clone {} ({})", url, path));
         }
         ExternalSource::Local { path } => {
             let src = expand_local_path(path)?;
@@ -70,6 +117,107 @@ fn install_external(
         }
     }
     Ok(target_rel)
+}
+
+/// Normalise a subdir path for joining into `plugin_dir`: strip a leading
+/// `./` and any trailing slash. (Traversal safety is enforced separately by
+/// `validate_plugin_source` before this is called.)
+fn normalize_rel_subdir(path: &str) -> String {
+    path.trim_start_matches("./").trim_end_matches('/').to_string()
+}
+
+/// Realise a `git-subdir` source: sparse + partial clone of just `path` from
+/// `url` into `target`. `url` may be an `owner/repo` shorthand (expanded as a
+/// GitHub repo) or a full git URL.
+fn git_subdir_clone(git: &Path, url: &str, path: &str, pin: &GitPin, target: &Path) -> Result<()> {
+    validate_plugin_source(path)?;
+    let sub = normalize_rel_subdir(path);
+    if sub.is_empty() {
+        bail!("git-subdir source has empty path");
+    }
+    let clone_url = resolve_subdir_url(url)?;
+
+    // Partial clone (no blobs) + no checkout, so we can scope the working tree
+    // to just `sub` before materialising any files.
+    let mut clone = Command::new(git);
+    clone.args(["clone", "--filter=blob:none", "--no-checkout", "--depth", "1"]);
+    // git-subdir pins are branch names in practice (the schema's `ref`); a
+    // commit `sha` would need full history, but the catalog carries none.
+    let branch = pin.git_ref.as_deref().or(pin.branch.as_deref());
+    if let Some(b) = branch {
+        clone.args(["--branch", b]);
+    }
+    clone.arg(clone_url.as_str()).arg(target);
+    let out = clone.output().context("spawn git clone (git-subdir)")?;
+    if !out.status.success() {
+        // Fall back to a plain shallow clone for git versions without
+        // partial-clone support; we still scope via sparse-checkout below.
+        let mut plain = Command::new(git);
+        plain.args(["clone", "--no-checkout", "--depth", "1"]);
+        if let Some(b) = branch {
+            plain.args(["--branch", b]);
+        }
+        plain.arg(clone_url.as_str()).arg(target);
+        let out2 = plain.output().context("spawn git clone (git-subdir fallback)")?;
+        if !out2.status.success() {
+            bail!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&out2.stderr)
+            );
+        }
+    }
+
+    // Scope the working tree to the subdir, then check it out. `--no-cone` +
+    // `--` keep an exotic path from being read as a cone pattern or a flag.
+    let sparse = Command::new(git)
+        .args(["sparse-checkout", "set", "--no-cone", "--", &sub])
+        .current_dir(target)
+        .output()
+        .context("spawn git sparse-checkout")?;
+    if !sparse.status.success() {
+        bail!(
+            "git sparse-checkout failed: {}",
+            String::from_utf8_lossy(&sparse.stderr)
+        );
+    }
+    let checkout = Command::new(git)
+        .args(["checkout"])
+        .current_dir(target)
+        .output()
+        .context("spawn git checkout (git-subdir)")?;
+    if !checkout.status.success() {
+        bail!(
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
+
+    // The subdir must actually exist in the repo, or this plugin is empty.
+    let materialised = target.join(&sub);
+    if !materialised.is_dir() {
+        bail!(
+            "git-subdir path `{}` not found in repo {}",
+            sub,
+            clone_url
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a git-subdir `url` field. `owner/repo` shorthand → GitHub https URL
+/// (reusing the existing anti-injection guard); anything with a scheme or an
+/// ssh host → validated as a full git URL.
+fn resolve_subdir_url(url: &str) -> Result<String> {
+    let looks_shorthand = !url.contains("://")
+        && !url.contains('@')
+        && url.matches('/').count() == 1
+        && !url.starts_with('/');
+    if looks_shorthand {
+        expand_github_repo(url)
+    } else {
+        validate_git_url(url)?;
+        Ok(url.to_string())
+    }
 }
 
 /// Expand a `github` shorthand (`owner/name`) into the canonical clone URL.
@@ -147,8 +295,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn git_clone_with_pin(url: &str, target: &Path, pin: &GitPin) -> Result<()> {
-    let mut cmd = Command::new("git");
+fn git_clone_with_pin(git: &Path, url: &str, target: &Path, pin: &GitPin) -> Result<()> {
+    let mut cmd = Command::new(git);
     cmd.arg("clone");
     let needs_full_history = pin.commit.is_some() || pin.tag.is_some() || pin.git_ref.is_some();
     if !needs_full_history {
@@ -170,7 +318,7 @@ fn git_clone_with_pin(url: &str, target: &Path, pin: &GitPin) -> Result<()> {
         .or(pin.tag.as_deref())
         .or(pin.git_ref.as_deref());
     if let Some(rev) = pin_ref {
-        let out = Command::new("git")
+        let out = Command::new(git)
             .args(["checkout", "--detach", rev])
             .current_dir(target)
             .output()
@@ -206,6 +354,9 @@ fn external_matches_marketplace(ext: &ExternalSource, mp_url: &str) -> bool {
             Ok(u) => (u, pin),
             Err(_) => return false,
         },
+        // A git-subdir install pulls only a subtree into its own dir; it must
+        // never be deduped against the marketplace's full clone.
+        ExternalSource::GitSubdir { .. } => return false,
         ExternalSource::Local { .. } => return false,
     };
     if pin.branch.is_some()
@@ -245,7 +396,45 @@ fn validate_plugin_source(source: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
+/// Result of resolving a bare plugin name across all registered marketplaces.
+#[derive(Debug, Clone)]
+pub struct PluginMarketplaceMatch {
+    pub marketplace: String,
+    pub plugin: String,
+}
+
+/// Find all marketplaces that contain a plugin matching the given name.
+/// The name is compared against both the raw plugin name and its sanitized
+/// form (e.g. "my plugin" matches "my-plugin" in the marketplace's plugin
+/// list). Returns an empty Vec if the plugin is not found in any marketplace.
+pub fn resolve_plugin_marketplace(plugin_name: &str) -> Result<Vec<PluginMarketplaceMatch>> {
+    let mp_state = load_marketplaces_file(&paths::marketplaces_file().unwrap())?;
+    let sanitized = sanitize_name(plugin_name);
+    let mut matches: Vec<PluginMarketplaceMatch> = Vec::new();
+
+    for (mp_name, entry) in &mp_state.marketplaces {
+        for p in &entry.plugins {
+            if p == plugin_name || p == &sanitized {
+                matches.push(PluginMarketplaceMatch {
+                    marketplace: mp_name.clone(),
+                    plugin: p.clone(),
+                });
+                break; // one match per marketplace is enough
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
+/// Install a plugin from a given marketplace with the specified scope.
+///
+/// For `User` scope, the plugin is installed under the global
+/// `~/.atomcode/plugins/` root (the original behaviour). For `Project`
+/// and `Local` scopes, the plugin files are copied into the project's
+/// `.atomcode/plugins/` or `.atomcode/plugins/local/` directory so
+/// they are visible only within that project.
+pub fn install(plugin: &str, marketplace: &str, scope: InstallScope) -> Result<InstalledPluginInfo> {
     let mp_state = load_marketplaces_file(&paths::marketplaces_file().unwrap())?;
     let entry = mp_state
         .marketplaces
@@ -258,6 +447,12 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
     // Resolve plugin source dir relative to marketplace root.
     let mp_root_rel = format!("marketplaces/{}", marketplace);
     let mp_root_abs = paths::plugins_root().unwrap().join(&mp_root_rel);
+    if !mp_root_abs.exists() {
+        bail!(
+            "marketplace `{}` clone is missing — run `/plugin update {marketplace}` to restore it",
+            marketplace
+        );
+    }
     let manifest = super::manifest::load_marketplace_manifest(&mp_root_abs)?;
     let plugin_entry: PluginEntry = match manifest {
         Some(m) => m
@@ -291,72 +486,288 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
                 install_external(&plugin_key, marketplace, ext)?
             }
         }
+        PluginSource::Unknown(raw) => {
+            bail!(
+                "plugin `{}` uses an unsupported source type and cannot be \
+                 installed by this build: {}",
+                plugin,
+                raw
+            );
+        }
     };
 
-    let id = plugin_id(&plugin_key, marketplace);
-    let installed_path = paths::installed_plugins_file().unwrap();
-    let mut installed = load_installed_plugins_file(&installed_path)?;
-    if installed.plugins.contains_key(&id) {
-        // Roll back any external clone that we just created so retries work.
-        if plugin_dir_rel.starts_with("installed/") {
-            let abs = paths::plugins_root().unwrap().join(&plugin_dir_rel);
-            std::fs::remove_dir_all(&abs).ok();
-        }
-        bail!("plugin `{}` already installed; uninstall first", id);
-    }
-    installed.plugins.insert(
-        id.clone(),
-        InstalledPluginEntry {
-            marketplace: marketplace.to_string(),
-            plugin: plugin_key.clone(),
-            plugin_dir: plugin_dir_rel.clone(),
-            installed_at: chrono::Utc::now().to_rfc3339(),
-        },
-    );
-    save_installed_plugins_file(&installed_path, &installed)?;
+    // Determine the target directory and state file based on scope.
+    match &scope {
+        InstallScope::User => {
+            // Original global install path.
+            let id = plugin_id(&plugin_key, marketplace);
+            let installed_path = paths::installed_plugins_file().unwrap();
+            let mut installed = load_installed_plugins_file(&installed_path)?;
+            if installed.plugins.contains_key(&id) {
+                let dir_missing = installed
+                    .plugins
+                    .get(&id)
+                    .map(|e| {
+                        let abs = paths::plugins_root().unwrap().join(&e.plugin_dir);
+                        !abs.exists()
+                    })
+                    .unwrap_or(false);
+                if !dir_missing {
+                    if plugin_dir_rel.starts_with("installed/") {
+                        let abs = paths::plugins_root().unwrap().join(&plugin_dir_rel);
+                        std::fs::remove_dir_all(&abs).ok();
+                    }
+                    return Err(AlreadyInstalledError { id: id.clone() }.into());
+                }
+                installed.plugins.remove(&id);
+            }
+            installed.plugins.insert(
+                id.clone(),
+                InstalledPluginEntry {
+                    marketplace: marketplace.to_string(),
+                    plugin: plugin_key.clone(),
+                    plugin_dir: plugin_dir_rel.clone(),
+                    installed_at: chrono::Utc::now().to_rfc3339(),
+                    scope: InstallScope::User,
+                },
+            );
+            save_installed_plugins_file(&installed_path, &installed)?;
 
-    Ok(InstalledPluginInfo {
-        plugin: plugin_key,
-        marketplace: marketplace.to_string(),
-        plugin_dir: plugin_dir_rel,
-    })
+            Ok(InstalledPluginInfo {
+                plugin: plugin_key,
+                marketplace: marketplace.to_string(),
+                plugin_dir: plugin_dir_rel,
+                scope: InstallScope::User,
+            })
+        }
+        InstallScope::Project | InstallScope::Local => {
+            // Project-level install: copy the plugin files into the project's
+            // .atomcode/plugins/ directory and record in the project-level
+            // installed_plugins.json.
+            let working_dir = std::env::current_dir()
+                .context("cannot determine current working directory")?;
+            let project_root = paths::project_plugins_root(&working_dir, &scope)
+                .ok_or_else(|| anyhow!("no project plugins root for scope {:?}", scope))?;
+
+            // Source: the actual plugin files on disk (resolved from the global
+            // plugins root since marketplaces always live there).
+            let source_abs = paths::plugins_root().unwrap().join(&plugin_dir_rel);
+            if !source_abs.exists() {
+                bail!("plugin source directory does not exist: {}", source_abs.display());
+            }
+
+            // Destination: project-level plugins dir.
+            let dest_rel = format!("installed/{}/{}", marketplace, plugin_key);
+            let dest_abs = project_root.join(&dest_rel);
+            if dest_abs.exists() {
+                // The directory already exists — same residual-detect logic
+                // as install_external: if the plugin is NOT recorded in the
+                // project-level installed_plugins.json, treat the directory
+                // as a stale leftover from a cancelled / failed install and
+                // remove it.  Otherwise, bail out.
+                let state_path = paths::project_installed_plugins_file(&working_dir, &scope)
+                    .ok_or_else(|| anyhow!("no project state file for scope {:?}", scope))?;
+                let id = plugin_id(&plugin_key, marketplace);
+                let is_registered = load_installed_plugins_file(&state_path)
+                    .map(|f| f.plugins.contains_key(&id))
+                    .unwrap_or(false);
+                if is_registered {
+                    bail!(
+                        "plugin already installed in project at {}",
+                        dest_abs.display()
+                    );
+                }
+                // Stale leftover — remove and continue.
+                std::fs::remove_dir_all(&dest_abs).with_context(|| {
+                    format!(
+                        "failed to remove stale project install dir {}",
+                        dest_abs.display()
+                    )
+                })?;
+            }
+            if let Some(parent) = dest_abs.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+
+            // Copy the plugin files into the project directory.
+            copy_dir_recursive(&source_abs, &dest_abs)
+                .with_context(|| format!("copy plugin to project dir {}", dest_abs.display()))?;
+
+            // Record in project-level installed_plugins.json.
+            let state_path = paths::project_installed_plugins_file(&working_dir, &scope)
+                .ok_or_else(|| anyhow!("no project state file for scope {:?}", scope))?;
+            let mut state = load_installed_plugins_file(&state_path)?;
+            let id = plugin_id(&plugin_key, marketplace);
+            if state.plugins.contains_key(&id) {
+                // Clean up the copy we just made.
+                std::fs::remove_dir_all(&dest_abs).ok();
+                bail!("plugin `{}` already installed in project scope {}", id, scope);
+            }
+            state.plugins.insert(
+                id.clone(),
+                InstalledPluginEntry {
+                    marketplace: marketplace.to_string(),
+                    plugin: plugin_key.clone(),
+                    plugin_dir: dest_rel.clone(),
+                    installed_at: chrono::Utc::now().to_rfc3339(),
+                    scope: scope.clone(),
+                },
+            );
+            save_installed_plugins_file(&state_path, &state)?;
+
+            Ok(InstalledPluginInfo {
+                plugin: plugin_key,
+                marketplace: marketplace.to_string(),
+                plugin_dir: dest_rel,
+                scope: scope.clone(),
+            })
+        }
+    }
 }
 
-pub fn uninstall(plugin: &str, marketplace: &str) -> Result<()> {
+/// Ensure a plugin from a marketplace is fully installed (user scope),
+/// automatically recovering from missing marketplace registrations or
+/// deleted clones. This is the single entry-point for `/guide` auto-install
+/// and similar "make this work no matter what" flows.
+pub fn ensure_plugin_installed(
+    plugin: &str,
+    marketplace: &str,
+    marketplace_url: &str,
+) -> Result<InstalledPluginInfo> {
+    // Step 1: Ensure marketplace is registered.
+    let mp_file = paths::marketplaces_file().unwrap();
+    let mp_state = load_marketplaces_file(&mp_file)?;
+    let needs_add = !mp_state.marketplaces.contains_key(marketplace);
+    drop(mp_state);
+
+    if needs_add {
+        match super::marketplace::add_marketplace(marketplace_url) {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("already exists") {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // Step 2: Ensure the marketplace clone exists on disk.
+    let mp_root = paths::plugins_root()
+        .unwrap()
+        .join("marketplaces")
+        .join(marketplace);
+    if !mp_root.exists() {
+        let mp_state = load_marketplaces_file(&mp_file)?;
+        let entry = mp_state
+            .marketplaces
+            .get(marketplace)
+            .ok_or_else(|| anyhow!("marketplace `{}` not registered", marketplace))?;
+        let url = entry.source.clone();
+        drop(mp_state);
+
+        super::marketplace::git_clone(&url, &mp_root)
+            .with_context(|| format!("re-clone marketplace `{}`", marketplace))?;
+    }
+
+    // Step 3: Install the plugin (user scope by default for auto-install).
+    install(plugin, marketplace, InstallScope::User)
+}
+
+/// Uninstall a plugin. For User scope, removes from the global plugins
+/// root. For Project/Local scope, removes from the project's .atomcode/plugins/
+/// directory.
+pub fn uninstall(plugin: &str, marketplace: &str, scope: InstallScope) -> Result<()> {
     let plugin_key = sanitize_name(plugin);
     let id = plugin_id(&plugin_key, marketplace);
-    let installed_path = paths::installed_plugins_file().unwrap();
-    let mut installed = load_installed_plugins_file(&installed_path)?;
-    let entry = installed
-        .plugins
-        .remove(&id)
-        .ok_or_else(|| anyhow!("plugin `{}` not installed", id))?;
-    save_installed_plugins_file(&installed_path, &installed)?;
 
-    // Garbage-collect external clones. `marketplaces/*` belongs to the
-    // marketplace itself and must be left intact for any sibling plugins.
-    if entry.plugin_dir.starts_with("installed/") {
-        if let Some(root) = paths::plugins_root() {
-            let abs = root.join(&entry.plugin_dir);
-            if abs.exists() {
-                std::fs::remove_dir_all(&abs).ok();
+    match &scope {
+        InstallScope::User => {
+            let installed_path = paths::installed_plugins_file().unwrap();
+            let mut installed = load_installed_plugins_file(&installed_path)?;
+            let entry = installed
+                .plugins
+                .remove(&id)
+                .ok_or_else(|| anyhow!("plugin `{}` not installed", id))?;
+            save_installed_plugins_file(&installed_path, &installed)?;
+
+            // Garbage-collect external clones. `marketplaces/*` belongs to the
+            // marketplace itself and must be left intact for any sibling plugins.
+            if entry.plugin_dir.starts_with("installed/") {
+                if let Some(root) = paths::plugins_root() {
+                    let install_root_rel = format!("installed/{}/{}", entry.marketplace, entry.plugin);
+                    let abs = root.join(&install_root_rel);
+                    if abs.exists() {
+                        std::fs::remove_dir_all(&abs).ok();
+                    }
+                }
+            }
+        }
+        InstallScope::Project | InstallScope::Local => {
+            let working_dir = std::env::current_dir()
+                .context("cannot determine current working directory")?;
+            let state_path = paths::project_installed_plugins_file(&working_dir, &scope)
+                .ok_or_else(|| anyhow!("no project state file for scope {:?}", scope))?;
+            let mut state = load_installed_plugins_file(&state_path)?;
+            let entry = state
+                .plugins
+                .remove(&id)
+                .ok_or_else(|| anyhow!("plugin `{}` not installed in project scope {}", id, scope))?;
+            save_installed_plugins_file(&state_path, &state)?;
+
+            // Remove the copied plugin files.
+            let project_root = paths::project_plugins_root(&working_dir, &scope)
+                .ok_or_else(|| anyhow!("no project plugins root for scope {:?}", scope))?;
+            if entry.plugin_dir.starts_with("installed/") {
+                let install_root_rel = format!("installed/{}/{}", entry.marketplace, entry.plugin);
+                let abs = project_root.join(&install_root_rel);
+                if abs.exists() {
+                    std::fs::remove_dir_all(&abs).ok();
+                }
             }
         }
     }
     Ok(())
 }
 
+/// List all installed plugins across all scopes.
+///
+/// Returns plugins from the global (user) scope plus any project-level
+/// plugins found in the current working directory.
 pub fn list_installed() -> Result<Vec<InstalledPluginInfo>> {
+    let mut result = Vec::new();
+
+    // User scope (global).
     let installed = load_installed_plugins_file(&paths::installed_plugins_file().unwrap())?;
-    Ok(installed
-        .plugins
-        .into_values()
-        .map(|e| InstalledPluginInfo {
+    for e in installed.plugins.into_values() {
+        result.push(InstalledPluginInfo {
             plugin: e.plugin,
             marketplace: e.marketplace,
             plugin_dir: e.plugin_dir,
-        })
-        .collect())
+            scope: e.scope,
+        });
+    }
+
+    // Project and Local scopes.
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for scope in [InstallScope::Project, InstallScope::Local] {
+        if let Some(state_path) = paths::project_installed_plugins_file(&working_dir, &scope) {
+            if state_path.exists() {
+                if let Ok(state) = load_installed_plugins_file(&state_path) {
+                    for e in state.plugins.into_values() {
+                        result.push(InstalledPluginInfo {
+                            plugin: e.plugin,
+                            marketplace: e.marketplace,
+                            plugin_dir: e.plugin_dir,
+                            scope: e.scope,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -390,7 +801,7 @@ mod tests {
         let _home = isolated_home();
         let repo = make_repo("solo", None);
         add_marketplace(&format!("file://{}", repo.display())).unwrap();
-        let info = install("solo", "solo").unwrap();
+        let info = install("solo", "solo", InstallScope::User).unwrap();
         assert_eq!(info.plugin_dir, "marketplaces/solo");
     }
 
@@ -400,8 +811,8 @@ mod tests {
         let _home = isolated_home();
         let repo = make_repo("dup", None);
         add_marketplace(&format!("file://{}", repo.display())).unwrap();
-        install("dup", "dup").unwrap();
-        assert!(install("dup", "dup").is_err());
+        install("dup", "dup", InstallScope::User).unwrap();
+        assert!(install("dup", "dup", InstallScope::User).is_err());
     }
 
     #[test]
@@ -410,8 +821,8 @@ mod tests {
         let _home = isolated_home();
         let repo = make_repo("u", None);
         add_marketplace(&format!("file://{}", repo.display())).unwrap();
-        install("u", "u").unwrap();
-        uninstall("u", "u").unwrap();
+        install("u", "u", InstallScope::User).unwrap();
+        uninstall("u", "u", InstallScope::User).unwrap();
         assert!(list_installed().unwrap().is_empty());
     }
 
@@ -427,7 +838,7 @@ mod tests {
         Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
         Command::new("git").args(["commit", "-q", "-m", "add sub"]).current_dir(&repo).status().unwrap();
         add_marketplace(&format!("file://{}", repo.display())).unwrap();
-        let info = install("sub", "mp").unwrap();
+        let info = install("sub", "mp", InstallScope::User).unwrap();
         assert_eq!(info.plugin_dir, "marketplaces/mp/plugins/sub");
     }
 
@@ -441,7 +852,7 @@ mod tests {
         let manifest = r#"{"name":"mp2","plugins":[{"name":"esc","source":"../../etc"}]}"#;
         let repo = make_repo("mp2", Some(manifest));
         add_marketplace(&format!("file://{}", repo.display())).unwrap();
-        let err = install("esc", "mp2").unwrap_err();
+        let err = install("esc", "mp2", InstallScope::User).unwrap_err();
         assert!(
             err.to_string().contains("disallowed components"),
             "expected traversal rejection, got: {}",
@@ -472,14 +883,14 @@ mod tests {
         let mp_repo = make_repo("mp_ext", Some(&manifest));
         add_marketplace(&format!("file://{}", mp_repo.display())).unwrap();
 
-        let info = install("ext", "mp_ext").unwrap();
+        let info = install("ext", "mp_ext", InstallScope::User).unwrap();
         assert_eq!(info.plugin_dir, "installed/mp_ext/ext");
 
         let abs = paths::plugins_root().unwrap().join(&info.plugin_dir);
         assert!(abs.join("PLUGIN_MARKER").exists(), "external clone missing");
 
         // uninstall must wipe the installed/* dir.
-        uninstall("ext", "mp_ext").unwrap();
+        uninstall("ext", "mp_ext", InstallScope::User).unwrap();
         assert!(!abs.exists(), "uninstall should remove installed/* clone");
     }
 
@@ -498,7 +909,7 @@ mod tests {
         );
         let mp_repo = make_repo("mp_local", Some(&manifest));
         add_marketplace(&format!("file://{}", mp_repo.display())).unwrap();
-        let info = install("loc", "mp_local").unwrap();
+        let info = install("loc", "mp_local", InstallScope::User).unwrap();
 
         let abs = paths::plugins_root().unwrap().join(&info.plugin_dir);
         assert!(abs.join("skills/x/SKILL.md").exists(), "local copy missing");
@@ -530,7 +941,7 @@ mod tests {
         Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
 
         add_marketplace(&url).unwrap();
-        let info = install("self_ref", "self_ref").unwrap();
+        let info = install("self_ref", "self_ref", InstallScope::User).unwrap();
 
         // Dedup must land in marketplaces/, not installed/.
         assert_eq!(info.plugin_dir, "marketplaces/self_ref");
@@ -600,5 +1011,127 @@ mod tests {
         assert!(validate_plugin_source("plugins/../etc").is_err());
         assert!(validate_plugin_source("/etc/passwd").is_err());
         assert!(validate_plugin_source("plugins/foo/../bar").is_err());
+    }
+
+    // ---- git-subdir source ----
+
+    #[test]
+    fn resolve_subdir_url_shorthand_and_full() {
+        // owner/repo shorthand → GitHub https
+        assert_eq!(
+            resolve_subdir_url("openclaw/openclaw").unwrap(),
+            "https://github.com/openclaw/openclaw.git"
+        );
+        // full url passes through
+        assert_eq!(
+            resolve_subdir_url("https://example.com/r.git").unwrap(),
+            "https://example.com/r.git"
+        );
+        // ssh form is not shorthand (has '@'), validated as a url
+        assert!(resolve_subdir_url("git@github.com:o/r.git").is_ok());
+        // three segments is neither valid shorthand nor (here) a url scheme
+        assert!(resolve_subdir_url("a/b/c").is_err());
+    }
+
+    #[test]
+    fn normalize_rel_subdir_strips_dot_and_slash() {
+        assert_eq!(normalize_rel_subdir("./a/b/"), "a/b");
+        assert_eq!(normalize_rel_subdir("a/b"), "a/b");
+        assert_eq!(normalize_rel_subdir(".agents/skills/x"), ".agents/skills/x");
+    }
+
+    /// Build an "upstream" repo containing a plugin in a subdirectory.
+    /// Returns (repo_path, current_branch_name) so the test can pin `ref`
+    /// without depending on the machine's git `init.defaultBranch`.
+    fn make_subdir_upstream(subdir: &str) -> (PathBuf, String) {
+        let work = tempfile::tempdir().unwrap().keep();
+        let repo = work.join("upstream");
+        std::fs::create_dir_all(&repo).unwrap();
+        Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["config", "user.name", "t"]).current_dir(&repo).status().unwrap();
+        let sub = repo.join(subdir);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("plugin.json"), r#"{"name":"sk"}"#).unwrap();
+        std::fs::create_dir_all(sub.join("skills/sk")).unwrap();
+        std::fs::write(
+            sub.join("skills/sk/SKILL.md"),
+            "---\nname: sk\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+        // A file OUTSIDE the subdir, to prove sparse-checkout scopes correctly.
+        std::fs::write(repo.join("OUTSIDE_MARKER"), "x").unwrap();
+        Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
+        let out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (repo, branch)
+    }
+
+    /// End-to-end: a marketplace whose manifest has a `git-subdir` entry
+    /// pointing at a separate upstream repo's subdirectory. Install must
+    /// sparse-clone only that subtree and record a plugin_dir INTO the subdir.
+    #[test]
+    #[serial_test::serial]
+    fn install_git_subdir_clones_only_subtree() {
+        let _home = isolated_home();
+        let (upstream, branch) = make_subdir_upstream("pkg/tool");
+        let upstream_url = format!("file://{}", upstream.display());
+
+        let manifest = format!(
+            r#"{{"name":"mp_gs","plugins":[{{"name":"tool","source":{{"source":"git-subdir","url":"{}","path":"pkg/tool","ref":"{}"}}}}]}}"#,
+            upstream_url, branch
+        );
+        let mp_repo = make_repo("mp_gs", Some(&manifest));
+        add_marketplace(&format!("file://{}", mp_repo.display())).unwrap();
+
+        let info = install("tool", "mp_gs", InstallScope::User).unwrap();
+        // plugin_dir points into the subdir.
+        assert_eq!(info.plugin_dir, "installed/mp_gs/tool/pkg/tool");
+
+        let abs = paths::plugins_root().unwrap().join(&info.plugin_dir);
+        assert!(abs.join("plugin.json").exists(), "subdir content missing");
+        assert!(abs.join("skills/sk/SKILL.md").exists(), "subdir skill missing");
+
+        // sparse-checkout must NOT have materialised files outside the subdir.
+        let clone_root = paths::plugins_root().unwrap().join("installed/mp_gs/tool");
+        assert!(
+            !clone_root.join("OUTSIDE_MARKER").exists(),
+            "sparse-checkout leaked files outside the requested subdir"
+        );
+
+        // uninstall removes the whole clone.
+        uninstall("tool", "mp_gs", InstallScope::User).unwrap();
+        assert!(!clone_root.exists(), "uninstall should remove the clone");
+    }
+
+    /// A git-subdir entry whose `path` escapes the repo must be rejected.
+    #[test]
+    #[serial_test::serial]
+    fn install_git_subdir_rejects_path_traversal() {
+        let _home = isolated_home();
+        let manifest = r#"{"name":"mp_bad","plugins":[{"name":"esc","source":{"source":"git-subdir","url":"o/r","path":"../etc","ref":"main"}}]}"#;
+        let mp_repo = make_repo("mp_bad", Some(manifest));
+        add_marketplace(&format!("file://{}", mp_repo.display())).unwrap();
+        let err = install("esc", "mp_bad", InstallScope::User).unwrap_err();
+        assert!(
+            err.to_string().contains("disallowed components")
+                || err.to_string().contains("git-subdir"),
+            "expected traversal rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dedup_skipped_for_git_subdir_source() {
+        let ext = ExternalSource::GitSubdir {
+            url: "o/r".into(),
+            path: "sub".into(),
+            pin: GitPin::default(),
+        };
+        assert!(!external_matches_marketplace(&ext, "https://github.com/o/r.git"));
     }
 }

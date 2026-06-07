@@ -95,135 +95,151 @@ impl Tool for GlobTool {
         let search_dir = derive_search_dir(&base_dir, &parsed.pattern);
         let name_pattern = derive_name_pattern(&parsed.pattern);
 
-        // Verify search directory exists. If not, walk the workspace to find
-        // directories with the same basename so the agent can self-correct
-        // without a round of manual `ls`. 2026-04-22: added for P0 #4 after
-        // 426-atom 2026-04-21 session where agent spent 5 turns listing
-        // directories because `/426-atom/index.html` was actually at
-        // `/426-atom/presentation/index.html`.
-        if !std::path::Path::new(&search_dir).is_dir() {
-            let target_basename = std::path::Path::new(&search_dir)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let mut dir_matches: Vec<String> = Vec::new();
-            if !target_basename.is_empty() {
-                fn find_dir(
-                    dir: &std::path::Path,
-                    target: &str,
-                    depth: usize,
-                    max_depth: usize,
-                    results: &mut Vec<String>,
-                ) {
-                    if depth > max_depth || results.len() >= 20 {
-                        return;
-                    }
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            if name.starts_with('.') || super::should_skip_dir(&name) {
-                                continue;
-                            }
-                            let p = entry.path();
-                            if p.is_dir() {
-                                if name == target {
-                                    results.push(p.to_string_lossy().to_string());
-                                }
-                                find_dir(&p, target, depth + 1, max_depth, results);
-                            }
-                        }
-                    }
-                }
-                find_dir(
-                    std::path::Path::new(&wd),
-                    &target_basename,
-                    0,
-                    5,
-                    &mut dir_matches,
-                );
-            }
-            let hint = if dir_matches.is_empty() {
-                String::new()
-            } else {
-                dir_matches
-                    .sort_by_key(|d| std::cmp::Reverse(super::shared_prefix_len(&search_dir, d)));
-                let shown: Vec<String> = dir_matches
-                    .iter()
-                    .take(3)
-                    .map(|d| format!("  {}", d))
-                    .collect();
-                format!(
-                    "\n\nSimilar directories found — did you mean one of these?\n{}",
-                    shown.join("\n")
-                )
-            };
-            return Ok(ToolResult {
-                call_id: String::new(),
-                output: format!(
-                    "No files matching '{}' (directory '{}' does not exist){}",
-                    parsed.pattern, search_dir, hint
-                ),
-                success: true,
-            });
-        }
-
-        // Use the `ignore` crate (ripgrep's walker) for cross-platform file
-        // search. This replaces the previous `Command::new("find")` approach
-        // which failed on Windows because Windows' `find.exe` is a string-
-        // search utility (like grep), not a file-search utility. It also
-        // correctly handles non-ASCII filenames (Chinese, Japanese, etc.)
-        // on all platforms without encoding issues.
-        //
-        // Issue #350: https://gitcode.com/atomgit_atomcode/atomcode/issues/350
-        let mut files: Vec<String> = Vec::new();
-        let search_path = std::path::Path::new(&search_dir);
-        let walker = ignore::WalkBuilder::new(search_path)
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .build();
-
-        for entry in walker.flatten() {
-            let path = entry.path();
-            // Skip directories — we only want files
-            if !path.is_file() {
-                continue;
-            }
-            // Skip directories that should be excluded (node_modules, .git, etc.)
-            // The ignore crate handles .gitignore already, but we also need to
-            // filter out SKIP_DIRS and SKIP_DIR_PREFIXES for consistency with
-            // the rest of the tool suite.
-            if should_skip_path(path) {
-                continue;
-            }
-            if let Some(file_name) = path.file_name() {
-                let name = file_name.to_string_lossy();
-                if simple_glob_match(&name, &name_pattern) {
-                    files.push(path.to_string_lossy().to_string());
-                }
-            }
-        }
-        files.sort();
-
-        let result = if files.is_empty() {
-            format!("No files matching '{}'", parsed.pattern)
-        } else {
-            let total = files.len();
-            let shown: Vec<&str> = files.iter().take(100).map(|s| s.as_str()).collect();
-
-            let mut out = shown.join("\n");
-            if total > 100 {
-                out.push_str(&format!("\n\n[{} more files not shown]", total - 100));
-            }
-            format!("{} files found:\n{}", total, out)
-        };
+        // The existence check, the fallback directory walk, and the main
+        // `ignore` walk are all BLOCKING fs syscalls. On a hung filesystem
+        // (e.g. a dead network mount) they would stall the async worker and
+        // make the turn uncancellable, so run the whole search on the blocking
+        // pool — the executor stays responsive and Esc/cancel aborts promptly.
+        let pattern = parsed.pattern.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            glob_search(&search_dir, &name_pattern, &wd, &pattern)
+        })
+        .await
+        .unwrap_or_else(|_| format!("No files matching '{}' (search task failed)", parsed.pattern));
 
         Ok(ToolResult {
             call_id: String::new(),
-            output: result,
+            output,
             success: true,
         })
+    }
+}
+
+/// Synchronous glob search, pulled out of `GlobTool::execute` so it can run
+/// inside `tokio::task::spawn_blocking` — the existence check, the fallback
+/// directory walk, and the main `ignore` walk all block, and on a hung
+/// filesystem they must not stall the async worker (else cancellation hangs).
+/// Returns the formatted output string.
+fn glob_search(
+    search_dir: &str,
+    name_pattern: &str,
+    wd: &std::path::Path,
+    pattern: &str,
+) -> String {
+    // Verify search directory exists. If not, walk the workspace to find
+    // directories with the same basename so the agent can self-correct
+    // without a round of manual `ls`. 2026-04-22: added for P0 #4 after
+    // 426-atom 2026-04-21 session where agent spent 5 turns listing
+    // directories because `/426-atom/index.html` was actually at
+    // `/426-atom/presentation/index.html`.
+    if !std::path::Path::new(search_dir).is_dir() {
+        let target_basename = std::path::Path::new(search_dir)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut dir_matches: Vec<String> = Vec::new();
+        if !target_basename.is_empty() {
+            fn find_dir(
+                dir: &std::path::Path,
+                target: &str,
+                depth: usize,
+                max_depth: usize,
+                results: &mut Vec<String>,
+            ) {
+                if depth > max_depth || results.len() >= 20 {
+                    return;
+                }
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with('.') || super::should_skip_dir(&name) {
+                            continue;
+                        }
+                        let p = entry.path();
+                        if p.is_dir() {
+                            if name == target {
+                                results.push(p.to_string_lossy().to_string());
+                            }
+                            find_dir(&p, target, depth + 1, max_depth, results);
+                        }
+                    }
+                }
+            }
+            find_dir(wd, &target_basename, 0, 5, &mut dir_matches);
+        }
+        let hint = if dir_matches.is_empty() {
+            String::new()
+        } else {
+            dir_matches.sort_by_key(|d| std::cmp::Reverse(super::shared_prefix_len(search_dir, d)));
+            let shown: Vec<String> = dir_matches
+                .iter()
+                .take(3)
+                .map(|d| format!("  {}", d))
+                .collect();
+            format!(
+                "\n\nSimilar directories found — did you mean one of these?\n{}",
+                shown.join("\n")
+            )
+        };
+        return format!(
+            "No files matching '{}' (directory '{}' does not exist){}",
+            pattern, search_dir, hint
+        );
+    }
+
+    // Use the `ignore` crate (ripgrep's walker) for cross-platform file
+    // search. This replaces the previous `Command::new("find")` approach
+    // which failed on Windows because Windows' `find.exe` is a string-
+    // search utility (like grep), not a file-search utility. It also
+    // correctly handles non-ASCII filenames (Chinese, Japanese, etc.)
+    // on all platforms without encoding issues.
+    //
+    // Issue #350: https://gitcode.com/atomgit_atomcode/atomcode/issues/350
+    let mut files: Vec<String> = Vec::new();
+    let search_path = std::path::Path::new(search_dir);
+    let walker = ignore::WalkBuilder::new(search_path)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    for entry in walker.flatten() {
+        let path = entry.path();
+        // Skip directories — we only want files
+        if !path.is_file() {
+            continue;
+        }
+        // Prune skip-dirs (node_modules, .git, .atomcode, …) only BELOW the
+        // explicitly-requested search root. When the agent points glob *at* a
+        // skip-listed dir (e.g. `.atomcode/skills`, `.claude/...`), that dir's
+        // own path segments must not be re-filtered — otherwise the search
+        // always returns empty even though that exact path was requested.
+        // Broad searches stay unaffected: the root is the workspace, so
+        // `.atomcode` is a child component below the root and is still pruned
+        // (and `.hidden(true)` already stops the walker descending into it).
+        if should_skip_below(search_path, path) {
+            continue;
+        }
+        if let Some(file_name) = path.file_name() {
+            let name = file_name.to_string_lossy();
+            if simple_glob_match(&name, name_pattern) {
+                files.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    files.sort();
+
+    if files.is_empty() {
+        format!("No files matching '{}'", pattern)
+    } else {
+        let total = files.len();
+        let shown: Vec<&str> = files.iter().take(100).map(|s| s.as_str()).collect();
+        let mut out = shown.join("\n");
+        if total > 100 {
+            out.push_str(&format!("\n\n[{} more files not shown]", total - 100));
+        }
+        format!("{} files found:\n{}", total, out)
     }
 }
 
@@ -241,6 +257,15 @@ fn should_skip_path(path: &std::path::Path) -> bool {
         }
     }
     false
+}
+
+/// Like [`should_skip_path`], but only inspects components STRICTLY BELOW
+/// `root`. Components of `root` itself are exempt, so a glob aimed directly at
+/// a skip-listed directory (`.atomcode/skills`, `.claude/...`) still returns
+/// its files. Paths not under `root` (shouldn't happen for walker entries)
+/// fall back to checking every component.
+fn should_skip_below(root: &std::path::Path, path: &std::path::Path) -> bool {
+    should_skip_path(path.strip_prefix(root).unwrap_or(path))
 }
 
 /// Simple glob match supporting `*` (match any non-separator chars) and
@@ -342,7 +367,7 @@ fn derive_name_pattern(pattern: &str) -> String {
 mod tests {
     use super::*;
     use crate::tool::ToolContext;
-    use std::path::{Path, PathBuf};
+    
     use tempfile::TempDir;
 
     /// P0 #4: when a glob's search dir doesn't exist, workspace-walk for dirs
@@ -656,6 +681,72 @@ mod tests {
         assert!(
             r.output.contains("Button.vue"),
             "glob must find file under English directory. output: {}",
+            r.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_finds_files_when_explicitly_targeting_skip_listed_dotdir() {
+        // 显式指向 .atomcode/（在 SKIP_DIRS 里的隐藏内部目录）应能搜到其中文件。
+        // 回归：早先 should_skip_path 对路径每一段生效，导致即便显式给出该路径，
+        // 结果里含 `.atomcode` 段就被滤掉，永远返回空。
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".atomcode/skills/coding")).unwrap();
+        std::fs::write(
+            dir.path().join(".atomcode/skills/coding/SKILL.md"),
+            "# skill",
+        )
+        .unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = GlobTool;
+
+        // 形式一：pattern 内含具体的 .atomcode/skills 前缀。
+        let r = tool
+            .execute(r#"{"pattern":".atomcode/skills/**/*.md"}"#, &ctx)
+            .await
+            .unwrap();
+        assert!(r.success, "glob should succeed: {}", r.output);
+        assert!(
+            r.output.contains("SKILL.md"),
+            "glob must find files under an explicitly targeted .atomcode/. output: {}",
+            r.output
+        );
+
+        // 形式二：通过 path 参数显式指向 .atomcode/skills。
+        let r2 = tool
+            .execute(r#"{"pattern":"**/*.md","path":".atomcode/skills"}"#, &ctx)
+            .await
+            .unwrap();
+        assert!(r2.success, "glob should succeed: {}", r2.output);
+        assert!(
+            r2.output.contains("SKILL.md"),
+            "glob must find files when path explicitly points into .atomcode/. output: {}",
+            r2.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_broad_search_still_skips_dotatomcode() {
+        // 广度搜索（根=工作区）仍应跳过 .atomcode/，行为不变。
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".atomcode/skills")).unwrap();
+        std::fs::write(dir.path().join(".atomcode/skills/internal.md"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/visible.md"), "y").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = GlobTool;
+        let r = tool.execute(r#"{"pattern":"**/*.md"}"#, &ctx).await.unwrap();
+        assert!(r.success, "glob should succeed: {}", r.output);
+        assert!(
+            r.output.contains("visible.md"),
+            "broad glob must find visible files. output: {}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("internal.md"),
+            "broad glob must still skip .atomcode/. output: {}",
             r.output
         );
     }

@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use atomcode_core::auth;
+use atomcode_core::{auth, config::Config};
 use atomcode_telemetry::Event;
 
 use crate::{api_config::cleanup_expired_sessions, json_error, AppState, LoginSessionEntry};
@@ -19,6 +19,13 @@ pub(crate) enum LoginPollStep {
 enum BlockingLoginPollStep {
     Pending(LoginSessionEntry),
     Authorized(auth::UserInfo),
+}
+
+pub(crate) fn pending_invite_for_login() -> (Option<String>, Option<uuid::Uuid>) {
+    match atomcode_telemetry::pending_invite::load(&Config::config_dir()) {
+        Some(invite) => (Some(invite.invite_code), Some(invite.install_uuid)),
+        None => (None, None),
+    }
 }
 
 // ============================================================================
@@ -171,8 +178,21 @@ pub(crate) async fn auth_login_poll(
             })
             .into_response(),
             Ok(LoginPollStep::Authorized(user)) => {
-                state_inner.telemetry.set_account_id(Some(user.id.to_string()));
-                state_inner.telemetry.track(Event::LoginSuccess);
+                state_inner
+                    .telemetry
+                    .set_account_id(Some(user.id.to_string()));
+                let (invite_code, install_uuid) = pending_invite_for_login();
+                let event = Event::LoginSuccess {
+                    invite_code,
+                    install_uuid,
+                };
+                if let Err(e) = state_inner.telemetry.track_durable(event.clone()).await {
+                    tracing::warn!(
+                        ?e,
+                        "login_success durable enqueue failed; falling back to async telemetry"
+                    );
+                    state_inner.telemetry.track(event);
+                }
                 Json(LoginPollResponse {
                     status: "authorized".to_string(),
                     user: Some(user),

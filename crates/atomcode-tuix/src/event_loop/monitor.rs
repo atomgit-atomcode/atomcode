@@ -40,8 +40,8 @@ impl CodingPlanWarning {
     /// (e.g. `接口暂不可用`, `当前时间窗口用量约 0%`).
     pub fn display_text(&self) -> String {
         match self {
-            Self::ModelMissing(name) => format!("⚠ '{}' 已下线 — /codingplan", name),
-            Self::StaleList => "ⓘ CodingPlan 模型列表更新 — 可执行/codingplan".into(),
+            Self::ModelMissing(name) => format!("⚠ '{}' 已下线 — /login", name),
+            Self::StaleList => "ⓘ CodingPlan 模型列表更新 — 可执行/login".into(),
         }
     }
 }
@@ -50,7 +50,7 @@ impl CodingPlanWarning {
 /// hit `/coding-plan/models` more than once per this interval within a
 /// single TUI session. Doesn't gate warnings: once a check has run and
 /// drift is detected, the user is told immediately regardless of when
-/// they last ran `/codingplan`. Startup always does one check (the
+/// they last ran `/login`. Startup always does one check (the
 /// in-session `Instant` resets on restart).
 ///
 /// 1 hour is a balance between:
@@ -143,15 +143,25 @@ pub fn spawn_check(
         let fetch: Result<Vec<String>, ()> = tokio::task::spawn_blocking(move || {
             let client =
                 atomcode_core::coding_plan::client::Client::from_stored_auth().map_err(|_| ())?;
-            // Pass `Max` so the response covers every CodingPlan-eligible
-            // model regardless of the user's actual tier; we filter the
-            // user's reachable subset by `plan_available` below. This
-            // sidesteps having to persist the cascade-landed plan_type
-            // anywhere — the drift check just needs the available set
-            // for the current user, which `plan_available=true` is.
-            let models = client
-                .list_models_v2(atomcode_core::coding_plan::PlanType::Max)
-                .map_err(|_| ())?;
+            // Query with the user's ACTUAL tier, not `Max`. `plan_available` is
+            // computed relative to the requested `plan_type` (see `ModelEntry`
+            // docs): a Lite user querying `Max` gets higher-tier models (e.g.
+            // GLM-5.1) marked `plan_available=true` even though their config —
+            // built by setup with their real tier — correctly omits them. That
+            // mismatch fired a permanent "CodingPlan 模型列表更新" false positive.
+            //
+            // Derive the tier from `/status`'s plan_name; skip silently (no
+            // warning) if it can't be determined, rather than guessing `Max`
+            // and re-introducing the bug. This also self-corrects after a plan
+            // upgrade — once status reports the new tier, drift surfaces against
+            // the new model set and prompts a `/login` refresh.
+            let plan_type = client
+                .status_v2()
+                .ok()
+                .and_then(|s| s.codingplan_free)
+                .and_then(|p| atomcode_core::coding_plan::PlanType::from_plan_name(&p.plan_name))
+                .ok_or(())?;
+            let models = client.list_models_v2(plan_type).map_err(|_| ())?;
             Ok(models
                 .into_iter()
                 .filter(|m| m.plan_available)
@@ -272,11 +282,11 @@ mod tests {
     fn display_text_format() {
         assert_eq!(
             CodingPlanWarning::ModelMissing("Kimi-K2".into()).display_text(),
-            "⚠ 'Kimi-K2' 已下线 — /codingplan"
+            "⚠ 'Kimi-K2' 已下线 — /login"
         );
         assert_eq!(
             CodingPlanWarning::StaleList.display_text(),
-            "ⓘ CodingPlan 模型列表更新 — 可执行/codingplan"
+            "ⓘ CodingPlan 模型列表更新 — 可执行/login"
         );
     }
 }

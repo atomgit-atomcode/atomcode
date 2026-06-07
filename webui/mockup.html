@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>atomcode webui — mockup</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    /* 细滚动条，贴近 IDE 观感 */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+    .dark ::-webkit-scrollbar-thumb { background: #475569; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+  <!-- ============ 顶栏 ============ -->
+  <div class="h-screen flex flex-col">
+    <header class="h-12 shrink-0 flex items-center justify-between px-4 border-b border-slate-200 bg-white">
+      <div class="flex items-center gap-2">
+        <span class="font-mono font-bold text-indigo-600">▲ atomcode</span>
+        <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">● daemon 已连接 · :13456</span>
+      </div>
+      <div class="flex items-center gap-3 text-sm">
+        <!-- cwd 面包屑（可点 → 打开目录切换器） -->
+        <button onclick="document.getElementById('cwdModal').style.display='flex'"
+          class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 font-mono text-xs">
+          <span class="text-slate-400">📁</span>
+          <span class="text-slate-400">~/workspace/</span><span class="font-semibold text-slate-700">atomcode</span>
+          <span class="text-slate-400">▾</span>
+        </button>
+        <span class="text-slate-300">|</span>
+        <button class="text-slate-500 hover:text-slate-800">⚙ 配置</button>
+        <span class="text-slate-300">|</span>
+        <span class="text-slate-500">claude-opus-4-8</span>
+      </div>
+    </header>
+
+    <div class="flex-1 flex min-h-0">
+      <!-- ============ 左侧会话栏 ============ -->
+      <aside class="w-64 shrink-0 border-r border-slate-200 bg-white flex flex-col">
+        <div class="p-3">
+          <button class="w-full py-2 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700">＋ 新建会话</button>
+        </div>
+        <div class="px-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wide">最近会话</div>
+        <div class="flex-1 overflow-y-auto px-2 space-y-1">
+          <div class="px-3 py-2 rounded-lg bg-indigo-50 border border-indigo-200 cursor-pointer">
+            <div class="text-sm font-medium truncate">重构 webui 鉴权中间件</div>
+            <div class="text-xs text-slate-400">~/workspace/atomcode · 12 条</div>
+          </div>
+          <div class="px-3 py-2 rounded-lg hover:bg-slate-50 cursor-pointer">
+            <div class="text-sm truncate">修复 SSE 流式断连</div>
+            <div class="text-xs text-slate-400">~/workspace/atomcode · 8 条</div>
+          </div>
+          <div class="px-3 py-2 rounded-lg hover:bg-slate-50 cursor-pointer">
+            <div class="text-sm truncate">给 daemon 加 token 校验</div>
+            <div class="text-xs text-slate-400">~/workspace/atomcode · 31 条</div>
+          </div>
+          <div class="px-3 py-2 rounded-lg hover:bg-slate-50 cursor-pointer">
+            <div class="text-sm truncate">i18n 文案对齐 zh/en</div>
+            <div class="text-xs text-slate-400">~/site · 5 条</div>
+          </div>
+        </div>
+        <div class="p-3 border-t border-slate-200 text-xs text-slate-400">
+          已登录 · cn2778823577
+        </div>
+      </aside>
+
+      <!-- ============ 中间聊天区 ============ -->
+      <main class="flex-1 flex flex-col min-w-0 bg-slate-50">
+        <div class="flex-1 overflow-y-auto p-6 space-y-5">
+
+          <!-- 用户消息 -->
+          <div class="flex justify-end">
+            <div class="max-w-2xl px-4 py-2.5 rounded-2xl rounded-br-sm bg-indigo-600 text-white text-sm">
+              帮我把 daemon 的 /chat 权限从 BypassAll 改成交互式审批
+            </div>
+          </div>
+
+          <!-- assistant 文本气泡 -->
+          <div class="flex justify-start">
+            <div class="max-w-2xl px-4 py-3 rounded-2xl rounded-bl-sm bg-white border border-slate-200 text-sm leading-relaxed shadow-sm">
+              好的，我先读 <code class="px-1 bg-slate-100 rounded font-mono text-xs">crates/atomcode-daemon/src/main.rs</code> 里 <code class="px-1 bg-slate-100 rounded font-mono text-xs">chat_stream</code> 的权限构造处，确认怎么接 <code class="px-1 bg-slate-100 rounded font-mono text-xs">InteractivePermissionDecider</code>。
+            </div>
+          </div>
+
+          <!-- 工具调用行：已完成 -->
+          <div class="flex justify-start">
+            <div class="max-w-2xl w-full">
+              <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-100 border border-slate-200 text-xs font-mono">
+                <span class="text-emerald-600">✓</span>
+                <span class="font-semibold text-slate-700">read_file</span>
+                <span class="text-slate-400 truncate">crates/atomcode-daemon/src/main.rs · 2000-2110</span>
+                <span class="ml-auto text-slate-400">耗时 0.2s</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- assistant 继续 -->
+          <div class="flex justify-start">
+            <div class="max-w-2xl px-4 py-3 rounded-2xl rounded-bl-sm bg-white border border-slate-200 text-sm leading-relaxed shadow-sm">
+              找到了 <span class="text-slate-500">(main.rs:2051)</span>。现在把它替换为交互式 decider，并写回文件：
+            </div>
+          </div>
+
+          <!-- 工具调用行：进行中（待批准） -->
+          <div class="flex justify-start">
+            <div class="max-w-2xl w-full">
+              <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-50 border border-amber-300 text-xs font-mono">
+                <span class="text-amber-500 animate-pulse">●</span>
+                <span class="font-semibold text-slate-700">edit_file</span>
+                <span class="text-slate-400 truncate">crates/atomcode-daemon/src/main.rs</span>
+                <span class="ml-auto text-amber-600">等待批准…</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- assistant 流式中（光标） -->
+          <div class="flex justify-start">
+            <div class="max-w-2xl px-4 py-3 rounded-2xl rounded-bl-sm bg-white border border-slate-200 text-sm leading-relaxed shadow-sm">
+              这个改动会替换权限构造并注册 response channel<span class="inline-block w-1.5 h-4 align-middle bg-slate-400 ml-0.5 animate-pulse"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- token 用量条 -->
+        <div class="px-6 py-1.5 text-xs text-slate-400 flex gap-4 border-t border-slate-100 bg-white/60">
+          <span>↑ 12.4k tokens</span>
+          <span>↓ 3.1k tokens</span>
+          <span class="ml-auto">上下文 18% · 36k / 200k</span>
+        </div>
+
+        <!-- 输入框 -->
+        <div class="p-4 border-t border-slate-200 bg-white">
+          <div class="flex items-end gap-2 rounded-xl border border-slate-300 focus-within:border-indigo-500 px-3 py-2">
+            <textarea rows="1" placeholder="输入消息，Enter 发送…" class="flex-1 resize-none outline-none text-sm bg-transparent"></textarea>
+            <button class="shrink-0 px-4 py-1.5 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700">发送</button>
+          </div>
+          <div class="mt-1.5 text-xs text-slate-400 flex gap-3">
+            <span>@文件</span><span>/命令</span><span class="ml-auto">cwd: ~/workspace/atomcode</span>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- ============ 工具批准卡片（modal） ============ -->
+  <div id="permModal" class="fixed inset-0 bg-black/40 flex items-center justify-center p-4" style="display:none">
+    <div class="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden">
+      <div class="px-5 py-4 border-b border-slate-200 flex items-center gap-2">
+        <span class="text-amber-500 text-xl">⚠</span>
+        <h3 class="font-semibold text-base">工具请求批准</h3>
+        <span class="ml-auto font-mono text-xs px-2 py-0.5 rounded bg-amber-100 text-amber-700">edit_file</span>
+      </div>
+      <div class="px-5 py-4 space-y-3">
+        <p class="text-sm text-slate-600">即将修改文件，需要你确认：</p>
+        <div class="text-xs font-mono text-slate-500">crates/atomcode-daemon/src/main.rs</div>
+        <pre class="bg-slate-900 text-slate-100 rounded-lg p-3 text-xs overflow-x-auto leading-relaxed"><span class="text-rose-400">- let permission = Box::new(AutoPermissionDecider::new(BypassAll));</span>
+<span class="text-emerald-400">+ let permission = Box::new(InteractivePermissionDecider::new(</span>
+<span class="text-emerald-400">+     perm_req_tx, perm_resp_rx, perm_store,</span>
+<span class="text-emerald-400">+ ));</span></pre>
+      </div>
+      <div class="px-5 py-3 bg-slate-50 border-t border-slate-200 flex gap-2 justify-end">
+        <button onclick="document.getElementById('permModal').style.display='none'" class="px-3.5 py-1.5 rounded-lg bg-white border border-slate-300 text-sm hover:bg-slate-100">拒绝</button>
+        <button onclick="document.getElementById('permModal').style.display='none'" class="px-3.5 py-1.5 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700">批准一次</button>
+        <button onclick="document.getElementById('permModal').style.display='none'" class="px-3.5 py-1.5 rounded-lg bg-emerald-600 text-white text-sm hover:bg-emerald-700">本会话总是允许</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 工作目录切换器（modal） ============ -->
+  <div id="cwdModal" class="fixed inset-0 bg-black/40 flex items-center justify-center p-4" style="display:none">
+    <div class="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden">
+      <div class="px-5 py-4 border-b border-slate-200 flex items-center gap-2">
+        <span class="text-xl">📁</span>
+        <h3 class="font-semibold text-base">切换工作目录</h3>
+        <span class="ml-auto text-xs text-slate-400">仅影响当前会话</span>
+      </div>
+
+      <!-- 手动输入 + 面包屑浏览 -->
+      <div class="px-5 py-4 space-y-4">
+        <div>
+          <label class="text-xs font-semibold text-slate-400 uppercase">路径</label>
+          <div class="mt-1 flex gap-2">
+            <input value="~/workspace/atomcode" class="flex-1 border border-slate-300 rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-indigo-500" />
+            <button class="px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm">跳转</button>
+          </div>
+          <p class="mt-1 text-xs text-slate-400">支持 <code class="font-mono">~</code> 展开。下方可浏览子目录（GET /fs/list）。</p>
+        </div>
+
+        <!-- 目录浏览器（面包屑 + 子目录列表） -->
+        <div class="border border-slate-200 rounded-lg overflow-hidden">
+          <div class="px-3 py-2 bg-slate-50 border-b border-slate-200 text-xs font-mono text-slate-500 flex items-center gap-1">
+            <span class="hover:text-indigo-600 cursor-pointer">~</span><span>/</span>
+            <span class="hover:text-indigo-600 cursor-pointer">workspace</span><span>/</span>
+            <span class="font-semibold text-slate-700">atomcode</span>
+          </div>
+          <div class="max-h-44 overflow-y-auto text-sm">
+            <div class="px-3 py-1.5 hover:bg-indigo-50 cursor-pointer flex items-center gap-2"><span class="text-slate-400">📁</span> crates</div>
+            <div class="px-3 py-1.5 hover:bg-indigo-50 cursor-pointer flex items-center gap-2"><span class="text-slate-400">📁</span> webui</div>
+            <div class="px-3 py-1.5 hover:bg-indigo-50 cursor-pointer flex items-center gap-2"><span class="text-slate-400">📁</span> docs</div>
+            <div class="px-3 py-1.5 hover:bg-indigo-50 cursor-pointer flex items-center gap-2"><span class="text-slate-400">📁</span> scripts</div>
+            <div class="px-3 py-1.5 hover:bg-indigo-50 cursor-pointer flex items-center gap-2"><span class="text-slate-400">📁</span> site</div>
+          </div>
+        </div>
+
+        <!-- 最近项目（GET /projects） -->
+        <div>
+          <label class="text-xs font-semibold text-slate-400 uppercase">最近项目</label>
+          <div class="mt-1 space-y-1">
+            <div class="px-3 py-2 rounded-lg bg-indigo-50 border border-indigo-200 cursor-pointer text-sm flex items-center justify-between">
+              <span class="font-mono">~/workspace/atomcode</span><span class="text-xs text-emerald-600">● 当前</span>
+            </div>
+            <div class="px-3 py-2 rounded-lg hover:bg-slate-50 cursor-pointer text-sm font-mono">~/site</div>
+            <div class="px-3 py-2 rounded-lg hover:bg-slate-50 cursor-pointer text-sm font-mono">~/work/api-gateway</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="px-5 py-3 bg-slate-50 border-t border-slate-200 flex items-center gap-2 justify-end">
+        <label class="mr-auto flex items-center gap-1.5 text-xs text-slate-500">
+          <input type="checkbox" class="rounded" /> 同时设为 daemon 默认目录（POST /cd，影响所有客户端）
+        </label>
+        <button onclick="document.getElementById('cwdModal').style.display='none'" class="px-3.5 py-1.5 rounded-lg bg-white border border-slate-300 text-sm hover:bg-slate-100">取消</button>
+        <button onclick="document.getElementById('cwdModal').style.display='none'" class="px-3.5 py-1.5 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右下角：重新唤出 modal 的小按钮，方便你预览 -->
+  <div class="fixed bottom-4 right-4 flex gap-2">
+    <button onclick="document.getElementById('cwdModal').style.display='flex'" class="px-3 py-2 rounded-full bg-slate-700 text-white text-xs shadow-lg">📁 预览目录切换器</button>
+    <button onclick="document.getElementById('permModal').style.display='flex'" class="px-3 py-2 rounded-full bg-slate-800 text-white text-xs shadow-lg">▶ 预览批准卡片</button>
+  </div>
+</body>
+</html>

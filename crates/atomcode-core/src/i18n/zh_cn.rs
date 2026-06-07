@@ -14,7 +14,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeOptionSkip => "暂时跳过".into(),
         Msg::WelcomeOptionSkipHint => "稍后再说".into(),
 
-        // ── /codingplan ──
+        // ── /login（完整配置流程） ──
         Msg::CodingPlanSetupFailed { error } =>
             format!("CodingPlan 设置失败：{error}").into(),
         Msg::CpReauthAfter401 =>
@@ -28,20 +28,22 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpStepSkipped { reason } =>
             format!("  ✓ {}\n", reason).into(),
         Msg::CpLoginFailed { error } =>
-            format!("  ✗ 登录失败 — {}\n", error).into(),
+            format!("  × 登录失败 — {}\n", error).into(),
         Msg::CpClaimed { message, plan_type } =>
             format!("  ✓ CodingPlan 已领取 — {}（CodingPlan {}）\n", message, plan_type).into(),
         Msg::CpClaimSuccessFallback => "成功".into(),
         Msg::CpAlreadyClaimed { reason } =>
             format!("  ✓ CodingPlan 已领取 — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  ✗ CodingPlan 领取失败 — {}\n", error).into(),
+            format!("  × CodingPlan 套餐配置失败 — {}\n", error).into(),
+        Msg::CpClaimFailedBare =>
+            "  × CodingPlan 套餐配置失败\n".into(),
         Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✓ CodingPlan {} 领取成功\n", tier).into(),
+            format!("  ✓ CodingPlan {} 生效\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✓ CodingPlan {} 已领取\n", tier).into(),
+            format!("  ✓ CodingPlan {} 生效\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  ✗ CodingPlan {} 领取失败 — {}\n", tier, reason).into(),
+            format!("  × CodingPlan {} 套餐配置失败 — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
             format!("  ✓ 已添加 {} 个 Provider：\n", count).into(),
         Msg::CpLocked { name } =>
@@ -49,8 +51,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             // 是亮色）让终端按当前主题映射 —— Solarized / Dracula /
             // 浅色模式都会落到各自的「红」上，不会被一个写死的 RGB
             // 锁住。retained 渲染器走严格 sanitizer 会把 SGR 剥光，
-            // 但 `✗ … （需要升级成 Pro 以上套餐）` 文本本身仍能传达含义。
-            format!("      \x1b[31m✗ {}  （需要升级成 Pro 以上套餐）\x1b[39m\n", name).into(),
+            // 但 `× … （需要升级成 Pro 以上套餐）` 文本本身仍能传达含义。
+            format!("      \x1b[31m× {}  （需要升级成 Pro 以上套餐）\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  （默认）".into(),
@@ -63,7 +65,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpModelsSkipped { reason } =>
             format!("  ✓ 模型步骤已跳过 — {}\n", reason).into(),
         Msg::CpModelsFailed { error } =>
-            format!("  ✗ 模型步骤失败 — {}\n", error).into(),
+            format!("  × 模型步骤失败 — {}\n", error).into(),
         Msg::CpStatusHeader =>
             "  ✓ CodingPlan 状态：\n".into(),
         Msg::CpPlanPending { plan } =>
@@ -75,6 +77,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::CpUsageLine { usage, reset_at, duration } =>
             format!("      用量：{}  ·  重置于 {}（{} 后）\n", usage, reset_at, duration).into(),
+        Msg::CpMonthlyQuotaExhausted { duration } =>
+            format!("      用量：本月用量已耗尽，等 {} 后再使用\n", duration).into(),
         Msg::CpWindowQuotaExhausted =>
             "      ⚠ 当前窗口配额已耗尽\n".into(),
         Msg::CpWindowQuotaHint { hint } =>
@@ -88,7 +92,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
              https://atomgit.com/atomgit_atomcode/atomcode/releases 下载安装。",
         ),
         Msg::CpAuthRequired => Cow::Borrowed(
-            "未登录 AtomCode CodingPlan。请运行 /codingplan 完成登录后再发送请求。",
+            "未登录 AtomCode CodingPlan。请运行 /login 完成登录后再发送请求。",
         ),
         Msg::CpSignStaleClockSkew => Cow::Borrowed(
             "请求被服务端拒绝：签名时间戳已过期。请校准本地系统时间（NTP 同步）后重试。",
@@ -109,14 +113,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 状态栏 ──
         Msg::StatusNoProvider =>
             "未配置 Provider · 使用 /provider 配置".into(),
+        Msg::StatusOfficialBuildRequired =>
+            "CodingPlan 需要官方构建".into(),
         Msg::StatusUpgradeHint { version } =>
             format!("↑ {version} 可用 · 使用 /upgrade 升级").into(),
+        Msg::StatusUpgradeHintPm { version } =>
+            format!("↑ {version} 可用 · 运行 brew upgrade atomcode 升级").into(),
         Msg::StatusModelNotConfigured =>
             "（未配置）".into(),
         Msg::StatusClipboardImageHint =>
             "剪贴板有图片 · ctrl+v 粘贴".into(),
         Msg::StatusClipboardImageHintSlash =>
             "剪贴板有图片 · /paste 粘贴".into(),
+        Msg::StatusWebuiHint =>
+            "提示：使用 /webui 在浏览器中打开 AtomCode".into(),
 
         // ── /status 命令主体 ──
         Msg::StatusBody { model, dir, config, tokens } =>
@@ -125,18 +135,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
                 model, dir, config, tokens,
             ).into(),
         Msg::StatusCpNotSignedIn =>
-            "  CodingPlan：（未登录 — 运行 /codingplan 进行配置）\n".into(),
+            "  CodingPlan：（未登录 — 运行 /login 进行配置）\n".into(),
         Msg::StatusCpFetchFailed { error } =>
             format!("  CodingPlan：（状态获取失败 — {}）\n", error).into(),
         Msg::StatusCpNoActive =>
-            "  CodingPlan：（无激活套餐 — 运行 /codingplan）\n".into(),
+            "  CodingPlan：（无激活套餐 — 运行 /login）\n".into(),
         Msg::StatusCpLine { plan, expires_at, remaining_days, total_days } =>
             format!(
                 "  CodingPlan：{}  ·  到期 {}（{}d / 共 {}d）\n",
                 plan, expires_at, remaining_days, total_days,
             ).into(),
-        Msg::StatusCpUsage { usage, reset_at, seconds } =>
-            format!("  用量：{}  ·  重置于 {}（{}s 后）\n", usage, reset_at, seconds).into(),
+        Msg::StatusCpUsage { usage, reset_at, duration } =>
+            format!("  用量：{}  ·  重置于 {}（{} 后）\n", usage, reset_at, duration).into(),
+        Msg::StatusCpMonthlyExhausted { duration } =>
+            format!("  ⚠ 本月用量已耗尽，等 {} 后再使用\n", duration).into(),
         Msg::StatusCpWindowExhausted =>
             "  ⚠ 当前窗口配额已耗尽\n".into(),
         Msg::StatusCpWindowHint { hint } =>
@@ -146,14 +158,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusInstructionPresent { path, label } =>
             format!("    ✓ {} ({})\n", path, label).into(),
         Msg::StatusInstructionMissing { label } =>
-            format!("    ✗ {} — 未找到\n", label).into(),
-
-        // ── /login 完成提示 ──
-        Msg::LoginSignedInWithCpHint { name, username } =>
-            format!(
-                "  已登录：{}（{}）。现在可以开始对话；运行 /codingplan 同步最新的模型权限。\n",
-                name, username,
-            ).into(),
+            format!("    × {} — 未找到\n", label).into(),
 
         // ── 帮助 ──
         Msg::HelpAvailableCommands =>
@@ -180,6 +185,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
   ── 历史 ──
     Up                               上一条输入
     Down                             下一条输入
+
+  ── 翻看输出 ──
+    用终端原生 scrollback（cmd+↑/↓、鼠标滚轮、tmux copy-mode 等都生效）
+    鼠标拖选 + Ctrl+C                复制（atomcode 不接管鼠标）
 
   ── 会话 ──
     Ctrl+C                           取消当前轮 / 关闭弹层
@@ -219,6 +228,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderMenuDeleteDesc => "移除 Provider".into(),
         Msg::ProviderMenuSetDefault => "设为默认".into(),
         Msg::ProviderMenuSetDefaultDesc => "切换默认 Provider".into(),
+        Msg::ProviderImportPrompt =>
+            "粘贴模板自动识别（curl / JSON / TOML），或直接回车手动填写：".into(),
+        Msg::ProviderImportParsed { base_url, type_name, model } =>
+            format!("已识别：{base_url} · {type_name} · {model}").into(),
+        Msg::ProviderImportFailed =>
+            "未能识别为模板，请重贴 curl / JSON / TOML，或留空回车手动填写。".into(),
         Msg::ProviderNoProviders =>
             "尚未配置任何 Provider。".into(),
         Msg::ProviderDeleteConfirm { name } =>
@@ -237,7 +252,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepTypeWithHint { current } =>
             format!("类型？[{current}]（openai / claude / ollama，留空保持不变）").into(),
         Msg::ProviderStepBaseUrl =>
-            "Base URL？（留空使用默认值）".into(),
+            "Base URL？（例：https://api.deepseek.com/v1）".into(),
         Msg::ProviderStepBaseUrlWithHint { current } =>
             format!("Base URL？[{current}]（留空保持不变）").into(),
         Msg::ProviderDefaultHint => "Provider 默认值".into(),
@@ -251,12 +266,19 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepModelWithHint { current } =>
             format!("模型？[{current}]（留空保持不变）").into(),
         Msg::ProviderNameEmpty => "名称不能为空。".into(),
+        Msg::ProviderBaseUrlEmpty => "Base URL 不能为空。".into(),
         Msg::ProviderUnknownType =>
             "未知类型。请选择 openai / claude / ollama。".into(),
         Msg::ProviderUnknownTypeEdit =>
             "未知类型。请选择 openai / claude / ollama 或留空。".into(),
         Msg::ProviderModelEmpty => "模型不能为空。".into(),
         Msg::ProviderEditKeep => "（保持不变）".into(),
+        Msg::ProviderTypeInferred { type_name } =>
+            format!("已识别类型：{type_name}").into(),
+        Msg::ProviderStepNameDefault { default } =>
+            format!("Provider 名称？[{default}]（留空使用此名）").into(),
+        Msg::ProviderStepProgress { current, total } =>
+            format!("（{current}/{total}）").into(),
 
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
@@ -287,6 +309,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("保存会话失败：{error}。未持久化新名称。").into(),
         Msg::SessionNoneSelected =>
             "未选中会话".into(),
+        Msg::SessionDeleted { name } =>
+            format!("「{name}」已删除").into(),
+        Msg::SessionDeleteConfirm { name } =>
+            format!("再按 Ctrl+D 确认删除「{name}」").into(),
+        Msg::SessionDeleteFailed { error } =>
+            format!("删除会话失败：{error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: 确认, Esc: 取消]").into(),
 
@@ -312,7 +340,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueCreated { number, title, url } =>
             format!("  [issue] ✓ 已创建 #{number}：{title}\n  {url}\n").into(),
         Msg::IssueCreateFailed { error } =>
-            format!("  [issue] ✗ 创建失败：{error}\n").into(),
+            format!("  [issue] × 创建失败：{error}\n").into(),
         Msg::IssueRequiredField { field } =>
             format!("（必填 — 请输入 {field}，或按 Esc 取消）").into(),
 
@@ -333,11 +361,16 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "添加自定义模型".into(),
         Msg::IdleHintProviderFull =>
             "使用 /provider 添加自定义模型".into(),
-        Msg::IdleHintCodingplan => "/codingplan".into(),
+        Msg::IdleHintCodingplan => "/login".into(),
         Msg::IdleHintCodingplanSuffix =>
             "领取免费 Token 额度".into(),
         Msg::IdleHintCodingplanFull =>
-            "使用 /codingplan 领取免费 Token 额度".into(),
+            "使用 /login 领取免费 Token 额度".into(),
+        Msg::IdleHintWebui => "/webui".into(),
+        Msg::IdleHintWebuiSuffix =>
+            "在浏览器中同步会话".into(),
+        Msg::IdleHintWebuiFull =>
+            "使用 /webui 在浏览器中同步会话".into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>
@@ -366,6 +399,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("重载失败：{error}（保留先前配置）").into(),
         Msg::CmdUndoNotSupported =>
             "  撤销功能暂不支持。\n".into(),
+        Msg::CmdUndoDone { target, last } =>
+            format!("  ↩ 已退回到第 {target} 轮之前（删除第 {target}~{last} 轮）。你的提示词已填回输入框。\n").into(),
+        Msg::CmdUndoDiskWarning =>
+            "  ⚠ 仅回滚了对话记忆，磁盘文件未恢复。如需还原代码，请手动处理或用 /diff 查看。\n".into(),
+        Msg::CmdUndoNoTurns =>
+            "  没有可撤销的轮次。\n".into(),
+        Msg::CmdUndoOutOfRange { requested, available } =>
+            format!("  无效的轮次 {requested}（当前共 {available} 轮）。\n").into(),
+        Msg::CmdUndoBusy =>
+            "  当前回合进行中，无法撤销——请先按 Esc 取消。\n".into(),
+        Msg::CmdUndoBadArg =>
+            "  用法：/undo 或 /undo N（N 为轮次号）。\n".into(),
         Msg::CmdNoChanges =>
             "  （无变更）\n".into(),
         Msg::CmdCheckingUpdate =>
@@ -415,23 +460,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ 终端不支持增强键盘协议。\n    请使用 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
         Msg::KbdHintOther =>
             "  ⚠ 终端不支持增强键盘协议。\n    请使用 Alt+Enter 或 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
-
-        // ── JediTerm / conhost 回退 ──
-        Msg::JediTermFallback =>
-            "  ⓘ 检测到 JetBrains IDE 终端 — 运行在备用屏幕模式下。\n    \
-            使用鼠标滚轮、PageUp/PageDown 或 Shift+Up/Down 滚动历史。\n    \
-            AtomCode 运行期间无法使用宿主终端的原生回滚；\n    \
-            退出后宿主终端将恢复到 AtomCode 之前的状态。\n    \
-            设置 ATOMCODE_PLAIN=1 使用基础 CI 风格输出，或\n    \
-            设置 ATOMCODE_RETAIN=1 绕过此回退（可能导致对齐问题）。\n\n".into(),
-        Msg::LegacyConhostFallback =>
-            "  ⓘ 检测到旧版 Windows 控制台 — 运行在备用屏幕模式下。\n    \
-            使用鼠标滚轮、PageUp/PageDown 或 Shift+Up/Down 滚动历史。\n    \
-            AtomCode 运行期间无法使用宿主终端的原生回滚。\n    \
-            要获得完整的宿主终端回滚支持，请安装 Windows Terminal\n    \
-            （免费，Microsoft Store）、ConEmu、Alacritty 或 WezTerm。\n    \
-            设置 ATOMCODE_PLAIN=1 使用基础输出，或设置 ATOMCODE_RETAIN=1\n    \
-            绕过此回退（滚动时可能出现重复内容）。\n\n".into(),
 
         // ── 后台任务 ──
         Msg::BackgroundComplete { turns } =>
@@ -498,6 +526,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("git diff 失败：{}", error).into(),
 
         // ── /upgrade ──
+        Msg::UpgradePackageManaged =>
+            "本版本由 HarmonyBrew 管理，请运行 `brew upgrade atomcode` 升级".into(),
         Msg::UpgradeUnknownArg { arg } =>
             format!("未知的 /upgrade 参数：{}\n  用法：/upgrade [rollback|--force]", arg).into(),
 
@@ -557,11 +587,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpServerConnected { name } =>
             format!("✓ MCP 服务 '{name}' 已连接").into(),
         Msg::McpServerFailed { name, error } =>
-            format!("✗ MCP 服务 '{name}' 失败：{error}").into(),
+            format!("× MCP 服务 '{name}' 失败：{error}").into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP 服务 '{name}' 已为 .{ext} 启动").into(),
         Msg::LspServerFailed { name, ext, error } =>
-            format!("✗ LSP 服务 '{name}'（.{ext}）失败：{error}").into(),
+            format!("× LSP 服务 '{name}'（.{ext}）失败：{error}").into(),
 
         // ── /worktree ──
         Msg::WorktreeUsage =>
@@ -622,9 +652,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SetupSkippedRow { kind, slug, reason } =>
             format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
         Msg::SetupFailedRow { kind, slug, error } =>
-            format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+            format!("  × {}:{} — {}\n", kind, slug, error).into(),
         Msg::CmdSetupTip =>
-            "\u{1f4a1} 提示：运行 \x1b[1;96m/setup\x1b[0m 可自动为该项目配置 hooks、skills 和 MCP。".into(),
+            // No leading emoji — U+1F4A1 has ambiguous terminal display
+            // width and desynced the line's cell layout on some terminals.
+            // CJK chars below have stable width-2 so they're fine.
+            "提示：运行 \x1b[1;96m/setup\x1b[0m 可自动为该项目配置 hooks、skills 和 MCP。".into(),
         Msg::CmdSetupRunning =>
             "正在运行 atomcode setup...".into(),
         Msg::CmdSetupSkillsReloaded { count } =>
@@ -638,13 +671,21 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── /plugin ──
         Msg::PluginUsage =>
-            "用法：/plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]".into(),
+            "用法：/plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | reload | list]".into(),
         Msg::PluginMarketplaceUsage =>
             "用法：/plugin marketplace [add|remove|update|list] <参数>".into(),
         Msg::PluginInstallUsage =>
-            "用法：/plugin install <插件>@<市场>".into(),
+            "用法：/plugin install <插件名> 或 <插件>@<市场>".into(),
+        Msg::PluginInstallNotFound { plugin } =>
+            format!("未在任何市场中找到插件 `{plugin}`。使用 /plugin marketplace list 查看已注册的市场。").into(),
+        Msg::PluginInstallAmbiguous { plugin } =>
+            format!("插件 `{plugin}` 存在于多个市场中，请指定：").into(),
         Msg::PluginUninstallUsage =>
-            "用法：/plugin uninstall <插件>@<市场>".into(),
+            "用法：/plugin uninstall <插件名> 或 <插件>@<市场>".into(),
+        Msg::PluginUninstallNotFound { plugin } =>
+            format!("插件 `{plugin}` 未安装。使用 /plugin list 查看已安装插件。").into(),
+        Msg::PluginUninstallAmbiguous { plugin } =>
+            format!("插件 `{plugin}` 从多个市场安装，请指定卸载哪一个：\n").into(),
         Msg::PluginNoMarketplaces =>
             "未注册任何市场".into(),
         Msg::PluginMarketplacesHeader =>
@@ -665,21 +706,63 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出 marketplace 失败：{error}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
+        Msg::PluginInstallingByName { plugin } =>
+            format!("正在安装 `{plugin}`…").into(),
+        Msg::PluginAlreadyInstalled { id } =>
+            format!("  插件 `{id}` 已安装。\n  PS: 如需重新安装，请先执行 `/plugin uninstall {id}`，然后再执行 `/plugin install {id}`\n").into(),
+        Msg::PluginMgrBrowse => "浏览并安装".into(),
+        Msg::PluginMgrAdd => "添加市场…".into(),
+        Msg::PluginMgrRemove => "移除市场…".into(),
+        Msg::PluginMgrInstalled { count } => format!("已安装 ({count})").into(),
+        Msg::PluginMgrInstalledMark => "✓ 已安装".into(),
+        Msg::PluginMgrHintNav => "↑/↓ 选择 · ⏎ 进入 · esc 返回".into(),
+        Msg::PluginMgrHintToggle => "⏎ 安装/卸载 · esc 返回".into(),
+        Msg::PluginMgrHintRemove => "⏎ 移除 · esc 返回".into(),
+        Msg::PluginMgrHintUninstall => "⏎ 卸载 · esc 返回".into(),
+        Msg::PluginMgrHintUrl => "输入/粘贴 git URL · ⏎ 添加 · esc 取消".into(),
+Msg::PluginMgrHintPending => "安装中，请稍候… · esc 返回".into(),
+Msg::PluginMgrInstallingLabel => "安装中…".into(),
+        Msg::PluginMgrEmptyMarketplaces => "暂无市场，请选「添加市场…」 · esc 返回".into(),
+        Msg::PluginMgrEmptyPlugins => "该市场暂无插件 · esc 返回".into(),
+        Msg::PluginMgrEmptyInstalled => "暂无已安装插件 · esc 返回".into(),
+        Msg::PluginMgrCloning => "正在克隆市场…".into(),
+        Msg::PluginMgrInstalling { plugin } => format!("正在安装 {plugin}…").into(),
+Msg::PluginMgrEscToCancel => "Esc 取消".into(),
+Msg::PluginScopeUser => "为你安装（用户级）".into(),
+Msg::PluginScopeUserDesc => "~/.atomcode/plugins — 所有项目可见".into(),
+Msg::PluginScopeProject => "为所有协作者安装（项目级）".into(),
+Msg::PluginScopeProjectDesc => ".atomcode/plugins — 通过 git 共享".into(),
+Msg::PluginScopeLocal => "仅在本仓库为你安装（本地级）".into(),
+Msg::PluginScopeLocalDesc => ".atomcode/plugins/local — 不提交到 git".into(),
+Msg::PluginScopeHint => "↑↓ 选择范围 · Enter 确认 · Esc 返回".into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("已卸载 `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
             format!("卸载失败：{error}").into(),
         Msg::PluginListFailed { error } =>
             format!("列出插件失败：{error}").into(),
+        Msg::PluginReloadDone { skills, warnings } =>
+            format!("插件已重新加载：{skills} 个 skill，{warnings} 个警告").into(),
+        Msg::PluginGitNotFound =>
+            "💡 当前环境未安装 git 或 git 不在 PATH 中，插件市场自动安装和自动更新已禁用。请安装 git（macOS 可执行 `xcode-select --install`，Ubuntu 可执行 `sudo apt install git`）后重启 AtomCode。".into(),
+        Msg::PluginMarketplaceAdded { name, commit, count } =>
+            format!("✓ 已添加 marketplace `{name}`（commit {commit}，共 {count} 个插件）").into(),
+        Msg::PluginMarketplaceUpdated { name, commit } =>
+            format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
+        Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
+            let hint = if show_details_hint { "  （按 Ctrl+O 查看详情）" } else { "" };
+            format!("✓ 已安装 `{plugin}@{marketplace}` —— 加载 {loaded} 个 skill，跳过 {skipped} 个{hint}").into()
+        }
+        Msg::SetupAutoReloaded { skills, warnings } =>
+            format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),
 
         // ── 命令描述 ──
+        Msg::CmdDescWebui => "启动浏览器 webui（子命令：stop / lan / --host <地址>）".into(),
 Msg::CmdDescSetup =>
 "扫描项目、安装种子文件并运行 setup skill [hooks|mcp|skills|all]".into(),
-        Msg::CmdDescCodingplan =>
-            "领取 CodingPlan 并从计划的模型列表中配置模型".into(),
         Msg::CmdDescResume => "恢复上次会话".into(),
         Msg::CmdDescRename => "重命名当前会话".into(),
-        Msg::CmdDescLogin => "使用 AtomGit OAuth 登录".into(),
+        Msg::CmdDescLogin => "使用 AtomGit OAuth 登录并领取 CodingPlan 模型".into(),
         Msg::CmdDescLogout => "退出 AtomGit 登录".into(),
         Msg::CmdDescWhoami => "显示当前登录用户".into(),
         Msg::CmdDescModel => "切换 Provider / 模型".into(),
@@ -701,21 +784,50 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescForget => "删除匹配的记忆".into(),
         Msg::CmdDescMemory => "显示所有已保存的记忆".into(),
         Msg::CmdDescMcp => "显示 MCP 服务器状态（子命令：reload）".into(),
-        Msg::CmdDescUndo => "撤销上次变更（暂不支持）".into(),
+        Msg::CmdDescUndo => "撤销：把对话记忆回退一轮（/undo 或 /undo N）".into(),
         Msg::CmdDescWorktree => "Git 工作树隔离（create/list/done/cleanup）".into(),
         Msg::CmdDescUpgrade => "升级到最新版本（子命令：rollback）".into(),
         Msg::CmdDescIssue => "为 AtomCode 报告 Bug / 提出功能建议（交互式向导）".into(),
         Msg::CmdDescPlan => "切换到 Plan 模式（只读探索）".into(),
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),
+        Msg::CmdDescEffort => "DeepSeek 推理强度控制（high / max / off）".into(),
         Msg::CmdDescHelp => "显示帮助".into(),
         Msg::CmdDescKeys => "显示键盘快捷键".into(),
         Msg::CmdDescLanguage => "切换显示语言".into(),
         Msg::CmdDescQuit => "退出 AtomCode".into(),
         Msg::CmdDescSkills => "浏览已加载的技能".into(),
-        Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, list）".into(),
+        Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
+        Msg::CmdDescGuide => "向 atomcode-guide 提问使用方法".into(),
+        Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
+        Msg::GuideMenuTopics => "常用话题：".into(),
+        Msg::GuideMenuGettingStarted => "怎么开始使用          首次安装、登录、配置".into(),
+        Msg::GuideMenuSwitchModel => "怎么切换模型          /model /provider 操作".into(),
+        Msg::GuideMenuMcp => "怎么用 MCP            MCP 服务器配置与管理".into(),
+        Msg::GuideMenuSkills => "怎么用技能和插件       /skills /plugin 使用".into(),
+        Msg::GuideMenuMemory => "怎么用记忆功能         /remember /forget /memory".into(),
+        Msg::GuideMenuBackground => "怎么用后台任务         /bg 后台执行".into(),
+        Msg::GuideMenuContext => "怎么管理上下文         /compact /context /cost".into(),
+        Msg::GuideMenuKeybindings => "快捷键有哪些           键盘快捷键参考".into(),
+        Msg::GuideMenuConfig => "怎么配置               config.toml 配置说明".into(),
+        Msg::GuideMenuTip => "
+  提示：输入 /guide <你的问题> 获取具体回答。
+  例如：/guide 怎么切换模型
+".into(),
+        Msg::GuideMenuDocUrl => "  完整文档：https://atomcode.atomgit.com/docs/zh/".into(),
+        Msg::CmdGuideInstalling => "正在安装 ask skill，请稍候...".into(),
+        Msg::CmdGuideAutoInstall => "ask skill 未安装，正在自动安装 atomcode@atomcode-skills...".into(),
+        Msg::CmdGuideAutoInvoke { topic } =>
+            format!("ask skill 安装完成，正在回答: {}", topic).into(),
+        Msg::CmdGuideSkillNotFound =>
+            "安装完成但未找到 ask skill，请运行 /plugin reload 后重试".into(),
+        Msg::CmdGuideInstallFailed { error } =>
+            format!("安装 ask skill 失败: {}. 请手动运行 /plugin install atomcode@atomcode-skills", error).into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
+
+        // ── reasoning effort ──
+        Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 有效）".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>
@@ -756,6 +868,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("✓ VL 识别图片成功，返回 {char_count} chars").into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
             format!("✓ {done} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {total_tokens} tokens").into(),
+        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
+            format!("✗ 已中断 · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {total_tokens} tokens").into(),
         Msg::LoginQrHeader =>
             "  登录 AtomGit — 使用微信扫描下方二维码：\n\n".into(),
         Msg::LoginUrlAfterQr =>
@@ -793,6 +907,19 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             model
         )
         .into(),
+        // ── --dangerously-skip-permissions / -y ──
+        Msg::BypassWarningBanner =>
+            "\u{26a0} --dangerously-skip-permissions 已启用：所有工具调用将自动批准（无权限提示）\n".into(),
+        Msg::BypassWarningHeadless =>
+            "[headless] --dangerously-skip-permissions：所有工具调用将自动批准".into(),
+        Msg::BypassBadge =>
+            "\u{26a0} BYPASS".into(),
+
+        Msg::AdminWarningBanner =>
+            "\x1b[33m\u{26a0} 警告：正在以管理员权限运行。\n   模型可能可以访问系统文件。\n   请在 /codingplan 中配置\"信任目录\"以限制文件访问。\x1b[39m\n".into(),
+        Msg::AdminWarningHeadless =>
+            "[warning] 正在以管理员权限运行 — 模型可能可以访问系统文件。".into(),
+
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} 多行输入：在行尾加 `\\` 再按 Enter。\n    \

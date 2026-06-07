@@ -75,11 +75,78 @@ where
     deserializer.deserialize_any(LenientU64)
 }
 
+/// Deserialize a bool that may arrive as a JSON string/number (weak models send
+/// `"true"`, `1`, etc. instead of a JSON boolean).
+fn deserialize_lenient_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct LenientBool;
+
+    impl<'de> de::Visitor<'de> for LenientBool {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a boolean")
+        }
+        fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<bool, E> {
+            Ok(matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        }
+    }
+
+    deserializer.deserialize_any(LenientBool)
+}
+
 #[derive(Deserialize)]
 struct BashArgs {
     command: String,
     #[serde(default, deserialize_with = "deserialize_lenient_u64")]
     timeout: Option<u64>,
+    /// When true, the command is launched detached (its own session via
+    /// setsid(2)) with output redirected to a log file; the tool returns
+    /// immediately instead of waiting, and the process survives this call.
+    #[serde(default, deserialize_with = "deserialize_lenient_bool")]
+    run_in_background: bool,
+}
+
+/// Build the `bash` tool description for the current platform.
+///
+/// The tool keeps the name `bash` (every provider's model is trained to
+/// reach for a `bash` tool), but on Windows it actually executes via
+/// `cmd.exe` (see the spawn in `bash_execute`). Left unsaid, weak models
+/// follow the `bash` name and emit bash-only syntax — heredocs, `$(...)`,
+/// `printf '\n'` — which cmd.exe can't parse, so multi-line commands
+/// (e.g. a multi-line commit message) fail and the model thrashes into a
+/// temp-file workaround. Telling the model the real shell here removes the
+/// contradiction (the prompt's env line already reports `Shell: cmd.exe`).
+fn shell_tool_description(is_windows: bool) -> String {
+    let base = "Execute a shell command. Use for: build, test, git, install deps.\n\
+        Do NOT use for: reading files (use read_file), searching (use grep), editing (use edit_file).\n\
+        For a long-running process (dev server, watcher, tunnel), set run_in_background=true \
+        instead of backgrounding with `&`/nohup yourself: it detaches into its own session, \
+        returns immediately, and writes output to a log file you can read later with cat/read_file.\n\
+        Default timeout: 60s. Destructive commands require user confirmation.";
+    if is_windows {
+        format!(
+            "{base}\n\
+            Windows: commands run via cmd.exe, NOT bash. Use cmd.exe syntax — do NOT use \
+            bash-only constructs such as heredocs (<<EOF), command substitution $(...), or \
+            printf '\\n'. Chain steps with &&. For multi-line text (e.g. a multi-line commit \
+            message) write it to a temp file and pass the file (e.g. git commit -F msg.txt)."
+        )
+    } else {
+        base.to_string()
+    }
 }
 
 #[async_trait]
@@ -87,15 +154,13 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "bash",
-            description: "Execute a shell command. Use for: build, test, git, install deps.\n\
-                Do NOT use for: reading files (use read_file), searching (use grep), editing (use edit_file).\n\
-                Do NOT start servers or long-running processes — the user manages those.\n\
-                Default timeout: 60s. Destructive commands require user confirmation.".to_string(),
+            description: shell_tool_description(cfg!(target_os = "windows")),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "The bash command to execute" },
-                    "timeout": { "type": "integer", "description": "Max wait seconds (default 60, max 300)" }
+                    "command": { "type": "string", "description": "The shell command to execute" },
+                    "timeout": { "type": "integer", "description": "Max wait seconds (default 60, max 300)" },
+                    "run_in_background": { "type": "boolean", "description": "Launch detached (own session) for long-running processes; returns immediately with a pid + log-file path. Default false." }
                 },
                 "required": ["command"]
             }),
@@ -113,7 +178,13 @@ impl Tool for BashTool {
             Err(_) => return ApprovalRequirement::AutoApprove,
         };
         if let Some(reason) = check_destructive_command(&parsed.command) {
-            return ApprovalRequirement::RequireApproval(reason);
+            // RequireApprovalAlways — not RequireApproval — so a prior session
+            // grant on "bash" (user pressed [A] on a safe command earlier)
+            // cannot disarm the destructive-command guard. Real-world incident
+            // 2026-05-24: `rmdir /s /q D:\…\native` ran without a prompt after
+            // a session grant, wiping the workspace including .git. See
+            // `bash_destructive_command_through_store_with_session_grant_asks`.
+            return ApprovalRequirement::RequireApprovalAlways(reason);
         }
         ApprovalRequirement::AutoApprove
     }
@@ -404,7 +475,11 @@ async fn snapshot_workspace_changes(
         .current_dir(wd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        // kill_on_drop: if SNAPSHOT_TIMEOUT_SECS fires or the caller's
+        // future is dropped (Ctrl-C cancel), tokio Drops the internal
+        // Child and we want the git process killed, not orphaned.
+        .kill_on_drop(true);
     crate::process_utils::suppress_console_window(&mut cmd);
     let out = match tokio::time::timeout(
         Duration::from_secs(SNAPSHOT_TIMEOUT_SECS),
@@ -418,7 +493,7 @@ async fn snapshot_workspace_changes(
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = crate::process_utils::decode_subprocess_output(&out.stdout);
     let mut set = std::collections::HashSet::new();
     for line in text.lines() {
         // `git status --porcelain` format: `XY <path>` (2-char status + space
@@ -431,31 +506,163 @@ async fn snapshot_workspace_changes(
     Some(set)
 }
 
-async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-    let parsed: BashArgs = serde_json::from_str(args)?;
-    // Command runs verbatim — no stripping of trailing tail/head/etc.
-    // Aligns with Claude Code: model decides how to shape its own
-    // output. Previous strip-and-notice path mis-fired on `ssh "...
-    // | tail -30"` (inner pipe inside SSH quotes) and similar nested
-    // forms.
+/// Unix-only wrapper that guarantees pgroup-wide cleanup of bash and
+/// everything it spawned. `setsid()` in bash's `pre_exec` made bash its
+/// own session+pgroup leader (pgid == pid), so `killpg(pgid, …)` reaches
+/// every grandchild — exactly the daemonised cargo / ssh / dev server
+/// that motivated this wrapper.
+///
+/// Two cleanup paths:
+/// - `terminate()` — explicit, awaitable. SIGTERM → 200ms grace → SIGKILL
+///   → reap. Used by timeout / idle-kill so well-behaved servers flush
+///   logs and release ports before the kernel takes them out.
+/// - `Drop` — implicit, runs when the tool future is dropped by the
+///   runner's `tokio::select!` cancel branch (we can't await). Immediate
+///   SIGKILL to the whole pgroup. The wrapped `Child`'s `kill_on_drop`
+///   handles the direct PID; this catches grandchildren.
+///
+/// Idempotent: a Drop after `terminate()` issues a second SIGKILL to a
+/// pgroup that's already empty. `killpg` returns ESRCH which we ignore.
+/// A `terminated` flag short-circuits the Drop signal to avoid the
+/// tiny PID-reuse window between `wait()` reaping the leader and Drop.
+#[cfg(not(target_os = "windows"))]
+struct PgroupChild {
+    child: tokio::process::Child,
+    pgid: i32,
+    terminated: bool,
+}
 
-    // Cap timeout: model may request absurdly large values. Max 5 min.
-    let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
-    let start_instant = Instant::now();
+#[cfg(not(target_os = "windows"))]
+impl PgroupChild {
+    fn new(child: tokio::process::Child) -> Self {
+        // setsid() in pre_exec makes the child its own pgroup leader,
+        // so pgid == pid. id() is Some() until try_wait()/wait() reaps,
+        // and we always read it pre-reap.
+        let pgid = child
+            .id()
+            .expect("PgroupChild::new called after the child was reaped") as i32;
+        Self { child, pgid, terminated: false }
+    }
 
-    let wd = ctx.working_dir.read().await.clone();
+    /// Graceful pgroup shutdown: SIGTERM → 200ms grace → SIGKILL → reap.
+    /// Call from explicit cleanup paths (timeout/idle) where we can await.
+    async fn terminate(&mut self) {
+        unsafe {
+            killpg(self.pgid, SIGTERM);
+        }
+        // 200ms is empirically: long enough for well-behaved servers
+        // (uvicorn, vite, cargo-watch) to release ports and flush logs,
+        // short enough that Ctrl-C still feels instant.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        unsafe {
+            killpg(self.pgid, SIGKILL);
+        }
+        // Reap the bash leader so its zombie doesn't linger.
+        let _ = self.child.wait().await;
+        self.terminated = true;
+    }
+}
 
-    // Platform-aware shell: cmd.exe on Windows, bash on Unix
+#[cfg(not(target_os = "windows"))]
+impl std::ops::Deref for PgroupChild {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl std::ops::DerefMut for PgroupChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Drop for PgroupChild {
+    fn drop(&mut self) {
+        // Skip if terminate() already ran: the pgroup is empty and the
+        // pid we hold may now belong to an unrelated process (PID reuse
+        // window between wait() reaping the leader and Drop running).
+        if self.terminated {
+            return;
+        }
+        unsafe {
+            killpg(self.pgid, SIGKILL);
+        }
+        // The wrapped Child has kill_on_drop=true, so its own Drop will
+        // SIGKILL the direct PID and reap. We just covered grandchildren.
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+extern "C" {
+    fn killpg(pgid: i32, sig: i32) -> i32;
+}
+
+// Standard POSIX signal numbers — identical on Linux, macOS, BSD.
+#[cfg(not(target_os = "windows"))]
+const SIGTERM: i32 = 15;
+#[cfg(not(target_os = "windows"))]
+const SIGKILL: i32 = 9;
+
+/// Generate a unique log path under `~/.atomcode/background/` (falling back to
+/// the system temp dir when no home is set) and ensure the directory exists.
+fn background_log_path() -> Result<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".atomcode")
+                .join("background")
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("atomcode-background"));
+    std::fs::create_dir_all(&dir)?;
+
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(dir.join(format!("bg-{millis}-{n}.log")))
+}
+
+/// Background launch path for `run_in_background`. Detaches the command into its
+/// own session via the `setsid(2)` syscall (the syscall — NOT the `setsid`
+/// binary, which is missing on some systems incl. OpenHarmony PC), redirects
+/// output to a log file, and returns immediately. The child is deliberately NOT
+/// wrapped in `PgroupChild` and uses `kill_on_drop(false)`, so it survives this
+/// tool call — and, being session-detached (no controlling tty), it gets no
+/// SIGHUP and is reparented to init if atomcode exits.
+async fn bash_execute_background(
+    command: &str,
+    wd: &std::path::Path,
+    start_instant: Instant,
+) -> Result<ToolResult> {
+    let log_path = background_log_path()?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)?;
+    let err_file = log_file.try_clone()?;
+
     #[cfg(target_os = "windows")]
     let mut child = {
+        // DETACHED_PROCESS (0x8) + CREATE_NEW_PROCESS_GROUP (0x200): no console,
+        // own process group, outlives the parent — the Windows analogue of setsid.
         let mut cmd = Command::new("cmd.exe");
         cmd.arg("/C");
-        cmd.as_std_mut().raw_arg(&parsed.command);
-        cmd.current_dir(&wd)
+        cmd.as_std_mut().raw_arg(command);
+        cmd.as_std_mut().creation_flags(0x0000_0008 | 0x0000_0200);
+        cmd.current_dir(wd)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        crate::process_utils::suppress_console_window(&mut cmd);
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(err_file))
+            .kill_on_drop(false);
         cmd.spawn()?
     };
 
@@ -464,16 +671,133 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         #[cfg(not(target_env = "ohos"))]
         let mut cmd = Command::new("bash");
         #[cfg(target_env = "ohos")]
-        let mut cmd = Command::new("sh");
-        // bash does not exist on ohos
-        // use sh (mksh)
-
+        let mut cmd = Command::new("sh"); // bash is absent on ohos; use sh (mksh)
         cmd.arg("-c")
-            .arg(&parsed.command)
-            .current_dir(&wd)
+            .arg(command)
+            .current_dir(wd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(err_file))
+            // Must NOT kill on drop — the process is meant to outlive this call.
+            .kill_on_drop(false);
+        unsafe {
+            cmd.pre_exec(|| {
+                extern "C" {
+                    fn setsid() -> i32;
+                }
+                // New session + process group: escapes the foreground path's
+                // killpg cleanup and detaches from the controlling tty.
+                setsid();
+                Ok(())
+            });
+        }
+        cmd.spawn()?
+    };
+
+    let pid = child.id().map(|p| p as i32).unwrap_or(-1);
+
+    // Reap on exit so a finished background job doesn't linger as a zombie while
+    // atomcode runs. wait() only collects the exit status — it never kills — so
+    // this does not weaken the "survives" guarantee.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+
+    let elapsed = start_instant.elapsed().as_secs_f64();
+    let output = format!(
+        "[background] started — pid={pid}, log={log}\n\
+         [elapsed: {elapsed:.1}s] 读取输出: cat {log}（或用 read_file）；停止: kill {pid}",
+        pid = pid,
+        log = log_path.display(),
+        elapsed = elapsed,
+    );
+    Ok(ToolResult {
+        call_id: String::new(),
+        output,
+        success: true,
+    })
+}
+
+/// Result of running a shell command, decoupled from tool-result framing.
+/// `bash_execute` (model-invoked Bash tool) and `handle_local_shell`
+/// (user-invoked `!` mode) both build on this.
+pub(crate) struct ShellOutcome {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit: ShellExit,
+    pub elapsed_secs: f64,
+}
+
+/// How the child process ended. Mirrors the three branches the old
+/// `bash_execute` match handled: clean exit, idle-kill, hard-timeout-kill.
+pub(crate) enum ShellExit {
+    /// Process exited on its own. `success` is `status.success()`,
+    /// `code` is the numeric exit code (None = terminated by signal).
+    Exited { success: bool, code: Option<i32> },
+    /// Readers hit EOF/idle but the child never reaped — killed as stuck.
+    KilledIdle,
+    /// Hard wall-clock timeout — killed.
+    KilledTimeout,
+}
+
+/// Spawn `command` in `wd`, stream output via `chunk_cb`, return raw outcome.
+/// No ToolResult framing, no git snapshot, no error-signature tracking —
+/// those stay in the tool layer. `chunk_cb` receives stdout chunks verbatim
+/// and stderr chunks prefixed with `[stderr] `.
+pub(crate) async fn run_shell(
+    command: &str,
+    wd: &std::path::Path,
+    timeout_secs: u64,
+    chunk_cb: impl Fn(&str),
+) -> ShellOutcome {
+    let start_instant = Instant::now();
+
+    // Platform-aware shell: cmd.exe on Windows, bash on Unix
+    #[cfg(target_os = "windows")]
+    let mut child = {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.arg("/C");
+        cmd.as_std_mut().raw_arg(command);
+        cmd.current_dir(wd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // kill_on_drop covers the direct cmd.exe PID on `tokio::select!`
+            // cancel / hard timeout. NOTE: Windows process trees still leak
+            // grandchildren — that's #3's Job Object work.
+            .kill_on_drop(true);
+        crate::process_utils::suppress_console_window(&mut cmd);
+        match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return ShellOutcome {
+                    stdout: String::new(),
+                    stderr: format!("failed to spawn: {e}"),
+                    exit: ShellExit::Exited { success: false, code: None },
+                    elapsed_secs: start_instant.elapsed().as_secs_f64(),
+                };
+            }
+        }
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut child = {
+        #[cfg(not(target_env = "ohos"))]
+        let mut cmd = Command::new("bash");
+        #[cfg(target_env = "ohos")]
+        let mut cmd = Command::new("sh");
+
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(wd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // kill_on_drop ensures bash itself dies if the tool future is
+            // dropped mid-flight. PgroupChild::Drop below extends that
+            // to bash's whole process group (cargo / ssh / dev-server
+            // grandchildren that setsid() detached from us).
+            .kill_on_drop(true);
         // Detach child from the controlling terminal so neither it nor any
         // grandchild (ssh, git credential helpers, server-side hook output
         // rendered by git) can write directly to /dev/tty.  Without this,
@@ -488,12 +812,7 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     fn close(fd: i32) -> i32;
                     fn ioctl(fd: i32, request: u64, ...) -> i32;
                 }
-                // Create a new session — detaches from the controlling
-                // terminal so /dev/tty opens fail.
                 setsid();
-                // Belt-and-suspenders: also try to explicitly detach using
-                // TIOCNOTTY, which works even when setsid alone doesn't
-                // fully sever the connection on some macOS versions.
                 const O_RDWR: i32 = 2;
                 #[cfg(target_os = "macos")]
                 const TIOCNOTTY: u64 = 0x20007471;
@@ -507,39 +826,31 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 Ok(())
             });
         }
-        cmd.spawn()?
+        // Wrap the spawned child so pgroup cleanup runs on Drop (cancel)
+        // and via the explicit terminate() calls below (timeout/idle).
+        match cmd.spawn() {
+            Ok(c) => PgroupChild::new(c),
+            Err(e) => {
+                return ShellOutcome {
+                    stdout: String::new(),
+                    stderr: format!("failed to spawn: {e}"),
+                    exit: ShellExit::Exited { success: false, code: None },
+                    elapsed_secs: start_instant.elapsed().as_secs_f64(),
+                };
+            }
+        }
     };
 
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
 
-    // Wait for process to finish or timeout. Read stdout/stderr concurrently.
-    // Idle detection: if output stops for SILENT_KILL_SECS after having produced
-    // some output, assume the command is truly stuck. This threshold needs to
-    // tolerate legitimate silent phases common across many tools/languages
-    // (build cache scan, dep lock waits, dep downloads, large file I/O, linking,
-    // compiler type-check pass, etc.) — none of which emit progress to stdout.
     let idle_timeout = Duration::from_secs(SILENT_KILL_SECS);
     let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let has_out_1 = has_any_output.clone();
     let has_out_2 = has_any_output.clone();
-
-    // Clone event sender for streaming output (if available)
-    let event_tx = ctx.event_tx.clone();
-    let call_id = ctx.current_call_id.clone();
-
-    // Helper to send output chunk event
-    let send_chunk = |chunk: &str| {
-        if let (Some(tx), Some(id)) = (&event_tx, &call_id) {
-            let _ = tx.send(crate::turn::event::TurnEvent::ToolOutputChunk {
-                call_id: id.clone(),
-                chunk: chunk.to_string(),
-            });
-        }
-    };
+    let chunk_cb = &chunk_cb;
 
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         let (_, _) = tokio::join!(
@@ -549,15 +860,14 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     match tokio::time::timeout(idle_timeout, stdout.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
-                            let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let chunk =
+                                crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stdout_buf.extend_from_slice(&buf[..n]);
                             has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
-                            // Send real-time output chunk
-                            send_chunk(&chunk);
+                            chunk_cb(&chunk);
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
-                            // No new stdout for 3s — if we have ANY output, break
                             if has_out_1.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
@@ -571,11 +881,11 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     match tokio::time::timeout(idle_timeout, stderr.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
-                            let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let chunk =
+                                crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stderr_buf.extend_from_slice(&buf[..n]);
                             has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
-                            // Send real-time output chunk (stderr marked with prefix)
-                            send_chunk(&format!("[stderr] {}", chunk));
+                            chunk_cb(&format!("[stderr] {}", chunk));
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
@@ -588,22 +898,6 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             }
         );
 
-        // Capture both the success flag AND the numeric exit code.
-        // Previously only `.success()` was read, which meant a failed
-        // command with empty stdout/stderr came back as bare
-        // "[elapsed: 0.0s]" — agent had zero signal on whether the
-        // command ran, was denied by the shell, or exited for a
-        // specific reason (e.g. grep's exit 1 = no match, exit 2 =
-        // real error; agent cannot tell these apart without the code).
-        //
-        // Two-stage wait to close a kernel-level race: for fast
-        // commands (true, echo, grep with no match) stdout/stderr hit
-        // EOF before SIGCHLD is observed, so a bare try_wait() sees
-        // `None` and the result gets misclassified as "idle kill".
-        // After the pipes close, we know the child is essentially
-        // done — give the reaper a tiny window to catch up before
-        // declaring it stuck. 100ms is well under human-perceptible
-        // latency and sufficient for any real reap on modern kernels.
         match child.try_wait() {
             Ok(Some(status)) => Some((status.success(), status.code())),
             _ => match tokio::time::timeout(Duration::from_millis(100), child.wait()).await {
@@ -614,32 +908,79 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
     })
     .await;
 
-    let stdout_str = String::from_utf8_lossy(&stdout_buf).to_string();
-    let stderr_str = String::from_utf8_lossy(&stderr_buf).to_string();
+    let stdout_str = crate::process_utils::decode_subprocess_output(&stdout_buf);
+    let stderr_str = crate::process_utils::decode_subprocess_output(&stderr_buf);
+    let elapsed_secs = start_instant.elapsed().as_secs_f64();
 
-    // Commands with & (backgrounded processes) may return non-zero even on success.
-    // pkill returns 1 when no process matched. These shouldn't be marked as failures.
+    let exit = match result {
+        Ok(Some((success, code))) => ShellExit::Exited { success, code },
+        Ok(None) => {
+            // Readers hit idle/EOF but the child never reaped — kill it.
+            // terminate() on Unix walks the pgroup (SIGTERM → 200ms → SIGKILL);
+            // Windows keeps the direct-child kill (process-tree cleanup is #3).
+            #[cfg(not(target_os = "windows"))]
+            child.terminate().await;
+            #[cfg(target_os = "windows")]
+            {
+                let _ = child.kill().await;
+            }
+            ShellExit::KilledIdle
+        }
+        Err(_) => {
+            // Hard wall-clock timeout — same pgroup-aware path as idle.
+            #[cfg(not(target_os = "windows"))]
+            child.terminate().await;
+            #[cfg(target_os = "windows")]
+            {
+                let _ = child.kill().await;
+            }
+            ShellExit::KilledTimeout
+        }
+    };
+
+    ShellOutcome { stdout: stdout_str, stderr: stderr_str, exit, elapsed_secs }
+}
+
+async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
+    let parsed: BashArgs = serde_json::from_str(args)?;
+    let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
+
+    let wd = ctx.working_dir.read().await.clone();
+
+    // `&`-detached / long-running launch: hand off to the background path
+    // (own session, log file, returns immediately) instead of the foreground
+    // run_shell. Restored on the pr_224 merge — its run_shell refactor predated
+    // the background-execution feature and dropped this branch.
+    if parsed.run_in_background {
+        return bash_execute_background(&parsed.command, &wd, Instant::now()).await;
+    }
+
+    let event_tx = ctx.event_tx.clone();
+    let call_id = ctx.current_call_id.clone();
+
+    let outcome = run_shell(&parsed.command, &wd, timeout_secs, |chunk| {
+        if let (Some(tx), Some(id)) = (&event_tx, &call_id) {
+            let _ = tx.send(crate::turn::event::TurnEvent::ToolOutputChunk {
+                call_id: id.clone(),
+                chunk: chunk.to_string(),
+            });
+        }
+    })
+    .await;
+
+    let stdout_str = outcome.stdout;
+    let stderr_str = outcome.stderr;
+    let elapsed_secs = outcome.elapsed_secs;
+
     let has_background = has_background_ampersand(&parsed.command);
     let has_pkill = parsed.command.contains("pkill");
 
-    // Total elapsed wall-clock — appended to every result so the agent can
-    // judge "slow but succeeded" vs "stalled/hung" without any per-tool
-    // pattern matching. Purely numeric, tech-neutral.
-    let elapsed_secs = start_instant.elapsed().as_secs_f64();
-
-    match result {
-        Ok(Some((success, code))) => {
+    match outcome.exit {
+        ShellExit::Exited { success, code } => {
             let mut combined = format_output(&stdout_str, &stderr_str);
-            // For background/pkill commands: non-empty output = success
             let effective_success =
                 success || has_background || (has_pkill && !combined.is_empty());
-
             if !effective_success {
-                // Even when stdout+stderr are empty, the agent needs to know
-                // the command actually failed and with what code. The old
-                // behavior dropped both pieces of info here, leaving the
-                // agent to retry the same command blindly. Now every failure
-                // carries exit code AND an explicit "nothing to read" note.
                 let suffix = if combined.is_empty() {
                     "[no stdout or stderr — use the exit code above to diagnose; \
                          common causes: missing file/path, permission denied, wrong shell, \
@@ -651,67 +992,41 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 combined.push_str(suffix);
             }
             let elapsed_marker = format_exit_marker(elapsed_secs, code);
-            // Prepend elapsed so it's visible even when output is truncated later
             let output = if combined.is_empty() {
                 elapsed_marker
             } else {
                 format!("{}\n{}", elapsed_marker, combined)
             };
-            Ok(ToolResult {
-                call_id: String::new(),
-                output,
-                success: effective_success,
-            })
+            Ok(ToolResult { call_id: String::new(), output, success: effective_success })
         }
-        Ok(None) => {
-            // Readers exited (idle timeout or EOF) but the child
-            // did not exit within the 1 s grace — process is stuck.
-            // Kill it. The elapsed marker already tells the model
-            // how long we waited; don't invent a hardcoded "90s"
-            // here (SILENT_KILL_SECS is a cap, not what actually
-            // happened — it lies when readers left via EOF and the
-            // grace wait is what fired).
-            let _ = child.kill().await;
+        ShellExit::KilledIdle => {
             let combined = format_output(&stdout_str, &stderr_str);
             let elapsed_marker = format!("[elapsed: {:.1}s, killed: idle]", elapsed_secs);
             let output = if combined.is_empty() {
                 format!(
-                        "{} [killed: process did not exit; no output produced — treat as stuck, don't retry the same command]",
-                        elapsed_marker
-                    )
-            } else {
-                format!(
-                        "{}\n{}\n\n[killed: process did not exit cleanly — output above may be partial]",
-                        elapsed_marker, combined
-                    )
-            };
-            Ok(ToolResult {
-                call_id: String::new(),
-                output,
-                success: false,
-            })
-        }
-        Err(_) => {
-            // Hard timeout — kill it
-            let _ = child.kill().await;
-            let combined = format_output(&stdout_str, &stderr_str);
-            let elapsed_marker = format!("[elapsed: {:.1}s, killed: timeout]", elapsed_secs);
-            let output = if combined.is_empty() {
-                format!(
-                    "{} [timed out after {}s with no output]",
-                    elapsed_marker, timeout_secs
+                    "{} [killed: process did not exit; no output produced — treat as stuck, don't retry the same command]",
+                    elapsed_marker
                 )
             } else {
                 format!(
-                        "{}\n{}\n\n[timed out after {}s — consider passing a larger `timeout` if this command legitimately takes longer]",
-                        elapsed_marker, combined, timeout_secs
-                    )
+                    "{}\n{}\n\n[killed: process did not exit cleanly — output above may be partial]",
+                    elapsed_marker, combined
+                )
             };
-            Ok(ToolResult {
-                call_id: String::new(),
-                output,
-                success: false,
-            })
+            Ok(ToolResult { call_id: String::new(), output, success: false })
+        }
+        ShellExit::KilledTimeout => {
+            let combined = format_output(&stdout_str, &stderr_str);
+            let elapsed_marker = format!("[elapsed: {:.1}s, killed: timeout]", elapsed_secs);
+            let output = if combined.is_empty() {
+                format!("{} [timed out after {}s with no output]", elapsed_marker, timeout_secs)
+            } else {
+                format!(
+                    "{}\n{}\n\n[timed out after {}s — consider passing a larger `timeout` if this command legitimately takes longer]",
+                    elapsed_marker, combined, timeout_secs
+                )
+            };
+            Ok(ToolResult { call_id: String::new(), output, success: false })
         }
     }
 }
@@ -1143,6 +1458,41 @@ fn check_destructive_command(command: &str) -> Option<String> {
                 "Destructive command detected: Recursive delete. Command: {}",
                 command
             ));
+        }
+    }
+
+    // --- ORM / migration schema-reset detection ---
+    // Tools like sea-orm, Laravel, Rails expose subcommands (`fresh`, `refresh`,
+    // `reset`) that drop every table and recreate the schema. The destruction
+    // happens inside the app binary at runtime, so the command line never holds
+    // `rm`/`drop` — pure pattern lists miss it. We match token-aware so safe
+    // verbs (`up`, `status`) and look-alikes (`refresh-cache`) stay allowed.
+    {
+        let tokens: Vec<&str> = cmd.split_whitespace().collect();
+        // verb token preceded by a migration/db trigger token
+        let reset_verbs = ["fresh", "refresh", "reset"];
+        let triggers = ["--", "migrate", "migration", "db", "database"];
+        for window in tokens.windows(2) {
+            let prev = window[0].trim_matches(|c: char| c == '"' || c == '\'' || c == ';');
+            let cur = window[1].trim_matches(|c: char| c == '"' || c == '\'' || c == ';');
+            if reset_verbs.contains(&cur) && triggers.contains(&prev) {
+                return Some(format!(
+                    "Schema reset (drops all tables): migration `{cur}`. Command: {command}"
+                ));
+            }
+        }
+        // colon-joined subcommands, e.g. `migrate:fresh`, `db:reset`
+        for token in &tokens {
+            let token = token.trim_matches(|c: char| c == '"' || c == '\'' || c == ';');
+            if let Some((left, right)) = token.split_once(':') {
+                if matches!(left, "migrate" | "migration" | "db" | "database")
+                    && reset_verbs.contains(&right)
+                {
+                    return Some(format!(
+                        "Schema reset (drops all tables): migration `{token}`. Command: {command}"
+                    ));
+                }
+            }
         }
     }
 
@@ -2216,6 +2566,42 @@ error: could not compile `hermes-tauri` (bin \"hermes-tauri\") due to 1 previous
             r.output
         );
     }
+
+    #[tokio::test]
+    async fn run_shell_captures_stdout_and_exit_zero() {
+        let dir = TempDir::new().unwrap();
+        let outcome = run_shell("echo hello", dir.path(), 30, |_| {}).await;
+        assert!(matches!(outcome.exit, ShellExit::Exited { success: true, code: Some(0) }));
+        assert!(outcome.stdout.contains("hello"), "stdout was: {:?}", outcome.stdout);
+    }
+
+    #[tokio::test]
+    async fn run_shell_captures_stderr_and_nonzero_exit() {
+        let dir = TempDir::new().unwrap();
+        let outcome = run_shell("echo boom >&2; exit 2", dir.path(), 30, |_| {}).await;
+        match outcome.exit {
+            ShellExit::Exited { success, code } => {
+                assert!(!success);
+                assert_eq!(code, Some(2));
+            }
+            _ => panic!("expected Exited, got other variant"),
+        }
+        assert!(outcome.stderr.contains("boom"), "stderr was: {:?}", outcome.stderr);
+    }
+
+    #[tokio::test]
+    async fn run_shell_streams_chunks() {
+        use std::sync::{Arc, Mutex};
+        let dir = TempDir::new().unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        let outcome = run_shell("echo streamed", dir.path(), 30, move |c| {
+            seen2.lock().unwrap().push_str(c);
+        })
+        .await;
+        assert!(matches!(outcome.exit, ShellExit::Exited { success: true, .. }));
+        assert!(seen.lock().unwrap().contains("streamed"));
+    }
 }
 
 #[cfg(test)]
@@ -2352,6 +2738,43 @@ mod sanitize_tests {
     fn destructive_check_allows_plain_powershell_and_non_destructive_windows_cmds() {
         assert!(check_destructive_command(r#"powershell -Command "Get-ChildItem .""#).is_none());
         assert!(check_destructive_command(r#"cmd /c dir C:\temp"#).is_none());
+    }
+
+    // --- ORM / migration schema-reset detection ---
+    // The destructive action (drop all tables, recreate) happens inside the
+    // application binary at runtime, so the shell command line never contains
+    // `rm`/`drop`. A real incident: `cargo run -- fresh` (sea-orm migration)
+    // wiped a database after a prior session grant on `bash`. These commands
+    // must be flagged so they hit RequireApprovalAlways regardless of grants.
+    #[test]
+    fn destructive_check_catches_orm_migration_reset() {
+        // sea-orm via cargo run -- <subcommand>
+        assert!(check_destructive_command("cargo run -- fresh").is_some());
+        assert!(check_destructive_command("cargo run -- refresh").is_some());
+        assert!(check_destructive_command("cargo run -- reset").is_some());
+        // sea-orm-cli / generic "migrate <verb>" and "migration <verb>"
+        assert!(check_destructive_command("sea-orm-cli migrate fresh").is_some());
+        assert!(check_destructive_command("cargo run -- migrate refresh").is_some());
+        assert!(check_destructive_command("alembic ... migration reset").is_some());
+        // Laravel-style colon subcommands
+        assert!(check_destructive_command("php artisan migrate:fresh").is_some());
+        assert!(check_destructive_command("php artisan migrate:refresh").is_some());
+        // Rails / generic db reset
+        assert!(check_destructive_command("rails db:reset").is_some());
+        assert!(check_destructive_command("npm run database reset").is_some());
+    }
+
+    #[test]
+    fn destructive_check_allows_safe_migration_subcommands() {
+        // The safe path must NOT be flagged — otherwise every `up`/`status`
+        // run prompts and trains users to confirm blindly.
+        assert!(check_destructive_command("cargo run -- up").is_none());
+        assert!(check_destructive_command("cargo run -- status").is_none());
+        assert!(check_destructive_command("sea-orm-cli migrate up").is_none());
+        // A bare `reset`/`fresh` token unrelated to migrations stays allowed:
+        // narrow patterns only, no catch-all on the words themselves.
+        assert!(check_destructive_command("git stash").is_none());
+        assert!(check_destructive_command("npm run refresh-cache").is_none());
     }
 
     // --- Vulnerability bypass tests (CVE-style: rm -rf detection bypass) ---
@@ -2629,6 +3052,55 @@ mod sanitize_tests {
         assert!(approval.is_none());
     }
 
+    // Regression: a single `[A]` (Always Allow for bash) on a safe command
+    // (cargo build, ls, git status) must NOT silently disarm the destructive
+    // check for the rest of the session. Real-world incident: model emitted
+    // `rmdir /s /q D:\...\native` after the user had pressed [A] earlier;
+    // PermissionStore::check honored the session grant and the bash tool's
+    // RequireApproval was bypassed, deleting the workspace including .git.
+    //
+    // Fix contract: destructive bash commands return RequireApprovalAlways
+    // — the variant PermissionStore::check unconditionally routes to Ask,
+    // regardless of session grants or AlwaysAllow overrides.
+    #[test]
+    fn bash_destructive_commands_require_always_not_session_bypassable() {
+        let cases = [
+            r#"{"command":"rmdir /s /q D:\\StorePlugin\\project"}"#,
+            r#"{"command":"rm -rf /important_directory"}"#,
+            r#"{"command":"del /q C:\\Users\\victim\\files"}"#,
+            r#"{"command":"git push --force origin main"}"#,
+            r#"{"command":"git reset --hard HEAD~5"}"#,
+            r#"{"command":"dd if=/dev/zero of=/dev/sda"}"#,
+        ];
+        for args in cases {
+            assert!(
+                matches!(
+                    BashTool.approval(args),
+                    ApprovalRequirement::RequireApprovalAlways(_)
+                ),
+                "{args} should return RequireApprovalAlways so session grant cannot bypass approval; \
+                 a single [A] press on a safe command must NOT disarm destructive-command detection"
+            );
+        }
+    }
+
+    // Cross-layer integration: bash destructive command → PermissionStore
+    // with an existing `grant_session("bash")` must still Ask. This pins the
+    // contract end-to-end so a future refactor of either layer can't quietly
+    // reintroduce the rmdir-bypass incident.
+    #[test]
+    fn bash_destructive_command_through_store_with_session_grant_asks() {
+        use crate::tool::{PermissionDecision, PermissionStore};
+        let mut store = PermissionStore::new();
+        store.grant_session("bash"); // simulate prior [A] on a safe command
+        let approval = BashTool.approval(r#"{"command":"rmdir /s /q D:\\proj"}"#);
+        let decision = store.check("bash", &approval);
+        assert!(
+            matches!(decision, PermissionDecision::Ask(_)),
+            "destructive bash command must prompt the user even with a session grant, got {decision:?}"
+        );
+    }
+
     // Regression: weak models occasionally send malformed bash args
     // (`{}`, missing `command`, wrong type). We must NOT prompt — the
     // UI would render `Bash()` with empty parens because format_tool_detail
@@ -2678,7 +3150,7 @@ mod sanitize_tests {
         // mirrors --force / -f so a force push to main / release/*
         // still surfaces a prompt.
         assert!(
-            check_destructive_command("git push --force-with-lease origin release/v4.23.1")
+            check_destructive_command("git push --force-with-lease origin release/v4.23.2")
                 .is_some()
         );
     }
@@ -2751,7 +3223,7 @@ mod sanitize_tests {
         assert!(check_destructive_command("git log --oneline -10").is_none());
         assert!(check_destructive_command("git add crates/atomcode-core/src/tool/bash.rs").is_none());
         assert!(check_destructive_command("git commit -m 'fix(bash): tighten git destructive patterns'").is_none());
-        assert!(check_destructive_command("git push origin release/v4.23.1").is_none());
+        assert!(check_destructive_command("git push origin release/v4.23.2").is_none());
         assert!(check_destructive_command("git pull --rebase origin main").is_none());
         assert!(check_destructive_command("git checkout main").is_none());
         assert!(check_destructive_command("git switch main").is_none());
@@ -2802,6 +3274,79 @@ mod exec_tests {
             "output must NOT leak the hardcoded 90s message, got: {}",
             result.output
         );
+    }
+
+    /// Background mode (`run_in_background: true`) must (1) return almost
+    /// immediately instead of blocking for the command's lifetime, (2) report
+    /// a pid + log path, (3) leave the process ALIVE after the tool returns —
+    /// proving it escaped the foreground path's killpg / kill_on_drop — and
+    /// (4) capture the command's stdout into the log file.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_run_in_background_returns_fast_and_survives() {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        fn alive(pid: i32) -> bool {
+            unsafe { kill(pid, 0) == 0 }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        // ~3s lifetime; a foreground run would block the tool for the full 3s.
+        let cmd = "for i in 1 2 3; do echo tick-$i; sleep 1; done";
+        let args = serde_json::json!({ "command": cmd, "run_in_background": true }).to_string();
+
+        let start = std::time::Instant::now();
+        let result = bash_execute(&args, &ctx).await.expect("bash_execute");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "background mode must return fast, took {:?}",
+            elapsed
+        );
+        assert!(
+            result.success,
+            "background launch should report success, got: {}",
+            result.output
+        );
+
+        // Parse pid + log path from the advertised output.
+        let pid: i32 = result
+            .output
+            .split("pid=")
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("output must advertise pid=, got: {}", result.output));
+        let log_path = result
+            .output
+            .lines()
+            .find_map(|l| l.split("log=").nth(1))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| panic!("output must advertise log=, got: {}", result.output));
+
+        assert!(
+            alive(pid),
+            "background process {} must still be alive right after the tool returns",
+            pid
+        );
+
+        // Output should land in the log within a moment.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("tick-1"),
+            "background log must capture stdout, got: {:?}",
+            log
+        );
+
+        // Cleanup: stop the background process and remove its log.
+        unsafe {
+            kill(pid, 9);
+        }
+        let _ = std::fs::remove_file(&log_path);
     }
 
     /// Silent fast-exit (`true`) — no stdout, quick success. Same bug
@@ -2876,7 +3421,16 @@ fn approval_for_command_paths(
             (Some(ApprovalRequirement::RequireApprovalAlways(reason)), _) => {
                 Some(ApprovalRequirement::RequireApprovalAlways(reason))
             }
+            // bash never path-scopes: a sensitive read embedded in an arbitrary
+            // command stays always-ask, so a per-file [A] grant (meant for the
+            // read_file tool) can't disarm the bash path guard.
+            (Some(ApprovalRequirement::RequireApprovalScoped { reason, .. }), _) => {
+                Some(ApprovalRequirement::RequireApprovalAlways(reason))
+            }
             (_, ApprovalRequirement::RequireApprovalAlways(reason)) => {
+                Some(ApprovalRequirement::RequireApprovalAlways(reason))
+            }
+            (_, ApprovalRequirement::RequireApprovalScoped { reason, .. }) => {
                 Some(ApprovalRequirement::RequireApprovalAlways(reason))
             }
             (Some(ApprovalRequirement::RequireApproval(reason)), _) => {
@@ -3100,6 +3654,60 @@ fn approval_for_command_paths(
 }
 
 // ───────────────────────────────────────────────────────────────────
+// tool-definition / shell-priming tests
+// ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod shell_tool_def_tests {
+    use super::*;
+
+    // The `command` parameter must NOT prime the model to write bash:
+    // on Windows the executor runs cmd.exe, so a "bash command" hint makes
+    // weak models emit heredocs / `$(...)` / `printf '\n'` that cmd.exe
+    // can't parse (the multi-line-commit thrash bug). Keep it shell-neutral.
+    #[test]
+    fn command_param_description_is_shell_neutral_not_bash() {
+        let def = BashTool.definition();
+        let desc = def.parameters["properties"]["command"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            desc.to_lowercase().contains("shell"),
+            "command param should say 'shell', got: {desc:?}"
+        );
+        assert!(
+            !desc.to_lowercase().contains("bash"),
+            "command param must not prime bash, got: {desc:?}"
+        );
+    }
+
+    // On Windows the description must explicitly tell the model it's cmd.exe
+    // (not bash) and steer it away from bash-only syntax. On Unix it stays
+    // plain (bash really is the shell there).
+    #[test]
+    fn windows_description_steers_to_cmd_not_bash() {
+        let win = shell_tool_description(true);
+        assert!(win.contains("cmd.exe"), "windows desc must name cmd.exe");
+        let lc = win.to_lowercase();
+        assert!(lc.contains("heredoc"), "windows desc must warn off heredocs");
+        assert!(
+            win.contains("$("),
+            "windows desc must warn off command substitution"
+        );
+        assert!(
+            lc.contains("not bash") || lc.contains("not\u{a0}bash") || lc.contains("cmd.exe, not bash"),
+            "windows desc must say it is not bash"
+        );
+
+        let unix = shell_tool_description(false);
+        assert!(
+            !unix.contains("cmd.exe"),
+            "unix desc must not mention cmd.exe"
+        );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
 // detect_cd_target tests
 // ───────────────────────────────────────────────────────────────────
 
@@ -3177,5 +3785,131 @@ mod detect_cd_target_tests {
         // accidentally; still must not persist.
         assert_eq!(detect_cd_target("cd /tmp | tee out.log"), None);
         assert_eq!(detect_cd_target("cd /tmp || echo fail"), None);
+    }
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod pgroup_child_tests {
+    use super::{PgroupChild, SIGKILL};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command;
+
+    fn pid_is_alive(pid: i32) -> bool {
+        // kill(pid, 0) is a permission/existence probe — returns 0 if
+        // the pid exists and we can signal it, -1 with errno=ESRCH if not.
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe { kill(pid, 0) == 0 }
+    }
+
+    fn spawn_setsid_bash(script: &str) -> tokio::process::Child {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        unsafe {
+            cmd.pre_exec(|| {
+                extern "C" {
+                    fn setsid() -> i32;
+                }
+                setsid();
+                Ok(())
+            });
+        }
+        cmd.spawn().expect("spawn bash for pgroup test")
+    }
+
+    async fn read_grandchild_pid(child: &mut tokio::process::Child) -> i32 {
+        let stdout = child.stdout.as_mut().expect("stdout piped");
+        let mut buf = [0u8; 32];
+        let n = tokio::time::timeout(Duration::from_secs(2), stdout.read(&mut buf))
+            .await
+            .expect("read timed out")
+            .expect("read failed");
+        String::from_utf8_lossy(&buf[..n])
+            .trim()
+            .parse()
+            .expect("grandchild pid parse")
+    }
+
+    /// Drop path (implicit cleanup): runner's `tokio::select!` cancel
+    /// branch drops the bash future without awaiting. The wrapped
+    /// child's `kill_on_drop` kills bash directly; PgroupChild::Drop
+    /// adds `killpg(SIGKILL)` so the backgrounded grandchild (which
+    /// `setsid()` detached from any process group we control) also
+    /// dies instead of becoming a permanent daemon under PID 1.
+    #[tokio::test]
+    async fn pgroup_child_drop_kills_grandchild() {
+        // Background a long sleep, echo its PID, then sleep ourselves.
+        // The backgrounded sleep is the "cargo / ssh / dev-server"
+        // analogue — it's in bash's session/pgroup courtesy of setsid().
+        let mut child = spawn_setsid_bash("sleep 30 & echo $! ; sleep 30");
+        let grandchild_pid = read_grandchild_pid(&mut child).await;
+        assert!(
+            pid_is_alive(grandchild_pid),
+            "grandchild {} should be alive after spawn",
+            grandchild_pid,
+        );
+
+        let pgroup = PgroupChild::new(child);
+        drop(pgroup);
+
+        // Give kernel a tick to deliver SIGKILL and reap.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert!(
+            !pid_is_alive(grandchild_pid),
+            "grandchild {} should be dead after PgroupChild drop — \
+             setsid()-detached daemons must NOT survive cancel",
+            grandchild_pid,
+        );
+    }
+
+    /// terminate() path (explicit cleanup, awaitable): used by bash's
+    /// timeout/idle branches. Verifies the same pgroup-wide kill and
+    /// also that the leader gets reaped (no zombie).
+    #[tokio::test]
+    async fn pgroup_child_terminate_kills_grandchild_and_reaps() {
+        let mut child = spawn_setsid_bash("sleep 30 & echo $! ; sleep 30");
+        let grandchild_pid = read_grandchild_pid(&mut child).await;
+        let leader_pid = child.id().expect("leader pid") as i32;
+
+        let mut pgroup = PgroupChild::new(child);
+        pgroup.terminate().await;
+
+        // No extra sleep needed: terminate() awaits the leader's wait()
+        // and sends SIGKILL synchronously to the pgroup before that.
+        assert!(
+            !pid_is_alive(grandchild_pid),
+            "grandchild {} should be dead after terminate()",
+            grandchild_pid,
+        );
+        assert!(
+            !pid_is_alive(leader_pid),
+            "bash leader {} should be reaped after terminate()",
+            leader_pid,
+        );
+    }
+
+    /// Drop after terminate() must NOT re-signal: the leader PID has
+    /// been wait()'d and may be reassigned to an unrelated process.
+    /// The `terminated` flag short-circuits the Drop signal.
+    #[tokio::test]
+    async fn pgroup_child_drop_after_terminate_is_noop() {
+        let child = spawn_setsid_bash("sleep 5");
+        let mut pgroup = PgroupChild::new(child);
+        pgroup.terminate().await;
+        // If Drop also fires killpg here it would target a reaped PID;
+        // the assertion is that this doesn't panic and the test runs to
+        // completion. SIGKILL constant is referenced to keep the use
+        // alive in scope so a misordered import surfaces as a compile
+        // error rather than silently going dead-code.
+        let _ = SIGKILL;
+        drop(pgroup);
     }
 }

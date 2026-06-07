@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.1</span>
+    <span class="dhdr-ver">v4.25.0</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -56,11 +56,14 @@
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
     <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
     <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
     <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
   </div>
 
   <div class="dside-group">
@@ -122,14 +125,21 @@ Tailwind for styles, and Vitest for unit tests.
         <p>If you have repetitive workflows (e.g. the same set of commands every bug fix), don't bloat <code>.atomcode.md</code> — write a <a href="./skills.html">Skill</a> instead. It's clearer and more reusable.</p>
       </div>
 
-      <h2>Relationship to CLAUDE.md / GEMINI.md</h2>
-      <p>If you also use Claude Code or Gemini CLI in the same project, they each have their own instruction files:</p>
+      <h2>Relationship to AGENTS.md / CLAUDE.md / GEMINI.md</h2>
+      <p>AtomCode natively supports <code>AGENTS.md</code>, the <a href="https://agents.md/">open standard</a> for AI coding agent context. If you have a project that already uses <code>AGENTS.md</code>, AtomCode will pick it up automatically — no extra setup needed. The lookup order is:</p>
+      <ol>
+        <li><code>.atomcode.md</code></li>
+        <li><code>ATOMCODE.md</code></li>
+        <li><code>AGENTS.md</code></li>
+        <li><code>CLAUDE.md</code> / <code>claude.md</code></li>
+      </ol>
+      <p>First match wins. If you also use Claude Code or Gemini CLI in the same project, they each have their own instruction files:</p>
       <ul>
+        <li>AtomCode &rarr; <code>.atomcode.md</code> or <code>AGENTS.md</code></li>
         <li>Claude Code &rarr; <code>CLAUDE.md</code></li>
         <li>Gemini CLI &rarr; <code>GEMINI.md</code></li>
-        <li>AtomCode &rarr; <code>.atomcode.md</code></li>
       </ul>
-      <p>The three don't conflict. Maintain them separately, or make <code>.atomcode.md</code> a link / simple include of <code>CLAUDE.md</code> to keep them aligned.</p>
+      <p>These don't conflict. By using <code>AGENTS.md</code>, you can share the same instruction file across multiple AI coding tools that follow the open standard.</p>
 
       <h2>Next steps</h2>
       <ul>

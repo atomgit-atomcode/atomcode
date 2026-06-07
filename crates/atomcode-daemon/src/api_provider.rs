@@ -28,6 +28,7 @@ pub(crate) struct CreateProviderRequest {
     pub thinking_type: Option<String>,
     pub thinking_keep: Option<String>,
     pub reasoning_history: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     #[serde(default)]
@@ -39,6 +40,8 @@ pub(crate) struct CreateProviderRequest {
 /// PATCH /providers/:name - Partially update a provider.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PatchProviderRequest {
+    /// New name to rename this provider to. Omitted = keep current name.
+    pub name: Option<String>,
     #[serde(rename = "type")]
     pub provider_type: Option<String>,
     pub model: Option<String>,
@@ -60,6 +63,7 @@ pub(crate) struct PatchProviderRequest {
     pub thinking_type: Option<Option<String>>,
     pub thinking_keep: Option<Option<String>>,
     pub reasoning_history: Option<Option<String>>,
+    pub reasoning_effort: Option<Option<String>>,
     pub skip_tls_verify: Option<bool>,
 }
 
@@ -72,6 +76,7 @@ pub(crate) struct PatchThinkingRequest {
     pub thinking_type: Option<Option<String>>,
     pub keep: Option<Option<String>>,
     pub reasoning_history: Option<Option<String>>,
+    pub reasoning_effort: Option<Option<String>>,
 }
 
 // ============================================================================
@@ -141,12 +146,12 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
         thinking_type: req.thinking_type,
         thinking_keep: req.thinking_keep,
         reasoning_history: req.reasoning_history,
+        reasoning_effort: req.reasoning_effort,
         thinking_enabled: req.thinking_enabled,
         thinking_budget: req.thinking_budget,
         skip_tls_verify: req.skip_tls_verify,
         ephemeral: false,
-
-};
+    };
 
     config.providers.insert(name.clone(), provider);
 
@@ -256,17 +261,46 @@ pub(crate) async fn patch_provider(
     if let Some(rh) = req.reasoning_history {
         existing.reasoning_history = rh;
     }
+    if let Some(re) = req.reasoning_effort {
+        existing.reasoning_effort = re;
+    }
     if let Some(stv) = req.skip_tls_verify {
         existing.skip_tls_verify = stv;
     }
+
+    // Rename: name is the map key, so re-key the entry and fix up
+    // default_provider if it pointed at the old name. `existing`'s borrow has
+    // ended above, so we can mutate the map directly.
+    let final_name = match req.name {
+        Some(new_name) if new_name.trim() != name => {
+            let new_name = new_name.trim().to_string();
+            if let Err(e) = validate_provider_name(&new_name) {
+                return json_error(StatusCode::BAD_REQUEST, e).into_response();
+            }
+            if config.providers.contains_key(&new_name) {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    format!("Provider '{}' already exists", new_name),
+                )
+                .into_response();
+            }
+            let provider = config.providers.remove(&name).unwrap();
+            config.providers.insert(new_name.clone(), provider);
+            if config.default_provider == name {
+                config.default_provider = new_name.clone();
+            }
+            new_name
+        }
+        _ => name.clone(),
+    };
 
     let default_provider = config.default_provider.clone();
     if let Err(e) = save_config(&config) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    let p = config.providers.get(&name).unwrap();
-    Json(provider_info(&name, p, &default_provider)).into_response()
+    let p = config.providers.get(&final_name).unwrap();
+    Json(provider_info(&final_name, p, &default_provider)).into_response()
 }
 
 /// DELETE /providers/:name - Delete a provider.
@@ -372,6 +406,9 @@ pub(crate) async fn patch_thinking(
     }
     if let Some(rh) = req.reasoning_history {
         provider.reasoning_history = rh;
+    }
+    if let Some(re) = req.reasoning_effort {
+        provider.reasoning_effort = re;
     }
 
     let default_provider = config.default_provider.clone();

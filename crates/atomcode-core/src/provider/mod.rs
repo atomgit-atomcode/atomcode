@@ -5,7 +5,7 @@ pub mod retry;
 
 use std::pin::Pin;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::Stream;
 
@@ -79,6 +79,21 @@ pub trait LlmProvider: Send + Sync {
     fn reasoning_history_policy(&self) -> ReasoningPolicy {
         ReasoningPolicy::Exclude
     }
+
+    /// Attach a stable per-session id so the provider can tag every request
+    /// of this conversation with it (e.g. the `x-atomcode-session-id`
+    /// header). A forwarding gateway (LiteLLM) can then pin a conversation
+    /// to one upstream account/replica, keeping that backend's prefix cache
+    /// warm across the conversation's requests. Default: no-op (providers
+    /// that don't sit behind such a gateway ignore it).
+    fn set_session_id(&self, _session_id: &str) {}
+
+    /// The currently-attached session id, or empty if none. Lets callers
+    /// (e.g. the datalog writer) tag log entries with the same session id
+    /// that rides the request header. Default: empty.
+    fn session_id(&self) -> String {
+        String::new()
+    }
 }
 
 /// Shared HTTP client with common timeouts and User-Agent.
@@ -148,6 +163,24 @@ pub(super) fn format_http_error(
     }
 }
 
+/// Whether a 429 / rate-limit error is **non-retryable** — i.e. a quota that
+/// only refills at a fixed future time (monthly / period quota exhausted).
+/// Retrying these before the reset is futile and just hammers the gateway, so
+/// callers fail fast instead of burning the retry budget.
+///
+/// Transient limits (rolling window, "请求过于频繁", load too high, generic
+/// "限流") are deliberately NOT matched here — those recover on their own and
+/// stay retryable. Matching is substring-based so it works on the raw JSON
+/// body, the extracted message, and the `[429] …` formatted string alike.
+pub(crate) fn is_non_retryable_rate_limit(msg: &str) -> bool {
+    msg.contains("额度已用完")
+        || msg.contains("额度已耗尽")
+        || msg.contains("额度耗尽")
+        || msg.contains("配额已用完")
+        || msg.contains("配额已耗尽")
+        || msg.contains("配额耗尽")
+}
+
 pub(super) fn extract_error_message(body: &str) -> String {
     let trimmed = body.trim();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -171,6 +204,48 @@ pub(super) fn extract_error_message(body: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod non_retryable_rate_limit_tests {
+    use super::is_non_retryable_rate_limit;
+
+    #[test]
+    fn monthly_quota_exhausted_is_non_retryable() {
+        // The exact body users hit: a 429 whose quota only resets at a fixed
+        // future time. Retrying before then is futile — must fail fast.
+        assert!(is_non_retryable_rate_limit(
+            "当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。"
+        ));
+        // Also matches on the raw JSON envelope (what retry.rs sees).
+        assert!(is_non_retryable_rate_limit(
+            r#"{"error":{"message":"当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。","type":"auth_error","code":"429"}}"#
+        ));
+        // And on the agent-side formatted string.
+        assert!(is_non_retryable_rate_limit("[429] 当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。"));
+    }
+
+    #[test]
+    fn quota_exhausted_variants_are_non_retryable() {
+        assert!(is_non_retryable_rate_limit("额度已耗尽"));
+        assert!(is_non_retryable_rate_limit("配额已用完"));
+    }
+
+    #[test]
+    fn transient_rate_limits_remain_retryable() {
+        // Rolling-window / load limits recover on their own — keep retrying.
+        assert!(!is_non_retryable_rate_limit("滚动窗口限流，请稍后再试"));
+        assert!(!is_non_retryable_rate_limit("请求过于频繁，请稍后再试"));
+        assert!(!is_non_retryable_rate_limit("模型「GLM-5.1」的请求负载过高，请稍后再试。"));
+        assert!(!is_non_retryable_rate_limit("服务繁忙"));
+        assert!(!is_non_retryable_rate_limit("当前已被限流"));
+    }
+
+    #[test]
+    fn unrelated_text_is_not_matched() {
+        assert!(!is_non_retryable_rate_limit(""));
+        assert!(!is_non_retryable_rate_limit("Internal Server Error"));
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +324,7 @@ mod format_http_error_tests {
         assert_eq!(
             format_http_error(
                 StatusCode::TOO_MANY_REQUESTS,
-                "https://llm-api.atomgit.com/v1/chat/completions",
+                "https://pre-llm-api-cce.atomgit.com/v1/chat/completions",
                 "codingplan rate limit exceeded for type='Pro'",
             ),
             "[429] codingplan rate limit exceeded for type='Pro'"
@@ -321,6 +396,21 @@ mod format_http_error_tests {
 /// (with token refresh if expired).
 pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> {
     let mut config = if config.api_key.is_none() && config.provider_type != "ollama" {
+        // Security: only fall back to the OAuth access_token when the
+        // provider talks to a trusted AtomGit gateway. Sending the
+        // platform credential to an attacker-controlled base_url would
+        // leak the user's AtomGit identity.
+        let base_url = config.base_url.as_deref().unwrap_or("");
+        if !crate::coding_plan::crypto::is_atomgit_gateway(base_url) {
+            anyhow::bail!(
+                "Provider '{}' has no api_key and base_url '{base_url}' is not \
+                 a trusted AtomGit gateway.\n\
+                 Either set an explicit api_key in your config.toml, or use the \
+                 AtomGit OAuth flow by setting base_url to \
+                 https://pre-llm-api-cce.atomgit.com/v1",
+                config.provider_type,
+            );
+        }
         let mut c = config.clone();
         c.api_key = Some(load_auth_token()?);
         c
@@ -421,10 +511,13 @@ fn load_auth_token() -> Result<String> {
 
     // Check expiry (5-minute safety margin)
     if let Some(expires_in) = auth.expires_in {
+        // If the wall clock is somehow before 1970, treat the token
+        // as expired — far safer than panicking inside `create_provider`
+        // and bringing down /login (#45).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX);
         if now >= auth.created_at + expires_in - 300 {
             // Token expired — try refresh
             if let Some(ref rt) = auth.refresh_token {
@@ -446,7 +539,9 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        // No `Client::new()` fallback — it panics on TLS/resolver init
+        // failure and `panic = "abort"` turns that into a process kill.
+        .context("failed to build OAuth refresh HTTP client")?;
     let builder = client
         .post(crate::auth::oauth::platform_refresh_url())
         .json(&serde_json::json!({ "refresh_token": refresh_token, "provider": "atomgit" }));
@@ -490,11 +585,14 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     // Preserve original token_type or use default
     let token_type = token.token_type.as_deref().unwrap_or("Bearer");
 
-    // Save updated auth.toml
+    // Save updated auth.toml — never panic the refresh path on a
+    // misconfigured wall clock (#45). `now = 0` makes the persisted
+    // token look immediately stale, forcing another refresh, which
+    // is the desired fail-safe behaviour.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let new_rt = token.refresh_token.as_deref().unwrap_or(refresh_token);
     let mut content = format!(
         "access_token = \"{}\"\ncreated_at = {}\nrefresh_token = \"{}\"\n",
@@ -619,6 +717,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -765,5 +864,124 @@ mod tests {
         // so this is actually safe. Kept here so the comment lives in
         // a real test and a future false-positive case can be added.
         assert!(!model_name_suggests_vision("focar-text-7b"));
+    }
+
+    // ── Security: OAuth token exfiltration guard ──────────────────
+
+    fn cfg_no_key(provider_type: &str, base_url: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: provider_type.to_string(),
+            api_key: None,
+            model: "m".to_string(),
+            base_url: base_url.map(|s| s.to_string()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 8000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        }
+    }
+
+    /// CVE guard: `create_provider` MUST NOT fall back to the OAuth
+    /// access_token when the provider points to an untrusted base_url.
+    #[test]
+    fn create_provider_rejects_no_api_key_on_untrusted_gateway() {
+        let result = super::create_provider(&cfg_no_key("openai", Some("https://evil.attacker.tld")));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for api_key=None + untrusted base_url"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no api_key") || msg.contains("untrusted"),
+            "expected gateway guard error, got: {}",
+            msg
+        );
+    }
+
+    /// Same guard with base_url = None (empty-string check).
+    #[test]
+    fn create_provider_rejects_no_api_key_on_empty_base_url() {
+        let result = super::create_provider(&cfg_no_key("openai", None));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for api_key=None + base_url=None"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no api_key") || msg.contains("untrusted"),
+            "expected gateway guard error, got: {}",
+            msg
+        );
+    }
+
+    /// Explicit api_key must still work even with an untrusted base_url
+    /// (user has deliberately configured a third-party provider).
+    #[test]
+    fn create_provider_accepts_explicit_key_on_untrusted_gateway() {
+        let result = super::create_provider(&cfg("openai", "sk-real-123"));
+        assert!(
+            result.is_ok(),
+            "explicit api_key on untrusted base_url should be accepted, got: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+    }
+
+    /// Trusted gateway + no api_key should pass the guard and then
+    /// either succeed (if auth.toml exists, e.g., on a developer
+    /// machine) or fail at `load_auth_token()`. Either way the error
+    /// must NOT be a gateway-guard error.
+    #[test]
+    fn create_provider_delegates_auth_on_trusted_gateway() {
+        let result =
+            super::create_provider(&cfg_no_key("openai", Some("https://pre-llm-api-cce.atomgit.com/v1")));
+        let msg = match &result {
+            Err(e) => e.to_string(),
+            Ok(_) => "provider constructed (auth.toml exists)".to_string(),
+        };
+        assert!(
+            !msg.contains("gateway") && !msg.contains("no api_key"),
+            "trusted gateway should pass the guard; got gateway-guard error: {}",
+            msg
+        );
+    }
+
+    /// Legacy CodingPlan hostname (api-ai.gitcode.com) — same as above.
+    #[test]
+    fn create_provider_delegates_auth_on_legacy_codingplan_gateway() {
+        let result =
+            super::create_provider(&cfg_no_key("openai", Some("https://api-ai.gitcode.com/v1")));
+        let msg = match &result {
+            Err(e) => e.to_string(),
+            Ok(_) => "provider constructed (auth.toml exists)".to_string(),
+        };
+        assert!(
+            !msg.contains("gateway") && !msg.contains("no api_key"),
+            "legacy gateway should pass the guard; got gateway-guard error: {}",
+            msg
+        );
+    }
+
+    /// Malicious subdomain of the trusted host must NOT pass the guard.
+    #[test]
+    fn create_provider_rejects_no_api_key_on_lookalike_gateway() {
+        let result = super::create_provider(&cfg_no_key("openai", Some("https://pre-llm-api-cce.atomgit.com.evil.com")));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for lookalike domain"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no api_key") || msg.contains("untrusted"),
+            "expected gateway guard error for lookalike domain, got: {}",
+            msg
+        );
     }
 }

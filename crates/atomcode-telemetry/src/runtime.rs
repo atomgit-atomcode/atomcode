@@ -5,7 +5,7 @@ use crate::event::*;
 use crate::identity::load_or_create;
 use crate::queue::Queue;
 use crate::sender::{http::HttpSender, SenderRuntime};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -82,12 +82,12 @@ impl CurrentContext {
 /// In-process atomic counters for observability. Shared between `Telemetry` and `SenderRuntime`.
 #[derive(Default)]
 pub struct Counters {
-    pub events_tracked: AtomicU64,       // successful try_send
-    pub events_dropped_mpsc: AtomicU64,  // try_send failed (channel full)
-    pub events_dropped_disk: AtomicU64,  // FIFO evicted from disk queue (cap exceeded)
+    pub events_tracked: AtomicU64,      // successful try_send
+    pub events_dropped_mpsc: AtomicU64, // try_send failed (channel full)
+    pub events_dropped_disk: AtomicU64, // FIFO evicted from disk queue (cap exceeded)
     pub segments_posted: AtomicU64,
-    pub bytes_sent: AtomicU64,           // gzipped body bytes
-    pub last_post_unix_ms: AtomicI64,    // 0 = never
+    pub bytes_sent: AtomicU64,        // gzipped body bytes
+    pub last_post_unix_ms: AtomicI64, // 0 = never
 }
 
 impl Counters {
@@ -129,10 +129,17 @@ pub struct CountersSnapshot {
 pub struct Telemetry {
     enabled: bool,
     tx: Option<mpsc::Sender<Record>>,
+    queue: Option<Arc<Mutex<Queue>>>,
     device_id: Uuid,
     launch_id: Uuid,
     session_id: std::sync::Arc<std::sync::RwLock<Uuid>>,
     account_id: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    /// Launch-level session mode (Tui / Headless / Ide / …). Like `account_id`,
+    /// this outlives any single `CurrentContext` scope: it is set once at
+    /// startup and used as the envelope `mode` fallback whenever a task emits
+    /// outside a mode-bearing scope (e.g. a spawned task that forgot to
+    /// re-apply the task-local). A per-scope `CurrentContext.mode` still wins.
+    default_mode: std::sync::Arc<std::sync::RwLock<Option<crate::event::SessionMode>>>,
     app_version: String,
     os: &'static str,
     arch: &'static str,
@@ -142,6 +149,20 @@ pub struct Telemetry {
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     pub counters: Arc<Counters>,
     health_path: Option<PathBuf>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TelemetryError {
+    #[error("telemetry disabled")]
+    Disabled,
+    #[error("telemetry queue unavailable")]
+    QueueUnavailable,
+    #[error("telemetry queue busy")]
+    QueueBusy,
+    #[error("telemetry queue append failed: {0}")]
+    QueueAppend(#[source] anyhow::Error),
+    #[error("telemetry queue roll failed: {0}")]
+    QueueRoll(#[source] anyhow::Error),
 }
 
 impl Telemetry {
@@ -155,10 +176,12 @@ impl Telemetry {
             return Arc::new(Self {
                 enabled: false,
                 tx: None,
+                queue: None,
                 device_id: Uuid::nil(),
                 launch_id,
                 session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
                 account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
                 app_version,
                 os,
                 arch,
@@ -186,10 +209,12 @@ impl Telemetry {
                 return Arc::new(Self {
                     enabled: false,
                     tx: None,
+                    queue: None,
                     device_id: Uuid::nil(),
                     launch_id,
                     session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
                     account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                    default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
                     app_version,
                     os,
                     arch,
@@ -207,12 +232,7 @@ impl Telemetry {
         let http = HttpSender::new(cfg.endpoint.clone(), app_version.clone());
         let counters = Arc::new(Counters::default());
         let health_path = cfg.atomcode_dir.join("telemetry/health.json");
-        let rt = SenderRuntime::new(
-            queue.clone(),
-            http,
-            counters.clone(),
-            health_path.clone(),
-        );
+        let rt = SenderRuntime::new(queue.clone(), http, counters.clone(), health_path.clone());
         let queue_task = queue.clone();
         let handle = tokio::spawn(async move {
             run_sender(rx, rt, queue_task, shutdown_rx).await;
@@ -223,10 +243,12 @@ impl Telemetry {
         Arc::new(Self {
             enabled: true,
             tx: Some(tx),
+            queue: Some(queue),
             device_id,
             launch_id,
             session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
             account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
             app_version,
             os,
             arch,
@@ -248,12 +270,116 @@ impl Telemetry {
             Some(t) => t,
             None => return,
         };
+        match tx.try_send(self.build_record(event)) {
+            Ok(()) => {
+                self.counters.events_tracked.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("telemetry event queued");
+            }
+            Err(_) => {
+                self.counters
+                    .events_dropped_mpsc
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!("telemetry mpsc full, event dropped");
+            }
+        }
+    }
+
+    /// Synchronously durable emit into the local disk queue.
+    ///
+    /// Unlike [`Telemetry::track`], this does not use the in-memory mpsc. It
+    /// appends to the current segment and force-rolls it so the record is fsynced
+    /// and visible as a ready `.ndjson` segment before returning.
+    pub async fn track_durable(&self, event: Event) -> Result<(), TelemetryError> {
+        if !self.enabled {
+            return Err(TelemetryError::Disabled);
+        }
+        let queue = self
+            .queue
+            .as_ref()
+            .ok_or(TelemetryError::QueueUnavailable)?;
+        let record = self.build_record(event);
+        let mut q = queue.lock().await;
+        q.append(&record).map_err(TelemetryError::QueueAppend)?;
+        q.force_roll().map_err(TelemetryError::QueueRoll)?;
+        self.counters.events_tracked.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("telemetry event durably queued");
+        Ok(())
+    }
+
+    /// Best-effort synchronous durable emit for legacy blocking flows.
+    ///
+    /// This is intentionally non-blocking on the async queue mutex: login runs
+    /// through a few synchronous call paths, including TUI rendering code, and
+    /// blocking a Tokio worker here would be riskier than falling back to the
+    /// regular async queue at the call site.
+    pub fn track_durable_sync(&self, event: Event) -> Result<(), TelemetryError> {
+        if !self.enabled {
+            return Err(TelemetryError::Disabled);
+        }
+        let queue = self
+            .queue
+            .as_ref()
+            .ok_or(TelemetryError::QueueUnavailable)?;
+        let record = self.build_record(event);
+        let mut q = queue.try_lock().map_err(|_| TelemetryError::QueueBusy)?;
+        q.append(&record).map_err(TelemetryError::QueueAppend)?;
+        q.force_roll().map_err(TelemetryError::QueueRoll)?;
+        self.counters.events_tracked.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("telemetry event durably queued synchronously");
+        Ok(())
+    }
+
+    /// Read `pending_invite` and emit `InstallCompleted` once per install.
+    ///
+    /// Call after telemetry init and device_id load, before any business logic.
+    /// Idempotent: writes `referral_state.json` to prevent duplicate emission.
+    pub async fn maybe_emit_install_completed(&self, atomcode_dir: &Path) {
+        if !self.enabled {
+            return;
+        }
+        let state_path = atomcode_dir.join("referral_state.json");
+        if let Some(invite) = crate::pending_invite::load(atomcode_dir) {
+            if install_completed_state_matches(&state_path, invite.install_uuid) {
+                return;
+            }
+            if let Err(e) = self
+                .track_durable(Event::InstallCompleted {
+                    invite_code: invite.invite_code,
+                    install_uuid: invite.install_uuid,
+                })
+                .await
+            {
+                warn!(?e, "install_completed durable enqueue failed");
+                return;
+            }
+            let state = serde_json::json!({
+                "install_completed_install_uuid": invite.install_uuid.to_string(),
+                "install_completed_at": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            });
+            if let Ok(json) = serde_json::to_string(&state) {
+                let _ = std::fs::write(&state_path, json);
+            }
+        }
+    }
+
+    fn build_record(&self, event: Event) -> Record {
+        Record {
+            envelope: self.build_envelope(),
+            event,
+        }
+    }
+
+    fn build_envelope(&self) -> Envelope {
         let ctx = CurrentContext::current();
-        let env = Envelope {
+        Envelope {
             device_id: self.device_id,
             launch_id: self.launch_id,
             account_id: self.account_id.read().ok().and_then(|g| g.clone()),
-            session_id: ctx.session_id
+            session_id: ctx
+                .session_id
                 .or_else(|| self.session_id.read().ok().map(|g| *g))
                 .unwrap_or(self.launch_id),
             turn_id: ctx.turn_id,
@@ -267,24 +393,11 @@ impl Telemetry {
             provider_host: ctx.provider_host,
             model: ctx.model,
             repo_origin: ctx.repo_origin,
-            mode: ctx.mode,
-        };
-        match tx.try_send(Record {
-            envelope: env,
-            event,
-        }) {
-            Ok(()) => {
-                self.counters
-                    .events_tracked
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("telemetry event queued");
-            }
-            Err(_) => {
-                self.counters
-                    .events_dropped_mpsc
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("telemetry mpsc full, event dropped");
-            }
+            // Fall back to the launch-level default when no scope set a mode —
+            // otherwise an un-scoped spawned task would emit `mode: null`.
+            mode: ctx
+                .mode
+                .or_else(|| self.default_mode.read().ok().and_then(|g| *g)),
         }
     }
 
@@ -317,6 +430,17 @@ impl Telemetry {
     pub fn set_account_id(&self, id: Option<String>) {
         if let Ok(mut g) = self.account_id.write() {
             *g = id;
+        }
+    }
+
+    /// Set the launch-level default session mode (Tui / Headless / Ide / …).
+    /// Call once at startup: the CLI passes its resolved session mode, the
+    /// daemon passes its startup mode. Events emitted outside a mode-bearing
+    /// `CurrentContext` scope fall back to this instead of `mode: null`; an
+    /// explicit per-scope `CurrentContext.mode` still overrides it.
+    pub fn set_default_mode(&self, mode: Option<crate::event::SessionMode>) {
+        if let Ok(mut g) = self.default_mode.write() {
+            *g = mode;
         }
     }
 
@@ -372,10 +496,12 @@ impl Telemetry {
         let t = Arc::new(Self {
             enabled: true,
             tx: Some(tx),
+            queue: None,
             device_id: Uuid::nil(),
             launch_id,
             session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
             account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
             app_version,
             os: os_str(),
             arch: arch_str(),
@@ -388,6 +514,20 @@ impl Telemetry {
         });
         (t, captured)
     }
+}
+
+fn install_completed_state_matches(state_path: &Path, install_uuid: Uuid) -> bool {
+    let Ok(contents) = std::fs::read_to_string(state_path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    value
+        .get("install_completed_install_uuid")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Uuid>().ok())
+        == Some(install_uuid)
 }
 
 async fn run_sender(
@@ -526,16 +666,28 @@ mod resolve_host_tests {
     fn drops_port_path_userinfo() {
         // Port and path are stripped — only the bare host remains.
         assert_eq!(
-            resolve_provider_host("openai", Some("https://user:pass@api.example.com:8443/v1/foo?bar=baz")),
+            resolve_provider_host(
+                "openai",
+                Some("https://user:pass@api.example.com:8443/v1/foo?bar=baz")
+            ),
             Some("api.example.com".into())
         );
     }
 
     #[test]
     fn falls_back_to_vendor_default_when_url_missing() {
-        assert_eq!(resolve_provider_host("claude", None), Some("api.anthropic.com".into()));
-        assert_eq!(resolve_provider_host("openai", None), Some("api.openai.com".into()));
-        assert_eq!(resolve_provider_host("ollama", None), Some("localhost".into()));
+        assert_eq!(
+            resolve_provider_host("claude", None),
+            Some("api.anthropic.com".into())
+        );
+        assert_eq!(
+            resolve_provider_host("openai", None),
+            Some("api.openai.com".into())
+        );
+        assert_eq!(
+            resolve_provider_host("ollama", None),
+            Some("localhost".into())
+        );
     }
 
     #[test]
@@ -581,7 +733,9 @@ mod session_id_tests {
                 ..Default::default()
             },
             || async {
-                tel.track(Event::OpenAtomcode);
+                tel.track(Event::OpenAtomcode {
+                    dangerously_skip_permissions: false,
+                });
             },
         )
         .await;
@@ -595,5 +749,252 @@ mod session_id_tests {
             records[0].envelope.session_id, override_uuid,
             "CurrentContext.session_id should override the Telemetry-level session_id"
         );
+    }
+}
+
+#[cfg(test)]
+mod default_mode_tests {
+    use super::*;
+    use crate::event::{Event, SessionMode};
+
+    /// The bug fix: `mode` is a launch-level attribute (like `account_id`). When
+    /// a spawned task forgets to re-apply the task-local `CurrentContext` scope,
+    /// the envelope must fall back to the process default instead of emitting
+    /// `mode: null`. (Real impact: IDE-daemon turns whose telemetry escaped the
+    /// per-request scope were landing as null instead of `ide`.)
+    #[tokio::test]
+    async fn default_mode_fills_envelope_when_no_scope_mode() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        tel.set_default_mode(Some(SessionMode::Ide));
+
+        // Emit OUTSIDE any CurrentContext::scope — the failure mode of an
+        // un-scoped spawned task.
+        tel.track(Event::OpenAtomcode {
+            dangerously_skip_permissions: false,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].envelope.mode,
+            Some(SessionMode::Ide),
+            "envelope must fall back to the launch-level default mode"
+        );
+    }
+
+    /// A per-request scope (e.g. the daemon's `daemon_scope` with the client's
+    /// X-AtomCode-Client header) must still override the process default, so
+    /// vscode/webui clients are attributed correctly.
+    #[tokio::test]
+    async fn current_context_mode_overrides_default_mode() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        tel.set_default_mode(Some(SessionMode::Ide));
+
+        CurrentContext::scope(
+            CurrentContext {
+                mode: Some(SessionMode::Vscode),
+                ..Default::default()
+            },
+            || async {
+                tel.track(Event::OpenAtomcode {
+                    dangerously_skip_permissions: false,
+                });
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].envelope.mode,
+            Some(SessionMode::Vscode),
+            "an explicit per-scope mode must win over the launch default"
+        );
+    }
+
+    /// Without a default set and without a scope, mode stays `None` (unchanged
+    /// behavior — the default is opt-in).
+    #[tokio::test]
+    async fn no_default_and_no_scope_stays_none() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+
+        tel.track(Event::OpenAtomcode {
+            dangerously_skip_permissions: false,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].envelope.mode, None);
+    }
+}
+
+#[cfg(test)]
+mod install_completed_tests {
+    use super::*;
+    use crate::config::{ResolvedConfig, TelemetryState};
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    fn enabled_telemetry(dir: &TempDir) -> Arc<Telemetry> {
+        Telemetry::init(
+            ResolvedConfig {
+                state: TelemetryState::Enabled,
+                endpoint: "http://127.0.0.1:1/v1/events".into(),
+                atomcode_dir: dir.path().to_path_buf(),
+            },
+            "test".into(),
+        )
+    }
+
+    fn write_pending_invite(dir: &TempDir, invite_code: &str, install_uuid: Uuid) {
+        let attempted_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(
+            dir.path().join("pending_invite"),
+            format!(
+                "invite_code={invite_code}\ninstall_uuid={install_uuid}\nattempted_at={attempted_at}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_referral_state(dir: &TempDir, install_uuid: Uuid) {
+        std::fs::write(
+            dir.path().join("referral_state.json"),
+            serde_json::json!({
+                "install_completed_install_uuid": install_uuid.to_string(),
+                "install_completed_at": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn records_for_event(dir: &TempDir, event_id: &str) -> Vec<Value> {
+        let queue_dir = dir.path().join("telemetry/queue");
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(queue_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) != Some("ndjson") {
+                continue;
+            }
+            let contents = std::fs::read_to_string(path).unwrap();
+            for line in contents.lines().filter(|line| !line.is_empty()) {
+                let value: Value = serde_json::from_str(line).unwrap();
+                if value.get("event_id").and_then(|v| v.as_str()) == Some(event_id) {
+                    records.push(value);
+                }
+            }
+        }
+        records
+    }
+
+    fn install_completed_records(dir: &TempDir) -> Vec<Value> {
+        records_for_event(dir, "install_completed")
+    }
+
+    fn referral_state_uuid(dir: &TempDir) -> Uuid {
+        let contents = std::fs::read_to_string(dir.path().join("referral_state.json")).unwrap();
+        let value: Value = serde_json::from_str(&contents).unwrap();
+        value
+            .get("install_completed_install_uuid")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn durable_enqueue_success_writes_referral_state() {
+        let dir = TempDir::new().unwrap();
+        let install_uuid = Uuid::new_v4();
+        write_pending_invite(&dir, "ABC12345", install_uuid);
+        let tel = enabled_telemetry(&dir);
+
+        tel.maybe_emit_install_completed(dir.path()).await;
+
+        assert_eq!(referral_state_uuid(&dir), install_uuid);
+        let records = install_completed_records(&dir);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("invite_code").and_then(|v| v.as_str()),
+            Some("ABC12345")
+        );
+        assert_eq!(
+            records[0].get("install_uuid").and_then(|v| v.as_str()),
+            Some(install_uuid.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_durable_login_success_rolls_ready_segment() {
+        let dir = TempDir::new().unwrap();
+        let tel = enabled_telemetry(&dir);
+        let install_uuid = Uuid::new_v4();
+
+        tel.track_durable_sync(Event::LoginSuccess {
+            invite_code: Some("ABC12345".into()),
+            install_uuid: Some(install_uuid),
+        })
+        .unwrap();
+
+        let records = records_for_event(&dir, "login_success");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("invite_code").and_then(|v| v.as_str()),
+            Some("ABC12345")
+        );
+        assert_eq!(
+            records[0].get("install_uuid").and_then(|v| v.as_str()),
+            Some(install_uuid.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn same_install_uuid_referral_state_skips_duplicate_send() {
+        let dir = TempDir::new().unwrap();
+        let install_uuid = Uuid::new_v4();
+        write_pending_invite(&dir, "ABC12345", install_uuid);
+        write_referral_state(&dir, install_uuid);
+        let tel = enabled_telemetry(&dir);
+
+        tel.maybe_emit_install_completed(dir.path()).await;
+
+        assert!(install_completed_records(&dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn different_install_uuid_referral_state_allows_send() {
+        let dir = TempDir::new().unwrap();
+        let install_uuid = Uuid::new_v4();
+        write_pending_invite(&dir, "ABC12345", install_uuid);
+        write_referral_state(&dir, Uuid::new_v4());
+        let tel = enabled_telemetry(&dir);
+
+        tel.maybe_emit_install_completed(dir.path()).await;
+
+        assert_eq!(referral_state_uuid(&dir), install_uuid);
+        let records = install_completed_records(&dir);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("install_uuid").and_then(|v| v.as_str()),
+            Some(install_uuid.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_enqueue_failure_does_not_write_referral_state() {
+        let dir = TempDir::new().unwrap();
+        write_pending_invite(&dir, "ABC12345", Uuid::new_v4());
+        let (tel, _captured) = Telemetry::in_memory("test".into());
+
+        tel.maybe_emit_install_completed(dir.path()).await;
+
+        assert!(!dir.path().join("referral_state.json").exists());
     }
 }

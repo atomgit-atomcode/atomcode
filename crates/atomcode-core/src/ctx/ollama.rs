@@ -17,7 +17,7 @@
 //!   [`crate::agent::prompt`] 层面做。
 //! - **不改工具集筛选**：哪些工具暴露给模型是 [`crate::tool::ToolRegistry`]
 //!   的职责,与 ctx 无关。
-//! - **不重写 render/microcompact/replace_stale_reads**：`build_messages`
+//! - **不重写 render/microcompact**：`build_messages`
 //!   直接透传给 [`crate::ctx::render::build_messages`] —— 与默认行为同
 //!   pipeline,只是 ctx_window 更小、配合更紧的 tool-output 截断。
 //!   想要 render pipeline 级别的定制,完全重写自己的 `build_messages`
@@ -85,10 +85,14 @@ impl CtxBuilder for OllamaCtx {
         crate::ctx::render::needs_compression(conv, system_tokens, self.ctx_window)
     }
 
-    fn compression_plan(&self, conv: &Conversation) -> Option<(String, usize)> {
+    fn compression_plan(
+        &self,
+        conv: &Conversation,
+        keep_ceiling: usize,
+    ) -> Option<(String, usize)> {
         // 决策用的是 self.needs_compression(35% 早触发),
         // plan 内容生成沿用 ctx::render 的 one-line-per-round 机械摘要。
-        let (content, n) = crate::ctx::render::build_compression_content(conv);
+        let (content, n) = crate::ctx::render::build_compression_content(conv, keep_ceiling);
         if content.is_empty() || n == 0 {
             None
         } else {
@@ -146,6 +150,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -270,7 +275,7 @@ mod tests {
     fn compression_plan_none_below_threshold() {
         let o = OllamaCtx::new(&ollama_provider(8_000));
         let conv = Conversation::new();
-        assert!(o.compression_plan(&conv).is_none());
+        assert!(o.compression_plan(&conv, usize::MAX).is_none());
     }
 
     #[test]

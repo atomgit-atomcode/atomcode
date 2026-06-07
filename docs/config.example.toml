@@ -12,6 +12,7 @@ context_window = 64000
 # a 400 like "reasoning_content ... must be passed back to the API" or
 # "reasoning_content is missing in assistant tool call message".
 # reasoning_history = "include"  # or "exclude"
+# reasoning_effort = "high"
 
 # Per-turn datalog. Each turn writes a markdown summary; each LLM
 # round writes a JSON request/response pair under `<dir>/<project>/llm/`.
