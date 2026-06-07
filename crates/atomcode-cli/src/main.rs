@@ -1130,6 +1130,7 @@ async fn run() -> Result<i32> {
                 language: None,
                 ui: Default::default(),
                 plugin: Default::default(),
+                web_search: Default::default(),
             }
         })
     } else {
@@ -1149,6 +1150,7 @@ async fn run() -> Result<i32> {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         }
     };
 
@@ -1343,7 +1345,7 @@ async fn run() -> Result<i32> {
         tool_registry.register_sync(Box::new(ListDirTool));
     }
     if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool));
+        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
     }
     if enabled("web_fetch") {
         tool_registry.register_sync(Box::new(WebFetchTool));
@@ -2653,6 +2655,7 @@ fn run_codingplan_core(
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         },
     };
 

@@ -2258,7 +2258,7 @@ async fn process_chat_request(
         tool_registry.register_sync(Box::new(ListDirTool));
     }
     if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool));
+        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
     }
     if enabled("web_fetch") {
         tool_registry.register_sync(Box::new(WebFetchTool));
