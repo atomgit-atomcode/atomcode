@@ -123,4 +123,41 @@ mod tests {
         let syms = extract_symbols("", Lang::Rust).expect("parse");
         assert!(syms.is_empty());
     }
+
+    #[test]
+    fn extracts_symbols_for_every_language() {
+        use Lang::*;
+        // (lang, sample source, symbol names that MUST be found)
+        let cases: &[(Lang, &str, &[&str])] = &[
+            (Rust, "struct S;\nfn f() {}\n", &["S", "f"]),
+            (Python, "class A:\n    def m(self):\n        pass\n\ndef g():\n    pass\n", &["A", "g"]),
+            (JavaScript, "function fn() {}\nclass C {}\n", &["fn", "C"]),
+            (TypeScript, "function fn(): void {}\ninterface I {}\nclass C {}\n", &["fn", "I", "C"]),
+            (Tsx, "function App() { return null; }\n", &["App"]),
+            (Go, "package p\nfunc F() {}\ntype T struct{}\n", &["F", "T"]),
+            (Java, "class C {\n  void m() {}\n}\n", &["C", "m"]),
+            (C, "struct S { int x; };\nint f(void) { return 0; }\n", &["S", "f"]),
+            (Cpp, "namespace N {}\nclass C {};\nvoid f() {}\n", &["N", "C", "f"]),
+            (CSharp, "class C {\n  void M() {}\n}\n", &["C", "M"]),
+            (Php, "<?php\nfunction f() {}\nclass C {}\n", &["f", "C"]),
+        ];
+        for (lang, src, expected) in cases {
+            let syms = extract_symbols(src, *lang).unwrap_or_default();
+            let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+            for e in *expected {
+                assert!(names.contains(e), "{lang:?}: expected symbol {e:?}, got {names:?}");
+            }
+        }
+        // HTML "symbols" are element-ish; just assert the query runs without error.
+        assert!(extract_symbols("<div id=\"app\"></div>\n", Lang::Html).is_some());
+    }
+
+    #[test]
+    fn byte_slicing_is_utf8_safe_with_multibyte_names() {
+        // tree-sitter byte offsets align to token (char) boundaries, so name slicing
+        // must not panic on multibyte identifiers / bodies.
+        let src = "// 注释\nfn 计算(参数: i32) -> i32 {\n    参数 + 1\n}\n";
+        let syms = extract_symbols(src, Lang::Rust).expect("parse");
+        assert!(syms.iter().any(|s| s.name == "计算"), "{:?}", syms.iter().map(|s| &s.name).collect::<Vec<_>>());
+    }
 }
