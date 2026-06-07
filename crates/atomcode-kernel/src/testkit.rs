@@ -1,7 +1,10 @@
 //! Spike-only test doubles. NOT part of the kernel's real API.
 
+use crate::agent::{Agent, AutoRespond};
 use crate::event::AgentCommand;
+use crate::event::StopReason;
 use crate::hook::{LifecycleHooks, TurnCtx};
+use crate::tool::MountedTools;
 use crate::message::{
     CompactionPlan, CompactionStrategy, CompactionView, Conversation, Message,
 };
@@ -815,6 +818,191 @@ impl CompactionStrategy for NeverShrinksStrategy {
             summary: Some("X".repeat(100_000)),
             rewrites: vec![],
             resume_note: None,
+        }
+    }
+}
+
+// ── SUBAGENT-BY-COMPOSITION doubles (claim 31) ───────────────────────────────
+//
+// A SUBAGENT is NOT a kernel concept. It is an L2 PATTERN: a parent agent spawns a
+// child agent for an isolated sub-task by mounting a `Tool` whose `execute` BUILDS
+// and RUNS a child `Agent`. These doubles prove the kernel supports that purely BY
+// COMPOSITION — using ONLY `Agent` + `Tool` + `run_to_completion` and the two new
+// builder seams (`working_dir`, `cancel_token`). The kernel gains NO "subagent"
+// type. See `tests/subagent.rs`.
+
+/// A tool that, in `execute`, BUILDS a fresh child `Agent` and runs it to
+/// completion on the parent's tool args (the "subtask"). It is the WHOLE subagent
+/// pattern: a Tool running a child Agent via the existing one-shot adapter — no new
+/// kernel concept.
+///
+/// It carries no shared mutable provider state of its own — instead it holds two
+/// FACTORIES (`Fn() -> ...`) so each `execute` mints a FRESH child provider and a
+/// FRESH `MountedTools` (neither is `Clone`, and a child session consumes its
+/// provider/tools). The child is built with:
+/// * `.working_dir(child_dir)` when `child_dir` is `Some` (SEAM 1 — dir isolation),
+/// * `.cancel_token(ctx.cancel.child_token())` ALWAYS (SEAM 2 — the parent's
+///   per-turn cancel propagates into the DETACHED child task), then
+/// * `run_to_completion(args, AllowAll)`.
+///
+/// The child's `Outcome.text` becomes this tool's result content; the result is an
+/// error iff the child did not stop cleanly (`stop != Stopped`).
+pub struct SubAgentTool {
+    name: String,
+    /// Fresh child provider per execution (a session consumes its provider).
+    make_provider: Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
+    /// Fresh mounted tool subset per execution (`MountedTools` is not `Clone`).
+    make_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
+    persona: String,
+    /// SEAM 1: when `Some`, the child runs dir-scoped to this path (distinct from
+    /// the parent's). `None` = the child inherits the default (process cwd) behavior.
+    child_dir: Option<std::path::PathBuf>,
+}
+
+impl SubAgentTool {
+    pub fn new(
+        name: impl Into<String>,
+        make_provider: impl Fn() -> Arc<dyn LlmProvider> + Send + Sync + 'static,
+        make_tools: impl Fn() -> MountedTools + Send + Sync + 'static,
+        persona: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            make_provider: Box::new(make_provider),
+            make_tools: Box::new(make_tools),
+            persona: persona.into(),
+            child_dir: None,
+        }
+    }
+    /// SEAM 1: scope the child agent to a distinct working dir.
+    pub fn child_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.child_dir = Some(dir);
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for SubAgentTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "Spawn a child agent for an isolated sub-task (subagent-by-composition)"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {"task": {"type": "string"}}})
+    }
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
+        // Build the CHILD agent purely from kernel primitives. SEAM 2: derive the
+        // child's cancel source from the PARENT's per-turn token (a child token) so
+        // a parent cancel reaches the DETACHED child session. SEAM 1: optionally pin
+        // the child's tool working_dir.
+        let mut builder = Agent::builder()
+            .provider((self.make_provider)())
+            .tools((self.make_tools)())
+            .persona(self.persona.clone())
+            .cancel_token(ctx.cancel.child_token());
+        if let Some(dir) = &self.child_dir {
+            builder = builder.working_dir(dir.clone());
+        }
+        let child = builder.build();
+        let task = args.to_string();
+        // DETACH the child run onto its own `tokio::spawn` task, then await its
+        // JoinHandle. This is the load-bearing shape for the cancel-propagation
+        // claim: if the PARENT's tool future is dropped on cancel, this awaited
+        // JoinHandle is dropped too — but the spawned run task KEEPS RUNNING
+        // (a dropped JoinHandle detaches, it does NOT abort). So the child's command
+        // channel stays open (no future-drop teardown), and the ONLY thing that can
+        // stop the still-running child is the cancel TOKEN cascading in via the
+        // `.cancel_token(ctx.cancel.child_token())` wired above. (`run_to_completion`
+        // already spawns the child SESSION detached; spawning the DRIVER here too
+        // makes the whole child genuinely independent of the parent tool future.)
+        let outcome = tokio::spawn(async move {
+            child.run_to_completion(task, AutoRespond::AllowAll).await
+        })
+        .await
+        // A child run task should not itself panic; if it did (or was aborted),
+        // surface a failure outcome rather than unwrapping.
+        .unwrap_or_default();
+        // Surface the child's work as this tool's content. Prefer the child's
+        // assistant text; if it produced none (a tool-only child, e.g. a probe),
+        // fall back to its tool-result contents so the child's actual output still
+        // flows back up. (`content: outcome.text` per the spec, with this fallback
+        // so a tool-only subagent is not silently empty.)
+        let content = if !outcome.text.is_empty() {
+            outcome.text
+        } else {
+            outcome.tool_results.iter().map(|r| r.content.clone()).collect::<Vec<_>>().join("\n")
+        };
+        ToolResult {
+            // call_id is set by the kernel after execute returns.
+            call_id: String::new(),
+            content,
+            is_error: outcome.stop != StopReason::Stopped,
+        }
+    }
+}
+
+/// A tool whose result content is exactly the `working_dir` it saw in its
+/// `ToolContext` — so a test can assert WHICH dir the (child) agent's tool context
+/// reported. Proves SEAM 1 is per-agent, not process-global.
+pub struct WorkingDirProbeTool;
+
+#[async_trait]
+impl Tool for WorkingDirProbeTool {
+    fn name(&self) -> &str {
+        "working_dir_probe"
+    }
+    fn description(&self) -> &str {
+        "Returns the ToolContext working_dir it saw"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
+        ToolResult {
+            call_id: String::new(),
+            content: ctx.working_dir.display().to_string(),
+            is_error: false,
+        }
+    }
+}
+
+/// A cooperative tool that BLOCKS until its `ctx.cancel` fires, then flips a shared
+/// `observed` flag and returns. Used by the subagent cancel-propagation test: a
+/// CHILD mounts this and its provider calls it, so the child session parks inside
+/// `execute` on the child's own cancel token. When the parent is cancelled, the
+/// parent's per-turn token (whose child the child-agent's cancel_token is) fires,
+/// the child's per-turn token (a grandchild) fires, this tool observes it, and
+/// `observed` flips — proving cancel propagated into the DETACHED child task.
+pub struct BlockUntilCancelTool {
+    pub observed: Arc<AtomicBool>,
+}
+
+impl BlockUntilCancelTool {
+    pub fn new(observed: Arc<AtomicBool>) -> Self {
+        Self { observed }
+    }
+}
+
+#[async_trait]
+impl Tool for BlockUntilCancelTool {
+    fn name(&self) -> &str {
+        "block_until_cancel"
+    }
+    fn description(&self) -> &str {
+        "Blocks until ctx.cancel fires, then flips a shared observed flag"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
+        ctx.cancel.cancelled().await;
+        self.observed.store(true, Ordering::SeqCst);
+        ToolResult {
+            call_id: String::new(),
+            content: "observed cancel".into(),
+            is_error: false,
         }
     }
 }

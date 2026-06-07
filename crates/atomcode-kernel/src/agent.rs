@@ -152,6 +152,25 @@ pub struct Agent {
     /// request (no opinion). Per-round variation is a deliberate follow-up — these
     /// session-level options are forwarded UNCHANGED on every round.
     chat_options: ChatOptions,
+    /// SEAM 1 (working_dir): the directory this agent's tools see as
+    /// `ToolContext::working_dir`. `None` (default) = read the process-global
+    /// `current_dir()` each turn (the prior behavior). `Some(dir)` PINS this agent's
+    /// tool context to `dir` regardless of the process cwd — fixing the
+    /// multi-session/process-global-cwd hazard AND letting a CHILD agent (subagent)
+    /// be dir-scoped independently of its parent. See `AgentBuilder::working_dir`.
+    working_dir: Option<std::path::PathBuf>,
+    /// SEAM 2 (cancel_token): an EXTERNAL cancel source this agent's per-turn tokens
+    /// are derived FROM (as `child_token()`s). `None` (default) = each turn mints a
+    /// fresh independent `CancellationToken` (the prior behavior). `Some(parent)` =
+    /// when `parent` is cancelled, every per-turn token (a child) is cancelled too,
+    /// so run_turn's existing cancel checkpoints fire.
+    ///
+    /// WHY this is the ONLY way to stop a running subagent: `run_to_completion`
+    /// `spawn()`s the child session as a DETACHED `tokio::spawn` task. Dropping the
+    /// parent's tool future does NOT abort that task — so the only mechanism that can
+    /// stop a running child is the cancel TOKEN propagating IN. See
+    /// `AgentBuilder::cancel_token`.
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl Agent {
@@ -178,6 +197,8 @@ impl Agent {
             compact_threshold: self.compact_threshold,
             stream_timeout: self.stream_timeout,
             chat_options: self.chat_options,
+            working_dir: self.working_dir,
+            cancel_token: self.cancel_token,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -235,9 +256,26 @@ struct RunningAgent {
     /// NEUTRAL per-call provider request knobs forwarded to `chat_stream` every
     /// round (see `Agent::chat_options`). Default = a neutral request.
     chat_options: ChatOptions,
+    /// SEAM 1: per-agent working dir (see `Agent::working_dir`). `None` = read the
+    /// process-global `current_dir()` each turn.
+    working_dir: Option<std::path::PathBuf>,
+    /// SEAM 2: external cancel source the per-turn tokens derive from (see
+    /// `Agent::cancel_token`). `None` = fresh independent token per turn.
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl RunningAgent {
+    /// SEAM 2: mint the per-turn cancellation token. When an external (parent) cancel
+    /// source is configured, the per-turn token is a CHILD of it — so cancelling the
+    /// parent cancels every in-flight turn (and, via `ToolContext::cancel`, every
+    /// tool). When unset, each turn gets a fresh independent token (prior behavior).
+    /// CENTRALIZED here so every per-turn-token creation site stays consistent.
+    fn new_turn_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel_token
+            .as_ref()
+            .map(|t| t.child_token())
+            .unwrap_or_else(tokio_util::sync::CancellationToken::new)
+    }
     /// Decide whether the AUTO task-boundary trigger should fire for the CURRENT
     /// stored history. Returns `Some(CompactTrigger::Auto{utilization})` iff a
     /// `compact_threshold` is configured AND the LAST stored assistant message's
@@ -453,8 +491,12 @@ impl RunningAgent {
         convo.push(Message::user(text));
         // Per-turn cancellation token: Cancel fires it; run_turn polls it at the
         // stream, between tools, and inside execute. A CLONE also rides into each
-        // ToolContext so cooperative tools can bail.
-        let turn_token = tokio_util::sync::CancellationToken::new();
+        // ToolContext so cooperative tools can bail. SEAM 2: derived from the
+        // session's external cancel source (a CHILD token) when one is configured —
+        // so a parent's cancel propagates into THIS turn (and its tools) too. Unset
+        // = a fresh independent token (prior behavior). Centralized in
+        // `new_turn_token` so every site stays consistent.
+        let turn_token = self.new_turn_token();
         // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
         // so a middleware blocked on approval can be answered out-of-band.
         let mut turn = Box::pin(self.run_turn(convo, turn_token.clone()));
@@ -750,8 +792,15 @@ impl RunningAgent {
                         } else {
                             executed = true;
                             self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
+                            // SEAM 1: a per-agent `working_dir` (when set) PINS the
+                            // tool context's dir instead of reading the process-global
+                            // `current_dir()` — fixing the multi-session cwd hazard and
+                            // letting a subagent be dir-scoped. Unset = prior behavior.
                             let ctx = ToolContext {
-                                working_dir: std::env::current_dir().unwrap_or_default(),
+                                working_dir: self
+                                    .working_dir
+                                    .clone()
+                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
                                 cancel: cancel.clone(),
                             };
                             // INSIDE-EXECUTE backstop: poll cancel while the tool
@@ -835,6 +884,10 @@ pub struct AgentBuilder {
     stream_timeout: Option<std::time::Duration>,
     request_timeout: Option<std::time::Duration>,
     chat_options: ChatOptions,
+    /// SEAM 1: optional per-agent working dir (see `Agent::working_dir`).
+    working_dir: Option<std::path::PathBuf>,
+    /// SEAM 2: optional external cancel source (see `Agent::cancel_token`).
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl Default for AgentBuilder {
@@ -869,6 +922,11 @@ impl Default for AgentBuilder {
             // The provider receives `ChatOptions::default()` unless a specialization
             // sets values via `AgentBuilder::chat_options`.
             chat_options: ChatOptions::default(),
+            // NEUTRAL defaults for the two subagent-by-composition seams: unset →
+            // current behavior (process-global cwd per turn; a fresh independent
+            // per-turn cancel token). An embedder opts in via the builder methods.
+            working_dir: None,
+            cancel_token: None,
         }
     }
 }
@@ -1022,6 +1080,40 @@ impl AgentBuilder {
         self.chat_options = o;
         self
     }
+    /// SEAM 1: PIN this agent's tool `working_dir`. Every `ToolContext` this agent
+    /// builds will report `dir` (cloned per call) instead of reading the
+    /// process-global `current_dir()`. Without this call the default is `None` —
+    /// the kernel reads `current_dir()` each turn (the prior behavior).
+    ///
+    /// WHY this is a seam: process cwd is GLOBAL — multiple agents/sessions in one
+    /// process share it, a hazard for concurrent runs. Pinning per-agent removes
+    /// that coupling AND lets a CHILD agent (a subagent) run dir-scoped to a
+    /// different path than its parent — proven by the subagent working-dir-isolation
+    /// spike. The kernel still does NOT chdir or sandbox; it only reports the value
+    /// to a (cooperating) tool (see the `crate::tool` trust-model contract).
+    pub fn working_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.working_dir = Some(dir);
+        self
+    }
+    /// SEAM 2: DERIVE this agent's per-turn cancellation tokens from an external
+    /// cancel source `t`. Each turn's token becomes a `t.child_token()`, so when `t`
+    /// is cancelled every in-flight turn (and, via `ToolContext::cancel`, every
+    /// cooperating tool) is cancelled too — run_turn's existing cancel checkpoints
+    /// fire. Without this call the default is `None` — each turn mints a fresh
+    /// independent token (the prior single-agent behavior; an external token only
+    /// affects sessions that opt in).
+    ///
+    /// WHY this seam EXISTS (subagent cancellation): `run_to_completion` `spawn()`s
+    /// the session as a DETACHED `tokio::spawn` task. When a parent runs a child via
+    /// a tool, DROPPING the parent's tool future does NOT abort that detached child
+    /// task — so the ONLY way to stop a running child is the cancel TOKEN propagating
+    /// in. Passing `ctx.cancel.child_token()` here wires the parent's per-turn cancel
+    /// straight into the child, which is exactly what the subagent cancel-propagation
+    /// spike proves.
+    pub fn cancel_token(mut self, t: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel_token = Some(t);
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -1041,6 +1133,8 @@ impl AgentBuilder {
             stream_timeout: self.stream_timeout,
             request_timeout: self.request_timeout,
             chat_options: self.chat_options,
+            working_dir: self.working_dir,
+            cancel_token: self.cancel_token,
         }
     }
 }
