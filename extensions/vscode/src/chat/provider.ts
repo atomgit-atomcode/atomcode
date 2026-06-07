@@ -421,7 +421,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this.newConversation();
       const newSid = this._focusedPanelId;
       if (!newSid) return;
-      this._postMessageToPanel(newSid, { type: 'userMessage', text });
+      this._postOrQueueToPanel(newSid, { type: 'userMessage', text });
       return;
     }
     this._postMessageToPanel(sid, { type: 'userMessage', text });
