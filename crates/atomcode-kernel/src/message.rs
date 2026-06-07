@@ -277,17 +277,37 @@ impl Conversation {
             candidate.push(Message::synthetic_user(summary.clone()));
         }
         candidate.extend_from_slice(&self.messages[drain_to..]);
-        // Apply rewrites in place against the CANDIDATE (post-drain) indices.
-        // Out-of-range indices are skipped (never panic). A rewrite index in the
-        // PROTECTED PREFIX (`< floor`) is SKIPPED too: the prefix `candidate[..floor]`
-        // equals `messages[..floor]` (drain_from >= floor), so a `< floor` rewrite
-        // would mutate the FROZEN system/first-real-user prefix — the sacred-floor
-        // guarantee must hold for rewrites just as it does for drains.
-        for (i, new_text) in &plan.rewrites {
-            if *i < floor {
-                continue;
+        // Apply rewrites. `rewrites` indices are ORIGINAL `self.messages` indices
+        // (the same space as drain_from/drain_to), so each must be TRANSLATED into
+        // the candidate Vec before applying. Three guards, in order:
+        //   * `orig_i < floor` (PROTECTED PREFIX) → SKIP. The prefix
+        //     `candidate[..floor]` equals `messages[..floor]` (drain_from >= floor),
+        //     so a `< floor` rewrite would mutate the FROZEN system/first-real-user
+        //     prefix — the sacred-floor guarantee must hold for rewrites as for drains.
+        //   * `orig_i` inside the drained range `[drain_from, drain_to)` → SKIP. That
+        //     message was removed by the drain; there is nothing to rewrite.
+        //   * otherwise TRANSLATE to the candidate index:
+        //       - `orig_i < drain_from` → unchanged (it precedes the drain).
+        //       - `orig_i >= drain_to`  → `drain_from + summary_shift + (orig_i - drain_to)`,
+        //         where `summary_shift` is 1 iff a summary was inserted at drain_from.
+        // An out-of-range translated index is skipped (never panic).
+        let summary_shift = usize::from(plan.summary.is_some());
+        for (orig_i, new_text) in &plan.rewrites {
+            let orig_i = *orig_i;
+            if orig_i < floor {
+                continue; // sacred prefix
             }
-            if let Some(m) = candidate.get_mut(*i) {
+            if orig_i >= drain_from && orig_i < drain_to {
+                continue; // drained away — no surviving message
+            }
+            let cand_i = if orig_i < drain_from {
+                orig_i
+            } else {
+                // orig_i >= drain_to here (the `[drain_from, drain_to)` case was
+                // skipped above). Map past the removed range and the summary insert.
+                drain_from + summary_shift + (orig_i - drain_to)
+            };
+            if let Some(m) = candidate.get_mut(cand_i) {
                 m.text = new_text.clone();
             }
         }
@@ -314,6 +334,31 @@ impl Conversation {
             let removed = len_before.saturating_sub(candidate.len());
             self.messages = candidate;
             self.cache_epoch = epoch_before + 1;
+            // PRESSURE RELIEF (anti re-fire): the auto task-boundary trigger
+            // (`should_compact`) reads the LAST assistant's frozen `meta.utilization`.
+            // `apply_plan` copies Message structs verbatim and never refreshes meta,
+            // so without this the SAME high utilization would be read at the next
+            // boundary and compaction would re-fire (over-shrink / spam
+            // Compacted{committed:false}) even though the history is now smaller.
+            // Reflect the relieved pressure deterministically: scale the surviving
+            // last assistant's `utilization` and `used_tokens` by the byte-reduction
+            // ratio `bytes_after / bytes_before` (< 1 here since we committed). This
+            // is an estimate that holds until the real provider reports fresh usage
+            // on the next turn. Only on commit.
+            if bytes_before > 0 {
+                let ratio = bytes_after as f64 / bytes_before as f64;
+                if let Some(meta) = self
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == Role::Assistant)
+                    .and_then(|m| m.meta.as_mut())
+                {
+                    meta.utilization = (meta.utilization as f64 * ratio) as f32;
+                    meta.used_tokens =
+                        (meta.used_tokens as f64 * ratio).round() as u32;
+                }
+            }
             (self.cache_epoch, removed)
         } else {
             // REFUSE: messages byte-identical, epoch unchanged.
@@ -375,10 +420,19 @@ pub struct CompactionView<'a> {
 /// Semantics: replace messages in range `[drain_from, drain_to)` with — if
 /// `summary` is `Some` — ONE synthetic `Role::User` summary message inserted at
 /// `drain_from`; apply `rewrites` as in-place `messages[i].text = new` (for
-/// stubbing a tool_result in place — a permanent microcompact), indices being
-/// post-drain positions; append `resume_note` (if `Some`) as a trailing synthetic
-/// `Role::User` message. A NOOP plan is an empty drain range + no summary + no
-/// rewrites + no resume_note.
+/// stubbing a tool_result in place — a permanent microcompact); append
+/// `resume_note` (if `Some`) as a trailing synthetic `Role::User` message. A NOOP
+/// plan is an empty drain range + no summary + no rewrites + no resume_note.
+///
+/// REWRITE INDEX SPACE (load-bearing): each `rewrites` index is an index into the
+/// ORIGINAL `self.messages` Vec (the same space `drain_from`/`drain_to` live in),
+/// NOT a post-drain candidate position. `apply_plan` TRANSLATES each original
+/// index into the candidate Vec (accounting for the drained range removal and the
+/// optional summary-insert shift), so a strategy may combine a drain, a summary,
+/// AND a rewrite of a surviving message in ONE plan and still hit the right target.
+/// A rewrite whose original index falls inside the drained range `[drain_from,
+/// drain_to)` (the message no longer exists) is SILENTLY SKIPPED; one targeting the
+/// sacred prefix (`< sacred_floor`) is SKIPPED too.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct CompactionPlan {
     pub drain_from: usize,
@@ -1054,6 +1108,81 @@ mod tests {
         assert_eq!(c.messages[1], user_before, "first real user must be byte-identical");
         // The in-range rewrite applied.
         assert_eq!(c.messages[2].text, "short");
+    }
+
+    // ── BUG 1 — rewrite-index space combines drain + summary + rewrite ───────
+
+    // The load-bearing combining case: a plan that DRAINS a middle range, inserts a
+    // SUMMARY, AND rewrites a message ORIGINALLY AFTER drain_to. Rewrite indices are
+    // ORIGINAL `self.messages` indices, so `apply_plan` must TRANSLATE them
+    // (accounting for the removed range + the summary-insert shift). Assert:
+    //   * the rewrite targeting an ORIGINAL index after drain_to hits the CORRECT
+    //     surviving message (not an off-by-N neighbor),
+    //   * a rewrite targeting a DRAINED index is silently skipped,
+    //   * a rewrite targeting the sacred prefix is skipped.
+    #[test]
+    fn apply_plan_rewrite_index_translates_with_drain_and_summary() {
+        let mut c = Conversation::new();
+        c.push(Message::system("SYS-FROZEN")); // 0 sacred
+        c.push(Message::user("THE-TASK")); // 1 sacred (first real user) → floor 2
+        // Drained pair (idx 2,3): assistant call c1 + its result, both inside [2,4).
+        c.push(Message::assistant("drain me A long enough", vec![call("c1", "echo")])); // 2
+        c.push(Message::tool_result("c1", "drain me B also long", false)); // 3
+        // Surviving pair AFTER drain_to (idx 4,5): assistant call c2 + its result.
+        c.push(Message::assistant("SURVIVOR keep me", vec![call("c2", "echo")])); // 4
+        c.push(Message::tool_result("c2", "ORIGINAL TOOL OUTPUT THAT IS LONG ENOUGH", false)); // 5 ← rewrite target
+        c.push(Message::user("TAIL keep me")); // 6
+        let floor = c.sacred_floor(); // 2
+        let sys_before = c.messages[0].clone();
+        let task_before = c.messages[1].clone();
+        let survivor_before = c.messages[4].clone();
+        let tail_before = c.messages[6].clone();
+        let epoch_before = c.cache_epoch;
+
+        // Drain [2,4); insert a summary at floor; rewrites in ORIGINAL index space:
+        //   (5, …)        → surviving tool result AFTER drain_to → must apply, translated.
+        //   (3, "SKIPPED")→ inside the drained range → must be skipped.
+        //   (0, "HACKED") → sacred prefix → must be skipped.
+        let plan = CompactionPlan {
+            drain_from: 2,
+            drain_to: 4,
+            summary: Some("s".into()),
+            rewrites: vec![
+                (5, "[stub]".into()),
+                (3, "SHOULD-BE-SKIPPED-DRAINED".into()),
+                (0, "HACKED".into()),
+            ],
+            resume_note: None,
+        };
+        let report = c.apply_plan(plan, floor);
+        assert!(report.committed, "net-smaller combining plan must commit");
+        assert_eq!(c.cache_epoch, epoch_before + 1);
+
+        // Post-compaction layout:
+        //   [0]=SYS [1]=TASK [2]=summary(synthetic) [3]=SURVIVOR(orig4)
+        //   [4]=tool result(orig5, REWRITTEN) [5]=TAIL(orig6)
+        // 7 original - 2 drained + 1 summary = 6.
+        assert_eq!(c.messages.len(), 6, "7 original - 2 drained + 1 summary = 6");
+        // Sacred prefix byte-identical (the (0,..) rewrite was skipped).
+        assert_eq!(c.messages[0], sys_before, "system byte-identical, sacred rewrite skipped");
+        assert_eq!(c.messages[1], task_before, "task byte-identical");
+        // Summary inserted at the floor.
+        assert!(c.messages[2].synthetic && c.messages[2].text == "s");
+        // SURVIVOR (orig 4) is unchanged — it was NOT the rewrite target.
+        assert_eq!(c.messages[3], survivor_before, "survivor assistant untouched");
+        // The CORRECT surviving message (orig 5 → candidate 4) got the rewrite,
+        // NOT an off-by-N neighbor.
+        assert_eq!(c.messages[4].text, "[stub]", "rewrite hit the translated index");
+        assert_eq!(c.messages[4].tool_call_id.as_deref(), Some("c2"), "and it is the right message");
+        // The drained-index rewrite never resurfaced anywhere.
+        assert!(
+            !c.messages.iter().any(|m| m.text == "SHOULD-BE-SKIPPED-DRAINED"),
+            "a rewrite of a drained index must be silently skipped"
+        );
+        // No message got HACKED.
+        assert!(!c.messages.iter().any(|m| m.text == "HACKED"), "sacred-prefix rewrite skipped");
+        // Tail preserved.
+        assert_eq!(c.messages[5], tail_before, "trailing user preserved");
     }
 
     // NoCompaction (the neutral default strategy) returns a noop plan.

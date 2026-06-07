@@ -1,5 +1,6 @@
 //! Spike-only test doubles. NOT part of the kernel's real API.
 
+use crate::event::AgentCommand;
 use crate::hook::{LifecycleHooks, TurnCtx};
 use crate::message::{
     CompactionPlan, CompactionStrategy, CompactionView, Conversation, Message,
@@ -15,6 +16,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Returns scripted stream events (one Vec per call) and RECORDS the messages it
 /// received on each call, so tests can assert exactly what the LLM saw.
@@ -205,6 +207,58 @@ impl Tool for CountingTool {
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         ToolResult { call_id: String::new(), content: format!("count#{n} args={args}"), is_error: false }
+    }
+}
+
+/// A shared, LATE-BOUND handle to the session's `commands` sender. The session's
+/// `cmd_tx` only exists AFTER `spawn()`, but a tool must be mounted BEFORE — this
+/// slot bridges that: a test creates it, builds an [`InjectCommandTool`] over a
+/// clone, spawns, then fills the slot with `handle.commands.clone()`.
+pub type DeferredCommands = Arc<Mutex<Option<UnboundedSender<AgentCommand>>>>;
+
+/// A tool that, the FIRST time it executes, INJECTS a pre-configured
+/// `AgentCommand` back into the session over a LATE-BOUND `commands` handle — a
+/// DETERMINISTIC mid-turn injection point. Because the kernel runs `execute`
+/// between the assistant's tool_call and the round completing, the injected
+/// command is delivered while the turn is still in flight (the mid-turn select),
+/// proving the kernel QUEUES rather than drops it. Fires AT MOST ONCE (guarded by
+/// an AtomicBool) so a multi-round turn does not re-inject.
+pub struct InjectCommandTool {
+    commands: DeferredCommands,
+    to_send: Mutex<Option<AgentCommand>>,
+    fired: AtomicBool,
+}
+
+impl InjectCommandTool {
+    pub fn new(commands: DeferredCommands, to_send: AgentCommand) -> Self {
+        Self { commands, to_send: Mutex::new(Some(to_send)), fired: AtomicBool::new(false) }
+    }
+}
+
+#[async_trait]
+impl Tool for InjectCommandTool {
+    fn name(&self) -> &str { "inject" }
+    fn description(&self) -> &str { "Injects a pre-configured AgentCommand mid-turn (test only)" }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            let cmd = self.to_send.lock().unwrap().take();
+            if let (Some(cmd), Some(tx)) = (cmd, self.commands.lock().unwrap().clone()) {
+                let _ = tx.send(cmd);
+            }
+            // Yield repeatedly so the turn future stays PENDING for a window after
+            // the command is enqueued — this guarantees the session's mid-turn
+            // `tokio::select!` gets polled while the turn is still in flight and
+            // drains the just-injected command (the deterministic mid-turn proof).
+            // Without this, an all-ready mock turn can run to completion in a single
+            // poll and the command would only be seen at idle, masking the bug.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+        }
+        ToolResult { call_id: String::new(), content: "injected".into(), is_error: false }
     }
 }
 
@@ -673,8 +727,10 @@ impl CompactionStrategy for StubToolResultsStrategy {
             return CompactionPlan::noop();
         }
         // Rewrite every tool result EXCEPT the last (most recent) one to a stub.
-        // No drain → post-drain indices equal current indices, so these indices
-        // are correct for `apply_plan`'s rewrite step.
+        // `apply_plan` interprets rewrite indices in the ORIGINAL `messages` space
+        // (the same space `view.messages` is enumerated in here), so these indices
+        // are correct as-is. This strategy never drains, so the original and the
+        // post-drain candidate indices happen to coincide too.
         let rewrites = tool_idxs[..tool_idxs.len() - 1]
             .iter()
             .map(|&i| (i, "[elided]".to_string()))

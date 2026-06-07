@@ -294,6 +294,16 @@ impl RunningAgent {
             }
         };
         self.hooks.session_start(&mut convo).await;
+        // FIFO queue for commands that arrive MID-TURN and must NOT be dropped: a
+        // `Snapshot` (a driver waiting on its reply would otherwise hang) and a
+        // `SendMessage` (the user's next prompt would otherwise vanish). They are
+        // enqueued by the mid-turn select and DRAINED after the current turn
+        // completes (see `process_send_message` + the drain loop below), so a free
+        // (no-longer-borrowed) `convo` services them in arrival order. A queued
+        // SendMessage that itself queues more mid-turn commands keeps working —
+        // the drain loop runs until `pending` is empty.
+        let mut pending: std::collections::VecDeque<AgentCommand> =
+            std::collections::VecDeque::new();
         loop {
             let cmd = match cmd_rx.recv().await {
                 Some(c) => c,
@@ -314,57 +324,108 @@ impl RunningAgent {
                 AgentCommand::Compact { focus } => {
                     self.run_compaction(&mut convo, CompactTrigger::Manual { focus }).await;
                 }
-                AgentCommand::SendMessage { mut text } => {
-                    if let Err(reason) = self.hooks.user_prompt_submit(&mut text).await {
-                        self.rt.emit(AgentEvent::Error { message: format!("prompt rejected: {reason}") });
-                        self.rt.emit(AgentEvent::TurnComplete);
-                        continue;
+                AgentCommand::SendMessage { text } => {
+                    let shutdown = self
+                        .process_send_message(&mut convo, &mut cmd_rx, &mut pending, text)
+                        .await;
+                    if shutdown {
+                        break;
                     }
-                    // ── TASK BOUNDARY auto-compaction ──
-                    // After the prompt is accepted but BEFORE the new user message
-                    // enters history and the turn runs, compact the PRIOR history
-                    // once (if pressure crossed the threshold). This is the
-                    // cache-safe trigger point: a committed compaction opens a NEW
-                    // epoch, then the fresh user message + turn run append-only on
-                    // the compacted history. NEVER fired inside run_turn's round
-                    // loop (that would reopen the within-turn cache break).
-                    if let Some(trigger) = self.should_compact(&convo) {
-                        self.run_compaction(&mut convo, trigger).await;
-                    }
-                    convo.push(Message::user(text));
-                    // Per-turn cancellation token: Cancel fires it; run_turn polls
-                    // it at the stream, between tools, and inside execute. A CLONE
-                    // also rides into each ToolContext so cooperative tools can bail.
-                    let turn_token = tokio_util::sync::CancellationToken::new();
-                    // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
-                    // so a middleware blocked on approval can be answered out-of-band.
-                    let mut turn = Box::pin(self.run_turn(&mut convo, turn_token.clone()));
-                    let mut shutdown = false;
-                    loop {
-                        tokio::select! {
-                            _ = &mut turn => break,
-                            maybe = cmd_rx.recv() => match maybe {
-                                Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
-                                Some(AgentCommand::Shutdown) => { shutdown = true; break; }
-                                Some(AgentCommand::Cancel) => turn_token.cancel(),
-                                Some(AgentCommand::Snapshot) => {}
-                                Some(AgentCommand::SendMessage { .. }) => {}
-                                // A Compact mid-turn is IGNORED: compacting inside a
-                                // running turn would reopen the within-turn cache
-                                // break (and `convo` is mutably borrowed by run_turn).
-                                // Manual compaction is honored at IDLE only.
-                                Some(AgentCommand::Compact { .. }) => {}
-                                None => { shutdown = true; break; }
+                    // DRAIN queued mid-turn commands (FIFO) now that the turn is
+                    // done and `convo` is free. A queued Snapshot replies from the
+                    // now-current convo; a queued SendMessage runs a full turn (which
+                    // may itself enqueue more — hence the while-not-empty loop).
+                    let mut drained_shutdown = false;
+                    while let Some(queued) = pending.pop_front() {
+                        match queued {
+                            AgentCommand::Snapshot => {
+                                self.rt.emit(AgentEvent::Snapshot {
+                                    snapshot: SessionSnapshot::from_conversation(&convo),
+                                });
                             }
+                            AgentCommand::SendMessage { text } => {
+                                if self
+                                    .process_send_message(
+                                        &mut convo, &mut cmd_rx, &mut pending, text,
+                                    )
+                                    .await
+                                {
+                                    drained_shutdown = true;
+                                    break;
+                                }
+                            }
+                            // Only Snapshot/SendMessage are ever enqueued.
+                            _ => {}
                         }
                     }
-                    if shutdown {
+                    if drained_shutdown {
                         break;
                     }
                 }
             }
         }
         self.hooks.session_end(&convo).await;
+    }
+
+    /// Handle ONE `SendMessage`: run `user_prompt_submit`, the task-boundary
+    /// auto-compaction, push the user message, then drive the turn while servicing
+    /// commands. Mid-turn `Snapshot`/`SendMessage` are QUEUED into `pending` (FIFO)
+    /// instead of being dropped — the caller drains them after this returns.
+    /// Returns `true` iff a `Shutdown` (or a closed command channel) was observed
+    /// mid-turn, so the caller must tear down without draining further.
+    async fn process_send_message(
+        &self,
+        convo: &mut Conversation,
+        cmd_rx: &mut UnboundedReceiver<AgentCommand>,
+        pending: &mut std::collections::VecDeque<AgentCommand>,
+        mut text: String,
+    ) -> bool {
+        if let Err(reason) = self.hooks.user_prompt_submit(&mut text).await {
+            self.rt.emit(AgentEvent::Error { message: format!("prompt rejected: {reason}") });
+            self.rt.emit(AgentEvent::TurnComplete);
+            return false;
+        }
+        // ── TASK BOUNDARY auto-compaction ──
+        // After the prompt is accepted but BEFORE the new user message enters
+        // history and the turn runs, compact the PRIOR history once (if pressure
+        // crossed the threshold). This is the cache-safe trigger point: a committed
+        // compaction opens a NEW epoch, then the fresh user message + turn run
+        // append-only on the compacted history. NEVER fired inside run_turn's round
+        // loop (that would reopen the within-turn cache break).
+        if let Some(trigger) = self.should_compact(convo) {
+            self.run_compaction(convo, trigger).await;
+        }
+        convo.push(Message::user(text));
+        // Per-turn cancellation token: Cancel fires it; run_turn polls it at the
+        // stream, between tools, and inside execute. A CLONE also rides into each
+        // ToolContext so cooperative tools can bail.
+        let turn_token = tokio_util::sync::CancellationToken::new();
+        // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
+        // so a middleware blocked on approval can be answered out-of-band.
+        let mut turn = Box::pin(self.run_turn(convo, turn_token.clone()));
+        let mut shutdown = false;
+        loop {
+            tokio::select! {
+                _ = &mut turn => break,
+                maybe = cmd_rx.recv() => match maybe {
+                    Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
+                    Some(AgentCommand::Shutdown) => { shutdown = true; break; }
+                    Some(AgentCommand::Cancel) => turn_token.cancel(),
+                    // QUEUE a mid-turn Snapshot/SendMessage rather than dropping it:
+                    // a Snapshot reply (driver may be blocking on it) and the user's
+                    // next prompt must survive. Drained after the turn completes.
+                    Some(c @ AgentCommand::Snapshot) | Some(c @ AgentCommand::SendMessage { .. }) => {
+                        pending.push_back(c);
+                    }
+                    // A Compact mid-turn is IGNORED: compacting inside a running turn
+                    // would reopen the within-turn cache break (and `convo` is mutably
+                    // borrowed by run_turn). Manual compaction is honored at IDLE only.
+                    Some(AgentCommand::Compact { .. }) => {}
+                    None => { shutdown = true; break; }
+                }
+            }
+        }
+        shutdown
     }
 
     async fn run_turn(&self, convo: &mut Conversation, cancel: tokio_util::sync::CancellationToken) {
