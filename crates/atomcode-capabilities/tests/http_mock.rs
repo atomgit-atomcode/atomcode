@@ -31,6 +31,15 @@ const TOOL_CALL_SSE: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"
 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
 data: [DONE]\n";
 
+/// Round-1 SSE from a THINKING model: reasoning_content deltas FOLLOWED by a tool call.
+/// The kernel accumulates the reasoning onto the assistant message; whether it is
+/// echoed back next round is the per-model ReasoningPolicy under test.
+const ROUND1_REASONING_TOOL_SSE: &str = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think. \"}}]}\n\
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"I should call get_time.\"}}]}\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]}}]}\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
+data: [DONE]\n";
+
 /// Build a provider pointed at the mock server, with FAST retry backoff so the
 /// exhaustion test does not sleep for real seconds.
 fn provider_for(server_uri: &str, model: &str) -> OpenAiCompatProvider {
@@ -207,4 +216,81 @@ async fn multi_round_tool_loop_executes_tool_and_logs_each_round() {
     let logs = log.lock().unwrap();
     let request_logs = logs.iter().filter(|l| l.contains("request (round")).count();
     assert_eq!(request_logs, 2, "WireLogHooks must observe both rounds: {logs:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-round REASONING round-trip (the load-bearing thinking-model behavior)
+// ---------------------------------------------------------------------------
+
+/// Drive a 2-round tool loop for `model`: round 1 emits `round1_sse`, round 2 the final
+/// answer. Returns the requests the server received (so a test can inspect round 2's
+/// body). Asserts the loop completed cleanly with the final answer.
+async fn run_two_round(model: &str, round1_sse: &str) -> Vec<wiremock::Request> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(round1_sse.to_string()))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(FINAL_SSE))
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(provider_for(&server.uri(), model));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(GetTimeTool));
+    let tools = registry.mount(&["get_time"]);
+
+    let outcome = Agent::builder()
+        .provider(provider)
+        .tools(tools)
+        .max_rounds(5)
+        .build()
+        .run_to_completion("what time is it?", AutoRespond::AllowAll)
+        .await;
+
+    assert!(outcome.error.is_none(), "no error: {:?}", outcome.error);
+    assert_eq!(outcome.text, "It is noon.", "final answer from round 2");
+    server.received_requests().await.unwrap()
+}
+
+/// DeepSeek-V4 (Include): the round-1 reasoning the model returned is STORED by the
+/// kernel and ECHOED BACK as `reasoning_content` on the assistant tool-call message in
+/// round 2 — the round-trip DeepSeek-V4 REQUIRES (HTTP 400 "must be passed back" else).
+#[tokio::test]
+async fn multi_round_reasoning_is_echoed_back_for_deepseek_v4() {
+    let reqs = run_two_round("deepseek-v4-flash", ROUND1_REASONING_TOOL_SSE).await;
+    assert_eq!(reqs.len(), 2, "two rounds");
+
+    let round2 = String::from_utf8_lossy(&reqs[1].body);
+    assert!(
+        round2.contains("reasoning_content"),
+        "V4 (Include) must echo reasoning_content back in round 2"
+    );
+    assert!(
+        round2.contains("I should call get_time."),
+        "round 2 must echo the EXACT round-1 reasoning the kernel stored: {round2}"
+    );
+}
+
+/// DeepSeek-R1 (Exclude): even though the model returned reasoning in round 1 (and the
+/// kernel stored it), it must NOT be echoed back in round 2 — R1 returns HTTP 400 if
+/// `reasoning_content` is sent. Proves the kernel STORES but the L1 policy decides the
+/// wire echo (mechanism vs policy).
+#[tokio::test]
+async fn multi_round_reasoning_is_stripped_for_deepseek_r1() {
+    let reqs = run_two_round("deepseek-r1", ROUND1_REASONING_TOOL_SSE).await;
+    assert_eq!(reqs.len(), 2, "two rounds");
+
+    let round2 = String::from_utf8_lossy(&reqs[1].body);
+    assert!(
+        !round2.contains("reasoning_content"),
+        "R1 (Exclude) must NOT echo reasoning_content (400 otherwise): {round2}"
+    );
+    // sanity: the round still carried the tool result + the assistant tool_call.
+    assert!(round2.contains("12:00"), "tool result still fed back");
+    assert!(round2.contains("get_time"), "assistant tool_call still echoed");
 }
