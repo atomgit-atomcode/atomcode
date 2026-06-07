@@ -78,7 +78,7 @@ async fn stream_timeout_fails_turn_cleanly() {
         let mut completed = false;
         while let Some(ev) = handle.events.recv().await {
             match ev {
-                AgentEvent::Error { message } => error_msg = Some(message),
+                AgentEvent::Error { message, .. } => error_msg = Some(message),
                 AgentEvent::TurnComplete { .. } => {
                     completed = true;
                     break;

@@ -77,6 +77,7 @@ async fn failed_open_run_to_completion_reports_error_not_empty_success() {
     let provider = Arc::new(ScriptedProvider::open_error(ProviderError {
         retryable: false,
         message: "auth failed (401)".into(),
+        ..Default::default()
     }));
 
     let agent = Agent::builder()
@@ -209,7 +210,7 @@ async fn turn_end_continuation_fuse_stops_runaway() {
         let mut error_msg: Option<String> = None;
         while let Some(ev) = handle.events.recv().await {
             match ev {
-                AgentEvent::Error { message } => error_msg = Some(message),
+                AgentEvent::Error { message, .. } => error_msg = Some(message),
                 AgentEvent::TurnComplete { reason: r } => {
                     reason = Some(r);
                     break;

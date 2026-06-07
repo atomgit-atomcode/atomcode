@@ -470,6 +470,7 @@ async fn committed_compaction_relieves_pressure_and_does_not_refire() {
             vec![StreamEvent::Error(ProviderError {
                 retryable: false,
                 message: "boom".into(),
+                ..Default::default()
             })],
             // Turn 3: a normal short answer (only reached if turn 3 runs at all).
             vec![StreamEvent::TextDelta("again".into()), StreamEvent::Done { truncated: false }],

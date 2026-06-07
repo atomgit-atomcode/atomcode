@@ -79,7 +79,16 @@ pub enum AgentEvent {
     /// `MaxContinuations`/`Cancelled`/`PromptRejected`). A driver can no longer
     /// mistake a failed turn for an empty success.
     TurnComplete { reason: StopReason },
-    Error { message: String },
+    /// A failure (failed open / mid-stream / timeout / max-rounds / prompt-rejected /
+    /// tool error). `message` is the human-readable cause; `http_status` + `code` are
+    /// the STRUCTURED error code for provider failures (`None` for kernel-internal ones).
+    Error {
+        message: String,
+        #[serde(default)]
+        http_status: Option<u16>,
+        #[serde(default)]
+        code: Option<String>,
+    },
     /// The turn was cooperatively cancelled (AgentCommand::Cancel mid-turn).
     /// Emitted immediately before the terminal TurnComplete on a cancel path;
     /// any dangling tool_calls have been backfilled with synthetic results so

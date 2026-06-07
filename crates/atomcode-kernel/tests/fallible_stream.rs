@@ -17,6 +17,7 @@ async fn provider_open_error_surfaces_and_fails_turn() {
     let provider = Arc::new(ScriptedProvider::open_error(ProviderError {
         retryable: false,
         message: "auth failed (401)".into(),
+        ..Default::default()
     }));
     let recorder = Arc::new(RecorderHook::new());
     let log = recorder.log.clone();
@@ -30,7 +31,7 @@ async fn provider_open_error_surfaces_and_fails_turn() {
     let mut got_text = false;
     while let Some(ev) = events.recv().await {
         match ev {
-            AgentEvent::Error { message } => error_msg = Some(message),
+            AgentEvent::Error { message, .. } => error_msg = Some(message),
             AgentEvent::TextDelta(_) => got_text = true,
             AgentEvent::TurnComplete { .. } => {
                 completed = true;
@@ -63,6 +64,7 @@ async fn mid_stream_error_surfaces_and_fails_turn() {
         StreamEvent::Error(ProviderError {
             retryable: true,
             message: "upstream 503".into(),
+            ..Default::default()
         }),
         // A trailing Done is scripted but must NEVER be reached — the error ends
         // the turn first.
@@ -79,7 +81,7 @@ async fn mid_stream_error_surfaces_and_fails_turn() {
     let mut complete_count = 0;
     while let Some(ev) = events.recv().await {
         match ev {
-            AgentEvent::Error { message } => error_msg = Some(message),
+            AgentEvent::Error { message, .. } => error_msg = Some(message),
             AgentEvent::TurnComplete { .. } => {
                 complete_count += 1;
                 break;

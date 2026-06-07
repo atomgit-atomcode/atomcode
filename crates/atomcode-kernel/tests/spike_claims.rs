@@ -318,7 +318,7 @@ async fn round_budget_projected_to_llm_and_hard_capped() {
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Usage(m) => rounds_seen.push(m.round),
-            AgentEvent::Error { message } if message.contains("max rounds") => capped = true,
+            AgentEvent::Error { message, .. } if message.contains("max rounds") => capped = true,
             AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }
@@ -621,7 +621,7 @@ async fn user_prompt_submit_can_block_a_prompt() {
     let mut turn_started = false;
     while let Some(ev) = handle.events.recv().await {
         match ev {
-            AgentEvent::Error { message } if message.contains("rejected") => rejected = true,
+            AgentEvent::Error { message, .. } if message.contains("rejected") => rejected = true,
             AgentEvent::TurnStarted => turn_started = true,
             AgentEvent::TurnComplete { .. } => break,
             _ => {}

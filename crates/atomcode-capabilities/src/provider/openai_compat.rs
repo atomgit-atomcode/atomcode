@@ -89,6 +89,7 @@ impl OpenAiCompatProvider {
             .map_err(|e| ProviderError {
                 retryable: false,
                 message: format!("http client build failed: {e}"),
+                ..Default::default()
             })?;
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
         Ok(Self { cfg, policy, client, url })
@@ -137,11 +138,17 @@ impl LlmProvider for OpenAiCompatProvider {
                             continue;
                         }
                         let text = resp.text().await.unwrap_or_default();
-                        // Prefer the parsed provider error (code + reason); fall back to raw.
-                        let detail = parse_provider_error(&text).unwrap_or_else(|| truncate_msg(&text));
+                        // Parse the error envelope ONCE for both the readable detail and
+                        // the STRUCTURED provider code.
+                        let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
+                        let err_obj = envelope.as_ref().and_then(|v| v.get("error"));
+                        let detail = err_obj.map(parse_error_obj).unwrap_or_else(|| truncate_msg(&text));
+                        let provider_code = err_obj.and_then(error_code);
                         return Err(ProviderError {
                             retryable: retry::is_retryable_status(code),
                             message: format!("HTTP {code}: {detail}"),
+                            http_status: Some(code),
+                            code: provider_code,
                         });
                     }
                     break resp;
@@ -172,6 +179,7 @@ impl LlmProvider for OpenAiCompatProvider {
                         yield StreamEvent::Error(ProviderError {
                             retryable: false,
                             message: "stream idle timeout".to_string(),
+                            ..Default::default()
                         });
                         return;
                     }
@@ -183,6 +191,7 @@ impl LlmProvider for OpenAiCompatProvider {
                         yield StreamEvent::Error(ProviderError {
                             retryable: false,
                             message: format!("stream read error: {e}"),
+                            ..Default::default()
                         });
                         return;
                     }
@@ -340,6 +349,7 @@ fn open_error(e: reqwest::Error) -> ProviderError {
     ProviderError {
         retryable: e.is_timeout() || e.is_connect(),
         message: format!("open failed: {e}"),
+        ..Default::default()
     }
 }
 
@@ -375,15 +385,21 @@ fn parse_error_obj(err: &serde_json::Value) -> String {
     truncate_msg(&format!("{tag}{msg}"))
 }
 
-/// Parse an OpenAI-compatible error envelope `{"error":{...}}`. `None` if not that shape.
-fn parse_provider_error(body: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let s = parse_error_obj(v.get("error")?);
-    if s.trim().is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+/// Extract the provider's STRUCTURED error code from an error object: `code` (string or
+/// number) if present, else fall back to `type`. For `ProviderError.code`.
+fn error_code(err: &serde_json::Value) -> Option<String> {
+    err.get("code")
+        .and_then(|c| match c {
+            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .or_else(|| {
+            err.get("type")
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +503,8 @@ impl SseDecoder {
             out.push(StreamEvent::Error(ProviderError {
                 retryable: false,
                 message: format!("provider error: {}", parse_error_obj(err)),
+                http_status: None,
+                code: error_code(err),
             }));
             self.done = true;
             return;
@@ -981,17 +999,25 @@ mod tests {
         assert!(err.message.contains("overloaded"), "must carry error code: {}", err.message);
         assert!(err.message.contains("the model is overloaded"), "must carry reason: {}", err.message);
         assert!(!err.retryable, "mid-stream errors are non-retryable");
+        assert_eq!(err.code.as_deref(), Some("overloaded"), "structured code on mid-stream error");
     }
 
     #[test]
-    fn parse_provider_error_extracts_type_code_reason() {
-        let body = r#"{"error":{"message":"The model `x` does not exist","type":"invalid_request_error","code":"model_not_found"}}"#;
-        let parsed = parse_provider_error(body).expect("should parse");
-        assert!(parsed.contains("invalid_request_error"));
-        assert!(parsed.contains("model_not_found"));
-        assert!(parsed.contains("does not exist"));
-        // non-envelope bodies return None (caller falls back to raw)
-        assert!(parse_provider_error("plain text 500").is_none());
+    fn error_obj_and_code_extract_type_code_reason() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"message":"The model `x` does not exist","type":"invalid_request_error","code":"model_not_found"}"#,
+        )
+        .unwrap();
+        let formatted = parse_error_obj(&v);
+        assert!(formatted.contains("invalid_request_error"), "{formatted}");
+        assert!(formatted.contains("model_not_found"), "{formatted}");
+        assert!(formatted.contains("does not exist"), "{formatted}");
+        assert_eq!(error_code(&v).as_deref(), Some("model_not_found"));
+        // missing `code` falls back to `type`; numeric code normalizes to a string.
+        let v2: serde_json::Value = serde_json::from_str(r#"{"message":"x","type":"server_error"}"#).unwrap();
+        assert_eq!(error_code(&v2).as_deref(), Some("server_error"));
+        let v3: serde_json::Value = serde_json::from_str(r#"{"message":"x","code":429}"#).unwrap();
+        assert_eq!(error_code(&v3).as_deref(), Some("429"));
     }
 
     #[test]

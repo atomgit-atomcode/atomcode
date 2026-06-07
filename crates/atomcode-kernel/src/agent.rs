@@ -89,6 +89,11 @@ pub struct Outcome {
     pub stop: StopReason,
     /// The last error surfaced during the run, if any (None on a clean stop).
     pub error: Option<String>,
+    /// STRUCTURED error code for the last error: HTTP status + provider code (both
+    /// `None` for kernel-internal errors / a clean stop). Lets a batch consumer branch
+    /// on the code instead of string-matching `error`.
+    pub http_status: Option<u16>,
+    pub error_code: Option<String>,
 }
 
 /// Auto-response policy for the one-shot adapter (no human in the loop).
@@ -240,7 +245,11 @@ impl Agent {
                 // FAILURE PERCEPTION: do NOT drop Error any more (the old `_ => {}`
                 // swallowed it → a failed run looked like an empty success). Capture
                 // it (last one wins) so the Outcome carries the cause.
-                AgentEvent::Error { message } => outcome.error = Some(message),
+                AgentEvent::Error { message, http_status, code } => {
+                    outcome.error = Some(message);
+                    outcome.http_status = http_status;
+                    outcome.error_code = code;
+                }
                 AgentEvent::TurnComplete { reason } => {
                     outcome.stop = reason;
                     let _ = handle.commands.send(AgentCommand::Shutdown);
@@ -510,7 +519,7 @@ impl RunningAgent {
         mut text: String,
     ) -> bool {
         if let Err(reason) = self.hooks.user_prompt_submit(&mut text).await {
-            self.rt.emit(AgentEvent::Error { message: format!("prompt rejected: {reason}") });
+            self.rt.emit(AgentEvent::Error { message: format!("prompt rejected: {reason}"), http_status: None, code: None });
             self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::PromptRejected });
             return false;
         }
@@ -580,7 +589,7 @@ impl RunningAgent {
             // Hard cap (safety fuse): stop before exceeding max_rounds.
             if let Some(max) = self.max_rounds {
                 if round > max {
-                    self.rt.emit(AgentEvent::Error { message: format!("max rounds ({max}) reached") });
+                    self.rt.emit(AgentEvent::Error { message: format!("max rounds ({max}) reached"), http_status: None, code: None });
                     self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::MaxRounds });
                     return;
                 }
@@ -611,7 +620,7 @@ impl RunningAgent {
                 Ok(s) => s,
                 Err(e) => {
                     self.hooks.on_error(&e.message).await;
-                    self.rt.emit(AgentEvent::Error { message: e.message });
+                    self.rt.emit(AgentEvent::Error { message: e.message, http_status: e.http_status, code: e.code });
                     self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::ProviderError });
                     return;
                 }
@@ -654,7 +663,7 @@ impl RunningAgent {
                     _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
                         let msg = "stream timeout".to_string();
                         self.hooks.on_error(&msg).await;
-                        self.rt.emit(AgentEvent::Error { message: msg });
+                        self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
                         self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::Timeout });
                         return;
                     }
@@ -704,7 +713,7 @@ impl RunningAgent {
                     // do NOT fall through to a fake empty-success completion.
                     StreamEvent::Error(e) => {
                         self.hooks.on_error(&e.message).await;
-                        self.rt.emit(AgentEvent::Error { message: e.message });
+                        self.rt.emit(AgentEvent::Error { message: e.message, http_status: e.http_status, code: e.code });
                         self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::ProviderError });
                         return;
                     }
@@ -775,6 +784,8 @@ impl RunningAgent {
                         if continuations >= max {
                             self.rt.emit(AgentEvent::Error {
                                 message: format!("max turn_end continuations ({max}) reached"),
+                                http_status: None,
+                                code: None,
                             });
                             self.rt.emit(AgentEvent::TurnComplete {
                                 reason: StopReason::MaxContinuations,

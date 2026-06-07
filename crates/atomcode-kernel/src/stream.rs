@@ -12,10 +12,17 @@ pub struct TokenUsage {
 /// A streaming failure surfaced by the provider. `retryable=true` =
 /// 429/5xx/timeout (the loop MAY retry later); `false` = terminal
 /// (auth/400/bad-request). The kernel does not retry here — it only surfaces.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ProviderError {
     pub retryable: bool,
     pub message: String,
+    /// HTTP status code for an OPEN failure (a non-2xx response). `None` for transport
+    /// or mid-stream errors that have no HTTP status. The "error code" in the HTTP sense.
+    pub http_status: Option<u16>,
+    /// The provider's STRUCTURED error code (e.g. `"model_not_found"`), or its error
+    /// `type` when no `code` is given. `None` if the provider surfaced neither. Lets a
+    /// consumer branch on the code instead of string-matching `message`.
+    pub code: Option<String>,
 }
 
 /// Minimal provider stream surface. Fallible: a real streaming LLM can fail

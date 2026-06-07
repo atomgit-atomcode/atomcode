@@ -144,11 +144,44 @@ async fn open_failure_parses_provider_error_code_and_reason() {
         .expect("a 400 must surface an Err");
 
     assert!(!err.retryable, "400 is fatal");
-    // Records HTTP status code + the provider's error type, code, AND reason.
+    // In the message string: status + type + code + reason.
     assert!(err.message.contains("400"), "status: {}", err.message);
     assert!(err.message.contains("invalid_request_error"), "type: {}", err.message);
     assert!(err.message.contains("model_not_found"), "code: {}", err.message);
     assert!(err.message.contains("does not exist"), "reason: {}", err.message);
+    // STRUCTURED fields (not just the message string):
+    assert_eq!(err.http_status, Some(400), "structured HTTP status");
+    assert_eq!(err.code.as_deref(), Some("model_not_found"), "structured provider code");
+}
+
+#[tokio::test]
+async fn agent_outcome_carries_structured_error_code() {
+    let server = MockServer::start().await;
+    let body = serde_json::json!({
+        "error": { "message": "nope", "type": "invalid_request_error", "code": "model_not_found" }
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(400).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(provider_for(&server.uri(), "glm-test"));
+    let tools = ToolRegistry::new().mount(&[]);
+    let outcome = Agent::builder()
+        .provider(provider)
+        .tools(tools)
+        .max_rounds(3)
+        .build()
+        .run_to_completion("hi", AutoRespond::AllowAll)
+        .await;
+
+    // The structured code threads all the way out: adapter → ProviderError →
+    // AgentEvent::Error → Outcome.
+    assert!(outcome.error.is_some(), "the turn should fail");
+    assert_eq!(outcome.http_status, Some(400), "Outcome carries structured HTTP status");
+    assert_eq!(outcome.error_code.as_deref(), Some("model_not_found"), "Outcome carries provider code");
 }
 
 #[tokio::test]

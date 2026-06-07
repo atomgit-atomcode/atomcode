@@ -25,7 +25,7 @@ async fn drive_collect_errors(handle: &mut atomcode_kernel::agent::AgentHandle, 
     let mut errors = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         match ev {
-            AgentEvent::Error { message } => errors.push(message),
+            AgentEvent::Error { message, .. } => errors.push(message),
             AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }
