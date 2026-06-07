@@ -201,13 +201,25 @@ async fn e2e_multi_round_reasoning_roundtrip_does_not_400() {
     );
     let provider = Arc::new(OpenAiCompatProvider::new(cfg).expect("build provider"));
 
-    // Count rounds via the general hook so we KNOW the loop went multi-round.
+    // Count rounds via the general hook so we KNOW the loop went multi-round, AND tee
+    // the full wire log to a file when ATOMCODE_WIRE_LOG_FILE is set (else stderr only).
     let rounds = Arc::new(Mutex::new(0usize));
     let counter = rounds.clone();
+    let log_file = std::env::var("ATOMCODE_WIRE_LOG_FILE").ok().map(|p| {
+        eprintln!("[e2e] wire log → file: {p}");
+        Arc::new(Mutex::new(
+            std::fs::OpenOptions::new().create(true).append(true).open(p).expect("open wire log file"),
+        ))
+    });
+    let lf = log_file.clone();
     let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| {
         eprintln!("{s}");
         if s.contains("[wire] request") {
             *counter.lock().unwrap() += 1;
+        }
+        if let Some(f) = &lf {
+            use std::io::Write;
+            let _ = writeln!(f.lock().unwrap(), "{s}\n");
         }
     }));
 
