@@ -509,7 +509,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self {
             out,
             caps,
-            screen: Screen::new(w, h),
+            screen: Screen::new(w, h).with_jediterm(caps.jediterm),
             input_buf: String::new(),
             input_cursor_byte: 0,
             menu: None,
@@ -3614,7 +3614,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         seq.push_str("\x1b[H");
         let _ = self.out.write_all(seq.as_bytes());
-        self.screen = Screen::new(self.screen.width(), self.screen.height());
+        self.screen =
+            Screen::new(self.screen.width(), self.screen.height()).with_jediterm(self.caps.jediterm);
         self.body_lines.clear();
         self.scrolled_off = 0;
         self.welcome_line_count = 0;

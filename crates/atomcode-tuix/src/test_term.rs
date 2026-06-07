@@ -44,6 +44,12 @@
 use crossterm::style::Color;
 use vte::{Params, Parser, Perform};
 
+/// Visible stand-in painted into a wide glyph's 2nd (continuation) column
+/// when [`VirtualTerminal::set_cjk_narrow_paint`] is on. U+2400 (`␀`,
+/// SYMBOL FOR NULL) is never emitted by the renderer, so it can't collide
+/// with real content and makes the "每个汉字后空一格" gap assertable.
+pub const CJK_NARROW_GAP: char = '\u{2400}';
+
 /// One cell of the reconstructed screen grid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GridCell {
@@ -118,6 +124,15 @@ pub struct VirtualTerminal {
     /// scrollback after footer-height transitions" user report.
     /// Default is off (matches xterm).
     ed_promotes_to_scrollback: bool,
+    /// Model JediTerm / DevEco-Studio's no-font-fallback paint of WIDE
+    /// glyphs: the 2-cell grid box is honoured (cursor still advances 2),
+    /// but the narrow substitute glyph is drawn centered, leaving the 2nd
+    /// column visually blank. Flip on to reproduce the user-reported
+    /// "每个汉字后空一格" gap — the continuation column gets stamped with
+    /// [`CJK_NARROW_GAP`] so a test can assert the artifact instead of an
+    /// indistinguishable space. Default off (matches a font with real
+    /// fullwidth CJK metrics, where the glyph fills both columns).
+    cjk_narrow_paint: bool,
 }
 
 impl VirtualTerminal {
@@ -136,6 +151,7 @@ impl VirtualTerminal {
             scroll_bottom: height.saturating_sub(1),
             scrollback: Vec::new(),
             ed_promotes_to_scrollback: false,
+            cjk_narrow_paint: false,
         }
     }
 
@@ -145,6 +161,13 @@ impl VirtualTerminal {
     /// 2J-on-footer-transition scrollback pollution.
     pub fn set_ed_promotes_to_scrollback(&mut self, on: bool) {
         self.ed_promotes_to_scrollback = on;
+    }
+
+    /// Opt into the JediTerm / DevEco-Studio "wide glyph painted narrow in
+    /// a 2-cell box" model (see the `cjk_narrow_paint` field). Call once
+    /// after construction to reproduce the per-ideograph gap on-screen.
+    pub fn set_cjk_narrow_paint(&mut self, on: bool) {
+        self.cjk_narrow_paint = on;
     }
 
     /// Scroll the current DECSTBM region up by one line: the row at
@@ -272,21 +295,35 @@ impl VirtualTerminal {
         if self.cursor_row as usize >= self.grid.len() {
             return;
         }
+        // Display width: 1 for narrow, 2 for wide. Computed up front so the
+        // narrow-paint model below can stamp the continuation column.
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
+        let narrow_paint = self.cjk_narrow_paint && w == 2;
+        let cursor_col = self.cursor_col as usize;
         let row = &mut self.grid[self.cursor_row as usize];
-        if (self.cursor_col as usize) < row.len() {
-            row[self.cursor_col as usize] = GridCell {
+        if cursor_col < row.len() {
+            row[cursor_col] = GridCell {
                 ch,
                 bold: self.style.bold,
                 faint: self.style.faint,
                 reverse: self.style.reverse,
                 fg: self.style.fg,
             };
+            // JediTerm narrow-paint: the wide glyph occupies a 2-cell box but
+            // its substitute glyph is drawn centered, so the 2nd column reads
+            // as blank. Stamp the gap-marker there so it's visible/assertable.
+            if narrow_paint {
+                let cont = cursor_col + 1;
+                if cont < row.len() {
+                    row[cont].ch = CJK_NARROW_GAP;
+                }
+            }
         }
-        // Advance cursor by display width (1 for narrow, 2 for
-        // wide). Retained emits a wide glyph once and we account
-        // for both cells; terminal auto-wrap is off in retained
-        // (we never exceed the right edge on purpose).
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
+        // Advance cursor by display width. Retained emits a wide glyph once
+        // and we account for both cells; terminal auto-wrap is off in
+        // retained (we never exceed the right edge on purpose). The advance
+        // is +2 for wide glyphs in BOTH paint modes — JediTerm's GRID still
+        // reserves 2 cells; only the on-screen paint differs.
         self.cursor_col = self.cursor_col.saturating_add(w);
     }
 
@@ -597,6 +634,34 @@ mod tests {
         assert_eq!(vt.cell_at(0, 0).ch, '你');
         assert_eq!(vt.cell_at(0, 2).ch, '好');
         assert_eq!(vt.cursor(), (0, 4));
+    }
+
+    /// Reproduce the DevEco/JediTerm bug: serialize_patches emits a per-cell
+    /// CUP for each ideograph (你@col1, 好@col3 in ANSI 1-indexed). With
+    /// narrow-paint on, the 2nd column of each 2-cell box reads blank — that
+    /// is the visible "每个汉字后空一格" gap from the screenshot.
+    #[test]
+    fn vt_cjk_narrow_paint_marks_continuation_gap() {
+        let mut vt = VirtualTerminal::new(10, 1);
+        vt.set_cjk_narrow_paint(true);
+        vt.feed("\x1b[1;1H你\x1b[1;3H好".as_bytes());
+        assert_eq!(vt.cell_at(0, 0).ch, '你');
+        assert_eq!(vt.cell_at(0, 1).ch, CJK_NARROW_GAP, "gap after 你");
+        assert_eq!(vt.cell_at(0, 2).ch, '好');
+        assert_eq!(vt.cell_at(0, 3).ch, CJK_NARROW_GAP, "gap after 好");
+        // The grid still advances 2 cells per ideograph — only paint differs.
+        assert_eq!(vt.cursor(), (0, 4));
+    }
+
+    /// Default (narrow-paint off) models a font with real fullwidth CJK
+    /// metrics: the continuation column stays an ordinary blank, no gap
+    /// marker. Guards that the toggle is opt-in and inert by default.
+    #[test]
+    fn vt_cjk_narrow_paint_off_leaves_blank_continuation() {
+        let mut vt = VirtualTerminal::new(10, 1);
+        vt.feed("\x1b[1;1H你".as_bytes());
+        assert_eq!(vt.cell_at(0, 0).ch, '你');
+        assert_eq!(vt.cell_at(0, 1).ch, ' ', "default: continuation stays blank");
     }
 
     #[test]

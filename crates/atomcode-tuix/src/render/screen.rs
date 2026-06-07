@@ -36,7 +36,7 @@
 
 use std::io::Write as _;
 
-use super::cell::{diff_cell_frames, serialize_patches, Cell};
+use super::cell::{diff_cell_frames, serialize_frames_tight, serialize_patches, Cell};
 
 /// Retained W×H cell grid + current/prev frames.
 ///
@@ -72,6 +72,15 @@ pub struct Screen {
     /// Last-emitted cursor visibility (`?25h` / `?25l`).
     /// `None` means "no visibility sequence emitted yet".
     last_cursor_visible: Option<bool>,
+    /// JediTerm (IntelliJ-platform terminal) repaint mode. When set,
+    /// `render_diff` serialises changed rows via
+    /// [`serialize_frames_tight`] — one CUP+EL per changed row, then a
+    /// contiguous run — instead of the per-cell-CUP [`serialize_patches`]
+    /// stream. Defeats the per-`─`-CUP rule fragmentation and stale-tail
+    /// ghosting JediTerm's no-font-fallback paint layer produces. Off by
+    /// default; set via [`Screen::with_jediterm`] from `caps.jediterm`.
+    /// Does NOT change the per-ideograph gap (that's a font artifact).
+    jediterm: bool,
 }
 
 impl Screen {
@@ -88,7 +97,15 @@ impl Screen {
             physical_dirty: false,
             last_cursor: None,
             last_cursor_visible: None,
+            jediterm: false,
         }
+    }
+
+    /// Enable the JediTerm per-row tight-repaint path (see the `jediterm`
+    /// field). Chainable so call sites read `Screen::new(w, h).with_jediterm(caps.jediterm)`.
+    pub fn with_jediterm(mut self, on: bool) -> Self {
+        self.jediterm = on;
+        self
     }
 
     pub fn width(&self) -> u16 {
@@ -216,8 +233,16 @@ impl Screen {
             body.extend_from_slice(b"\x1b[H");
             self.physical_dirty = false;
         }
-        let patches = diff_cell_frames(&self.prev_cells, &self.cells);
-        let patch_bytes = serialize_patches(&patches);
+        // JediTerm: per-row tight repaint (one CUP+EL + contiguous run per
+        // changed row) instead of the per-cell-CUP patch stream. Defeats the
+        // rule fragmentation + stale-tail ghosting its no-font-fallback paint
+        // layer produces. Every other terminal keeps the minimal patch path.
+        let patch_bytes = if self.jediterm {
+            serialize_frames_tight(&self.prev_cells, &self.cells)
+        } else {
+            let patches = diff_cell_frames(&self.prev_cells, &self.cells);
+            serialize_patches(&patches)
+        };
         body.extend_from_slice(&patch_bytes);
         // Anti-flicker wrap around any frame that moves the caret.
         // `serialize_patches` walks the cursor across every changed
@@ -415,6 +440,44 @@ mod tests {
         let out = String::from_utf8(bytes).unwrap();
         // Expect exactly the cursor-show sequence, nothing else.
         assert_eq!(out, "\x1b[?25h", "unexpected bytes: {:?}", out);
+    }
+
+    /// JediTerm mode renders a box-drawing rule as one contiguous run
+    /// (single CUP for the row) — the per-`─`-CUP fragmentation the
+    /// default path produces is what visually shatters the rule on
+    /// JediTerm's paint layer.
+    #[test]
+    fn jediterm_renders_rule_as_contiguous_run() {
+        let mut s = Screen::new(6, 2).with_jediterm(true);
+        let mut rule = Vec::new();
+        push_str_cells(&mut rule, "──────", &CellStyle::default());
+        s.draw_row(0, 0, &rule);
+        let out = String::from_utf8(s.render_diff()).unwrap();
+        assert!(out.contains("──────"), "rule must be one contiguous run: {:?}", out);
+        assert_eq!(
+            out.matches("\x1b[1;1H").count(),
+            1,
+            "exactly one CUP for the rule row (no per-dash CUP): {:?}",
+            out
+        );
+    }
+
+    /// Default Screen (no `with_jediterm`) keeps the per-cell-CUP path:
+    /// a rule of non-ASCII dashes emits one CUP per dash. Guards that the
+    /// JediTerm branch is opt-in and the legacy path is byte-unchanged.
+    #[test]
+    fn default_screen_keeps_per_cell_cup_for_rule() {
+        let mut s = Screen::new(5, 1);
+        let mut rule = Vec::new();
+        push_str_cells(&mut rule, "───", &CellStyle::default());
+        s.draw_row(0, 0, &rule);
+        let out = String::from_utf8(s.render_diff()).unwrap();
+        // serialize_patches forces a CUP before every non-ASCII cell → 3.
+        assert!(
+            out.matches('H').count() >= 3,
+            "default path per-dash CUPs, got: {:?}",
+            out
+        );
     }
 
     #[test]

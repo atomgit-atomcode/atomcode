@@ -449,6 +449,7 @@ mod tests {
             scroll_region: false,
             unicode_symbols: false,
             legacy_conhost: false,
+            jediterm: false,
         }
     }
 
@@ -466,6 +467,7 @@ mod tests {
             scroll_region: false,
             unicode_symbols: true,
             legacy_conhost: false,
+            jediterm: true,
         }
     }
 
