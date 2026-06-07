@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use atomcode_capabilities::hooks::WireLogHooks;
 use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider, RetryPolicy};
 use atomcode_kernel::agent::{Agent, AutoRespond};
+use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::stream::StreamEvent;
@@ -282,6 +283,71 @@ async fn multi_round_reasoning_is_echoed_back_for_deepseek_v4() {
         round2.contains("I should call get_time."),
         "round 2 must echo the EXACT round-1 reasoning the kernel stored: {round2}"
     );
+}
+
+async fn drain_until_turn_complete(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+) {
+    while let Some(ev) = events.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            return;
+        }
+    }
+}
+
+/// `round` is WITHIN a turn (resets each turn); `request_id` is SESSION-GLOBAL
+/// (monotonic, never resets). They coincide only during the first turn. Drives TWO
+/// turns on one long-lived session: turn 1 makes a tool call (2 rounds), turn 2 answers
+/// directly (1 round). Asserts round resets to 1 in turn 2 while request_id keeps
+/// climbing to 3 and turn_id increments to 2.
+#[tokio::test]
+async fn round_resets_per_turn_request_id_is_session_global() {
+    let server = MockServer::start().await;
+    // Request #1 → a tool call (drives turn 1 to a 2nd round); requests #2,#3 → final.
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(TOOL_CALL_SSE))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(FINAL_SSE))
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(provider_for(&server.uri(), "glm-test"));
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = log.clone();
+    let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| sink.lock().unwrap().push(s.to_string())));
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(GetTimeTool));
+    let tools = registry.mount(&["get_time"]);
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .session_id("sess-multiturn")
+        .tools(tools)
+        .hook(Arc::new(hooks))
+        .max_rounds(5)
+        .build()
+        .spawn();
+
+    // Turn 1 (tool call → 2 rounds), then Turn 2 (direct answer → 1 round).
+    handle.commands.send(AgentCommand::SendMessage { text: "turn one".into() }).unwrap();
+    drain_until_turn_complete(&mut handle.events).await;
+    handle.commands.send(AgentCommand::SendMessage { text: "turn two".into() }).unwrap();
+    drain_until_turn_complete(&mut handle.events).await;
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+
+    let logs = log.lock().unwrap();
+    let reqs: Vec<&String> = logs.iter().filter(|l| l.contains("[wire] request")).collect();
+    assert_eq!(reqs.len(), 3, "turn1 (tool→2 rounds) + turn2 (1 round) = 3 requests: {reqs:?}");
+    assert!(reqs[0].contains("turn=1 round=1 req=1"), "got: {}", reqs[0]);
+    assert!(reqs[1].contains("turn=1 round=2 req=2"), "got: {}", reqs[1]);
+    // THE point: turn 2 RESETS round to 1, but request_id CONTINUES to 3 (and turn_id→2).
+    assert!(reqs[2].contains("turn=2 round=1 req=3"), "round must reset while request_id is session-global: {}", reqs[2]);
 }
 
 /// DeepSeek-R1 (Exclude): even though the model returned reasoning in round 1 (and the
