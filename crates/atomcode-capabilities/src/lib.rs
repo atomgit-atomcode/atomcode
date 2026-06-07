@@ -31,3 +31,9 @@ pub mod provider;
 /// minimal `ToolContext` with NO coding enrichments; see [`tools`] for the trust model.
 #[cfg(feature = "tools")]
 pub mod tools;
+
+/// Code-intelligence capability: tree-sitter `list_symbols` / `read_symbol` over 12
+/// languages. Single-file + stateless (no shared index, no ctx coupling). Opt-in
+/// `codeintel` feature (heavy grammar compilation). See [`codeintel`].
+#[cfg(feature = "codeintel")]
+pub mod codeintel;

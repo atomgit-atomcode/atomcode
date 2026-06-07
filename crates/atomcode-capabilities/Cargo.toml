@@ -23,6 +23,20 @@ async-stream = { version = "0.3", optional = true }
 ignore = { version = "0.4", optional = true }
 regex = { version = "1", optional = true }
 globset = { version = "0.4", optional = true }
+# `codeintel` capability deps (tree-sitter symbol extraction). Heavy C compilation, so
+# opt-in (NOT in default) — an embedder that wants only provider/tools skips all grammars.
+tree-sitter = { version = "0.26", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
+tree-sitter-html = { version = "0.23", optional = true }
+tree-sitter-php = { version = "0.24", optional = true }
 
 [features]
 default = ["provider", "tools"]
@@ -31,11 +45,19 @@ provider = ["dep:reqwest", "dep:bytes", "dep:async-stream"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
 tools = ["dep:ignore", "dep:regex", "dep:globset", "tokio/fs", "tokio/process", "tokio/io-util"]
+# Code-intelligence tools (tree-sitter symbol extraction): list_symbols / read_symbol.
+# Opt-in (NOT default) — pulls 12 tree-sitter grammar crates (heavy C compilation).
+codeintel = [
+    "dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript", "dep:tree-sitter-typescript", "dep:tree-sitter-go",
+    "dep:tree-sitter-java", "dep:tree-sitter-c", "dep:tree-sitter-cpp",
+    "dep:tree-sitter-c-sharp", "dep:tree-sitter-html", "dep:tree-sitter-php",
+]
 # E2E tests that hit a REAL provider (network + API key). Separate from the default
 # suite; run on demand: `cargo test -p atomcode-capabilities --features e2e --test e2e`.
 e2e = ["provider"]
 # Future capabilities land as their own features:
-#   mcp = [...]   skills = [...]   codeintel = [...]
+#   mcp = [...]   skills = [...]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }
