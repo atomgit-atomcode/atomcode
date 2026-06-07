@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -123,9 +123,17 @@ fn is_safe_ip(ip: IpAddr) -> Result<(), String> {
             if (first & 0xffc0) == 0xfe80 {
                 return reject("link-local fe80::/10");
             }
-            // IPv4-mapped ::ffff:a.b.c.d — unwrap and re-check against v4 rules
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_safe_ip(IpAddr::V4(mapped));
+            // Embedded IPv4 — the kernel may dial the v4 address directly, so a
+            // v6 wrapper around an unsafe v4 must be unwrapped and re-checked.
+            // `to_ipv4()` covers BOTH the IPv4-mapped form (::ffff:a.b.c.d) and
+            // the deprecated-but-still-resolvable IPv4-compatible form
+            // (::a.b.c.d) — the latter is what to_ipv4_mapped() missed, letting
+            // ::127.0.0.1 / ::169.254.169.254 slip through as "safe". The ::1
+            // and :: specials are already rejected above, and a genuine public
+            // v6 yields None here (its high bits are non-zero) so it stays Ok.
+            // Not covered: NAT64 (64:ff9b::/96) — a narrower, rarer vector.
+            if let Some(embedded) = v6.to_ipv4() {
+                return is_safe_ip(IpAddr::V4(embedded));
             }
             Ok(())
         }
@@ -136,33 +144,60 @@ fn is_safe_ip(ip: IpAddr) -> Result<(), String> {
 /// safe: partial acceptance would let a host resolve to [1.2.3.4, 127.0.0.1]
 /// and gamble on which reqwest picks.
 ///
-/// Caveat: DNS is looked up here and again by the kernel when reqwest connects
-/// — a TTL=0 attacker could in theory rebind between the two. Mitigation would
-/// require pinning the verified IP into the reqwest client's resolver, which
-/// we can add later if the threat model warrants it. Today's protection still
-/// eliminates the 99% of SSRF attempts that rely on literal-IP or static-DNS
-/// targets (file://, localhost, 169.254.169.254, fixed internal hostnames).
-async fn validate_host(url: &Url) -> Result<(), String> {
+/// Returns the validated socket addresses so the caller can PIN them into
+/// reqwest's resolver (`resolve_to_addrs`). That closes the DNS-rebinding
+/// TOCTOU window: without pinning, DNS is looked up here and then a SECOND time
+/// by reqwest at connect — a TTL=0 attacker could rebind the host to a private
+/// IP between the two lookups. Pinning makes the IP we approved here the exact
+/// IP the connection dials; reqwest performs no second lookup for this host.
+///
+/// Returns an empty vec for a literal-IP host: there is no DNS to rebind, so
+/// reqwest dials the address in the URL directly and there is nothing to pin.
+async fn validate_host(url: &Url) -> Result<Vec<SocketAddr>, String> {
     let host = url
         .host_str()
         .ok_or_else(|| format!("URL has no host: {}", url))?;
-    // Literal IP in URL: check directly, bypass DNS.
+    // Literal IP in URL: check directly, bypass DNS. No pinning needed.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return is_safe_ip(ip);
+        is_safe_ip(ip)?;
+        return Ok(Vec::new());
     }
     let port = url.port_or_known_default().unwrap_or(80);
-    let addrs = tokio::net::lookup_host((host, port))
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|e| format!("DNS resolution failed for `{}`: {}", host, e))?;
-    let mut saw_any = false;
-    for addr in addrs {
-        saw_any = true;
-        is_safe_ip(addr.ip())?;
-    }
-    if !saw_any {
+        .map_err(|e| format!("DNS resolution failed for `{}`: {}", host, e))?
+        .collect();
+    if addrs.is_empty() {
         return Err(format!("DNS returned no addresses for `{}`", host));
     }
-    Ok(())
+    for addr in &addrs {
+        is_safe_ip(addr.ip())?;
+    }
+    Ok(addrs)
+}
+
+/// Build the per-request HTTP client. When `pinned` is non-empty the host is
+/// resolved ONLY to those already-validated addresses, so reqwest performs no
+/// DNS lookup of its own for the host — this is what closes the DNS-rebinding
+/// TOCTOU window. An empty `pinned` (literal-IP host) leaves resolution
+/// untouched. Per-hop because a redirect can change the host and resolve
+/// overrides are fixed at builder time. `resolve_to_addrs` keeps the URL's
+/// port, SNI and TLS cert hostname intact — only the dialed address is pinned.
+fn build_client(host: &str, pinned: &[SocketAddr]) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        // Handle redirects manually so every hop re-runs scheme + IP checks.
+        // reqwest's built-in follower would let a 302 rebind to 127.0.0.1
+        // after we've already validated the start URL's host.
+        .redirect(Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36");
+    if !pinned.is_empty() {
+        builder = builder.resolve_to_addrs(host, pinned);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
 }
 
 fn err_result(msg: impl Into<String>) -> ToolResult {
@@ -249,20 +284,6 @@ impl Tool for WebFetchTool {
             }
         };
 
-        let client = match reqwest::Client::builder()
-            // Handle redirects manually so every hop re-runs scheme + IP checks.
-            // reqwest's built-in follower would let a 302 rebind to 127.0.0.1
-            // after we've already validated the start URL's host.
-            .redirect(Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
-            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => return Ok(err_result(format!("Failed to build HTTP client: {}", e))),
-        };
-
         let mut url = match Url::parse(&parsed.url) {
             Ok(u) => u,
             Err(e) => return Ok(err_result(format!("Invalid URL: {}", e))),
@@ -274,9 +295,19 @@ impl Tool for WebFetchTool {
             if let Err(e) = validate_scheme(&url) {
                 return Ok(err_result(format!("Blocked: {}", e)));
             }
-            if let Err(e) = validate_host(&url).await {
-                return Ok(err_result(format!("Blocked: {}", e)));
-            }
+            let pinned = match validate_host(&url).await {
+                Ok(addrs) => addrs,
+                Err(e) => return Ok(err_result(format!("Blocked: {}", e))),
+            };
+
+            // Pin the validated addresses into this hop's client so reqwest
+            // dials exactly what we approved and never re-resolves the host —
+            // see build_client / validate_host for the rebinding rationale.
+            let host = url.host_str().unwrap_or_default();
+            let client = match build_client(host, &pinned) {
+                Ok(c) => c,
+                Err(e) => return Ok(err_result(e)),
+            };
 
             let resp = match client.get(url.clone()).send().await {
                 Ok(r) => r,
@@ -754,6 +785,30 @@ mod tests {
         assert!(is_safe_ip(IpAddr::V6("2001:4860:4860::8888".parse().unwrap())).is_ok());
     }
 
+    #[test]
+    fn is_safe_ip_ipv4_compatible_v6_rechecks_against_v4_rules() {
+        // Deprecated IPv4-compatible form ::a.b.c.d. to_ipv4_mapped() returns
+        // None for these and is_loopback() is false, so the old code waved them
+        // through — a real SSRF gap. to_ipv4() unwraps the embedded v4 and the
+        // v4 rules must now reject the unsafe ones.
+        assert!(
+            is_safe_ip(IpAddr::V6("::127.0.0.1".parse().unwrap())).is_err(),
+            "::127.0.0.1 (ipv4-compatible loopback) must be blocked"
+        );
+        assert!(
+            is_safe_ip(IpAddr::V6("::192.168.1.1".parse().unwrap())).is_err(),
+            "::192.168.1.1 (ipv4-compatible private) must be blocked"
+        );
+        assert!(
+            is_safe_ip(IpAddr::V6("::169.254.169.254".parse().unwrap())).is_err(),
+            "::169.254.169.254 (ipv4-compatible cloud metadata) must be blocked"
+        );
+        assert!(
+            is_safe_ip(IpAddr::V6("::10.0.0.1".parse().unwrap())).is_err(),
+            "::10.0.0.1 (ipv4-compatible private) must be blocked"
+        );
+    }
+
     // ── Scheme whitelist ───────────────────────────────────────────────────
 
     #[test]
@@ -899,6 +954,24 @@ mod tests {
             "unexpected error: {}",
             r.output
         );
+    }
+
+    // ── validate_host: pinning contract ────────────────────────────────────
+
+    #[tokio::test]
+    async fn validate_host_literal_public_ip_returns_no_pins() {
+        // Literal IP → no DNS, nothing to rebind, so nothing to pin.
+        let url = Url::parse("http://8.8.8.8/").unwrap();
+        let pins = validate_host(&url).await.expect("public literal IP is allowed");
+        assert!(pins.is_empty(), "literal IP needs no resolve override: {pins:?}");
+    }
+
+    #[tokio::test]
+    async fn validate_host_literal_private_ip_is_blocked() {
+        let url = Url::parse("http://127.0.0.1:1/").unwrap();
+        assert!(validate_host(&url).await.is_err(), "loopback literal must be blocked");
+        let url = Url::parse("http://169.254.169.254/").unwrap();
+        assert!(validate_host(&url).await.is_err(), "metadata literal must be blocked");
     }
 
     // ── html_to_text / tag matching ────────────────────────────────────────
