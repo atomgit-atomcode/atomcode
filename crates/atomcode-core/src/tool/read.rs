@@ -127,21 +127,22 @@ impl Tool for ReadFileTool {
         };
         let path_ref = path.as_path();
 
-        // ── Read cache: performance optimization only, NOT a STUB gate ──
-        // Cache stores (mtime, rendered_output). If mtime matches, skip disk read +
-        // UTF-8 parse + tree-sitter. Returns full content so the model always gets
-        // what it asked for. STUB behavior was tried and reverted — it blocks
-        // legitimate re-reads and doesn't prevent short-distance duplicates
-        // (model ignores STUB text due to lost-at-the-end attention).
+        // ── Read cache: pure performance optimization ──
+        // Cache stores (mtime, rendered_output). If mtime matches the
+        // current disk state, return the cached output directly —
+        // saves UTF-8 decode + tree-sitter cost on identical re-reads.
+        // No model-visible meta-commentary on cache hits: the cached
+        // bytes are returned silently, same way Claude Code's Read
+        // tool replays content. Aligns with the "framework doesn't
+        // educate the model about its own behaviour" principle.
         let cache_key: crate::tool::ReadCacheKey = (path.clone(), parsed.offset, parsed.limit);
         let disk_mtime = tokio::fs::metadata(&path)
             .await
             .ok()
             .and_then(|m| m.modified().ok());
         if let Some(mtime) = disk_mtime {
-            if let Some((cached_mtime, cached_output)) =
-                ctx.read_cache.read().await.get(&cache_key).cloned()
-            {
+            let cached = ctx.read_cache.read().await.get(&cache_key).cloned();
+            if let Some((cached_mtime, cached_output, _)) = cached {
                 if cached_mtime == mtime {
                     return Ok(ToolResult {
                         call_id: String::new(),
@@ -272,37 +273,85 @@ impl Tool for ReadFileTool {
             });
         }
 
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-
-        // Decode: UTF-8 first (the vast majority of text files), then GBK
-        // fallback for plain-text extensions (Chinese Windows legacy files
-        // that fail UTF-8 validation), then declare binary.
-        let content = match String::from_utf8(bytes.clone()) {
-            Ok(s) => s,
-            Err(_) => match decode_non_utf8_text(path_ref, &bytes) {
-                Some(s) => s,
-                None => {
-                    let output = format!(
-                        "Binary file ({} bytes), cannot display as text.{}",
-                        bytes.len(),
-                        binary_recovery_hint(path_ref, &parsed.file_path),
-                    );
-                    if let Some(mtime) = disk_mtime {
-                        ctx.read_cache
-                            .write()
-                            .await
-                            .insert(cache_key.clone(), (mtime, output.clone()));
-                    }
-                    return Ok(ToolResult {
-                        call_id: String::new(),
-                        output,
-                        success: true,
-                    });
-                }
-            },
+        // D3 (merged): consult FileStore before reading disk. If we've
+        // read this path before AND mtime hasn't moved, every range
+        // read of any subsequent offset/limit can be served from
+        // memory. The previous design exposed this as a separate
+        // `peek_file` tool, but the model often defaulted to
+        // read_file anyway (datalog 2026-05-06_15-33-23: 13 peeks vs
+        // 59 reads — 18% adoption). Routing the cache hit through
+        // read_file's own path makes the optimisation transparent and
+        // tool-surface-neutral: the model has one tool, the framework
+        // decides disk vs cache.
+        let store_hit: Option<String> = if let Some(mtime) = disk_mtime {
+            let store = ctx.file_store.read().await;
+            store
+                .store_id_for_path(&path)
+                .map(|s| s.to_string())
+                .and_then(|id| store.get(&id).cloned())
+                .filter(|entry| entry.mtime == mtime)
+                .map(|entry| entry.content)
+        } else {
+            None
         };
+        let served_from_store = store_hit.is_some();
+
+        let content = if let Some(c) = store_hit {
+            // Store entries only ever hold text (we never push binary
+            // bytes), so we can short-circuit the UTF-8 / GBK decode
+            // dance. mtime check above guarantees the content matches
+            // what's currently on disk.
+            c
+        } else {
+            let bytes = tokio::fs::read(&path)
+                .await
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+
+            // Decode: UTF-8 first (the vast majority of text files), then GBK
+            // fallback for plain-text extensions (Chinese Windows legacy files
+            // that fail UTF-8 validation), then declare binary.
+            match String::from_utf8(bytes.clone()) {
+                Ok(s) => s,
+                Err(_) => match decode_non_utf8_text(path_ref, &bytes) {
+                    Some(s) => s,
+                    None => {
+                        let output = format!(
+                            "Binary file ({} bytes), cannot display as text.{}",
+                            bytes.len(),
+                            binary_recovery_hint(path_ref, &parsed.file_path),
+                        );
+                        if let Some(mtime) = disk_mtime {
+                            ctx.read_cache
+                                .write()
+                                .await
+                                .insert(cache_key.clone(), (mtime, output.clone(), 1));
+                        }
+                        return Ok(ToolResult {
+                            call_id: String::new(),
+                            output,
+                            success: true,
+                        });
+                    }
+                },
+            }
+        };
+
+        // Push fresh disk content into the FileStore exactly once,
+        // upstream of every output-shaping branch (skeleton / D3a /
+        // range-slice). Subsequent reads of the same path at any range
+        // hit the store path above (`store_hit`) and skip disk
+        // entirely. Idempotent: re-reading after an edit pushes the
+        // new content under the same path key, replacing the prior
+        // entry. Skipped when we just served from store — content is
+        // already there.
+        if !served_from_store {
+            if let Some(mtime) = disk_mtime {
+                ctx.file_store
+                    .write()
+                    .await
+                    .insert(path.clone(), content.clone(), mtime);
+            }
+        }
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -412,11 +461,17 @@ impl Tool for ReadFileTool {
                 format!("[File skeleton: {} ({} lines) — use grep to find relevant lines, then read with offset/limit.]\n",
                     fname, total_lines)
             };
+            // The upstream `served_from_store ? skip : push` block
+            // already populated FileStore with the raw content; this
+            // skeleton path does NOT need its own push. Subsequent
+            // range reads of this file hit FileStore transparently
+            // via the upstream `store_hit` branch — no model-visible
+            // metadata in the result.
             if let Some(mtime) = disk_mtime {
-                ctx.read_cache
-                    .write()
-                    .await
-                    .insert(cache_key.clone(), (mtime, skeleton.clone()));
+                ctx.read_cache.write().await.insert(
+                    cache_key.clone(),
+                    (mtime, skeleton.clone(), 1),
+                );
             }
             return Ok(ToolResult {
                 call_id: String::new(),
@@ -506,11 +561,18 @@ impl Tool for ReadFileTool {
             ));
         }
 
+        // After the merge of peek_file → read_file, the previous
+        // "pointer + preview" branch (LARGE_FILE_LINE_THRESHOLD) is
+        // gone. Range reads are served from FileStore transparently
+        // via the upstream `store_hit` check, so there's no separate
+        // store-id pointer the model needs to track. The renderer
+        // just emits full inline content (skeleton already handled
+        // very-large files above).
         if let Some(mtime) = disk_mtime {
             ctx.read_cache
                 .write()
                 .await
-                .insert(cache_key, (mtime, output.clone()));
+                .insert(cache_key, (mtime, output.clone(), 1));
         }
         Ok(ToolResult {
             call_id: String::new(),
@@ -664,6 +726,35 @@ mod tests {
         );
     }
 
+    /// 2nd+ identical read returns the cached output silently — no
+    /// model-visible meta-commentary. Aligns with Claude Code's Read
+    /// tool behaviour: cache is a performance optimisation, not a
+    /// teaching tool. The "you've read this N times" preamble that
+    /// the previous version prepended has been removed.
+    #[tokio::test]
+    async fn read_cache_hits_replay_silently() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+
+        let r1 = tool.execute(&args, &ctx).await.unwrap();
+        let r2 = tool.execute(&args, &ctx).await.unwrap();
+        let r3 = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r1.success && r2.success && r3.success);
+        // No "you've read N times" preamble on any replay.
+        for r in [&r2, &r3] {
+            assert!(
+                !r.output.contains("times this session"),
+                "no meta-commentary on cache hits; got:\n{}",
+                r.output
+            );
+        }
+    }
+
     /// Cache miss after file content changes — mtime shifts, cached entry is ignored.
     #[tokio::test]
     async fn read_cache_misses_when_mtime_changes() {
@@ -688,6 +779,112 @@ mod tests {
             "2nd read must re-read from disk when mtime changed"
         );
         assert!(r2.output.contains("println"));
+    }
+
+    /// D3 SMOKE TEST: edit_file invalidates both read_cache (via mtime) and
+    /// FileStore (via explicit invalidate). This is the load-bearing assumption
+    /// for Task 1 of plans/2026-05-07-readfile-skip-and-edit-verify.md — if
+    /// this test fails, weak models will read stale post-edit content and
+    /// the read_file-skips-microcompact strategy collapses.
+    ///
+    /// Sequence: write A → read (populates caches) → edit A→B → read again →
+    /// must observe B, not cached A.
+    #[tokio::test]
+    async fn d3_edit_invalidates_caches_for_subsequent_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("payload.rs");
+        std::fs::write(&path, "fn before() {}\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let read_tool = ReadFileTool;
+        let edit_tool = crate::tool::edit::EditFileTool;
+        let read_args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+
+        // Step 1: initial read populates read_cache and FileStore.
+        let r1 = read_tool.execute(&read_args, &ctx).await.unwrap();
+        assert!(r1.output.contains("fn before"));
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            1,
+            "FileStore should have 1 entry after read"
+        );
+        assert_eq!(
+            ctx.read_cache.read().await.len(),
+            1,
+            "read_cache should have 1 entry after read"
+        );
+
+        // NO SLEEP: deliberately worst-case. On filesystems with coarse mtime
+        // granularity (ext4 sec-precision), the post-edit mtime may equal the
+        // pre-edit mtime, defeating the read_cache mtime gate. Then the only
+        // line of defense is the explicit `invalidate(canon_path)` in edit.rs.
+        // If this test passes without sleeping, both layers are working.
+
+        // Step 2: edit_file replaces "before" with "after".
+        let edit_args = format!(
+            r#"{{"file_path":"{}","old_string":"fn before() {{}}","new_string":"fn after() {{ /* edited */ }}"}}"#,
+            path.display()
+        );
+        let e = edit_tool.execute(&edit_args, &ctx).await.unwrap();
+        assert!(e.success, "edit should succeed; got: {}", e.output);
+
+        // Sanity: disk now holds B.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("fn after"),
+            "disk content not updated: {}",
+            on_disk
+        );
+
+        // FileStore should be invalidated for this path. (Either entry gone,
+        // or replaced with new content. Both are correct outcomes.)
+        let fs_state_after_edit = {
+            let store = ctx.file_store.read().await;
+            store
+                .store_id_for_path(&path)
+                .and_then(|id| store.get(id).cloned())
+                .map(|e| e.content)
+        };
+        if let Some(content) = &fs_state_after_edit {
+            assert!(
+                content.contains("fn after"),
+                "FileStore retained pre-edit content: {}",
+                content
+            );
+        }
+        // (If None, that's even better — fully invalidated.)
+
+        // Defense-layer probe (BEFORE the second read): both caches are
+        // now explicitly purged by edit.rs.
+        //
+        // FileStore: explicitly invalidated by edit.rs — entry gone OR
+        //   overwritten with new content (already asserted above).
+        // read_cache: explicitly purged by edit.rs (defense-in-depth for
+        //   FS with coarse mtime granularity where the mtime gate alone
+        //   could fail). Map should hold no entries for this path.
+        let read_cache_post_edit = ctx.read_cache.read().await.clone();
+        let stale_cache_for_path = read_cache_post_edit
+            .keys()
+            .filter(|(p, _, _)| p == &path)
+            .count();
+        assert_eq!(
+            stale_cache_for_path, 0,
+            "read_cache must be purged for edited path; lingering entries \
+             would let coarse-mtime FS serve stale content"
+        );
+
+        // Step 3: re-read must surface B, NOT cached A.
+        let r2 = read_tool.execute(&read_args, &ctx).await.unwrap();
+        assert!(
+            r2.output.contains("fn after"),
+            "POST-EDIT READ SERVED STALE CONTENT: {}",
+            r2.output
+        );
+        assert!(
+            !r2.output.contains("fn before"),
+            "post-edit read still mentions pre-edit symbol: {}",
+            r2.output
+        );
     }
 
     /// GBK-encoded .txt should decode via the fallback path, not be reported
@@ -934,5 +1131,224 @@ mod tests {
             "absolute-input path must NOT show the relative-path hint. output:\n{}",
             r.output
         );
+    }
+
+    // ── D3 FileStore integration ────────────────────────────────────
+
+    /// Helper: write a file with `n_lines` lines (each `line N`) and
+    /// return its absolute path. Use file sizes large enough to trip
+    /// the FileStore threshold (50 lines).
+    fn write_n_line_file(dir: &TempDir, name: &str, n_lines: usize) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let body: String = (1..=n_lines).map(|i| format!("line {}\n", i)).collect();
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Every fresh disk read pushes its content into FileStore so
+    /// subsequent reads of any range hit the in-memory snapshot
+    /// instead of touching disk again. After the peek_file → read_file
+    /// merge, the model never sees a store_id — the cache is purely
+    /// internal.
+    #[tokio::test]
+    async fn d3_full_read_pushes_to_store_returns_inline_content() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "big.rs", 200);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        // No more pointer/preview formatting — model gets the content
+        // directly. store_id is internal-only after the merge.
+        assert!(
+            !r.output.contains("store_id="),
+            "store_id must NOT leak into model output:\n{}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("peek_file"),
+            "peek_file no longer exists, must not be referenced:\n{}",
+            r.output
+        );
+        // Full content is inline.
+        assert!(r.output.contains("line 1"));
+        assert!(r.output.contains("line 100"));
+        assert!(r.output.contains("line 200"));
+        // Store populated for future range reads.
+        assert_eq!(ctx.file_store.read().await.len(), 1);
+    }
+
+    /// Small files also populate the store — uniform behaviour means
+    /// the "Nth read" hint can fire on any file, and a future range
+    /// read of a small file (rare but possible) hits cache too.
+    #[tokio::test]
+    async fn d3_small_file_pushes_to_store_after_merge() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "small.rs", 10);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            1,
+            "fresh disk read must populate store regardless of file size"
+        );
+    }
+
+    /// THE merge's core promise: a range read after a full read of
+    /// the same path is served from FileStore (no disk hit). After
+    /// the CC-alignment cleanup the store-served path is silent —
+    /// the model gets the requested range with no model-visible
+    /// metadata about cache origin. Test pins behaviour by checking
+    /// (a) the requested lines are returned, (b) no leaked
+    /// "FileStore" / "cache" preamble appears, and (c) the store
+    /// still has the entry (so we know the cache was actually used).
+    #[tokio::test]
+    async fn d3_range_read_after_full_read_silently_serves_from_store() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "big.rs", 200);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+
+        let full_args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let _ = ReadFileTool.execute(&full_args, &ctx).await.unwrap();
+
+        let range_args = format!(
+            r#"{{"file_path":"{}","offset":100,"limit":5}}"#,
+            path.display()
+        );
+        let r = ReadFileTool.execute(&range_args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(r.output.contains("line 100"));
+        assert!(
+            !r.output.contains("FileStore"),
+            "store-served read must NOT leak any FileStore preamble:\n{}",
+            r.output
+        );
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            1,
+            "FileStore must retain the entry across both reads"
+        );
+    }
+
+    /// Edit invalidates the cache so the next read sees fresh disk
+    /// content, not a stale snapshot. Without this, the model would
+    /// reason against bytes that no longer match what's on disk after
+    /// its own edit.
+    #[tokio::test]
+    async fn d3_edit_invalidates_cache_next_read_hits_disk() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "big.rs", 200);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+
+        let read_args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let _ = ReadFileTool.execute(&read_args, &ctx).await.unwrap();
+        assert_eq!(ctx.file_store.read().await.len(), 1);
+
+        let edit_args = format!(
+            r#"{{"file_path":"{}","old_string":"line 1\n","new_string":"LINE 1\n"}}"#,
+            path.display()
+        );
+        let e = crate::tool::edit::EditFileTool
+            .execute(&edit_args, &ctx)
+            .await
+            .unwrap();
+        assert!(e.success, "edit must succeed:\n{}", e.output);
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            0,
+            "edit must invalidate the store entry"
+        );
+
+        // Range read after edit: store was invalidated, so this is a
+        // fresh disk read. Output must NOT carry the cache notice and
+        // store gets repopulated.
+        let range_args = format!(
+            r#"{{"file_path":"{}","offset":1,"limit":3}}"#,
+            path.display()
+        );
+        let r = ReadFileTool.execute(&range_args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(
+            !r.output.contains("FileStore cache"),
+            "post-edit read must come from disk, not stale cache:\n{}",
+            r.output
+        );
+        assert_eq!(ctx.file_store.read().await.len(), 1);
+    }
+
+    /// Re-reading the same path with the same args keeps store size
+    /// at 1 — the entry is replaced, not duplicated. Guards against
+    /// a regression where every call grew the store unboundedly.
+    #[tokio::test]
+    async fn d3_reread_unchanged_file_keeps_one_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "big.rs", 200);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let _ = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        let _ = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        assert_eq!(ctx.file_store.read().await.len(), 1);
+    }
+
+    /// Auto-skeleton path (>300 lines) populates the store too — fix
+    /// for the early-return bug that left huge files completely
+    /// outside the cache (datalog 2026-05-06_14-29-08: 19 reads of a
+    /// single 753-line file, zero cache hits, before this guard).
+    #[tokio::test]
+    async fn d3_skeleton_path_pushes_to_store() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "huge.rs", 350);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(
+            r.output.contains("File skeleton:"),
+            "huge file should still get skeleton:\n{}",
+            r.output
+        );
+        // Skeleton path used to expose store_id; merge removed that.
+        // The store is populated invisibly so future range reads can
+        // hit cache.
+        assert!(
+            !r.output.contains("store_id="),
+            "merged design hides store_id from model:\n{}",
+            r.output
+        );
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            1,
+            "auto_skeleton path must populate FileStore"
+        );
+    }
+
+    /// After CC alignment: subsequent reads of the same path do NOT
+    /// surface any framework-side "Nth read of X" preamble. The
+    /// model gets the same shape of output every time. Pins the
+    /// removal of the R2 hint that earlier datalogs (2026-05-06)
+    /// showed glm-5.1 ignoring anyway — keeping it was both
+    /// hardcoded metadata-injection and ineffective.
+    #[tokio::test]
+    async fn d3_subsequent_reads_have_no_framework_preamble() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "big.rs", 200);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args1 = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let args2 = format!(r#"{{"file_path":"{}","offset":50,"limit":10}}"#, path.display());
+        let args3 = format!(r#"{{"file_path":"{}","offset":100,"limit":10}}"#, path.display());
+        let r1 = ReadFileTool.execute(&args1, &ctx).await.unwrap();
+        let r2 = ReadFileTool.execute(&args2, &ctx).await.unwrap();
+        let r3 = ReadFileTool.execute(&args3, &ctx).await.unwrap();
+        assert!(r1.success && r2.success && r3.success);
+        for (i, r) in [&r1, &r2, &r3].iter().enumerate() {
+            assert!(
+                !r.output.contains("read of `") && !r.output.contains("FileStore cache"),
+                "read #{} must not carry framework metadata; got:\n{}",
+                i + 1,
+                r.output
+            );
+        }
     }
 }

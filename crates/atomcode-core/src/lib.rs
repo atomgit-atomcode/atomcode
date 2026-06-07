@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod atomgit;
 pub mod auth;
+pub mod process_utils;
 pub mod coding_plan;
 pub mod commands;
 pub mod config;
@@ -9,8 +10,10 @@ pub mod ctx;
 pub mod git;
 pub mod graph;
 pub mod hook;
+pub mod i18n;
 pub mod init;
 pub mod input_history;
+pub mod locale;
 pub mod lsp;
 pub mod mcp;
 pub mod notify;
@@ -20,12 +23,16 @@ pub mod provider;
 pub mod self_update;
 pub mod semantic;
 pub mod session;
+pub mod plugin;
+pub mod setup;
 pub mod skill;
 pub mod stream;
 pub mod telemetry_bootstrap;
 pub mod tool;
 pub mod turn;
+pub mod uninstall;
 pub mod version_check;
+pub mod vision_preprocessor;
 
 /// User-Agent identifier for every outbound HTTP request the app makes.
 ///

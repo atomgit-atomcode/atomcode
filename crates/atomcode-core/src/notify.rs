@@ -35,6 +35,7 @@ pub enum NotificationEvent<'a> {
 enum TerminalApp {
     Kitty,
     WezTerm,
+    Ghostty,
     ITerm2,
     AppleTerminal,
     WindowsTerminal,
@@ -133,7 +134,15 @@ fn build_notification_plan(
     };
 
     // Windows 上系统通知走 PowerShell NotifyIcon，实测会让 TUI 闪退，整条通道关掉。
-    let emit_system = cfg.system && !cfg!(target_os = "windows");
+    //
+    // For background-only notifications, only use OS-native fallbacks when we
+    // know the terminal is actually unfocused. macOS Terminal.app does not feed
+    // focus events into our current reader, so its state stays Unknown while the
+    // user may still be reading scrollback in the foreground. BEL / terminal
+    // protocols can still let the terminal decide how much attention to request.
+    let emit_system = cfg.system
+        && !cfg!(target_os = "windows")
+        && (!cfg.background_only || terminal_focus_state() == Some(false));
 
     Some(NotificationPlan {
         title,
@@ -199,7 +208,7 @@ fn build_turn_terminal_notification_text(
     turn: &TurnNotification<'_>,
 ) -> (Cow<'static, str>, String) {
     let (title, mut body) = build_system_notification_text(turn);
-    if matches!(app, TerminalApp::Kitty | TerminalApp::WezTerm) {
+    if matches!(app, TerminalApp::Kitty | TerminalApp::WezTerm | TerminalApp::Ghostty) {
         if let Some(scope) = turn
             .working_dir
             .and_then(|p| p.file_name())
@@ -297,10 +306,10 @@ fn write_terminal_notification(
             write_kitty_notification(out, plan.terminal_id, plan.visibility, title, body)?;
             Ok(true)
         }
-        TerminalApp::WezTerm => {
+        TerminalApp::WezTerm | TerminalApp::Ghostty => {
             let title = &plan.title;
             let body = &plan.body;
-            write_wezterm_notification(out, title, body)?;
+            write_osc777_notification(out, title, body)?;
             Ok(true)
         }
         TerminalApp::ITerm2 => {
@@ -330,7 +339,7 @@ fn write_kitty_notification(
     Ok(())
 }
 
-fn write_wezterm_notification(out: &mut dyn Write, title: &str, body: &str) -> io::Result<()> {
+fn write_osc777_notification(out: &mut dyn Write, title: &str, body: &str) -> io::Result<()> {
     let title = sanitize_plain_text(title).replace(';', ":");
     let body = sanitize_plain_text(body).replace(';', ":");
     write!(out, "\x1b]777;notify;{title};{body}\x1b\\")?;
@@ -362,6 +371,9 @@ fn detect_terminal_app() -> Option<TerminalApp> {
     let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
     if term_program.eq_ignore_ascii_case("wezterm") {
         return Some(TerminalApp::WezTerm);
+    }
+    if term_program.eq_ignore_ascii_case("ghostty") {
+        return Some(TerminalApp::Ghostty);
     }
     if term_program == "iTerm.app" || term_program.eq_ignore_ascii_case("iTerm2") {
         return Some(TerminalApp::ITerm2);
@@ -407,11 +419,18 @@ fn macos_terminal_bundle_id(app: Option<TerminalApp>) -> Option<&'static str> {
         Some(TerminalApp::AppleTerminal) => Some("com.apple.Terminal"),
         Some(TerminalApp::ITerm2) => Some("com.googlecode.iterm2"),
         Some(TerminalApp::WezTerm) => Some("com.github.wez.wezterm"),
+        Some(TerminalApp::Ghostty) => Some("com.mitchellh.ghostty"),
         Some(TerminalApp::Kitty) => Some("net.kovidgoyal.kitty"),
         _ => None,
     }
 }
 
+// Only the macOS branch of `spawn_system_notification` calls this (to
+// find `terminal-notifier`). Linux uses notify-send unconditionally and
+// Windows shells out to powershell.exe — neither needs PATH lookup.
+// Kept callable on every platform because `missing_executable_lookup_
+// returns_none` is a portable unit test of PATH-iteration semantics.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn find_executable_on_path(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -509,6 +528,12 @@ fn powershell_string_literal(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn focus_state_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn builds_human_readable_notification_text() {
@@ -658,6 +683,7 @@ mod tests {
 
     #[test]
     fn focused_terminal_suppresses_background_only_notifications() {
+        let _guard = focus_state_test_lock();
         let cfg = NotificationConfig::default();
         set_terminal_focus_state(Some(true));
         let plan = build_notification_plan(
@@ -670,6 +696,73 @@ mod tests {
         );
         set_terminal_focus_state(None);
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn background_only_unknown_focus_suppresses_system_fallback() {
+        let _guard = focus_state_test_lock();
+        let cfg = NotificationConfig::default();
+        set_terminal_focus_state(None);
+        let plan = build_notification_plan(
+            &cfg,
+            NotificationEvent::TurnFinished(TurnNotification {
+                duration: Duration::from_secs(12),
+                turn_count: 1,
+                tool_call_count: 1,
+                total_tokens: None,
+                stop_reason: TurnStopReason::Natural,
+                working_dir: Some(Path::new("/tmp/demo")),
+            }),
+        )
+        .unwrap();
+
+        assert!(plan.emit_terminal);
+        assert!(plan.emit_bell);
+        assert!(!plan.emit_system);
+    }
+
+    #[test]
+    fn background_only_unfocused_allows_system_fallback() {
+        let _guard = focus_state_test_lock();
+        let cfg = NotificationConfig::default();
+        set_terminal_focus_state(Some(false));
+        let plan = build_notification_plan(
+            &cfg,
+            NotificationEvent::TurnFinished(TurnNotification {
+                duration: Duration::from_secs(12),
+                turn_count: 1,
+                tool_call_count: 1,
+                total_tokens: None,
+                stop_reason: TurnStopReason::Natural,
+                working_dir: Some(Path::new("/tmp/demo")),
+            }),
+        )
+        .unwrap();
+        set_terminal_focus_state(None);
+
+        assert_eq!(plan.emit_system, !cfg!(target_os = "windows"));
+    }
+
+    #[test]
+    fn non_background_only_keeps_system_fallback_for_unknown_focus() {
+        let _guard = focus_state_test_lock();
+        let mut cfg = NotificationConfig::default();
+        cfg.background_only = false;
+        set_terminal_focus_state(None);
+        let plan = build_notification_plan(
+            &cfg,
+            NotificationEvent::TurnFinished(TurnNotification {
+                duration: Duration::from_secs(12),
+                turn_count: 1,
+                tool_call_count: 1,
+                total_tokens: None,
+                stop_reason: TurnStopReason::Natural,
+                working_dir: Some(Path::new("/tmp/demo")),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(plan.emit_system, !cfg!(target_os = "windows"));
     }
 
     #[cfg(target_os = "macos")]
@@ -686,6 +779,10 @@ mod tests {
         assert_eq!(
             macos_terminal_bundle_id(Some(TerminalApp::WezTerm)),
             Some("com.github.wez.wezterm")
+        );
+        assert_eq!(
+            macos_terminal_bundle_id(Some(TerminalApp::Ghostty)),
+            Some("com.mitchellh.ghostty")
         );
         assert_eq!(
             macos_terminal_bundle_id(Some(TerminalApp::Kitty)),

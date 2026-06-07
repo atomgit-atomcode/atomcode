@@ -14,6 +14,11 @@ pub enum HookEvent {
     SessionStart,
     SessionEnd,
     Notification,
+    /// Fires when a user submits a new message but before it reaches the
+    /// LLM. Hooks bound to this event can inject additional context or
+    /// block the submission entirely (CC parity — used by workflow router
+    /// plugins like the ascend `workflow_planner_hook.py`).
+    UserPromptSubmit,
 }
 
 /// A single hook definition from the user's configuration.
@@ -28,10 +33,65 @@ pub struct HookConfig {
     /// Maximum time (in milliseconds) the hook command may run before being killed.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Plugin install dir — set when this hook came from an installed
+    /// plugin. The executor exports it as `CLAUDE_PLUGIN_ROOT` and
+    /// `ATOMCODE_PLUGIN_ROOT` so plugin authors can reference resources
+    /// alongside their manifest. This is the safe channel: doing string
+    /// substitution into the command line would break on paths containing
+    /// spaces / quotes / `$` and could open command injection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_root: Option<std::path::PathBuf>,
 }
 
 fn default_timeout_ms() -> u64 {
     10_000
+}
+
+/// CC-compatible payload sent to a `UserPromptSubmit` hook over stdin
+/// (serialized as JSON). Field names match Claude Code's spec verbatim so
+/// existing CC plugin scripts work unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserPromptSubmitPayload {
+    pub session_id: String,
+    pub hook_event_name: String,
+    pub prompt: String,
+    pub cwd: String,
+}
+
+/// Result of running all `UserPromptSubmit` hooks for a single user message.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserPromptHookResult {
+    /// All hooks passed without modifying or blocking the prompt.
+    Continue,
+    /// At least one hook contributed extra context (concatenated by the
+    /// agent into the user message before LLM processing).
+    Inject(String),
+    /// A hook explicitly blocked the prompt; `reason` is shown in the UI.
+    Block(String),
+}
+
+/// Internal: parsed shape of a single hook's stdout payload (CC spec).
+/// We only deserialize the fields we act on; CC adds more keys in newer
+/// versions and we ignore them by default.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct UserPromptSubmitOutput {
+    /// Top-level decision. `"block"` blocks the prompt; absent / other
+    /// values are treated as continue.
+    pub decision: Option<String>,
+    /// Reason shown to the user when `decision == "block"`.
+    pub reason: Option<String>,
+    /// Newer CC layout: hook-specific output bag.
+    #[serde(rename = "hookSpecificOutput")]
+    pub hook_specific_output: Option<UserPromptHookSpecific>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct UserPromptHookSpecific {
+    /// Plain text appended to the user prompt as additional context.
+    #[serde(rename = "additionalContext")]
+    pub additional_context: Option<String>,
 }
 
 /// Result returned by a pre-tool-use hook to control tool execution.
@@ -114,6 +174,7 @@ mod tests {
             matcher: Some("bash".into()),
             command: "echo ok".into(),
             timeout_ms: 5000,
+            plugin_root: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: HookConfig = serde_json::from_str(&json).unwrap();

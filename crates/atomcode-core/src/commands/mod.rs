@@ -3,7 +3,7 @@
 // Custom slash-command registry. Users define commands as `.md` files with
 // YAML-style frontmatter in two locations:
 //
-//   1. `~/.atomcode/commands/`          — global (apply to every project)
+//   1. `$ATOMCODE_HOME/commands/`          — global (apply to every project)
 //   2. `<project>/.atomcode/commands/`  — project-level (override global
 //                                          when names collide)
 //
@@ -35,6 +35,7 @@ pub struct CustomCommand {
     pub args_requirement: ArgsRequirement,
     pub template: String,
     pub source: PathBuf,
+    pub namespace: Option<String>,
 }
 
 /// Whether a custom command expects arguments from the user.
@@ -53,15 +54,19 @@ pub struct CustomCommandRegistry {
 }
 
 impl CustomCommandRegistry {
-    /// Scan both global (`~/.atomcode/commands/`) and project-level
+    /// Scan both global (`$ATOMCODE_HOME/commands/`) and project-level
     /// (`<project_root>/.atomcode/commands/`) directories, merging results.
     /// Project entries win on name collision.
     pub fn load(project_root: &Path) -> Self {
         let config_dir = crate::config::Config::config_dir();
         let mut commands = HashMap::new();
         // Global first — project overrides on second pass.
-        Self::load_from_dir(&config_dir.join("commands"), &mut commands);
-        Self::load_from_dir(&project_root.join(".atomcode/commands"), &mut commands);
+        Self::load_from_dir(&config_dir.join("commands"), None, &mut commands);
+        Self::load_from_dir(&project_root.join(".atomcode/commands"), None, &mut commands);
+        // Plugin layer
+        for assets in crate::plugin::loader::iter_installed_plugin_assets() {
+            Self::load_from_dir(&assets.commands_dir(), Some(&assets.plugin), &mut commands);
+        }
         Self { commands }
     }
 
@@ -73,7 +78,11 @@ impl CustomCommandRegistry {
         }
     }
 
-    fn load_from_dir(dir: &Path, commands: &mut HashMap<String, CustomCommand>) {
+    fn load_from_dir(
+        dir: &Path,
+        namespace: Option<&str>,
+        commands: &mut HashMap<String, CustomCommand>,
+    ) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -83,8 +92,15 @@ impl CustomCommandRegistry {
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            if let Some(cmd) = Self::parse_command_file(&path) {
-                commands.insert(cmd.name.clone(), cmd);
+            if let Some(mut cmd) = Self::parse_command_file(&path) {
+                if let Some(ns) = namespace {
+                    cmd.namespace = Some(ns.to_string());
+                }
+                let key = match &cmd.namespace {
+                    Some(ns) => format!("{}:{}", ns, cmd.name),
+                    None => cmd.name.clone(),
+                };
+                commands.insert(key, cmd);
             }
         }
     }
@@ -107,6 +123,7 @@ impl CustomCommandRegistry {
             args_requirement,
             template: template.trim().to_string(),
             source: path.to_path_buf(),
+            namespace: None,
         })
     }
 
@@ -276,7 +293,7 @@ mod tests {
         )
         .unwrap();
         let mut commands = HashMap::new();
-        CustomCommandRegistry::load_from_dir(&cmd_dir, &mut commands);
+        CustomCommandRegistry::load_from_dir(&cmd_dir, None, &mut commands);
         assert_eq!(commands.len(), 1);
         assert!(commands.contains_key("valid"));
     }
@@ -305,8 +322,8 @@ mod tests {
 
         let mut commands = HashMap::new();
         // Load global first, then project — project should override.
-        CustomCommandRegistry::load_from_dir(&global_dir, &mut commands);
-        CustomCommandRegistry::load_from_dir(&project_dir, &mut commands);
+        CustomCommandRegistry::load_from_dir(&global_dir, None, &mut commands);
+        CustomCommandRegistry::load_from_dir(&project_dir, None, &mut commands);
 
         let cmd = commands.get("review").unwrap();
         assert_eq!(cmd.description, "Project review");
@@ -377,5 +394,33 @@ mod tests {
         std::fs::write(&path, "---\nname: noargs\n---\nTemplate").unwrap();
         let cmd = CustomCommandRegistry::parse_command_file(&path).unwrap();
         assert_eq!(cmd.args_requirement, ArgsRequirement::None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_plugin_layer_namespaces_commands() {
+        // Set up an installed plugin on disk via the plugin module's state.
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", tmp.path());
+
+        let plugin_dir = tmp.path().join("plugins/marketplaces/p");
+        let cmd_dir = plugin_dir.join("commands");
+        std::fs::create_dir_all(&cmd_dir).unwrap();
+        std::fs::write(
+            cmd_dir.join("greet.md"),
+            "---\nname: greet\ndescription: hi\n---\nhello $ARGUMENTS",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("plugins/installed_plugins.json"),
+            r#"{"version":1,"plugins":{"p@p":{"marketplace":"p","plugin":"p","plugin_dir":"marketplaces/p","installed_at":"x"}}}"#,
+        )
+        .unwrap();
+
+        let working = tempfile::tempdir().unwrap();
+        let reg = CustomCommandRegistry::load(working.path());
+        assert!(reg.get("p:greet").is_some());
+
+        std::env::remove_var("ATOMCODE_HOME");
     }
 }

@@ -244,6 +244,7 @@ mod tests {
                     arguments: String::new(),
                 }],
                 reasoning_content: None,
+                thinking_blocks: Vec::new(),
             },
         }
     }

@@ -155,6 +155,139 @@ pub fn push_str_cells(row: &mut Vec<Cell>, s: &str, style: &CellStyle) {
     }
 }
 
+/// Like [`push_str_cells`] but parses embedded SGR escape sequences
+/// (`\x1b[...m`) inline, mutating a working `CellStyle` so subsequent
+/// cells pick up the colour / bold / faint / reverse attributes the
+/// terminal would otherwise paint via raw ANSI. Returns the style
+/// state at end-of-input so a caller wrapping a single physical line
+/// into multiple chunks can carry attributes across chunk boundaries
+/// (e.g. `\x1b[31m` on one chunk and `\x1b[39m` on the next).
+///
+/// Why this exists: the retained renderer paints from a cell grid
+/// rather than streaming raw bytes to stdout, so SGR sequences that
+/// survive [`crate::sanitize::scrub_controls_keep_sgr`] would
+/// otherwise land as literal `^[[31m` characters in cells. This
+/// function is the cell-pipeline equivalent of alt-screen's
+/// `truncate_to_width_sgr_aware` — it understands SGR enough to
+/// translate it into `CellStyle` mutations on the way in.
+///
+/// Non-SGR CSI sequences (cursor moves, DSR, etc.) are silently
+/// dropped — they should have been scrubbed upstream; this is
+/// belt-and-suspenders.
+pub fn push_str_cells_sgr(
+    row: &mut Vec<Cell>,
+    s: &str,
+    mut working_style: CellStyle,
+) -> CellStyle {
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                let mut params = String::new();
+                let mut final_byte: Option<char> = None;
+                while let Some(&p) = chars.peek() {
+                    chars.next();
+                    if ('\x40'..='\x7E').contains(&p) {
+                        final_byte = Some(p);
+                        break;
+                    }
+                    params.push(p);
+                }
+                if final_byte == Some('m') {
+                    apply_sgr_params(&params, &mut working_style);
+                }
+            }
+            continue;
+        }
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        if ch == '\t' {
+            for _ in 0..SOFT_TAB_WIDTH {
+                row.push(Cell {
+                    ch: ' ',
+                    style: working_style.clone(),
+                    width: 1,
+                });
+            }
+            continue;
+        }
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        if w == 0 {
+            continue;
+        }
+        row.push(Cell {
+            ch,
+            style: working_style.clone(),
+            width: w as u8,
+        });
+        for _ in 1..w {
+            row.push(Cell::continuation());
+        }
+    }
+    working_style
+}
+
+/// Parse a `;`-separated SGR parameter list and fold each recognised
+/// code into `style`. The crossterm colour variants chosen here mirror
+/// the SGR-to-name mapping that `serialize_row` uses to emit cells
+/// back to the terminal — so a row built from `\x1b[31m…` round-trips
+/// to `\x1b[31m…` on output, and the terminal's theme palette gets to
+/// pick the actual shade rather than us hard-coding RGB.
+///
+/// Unknown / unsupported codes (256-colour `38;5;N`, RGB `38;2;R;G;B`,
+/// background colours, italic, underline) are silently skipped —
+/// they're outside the cosmetic surface `CellStyle` currently
+/// represents, so picking up an LLM-emitted underline would just be
+/// lost on the retained path. Adding fields to `CellStyle` is the
+/// trigger for extending this match.
+fn apply_sgr_params(params: &str, style: &mut CellStyle) {
+    // `\x1b[m` (empty params) means "reset" — same as `\x1b[0m`.
+    if params.is_empty() {
+        *style = CellStyle::default();
+        return;
+    }
+    for code in params.split(';') {
+        // `\x1b[;31m` (leading empty) also resets before applying.
+        if code.is_empty() {
+            *style = CellStyle::default();
+            continue;
+        }
+        let Ok(n) = code.parse::<u16>() else { continue };
+        match n {
+            0 => *style = CellStyle::default(),
+            1 => style.bold = true,
+            2 => style.faint = true,
+            7 => style.reverse = true,
+            22 => {
+                // SGR 22 = normal intensity, clears BOTH bold and faint.
+                style.bold = false;
+                style.faint = false;
+            }
+            27 => style.reverse = false,
+            30 => style.fg = Some(Color::Black),
+            31 => style.fg = Some(Color::DarkRed),
+            32 => style.fg = Some(Color::DarkGreen),
+            33 => style.fg = Some(Color::DarkYellow),
+            34 => style.fg = Some(Color::DarkBlue),
+            35 => style.fg = Some(Color::DarkMagenta),
+            36 => style.fg = Some(Color::DarkCyan),
+            37 => style.fg = Some(Color::Grey),
+            39 => style.fg = None,
+            90 => style.fg = Some(Color::DarkGrey),
+            91 => style.fg = Some(Color::Red),
+            92 => style.fg = Some(Color::Green),
+            93 => style.fg = Some(Color::Yellow),
+            94 => style.fg = Some(Color::Blue),
+            95 => style.fg = Some(Color::Magenta),
+            96 => style.fg = Some(Color::Cyan),
+            97 => style.fg = Some(Color::White),
+            _ => {}
+        }
+    }
+}
+
 /// A single cell's worth of change: "put this cell at absolute position
 /// (row, col)". Multiple adjacent patches with the same style serialise
 /// into one cursor move + a run of characters, so small clusters stay

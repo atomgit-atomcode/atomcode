@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::conversation::Conversation;
 use crate::ctx::CtxBuilder;
+use crate::i18n::{t, Msg};
 use crate::provider::LlmProvider;
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::turn::event::TurnResult;
@@ -41,7 +42,7 @@ pub async fn run_background_task(
     {
         Ok(result) => result,
         Err(_) => AgentEvent::BackgroundComplete {
-            summary: format!("Background task timed out after {}s.", BACKGROUND_TIMEOUT.as_secs()),
+            summary: t(Msg::BgTaskTimedOut { secs: BACKGROUND_TIMEOUT.as_secs() }).into_owned(),
             files_edited: vec![],
             turns: 0,
             success: false,
@@ -87,11 +88,10 @@ async fn run_background_inner(
         ctx,
         permission,
         recently_edited_files: Vec::new(),
-        recent_calls: Vec::new(),
-        file_read_counts: std::collections::HashMap::new(),
         hook_executor: std::sync::Arc::new(
             crate::hook::executor::HookExecutor::new(hooks)
         ),
+        loop_guard: Default::default(),
     };
 
     let mut conversation = Conversation::new();
@@ -129,7 +129,7 @@ async fn run_background_inner(
             }
             TurnResult::Failed(e) => {
                 return AgentEvent::BackgroundComplete {
-                    summary: format!("Error: {}", e),
+                    summary: t(Msg::BgTaskError { error: &e.to_string() }).into_owned(),
                     files_edited: std::mem::take(&mut runner.recently_edited_files),
                     turns,
                     success: false,
@@ -137,7 +137,7 @@ async fn run_background_inner(
             }
             TurnResult::Cancelled => {
                 return AgentEvent::BackgroundComplete {
-                    summary: "Cancelled.".to_string(),
+                    summary: t(Msg::BgTaskCancelled).into_owned(),
                     files_edited: std::mem::take(&mut runner.recently_edited_files),
                     turns,
                     success: false,
@@ -153,7 +153,7 @@ async fn run_background_inner(
         }
         format!("{}...", &last_text[..boundary])
     } else if last_text.is_empty() {
-        "Task completed (no summary text).".to_string()
+        t(Msg::BgTaskNoSummary).into_owned()
     } else {
         last_text
     };

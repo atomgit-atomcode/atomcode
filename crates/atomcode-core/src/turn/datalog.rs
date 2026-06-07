@@ -3,8 +3,8 @@
 //! projects don't pile their logs into a single bucket.
 //!
 //! Default layout:
-//!   ~/.atomcode/datalog/<project-slug>/YYYY-MM-DD_HH-MM-SS.md
-//!   ~/.atomcode/datalog/<project-slug>/llm/YYYY-MM-DD_HH-MM-SS_sss.json
+//!   $ATOMCODE_HOME/datalog/<project-slug>/YYYY-MM-DD_HH-MM-SS.md
+//!   $ATOMCODE_HOME/datalog/<project-slug>/llm/YYYY-MM-DD_HH-MM-SS_sss.json
 //!
 //! Project slug = sanitized cwd basename + 8-char sha256 prefix of the canonical
 //! cwd path. The hash suffix prevents collisions when two unrelated projects
@@ -13,11 +13,11 @@
 //! Content mirrors what the user sees on screen.
 //! Every write operation flushes immediately so logs survive crashes.
 //!
-//! Configured via `[datalog]` in `~/.atomcode/config.toml`:
+//! Configured via `[datalog]` in `$ATOMCODE_HOME/config.toml`:
 //! - `enabled = false`     — disables logging entirely (writer becomes a no-op)
 //! - `dir = "<path>"`      — root directory; project slug is always appended
 //!   underneath. Accepts absolute, `~/…`, or relative paths. Default
-//!   `"~/.atomcode/datalog"`.
+//!   `"$ATOMCODE_HOME/datalog"`.
 
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ pub struct DatalogWriter {
     /// resolve `configured_dir` when it's relative.
     base_dir: PathBuf,
     /// Raw user-configured root (pre-resolution). `None` → default to
-    /// `~/.atomcode/datalog`. Otherwise absolute, `~/…`, or relative. The
+    /// `$ATOMCODE_HOME/datalog`. Otherwise absolute, `~/…`, or relative. The
     /// project slug is always appended underneath whichever value resolves.
     configured_dir: Option<String>,
     /// When false, all methods are no-ops and no files are created.
@@ -50,10 +50,28 @@ pub struct DatalogWriter {
     step: usize,
     /// File path for this turn
     file_path: Option<PathBuf>,
+    /// Optional suffix inserted into the markdown filename before `.md`.
+    filename_tag: Option<String>,
 }
 
 impl DatalogWriter {
     pub fn new(working_dir: &Path, config: &DatalogConfig) -> Self {
+        Self::new_inner(working_dir, config, None)
+    }
+
+    pub fn new_with_filename_tag(
+        working_dir: &Path,
+        config: &DatalogConfig,
+        filename_tag: &str,
+    ) -> Self {
+        Self::new_inner(
+            working_dir,
+            config,
+            Some(sanitize_filename_tag(filename_tag)),
+        )
+    }
+
+    fn new_inner(working_dir: &Path, config: &DatalogConfig, filename_tag: Option<String>) -> Self {
         Self {
             base_dir: working_dir.to_path_buf(),
             configured_dir: config.dir.clone(),
@@ -64,6 +82,7 @@ impl DatalogWriter {
             llm_turn_start: None,
             step: 0,
             file_path: None,
+            filename_tag: filename_tag.filter(|s| !s.is_empty()),
         }
     }
 
@@ -81,7 +100,7 @@ impl DatalogWriter {
     /// unit tests.
     ///
     /// The result is always `<root>/<project-slug>` so multiple projects don't
-    /// collide. `<root>` is `~/.atomcode/datalog` by default, or whatever the
+    /// collide. `<root>` is `$ATOMCODE_HOME/datalog` by default, or whatever the
     /// user configured (absolute / `~/…` / relative-to-cwd).
     pub fn resolve_log_dir(base_dir: &Path, configured: Option<&str>) -> PathBuf {
         let root = match configured {
@@ -104,7 +123,7 @@ impl DatalogWriter {
         root.join(project_slug(base_dir))
     }
 
-    /// `~/.atomcode/datalog` — the built-in root used when `[datalog].dir`
+    /// `$ATOMCODE_HOME/datalog` — the built-in root used when `[datalog].dir`
     /// is unset. Respects `ATOMCODE_HOME` environment variable if set.
     /// Falls back to a CWD-relative path on the (vanishingly rare)
     /// platforms where `$HOME` can't be resolved.
@@ -145,7 +164,11 @@ impl DatalogWriter {
         self.start = Some(Instant::now());
 
         let timestamp = format_timestamp();
-        let filename = format!("{}.md", timestamp.replace(' ', "_").replace(':', "-"));
+        let filename_stem = timestamp.replace(' ', "_").replace(':', "-");
+        let filename = match self.filename_tag.as_deref() {
+            Some(tag) => format!("{filename_stem}_{tag}.md"),
+            None => format!("{filename_stem}.md"),
+        };
         let log_dir = Self::resolve_log_dir(&self.base_dir, self.configured_dir.as_deref());
         let _ = std::fs::create_dir_all(&log_dir);
         self.file_path = Some(log_dir.join(filename));
@@ -392,6 +415,19 @@ impl DatalogWriter {
         self.flush();
     }
 
+    /// Log a non-fatal advisory (e.g. provider truncation detector).
+    /// Persisting it here makes post-hoc datalog inspection useful even
+    /// when the live TUI line scrolls past — the user can grep the
+    /// markdown for `**Warning:**` after the run.
+    pub fn log_warning(&mut self, warning: &str) {
+        if !self.active {
+            return;
+        }
+        let _ = writeln!(&mut self.buf, "**Warning:** {}", warning);
+        let _ = writeln!(&mut self.buf);
+        self.flush();
+    }
+
     /// End the turn: write duration and final flush.
     pub fn end_turn(&mut self, total_tokens: usize, tool_call_count: usize) {
         if !self.active {
@@ -523,6 +559,20 @@ fn format_timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn sanitize_filename_tag(tag: &str) -> String {
+    tag.chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                Some(c)
+            } else if c.is_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Per-project slug derived from `working_dir`. Shape: `<basename>-<hash8>`.
 ///
 /// - `<basename>`: the last path component, with anything outside
@@ -569,7 +619,7 @@ mod tests {
 
     fn make_log(dir: &Path) -> DatalogWriter {
         // Pin `dir` explicitly so tests write under the temp root, not the
-        // real `~/.atomcode/datalog/` (the new default). Slug subdir still
+        // real `$ATOMCODE_HOME/datalog/` (the new default). Slug subdir still
         // gets appended underneath — file_path lookups in the test go via
         // `log.file_path`, so the exact slugged path is opaque to callers.
         let cfg = DatalogConfig {
@@ -586,10 +636,9 @@ mod tests {
     fn resolve_log_dir_default_lands_under_home() {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, None);
-        let expected_root = crate::tool::real_home_dir()
-            .unwrap()
-            .join(".atomcode")
-            .join("datalog");
+        // default_root() uses Config::config_dir().join("datalog"),
+        // which resolves ATOMCODE_HOME when set, else $HOME/.atomcode.
+        let expected_root = crate::config::Config::config_dir().join("datalog");
         assert!(
             p.starts_with(&expected_root),
             "{:?} should start with {:?}",
@@ -611,7 +660,11 @@ mod tests {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, Some("/var/logs/atomcode"));
         assert!(p.starts_with("/var/logs/atomcode"));
-        assert!(p.file_name().unwrap().to_string_lossy().starts_with("work-"));
+        assert!(p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("work-"));
     }
 
     #[test]
@@ -619,16 +672,27 @@ mod tests {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, Some("logs/ac"));
         assert!(p.starts_with("/tmp/work/logs/ac"));
-        assert!(p.file_name().unwrap().to_string_lossy().starts_with("work-"));
+        assert!(p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("work-"));
     }
 
     #[test]
     fn resolve_log_dir_tilde_expands_home() {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, Some("~/.atomcode/logs"));
+        // `~/.atomcode/logs` expands via real_home_dir, which always resolves
+        // to the system home (not ATOMCODE_HOME) — this is the same as the
+        // `~/` expansion in the datalog dir config.
         let expected_root = crate::tool::real_home_dir().unwrap().join(".atomcode/logs");
         assert!(p.starts_with(&expected_root));
-        assert!(p.file_name().unwrap().to_string_lossy().starts_with("work-"));
+        assert!(p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("work-"));
     }
 
     #[test]
@@ -683,7 +747,7 @@ mod tests {
     #[test]
     fn disabled_writer_never_creates_files() {
         // Point `dir` at a temp subdir so this test doesn't depend on (or
-        // pollute) the real `~/.atomcode/datalog/`. With enabled=false the
+        // pollute) the real `$ATOMCODE_HOME/datalog/`. With enabled=false the
         // writer should still create nothing under that root.
         let dir = std::env::temp_dir().join("atomcode_test_datalog_disabled");
         let _ = std::fs::remove_dir_all(&dir);
@@ -697,7 +761,46 @@ mod tests {
         log.log_text("response");
         log.end_turn(0, 0);
         assert!(log.file_path.is_none());
-        assert!(!dir.exists(), "disabled writer must not create the root dir");
+        assert!(
+            !dir.exists(),
+            "disabled writer must not create the root dir"
+        );
+    }
+
+    #[test]
+    fn filename_tag_is_added_only_for_tagged_writer() {
+        let dir = std::env::temp_dir().join("atomcode_test_datalog_filename_tag");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = DatalogConfig {
+            enabled: true,
+            dir: Some(dir.to_string_lossy().to_string()),
+        };
+
+        let mut default_log = DatalogWriter::new(&dir, &cfg);
+        default_log.begin_turn("hello", "m", 1000);
+        let default_name = default_log
+            .file_path
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(!default_name.contains("runtime-2"));
+
+        let mut tagged_log = DatalogWriter::new_with_filename_tag(&dir, &cfg, "runtime-2");
+        tagged_log.begin_turn("hello", "m", 1000);
+        let tagged_name = tagged_log
+            .file_path
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(tagged_name.ends_with("_runtime-2.md"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

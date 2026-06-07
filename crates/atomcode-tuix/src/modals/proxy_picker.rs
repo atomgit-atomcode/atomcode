@@ -94,12 +94,14 @@ impl Modal for ProxyPicker {
         let payload = MenuPayload {
             items,
             selected: self.selected,
+            kind: crate::render::MenuKind::SlashCommand,
         };
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),
             cursor_byte: buf.cursor,
             menu: Some(payload),
             status: build_status(state, ctx),
+            attachments: Vec::new(),
         });
         renderer.flush();
     }

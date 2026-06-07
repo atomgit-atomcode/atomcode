@@ -85,6 +85,11 @@ impl OllamaProvider {
                             "content": r.summary,
                         }))
                     }
+                    MessageContent::MultiPart { text, .. } => {
+                        let t = text.as_deref().unwrap_or("");
+                        if t.is_empty() { return None; }
+                        Some(json!({"role": "user", "content": t}))
+                    }
                 }
             })
             .collect()
@@ -171,9 +176,10 @@ impl LlmProvider for OllamaProvider {
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
+                let msg = super::extract_error_message(&body);
                 let _ = tx.send(Ok(StreamEvent::Error(format!(
                     "Ollama error ({}): {}",
-                    status, body
+                    status, msg
                 ))));
                 return;
             }

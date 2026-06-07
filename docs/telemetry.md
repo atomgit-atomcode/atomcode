@@ -19,7 +19,8 @@ Exactly 7 event types, each with a common "envelope" of identifiers/metadata.
 |---|---|
 | `device_id` | UUIDv4 generated on first run, stored at `~/.atomcode/device_id`. Persists across login/logout. Resets only if you delete `~/.atomcode/`. |
 | `account_id` | Your AtomGit user ID — only included when logged in. |
-| `session_id` | Per process launch. |
+| `session_id` | Per process launch (CLI) or per conversation session (daemon). |
+| `mode` | Event source: `headless` (non-interactive CLI), `tui` (interactive CLI), `ide` (daemon process serving IDE integrations). |
 | `turn_id` | Per agent turn (inside one LLM interaction). |
 | `ts`, `schema_version`, `app_version`, `os`, `arch`, `locale` | Static context. |
 | `provider`, `model` | Current LLM provider/model name (during agent turns). |
@@ -58,6 +59,70 @@ Any one of these works (higher precedence overrides lower):
 4. `atomcode telemetry disable` (persistent — writes to `~/.atomcode/config.toml`)
 
 `atomcode telemetry status` shows which rule applies.
+
+## Daemon behavior
+
+The `atomcode daemon` process (backend for VS Code and other IDE integrations)
+shares the same telemetry pipeline as the CLI.
+
+### Startup status line
+
+On launch, the daemon prints one line to stdout:
+
+```
+Telemetry: enabled
+```
+
+or, if disabled:
+
+```
+Telemetry: disabled (reason: env:ATOMCODE_TELEMETRY=0)
+```
+
+The reason string matches the output of `atomcode telemetry status`.
+
+### `--no-telemetry` flag
+
+```sh
+atomcode daemon --port 13456 --no-telemetry
+```
+
+Disables telemetry for this daemon process only (equivalent to
+`atomcode --no-telemetry` for CLI invocations).
+
+### Graceful shutdown flush
+
+When the daemon receives `SIGINT` / `SIGTERM` (or Ctrl+C on Windows), it:
+
+1. Stops accepting new HTTP connections.
+2. Waits for in-flight requests to complete.
+3. Flushes any buffered telemetry events to disk (timeout: 500 ms).
+4. Exits.
+
+Events that cannot be sent within the 500 ms budget remain in the local queue
+and are retried on the next process start.
+
+### Shared state with CLI
+
+The daemon and CLI share the same on-disk identity and queue:
+
+| Path | Purpose |
+|---|---|
+| `~/.atomcode/device_id` | Stable device UUID (created on first run by whichever process starts first) |
+| `~/.atomcode/telemetry/queue/` | NDJSON event queue — both processes write segments concurrently using a claim-based mechanism to avoid corruption |
+
+No daemon-specific files are introduced. Both processes read the same
+`~/.atomcode/config.toml` for the `[telemetry].enabled` setting.
+
+### Filtering daemon events
+
+`atomcode telemetry status` and `atomcode telemetry dump` work for daemon events
+too — they read from the same shared queue. To show only daemon-originated
+events:
+
+```sh
+atomcode telemetry dump --last 100 --pretty | jq 'select(.mode == "ide")'
+```
 
 ## Inspect what will be sent
 

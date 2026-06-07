@@ -81,6 +81,14 @@ impl Modal for ModelPicker {
                 if let Ok(mut g) = ctx.monitor_warning.lock() {
                     *g = None;
                 }
+                // Same treatment for the usage slot: switching providers
+                // invalidates the previous CodingPlan's quota snapshot.
+                // Clearing here makes `build_usage_hint` short-circuit to
+                // None until a fresh fetch lands; otherwise the user would
+                // briefly see the OLD plan's percent on the new provider.
+                if let Ok(mut g) = ctx.usage_slot.lock() {
+                    *g = None;
+                }
                 // Re-fire the drift check if the new provider is also
                 // CodingPlan-managed. Bypasses the 15-min cooldown on
                 // purpose — explicit user action deserves a fresh read.
@@ -92,11 +100,18 @@ impl Modal for ModelPicker {
                         ctx.monitor_warning.clone(),
                         ctx.wake_tx.clone(),
                     );
+                    // Mirror: re-fire usage check too. 30s cooldown is
+                    // bypassed because the user just made an explicit
+                    // switch — they want fresh data, not stale 30s data.
+                    ctx.usage_last_check_at = Some(std::time::Instant::now());
+                    crate::event_loop::usage_monitor::spawn_check(
+                        ctx.usage_slot.clone(),
+                        ctx.wake_tx.clone(),
+                    );
                 }
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  Switched to {} · {}\n",
-                    chosen, display
-                )));
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::ModelSwitched { provider: &chosen, model: &display }).into_owned(),
+                ));
                 renderer.flush();
                 Ok(ModalAction::Close)
             }
@@ -122,12 +137,14 @@ impl Modal for ModelPicker {
         let payload = MenuPayload {
             items,
             selected: self.selected,
+            kind: crate::render::MenuKind::SlashCommand,
         };
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),
             cursor_byte: buf.cursor,
             menu: Some(payload),
             status: build_status(state, ctx),
+            attachments: Vec::new(),
         });
         renderer.flush();
     }

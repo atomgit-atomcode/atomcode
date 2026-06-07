@@ -1,5 +1,12 @@
+// `Write::write_all` and `PathBuf` only appear inside `#[cfg(unix)]`
+// blocks below (the atomic-rename + chmod-600 path uses them; the
+// Windows fallback at line 49 just calls `std::fs::write`). Gate the
+// imports so a Windows build doesn't fire unused_imports.
+#[cfg(unix)]
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 

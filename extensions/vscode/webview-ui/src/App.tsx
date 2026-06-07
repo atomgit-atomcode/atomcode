@@ -10,10 +10,18 @@ function ChatApp() {
   const { state } = useChatContext();
   const hasMessages = state.messages.length > 0 || state.isGenerating;
 
+  if (state.isSessionList) {
+    return (
+      <div className="app app-sidebar">
+        <SessionList variant="sidebar" />
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       <Header />
-      {state.historyOpen && <SessionList />}
+      {state.historyOpen && <SessionList variant="overlay" />}
       <div className="session-body">
         {hasMessages ? <MessageList /> : <WelcomeScreen />}
         <InputArea />

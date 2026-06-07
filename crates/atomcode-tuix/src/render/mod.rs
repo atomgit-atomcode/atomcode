@@ -49,6 +49,35 @@ pub enum UiLine {
     ToolCallCommit {
         call_id: Option<String>,
     },
+    /// Push a parallel-tool batch as a live multi-row group: one
+    /// header line + N child rows (one per tool call), all visible
+    /// from the start. Subsequent `ToolGroupChildUpdate` events find
+    /// child rows by `call_id` and update them in place (CC-style
+    /// ✓ light-up). The group is "live" only as long as it remains
+    /// the bottom of body_lines; any other body push freezes it (in
+    /// place forever, but no further child updates take effect).
+    ToolGroupRender {
+        batch_id: String,
+        header: String,
+        children: Vec<ToolGroupChild>,
+    },
+    /// Update one child row inside an active live-group. Renderer
+    /// finds the row keyed by `call_id` and CUPs to its terminal
+    /// position to rewrite. Falls back to no-op if the group has been
+    /// frozen (other content was pushed below it).
+    ToolGroupChildUpdate {
+        batch_id: String,
+        call_id: String,
+        new_text: String,
+    },
+    /// One-shot summary line for a completed tool batch — rendered
+    /// with bold + brand-color emphasis so it stands out as the
+    /// "this is what happened" anchor (mirrors CC's task-completion
+    /// summary visual). Used by both ToolBatchCompleted and
+    /// SubAgentDispatchEnd.
+    ToolGroupSummary {
+        text: String,
+    },
     ToolResult {
         success: bool,
         summary: String,
@@ -70,6 +99,11 @@ pub enum UiLine {
         detail: String,
     },
     Error(String),
+    /// Non-fatal advisory line (yellow). Visually distinct from `Error`
+    /// so the user can tell "we saw something fishy and want you to
+    /// know" apart from "the turn died." Currently used by the OpenAI
+    /// provider's truncation detector.
+    Warning(String),
     TurnCancelled,
     TurnComplete,
     /// Legacy single-line spinner (kept for tests / PlainRenderer fallback).
@@ -92,6 +126,16 @@ pub enum UiLine {
         cursor_byte: usize,
         menu: Option<MenuPayload>,
         status: StatusLine,
+        /// Marker numbers (`N` from `[Image #N]`) that actually have
+        /// image bytes ready to ship — either freshly attached this
+        /// turn or recalled from cache via arrow-up. Renderers cross-
+        /// reference each marker against `buf` and draw a `└ [Image #N]`
+        /// preview row for the intersection right under the input box,
+        /// so users can tell "real attachment" from "literal text" at
+        /// a glance, before submit. Empty means no preview rows. Only
+        /// the main idle / streaming compose paths populate this; modal
+        /// flows that reuse `InputPrompt` for text entry pass `Vec::new()`.
+        attachments: Vec<usize>,
     },
     /// Streaming chrome: spinner line above a (possibly multi-line)
     /// input box. Same `cursor_byte` semantics as `InputPrompt`.
@@ -105,11 +149,36 @@ pub enum UiLine {
         label: String,
         status: StatusLine,
         menu: Option<MenuPayload>,
+        /// Same semantics as `InputPrompt::attachments` — type-ahead
+        /// during streaming can carry pasted attachments too, so the
+        /// preview path needs to fire here as well.
+        attachments: Vec<usize>,
     },
     /// User pressed Enter: commit the current InputPrompt to scrollback.
     InputCommit,
     /// Slash-command output (arbitrary text, already sanitised by caller).
     CommandOutput(String),
+    /// Image-attachment echo (`└ [Image #N]`). Emitted right after the
+    /// `UiLine::User` row that contains the matching `[Image #N]`
+    /// marker, so each renderer can align the `└` glyph at the same
+    /// column as the `[` of the marker in the user message above
+    /// (col 2). A dedicated variant rather than `CommandOutput` so
+    /// alignment stays consistent across renderers — retained's
+    /// `push_body_text` auto-prefixes PAD_COL (2 spaces) but
+    /// alt-screen's `push_command_output` does not, so the same
+    /// CommandOutput payload would land at col 2 in one and col 4
+    /// (or col 0) in the other.
+    ImageAttachment(usize),
+    /// One-line success notice for vision-preprocessor OCR. Renders as
+    /// `{msg}  {model}` where `msg` uses the default text style and
+    /// `model` uses the Muted (gray) role — visually distinct from
+    /// failure (yellow `! ...`) and from arbitrary command output.
+    /// The actual VL description is intentionally NOT shown in the UI;
+    /// it still rides into conversation history for the main model.
+    VisionPreprocessSuccess {
+        msg: String,
+        model: String,
+    },
     /// A visible separator between turns: `────── {label} ──────`.
     TurnSeparator {
         label: String,
@@ -199,13 +268,56 @@ pub trait Renderer: Send {
     fn begin_selection(&mut self, _col: u16, _row: u16) {}
     fn update_selection(&mut self, _col: u16, _row: u16) {}
     fn end_selection(&mut self) {}
+
+    /// Copy the current mouse-selection text to the system clipboard
+    /// (using arboard, not OSC 52) and clear the selection highlight.
+    /// Returns `true` if a non-empty selection was copied.
+    ///
+    /// This is the Ctrl+C fallback for terminals (Windows Terminal,
+    /// conhost) that ignore OSC 52 — the user selects text with the
+    /// mouse, then presses Ctrl+C to copy it. AltScreenRenderer
+    /// implements this; other backends return `false` (they use the
+    /// host terminal's native selection).
+    fn copy_selection(&mut self) -> bool {
+        false
+    }
+
+    /// Update the cached welcome banner's model / working_dir fields in
+    /// place and trigger a repaint of the banner rows. Used after the
+    /// QR-onboarding `/codingplan` claim finishes: the banner was
+    /// painted at the top of scrollback with `model=""` (the claim
+    /// hadn't picked a default provider yet) — once the claim writes
+    /// `ctx.model_name`, this hook splices the resolved model into the
+    /// existing banner rows so the user doesn't see a permanently
+    /// blank model bullet.
+    ///
+    /// Default no-op: renderers without a retained body buffer can't
+    /// edit already-emitted rows in place.
+    fn refresh_welcome_banner(&mut self, _model: &str, _working_dir: &str) {}
+}
+
+/// Visual style for the menu popup. Drives whether the renderer prefixes
+/// each row with `/` (slash-command palette) or `+ ` (file/dir mention),
+/// and which marker indicates the selected row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MenuKind {
+    /// Default: rows shown as `/<name>`, selected row marked `▸`.
+    #[default]
+    SlashCommand,
+    /// `@`-mention popup: rows shown as `+ <path>`, no slash prefix.
+    /// Selected row uses reverse-video only (no extra arrow).
+    AtMention,
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MenuPayload {
     pub items: Vec<(String, String)>, // (name, desc)
     pub selected: usize,
+    /// Visual style. Defaults to `SlashCommand`; existing call sites
+    /// using `MenuPayload { items, selected }` get the slash style for
+    /// free. `@`-mention path explicitly sets `MenuKind::AtMention`.
+    pub kind: MenuKind,
 }
 
 /// Persistent status line drawn directly below the input box — CC-style
@@ -219,23 +331,58 @@ pub enum HintSeverity {
     Info,
 }
 
-/// "model · cwd · tokens" chrome. Visible in both Idle and Streaming
-/// phases so the user always sees what provider is active.
+/// "model · cwd · ctx_used / ctx_window" chrome. Visible in both Idle
+/// and Streaming phases so the user always sees what provider is active
+/// and how much of the context window is currently in use. Cumulative
+/// session token totals are NOT shown here — they're per-session and
+/// don't tell the user whether the next turn is at risk of overflow.
+/// `ctx_used` answers "what does the model see right now"; `ctx_window`
+/// is the cap. Together they answer "how close are we to compaction".
 #[derive(Debug, Clone, Default)]
 pub struct StatusLine {
     pub model: String,
     pub cwd: String, // HOME replaced with "~"
-    pub total_tokens: usize,
+    /// Tokens currently in the model's context (last turn's `sent_tokens`).
+    /// Pre-first-turn this is 0; the renderer hides the field then.
+    pub ctx_used: usize,
+    /// Provider's context window (cap). 0 when not yet known — renderer
+    /// falls back to a bare "12.3k tok" display in that case.
+    pub ctx_window: usize,
     /// Right-aligned passive hint with severity. `Warning` renders red
     /// (no-provider nudge, CodingPlan model-missing); `Info` renders
     /// muted (upgrade banner, CodingPlan drift notice). None → no hint.
     pub hint: Option<(String, HintSeverity)>,
+    /// Left-aligned mode indicator, prepended before `model`. Present
+    /// only when the user explicitly switched to a non-default agent
+    /// mode (Plan today; conceivably others later). `None` for the
+    /// default Build mode so the status row doesn't gain noise for
+    /// the common case. Renders in brand color (Role::Brand) to draw
+    /// the eye — switching modes changes whether file edits and shell
+    /// run, so the user wants this prominent.
+    pub mode_indicator: Option<String>,
+    /// Current session display name, shown as a right-aligned cyan
+    /// pill overlaid on the input box's top rule. `Some` only after
+    /// the user has explicitly run `/rename` (Session::user_renamed) —
+    /// auto-named / default sessions leave this `None` to keep the
+    /// chrome quiet on fresh conversations.
+    pub session_name: Option<String>,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.
 #[derive(Debug, Clone)]
 pub struct DiffEntry {
     pub added: bool,
+    pub text: String,
+}
+
+/// One child entry inside a `UiLine::ToolGroupRender` payload. `call_id`
+/// is the model-supplied tool-call id; `text` is the display string the
+/// renderer initially prints (e.g. `↳ Read File foo.rs`). Subsequent
+/// `ToolGroupChildUpdate` events with the same call_id rewrite this row
+/// in place (e.g. to `↳ ✓ Read File foo.rs`).
+#[derive(Debug, Clone)]
+pub struct ToolGroupChild {
+    pub call_id: String,
     pub text: String,
 }
 

@@ -2,6 +2,8 @@
 
 pub mod commands;
 pub mod event_loop;
+pub mod highlight;
+pub mod i18n;
 pub mod input;
 pub mod markdown;
 pub mod modals;
@@ -10,6 +12,7 @@ pub mod render;
 pub mod sanitize;
 pub mod state;
 pub mod terminal;
+pub mod terminal_bg;
 #[cfg(test)]
 pub mod test_term;
 pub mod think;
@@ -17,9 +20,8 @@ pub mod trace;
 pub mod width;
 
 use anyhow::Result;
-use atomcode_core::agent::AgentHandle;
+use atomcode_core::agent::{AgentHandle, AgentRuntimeFactory};
 use atomcode_core::config::Config;
-use atomcode_core::tool::ToolContext;
 use crossterm::{
     event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
@@ -168,11 +170,12 @@ pub async fn run(
     config: Config,
     model_name: String,
     agent_handle: AgentHandle,
-    _tool_context: ToolContext,
+    runtime_factory: AgentRuntimeFactory,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
     mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
+    lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 ) -> Result<()> {
     let mut caps = TerminalCaps::probe();
@@ -260,21 +263,24 @@ pub async fn run(
     // Phase 5 upgrades the auto-fallback to alt-screen so users
     // get the full UI).
     let force_plain = force_plain_env;
-    let auto_alt_screen = !force_plain_env
-        && !force_retain
-        && (is_jediterm || is_legacy_conhost);
+    let auto_alt_screen = !force_plain_env && !force_retain && (is_jediterm || is_legacy_conhost);
 
     // Marker env vars so the event loop can render a one-line hint
     // explaining what just happened and how to recover. Only set
     // when the auto-fallback fired — if the user explicitly opted
     // in via ATOMCODE_PLAIN they already know; lecturing would be
-    // noise. Mutually exclusive (legacy_conhost is gated on
-    // !is_jediterm above) so at most one hint fires.
+    // noise.
+    //
+    // The conhost banner used to fire here too (gated on
+    // is_legacy_conhost), but as of v4.22 alt-screen on conhost
+    // covers wheel-scroll + PageUp/Down + ?1006 SGR mouse
+    // coordinates well enough that the wall-of-text hint became
+    // dead weight — users see it once and immediately want it
+    // gone. Removed in favour of the universal `\<Enter>` hint
+    // (kbd_hint block in event_loop) which is one line and
+    // terminal-agnostic.
     if is_jediterm && !force_retain && !force_plain_env {
         std::env::set_var("ATOMCODE_JEDITERM_FALLBACK", "1");
-    }
-    if is_legacy_conhost && !force_retain && !force_plain_env {
-        std::env::set_var("ATOMCODE_LEGACY_CONHOST_FALLBACK", "1");
     }
 
     // Capture whether stdout was a real TTY BEFORE we mutate caps.
@@ -296,8 +302,7 @@ pub async fn run(
     // setting any env var. Manual `ATOMCODE_RETAIN=1` still bypasses
     // (lets the curious try retained on those terminals despite the
     // known DECSTBM issues).
-    let want_alt_screen =
-        (force_alt_env || auto_alt_screen) && !force_plain_env && was_real_tty;
+    let want_alt_screen = (force_alt_env || auto_alt_screen) && !force_plain_env && was_real_tty;
 
     // When force_plain wins, strip raw-mode-related capabilities so
     // every downstream branch (TerminalGuard activate, reader spawn,
@@ -315,6 +320,34 @@ pub async fn run(
 
     let (_guard, kbd_enhanced) = TerminalGuard::activate(caps)?;
 
+    // Pick the colour palette now that raw mode is on (OSC 11 detection
+    // requires it — otherwise the response is line-buffered and never
+    // reaches us before timeout).
+    //
+    // - `Light` / `Dark`: explicit, skip detection.
+    // - `Auto`: query the terminal background; fall back to `dark` if
+    //   it doesn't reply within 100ms. Responsive emulators (iTerm2,
+    //   WezTerm, Alacritty, Kitty, Windows Terminal, VSCode integrated)
+    //   reply on first byte well under the budget; non-responsive
+    //   terminals (macOS Terminal.app, Windows conhost, SSH through
+    //   relays that strip OSC) silently default to dark — matches the
+    //   legacy behaviour, never makes things worse.
+    let theme_light = match config.ui.theme {
+        atomcode_core::config::UiTheme::Light => true,
+        atomcode_core::config::UiTheme::Dark => false,
+        atomcode_core::config::UiTheme::Auto => {
+            if caps.colors {
+                crate::terminal_bg::detect_light(
+                    std::time::Duration::from_millis(100),
+                )
+                .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    };
+    crate::highlight::theme::set_theme_mode(theme_light);
+
     // If the terminal doesn't support Kitty keyboard protocol (CSI u),
     // set an env var so the event loop can show a hint on startup.
     // Shift+Enter won't work for newline insertion; users should use
@@ -331,13 +364,30 @@ pub async fn run(
     // TTY → retained-mode Ink-style cell-diff renderer.
     // Non-TTY (pipe, CI, dumb terminal, force_plain) → PlainRenderer,
     // which just writes plain text without ANSI cursor positioning.
+    //
+    // `is_plain_renderer` mirrors the predicate that picks PlainRenderer
+    // below — neither alt-screen wanted nor caps.tty means plain. Threaded
+    // into LoopCtx so non-interactive sessions (CI, pipe, dumb TERM) can
+    // skip the OnboardingWizard auto-trigger; the modal would otherwise
+    // try to draw a Cyan-bordered box into a stdout that no human is
+    // watching.
+    let is_plain_renderer = !want_alt_screen && !caps.tty;
     let inner: Box<dyn Renderer> = if want_alt_screen {
         // Alt-screen renderer: takes over the alternate screen buffer
         // (`\x1b[?1049h`) so it can use absolute cursor positioning
         // without depending on DECSTBM scroll regions. Trade-off:
         // host terminal's native scrollback is unavailable while the
         // app runs (in-app PageUp/PageDown ships in Phase 2).
-        Box::new(crate::render::alt_screen::AltScreenRenderer::new(caps))
+        // Slow-paint flag controls per-frame cursor hide/show in
+        // alt-screen renderer. JediTerm + legacy conhost process CUP
+        // sequences synchronously and need the hide to avoid a visible
+        // cursor trail through paint_body's per-row CUPs; everywhere
+        // else we leave the cursor visible to avoid the per-frame
+        // toggle reading as flicker on hardware cursors.
+        let slow_paint = is_jediterm || is_legacy_conhost;
+        Box::new(crate::render::alt_screen::AltScreenRenderer::new(
+            caps, slow_paint,
+        ))
     } else if caps.tty {
         Box::new(RetainedRenderer::new(caps))
     } else {
@@ -398,9 +448,12 @@ pub async fn run(
     // inside `platform::history_path`), so the explicit else-branch
     // with a hardcoded Unix path is gone — Windows used to fall here
     // and then fail to write to `/tmp`.
-    let history = History::default_path()
-        .map(History::load)
-        .unwrap_or_else(|| History::load(crate::platform::history_path()));
+    let history = {
+        let path = History::default_path()
+            .unwrap_or_else(crate::platform::history_path);
+        let cache = crate::platform::image_cache_dir();
+        crate::input::history::History::load_with_cache(path, cache)
+    };
 
     let session_manager = atomcode_core::session::SessionManager::new(&working_dir);
     // Fresh session by default; `/resume` replaces this on load.
@@ -413,6 +466,13 @@ pub async fn run(
     // instead of waiting for the user's next keystroke.
     let update_hint = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // Background OAuth poll → event-loop channel. Unbounded so the
+    // poll thread never blocks waiting for the consumer (poll thread
+    // is std::thread, can't `await`). One event per spawned task,
+    // capacity is irrelevant — even an unbounded channel is essentially
+    // empty here.
+    let (oauth_event_tx, oauth_event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::event_loop::oauth_poll::OauthEvent>();
 
     // Seed the hint from any prior-session staged upgrade so the user
     // sees the pending status on the very first frame rather than
@@ -458,6 +518,10 @@ pub async fn run(
     // we never want the upgrade task to block on UI backpressure.
     let (upgrade_tx, upgrade_rx) =
         tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
+    // Mirror channel for /plugin add|update|install so git latency never
+    // stalls the input loop. See LoopCtx::plugin_job_tx for the rationale.
+    let (plugin_job_tx, plugin_job_rx) =
+        tokio::sync::mpsc::unbounded_channel::<atomcode_core::plugin::PluginJobEvent>();
 
     // Seed the recent-project-dirs ring from disk and guarantee the
     // current working dir sits at index 0 so the `/cd` picker always
@@ -469,17 +533,36 @@ pub async fn run(
         dirs
     };
 
-    let custom_commands =
-        atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
+    let custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
     // Same Arc the agent loop holds — reload() calls there propagate
     // here automatically, so the slash menu reflects newly-installed
     // skills without re-plumbing.
-    let skill_registry = agent_handle.skill_registry.clone();
+    let foreground_runtime_id = event_loop::bg_runtime::RuntimeId::new(1);
+    let agent_client = agent_handle.client.clone();
+    let skill_registry = agent_client.skill_registry.clone();
+    let (runtime_event_tx, runtime_event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<event_loop::bg_runtime::RuntimeEvent>();
+    event_loop::bg_runtime::spawn_event_forwarder(
+        foreground_runtime_id,
+        agent_handle.event_rx,
+        runtime_event_tx.clone(),
+    );
+    let bg_manager = event_loop::bg_runtime::BgRuntimeManager::new(
+        current_session.clone(),
+        foreground_runtime_id,
+        agent_client.clone(),
+    );
 
+    let file_index_root = working_dir.clone();
     let ctx = LoopCtx {
         config,
         model_name,
-        agent: agent_handle,
+        agent: agent_client,
+        runtime_factory,
+        bg_manager,
+        foreground_runtime_id,
+        runtime_event_tx,
+        runtime_event_rx,
         working_dir,
         previous_dir: None,
         recent_dirs,
@@ -491,27 +574,40 @@ pub async fn run(
         update_hint,
         monitor_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
         monitor_last_check_at: None,
+        usage_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        usage_last_check_at: None,
         // Seed with whatever's on disk now — any NEWER mtime observed
         // later means another atomcode process resynced and our drift
         // warning (if any) is stale.
         monitor_last_sync_seen: atomcode_core::coding_plan::read_last_sync(),
         wake_rx,
         wake_tx: wake_tx.clone(),
+        oauth_event_rx,
+        oauth_event_tx,
         reader: reader_handle,
         upgrade_tx,
         upgrade_rx,
+        plugin_job_tx,
+        plugin_job_rx,
         pending_new_issue: None,
         pending_run_codingplan: false,
         pending_open_provider_wizard: false,
         mcp_registry,
         mcp_connect_rx,
         mcp_reload: None,
+        lsp_connect_rx,
         telemetry,
         worktree_original_dir: None,
         custom_commands,
         skill_registry,
         caps,
         replay_on_start: session_to_continue,
+        file_index: crate::event_loop::file_index::FileIndex::new(file_index_root),
+        current_session_id: None,
+        clipboard_check: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::event_loop::ClipboardCheckState::default(),
+        )),
+        is_plain_renderer,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current
@@ -530,8 +626,39 @@ pub async fn run(
 
     let result = run_loop(ctx, renderer.as_mut()).await;
 
+    // Must shut down the renderer BEFORE re-exec: the alternate screen is
+    // still active and raw mode is on — if we spawn a child while the
+    // terminal is in that state, the new process inherits a garbled TTY.
     renderer.shutdown();
     drop(pipe_reader); // pipe-mode thread exits on next channel send failure
 
-    result
+    // If /upgrade succeeded, the live binary has been replaced on disk.
+    // Re-exec into the new version so the user gets a seamless upgrade
+    // without manually restarting. This mirrors the startup-time upgrade
+    // path in main.rs (apply_pending_upgrade → re_exec_self).
+    //
+    // The exe path comes from `ExitReason::UpgradeRestart { exe }`, which
+    // was captured *before* `replace_binary` renamed the running binary.
+    // On Windows, `std::env::current_exe()` would return the renamed
+    // `.atomcode.rolling` path after the swap, so we MUST use this saved
+    // value instead.
+    if let Ok(event_loop::ExitReason::UpgradeRestart { exe }) = &result {
+        // Set env var so the new process can show a one-time "upgraded" banner
+        // on the welcome screen.
+        std::env::set_var("ATOMCODE_UPGRADED_FROM", format!("v{}", env!("CARGO_PKG_VERSION")));
+        match atomcode_core::self_update::re_exec_self(Some(exe)) {
+            Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
+            Err(e) => {
+                // Re-exec failed. The upgrade is on disk, so the user just
+                // needs to start atomcode again — don't treat this as fatal.
+                eprintln!(
+                    "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
+                    e
+                );
+                std::env::remove_var("ATOMCODE_UPGRADED_FROM");
+            }
+        }
+    }
+
+    result.map(|_| ())
 }

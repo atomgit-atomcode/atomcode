@@ -4,12 +4,16 @@
 #   curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.sh | sh
 #
 # Env overrides:
-#   ATOMCODE_VERSION   release tag to install (default: v4.21.0)
+#   ATOMCODE_VERSION   release tag to install (default: v4.22.3)
 #   ATOMCODE_PREFIX    install dir (absolute path; default: /usr/local/bin if writable,
 #                        else ~/.local/bin). On HarmonyOS as non-root, default is ~/.local/bin.
+# IMPORTANT: when changing install paths, the PATH-rc edit format, or filenames here,
+# also update scripts/uninstall.sh AND
+# crates/atomcode-core/src/uninstall/paths.rs. The CI parity test guards
+# the manifest, but binary path / rc-edit format are not checked.
 set -eu
 
-VERSION="${ATOMCODE_VERSION:-v4.21.0}"
+VERSION="${ATOMCODE_VERSION:-v4.23.1}"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 
 # --- detect platform ---
@@ -28,12 +32,6 @@ case "$uname_m" in
     x86_64|amd64)  arch="x64"   ;;
     *) echo "Unsupported arch: $uname_m"; exit 1 ;;
 esac
-
-# Linux only ships x64
-if [ "$os" = "linux" ] && [ "$arch" != "x64" ]; then
-    echo "Unsupported platform: linux-$arch (only linux-x64 is released)"
-    exit 1
-fi
 
 BIN_NAME="atomcode-${VERSION}-${os}-${arch}"
 URL="${REPO_BASE}/${VERSION}/${BIN_NAME}"

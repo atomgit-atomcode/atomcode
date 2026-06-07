@@ -254,6 +254,16 @@ fn p0_sprint_clean_session_bash_has_exit_markers() {
 }
 
 #[test]
+fn p0_sprint_clean_session_tool_call_result_parity() {
+    assert_tool_call_result_parity("session_p0_sprint_clean.jsonl");
+}
+
+#[test]
+fn path_404_recovery_session_tool_call_result_parity() {
+    assert_tool_call_result_parity("session_404_recovery.jsonl");
+}
+
+#[test]
 fn path_404_recovery_session_is_free_of_removed_patterns() {
     // hermes 2026-04-22_20-12-44 — 4-turn session proving #4 path-prefix
     // ranking works: read_file `/hermes/hermes-tauri/src/main.rs` 404'd,
@@ -264,6 +274,54 @@ fn path_404_recovery_session_is_free_of_removed_patterns() {
 #[test]
 fn path_404_recovery_session_has_no_shell_workarounds() {
     assert_no_shell_workaround_calls("session_404_recovery.jsonl");
+}
+
+/// Every `AssistantWithToolCalls` message must be followed by exactly the
+/// same number of `ToolResult` messages. If `merge_edit_calls` runs AFTER
+/// `finalize_stream_with_tool_calls`, the assistant message declares N
+/// tool calls but only M < N results are appended — this poisons the
+/// next provider request (the bug fixed in runner.rs 2026-04-30).
+fn assert_tool_call_result_parity(fixture_name: &str) {
+    let ev = load_last_event(fixture_name);
+    let messages = ev
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+
+    let mut i = 0;
+    while i < messages.len() {
+        if let Some(a) = messages[i]
+            .get("content")
+            .and_then(|c| c.get("AssistantWithToolCalls"))
+        {
+            if let Some(tcs) = a.get("tool_calls").and_then(|v| v.as_array()) {
+                let expected = tcs.len();
+                // Count consecutive ToolResult messages after this assistant message.
+                let mut actual = 0;
+                let mut j = i + 1;
+                while j < messages.len() {
+                    if messages[j]
+                        .get("content")
+                        .and_then(|c| c.get("ToolResult"))
+                        .is_some()
+                    {
+                        actual += 1;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    expected, actual,
+                    "fixture {} msg[{}]: assistant declares {} tool calls but \
+                     followed by {} ToolResult messages — tool_call/tool_result \
+                     mismatch poisons the next provider request",
+                    fixture_name, i, expected, actual,
+                );
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Meta-test: make sure the fixture loader + collector actually visit

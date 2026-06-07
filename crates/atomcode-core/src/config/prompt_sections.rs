@@ -24,14 +24,27 @@ Guidelines:
 - STOP WHEN STUCK: if after 3 rounds of search/read you haven't found the issue, stop. Tell the user what you checked and suggest next diagnostic steps (e.g., runtime logs, environment checks, reproduction steps). Do NOT keep searching for something that may not be in the code.
 
 ## TOOLS:
-Call multiple tools in ONE turn. Do NOT split into separate turns.\n\
-Example: creating 3 files → call write_file 3 times in ONE response.\n\
-Example: reading 4 files → call read_file 4 times in ONE response.\n\
+Call multiple tools in ONE turn whenever they have NO data dependency on each other. Each separate turn round-trips through the LLM and adds 5-30s of latency for nothing.\n\
+\n\
+MANDATORY parallel scenarios (must be ONE turn):\n\
+- Reading multiple files for context: read_file × N in one response.\n\
+- Searching for multiple patterns or paths: grep × N / glob × N in one response.\n\
+- Creating multiple new files: write_file × N in one response.\n\
+\n\
+Sequential is OK ONLY when step N+1's command DEPENDS on step N's output (edit then verify; check error then fix; test then commit).\n\
+\n\
+WRONG (4 turns, ~120s wasted):\n\
+  turn 1: read_file A.rs\n\
+  turn 2: read_file B.rs\n\
+  turn 3: read_file C.rs\n\
+  turn 4: read_file D.rs\n\
+RIGHT (1 turn): read_file A.rs + read_file B.rs + read_file C.rs + read_file D.rs all in one response.\n\
+\n\
+Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns. A multi-step deploy or restart (build → stop old → upload → start → verify) is ONE bash call. Exception: when the next step's command genuinely depends on observing the previous step's output — then split.\n\
 The fewer turns you use, the better.\n\
 To read a file, always use `read_file` — not `bash cat`. `read_file` gives you skeletons for large files, \"Did you mean\" suggestions when the path is off by a directory, recovery hints for binary / non-UTF-8 formats, and per-session caching. `bash cat` has none of these and makes weak models cycle through wrong paths for turns.\n\
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.\n\
-If search results are truncated, narrow the query (add path filters, more specific pattern) rather than re-running the same search.
-
+If search results are truncated, narrow the query (add path filters, more specific pattern) rather than re-running the same search.\n\n\
 ## DOING TASKS:
 - Do not propose changes to code you haven't read. Read first, then modify.
 - Prefer editing existing files over creating new ones.
@@ -59,7 +72,129 @@ Do NOT restate what the user said — just do it.
 Skip filler words, preamble, and transitions.
 Focus output on: decisions needing user input, key findings, errors or blockers.
 Use tables for structured data.
+Tables MUST use `|`-pipe markdown form (`| col1 | col2 |` with `|---|---|` separator). NEVER pre-draw tables with Unicode box-drawing characters (┌ ─ ┐ │ ├ ┼ ┤ └ ┴ ┘) — the renderer relies on the `|` form to detect the table and re-flow it for narrow terminals; pre-drawn box tables overflow on small screens and break alignment.
 Match the user's language. If the user writes in Chinese, respond in Chinese. If in English, respond in English.
+
+## CHINESE CODE SUPPORT:
+When working with Chinese codebases:
+- Chinese comments (单行注释 //中文, 多行注释 /* 中文 */) should be understood and preserved.
+- Chinese variable names (e.g., 用户名, 订单列表) are valid identifiers — treat them like any other symbol.
+- Pinyin variable names (e.g., yonghuMing, dingdanList) are common in legacy code — recognize them as meaningful.
+- Chinese string literals (e.g., 欢迎, 错误) should be handled correctly in searches and replacements.
+- When searching for Chinese content, use Unicode-aware patterns. The grep tool supports Chinese regex.
+- In code generation, prefer English identifiers for new code, but preserve existing Chinese naming conventions.
+- Chinese documentation comments (/** 中文注释 */) should be treated as first-class documentation.
+- Support mixed Chinese-English content in code (common in Chinese developer workflows).
 
 ## CONTEXT:
 The system will automatically compress prior messages as context fills up. Your conversation is not limited by the context window. After compression, do NOT assume prior tool results are still available. Re-read files and re-check state before continuing.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lock the bash-chunking guidance into the prompt. 5-7 atomgr datalog
+    /// (build 942b615) showed weak models burn 5-8 turns on what should be
+    /// a single `&&`-chained bash call. If a future refactor accidentally
+    /// drops this paragraph, this test catches it.
+    #[test]
+    fn unified_prompt_includes_bash_chunking_guidance() {
+        let p = build_rules();
+        assert!(
+            p.contains("chain dependent shell steps"),
+            "TOOLS section must keep the chunking principle"
+        );
+        assert!(
+            p.contains("&&") && p.contains(";"),
+            "must show the chain operators the model should use"
+        );
+        assert!(
+            p.contains("ONE bash call"),
+            "must call out the unit of chunking"
+        );
+    }
+
+    /// Lock the parallel-mandate guidance. 5-7 atomgr datalog (build 2e6621f)
+    /// 24 turn / 24 tool calls = 1.0 tool/turn average — model burns turns
+    /// on independent reads/greps that should fly in parallel. The
+    /// guidance teaches MANDATORY parallel scenarios + a concrete WRONG/
+    /// RIGHT contrast so weak models with low directive-uptake can
+    /// pattern-match and chunk correctly.
+    #[test]
+    fn unified_prompt_includes_mandatory_parallel_scenarios() {
+        let p = build_rules();
+        assert!(
+            p.contains("MANDATORY parallel"),
+            "TOOLS section must keep the mandatory-parallel header"
+        );
+        assert!(
+            p.contains("read_file × N"),
+            "must enumerate the read-many scenario"
+        );
+        assert!(
+            p.contains("grep × N"),
+            "must enumerate the search-many scenario"
+        );
+        assert!(
+            p.contains("write_file × N"),
+            "must enumerate the create-many scenario"
+        );
+        assert!(
+            p.contains("WRONG") && p.contains("RIGHT"),
+            "must include the WRONG/RIGHT contrast example"
+        );
+        assert!(
+            p.contains("DEPENDS on step N's output"),
+            "must explain when sequential is actually correct"
+        );
+    }
+
+    /// Tech-stack-neutrality check for the parallel guidance paragraph.
+    /// Other prompt sections may mention concrete commands (`cargo check`,
+    /// `tsc --noEmit`), but the parallel paragraph stays at the generic
+    /// tool-name level (read_file / grep / glob / write_file are
+    /// framework-internal tool names, not tech-stack keywords).
+    #[test]
+    fn parallel_guidance_paragraph_stays_tech_neutral() {
+        let p = build_rules();
+        let start = p
+            .find("MANDATORY parallel")
+            .expect("parallel guidance must exist");
+        // Inspect ~700 chars after the anchor (covers the WRONG/RIGHT
+        // contrast block too).
+        let para_end = (start + 700).min(p.len());
+        let para = &p[start..para_end];
+        for forbidden in &["cargo ", "npm ", "pytest", "go build", "mvn ", "gradle "] {
+            assert!(
+                !para.contains(forbidden),
+                "parallel guidance must stay tech-neutral; found `{}` in:\n{}",
+                forbidden,
+                para
+            );
+        }
+    }
+
+    /// Tech-stack-neutrality check: the chunking paragraph stays generic.
+    /// Other prompt sections still mention concrete commands as
+    /// illustrations (e.g. `cargo check`, `tsc --noEmit`), but the
+    /// chunking paragraph must not bloat the prompt with tool-specific
+    /// examples. Guards against well-meaning future edits that add
+    /// rust/node/python-specific deploy chains.
+    #[test]
+    fn shell_chunking_paragraph_stays_tech_neutral() {
+        let p = build_rules();
+        let start = p
+            .find("chain dependent shell steps")
+            .expect("chunking guidance must exist");
+        // Inspect the paragraph (~500 chars after the anchor).
+        let para_end = (start + 500).min(p.len());
+        let para = &p[start..para_end];
+        for forbidden in &["cargo ", "npm ", "pytest", "go build", "mvn ", "gradle "] {
+            assert!(
+                !para.contains(forbidden),
+                "chunking paragraph must stay tech-neutral; found `{}`",
+                forbidden
+            );
+        }
+    }
+}

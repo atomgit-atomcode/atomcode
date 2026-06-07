@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Skills 扩展 · AtomCode 文档</title>
+<meta name="description" content="Skills 扩展 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="skills">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.1</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Skills 扩展</h1>
+      <p class="lede">Skill 是用户自定义的、可复用的命令,它本质上是一段带 frontmatter 的 markdown 指令,告诉 AI"在这种任务下应该怎么做"。写好 skill 之后,它会像内置斜杠命令一样出现在菜单里,或者被 <code>use_skill</code> 工具按需调用。</p>
+
+      <h2>Skill 能做什么</h2>
+      <ul>
+        <li>把常见工作流固化下来:<em>发布 release、写 changelog、跑回归测试、生成周报…</em></li>
+        <li>封装需要一步一步引导的复杂任务:<em>代码重构流程、bug 根因分析、性能调优</em></li>
+        <li>让模型在特定话题下遵循你定义的步骤和校验规则</li>
+      </ul>
+
+      <h2>Skill 文件结构</h2>
+      <p>一个 skill 通常是一个目录,里面至少包含一个 <code>SKILL.md</code>:</p>
+      <pre><code>my-skills/
+├── release/
+│   └── SKILL.md
+├── write-changelog/
+│   └── SKILL.md
+└── debug-flaky-test/
+    ├── SKILL.md
+    └── references/
+        └── pattern-library.md</code></pre>
+
+      <p><code>SKILL.md</code> 的典型格式:</p>
+      <pre><code>---
+name: release
+description: 发布一个新的 release tag,更新 changelog,并打包
+---
+
+## 何时使用
+
+当用户说"发布新版本"、"出一个 release"、"打 tag" 时使用。
+
+## 步骤
+
+1. 通过 `git log` 确认上次发布以来的改动
+2. 让用户确认 semver 版本号(patch / minor / major)
+3. 更新 `CHANGELOG.md` 中新增条目
+4. 运行 `pnpm build` 并确保构建通过
+5. 创建 git tag `v&lt;version&gt;` 并写上发布说明
+6. 运行 `pnpm publish`(或者对应的发布命令)
+
+## 规则
+
+- 版本号必须符合 semver
+- 不允许绕过测试,任何失败都必须先修复
+- 发布失败时,回滚所有本地 tag 和 changelog 改动</code></pre>
+
+      <h2>Skill 目录</h2>
+      <p>AtomCode 会从若干约定位置加载 skills:</p>
+      <ul>
+        <li><strong>全局</strong>:<code>~/.atomcode/skills/</code></li>
+        <li><strong>项目级</strong>:当前工作目录及其上级的 <code>.atomcode/skills/</code>(如有)</li>
+      </ul>
+      <p>项目级会覆盖同名全局 skill,方便你在不同项目用同一个名字定义不同流程。</p>
+
+      <h2>调用方式</h2>
+
+      <h3>通过斜杠命令</h3>
+      <p>所有加载成功的 skill 会自动出现在斜杠命令补全菜单里:</p>
+      <pre><code>&gt; /release
+&gt; /write-changelog
+&gt; /debug-flaky-test</code></pre>
+
+      <h3>模型自动触发</h3>
+      <p>模型可以主动调用 <code>use_skill</code> 工具,把一个与任务相关的 skill 作为子流程运行。比如你说"帮我发布新版本",即便不显式打 <code>/release</code>,模型也可能自动选择调用这个 skill。</p>
+
+      <h2>写好一个 skill 的几条经验</h2>
+      <ul>
+        <li><strong>description 要具体</strong> —— 它决定了菜单里的描述文本,也是模型判断"要不要用这个 skill"的主要依据。</li>
+        <li><strong>步骤要有序</strong> —— 模型会按顺序读,把强依赖步骤放在前面。</li>
+        <li><strong>明确分支</strong> —— "如果 build 失败则…;否则…",比让模型自己猜要可靠得多。</li>
+        <li><strong>列出红线</strong> —— 绝对不能做的事情放在独立的"规则"小节,提高顺从度。</li>
+        <li><strong>必要时用子文档</strong> —— 把很长的参考资料放到 <code>references/*.md</code>,只在 <code>SKILL.md</code> 里留一句"必要时参见…"。</li>
+      </ul>
+
+      <h2>与项目指令的分工</h2>
+      <table>
+        <thead>
+          <tr><th>场景</th><th>放在</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>始终生效的项目约定(技术栈、代码风格、命令)</td><td><a href="./project-instructions.html"><code>.atomcode.md</code></a></td></tr>
+          <tr><td>某个特定流程、需要被显式触发</td><td>Skill</td></tr>
+          <tr><td>只需要一次的临时要求</td><td>直接写在 prompt 里</td></tr>
+        </tbody>
+      </table>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./basic-usage.html">基本使用</a> —— 回到日常使用场景</li>
+        <li><a href="./faq.html">常见问题</a> —— 为什么我的 skill 没出现在菜单里?</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

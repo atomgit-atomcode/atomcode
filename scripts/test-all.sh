@@ -20,14 +20,15 @@ echo ""
 echo -n "Compiling & running all tests... "
 output=$(cargo test -p atomcode-core 2>&1) || true
 
-# Extract compile warnings from the combined output
-warnings=$(echo "$output" | grep -c "warning\[" || true)
+# Extract compile warnings from the combined output. Rustc diagnostics usually
+# start with `warning:`; some tools emit `warning[lint_name]:`.
+warnings=$(echo "$output" | grep -cE "^warning(:|\\[)" || true)
 echo "done (${warnings} warnings)"
 
 if [ "$warnings" -gt 0 ]; then
     echo "## Compile Warnings ($warnings)" >> $REPORT
     echo '```' >> $REPORT
-    echo "$output" | grep "warning\[" >> $REPORT
+    echo "$output" | grep -E "^warning(:|\\[)" >> $REPORT
     echo '```' >> $REPORT
 else
     echo "## Compile Check (0 warnings)" >> $REPORT
