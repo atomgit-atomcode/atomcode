@@ -207,6 +207,16 @@ impl Agent {
     /// One-shot adapter for batch/CI/CodeReview: send one message, auto-answer
     /// Requests per policy, aggregate events into a structured Outcome, then let
     /// the session tear down (so session_end runs).
+    ///
+    /// SUBAGENT NOTE (cooperative cancellation): this future OWNS the child's
+    /// command channel — dropping it closes `cmd_tx`, which tears the session down
+    /// via `recv() == None` BEFORE any in-flight tool can observe a cancel token.
+    /// So a parent that wants its child to stop *cooperatively* on cancel (via
+    /// `.cancel_token(parent.child_token())`) must DETACH this call onto its own
+    /// `tokio::spawn(...).await` (see `testkit::SubAgentTool`): then the parent
+    /// dropping its tool future leaves the spawned run alive, and the cancel TOKEN
+    /// — not channel-close — is what stops the child. Awaiting it directly inside a
+    /// tool that may itself be cancel-dropped degrades to hard teardown instead.
     pub async fn run_to_completion(self, input: impl Into<String>, policy: AutoRespond) -> Outcome {
         let mut handle = self.spawn();
         let _ = handle.commands.send(AgentCommand::SendMessage { text: input.into() });

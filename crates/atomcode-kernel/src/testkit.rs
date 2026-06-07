@@ -929,16 +929,29 @@ impl Tool for SubAgentTool {
         // fall back to its tool-result contents so the child's actual output still
         // flows back up. (`content: outcome.text` per the spec, with this fallback
         // so a tool-only subagent is not silently empty.)
-        let content = if !outcome.text.is_empty() {
+        let is_error = outcome.stop != StopReason::Stopped;
+        let content = if is_error {
+            // A failed child must surface its CAUSE, not an empty errored result.
+            // `Outcome.error` carries the last error message (kernel populates it);
+            // include it + the StopReason so the parent/model sees why the subagent
+            // failed instead of a blank is_error=true blob.
+            format!(
+                "subagent failed ({:?}): {}",
+                outcome.stop,
+                outcome.error.unwrap_or_else(|| "<no error message>".into())
+            )
+        } else if !outcome.text.is_empty() {
             outcome.text
         } else {
+            // Tool-only child (e.g. a probe): fall back to its tool-result contents
+            // so the child's actual output still flows back up.
             outcome.tool_results.iter().map(|r| r.content.clone()).collect::<Vec<_>>().join("\n")
         };
         ToolResult {
             // call_id is set by the kernel after execute returns.
             call_id: String::new(),
             content,
-            is_error: outcome.stop != StopReason::Stopped,
+            is_error,
         }
     }
 }
