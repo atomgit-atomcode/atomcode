@@ -33,7 +33,7 @@ async fn neutral_turn_runs_without_persona_or_middleware() {
         match ev {
             AgentEvent::ToolResult { result } if result.content.contains("echo: ") => echoed = true,
             AgentEvent::Request { .. } => requested = true,
-            AgentEvent::TurnComplete => { completed = true; break; }
+            AgentEvent::TurnComplete { .. } => { completed = true; break; }
             _ => {}
         }
     }
@@ -75,7 +75,7 @@ async fn approval_middleware_gates_risky_tool_via_id_roundtrip() {
                 commands.send(AgentCommand::Respond { id, value: serde_json::json!({"decision": "allow"}) }).unwrap();
             }
             AgentEvent::ToolResult { result } if result.content.contains("wrote: ") => wrote = true,
-            AgentEvent::TurnComplete => break,
+            AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }
     }
@@ -154,7 +154,7 @@ async fn lifecycle_hook_injects_and_continues_loop() {
         match ev {
             AgentEvent::TurnStarted => turn_started = true,
             AgentEvent::ToolResult { result } if result.content.contains("echo: ") => echoed = true,
-            AgentEvent::TurnComplete => { completed = true; break; }
+            AgentEvent::TurnComplete { .. } => { completed = true; break; }
             _ => {}
         }
     }
@@ -191,7 +191,7 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
     handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
 
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete) {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
         }
     }
@@ -245,7 +245,7 @@ async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Usage(m) => usage_utils.push(m.utilization),
-            AgentEvent::TurnComplete => break,
+            AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }
     }
@@ -254,7 +254,7 @@ async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Usage(m) => usage_utils.push(m.utilization),
-            AgentEvent::TurnComplete => break,
+            AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }
     }
@@ -314,7 +314,7 @@ async fn round_budget_projected_to_llm_and_hard_capped() {
         match ev {
             AgentEvent::Usage(m) => rounds_seen.push(m.round),
             AgentEvent::Error { message } if message.contains("max rounds") => capped = true,
-            AgentEvent::TurnComplete => break,
+            AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }
     }
@@ -356,7 +356,7 @@ async fn on_model_response_can_transform_response_into_storage() {
     handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
 
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete) {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
         }
     }
@@ -406,7 +406,7 @@ async fn dropping_tool_calls_in_on_model_response_prevents_execution() {
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::ToolStarted { .. } | AgentEvent::ToolResult { .. } => executed = true,
-            AgentEvent::TurnComplete => { completed = true; break; }
+            AgentEvent::TurnComplete { .. } => { completed = true; break; }
             _ => {}
         }
     }
@@ -440,7 +440,7 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::ToolResult { result } => echoed = result.content,
-                AgentEvent::TurnComplete => break,
+                AgentEvent::TurnComplete { .. } => break,
                 _ => {}
             }
         }
@@ -473,7 +473,7 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
                         blocked = true;
                     }
                 }
-                AgentEvent::TurnComplete => break,
+                AgentEvent::TurnComplete { .. } => break,
                 _ => {}
             }
         }
@@ -501,7 +501,7 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::ToolResult { result } => content = result.content,
-                AgentEvent::TurnComplete => break,
+                AgentEvent::TurnComplete { .. } => break,
                 _ => {}
             }
         }
@@ -537,7 +537,7 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
             match ev {
                 AgentEvent::Request { kind, .. } if kind == "approval" => asked += 1,
                 AgentEvent::ToolResult { result } if result.content.starts_with("ran:") => ran = true,
-                AgentEvent::TurnComplete => break,
+                AgentEvent::TurnComplete { .. } => break,
                 _ => {}
             }
         }
@@ -579,7 +579,7 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
                         .unwrap();
                 }
                 AgentEvent::ToolResult { result } if result.content.starts_with("ran:") => ran += 1,
-                AgentEvent::TurnComplete => {
+                AgentEvent::TurnComplete { .. } => {
                     turns_done += 1;
                     if turns_done == 1 && !sent_second {
                         sent_second = true;
@@ -618,7 +618,7 @@ async fn user_prompt_submit_can_block_a_prompt() {
         match ev {
             AgentEvent::Error { message } if message.contains("rejected") => rejected = true,
             AgentEvent::TurnStarted => turn_started = true,
-            AgentEvent::TurnComplete => break,
+            AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }
     }

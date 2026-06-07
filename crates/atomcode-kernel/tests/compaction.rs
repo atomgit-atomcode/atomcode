@@ -50,7 +50,7 @@ async fn drive_turn_collect(
     handle.commands.send(AgentCommand::SendMessage { text: text.into() }).unwrap();
     let mut events = Vec::new();
     while let Some(ev) = handle.events.recv().await {
-        let done = matches!(ev, AgentEvent::TurnComplete);
+        let done = matches!(ev, AgentEvent::TurnComplete { .. });
         events.push(ev);
         if done {
             break;
@@ -572,7 +572,7 @@ async fn mid_turn_snapshot_is_queued_and_delivered_after_turn() {
     let mut snapshot = None;
     while let Some(ev) = handle.events.recv().await {
         match ev {
-            AgentEvent::TurnComplete => saw_turn_complete = true,
+            AgentEvent::TurnComplete { .. } => saw_turn_complete = true,
             AgentEvent::Snapshot { snapshot: s } => {
                 snapshot = Some(s);
                 break;
@@ -644,7 +644,7 @@ async fn mid_turn_send_message_runs_after_current_turn() {
     // would ever arrive and this would hang.
     let mut completes = 0;
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete) {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
             completes += 1;
             if completes == 2 {
                 break;

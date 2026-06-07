@@ -32,7 +32,7 @@ async fn provider_open_error_surfaces_and_fails_turn() {
         match ev {
             AgentEvent::Error { message } => error_msg = Some(message),
             AgentEvent::TextDelta(_) => got_text = true,
-            AgentEvent::TurnComplete => {
+            AgentEvent::TurnComplete { .. } => {
                 completed = true;
                 break;
             }
@@ -80,7 +80,7 @@ async fn mid_stream_error_surfaces_and_fails_turn() {
     while let Some(ev) = events.recv().await {
         match ev {
             AgentEvent::Error { message } => error_msg = Some(message),
-            AgentEvent::TurnComplete => {
+            AgentEvent::TurnComplete { .. } => {
                 complete_count += 1;
                 break;
             }
@@ -125,7 +125,7 @@ async fn reasoning_is_emitted() {
     while let Some(ev) = events.recv().await {
         match ev {
             AgentEvent::Reasoning(t) => reasoning = Some(t),
-            AgentEvent::TurnComplete => break,
+            AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }
     }
@@ -157,7 +157,7 @@ async fn truncated_done_emits_warning() {
     while let Some(ev) = events.recv().await {
         match ev {
             AgentEvent::Warning(w) => warning = Some(w),
-            AgentEvent::TurnComplete => {
+            AgentEvent::TurnComplete { .. } => {
                 completed = true;
                 break;
             }

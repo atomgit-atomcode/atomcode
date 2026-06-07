@@ -57,8 +57,8 @@ async fn main() {
                 println!("[{kind} for {}]", payload["tool"]);
                 commands.send(AgentCommand::Respond { id, value: serde_json::json!({"decision": "allow"}) }).unwrap();
             }
-            AgentEvent::TurnComplete => {
-                println!("\n[turn complete]");
+            AgentEvent::TurnComplete { reason } => {
+                println!("\n[turn complete: {reason:?}]");
                 break;
             }
             _ => {}

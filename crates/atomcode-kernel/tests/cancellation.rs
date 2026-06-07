@@ -109,7 +109,7 @@ async fn cancel_between_tools_backfills_and_ends() {
     handle.commands.send(AgentCommand::SendMessage { text: "do two things".into() }).unwrap();
     let mut events: Vec<AgentEvent> = Vec::new();
     while let Some(ev) = handle.events.recv().await {
-        let stop = matches!(ev, AgentEvent::TurnComplete);
+        let stop = matches!(ev, AgentEvent::TurnComplete { .. });
         events.push(ev);
         if stop {
             break;
@@ -122,7 +122,7 @@ async fn cancel_between_tools_backfills_and_ends() {
         .position(|e| matches!(e, AgentEvent::Cancelled))
         .expect("AgentEvent::Cancelled must be emitted on a cancelled turn");
     assert!(
-        matches!(events.get(cancelled_idx + 1), Some(AgentEvent::TurnComplete)),
+        matches!(events.get(cancelled_idx + 1), Some(AgentEvent::TurnComplete { .. })),
         "TurnComplete must immediately follow Cancelled; got {events:?}"
     );
 
@@ -138,7 +138,7 @@ async fn cancel_between_tools_backfills_and_ends() {
     // a matching tool_result.
     handle.commands.send(AgentCommand::SendMessage { text: "again".into() }).unwrap();
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete) {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
         }
     }
@@ -207,7 +207,7 @@ async fn cancel_command_ends_turn() {
                 }
             }
             AgentEvent::Cancelled => cancelled = true,
-            AgentEvent::TurnComplete => {
+            AgentEvent::TurnComplete { .. } => {
                 completed = true;
                 break;
             }

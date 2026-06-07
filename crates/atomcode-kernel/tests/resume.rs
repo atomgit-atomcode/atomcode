@@ -89,7 +89,7 @@ fn resumed_agent(provider: Arc<RecordingProvider>, snapshot: SessionSnapshot) ->
 async fn drive_one_turn(handle: &mut AgentHandle, text: &str) {
     handle.commands.send(AgentCommand::SendMessage { text: text.into() }).unwrap();
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete) {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
         }
     }
@@ -225,7 +225,7 @@ async fn unsupported_snapshot_version_errors_and_starts_empty() {
             AgentEvent::Error { message } if message.contains("unsupported snapshot version 9999") => {
                 errored = true;
             }
-            AgentEvent::TurnComplete => break,
+            AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }
     }

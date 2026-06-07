@@ -79,7 +79,7 @@ async fn stream_timeout_fails_turn_cleanly() {
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::Error { message } => error_msg = Some(message),
-                AgentEvent::TurnComplete => {
+                AgentEvent::TurnComplete { .. } => {
                     completed = true;
                     break;
                 }
@@ -150,7 +150,7 @@ async fn request_timeout_degrades_to_null_and_unblocks_turn() {
                 // Deliberately do NOT respond — model a crashed/silent driver.
                 AgentEvent::Request { .. } => saw_request = true,
                 AgentEvent::ToolResult { result } => blocked_result = Some(result.content),
-                AgentEvent::TurnComplete => {
+                AgentEvent::TurnComplete { .. } => {
                     completed = true;
                     break;
                 }
@@ -202,7 +202,7 @@ async fn no_timeout_by_default_unchanged() {
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::TextDelta(t) => text.push_str(&t),
-                AgentEvent::TurnComplete => {
+                AgentEvent::TurnComplete { .. } => {
                     completed = true;
                     break;
                 }

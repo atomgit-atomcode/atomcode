@@ -26,7 +26,7 @@ async fn drive_collect_errors(handle: &mut atomcode_kernel::agent::AgentHandle, 
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Error { message } => errors.push(message),
-            AgentEvent::TurnComplete => break,
+            AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }
     }
@@ -92,7 +92,7 @@ async fn pre_request_hooks_compose() {
 
     handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete) {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
         }
     }
@@ -172,7 +172,7 @@ async fn turn_end_first_some_wins() {
 
     handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete) {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
         }
     }
