@@ -42,7 +42,15 @@ impl Tool for ListDirTool {
     }
     // listing is non-destructive → risk() defaults to Safe.
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let a: Args = serde_json::from_str(args).unwrap_or(Args { path: None, depth: None });
+        let a: Args = match serde_json::from_str(args) {
+            Ok(a) => a,
+            Err(e) => {
+                return err(format!(
+                    "list_directory: invalid arguments: {e}. Expected \
+                     {{\"path\":\"<dir>\",\"depth\":<int>}} (both optional)."
+                ))
+            }
+        };
         let raw = a.path.unwrap_or_else(|| ".".to_string());
         let root = resolve_path(&raw, &ctx.working_dir);
         let depth = a.depth.unwrap_or(2).min(MAX_DEPTH_CAP);
@@ -138,6 +146,14 @@ mod tests {
         let r = ListDirTool.execute(r#"{"path":"."}"#, &ctx(d.path())).await;
         assert!(r.content.contains("target/ (skipped)"), "{}", r.content);
         assert!(!r.content.contains("junk"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn invalid_json_args_error() {
+        let d = tempfile::tempdir().unwrap();
+        let r = ListDirTool.execute("{not valid json", &ctx(d.path())).await;
+        assert!(r.is_error, "malformed args must surface an error, not silently default");
+        assert!(r.content.contains("invalid arguments"), "{}", r.content);
     }
 
     #[tokio::test]

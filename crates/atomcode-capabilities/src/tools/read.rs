@@ -18,10 +18,39 @@ pub struct ReadFileTool;
 #[derive(Deserialize)]
 struct Args {
     file_path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_usize")]
     offset: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_usize")]
     limit: Option<usize>,
+}
+
+/// Deserialize a usize that weak models may send as a float or a string (`50`, `"50"`,
+/// `50.0`, `"50.0"`) instead of an integer. Absent / null / empty → `None`.
+fn lenient_usize<'de, D>(d: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Num {
+        U(u64),
+        F(f64),
+        S(String),
+    }
+    Ok(match Option::<Num>::deserialize(d)? {
+        None => None,
+        Some(Num::U(n)) => Some(n as usize),
+        Some(Num::F(f)) => Some(f.max(0.0) as usize),
+        Some(Num::S(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                let v = t.parse::<usize>().or_else(|_| t.parse::<f64>().map(|f| f.max(0.0) as usize));
+                Some(v.map_err(serde::de::Error::custom)?)
+            }
+        }
+    })
 }
 
 #[async_trait]
@@ -193,6 +222,20 @@ mod tests {
         let r = ReadFileTool.execute(r#"{"file_path":"nope.txt"}"#, &ctx(d.path())).await;
         assert!(r.is_error);
         assert!(r.content.contains("no such file"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn lenient_offset_limit_accepts_float_strings() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "l1\nl2\nl3\nl4\n").unwrap();
+        // Weak models send "2.0" / "2.0" instead of integers.
+        let r = ReadFileTool
+            .execute(r#"{"file_path":"a.txt","offset":"2.0","limit":"2.0"}"#, &ctx(d.path()))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("     2\tl2"), "{}", r.content);
+        assert!(r.content.contains("     3\tl3"), "{}", r.content);
+        assert!(!r.content.contains("\tl4"), "{}", r.content);
     }
 
     #[tokio::test]
