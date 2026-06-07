@@ -642,16 +642,32 @@ impl RunningAgent {
                         // live stream (driver/UI) AND the stored assistant message
                         // are CONSISTENTLY transformed (e.g. redacted). Closes the
                         // on_model_response leak where un-redacted bytes streamed
-                        // before the post-stream message scrub ran.
+                        // before the post-stream message scrub ran. A hook that CLEARS
+                        // the chunk (`delta.clear()`) suppresses it: an empty post-hook
+                        // chunk is neither accumulated NOR emitted (no spurious empty
+                        // AgentEvent::TextDelta("")).
                         self.hooks.on_text_delta(&mut t).await;
-                        assistant_text.push_str(&t);
-                        self.rt.emit(AgentEvent::TextDelta(t));
+                        if !t.is_empty() {
+                            assistant_text.push_str(&t);
+                            self.rt.emit(AgentEvent::TextDelta(t));
+                        }
                     }
-                    StreamEvent::Reasoning(t) => {
-                        // STORE it on the message (accumulate) AND keep the live
-                        // channel — the kernel no longer drops the reasoning text.
-                        reasoning.push_str(&t);
-                        self.rt.emit(AgentEvent::Reasoning(t));
+                    StreamEvent::Reasoning(mut t) => {
+                        // SYMMETRIC reasoning-channel transform seam (twin of
+                        // on_text_delta): run the hook on EACH chunk BEFORE emit, and
+                        // accumulate the POST-hook bytes — so the live
+                        // AgentEvent::Reasoning stream AND the stored
+                        // Message.reasoning are CONSISTENTLY transformed (e.g.
+                        // redacted), closing the leak where scrubbing only
+                        // on_text_delta left a secret in the reasoning channel. A hook
+                        // that CLEARS the chunk suppresses it: an empty post-hook chunk
+                        // is neither accumulated NOR emitted (no spurious empty
+                        // AgentEvent::Reasoning("")).
+                        self.hooks.on_reasoning_delta(&mut t).await;
+                        if !t.is_empty() {
+                            reasoning.push_str(&t);
+                            self.rt.emit(AgentEvent::Reasoning(t));
+                        }
                     }
                     StreamEvent::ToolCall(c) => pending_calls.push(c),
                     StreamEvent::Usage(u) => usage = u,

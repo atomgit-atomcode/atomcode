@@ -95,6 +95,21 @@ pub trait LifecycleHooks: Send + Sync {
     /// guarantees only per-chunk delivery before emit, nothing about chunk boundaries.
     async fn on_text_delta(&self, _delta: &mut String) {}
 
+    /// Transform EACH streamed REASONING/thinking chunk IN PLACE just before it is
+    /// emitted to the driver AND accumulated into the stored assistant message's
+    /// `reasoning`. The exact symmetric twin of `on_text_delta`, but for the
+    /// reasoning channel: EPHEMERAL per call, yet the post-hook bytes flow to BOTH
+    /// the live `AgentEvent::Reasoning` stream AND the stored `Message.reasoning`
+    /// (claim 29 stores reasoning), so a redaction here is CONSISTENT across the
+    /// live channel and storage — closing the leak where scrubbing only
+    /// `on_text_delta` left a secret in the reasoning channel.
+    ///
+    /// DELIVERY GUARANTEE: a hook sees ONE chunk at a time. Cross-chunk redaction (a
+    /// secret SPLIT across two deltas) is the HOOK's responsibility — it must buffer
+    /// internally, or clear a chunk (`delta.clear()`) to suppress it — the kernel
+    /// guarantees only per-chunk delivery before emit, nothing about chunk boundaries.
+    async fn on_reasoning_delta(&self, _delta: &mut String) {}
+
     /// After the model response: the assistant message (text + tool_calls +
     /// kernel-filled `meta`) is built but not yet stored. Observe or TRANSFORM it —
     /// including dropping/rewriting `tool_calls`, which the kernel HONORS.
@@ -144,6 +159,10 @@ impl LifecycleHooks for NoopHooks {}
 /// - `on_text_delta`: run ALL in registration order; each TRANSFORMS the streamed
 ///   chunk in turn (a later hook sees the earlier hook's rewrite), then the
 ///   post-chain bytes are emitted AND accumulated.
+/// - `on_reasoning_delta`: run ALL in registration order; each TRANSFORMS the
+///   streamed reasoning chunk in turn (a later hook sees the earlier hook's
+///   rewrite), then the post-chain bytes are emitted AND accumulated (symmetric to
+///   `on_text_delta`, on the reasoning channel).
 /// - `on_model_response`: run ALL in registration order; each TRANSFORMS the
 ///   response message in turn (e.g. redaction then truncation compose; a later
 ///   hook sees the earlier hook's rewrite).
@@ -213,6 +232,12 @@ impl LifecycleHooks for HookChain {
     async fn on_text_delta(&self, delta: &mut String) {
         for h in &self.hooks {
             h.on_text_delta(delta).await;
+        }
+    }
+
+    async fn on_reasoning_delta(&self, delta: &mut String) {
+        for h in &self.hooks {
+            h.on_reasoning_delta(delta).await;
         }
     }
 

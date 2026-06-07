@@ -176,7 +176,11 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
             StreamEvent::ToolCall(ToolCall { id: "b".into(), name: "does_not_exist".into(), arguments: "{}".into() }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::Reasoning("thinking".into()),
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let recorder = Arc::new(RecorderHook::new());
@@ -201,8 +205,8 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
     let fired = log.lock().unwrap().clone();
     for point in [
         "session_start", "user_prompt_submit", "turn_start", "pre_request",
-        "on_request", "on_text_delta", "on_model_response", "on_error", "turn_end",
-        "session_end",
+        "on_request", "on_text_delta", "on_reasoning_delta", "on_model_response",
+        "on_error", "turn_end", "session_end",
     ] {
         assert!(fired.contains(&point.to_string()), "hook '{point}' was never called; fired = {fired:?}");
     }

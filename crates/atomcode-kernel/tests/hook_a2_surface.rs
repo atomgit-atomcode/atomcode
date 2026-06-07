@@ -4,6 +4,10 @@
 //!   * `on_text_delta` — redaction at the STREAMED-output seam (closes the
 //!     `on_model_response` leak: redaction must reach BOTH the live delta and the
 //!     stored assistant message, not just storage).
+//!   * `on_reasoning_delta` (claim 34) — the symmetric reasoning-channel seam:
+//!     redaction reaches BOTH the live `AgentEvent::Reasoning` stream AND the stored
+//!     `Message.reasoning`, closing the reasoning leak. A cleared delta also emits
+//!     no spurious empty event (the empty-emit guard).
 //!   * `session_start(&mut Conversation, resumed: bool)` — the `resumed` flag lets
 //!     a seed hook SKIP re-injecting on resume (closes the double-seed bug).
 //!   * `on_request` — read-only wire observation AFTER `pre_request` projects, so
@@ -129,6 +133,165 @@ async fn on_text_delta_redacts_streamed_output() {
     );
     // Consistency: stream and storage agree byte-for-byte.
     assert_eq!(streamed, assistant.text, "streamed text and stored text must be identical");
+}
+
+// ── Item 1b: on_reasoning_delta closes the reasoning redaction leak ───────────
+
+/// A hook whose `on_reasoning_delta` scrubs "SECRET" → "[REDACTED]" in each
+/// streamed reasoning chunk BEFORE it is emitted live and accumulated into the
+/// stored `Message.reasoning`. The symmetric twin of `DeltaRedactHook`.
+struct ReasoningRedactHook;
+
+#[async_trait]
+impl LifecycleHooks for ReasoningRedactHook {
+    async fn on_reasoning_delta(&self, delta: &mut String) {
+        if delta.contains("SECRET") {
+            *delta = delta.replace("SECRET", "[REDACTED]");
+        }
+    }
+}
+
+// CLAIM 34a: a redaction hook at the on_reasoning_delta seam scrubs the secret out
+// of BOTH the live AgentEvent::Reasoning stream AND the stored Message.reasoning —
+// proving the reasoning leak (un-redacted thinking streaming live AND persisted on
+// the message) is closed on live + storage, symmetric to on_text_delta.
+#[tokio::test]
+async fn on_reasoning_delta_redacts_reasoning() {
+    let reg = ToolRegistry::new();
+    // The provider streams reasoning containing the secret (in two chunks, one of
+    // which carries the secret token whole), plus some normal visible text.
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::Reasoning("thinking before ".into()),
+        StreamEvent::Reasoning("SECRET plan ".into()),
+        StreamEvent::TextDelta("the answer".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[]))
+        .persona(PERSONA)
+        .hook(Arc::new(ReasoningRedactHook))
+        .build()
+        .spawn();
+
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+
+    // Collect the LIVE streamed reasoning.
+    let mut streamed_reasoning = String::new();
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::Reasoning(t) => streamed_reasoning.push_str(&t),
+            AgentEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+
+    // (a) LIVE reasoning stream is redacted: the secret never reached the driver/UI.
+    assert!(
+        !streamed_reasoning.contains("SECRET"),
+        "the live streamed reasoning must NOT contain the secret; got {streamed_reasoning:?}"
+    );
+    assert!(
+        streamed_reasoning.contains("[REDACTED]"),
+        "the live streamed reasoning must show the redaction; got {streamed_reasoning:?}"
+    );
+
+    // (b) STORAGE is redacted too: the stored Message.reasoning shows the redaction,
+    // not the secret.
+    let snapshot = capture_snapshot(&mut handle).await;
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let assistant = snapshot
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Assistant)
+        .expect("an assistant message must be stored");
+    let stored_reasoning = assistant
+        .reasoning
+        .as_deref()
+        .expect("the assistant message must carry stored reasoning");
+    assert!(
+        !stored_reasoning.contains("SECRET"),
+        "stored Message.reasoning must NOT contain the secret; got {stored_reasoning:?}"
+    );
+    assert!(
+        stored_reasoning.contains("[REDACTED]"),
+        "stored Message.reasoning must show the redaction; got {stored_reasoning:?}"
+    );
+    // Consistency: the live reasoning stream and stored reasoning agree byte-for-byte.
+    assert_eq!(
+        streamed_reasoning, stored_reasoning,
+        "streamed reasoning and stored reasoning must be identical"
+    );
+}
+
+// ── Item 1c: a cleared delta emits no spurious empty event ────────────────────
+
+/// A hook that CLEARS every text delta — suppressing all visible output.
+struct ClearTextDeltaHook;
+
+#[async_trait]
+impl LifecycleHooks for ClearTextDeltaHook {
+    async fn on_text_delta(&self, delta: &mut String) {
+        delta.clear();
+    }
+}
+
+// CLAIM 34b: a hook that clears each TextDelta to suppress it must NOT cause the
+// kernel to emit spurious empty AgentEvent::TextDelta("") events — a cleared
+// (empty) post-hook chunk is neither accumulated nor emitted.
+#[tokio::test]
+async fn cleared_delta_emits_no_event() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::TextDelta("a".into()),
+        StreamEvent::TextDelta("b".into()),
+        StreamEvent::TextDelta("c".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[]))
+        .persona(PERSONA)
+        .hook(Arc::new(ClearTextDeltaHook))
+        .build()
+        .spawn();
+
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+
+    // ZERO AgentEvent::TextDelta events must reach the driver (each chunk was
+    // cleared → suppressed, not emitted as "").
+    let mut text_delta_events = 0usize;
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::TextDelta(_) => text_delta_events += 1,
+            AgentEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+
+    // Storage agrees: no assistant text accumulated either.
+    let snapshot = capture_snapshot(&mut handle).await;
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    assert_eq!(
+        text_delta_events, 0,
+        "a cleared delta must emit NO AgentEvent::TextDelta event; got {text_delta_events}"
+    );
+    let assistant = snapshot
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Assistant)
+        .expect("an assistant message must be stored");
+    assert_eq!(
+        assistant.text, "",
+        "cleared deltas must not accumulate into stored assistant text; got {:?}",
+        assistant.text
+    );
 }
 
 // ── Item 2: session_start(resumed) lets a seed hook skip on resume ───────────
@@ -352,6 +515,14 @@ async fn noop_and_empty_hookchain_have_new_methods_as_noop() {
     let mut delta2 = "also untouched".to_string();
     chain.on_text_delta(&mut delta2).await;
     assert_eq!(delta2, "also untouched", "empty HookChain::on_text_delta must not mutate");
+
+    // on_reasoning_delta: no-op leaves the reasoning delta unchanged (symmetric).
+    let mut rdelta = "reasoning SECRET".to_string();
+    NoopHooks.on_reasoning_delta(&mut rdelta).await;
+    assert_eq!(rdelta, "reasoning SECRET", "NoopHooks::on_reasoning_delta must not mutate");
+    let mut rdelta2 = "also reasoning".to_string();
+    chain.on_reasoning_delta(&mut rdelta2).await;
+    assert_eq!(rdelta2, "also reasoning", "empty HookChain::on_reasoning_delta must not mutate");
 
     // session_start(resumed): no-op leaves the conversation unchanged either way.
     let mut convo = Conversation::new();

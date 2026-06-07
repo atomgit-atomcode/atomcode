@@ -85,7 +85,11 @@ pub enum AgentEvent {
     /// any dangling tool_calls have been backfilled with synthetic results so
     /// the conversation stays API-valid.
     Cancelled,
-    /// Model thinking/reasoning channel (perception side; not stored on Message).
+    /// Model thinking/reasoning channel. The reasoning is BOTH emitted live here
+    /// (perception side) AND accumulated + stored on `Message.reasoning` (claim 29),
+    /// and is transformable per-chunk via `LifecycleHooks::on_reasoning_delta`
+    /// (symmetric to visible text via `on_text_delta`) — so a redaction reaches both
+    /// the live channel and storage consistently.
     Reasoning(String),
     /// Non-fatal advisory (e.g. a truncated response). The turn still completes.
     Warning(String),

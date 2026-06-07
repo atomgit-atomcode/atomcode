@@ -453,6 +453,7 @@ impl LifecycleHooks for RecorderHook {
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) { self.record("pre_request"); }
     async fn on_request(&self, _messages: &[Message], _tools: &[ToolDef], _options: &ChatOptions, _ctx: &TurnCtx) { self.record("on_request"); }
     async fn on_text_delta(&self, _delta: &mut String) { self.record("on_text_delta"); }
+    async fn on_reasoning_delta(&self, _delta: &mut String) { self.record("on_reasoning_delta"); }
     async fn on_model_response(&self, _response: &mut Message) { self.record("on_model_response"); }
     async fn turn_end(&self, _convo: &Conversation) -> Option<String> { self.record("turn_end"); None }
     async fn on_error(&self, _error: &str) { self.record("on_error"); }
