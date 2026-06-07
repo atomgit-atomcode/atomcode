@@ -500,7 +500,11 @@ struct Cli {
     /// --dangerously-skip-permissions. The TUI shows a red ⚠ BYPASS
     /// badge while active. Use in CI/CD, eval harnesses, or when you
     /// trust the agent's built-in safety constraints.
-    #[arg(short = 'y', long = "dangerously-skip-permissions", default_value_t = false)]
+    #[arg(
+        short = 'y',
+        long = "dangerously-skip-permissions",
+        default_value_t = false
+    )]
     pub dangerously_skip_permissions: bool,
 }
 
@@ -770,7 +774,9 @@ async fn async_main() {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::Globalization::CP_UTF8;
-        use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP};
+        use windows_sys::Win32::System::Console::{
+            GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
+        };
         unsafe {
             SetConsoleOutputCP(CP_UTF8);
             SetConsoleCP(CP_UTF8);
@@ -1544,7 +1550,11 @@ async fn run() -> Result<i32> {
             // Capture the assistant's streamed text only when we need to post
             // it back to AtomGit (fixissue). Plain `-p` stays zero-alloc.
             let capture = fixissue_ref.is_some();
-            let (ec, captured) = run_headless(
+            // Don't `?`-propagate here: an error must still fall through to the
+            // telemetry.shutdown() below, otherwise this session's un-drained
+            // mpsc events are lost. Capture the Result and let it bubble up only
+            // *after* the flush.
+            match run_headless(
                 agent_loop,
                 agent_handle,
                 prompt,
@@ -1555,44 +1565,50 @@ async fn run() -> Result<i32> {
                 cli.dangerously_skip_permissions,
                 is_admin,
             )
-            .await?;
-
-            // Post-run side effects for fixissue: only on clean completion
-            // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
-            // On non-zero we leave the issue alone — the user can retry.
-            if let Some(issue_ref) = fixissue_ref {
-                let mut final_exit = ec;
-                if ec == 0 {
-                    if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
-                        match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
-                            Ok(()) => eprintln!(
-                                "[fixissue] ✓ posted summary + applied 'fixed' label to issue #{}",
-                                issue_ref.number
-                            ),
-                            Err(e) => {
+            .await
+            {
+                Err(e) => Err(e),
+                Ok((ec, captured)) => {
+                    // Post-run side effects for fixissue: only on clean completion
+                    // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
+                    // On non-zero we leave the issue alone — the user can retry.
+                    if let Some(issue_ref) = fixissue_ref {
+                        let mut final_exit = ec;
+                        if ec == 0 {
+                            if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
+                                match atomcode_core::atomgit::fixissue::post_completion(
+                                    &issue_ref, &summary,
+                                ) {
+                                    Ok(()) => eprintln!(
+                                        "[fixissue] ✓ posted summary + applied 'fixed' label to issue #{}",
+                                        issue_ref.number
+                                    ),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
+                                            e
+                                        );
+                                        // Signal partial failure so CI/scripts can detect it.
+                                        final_exit = 3;
+                                    }
+                                }
+                            } else {
                                 eprintln!(
-                                    "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
-                                    e
+                                    "[fixissue] agent produced no text; skipping comment + label on issue #{}",
+                                    issue_ref.number
                                 );
-                                // Signal partial failure so CI/scripts can detect it.
-                                final_exit = 3;
                             }
+                        } else {
+                            eprintln!(
+                                "[fixissue] agent exited non-zero ({}); skipping comment + label on issue #{}",
+                                ec, issue_ref.number
+                            );
                         }
+                        Ok::<i32, anyhow::Error>(final_exit)
                     } else {
-                        eprintln!(
-                            "[fixissue] agent produced no text; skipping comment + label on issue #{}",
-                            issue_ref.number
-                        );
+                        Ok::<i32, anyhow::Error>(ec)
                     }
-                } else {
-                    eprintln!(
-                        "[fixissue] agent exited non-zero ({}); skipping comment + label on issue #{}",
-                        ec, issue_ref.number
-                    );
                 }
-                Ok::<i32, anyhow::Error>(final_exit)
-            } else {
-                Ok::<i32, anyhow::Error>(ec)
             }
         } else {
             // Fire-and-forget: spawn a setsid'd subprocess to stage the next
@@ -1628,10 +1644,20 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await?;
-            Ok(0)
+            // Same as the headless arm: don't `?` — a TUI run that ends in an
+            // error must still reach the shutdown/flush below. Ok(()) → exit 0;
+            // the error propagates only after telemetry is drained.
+            match atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
+                Ok(()) => Ok(0),
+                Err(e) => Err(e.into()),
+            }
         };
 
+        // Flush telemetry on EVERY exit path — Ok and Err alike. Both session
+        // arms above return their Result into `exit_code` instead of using `?`,
+        // so an errored TUI/headless run still drains the in-memory mpsc queue
+        // here before the error bubbles up to async_main's exit(1). Without this
+        // the tail of any session that ended in an error was silently dropped.
         telemetry.shutdown(std::time::Duration::from_millis(500)).await;
         exit_code
     })
@@ -2584,9 +2610,7 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
                 if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
                     println!(
                         "\n{}",
-                        atomcode_core::i18n::t(
-                            atomcode_core::i18n::Msg::UpgradePackageManaged
-                        )
+                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
                     );
                 } else {
                     eprintln!("\nupgrade failed: {}", msg);
@@ -2772,7 +2796,10 @@ fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
         .map(|s| s.to_string())
         .or_else(|| info.payload().downcast_ref::<String>().cloned())
         .unwrap_or_default();
-    let thread = std::thread::current().name().unwrap_or("unknown").to_string();
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or("unknown")
+        .to_string();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
