@@ -416,15 +416,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // Public API for commands
   public async sendMessage(text: string) {
-    const sid = this._focusedPanelId;
+    let sid = this._focusedPanelId;
     if (!sid) {
+      // No open panel — start a fresh conversation/tab first. newConversation
+      // sets _focusedPanelId to the new session.
       await this.newConversation();
-      const newSid = this._focusedPanelId;
-      if (!newSid) return;
-      this._postOrQueueToPanel(newSid, { type: 'userMessage', text });
-      return;
+      sid = this._focusedPanelId;
+      if (!sid) return;
     }
-    this._postMessageToPanel(sid, { type: 'userMessage', text });
+    // Echo the message into the (possibly freshly-opened) panel via the
+    // queueing path — a brand-new tab's webview hasn't sent `ready` yet, so a
+    // direct post would be dropped — then actually run the turn. Without
+    // _handleSend the text would only render as a bubble and never reach the
+    // backend. Mirrors sendEditorCommandMessage.
+    this._postOrQueueToPanel(sid, { type: 'userMessage', text });
+    await this._handleSend(text);
   }
 
   public async sendEditorCommandMessage(text: string) {

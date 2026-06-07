@@ -800,24 +800,16 @@ impl TurnRunner {
         //    see clean prose, not raw text_buf with leaked XML
         //    tool_call blocks.
         if tool_calls_buf.is_empty() {
-            // Trigger post-turn hooks for Responded
+            // Trigger post-turn hooks for Responded, THEN emit telemetry.
+            // Order is load-bearing: tel_return! tracks the LlmChat event and
+            // returns, so any code after it never runs — the hooks must come
+            // first. Emitting via tel_return! (not a bare `return`) is what
+            // restores the LlmChat event for text-only turns; the previous bare
+            // return silently dropped it, so every text-only turn went
+            // unreported. visible_text_buf (filtered) is used so downstream
+            // consumers (datalog `log_text`, ATLAS plan extraction, telemetry)
+            // see clean prose, not raw text_buf with leaked <tool_call> XML.
             self.trigger_post_turn_hooks("Responded").await;
-            
-            return TurnResult::Responded {
-                text: visible_text_buf,
-                tokens: total_tokens,
-                truncated: was_truncated,
-            };
-        }
-
-        // 5. If no tool calls, we're done — LLM produced text only.
-        //    Use the FILTERED accumulator so downstream consumers
-        //    (datalog `log_text`, ATLAS plan extraction, telemetry)
-        //    see clean prose, not raw text_buf with leaked XML
-        //    tool_call blocks. Earlier bug: 5-7 atomgr datalog
-        //    20-14-23 Turn 5 logged `### 3. 传输层安全<tool_call>grep
-        //    <arg_key>...` because Responded.text was raw.
-        if tool_calls_buf.is_empty() {
             tel_return!(
                 TurnResult::Responded {
                     text: visible_text_buf,
