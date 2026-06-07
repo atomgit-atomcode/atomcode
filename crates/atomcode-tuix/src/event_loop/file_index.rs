@@ -6,8 +6,19 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
+
+/// How long a completed full-tree index stays "fresh" before the next
+/// `filter()` call kicks a background re-walk. This is what lets files
+/// created mid-session (`touch new.rs`, then `@new`) show up without a
+/// `/cd` or restart. The stale index keeps serving until the re-walk
+/// lands, so the popup never blocks or flickers. Kept short enough to
+/// feel live, long enough that rapid typing doesn't thrash the walker
+/// (at most one re-walk per interval — `built_at` only advances when a
+/// walk completes).
+const STALE_TTL: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
 // Token detection
@@ -111,6 +122,10 @@ pub struct FileIndex {
     /// True once the initial background build has been kicked off, so we
     /// don't spawn a second thread while the first is still running.
     building: RefCell<bool>,
+    /// When the currently-cached *full* index finished walking. `None`
+    /// until the first full walk completes (the shallow warm-up doesn't
+    /// count). Drives the TTL-based background refresh in `maybe_refresh`.
+    built_at: RefCell<Option<Instant>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +144,7 @@ impl FileIndex {
             entries: RefCell::new(None),
             pending: RefCell::new(None),
             building: RefCell::new(false),
+            built_at: RefCell::new(None),
         }
     }
 
@@ -179,32 +195,13 @@ impl FileIndex {
     pub fn filter(&self, scope_dir: &str, filter: &str) -> Vec<Entry> {
         // Kick off background build on first call if not already building/cached.
         self.build_async();
+        // Pick up a completed walk (initial or TTL refresh) if one landed.
+        self.drain_pending();
+        // If the cache has aged past STALE_TTL, kick a background re-walk so
+        // mid-session file creations become discoverable. Serves stale
+        // entries until the fresh walk lands (drained on a later keystroke).
+        self.maybe_refresh();
 
-        // Drain background walk result if available.
-        // Note: entries is never None after build_async (it has a shallow
-        // snapshot), so we check pending instead.
-        if self.pending.borrow().is_some() {
-            let mut pending = self.pending.borrow_mut();
-            if let Some(rx) = pending.as_mut() {
-                match rx.try_recv() {
-                    Ok(walked) => {
-                        *self.entries.borrow_mut() = Some(walked);
-                        *self.building.borrow_mut() = false;
-                        *pending = None;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        // Background walk still in progress — use shallow entries.
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        // Thread panicked or dropped — fall back to synchronous walk.
-                        let walked = Self::walk_inner(self.root.borrow().clone());
-                        *self.entries.borrow_mut() = Some(walked);
-                        *self.building.borrow_mut() = false;
-                        *pending = None;
-                    }
-                }
-            }
-        }
         // entries is guaranteed to be Some (shallow at minimum), but be defensive.
         let entries = self.entries.borrow();
         let entries = match entries.as_ref() {
@@ -250,6 +247,58 @@ impl FileIndex {
 
         matched.truncate(30);
         matched
+    }
+
+    /// Non-blocking drain of the background walk receiver. When a walk has
+    /// completed, swap its result into the cache, stamp `built_at`, and clear
+    /// the in-flight markers. Shared by the initial build and TTL refreshes.
+    fn drain_pending(&self) {
+        if self.pending.borrow().is_none() {
+            return;
+        }
+        let mut pending = self.pending.borrow_mut();
+        let Some(rx) = pending.as_mut() else { return };
+        match rx.try_recv() {
+            Ok(walked) => {
+                *self.entries.borrow_mut() = Some(walked);
+                *self.built_at.borrow_mut() = Some(Instant::now());
+                *self.building.borrow_mut() = false;
+                *pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Background walk still in progress — keep serving the cache.
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Thread panicked or dropped — fall back to a synchronous walk.
+                let walked = Self::walk_inner(self.root.borrow().clone());
+                *self.entries.borrow_mut() = Some(walked);
+                *self.built_at.borrow_mut() = Some(Instant::now());
+                *self.building.borrow_mut() = false;
+                *pending = None;
+            }
+        }
+    }
+
+    /// Spawn a background re-walk when the cached full index has aged past
+    /// `STALE_TTL` and nothing is already building. The stale cache keeps
+    /// serving until `drain_pending` swaps in the fresh result, so the popup
+    /// never blocks. `built_at == None` means the initial full walk hasn't
+    /// finished yet — `build_async` owns that, so there's nothing to refresh.
+    fn maybe_refresh(&self) {
+        if *self.building.borrow() {
+            return; // a build/refresh is already in flight
+        }
+        let stale = matches!(*self.built_at.borrow(), Some(t) if t.elapsed() >= STALE_TTL);
+        if !stale {
+            return;
+        }
+        *self.building.borrow_mut() = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.pending.borrow_mut() = Some(rx);
+        let root = self.root.borrow().clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::walk_inner(root));
+        });
     }
 
     fn walk_inner(root: PathBuf) -> Vec<Entry> {
@@ -340,6 +389,7 @@ impl FileIndex {
         *self.root.borrow_mut() = new_root;
         *self.entries.borrow_mut() = None;
         *self.building.borrow_mut() = false;
+        *self.built_at.borrow_mut() = None;
     }
 
     /// Test-only: construct an index with hand-built entries, bypassing walk.
@@ -350,7 +400,16 @@ impl FileIndex {
             entries: RefCell::new(Some(entries)),
             pending: RefCell::new(None),
             building: RefCell::new(false),
+            built_at: RefCell::new(None),
         }
+    }
+
+    /// Test-only: backdate the cache so the next `filter()` treats it as stale
+    /// and triggers a TTL refresh — without sleeping for the real TTL.
+    #[cfg(test)]
+    fn mark_stale(&self) {
+        *self.built_at.borrow_mut() =
+            Instant::now().checked_sub(STALE_TTL + Duration::from_secs(1));
     }
 }
 
@@ -706,6 +765,42 @@ mod tests {
         // completes.
         let result = filter_walk(&idx, "", "");
         assert!(!result.is_empty());
+    }
+
+    // Regression: a file created mid-session must become discoverable via the
+    // TTL refresh, without a `/cd` or restart (the v1 "built once per session"
+    // limitation). The cache serves stale until the staleness window elapses,
+    // then a background re-walk picks up the new file.
+    #[test]
+    fn stale_cache_refresh_picks_up_new_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("first.txt"), "x");
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+
+        // Initial full walk sees first.txt only.
+        let r1 = filter_walk(&idx, "", "");
+        let n1: Vec<&str> = r1.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(n1.contains(&"first.txt"), "got: {:?}", n1);
+        assert!(!n1.contains(&"second.txt"), "got: {:?}", n1);
+
+        // Create a file after the index was built.
+        write_file(&tmp.path().join("second.txt"), "y");
+
+        // While the cache is still fresh, the new file stays hidden.
+        let r2 = idx.filter("", "");
+        assert!(
+            !r2.iter().any(|e| e.rel_path == "second.txt"),
+            "fresh cache should not yet show the new file: {:?}",
+            r2.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>()
+        );
+
+        // Once stale, the next filter() kicks a background re-walk that
+        // surfaces the new file.
+        idx.mark_stale();
+        let r3 = filter_walk(&idx, "", "");
+        let n3: Vec<&str> = r3.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(n3.contains(&"second.txt"), "TTL refresh should surface new file: {:?}", n3);
+        assert!(n3.contains(&"first.txt"), "got: {:?}", n3);
     }
 
     #[test]
