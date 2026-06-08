@@ -82,6 +82,10 @@ pub enum AgentEvent {
         arguments: String,
     },
     ToolStarted { call: ToolCall },
+    /// Live progress from a long-running tool MID-execution (e.g. a sub-agent tool
+    /// reporting a per-task update). `call_id` is the executing call's id; `message` is
+    /// the tool's free-form status. Purely observational — a driver may render or ignore it.
+    ToolProgress { call_id: String, message: String },
     ToolResult { result: ToolResult },
     /// Generic middleware ↔ driver round-trip. Kernel is agnostic to kind/payload.
     Request { id: RequestId, kind: String, payload: serde_json::Value },

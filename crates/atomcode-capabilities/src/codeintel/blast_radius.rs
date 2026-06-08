@@ -119,7 +119,7 @@ mod tests {
         std::fs::write(d.path().join("core.rs"), "pub fn core_fn() {}\n").unwrap();
         std::fs::write(d.path().join("user.rs"), "fn u() { core_fn(); }\n").unwrap();
         let tool = BlastRadiusTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new() };
+        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
         let r = tool.execute(r#"{"file":"core.rs"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("Blast radius for core.rs"), "{}", r.content);
@@ -132,7 +132,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn a() {}\n").unwrap();
         let tool = BlastRadiusTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new() };
+        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
         let r = tool.execute(r#"{"file":"ghost.rs"}"#, &ctx).await;
         assert!(r.is_error);
         assert!(r.content.contains("not found in the code graph"), "{}", r.content);

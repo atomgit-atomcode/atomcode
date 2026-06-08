@@ -8,7 +8,7 @@ use crate::middleware::ToolMiddleware;
 use crate::provider::{ChatOptions, LlmProvider};
 use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
-use crate::tool::{MountedTools, ToolContext, ToolResult};
+use crate::tool::{MountedTools, ProgressSink, ToolContext, ToolResult};
 use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
@@ -912,6 +912,19 @@ impl RunningAgent {
                                     .clone()
                                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
                                 cancel: cancel.clone(),
+                                // Live progress seam: a tool MAY report mid-execution status,
+                                // tagged with THIS call's id, straight to the driver (e.g. a
+                                // sub-agent tool's per-task progress). noop unless used.
+                                progress: {
+                                    let events = self.rt.events.clone();
+                                    let call_id = call.id.clone();
+                                    ProgressSink::new(std::sync::Arc::new(move |message| {
+                                        let _ = events.send(AgentEvent::ToolProgress {
+                                            call_id: call_id.clone(),
+                                            message,
+                                        });
+                                    }))
+                                },
                             };
                             // INSIDE-EXECUTE backstop: poll cancel while the tool
                             // future runs so a long tool is interrupted mid-flight.

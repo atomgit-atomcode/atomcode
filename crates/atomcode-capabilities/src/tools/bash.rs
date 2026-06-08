@@ -511,7 +511,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new() }
+        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
     }
     fn risk_of(cmd: &str) -> RiskLevel {
         BashTool.risk(&serde_json::json!({ "command": cmd }).to_string())
@@ -607,7 +607,7 @@ mod tests {
     async fn cancel_returns_promptly() {
         let d = tempfile::tempdir().unwrap();
         let token = CancellationToken::new();
-        let cx = ToolContext { working_dir: d.path().to_path_buf(), cancel: token.clone() };
+        let cx = ToolContext { working_dir: d.path().to_path_buf(), cancel: token.clone(), progress: atomcode_kernel::tool::ProgressSink::noop() };
         token.cancel(); // already cancelled → the cancel arm wins immediately
         let r = BashTool.execute(r#"{"command":"sleep 30"}"#, &cx).await;
         assert!(r.is_error, "{}", r.content);

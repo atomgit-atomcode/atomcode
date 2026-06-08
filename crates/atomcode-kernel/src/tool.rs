@@ -83,9 +83,57 @@ pub struct ToolDef {
 /// resource (e.g. a child-process handle that SIGKILLs on drop). A tool that does
 /// neither may leak on cancel, and a side effect already in flight when the future
 /// is dropped is reported to the model as cancelled even though it may have landed.
+/// A live progress channel a long-running tool MAY use to report incremental status to
+/// the DRIVER mid-execution — e.g. a sub-agent tool reporting per-task progress, or a
+/// batch editor reporting per-file. Each [`emit`](ProgressSink::emit) becomes an
+/// `AgentEvent::ToolProgress` tagged with the executing call's id. Cheap to clone; the
+/// `noop()` sink (the DEFAULT, installed when no driver wires one) silently discards, so
+/// a tool can always call `emit` without branching.
+///
+/// NEUTRALITY: the kernel knows nothing about "sub-agents" (those are an L2 composition
+/// — a tool running a child session). This is the GENERIC observability seam such a tool
+/// builds on to surface child/sub-task progress; the kernel only forwards the bytes.
+#[derive(Clone)]
+pub struct ProgressSink {
+    inner: Option<Arc<dyn Fn(String) + Send + Sync>>,
+}
+
+impl ProgressSink {
+    /// A sink that discards (no driver listening). The default.
+    pub fn noop() -> Self {
+        Self { inner: None }
+    }
+    /// A sink backed by `f`. The kernel installs one that forwards to the driver event
+    /// stream, tagging each message with the executing call's id.
+    pub fn new(f: Arc<dyn Fn(String) + Send + Sync>) -> Self {
+        Self { inner: Some(f) }
+    }
+    /// Report incremental progress to the driver. No-op if no driver is listening.
+    pub fn emit(&self, message: impl Into<String>) {
+        if let Some(f) = &self.inner {
+            f(message.into());
+        }
+    }
+}
+
+impl Default for ProgressSink {
+    fn default() -> Self {
+        Self::noop()
+    }
+}
+
+impl std::fmt::Debug for ProgressSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgressSink").field("active", &self.inner.is_some()).finish()
+    }
+}
+
 pub struct ToolContext {
     pub working_dir: PathBuf,
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Live progress channel (see [`ProgressSink`]). Default `noop()` — a tool reports
+    /// progress only if it wants to, and only a driver that cares receives it.
+    pub progress: ProgressSink,
 }
 
 /// A mounted tool. Its `execute` runs with the host process's FULL ambient
@@ -183,6 +231,23 @@ mod tests {
         async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
             ToolResult { call_id: String::new(), content: "ok".into(), is_error: false }
         }
+    }
+
+    #[test]
+    fn progress_noop_sink_is_silent() {
+        ProgressSink::noop().emit("ignored"); // no listener → must not panic
+        ProgressSink::default().emit("also ignored");
+    }
+
+    #[test]
+    fn progress_sink_forwards_each_message() {
+        use std::sync::Mutex;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let c2 = captured.clone();
+        let sink = ProgressSink::new(Arc::new(move |m| c2.lock().unwrap().push(m)));
+        sink.emit("a");
+        sink.emit("b");
+        assert_eq!(*captured.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

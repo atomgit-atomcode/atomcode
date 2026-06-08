@@ -110,7 +110,7 @@ mod tests {
         Arc::new(LspManager::with_registry(r))
     }
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new() }
+        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
     }
 
     #[tokio::test]
