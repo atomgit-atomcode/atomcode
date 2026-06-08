@@ -3,7 +3,7 @@
 // 从累积缓冲里切出完整 SSE 事件（"data: {json}\n\n"），返回事件数组与残块。
 export function parseSseLines(buffer) {
   const parts = buffer.split('\n\n');
-  const rest = parts.pop(); // 末段可能不完整，留到下次
+  const rest = parts.pop() ?? ''; // 末段可能不完整，留到下次；恰好以 \n\n 结尾时为空串而非 undefined
   const events = [];
   for (const block of parts) {
     for (const line of block.split('\n')) {

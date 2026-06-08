@@ -15,6 +15,12 @@ test('parseSseLines 解析完整事件并保留残块', () => {
   assert.equal(rest, 'data: {"type":"text","conte');
 });
 
+test('parseSseLines 缓冲恰好以 \\n\\n 结尾时 rest 为空串(非 undefined)', () => {
+  const { events, rest } = parseSseLines('data: {"type":"text","content":"hi"}\n\n');
+  assert.deepEqual(events, [{ type: 'text', content: 'hi' }]);
+  assert.equal(rest, ''); // 必须是 ''，否则 streamChat 中 buf += rest 会拼出 "undefined…"
+});
+
 test('dispatch 路由到对应 handler', () => {
   const calls = [];
   const h = {
