@@ -22,12 +22,17 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 
+/// Recorded `(role_debug, text)` for each received message, per `chat_stream` call.
+type ReceivedLog = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+/// Recorded `(messages, tools, options)` per `chat_stream` call.
+type CallLog = Arc<Mutex<Vec<(Vec<Message>, Vec<ToolDef>, ChatOptions)>>>;
+
 /// Returns scripted stream events (one Vec per call) and RECORDS the messages it
 /// received on each call, so tests can assert exactly what the LLM saw.
 pub struct MockProvider {
     turns: Mutex<VecDeque<Vec<StreamEvent>>>,
     /// Per chat_stream call: the received messages as (role_debug, text).
-    pub received: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+    pub received: ReceivedLog,
     ctx_window: u32,
 }
 
@@ -123,7 +128,7 @@ impl LlmProvider for ScriptedProvider {
 /// multi-turn sessions.
 pub struct RecordingProvider {
     turns: Mutex<VecDeque<Vec<StreamEvent>>>,
-    calls: Arc<Mutex<Vec<(Vec<Message>, Vec<ToolDef>, ChatOptions)>>>,
+    calls: CallLog,
     ctx_window: u32,
 }
 
@@ -143,7 +148,7 @@ impl RecordingProvider {
     /// the builder so the test can inspect what the LLM saw afterwards. Each entry
     /// is `(messages, tools, options)` — the `.0`/`.1` history/tool-block view is
     /// unchanged; `.2` is the neutral `ChatOptions` that reached the provider.
-    pub fn calls(&self) -> Arc<Mutex<Vec<(Vec<Message>, Vec<ToolDef>, ChatOptions)>>> {
+    pub fn calls(&self) -> CallLog {
         self.calls.clone()
     }
     /// A point-in-time snapshot of every recorded `(messages, tools, options)` call.

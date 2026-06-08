@@ -309,7 +309,7 @@ impl RunningAgent {
         self.cancel_token
             .as_ref()
             .map(|t| t.child_token())
-            .unwrap_or_else(tokio_util::sync::CancellationToken::new)
+            .unwrap_or_default()
     }
     /// Decide whether the AUTO task-boundary trigger should fire for the CURRENT
     /// stored history. Returns `Some(CompactTrigger::Auto{utilization})` iff a
