@@ -863,6 +863,17 @@ fn is_loopback_authority(authority: &str) -> bool {
     let host = authority.split(':').next().unwrap_or(authority);
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
+
+/// 渠道客户端是否启用交互式审批。
+/// - webui token 模式(enforce_token)：始终交互（原行为）。
+/// - SessionMode::Channel：仅当 daemon 绑定回环时交互（免 token 故强制回环守卫）。
+fn channel_interactive_permission(
+    client_mode: SessionMode,
+    enforce_token: bool,
+    bind_host: &str,
+) -> bool {
+    enforce_token || (matches!(client_mode, SessionMode::Channel) && is_loopback_authority(bind_host))
+}
 pub(crate) fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -4343,5 +4354,13 @@ mod channel_mode_tests {
         assert_eq!(resolve_client_mode("channel"), SessionMode::Channel);
         assert_eq!(resolve_client_mode("vscode"), SessionMode::Vscode);
         assert_eq!(resolve_client_mode("nope"), SessionMode::Ide);
+    }
+
+    #[test]
+    fn channel_interactive_only_on_loopback() {
+        assert!(channel_interactive_permission(SessionMode::Ide, true, "0.0.0.0"));
+        assert!(channel_interactive_permission(SessionMode::Channel, false, "127.0.0.1"));
+        assert!(!channel_interactive_permission(SessionMode::Channel, false, "0.0.0.0"));
+        assert!(!channel_interactive_permission(SessionMode::Ide, false, "127.0.0.1"));
     }
 }
