@@ -41,7 +41,7 @@ pub use index::{build_graph, CodeIndex};
 pub use lang::Lang;
 pub use list_symbols::ListSymbolsTool;
 pub use read_symbol::ReadSymbolTool;
-pub use symbols::{extract_symbol, extract_symbols, Symbol};
+pub use symbols::{extract_symbol, extract_symbols, skeleton, Symbol};
 pub use trace_callees::TraceCalleesTool;
 pub use trace_callers::TraceCallersTool;
 pub use trace_chain::TraceChainTool;

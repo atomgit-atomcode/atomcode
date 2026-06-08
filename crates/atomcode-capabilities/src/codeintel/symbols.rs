@@ -4,6 +4,7 @@
 //! a neutral tool holds no shared index; the cross-file graph layer comes later).
 
 use crate::codeintel::lang::Lang;
+use std::path::Path;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 /// A symbol definition found in a source file.
@@ -82,6 +83,48 @@ pub fn extract_symbols(source: &str, lang: Lang) -> Option<Vec<Symbol>> {
 /// Extract the first symbol named `name` from `source`.
 pub fn extract_symbol(source: &str, lang: Lang, name: &str) -> Option<Symbol> {
     extract_symbols(source, lang)?.into_iter().find(|s| s.name == name)
+}
+
+/// Render a compact STRUCTURE skeleton of a source file: leading import lines + each
+/// symbol's signature line annotated with its line range. `None` when the language is
+/// unsupported or no symbols are found (the caller, e.g. `read_file`, then falls back to
+/// a normal read). Lets a large file be outlined instead of dumped.
+pub fn skeleton(path: &Path, source: &str) -> Option<String> {
+    let lang = Lang::detect(path)?;
+    let syms = extract_symbols(source, lang)?;
+    if syms.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out = format!(
+        "[File skeleton: {} lines, {} symbols. Read a symbol with read_symbol, or a line range with read_file offset/limit.]\n",
+        lines.len(),
+        syms.len()
+    );
+    // Leading import/use/include lines — cheap, high-value context.
+    let mut shown_import = false;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("use ")
+            || t.starts_with("import ")
+            || t.starts_with("from ")
+            || t.starts_with("#include")
+            || t.starts_with("package ")
+            || t.starts_with("require")
+        {
+            out.push_str(&format!("{:>6}| {}\n", i + 1, line.trim_end()));
+            shown_import = true;
+        }
+    }
+    if shown_import {
+        out.push('\n');
+    }
+    for s in &syms {
+        let sig = lines.get(s.start_line.saturating_sub(1)).map(|l| l.trim_end().to_string()).unwrap_or_else(|| s.name.clone());
+        let n = s.end_line.saturating_sub(s.start_line) + 1;
+        out.push_str(&format!("{:>6}| {}  // L{}-{} ({} lines)\n", s.start_line, sig, s.start_line, s.end_line, n));
+    }
+    Some(out)
 }
 
 #[cfg(test)]

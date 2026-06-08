@@ -12,6 +12,10 @@ use serde_json::json;
 const MAX_FULL_BYTES: u64 = 5 * 1024 * 1024;
 /// Per-line display cap (very long minified lines are truncated with a marker).
 const MAX_LINE_LEN: usize = 2000;
+/// Above this line count, an un-sliced read of a CODE file returns a symbol skeleton
+/// (when the `codeintel` capability is enabled) instead of the full dump.
+#[cfg(feature = "codeintel")]
+const SKELETON_THRESHOLD: usize = 300;
 
 pub struct ReadFileTool;
 
@@ -137,6 +141,17 @@ impl Tool for ReadFileTool {
         let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<&str> = text.lines().collect();
         let total = lines.len();
+
+        // codeintel enrichment: outline a large CODE file as a symbol skeleton instead of
+        // dumping it (cross-capability composition; only when codeintel is compiled in).
+        // A given offset/limit means the model wants a specific range, so skip it.
+        #[cfg(feature = "codeintel")]
+        if a.offset.is_none() && a.limit.is_none() && total > SKELETON_THRESHOLD {
+            if let Some(skel) = crate::codeintel::skeleton(&path, text.as_ref()) {
+                return ok(skel);
+            }
+        }
+
         let start = a.offset.unwrap_or(1).max(1); // 1-based
         let start_idx = start - 1;
         if start_idx >= total {
@@ -236,6 +251,52 @@ mod tests {
         assert!(r.content.contains("     2\tl2"), "{}", r.content);
         assert!(r.content.contains("     3\tl3"), "{}", r.content);
         assert!(!r.content.contains("\tl4"), "{}", r.content);
+    }
+
+    #[cfg(feature = "codeintel")]
+    #[tokio::test]
+    async fn large_code_file_returns_skeleton() {
+        let d = tempfile::tempdir().unwrap();
+        let mut src = String::from("fn alpha() {\n");
+        for _ in 0..350 {
+            src.push_str("    let _ = 1;\n");
+        }
+        src.push_str("}\nfn beta() {}\n");
+        std::fs::write(d.path().join("big.rs"), &src).unwrap();
+        let r = ReadFileTool.execute(r#"{"file_path":"big.rs"}"#, &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("File skeleton"), "{}", r.content);
+        assert!(r.content.contains("alpha") && r.content.contains("beta"), "{}", r.content);
+        assert!(!r.content.contains("let _ = 1;"), "skeleton must not dump bodies: {}", r.content);
+    }
+
+    #[cfg(feature = "codeintel")]
+    #[tokio::test]
+    async fn offset_bypasses_skeleton() {
+        let d = tempfile::tempdir().unwrap();
+        let mut src = String::from("fn f() {}\n");
+        for i in 0..400 {
+            src.push_str(&format!("// line {i}\n"));
+        }
+        std::fs::write(d.path().join("big.rs"), &src).unwrap();
+        let r = ReadFileTool.execute(r#"{"file_path":"big.rs","offset":1,"limit":3}"#, &ctx(d.path())).await;
+        assert!(!r.content.contains("File skeleton"), "offset/limit must bypass skeleton: {}", r.content);
+        assert!(r.content.contains("     1\tfn f"), "{}", r.content);
+    }
+
+    #[cfg(feature = "codeintel")]
+    #[tokio::test]
+    async fn large_non_code_file_reads_fully() {
+        // .txt has no tree-sitter language → skeleton() returns None → normal full read.
+        let d = tempfile::tempdir().unwrap();
+        let mut src = String::new();
+        for i in 0..400 {
+            src.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(d.path().join("big.txt"), &src).unwrap();
+        let r = ReadFileTool.execute(r#"{"file_path":"big.txt"}"#, &ctx(d.path())).await;
+        assert!(!r.content.contains("File skeleton"), "{}", r.content);
+        assert!(r.content.contains("line 0"), "{}", r.content);
     }
 
     #[tokio::test]
