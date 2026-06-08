@@ -328,6 +328,7 @@ Then just type what you want:
 | `/login` | Login with AtomGit OAuth |
 | `/cd` | Change working directory |
 | `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
+| `/view &lt;filepath&gt;` | View file content in an overlay modal |
 | `/undo` | Undo last turn's edits |
 | `/diff` | Show git diff of current changes |
 | `/cost` | Show token usage for this session |

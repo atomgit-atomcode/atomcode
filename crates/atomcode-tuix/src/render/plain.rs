@@ -396,6 +396,12 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 let _ = writeln!(self.out, "  {}  {}", msg, model);
                 let _ = writeln!(self.out);
             }
+            UiLine::ModalOverlay { .. } => {
+                // No overlay rendering in plain mode.
+            }
+            UiLine::ModalOverlayClear => {
+                // No-op in plain mode.
+            }
         }
     }
 

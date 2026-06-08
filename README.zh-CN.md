@@ -325,6 +325,7 @@ atomcode --prompt-file task.md
 | `/login` | 通过 AtomGit OAuth 登录 |
 | `/cd` | 切换工作目录 |
 | `/paste` | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
+| `/view &lt;filepath&gt;` | 在浮层窗口中查看文件内容 |
 | `/undo` | 撤销上一轮的文件编辑 |
 | `/diff` | 显示当前修改的 git diff |
 | `/cost` | 显示本次会话的 token 消耗 |

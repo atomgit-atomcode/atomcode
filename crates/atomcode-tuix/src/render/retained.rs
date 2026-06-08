@@ -410,6 +410,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// no-op since the group rows are no longer at the bottom and may
     /// have scrolled out of the visible body strip).
     live_group: Option<LiveGroup>,
+    /// Modal overlay state: a floating window drawn on top of body+footer.
+    /// When Some, `paint_frame` paints the overlay cells after the normal
+    /// body+footer, so the diff sees the combined frame.
+    modal_overlay: Option<ModalOverlayState>,
     /// Windows only: the STD_INPUT_HANDLE console mode value saved by
     /// `enable_conhost_mouse_capture`. Currently always `None` — mouse
     /// capture is intentionally disabled (see `with_writer` comment),
@@ -420,6 +424,14 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// only on one side of the lifecycle).
     #[cfg(windows)]
     prior_console_in_mode: Option<u32>,
+}
+
+/// Pre-computed overlay cell grid + screen position for a modal window.
+#[derive(Debug, Clone)]
+struct ModalOverlayState {
+    cells: Vec<Vec<Cell>>,
+    x: u16,
+    y: u16,
 }
 
 /// Tracking state for an active multi-row live group. Populated by
@@ -530,6 +542,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_tool: None,
             inflight_tool_rows: 0,
             live_group: None,
+            modal_overlay: None,
             #[cfg(windows)]
             prior_console_in_mode,
         }
@@ -1488,6 +1501,136 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn paint_frame(&mut self) {
         self.paint_body_into_cells();
         self.paint_footer();
+        // Overlay modal drawn on top of body+footer so the diff sees
+        // the combined frame. When modal_overlay is None this is a no-op.
+        if let Some(ref overlay) = self.modal_overlay {
+            for (dy, row) in overlay.cells.iter().enumerate() {
+                self.screen.draw_row(overlay.y as usize + dy, overlay.x as usize, row);
+            }
+        }
+    }
+
+    /// Build a modal overlay cell grid from the given title + content lines.
+    /// The window is centred on the current screen and bounded to fit.
+    fn build_modal_overlay(
+        &self,
+        title: &str,
+        lines: &[String],
+        scroll: usize,
+        total: usize,
+        win_width: u16,
+        win_height: u16,
+    ) -> ModalOverlayState {
+        let screen_w = self.screen.width();
+        let screen_h = self.screen.height();
+
+        // Clamp to screen bounds with a small margin.
+        let win_w = win_width.min(screen_w.saturating_sub(4)).max(20);
+        let win_h = win_height.min(screen_h.saturating_sub(4)).max(6);
+        let x = (screen_w.saturating_sub(win_w)) / 2;
+        let y = (screen_h.saturating_sub(win_h)) / 2;
+
+        let mut cells: Vec<Vec<Cell>> = Vec::with_capacity(win_h as usize);
+        let border_style = self.style_for(Role::Muted);
+        let title_style = self.style_bold(Role::Brand);
+        let text_style = CellStyle::default();
+        let hint_style = self.style_for(Role::Muted);
+
+        // Helper to build a full-width row padded with spaces.
+        let build_row = |content: Vec<Cell>| -> Vec<Cell> {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '│', style: border_style.clone(), width: 1 });
+            row.extend(content);
+            let filled: usize = row.iter().map(|c| c.width as usize).sum();
+            let pad = (win_w as usize).saturating_sub(filled).saturating_sub(1); // -1 for right border
+            for _ in 0..pad {
+                row.push(Cell::blank());
+            }
+            row.push(Cell { ch: '│', style: border_style.clone(), width: 1 });
+            row
+        };
+
+        // Top border: ┌─────┐
+        {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '┌', style: border_style.clone(), width: 1 });
+            for _ in 0..(win_w as usize).saturating_sub(2) {
+                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+            }
+            row.push(Cell { ch: '┐', style: border_style.clone(), width: 1 });
+            cells.push(row);
+        }
+
+        // Title row
+        {
+            let safe_title = crate::sanitize::scrub_controls(title);
+            let mut content = Vec::new();
+            content.push(Cell::blank());
+            push_str_cells(&mut content, " ", &text_style);
+            push_str_cells(&mut content, &safe_title, &title_style);
+            cells.push(build_row(content));
+        }
+
+        // Separator line
+        {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '├', style: border_style.clone(), width: 1 });
+            for _ in 0..(win_w as usize).saturating_sub(2) {
+                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+            }
+            row.push(Cell { ch: '┤', style: border_style.clone(), width: 1 });
+            cells.push(row);
+        }
+
+        // Content rows
+        let content_height = (win_h as usize).saturating_sub(5); // top + title + sep + hint + bottom
+        for line in lines.iter().take(content_height) {
+            let safe = crate::sanitize::scrub_controls(line);
+            let mut content = Vec::new();
+            content.push(Cell::blank());
+            // Truncate to inner width (win_w - 2 borders - 1 padding)
+            let max_inner = (win_w as usize).saturating_sub(3);
+            let mut used = 0usize;
+            for ch in safe.chars() {
+                let w = crate::width::cell_char_width(ch).unwrap_or(1);
+                if w > 0 && used + w > max_inner {
+                    break;
+                }
+                content.push(Cell { ch, style: text_style.clone(), width: w as u8 });
+                used += w;
+                for _ in 1..w {
+                    content.push(Cell::continuation());
+                }
+            }
+            cells.push(build_row(content));
+        }
+
+        // Pad remaining content rows with blank lines
+        for _ in lines.len()..content_height {
+            cells.push(build_row(vec![Cell::blank()]));
+        }
+
+        // Bottom hint row: "Line X/Y · Esc to close"
+        {
+            let hint = format!("Line {}/{} · Esc/q to close", scroll + 1, total);
+            let mut content = Vec::new();
+            content.push(Cell::blank());
+            push_str_cells(&mut content, &hint, &hint_style);
+            cells.push(build_row(content));
+        }
+
+        // Bottom border: └─────┘
+        {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '└', style: border_style.clone(), width: 1 });
+            for _ in 0..(win_w as usize).saturating_sub(2) {
+                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+            }
+            row.push(Cell { ch: '┘', style: border_style.clone(), width: 1 });
+            cells.push(row);
+        }
+
+        ModalOverlayState { cells, x, y }
     }
 
     /// Append-only model: copy the body_lines tail into screen.cells
@@ -3353,6 +3496,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let prefix = format!("{msg}  ");
                 self.push_body_prefixed(&prefix, &default_style, &model, &muted_style);
                 self.push_body_row(Vec::new());
+            }
+            UiLine::ModalOverlay {
+                title,
+                lines,
+                scroll,
+                total,
+                win_width,
+                win_height,
+            } => {
+                self.modal_overlay = Some(self.build_modal_overlay(
+                    &title,
+                    &lines,
+                    scroll,
+                    total,
+                    win_width,
+                    win_height,
+                ));
+            }
+            UiLine::ModalOverlayClear => {
+                self.modal_overlay = None;
             }
         }
         // Phase 5: widget state updated → mark frame dirty. No
