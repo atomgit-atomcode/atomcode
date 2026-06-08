@@ -701,6 +701,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.isGenerating = false;
         srt.queuedMessages = [];
         srt.eventBuffer = [];
+        srt.errorMessage = message;
         this._postMessageToPanel(streamSessionId, { type: 'error', message });
       },
     });
