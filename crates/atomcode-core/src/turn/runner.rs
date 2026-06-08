@@ -798,11 +798,6 @@ impl TurnRunner {
         //    Use the FILTERED accumulator so downstream consumers
         //    (datalog `log_text`, ATLAS plan extraction, telemetry)
         //    see clean prose, not raw text_buf with leaked XML
-        //    tool_call blocks.
-        // 5. If no tool calls, we're done — LLM produced text only.
-        //    Use the FILTERED accumulator so downstream consumers
-        //    (datalog `log_text`, ATLAS plan extraction, telemetry)
-        //    see clean prose, not raw text_buf with leaked XML
         //    tool_call blocks. Earlier bug: 5-7 atomgr datalog
         //    20-14-23 Turn 5 logged `### 3. 传输层安全<tool_call>grep
         //    <arg_key>...` because Responded.text was raw.
