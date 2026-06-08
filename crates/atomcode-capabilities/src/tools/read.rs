@@ -286,6 +286,43 @@ mod tests {
 
     #[cfg(feature = "codeintel")]
     #[tokio::test]
+    async fn skeleton_threshold_boundary() {
+        let d = tempfile::tempdir().unwrap();
+        // exactly 300 lines (fn + 299 fillers) → total > 300 is false → full read
+        let mut at = String::from("fn f() {}\n");
+        for _ in 0..299 {
+            at.push_str("// x\n");
+        }
+        std::fs::write(d.path().join("at.rs"), &at).unwrap();
+        let r = ReadFileTool.execute(r#"{"file_path":"at.rs"}"#, &ctx(d.path())).await;
+        assert!(!r.content.contains("File skeleton"), "300 lines must NOT skeleton: {}", r.content);
+        // 301 lines → skeleton
+        let mut over = String::from("fn f() {}\n");
+        for _ in 0..300 {
+            over.push_str("// x\n");
+        }
+        std::fs::write(d.path().join("over.rs"), &over).unwrap();
+        let r2 = ReadFileTool.execute(r#"{"file_path":"over.rs"}"#, &ctx(d.path())).await;
+        assert!(r2.content.contains("File skeleton"), "301 lines must skeleton: {}", r2.content);
+    }
+
+    #[cfg(feature = "codeintel")]
+    #[tokio::test]
+    async fn large_symbolless_code_file_reads_fully() {
+        // a >300-line .rs with NO symbols (only comments) → skeleton() None → full read.
+        let d = tempfile::tempdir().unwrap();
+        let mut src = String::new();
+        for i in 0..400 {
+            src.push_str(&format!("// comment {i}\n"));
+        }
+        std::fs::write(d.path().join("c.rs"), &src).unwrap();
+        let r = ReadFileTool.execute(r#"{"file_path":"c.rs"}"#, &ctx(d.path())).await;
+        assert!(!r.content.contains("File skeleton"), "{}", r.content);
+        assert!(r.content.contains("comment 0"), "{}", r.content);
+    }
+
+    #[cfg(feature = "codeintel")]
+    #[tokio::test]
     async fn large_non_code_file_reads_fully() {
         // .txt has no tree-sitter language → skeleton() returns None → normal full read.
         let d = tempfile::tempdir().unwrap();

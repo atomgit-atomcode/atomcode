@@ -7,6 +7,10 @@ use crate::codeintel::lang::Lang;
 use std::path::Path;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
+/// Per-signature display cap in a skeleton — mirrors `read_file`'s line cap so the
+/// skeleton never shows MORE of a (pathologically long, minified) line than a full read.
+const SIG_MAX: usize = 2000;
+
 /// A symbol definition found in a source file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Symbol {
@@ -120,7 +124,10 @@ pub fn skeleton(path: &Path, source: &str) -> Option<String> {
         out.push('\n');
     }
     for s in &syms {
-        let sig = lines.get(s.start_line.saturating_sub(1)).map(|l| l.trim_end().to_string()).unwrap_or_else(|| s.name.clone());
+        let mut sig = lines.get(s.start_line.saturating_sub(1)).map(|l| l.trim_end().to_string()).unwrap_or_else(|| s.name.clone());
+        if sig.chars().count() > SIG_MAX {
+            sig = sig.chars().take(SIG_MAX).collect::<String>() + "…";
+        }
         let n = s.end_line.saturating_sub(s.start_line) + 1;
         out.push_str(&format!("{:>6}| {}  // L{}-{} ({} lines)\n", s.start_line, sig, s.start_line, s.end_line, n));
     }
@@ -165,6 +172,24 @@ mod tests {
     fn empty_source_is_some_empty() {
         let syms = extract_symbols("", Lang::Rust).expect("parse");
         assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn skeleton_truncates_pathological_signature() {
+        let long = "x".repeat(5000);
+        let src = format!("fn f(/* {long} */) {{}}\n");
+        let sk = skeleton(std::path::Path::new("a.rs"), &src).expect("skeleton");
+        assert!(sk.contains("File skeleton"), "{}", &sk[..sk.len().min(120)]);
+        assert!(sk.contains('…'), "long signature must be truncated");
+        assert!(!sk.contains(&"x".repeat(2100)), "must not show the full 5000-char line");
+    }
+
+    #[test]
+    fn skeleton_none_for_symbolless_source() {
+        // pure comments → no symbols → None (caller falls back to a normal read)
+        assert!(skeleton(std::path::Path::new("a.rs"), "// just\n// comments\n").is_none());
+        // unsupported language → None
+        assert!(skeleton(std::path::Path::new("a.unknownext"), "anything").is_none());
     }
 
     #[test]
