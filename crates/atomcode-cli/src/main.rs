@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod telemetry_cmd;
@@ -548,6 +548,10 @@ enum Commands {
         /// Client identifier for telemetry (e.g. "vscode", "atomcode-air")
         #[arg(long)]
         client: Option<String>,
+        /// Idle-shutdown timeout in seconds; 0 disables. Env
+        /// ATOMCODE_DAEMON_IDLE_TIMEOUT overrides. Default 1800 (30 min).
+        #[arg(long)]
+        idle_timeout: Option<u64>,
     },
     /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
     Webui {
@@ -1033,45 +1037,53 @@ async fn run() -> Result<i32> {
                     }
                 }
             }
-            Commands::Daemon { port, client } => {
+            Commands::Daemon {
+                port,
+                client,
+                idle_timeout,
+            } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 eprintln!("Starting AtomCode daemon on port {}...", port);
                 eprintln!("Press Ctrl+C to stop.");
-                // Re-exec into the atomcode-daemon binary with matching port.
-                // This keeps the daemon as a separate compilation unit while
-                // providing a user-friendly `atomcode daemon` subcommand.
-                let daemon_bin = std::env::current_exe().ok().and_then(|p| {
-                    let dir = p.parent()?;
-                    let daemon = dir.join("atomcode-daemon");
-                    if daemon.exists() {
-                        Some(daemon)
-                    } else {
-                        None
-                    }
-                });
-                match daemon_bin {
-                    Some(bin) => {
-                        let mut cmd = std::process::Command::new(bin);
-                        cmd.arg("--port").arg(port.to_string());
-                        if let Some(ref c) = client {
-                            cmd.arg("--client").arg(c);
-                        }
-                        let status = cmd.status().context("Failed to start atomcode-daemon")?;
-                        // Flush telemetry events before handing over to daemon process.
-                        telemetry
-                            .shutdown(std::time::Duration::from_millis(500))
-                            .await;
-                        return Ok(if status.success() { 0 } else { 1 });
-                    }
-                    None => {
-                        eprintln!("Error: atomcode-daemon binary not found next to atomcode.");
-                        eprintln!("Make sure both binaries are installed together.");
-                        telemetry
-                            .shutdown(std::time::Duration::from_millis(500))
-                            .await;
-                        return Ok(1);
-                    }
+                // Run the bundled server IN-PROCESS (same `run_server` the webui uses),
+                // instead of re-exec'ing into a separate `atomcode-daemon` binary that
+                // may not be installed. `webui_tokens: None` ⇒ enforce_token=false
+                // (headless), so loopback channel clients get interactive approval.
+                let idle = idle_timeout
+                    .or_else(|| {
+                        std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                    })
+                    .unwrap_or(30 * 60);
+                let startup_mode = match client.as_deref() {
+                    Some("vscode") => atomcode_telemetry::SessionMode::Vscode,
+                    Some("webui") => atomcode_telemetry::SessionMode::Webui,
+                    Some("atomcode-air") => atomcode_telemetry::SessionMode::AtomcodeAir,
+                    _ => atomcode_telemetry::SessionMode::Ide,
+                };
+                let res = atomcode_daemon::run_server(atomcode_daemon::ServerOpts {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    cli_override: CliOverride {
+                        disabled: cli.no_telemetry,
+                    },
+                    idle_timeout_secs: idle,
+                    startup_mode,
+                    webui_tokens: None,
+                    quiet: false,
+                    working_dir_override: None,
+                    prebound_listener: None,
+                })
+                .await;
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                if let Err(e) = res {
+                    eprintln!("Fatal: daemon server error: {e:#}");
+                    return Ok(1);
                 }
+                return Ok(0);
             }
             Commands::Webui { port, host } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
