@@ -832,6 +832,7 @@ async fn activity_tracker_middleware(
 /// Unknown values fall back to Ide.
 fn resolve_client_mode(header: &str) -> SessionMode {
     match header {
+        "channel" => SessionMode::Channel,
         "vscode" => SessionMode::Vscode,
         "webui" => SessionMode::Webui,
         "atomcode-air" => SessionMode::AtomcodeAir,
@@ -4330,5 +4331,17 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
             Some("172.16.2.14".into())
         );
         assert_eq!(extract_ip_eq("no ip here"), None);
+    }
+}
+
+#[cfg(test)]
+mod channel_mode_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_channel_header() {
+        assert_eq!(resolve_client_mode("channel"), SessionMode::Channel);
+        assert_eq!(resolve_client_mode("vscode"), SessionMode::Vscode);
+        assert_eq!(resolve_client_mode("nope"), SessionMode::Ide);
     }
 }
