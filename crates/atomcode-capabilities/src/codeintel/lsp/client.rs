@@ -210,6 +210,19 @@ impl LspClient {
     }
 }
 
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        // Abort the background reader regardless of whether shutdown() ran, so a client
+        // dropped on an early-return path can't leak the task. (A spawned server's child
+        // is also killed via kill_on_drop.)
+        if let Ok(mut h) = self.reader_handle.lock() {
+            if let Some(handle) = h.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 fn path_to_uri(path: &Path) -> Result<String, String> {
     url::Url::from_file_path(path).map(|u| u.to_string()).map_err(|_| format!("not an absolute path: {}", path.display()))
 }
@@ -235,12 +248,14 @@ fn handle_publish(params: &Value, diagnostics: &DiagMap) {
     let file = path.display().to_string();
     let parsed: Vec<Diagnostic> = items
         .iter()
-        .map(|d| {
-            let range = d.get("range");
-            let start = range.and_then(|r| r.get("start"));
-            let end = range.and_then(|r| r.get("end"));
-            let line = start.and_then(|s| s.get("line")).and_then(Value::as_u64).unwrap_or(0) as u32 + 1;
-            let column = start.and_then(|s| s.get("character")).and_then(Value::as_u64).unwrap_or(0) as u32 + 1;
+        .filter_map(|d| {
+            // `range.start.{line,character}` are required by the LSP spec — drop a
+            // malformed diagnostic rather than inventing a (1,1) position.
+            let range = d.get("range")?;
+            let start = range.get("start")?;
+            let line = start.get("line").and_then(Value::as_u64)? as u32 + 1;
+            let column = start.get("character").and_then(Value::as_u64)? as u32 + 1;
+            let end = range.get("end");
             let end_line = end.and_then(|e| e.get("line")).and_then(Value::as_u64).map(|l| l as u32 + 1);
             let end_column = end.and_then(|e| e.get("character")).and_then(Value::as_u64).map(|c| c as u32 + 1);
             let severity = DiagnosticSeverity::from_lsp(d.get("severity").and_then(Value::as_u64).unwrap_or(1));
@@ -251,10 +266,14 @@ fn handle_publish(params: &Value, diagnostics: &DiagMap) {
                 Value::Number(n) => Some(n.to_string()),
                 _ => None,
             });
-            Diagnostic { file: file.clone(), line, column, end_line, end_column, severity, message, source, code }
+            Some(Diagnostic { file: file.clone(), line, column, end_line, end_column, severity, message, source, code })
         })
         .collect();
-    diagnostics.lock().unwrap().insert(path, parsed);
+    if parsed.is_empty() {
+        diagnostics.lock().unwrap().remove(&path);
+    } else {
+        diagnostics.lock().unwrap().insert(path, parsed);
+    }
 }
 
 #[cfg(test)]
@@ -347,5 +366,22 @@ mod tests {
         assert_eq!(dm.lock().unwrap().values().flatten().count(), 1);
         handle_publish(&json!({ "uri": p, "diagnostics": [] }), &dm);
         assert_eq!(dm.lock().unwrap().values().flatten().count(), 0, "empty publish clears");
+    }
+
+    #[test]
+    fn malformed_diagnostics_are_dropped_not_defaulted() {
+        let dm: DiagMap = Arc::new(Mutex::new(HashMap::new()));
+        let p = if cfg!(windows) { "file:///C:/y.rs" } else { "file:///y.rs" };
+        // one valid + one missing `range` → only the valid one is kept (no (1,1) ghost).
+        handle_publish(
+            &json!({ "uri": p, "diagnostics": [
+                { "range": {"start":{"line":2,"character":0},"end":{"line":2,"character":1}}, "severity": 1, "message": "ok" },
+                { "severity": 1, "message": "no range" }
+            ]}),
+            &dm,
+        );
+        let all: Vec<_> = dm.lock().unwrap().values().flatten().cloned().collect();
+        assert_eq!(all.len(), 1, "malformed diagnostic must be dropped");
+        assert_eq!(all[0].message, "ok");
     }
 }

@@ -76,7 +76,7 @@ impl LspManager {
         };
         let client = self.clients.lock().await.get(&ext).cloned();
         if let Some(client) = client {
-            let _ = client.sync_document(path, content, extension_to_language_id(&ext)).await;
+            let _ = client.sync_document(path, content, &extension_to_language_id(&ext)).await;
             true
         } else {
             false

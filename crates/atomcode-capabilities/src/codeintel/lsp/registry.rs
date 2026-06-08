@@ -63,9 +63,11 @@ impl Default for LspServerRegistry {
     }
 }
 
-/// LSP `languageId` for a file extension (sent in `textDocument/didOpen`).
-pub fn extension_to_language_id(ext: &str) -> &'static str {
-    match ext {
+/// LSP `languageId` for a file extension (sent in `textDocument/didOpen`). An unknown
+/// extension maps to itself (production parity) so a server can still recognize a custom
+/// language id rather than always seeing "plaintext".
+pub fn extension_to_language_id(ext: &str) -> String {
+    let id = match ext {
         "rs" => "rust",
         "ts" => "typescript",
         "tsx" => "typescriptreact",
@@ -79,8 +81,9 @@ pub fn extension_to_language_id(ext: &str) -> &'static str {
         "cs" => "csharp",
         "rb" => "ruby",
         "php" => "php",
-        _ => "plaintext",
-    }
+        other => other,
+    };
+    id.to_string()
 }
 
 #[cfg(test)]
@@ -102,7 +105,7 @@ mod tests {
         assert_eq!(extension_to_language_id("rs"), "rust");
         assert_eq!(extension_to_language_id("tsx"), "typescriptreact");
         assert_eq!(extension_to_language_id("cpp"), "cpp");
-        assert_eq!(extension_to_language_id("zzz"), "plaintext");
+        assert_eq!(extension_to_language_id("zzz"), "zzz"); // unknown → itself
     }
 
     #[test]
