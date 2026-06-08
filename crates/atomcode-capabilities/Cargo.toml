@@ -63,11 +63,13 @@ codeintel = [
 lsp = ["codeintel", "dep:which", "dep:url", "tokio/process", "tokio/io-util", "tokio/fs"]
 # Real-server LSP e2e (needs rust-analyzer etc. installed) — default-off, on demand.
 lsp-e2e = ["lsp"]
+# Skills: markdown/frontmatter skill loader + use_skill / list_skills tools. No new deps.
+skills = []
 # E2E tests that hit a REAL provider (network + API key). Separate from the default
 # suite; run on demand: `cargo test -p atomcode-capabilities --features e2e --test e2e`.
 e2e = ["provider"]
 # Future capabilities land as their own features:
-#   mcp = [...]   skills = [...]
+#   mcp = [...]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }

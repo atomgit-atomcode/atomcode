@@ -37,3 +37,8 @@ pub mod tools;
 /// `codeintel` feature (heavy grammar compilation). See [`codeintel`].
 #[cfg(feature = "codeintel")]
 pub mod codeintel;
+
+/// Skills capability: a markdown/frontmatter skill loader + `use_skill` / `list_skills`
+/// tools (Claude-Code-compatible). Opt-in `skills` feature. See [`skills`].
+#[cfg(feature = "skills")]
+pub mod skills;
