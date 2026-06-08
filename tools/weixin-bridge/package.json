@@ -5,7 +5,7 @@
   "type": "module",
   "description": "PoC bridge: WeChat (iLink Bot API) <-> atomcode daemon",
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test",
     "smoke": "node src/smoke-echo.js",
     "start": "node src/index.js"
   },
