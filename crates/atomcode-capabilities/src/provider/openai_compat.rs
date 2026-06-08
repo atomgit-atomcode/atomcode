@@ -230,18 +230,40 @@ fn format_messages(messages: &[Message], policy: ReasoningPolicy) -> Vec<Value> 
                     out.push(json!({ "role": "user", "content": m.text }));
                 } else {
                     // Multimodal: `content` becomes an array — text part first (if any),
-                    // then each image as an OpenAI `image_url` base64 data URL.
+                    // then each image as an OpenAI `image_url` base64 data URL. NOTE on
+                    // compatibility: OpenAI/DeepSeek accept an image-only message (no text
+                    // part); a stricter server might require text — that's a provider
+                    // contract, not ours. `json!()` escapes any special chars in the data
+                    // URL to valid JSON; the provider unescapes on decode.
                     let mut parts: Vec<Value> = Vec::with_capacity(m.images.len() + 1);
                     if !m.text.is_empty() {
                         parts.push(json!({ "type": "text", "text": m.text }));
                     }
                     for img in &m.images {
+                        // Harden the wire shape at this L1 boundary (the kernel only stores
+                        // + forwards): an image with no payload carries no information → skip
+                        // it rather than emit a degenerate `data:...;base64,` URL; an empty
+                        // media_type falls back to a generic type so the URL stays well-formed.
+                        if img.data.is_empty() {
+                            continue;
+                        }
+                        let media_type = if img.media_type.is_empty() {
+                            "application/octet-stream"
+                        } else {
+                            img.media_type.as_str()
+                        };
                         parts.push(json!({
                             "type": "image_url",
-                            "image_url": { "url": format!("data:{};base64,{}", img.media_type, img.data) },
+                            "image_url": { "url": format!("data:{media_type};base64,{}", img.data) },
                         }));
                     }
-                    out.push(json!({ "role": "user", "content": parts }));
+                    // Degenerate input (all images had empty data AND no text) → fall back
+                    // to a STRING so we never emit an empty content array a server rejects.
+                    if parts.is_empty() {
+                        out.push(json!({ "role": "user", "content": m.text }));
+                    } else {
+                        out.push(json!({ "role": "user", "content": parts }));
+                    }
                 }
             }
             Role::Assistant => {
@@ -738,6 +760,29 @@ mod tests {
         let c = out[0]["content"].as_array().unwrap();
         assert_eq!(c.len(), 1, "no text part when text is empty");
         assert_eq!(c[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn empty_image_data_is_skipped_and_degrades_to_string() {
+        use atomcode_kernel::message::ImageContent;
+        // An empty-data image carries nothing → skipped; with no text either, the message
+        // degrades to a plain STRING content (never an empty content array a server rejects).
+        let m = Message::user_with_images(
+            "",
+            vec![ImageContent { media_type: "image/png".into(), data: "".into() }],
+        );
+        assert_eq!(format_messages(&[m], ReasoningPolicy::Exclude)[0], json!({"role":"user","content":""}));
+    }
+
+    #[test]
+    fn empty_media_type_falls_back_to_generic() {
+        use atomcode_kernel::message::ImageContent;
+        let m = Message::user_with_images(
+            "x",
+            vec![ImageContent { media_type: "".into(), data: "QUJD".into() }],
+        );
+        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        assert_eq!(out[0]["content"][1]["image_url"]["url"], "data:application/octet-stream;base64,QUJD");
     }
 
     #[test]
