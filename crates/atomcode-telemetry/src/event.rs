@@ -21,6 +21,7 @@ pub enum SessionMode {
     #[serde(rename = "webui")]
     Webui,
     AtomcodeAir,
+    Channel,
 }
 
 // ---------- Envelope (common to every event) ----------
@@ -805,6 +806,11 @@ mod tests {
     #[test]
     fn session_mode_webui_serializes_as_webui() {
         assert_eq!(serde_json::to_string(&SessionMode::Webui).unwrap(), "\"webui\"");
+    }
+
+    #[test]
+    fn session_mode_channel_serializes_snake_case() {
+        assert_eq!(serde_json::to_string(&SessionMode::Channel).unwrap(), "\"channel\"");
     }
 }
 
