@@ -1550,6 +1550,28 @@ impl<W: Write + Send> RetainedRenderer<W> {
             row
         };
 
+        // Inner text width: window minus the 2 borders and the 1-col left
+        // pad every row carries. ALL variable-text rows (title, content,
+        // hint) clip to this so none can overflow the frame and shove the
+        // right border out of alignment.
+        let max_inner = (win_w as usize).saturating_sub(3);
+        let clip_cells = |text: &str, style: &CellStyle| -> Vec<Cell> {
+            let mut out = Vec::new();
+            let mut used = 0usize;
+            for ch in text.chars() {
+                let w = crate::width::cell_char_width(ch).unwrap_or(1);
+                if w > 0 && used + w > max_inner {
+                    break;
+                }
+                out.push(Cell { ch, style: style.clone(), width: w as u8 });
+                used += w;
+                for _ in 1..w {
+                    out.push(Cell::continuation());
+                }
+            }
+            out
+        };
+
         // Top border: ┌─────┐
         {
             let mut row = Vec::with_capacity(win_w as usize);
@@ -1561,13 +1583,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             cells.push(row);
         }
 
-        // Title row
+        // Title row (clipped so a long filename can't overflow the frame).
         {
             let safe_title = crate::sanitize::scrub_controls(title);
             let mut content = Vec::new();
             content.push(Cell::blank());
-            push_str_cells(&mut content, " ", &text_style);
-            push_str_cells(&mut content, &safe_title, &title_style);
+            content.extend(clip_cells(&format!(" {}", safe_title), &title_style));
             cells.push(build_row(content));
         }
 
@@ -1588,20 +1609,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let safe = crate::sanitize::scrub_controls(line);
             let mut content = Vec::new();
             content.push(Cell::blank());
-            // Truncate to inner width (win_w - 2 borders - 1 padding)
-            let max_inner = (win_w as usize).saturating_sub(3);
-            let mut used = 0usize;
-            for ch in safe.chars() {
-                let w = crate::width::cell_char_width(ch).unwrap_or(1);
-                if w > 0 && used + w > max_inner {
-                    break;
-                }
-                content.push(Cell { ch, style: text_style.clone(), width: w as u8 });
-                used += w;
-                for _ in 1..w {
-                    content.push(Cell::continuation());
-                }
-            }
+            content.extend(clip_cells(&safe, &text_style));
             cells.push(build_row(content));
         }
 
@@ -1610,12 +1618,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             cells.push(build_row(vec![Cell::blank()]));
         }
 
-        // Bottom hint row: "Line X/Y · Esc to close"
+        // Bottom hint row: "Line X/Y · Esc/q to close" (clipped to width).
         {
             let hint = format!("Line {}/{} · Esc/q to close", scroll + 1, total);
             let mut content = Vec::new();
             content.push(Cell::blank());
-            push_str_cells(&mut content, &hint, &hint_style);
+            content.extend(clip_cells(&hint, &hint_style));
             cells.push(build_row(content));
         }
 
