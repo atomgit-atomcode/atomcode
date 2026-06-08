@@ -1,0 +1,16 @@
+[package]
+name = "atomcode-coding"
+version = "0.0.0"
+edition = "2021"
+description = "L2 coding specialization: assembles the neutral kernel + capabilities into a runnable, self-correcting coding agent."
+
+[dependencies]
+atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "codeintel"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+# atomcode-kernel::testkit (MockProvider, scripted StreamEvents) is ungated — no extra dep.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tempfile = "3"

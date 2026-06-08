@@ -245,6 +245,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-coding"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "atomcode-capabilities",
+ "atomcode-kernel",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "atomcode-codingplan-crypto"
 version = "0.1.0"
 dependencies = [
