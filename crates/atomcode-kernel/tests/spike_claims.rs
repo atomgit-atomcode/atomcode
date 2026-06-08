@@ -25,7 +25,7 @@ async fn neutral_turn_runs_without_persona_or_middleware() {
         .tools(reg.mount(&["echo"]))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "hi".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "hi".into(), images: vec![] }).unwrap();
 
     let mut events = handle.events;
     let (mut echoed, mut completed, mut requested) = (false, false, false);
@@ -63,7 +63,7 @@ async fn approval_middleware_gates_risky_tool_via_id_roundtrip() {
         .build()
         .spawn();
     let commands = handle.commands.clone();
-    handle.commands.send(AgentCommand::SendMessage { text: "write".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "write".into(), images: vec![] }).unwrap();
 
     let mut events = handle.events;
     let (mut asked, mut wrote) = (false, false);
@@ -146,7 +146,7 @@ async fn lifecycle_hook_injects_and_continues_loop() {
         .hooks(Arc::new(ContinueOnceHook::new()))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
 
     let mut events = handle.events;
     let (mut turn_started, mut echoed, mut completed) = (false, false, false);
@@ -192,7 +192,7 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
         .hooks(recorder)
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
 
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
@@ -246,7 +246,7 @@ async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
     let mut usage_utils: Vec<f32> = Vec::new();
 
     // Turn A
-    handle.commands.send(AgentCommand::SendMessage { text: "first".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "first".into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Usage(m) => usage_utils.push(m.utilization),
@@ -255,7 +255,7 @@ async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
         }
     }
     // Turn B
-    handle.commands.send(AgentCommand::SendMessage { text: "second".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "second".into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Usage(m) => usage_utils.push(m.utilization),
@@ -311,7 +311,7 @@ async fn round_budget_projected_to_llm_and_hard_capped() {
         .max_rounds(3)
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
 
     let mut rounds_seen: Vec<u32> = Vec::new();
     let mut capped = false;
@@ -358,7 +358,7 @@ async fn on_model_response_can_transform_response_into_storage() {
         .hooks(Arc::new(RedactHook))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
 
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
@@ -384,7 +384,7 @@ async fn on_model_response_can_transform_response_into_storage() {
     assert!(!assistant.text.contains("SECRET"), "secret must be gone");
     // (2) the hook saw the kernel-filled meta on the response
     assert!(
-        assistant.meta.as_ref().map_or(false, |m| m.tokens.prompt == 50),
+        assistant.meta.as_ref().is_some_and(|m| m.tokens.prompt == 50),
         "kernel meta must be present on the response the hook received"
     );
 }
@@ -404,7 +404,7 @@ async fn dropping_tool_calls_in_on_model_response_prevents_execution() {
         .hooks(Arc::new(DropToolsHook))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
 
     let mut executed = false;
     let mut completed = false;
@@ -440,7 +440,7 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
             .middleware(Arc::new(ArgRewriteMiddleware))
             .build()
             .spawn();
-        handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+        handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
         let mut echoed = String::new();
         while let Some(ev) = handle.events.recv().await {
             match ev {
@@ -467,7 +467,7 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
             .middleware(Arc::new(BlockToolMiddleware))
             .build()
             .spawn();
-        handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+        handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
         let mut started = false;
         let mut blocked = false;
         while let Some(ev) = handle.events.recv().await {
@@ -501,7 +501,7 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
             .middleware(Arc::new(TruncateMiddleware))
             .build()
             .spawn();
-        handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+        handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
         let mut content = String::new();
         while let Some(ev) = handle.events.recv().await {
             match ev {
@@ -535,7 +535,7 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
             .middleware(Arc::new(ApprovalMiddleware::new()))
             .build()
             .spawn();
-        handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+        handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
         let mut asked = 0;
         let mut ran = false;
         while let Some(ev) = handle.events.recv().await {
@@ -574,7 +574,7 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
         let mut turns_done = 0;
         let mut sent_second = false;
 
-        commands.send(AgentCommand::SendMessage { text: "one".into() }).unwrap();
+        commands.send(AgentCommand::SendMessage { text: "one".into(), images: vec![] }).unwrap();
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::Request { id, kind, .. } if kind == "approval" => {
@@ -588,7 +588,7 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
                     turns_done += 1;
                     if turns_done == 1 && !sent_second {
                         sent_second = true;
-                        commands.send(AgentCommand::SendMessage { text: "two".into() }).unwrap();
+                        commands.send(AgentCommand::SendMessage { text: "two".into(), images: vec![] }).unwrap();
                     } else if turns_done >= 2 {
                         break;
                     }
@@ -615,7 +615,7 @@ async fn user_prompt_submit_can_block_a_prompt() {
         .hooks(Arc::new(RejectPromptHook))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "do something bad".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "do something bad".into(), images: vec![] }).unwrap();
 
     let mut rejected = false;
     let mut turn_started = false;
@@ -671,7 +671,7 @@ async fn model_reasoning_is_stored_on_assistant_message_and_still_emitted_live()
         .tools(reg.mount(&[]))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "think then answer".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "think then answer".into(), images: vec![] }).unwrap();
 
     // The LIVE reasoning channel must STILL fire (storage did not replace it).
     let mut live_reasoning_seen = false;
@@ -724,7 +724,7 @@ async fn no_reasoning_stream_stores_none() {
         .tools(reg.mount(&[]))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "answer".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "answer".into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;

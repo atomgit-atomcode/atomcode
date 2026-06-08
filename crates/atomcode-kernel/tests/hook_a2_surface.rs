@@ -31,7 +31,7 @@ fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
 }
 
 async fn drive_one_turn(handle: &mut AgentHandle, text: &str) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -88,7 +88,7 @@ async fn on_text_delta_redacts_streamed_output() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
 
     // Collect the LIVE streamed deltas.
     let mut streamed = String::new();
@@ -175,7 +175,7 @@ async fn on_reasoning_delta_redacts_reasoning() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
 
     // Collect the LIVE streamed reasoning.
     let mut streamed_reasoning = String::new();
@@ -260,7 +260,7 @@ async fn cleared_delta_emits_no_event() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
 
     // ZERO AgentEvent::TextDelta events must reach the driver (each chunk was
     // cleared → suppressed, not emitted as "").

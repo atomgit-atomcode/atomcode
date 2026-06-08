@@ -36,7 +36,7 @@ fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
 
 /// Collect every AgentEvent up to (and including) the first TurnComplete.
 async fn drive_collect(handle: &mut atomcode_kernel::agent::AgentHandle, text: &str) -> Vec<AgentEvent> {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
     let mut events = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         let stop = matches!(ev, AgentEvent::TurnComplete { .. });
@@ -50,7 +50,7 @@ async fn drive_collect(handle: &mut atomcode_kernel::agent::AgentHandle, text: &
 
 /// Just drive a turn to completion, dropping the events.
 async fn drive_one_turn(handle: &mut atomcode_kernel::agent::AgentHandle, text: &str) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;

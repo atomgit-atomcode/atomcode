@@ -223,7 +223,27 @@ fn format_messages(messages: &[Message], policy: ReasoningPolicy) -> Vec<Value> 
     for m in messages {
         match m.role {
             Role::System => out.push(json!({ "role": "system", "content": m.text })),
-            Role::User => out.push(json!({ "role": "user", "content": m.text })),
+            Role::User => {
+                if m.images.is_empty() {
+                    // Text-only: `content` stays a STRING — byte-identical to the prior
+                    // path, so a no-image conversation's prefix cache is unperturbed.
+                    out.push(json!({ "role": "user", "content": m.text }));
+                } else {
+                    // Multimodal: `content` becomes an array — text part first (if any),
+                    // then each image as an OpenAI `image_url` base64 data URL.
+                    let mut parts: Vec<Value> = Vec::with_capacity(m.images.len() + 1);
+                    if !m.text.is_empty() {
+                        parts.push(json!({ "type": "text", "text": m.text }));
+                    }
+                    for img in &m.images {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{};base64,{}", img.media_type, img.data) },
+                        }));
+                    }
+                    out.push(json!({ "role": "user", "content": parts }));
+                }
+            }
             Role::Assistant => {
                 let mut obj = Map::new();
                 obj.insert("role".into(), json!("assistant"));
@@ -682,6 +702,42 @@ mod tests {
         assert_eq!(out[2]["content"], "ans");
         assert!(out[2].get("reasoning_content").is_none());
         assert_eq!(out[3], json!({"role":"tool","tool_call_id":"call_1","content":"result text"}));
+    }
+
+    #[test]
+    fn user_without_images_stays_a_content_string() {
+        // Byte-identical to the pre-multimodal path → a no-image conversation's prefix
+        // cache is unperturbed.
+        let out = format_messages(&[Message::user("hi")], ReasoningPolicy::Exclude);
+        assert_eq!(out[0], json!({"role":"user","content":"hi"}));
+    }
+
+    #[test]
+    fn user_with_images_becomes_content_array() {
+        use atomcode_kernel::message::ImageContent;
+        let m = Message::user_with_images(
+            "look",
+            vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
+        );
+        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let c = &out[0]["content"];
+        assert!(c.is_array(), "multimodal content must be an array: {c}");
+        assert_eq!(c[0], json!({"type":"text","text":"look"}));
+        assert_eq!(c[1]["type"], "image_url");
+        assert_eq!(c[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+    }
+
+    #[test]
+    fn user_with_image_and_empty_text_omits_text_part() {
+        use atomcode_kernel::message::ImageContent;
+        let m = Message::user_with_images(
+            "",
+            vec![ImageContent { media_type: "image/jpeg".into(), data: "eHl6".into() }],
+        );
+        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let c = out[0]["content"].as_array().unwrap();
+        assert_eq!(c.len(), 1, "no text part when text is empty");
+        assert_eq!(c[0]["type"], "image_url");
     }
 
     #[test]

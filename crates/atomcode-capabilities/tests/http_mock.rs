@@ -407,9 +407,9 @@ async fn round_resets_per_turn_request_id_is_session_global() {
         .spawn();
 
     // Turn 1 (tool call → 2 rounds), then Turn 2 (direct answer → 1 round).
-    handle.commands.send(AgentCommand::SendMessage { text: "turn one".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "turn one".into(), images: vec![] }).unwrap();
     drain_until_turn_complete(&mut handle.events).await;
-    handle.commands.send(AgentCommand::SendMessage { text: "turn two".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "turn two".into(), images: vec![] }).unwrap();
     drain_until_turn_complete(&mut handle.events).await;
     handle.commands.send(AgentCommand::Shutdown).unwrap();
 

@@ -97,7 +97,7 @@ fn agent_handle(provider: Arc<RecordingProvider>) -> atomcode_kernel::agent::Age
 }
 
 async fn drive_one_turn(handle: &mut atomcode_kernel::agent::AgentHandle, text: &str) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;

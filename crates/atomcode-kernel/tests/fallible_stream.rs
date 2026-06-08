@@ -181,7 +181,7 @@ use atomcode_kernel::event::AgentCommand;
 use atomcode_kernel::provider::LlmProvider;
 
 fn send(text: &str) -> AgentCommand {
-    AgentCommand::SendMessage { text: text.into() }
+    AgentCommand::SendMessage { text: text.into(), images: vec![] }
 }
 
 fn spawn_agent(

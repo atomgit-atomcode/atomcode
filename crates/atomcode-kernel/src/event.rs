@@ -1,4 +1,4 @@
-use crate::message::{MessageMeta, SessionSnapshot};
+use crate::message::{ImageContent, MessageMeta, SessionSnapshot};
 use crate::tool::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +40,14 @@ pub enum StopReason {
 #[non_exhaustive]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentCommand {
-    SendMessage { text: String },
+    /// The user's next prompt. `images` carries optional multimodal attachments;
+    /// ADDITIVE (`#[serde(default)]`) so an older `{text}`-only command still
+    /// deserializes (→ no images). Empty `images` is exactly the text-only path.
+    SendMessage {
+        text: String,
+        #[serde(default)]
+        images: Vec<ImageContent>,
+    },
     /// Answer a pending AgentEvent::Request, correlated by id.
     Respond { id: RequestId, value: serde_json::Value },
     /// Ask the agent to emit a snapshot of per-message execution stats.
@@ -115,4 +122,22 @@ pub enum AgentEvent {
         bytes_after: usize,
         committed: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_message_serde_is_additive_for_images() {
+        // An OLD {text}-only command (no `images`) must still deserialize → no images.
+        let cmd: AgentCommand = serde_json::from_str(r#"{"SendMessage":{"text":"hi"}}"#).unwrap();
+        match cmd {
+            AgentCommand::SendMessage { text, images } => {
+                assert_eq!(text, "hi");
+                assert!(images.is_empty());
+            }
+            _ => panic!("expected SendMessage"),
+        }
+    }
 }

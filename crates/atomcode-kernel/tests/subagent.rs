@@ -37,7 +37,7 @@ fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
 }
 
 fn send(text: &str) -> AgentCommand {
-    AgentCommand::SendMessage { text: text.into() }
+    AgentCommand::SendMessage { text: text.into(), images: vec![] }
 }
 
 // ── CLAIM 31a: COMPOSITION ───────────────────────────────────────────────────

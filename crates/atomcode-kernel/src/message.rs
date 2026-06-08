@@ -11,6 +11,17 @@ pub enum Role {
     Tool,
 }
 
+/// A neutral inline image attached to a [`Message`] (user input). `data` is base64-encoded
+/// bytes; `media_type` is the MIME type (e.g. `"image/png"`). The kernel only STORES and
+/// FORWARDS it — each provider ADAPTER decides the wire shape (OpenAI `image_url` data URL
+/// vs Anthropic base64 `source`). Turning an image into text for a non-vision model (VL
+/// preprocessing) is an L1/L2 concern, NEVER the kernel's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageContent {
+    pub media_type: String,
+    pub data: String,
+}
+
 /// Kernel-native per-message execution stats, recorded at on_model_response.
 /// A SIDECAR — never part of `text` — so storing it never changes the bytes the
 /// LLM sees (prefix-cache safety). The renderer (pre_request) chooses whether to
@@ -117,22 +128,29 @@ pub struct Message {
     /// signature, fully served by the flat `reasoning` below.
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// Inline images attached to this message (multimodal user input). ADDITIVE:
+    /// `#[serde(default)]` so an older snapshot (no `images`) still deserializes (→
+    /// empty). Empty for every non-image message — so a text-only path keeps rendering
+    /// `content` as a STRING unchanged (prefix-cache safety); only a NON-empty `images`
+    /// makes an adapter switch to the array `content` shape. See [`ImageContent`].
+    #[serde(default)]
+    pub images: Vec<ImageContent>,
 }
 
 impl Message {
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None }
+        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![] }
     }
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None }
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![] }
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None }
+        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![] }
     }
     /// A tool RESULT. `is_error` is now STORED (a real adapter must echo it to the
     /// provider) — it was previously dropped, losing tool failure state.
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
-        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), is_error, meta: None, synthetic: false, reasoning: None }
+        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), is_error, meta: None, synthetic: false, reasoning: None, images: vec![] }
     }
     /// A KERNEL-INJECTED synthetic `Role::User` message (compaction cold summary or
     /// resume note). It carries `synthetic = true` so `sacred_floor` skips it when
@@ -142,7 +160,12 @@ impl Message {
     /// the whole cached prefix — see `ctx/render.rs` in production. Inserted
     /// after the system message, it preserves the frozen system prefix.
     pub fn synthetic_user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: true, reasoning: None }
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: true, reasoning: None, images: vec![] }
+    }
+    /// A user message carrying inline `images` (multimodal input). Identical to
+    /// [`Message::user`] when `images` is empty.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageContent>) -> Self {
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images }
     }
 }
 
@@ -612,6 +635,32 @@ mod tests {
 
     fn call(id: &str, name: &str) -> ToolCall {
         ToolCall { id: id.into(), name: name.into(), arguments: "{}".into() }
+    }
+
+    #[test]
+    fn user_with_images_carries_them_else_empty() {
+        let m = Message::user_with_images(
+            "hi",
+            vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
+        );
+        assert_eq!(m.images.len(), 1);
+        assert_eq!(m.images[0].media_type, "image/png");
+        assert!(Message::user("hi").images.is_empty(), "a plain user message has no images");
+    }
+
+    #[test]
+    fn message_serde_is_additive_for_images() {
+        // An OLD snapshot message (no `images` field) must still deserialize → empty.
+        let old = r#"{"role":"User","text":"hi","tool_calls":[],"tool_call_id":null,"is_error":false,"meta":null}"#;
+        let m: Message = serde_json::from_str(old).unwrap();
+        assert!(m.images.is_empty(), "missing images field defaults to empty");
+        // A round-trip with images preserves them losslessly.
+        let with = Message::user_with_images(
+            "x",
+            vec![ImageContent { media_type: "image/png".into(), data: "AA".into() }],
+        );
+        let back: Message = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.images, with.images);
     }
 
     // Mirrors production `cancel_backfills_missing_tool_results`: an assistant

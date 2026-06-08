@@ -28,7 +28,7 @@ use std::time::Duration;
 const OUTER_GUARD: Duration = Duration::from_secs(5);
 
 fn send(text: &str) -> AgentCommand {
-    AgentCommand::SendMessage { text: text.into() }
+    AgentCommand::SendMessage { text: text.into(), images: vec![] }
 }
 
 fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {

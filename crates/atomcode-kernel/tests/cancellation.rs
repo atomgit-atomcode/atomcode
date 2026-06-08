@@ -106,7 +106,7 @@ async fn cancel_between_tools_backfills_and_ends() {
         .spawn();
 
     // Drive turn 1 and collect the event sequence up to its TurnComplete.
-    handle.commands.send(AgentCommand::SendMessage { text: "do two things".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "do two things".into(), images: vec![] }).unwrap();
     let mut events: Vec<AgentEvent> = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         let stop = matches!(ev, AgentEvent::TurnComplete { .. });
@@ -136,7 +136,7 @@ async fn cancel_between_tools_backfills_and_ends() {
     // (3) No-dangling property: drive a SECOND turn and inspect the messages the
     // provider received on its FIRST request — every assistant tool_call must have
     // a matching tool_result.
-    handle.commands.send(AgentCommand::SendMessage { text: "again".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "again".into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -192,7 +192,7 @@ async fn cancel_command_ends_turn() {
         .spawn();
 
     let commands = handle.commands.clone();
-    handle.commands.send(AgentCommand::SendMessage { text: "run the blocker".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "run the blocker".into(), images: vec![] }).unwrap();
 
     let mut cancelled = false;
     let mut completed = false;

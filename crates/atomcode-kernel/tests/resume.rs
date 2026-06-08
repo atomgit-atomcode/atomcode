@@ -87,7 +87,7 @@ fn resumed_agent(provider: Arc<RecordingProvider>, snapshot: SessionSnapshot) ->
 }
 
 async fn drive_one_turn(handle: &mut AgentHandle, text: &str) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -218,7 +218,7 @@ async fn unsupported_snapshot_version_errors_and_starts_empty() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
     let mut warned = false;
     while let Some(ev) = handle.events.recv().await {
         match ev {

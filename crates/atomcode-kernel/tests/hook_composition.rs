@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 /// Drains events until TurnComplete (collecting any Error messages along the way).
 async fn drive_collect_errors(handle: &mut atomcode_kernel::agent::AgentHandle, text: &str) -> Vec<String> {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
     let mut errors = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         match ev {
@@ -90,7 +90,7 @@ async fn pre_request_hooks_compose() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -170,7 +170,7 @@ async fn turn_end_first_some_wins() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;

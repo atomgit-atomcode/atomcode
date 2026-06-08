@@ -45,7 +45,7 @@ async fn main() {
     // ---- Driver B: interactive (TUI/web/server shape) ----
     let handle = make_builder().build().spawn();
     let commands = handle.commands.clone();
-    handle.commands.send(AgentCommand::SendMessage { text: "do the demo".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "do the demo".into(), images: vec![] }).unwrap();
 
     let mut events = handle.events;
     while let Some(ev) = events.recv().await {

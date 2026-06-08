@@ -1,8 +1,8 @@
 use crate::event::{AgentCommand, AgentEvent, StopReason};
 use crate::hook::{HookChain, LifecycleHooks, TurnCtx};
 use crate::message::{
-    CompactTrigger, CompactionStrategy, CompactionView, Conversation, Message, MessageMeta,
-    NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
+    CompactTrigger, CompactionStrategy, CompactionView, Conversation, ImageContent, Message,
+    MessageMeta, NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
 };
 use crate::middleware::ToolMiddleware;
 use crate::provider::{ChatOptions, LlmProvider};
@@ -232,7 +232,7 @@ impl Agent {
     /// tool that may itself be cancel-dropped degrades to hard teardown instead.
     pub async fn run_to_completion(self, input: impl Into<String>, policy: AutoRespond) -> Outcome {
         let mut handle = self.spawn();
-        let _ = handle.commands.send(AgentCommand::SendMessage { text: input.into() });
+        let _ = handle.commands.send(AgentCommand::SendMessage { text: input.into(), images: vec![] });
         let mut outcome = Outcome::default();
         while let Some(ev) = handle.events.recv().await {
             match ev {
@@ -462,9 +462,9 @@ impl RunningAgent {
                 AgentCommand::Compact { focus } => {
                     self.run_compaction(&mut convo, CompactTrigger::Manual { focus }).await;
                 }
-                AgentCommand::SendMessage { text } => {
+                AgentCommand::SendMessage { text, images } => {
                     let shutdown = self
-                        .process_send_message(&mut convo, &mut cmd_rx, &mut pending, text)
+                        .process_send_message(&mut convo, &mut cmd_rx, &mut pending, text, images)
                         .await;
                     if shutdown {
                         break;
@@ -481,10 +481,10 @@ impl RunningAgent {
                                     snapshot: SessionSnapshot::from_conversation(&convo),
                                 });
                             }
-                            AgentCommand::SendMessage { text } => {
+                            AgentCommand::SendMessage { text, images } => {
                                 if self
                                     .process_send_message(
-                                        &mut convo, &mut cmd_rx, &mut pending, text,
+                                        &mut convo, &mut cmd_rx, &mut pending, text, images,
                                     )
                                     .await
                                 {
@@ -517,6 +517,7 @@ impl RunningAgent {
         cmd_rx: &mut UnboundedReceiver<AgentCommand>,
         pending: &mut std::collections::VecDeque<AgentCommand>,
         mut text: String,
+        images: Vec<ImageContent>,
     ) -> bool {
         if let Err(reason) = self.hooks.user_prompt_submit(&mut text).await {
             self.rt.emit(AgentEvent::Error { message: format!("prompt rejected: {reason}"), http_status: None, code: None });
@@ -533,7 +534,7 @@ impl RunningAgent {
         if let Some(trigger) = self.should_compact(convo) {
             self.run_compaction(convo, trigger).await;
         }
-        convo.push(Message::user(text));
+        convo.push(Message::user_with_images(text, images));
         // Per-turn cancellation token: Cancel fires it; run_turn polls it at the
         // stream, between tools, and inside execute. A CLONE also rides into each
         // ToolContext so cooperative tools can bail. SEAM 2: derived from the

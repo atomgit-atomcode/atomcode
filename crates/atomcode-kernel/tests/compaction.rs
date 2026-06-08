@@ -47,7 +47,7 @@ async fn drive_turn_collect(
     handle: &mut atomcode_kernel::agent::AgentHandle,
     text: &str,
 ) -> Vec<AgentEvent> {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
     let mut events = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         let done = matches!(ev, AgentEvent::TurnComplete { .. });
@@ -198,27 +198,29 @@ async fn injected_strategy_compacts_at_task_boundary() {
     // The turn-2 first request history is SHORTER than the un-compacted history
     // WOULD have been (turn-1 end + the one new user message), leads with the
     // byte-identical System message, and contains a synthetic Role::User summary.
-    let recorded = calls.lock().unwrap();
-    let turn2_first = &recorded[recorded.len() - 1].0; // first call of turn 2
-    let would_be_uncompacted = end_turn1_len + 1; // +1 for the new user message
-    assert!(
-        turn2_first.len() < would_be_uncompacted,
-        "compacted turn-2 history ({}) must be shorter than the un-compacted {} (turn-1 end {} + 1 user)",
-        turn2_first.len(),
-        would_be_uncompacted,
-        end_turn1_len
-    );
-    // Frozen system prefix preserved byte-identically across the compaction epoch.
-    assert_eq!(turn2_first[0].role, Role::System);
-    assert_eq!(system_turn1.text, turn2_first[0].text, "System message must be byte-identical");
-    assert_eq!(turn2_first[0].text, PERSONA);
-    // A synthetic Role::User summary is present.
-    let has_synth_summary = turn2_first
-        .iter()
-        .any(|m| m.role == Role::User && m.synthetic && m.text.contains("summary of"));
-    assert!(has_synth_summary, "a synthetic Role::User summary must be present after compaction");
+    // Scope the MutexGuard so it drops BEFORE the await below (clippy await_holding_lock).
+    {
+        let recorded = calls.lock().unwrap();
+        let turn2_first = &recorded[recorded.len() - 1].0; // first call of turn 2
+        let would_be_uncompacted = end_turn1_len + 1; // +1 for the new user message
+        assert!(
+            turn2_first.len() < would_be_uncompacted,
+            "compacted turn-2 history ({}) must be shorter than the un-compacted {} (turn-1 end {} + 1 user)",
+            turn2_first.len(),
+            would_be_uncompacted,
+            end_turn1_len
+        );
+        // Frozen system prefix preserved byte-identically across the compaction epoch.
+        assert_eq!(turn2_first[0].role, Role::System);
+        assert_eq!(system_turn1.text, turn2_first[0].text, "System message must be byte-identical");
+        assert_eq!(turn2_first[0].text, PERSONA);
+        // A synthetic Role::User summary is present.
+        let has_synth_summary = turn2_first
+            .iter()
+            .any(|m| m.role == Role::User && m.synthetic && m.text.contains("summary of"));
+        assert!(has_synth_summary, "a synthetic Role::User summary must be present after compaction");
+    }
 
-    drop(recorded);
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 }
@@ -564,7 +566,7 @@ async fn mid_turn_snapshot_is_queued_and_delivered_after_turn() {
     // LATE-BIND the session's command sender into the tool now that it exists.
     *deferred.lock().unwrap() = Some(handle.commands.clone());
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
 
     // Read events: the turn completes FIRST, then the queued Snapshot is drained
     // and an AgentEvent::Snapshot arrives. If the mid-turn Snapshot were dropped
@@ -607,7 +609,7 @@ async fn mid_turn_send_message_runs_after_current_turn() {
     reg.register(Arc::new(EchoTool));
     reg.register(Arc::new(InjectCommandTool::new(
         deferred.clone(),
-        AgentCommand::SendMessage { text: "SECOND-PROMPT".into() },
+        AgentCommand::SendMessage { text: "SECOND-PROMPT".into(), images: vec![] },
     )));
 
     let provider = Arc::new(
@@ -638,7 +640,7 @@ async fn mid_turn_send_message_runs_after_current_turn() {
         .spawn();
     *deferred.lock().unwrap() = Some(handle.commands.clone());
 
-    handle.commands.send(AgentCommand::SendMessage { text: "FIRST-PROMPT".into() }).unwrap();
+    handle.commands.send(AgentCommand::SendMessage { text: "FIRST-PROMPT".into(), images: vec![] }).unwrap();
 
     // Expect TWO TurnComplete events: turn 1, then the drained mid-turn SendMessage's
     // turn 2. If the mid-turn SendMessage were dropped (the old no-op), only ONE
