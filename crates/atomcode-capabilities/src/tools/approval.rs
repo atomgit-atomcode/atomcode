@@ -71,10 +71,13 @@ impl InMemoryPermissionStore {
 
 impl PermissionStore for InMemoryPermissionStore {
     fn is_granted(&self, key: &str) -> bool {
-        self.granted.lock().unwrap().contains(key)
+        // Poison-recover instead of unwrap: an approval gate runs in the tool path and
+        // MUST NOT panic (the kernel runs panic=abort). The critical section only touches
+        // an infallible HashSet, so the guarded set is never left inconsistent.
+        self.granted.lock().unwrap_or_else(|e| e.into_inner()).contains(key)
     }
     fn grant(&self, key: &str) {
-        self.granted.lock().unwrap().insert(key.to_string());
+        self.granted.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string());
     }
 }
 

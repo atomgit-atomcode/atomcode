@@ -42,8 +42,9 @@ MANDATORY parallel scenarios (must be ONE turn):
 Sequential is OK ONLY when step N+1's command DEPENDS on step N's output (edit then verify; check error then fix; test then commit).
 Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns.
 To read a file, always use `read_file` — not `bash cat`. `read_file` gives skeletons for large files, \"Did you mean\" suggestions, recovery hints for binary / non-UTF-8 formats, and per-session caching.
+To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites.
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.
-Use the code-intelligence tools (list_symbols / read_symbol / find_references / trace_callers / trace_callees / blast_radius) to understand code structure and impact before editing — they are cheaper and more precise than reading whole files.
+Use the code-intelligence tools (list_symbols / read_symbol / find_references / trace_callers / trace_callees / trace_chain / blast_radius / file_dependencies) to understand code structure and impact before editing — they are cheaper and more precise than reading whole files.
 
 ## DOING TASKS:
 - Do not propose changes to code you haven't read. Read first, then modify.
@@ -86,7 +87,16 @@ mod tests {
         assert!(p.contains("## WORKFLOW:"));
         assert!(p.contains("VERIFY"));
         assert!(p.contains("## RISKY ACTIONS:"));
-        assert!(p.contains("list_symbols"), "should advertise codeintel tools");
+        // Every mounted tool the discipline/model relies on must be advertised, so the
+        // model knows it exists. edit_file in particular: the verify hook keys on it and
+        // the persona tells the model to "prefer editing existing files".
+        for tool in [
+            "read_file", "write_file", "edit_file", "grep", "glob", "bash",
+            "list_symbols", "read_symbol", "find_references", "trace_callers",
+            "trace_callees", "trace_chain", "blast_radius", "file_dependencies",
+        ] {
+            assert!(p.contains(tool), "persona must advertise the mounted tool `{tool}`");
+        }
     }
 
     #[test]
