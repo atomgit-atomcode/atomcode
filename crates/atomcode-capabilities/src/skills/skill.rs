@@ -28,48 +28,73 @@ impl Skill {
     /// `${CLAUDE_SESSION_ID}`, `${CLAUDE_SKILL_DIR}`, and `` !`cmd` `` (shell pre-exec).
     pub fn expand(&self, arguments: &str, session_id: &str) -> String {
         let positional: Vec<&str> = arguments.split_whitespace().collect();
-        let mut result = self.template.clone();
+        let skill_dir = self.skill_dir.to_string_lossy();
 
-        for (i, arg) in positional.iter().enumerate() {
-            result = result.replace(&format!("$ARGUMENTS[{i}]"), arg);
+        // SINGLE left-to-right pass: each substitution's value is emitted literally and
+        // never re-scanned — so an argument that itself contains `$1` is NOT re-expanded.
+        let t = self.template.as_str();
+        let mut result = String::with_capacity(t.len());
+        let mut i = 0;
+        while i < t.len() {
+            let rest = &t[i..];
+            if let Some((value, len)) = match_substitution(rest, &positional, arguments, session_id, skill_dir.as_ref()) {
+                result.push_str(value);
+                i += len;
+            } else {
+                let ch = rest.chars().next().unwrap();
+                result.push(ch);
+                i += ch.len_utf8();
+            }
         }
-        for (i, arg) in positional.iter().enumerate() {
-            result = replace_positional_short(&result, i, arg);
-        }
-        // Check the ORIGINAL template for $ARGUMENTS so $ARGUMENTS[N]-only templates are
-        // treated as "handled" (no append); $N-only templates still get args appended.
-        if self.template.contains("$ARGUMENTS") {
-            result = result.replace("$ARGUMENTS", arguments);
-        } else if !arguments.trim().is_empty() {
+        // A template with no `$ARGUMENTS` token at all still gets the full args appended.
+        if !self.template.contains("$ARGUMENTS") && !arguments.trim().is_empty() {
             result = format!("{}\n\nARGUMENTS: {}", result.trim_end(), arguments);
         }
-        result = result.replace("${CLAUDE_SESSION_ID}", session_id);
-        result = result.replace("${CLAUDE_SKILL_DIR}", &self.skill_dir.to_string_lossy());
         expand_shell_injections(&result)
     }
 }
 
-/// Replace `$N` only when not followed by another digit (so `$1` ≠ inside `$10`).
-fn replace_positional_short(s: &str, n: usize, replacement: &str) -> String {
-    let pattern = format!("${n}");
-    let pat = pattern.as_bytes();
-    let src = s.as_bytes();
-    let mut out = Vec::with_capacity(s.len());
-    let mut i = 0;
-    while i < src.len() {
-        if src[i..].starts_with(pat) {
-            let after = i + pat.len();
-            let next_is_digit = src.get(after).map(u8::is_ascii_digit).unwrap_or(false);
-            if !next_is_digit {
-                out.extend_from_slice(replacement.as_bytes());
-                i += pat.len();
-                continue;
+/// Match a substitution token at the START of `rest`; returns `(replacement, consumed)`.
+/// Longest-token-first; only DEFINED positional indices substitute (others stay literal,
+/// matching production). `$N` consumes a maximal digit run (so `$10` ≠ `$1` + `0`).
+fn match_substitution<'a>(
+    rest: &str,
+    positional: &[&'a str],
+    arguments: &'a str,
+    session_id: &'a str,
+    skill_dir: &'a str,
+) -> Option<(&'a str, usize)> {
+    if let Some(after) = rest.strip_prefix("$ARGUMENTS[") {
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() && after[digits.len()..].starts_with(']') {
+            if let Ok(n) = digits.parse::<usize>() {
+                if n < positional.len() {
+                    return Some((positional[n], "$ARGUMENTS[".len() + digits.len() + 1));
+                }
             }
         }
-        out.push(src[i]);
-        i += 1;
+        return None; // malformed / out-of-range → literal
     }
-    String::from_utf8_lossy(&out).into_owned()
+    if rest.starts_with("${CLAUDE_SESSION_ID}") {
+        return Some((session_id, "${CLAUDE_SESSION_ID}".len()));
+    }
+    if rest.starts_with("${CLAUDE_SKILL_DIR}") {
+        return Some((skill_dir, "${CLAUDE_SKILL_DIR}".len()));
+    }
+    if rest.starts_with("$ARGUMENTS") {
+        return Some((arguments, "$ARGUMENTS".len()));
+    }
+    if let Some(after) = rest.strip_prefix('$') {
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            if let Ok(n) = digits.parse::<usize>() {
+                if n < positional.len() {
+                    return Some((positional[n], 1 + digits.len()));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Replace each `` !`cmd` `` with the command's trimmed stdout (sh -c). Stops on an
@@ -119,8 +144,8 @@ struct Frontmatter {
 }
 
 fn fm_value(s: &str) -> String {
-    let t = s.trim();
-    t.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(t).to_string()
+    // Strip a surrounding pair of double OR single quotes (production parity).
+    s.trim().trim_matches('"').trim_matches('\'').to_string()
 }
 
 /// Parse `---`-delimited frontmatter; returns `(Frontmatter, body)`. Absent/unclosed
@@ -143,7 +168,8 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
         } else if let Some(v) = line.strip_prefix("description:") {
             fm.description = fm_value(v);
         } else if let Some(v) = line.strip_prefix("allowed-tools:") {
-            fm.allowed_tools = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            // AgentSkills spec is space-delimited; also accept commas (Claude Code compat).
+            fm.allowed_tools = v.split([' ', ',']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         }
     }
     (fm, body.to_string())
@@ -151,6 +177,13 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
 
 /// Locate the closing `---`. Returns `(offset_of_close_newline, bytes_to_skip)`.
 fn find_frontmatter_close(after_open: &str) -> Option<(usize, usize)> {
+    // Closing delimiter at EOF with no trailing newline (empty / minimal frontmatter).
+    if after_open == "---" {
+        return Some((0, 3));
+    }
+    if after_open == "---\r" {
+        return Some((0, 4));
+    }
     if after_open.starts_with("---\n") {
         return Some((0, 4)); // empty frontmatter
     }
@@ -299,6 +332,33 @@ mod tests {
         let (fm, body) = parse_frontmatter("just a template\nmore");
         assert!(fm.name.is_none());
         assert_eq!(body, "just a template\nmore");
+    }
+
+    #[test]
+    fn argument_containing_dollar_token_is_not_re_expanded() {
+        // arg0 is the literal "$1"; the single pass must NOT re-expand it into arg1.
+        let out = skill("a=$0 b=$1").expand("$1 V", "");
+        assert!(out.starts_with("a=$1 b=V"), "{out}");
+    }
+
+    #[test]
+    fn out_of_range_positional_stays_literal() {
+        let out = skill("x=$5").expand("a b", "");
+        assert!(out.starts_with("x=$5"), "undefined $5 stays literal: {out}");
+    }
+
+    #[test]
+    fn frontmatter_single_quotes_and_space_tools() {
+        let (fm, _) = parse_frontmatter("---\nname: 'my-skill'\nallowed-tools: read_file bash grep\n---\nbody\n");
+        assert_eq!(fm.name.as_deref(), Some("my-skill"));
+        assert_eq!(fm.allowed_tools, vec!["read_file".to_string(), "bash".to_string(), "grep".to_string()]);
+    }
+
+    #[test]
+    fn frontmatter_close_at_eof() {
+        let (fm, body) = parse_frontmatter("---\ndescription: x\n---");
+        assert_eq!(fm.description, "x");
+        assert_eq!(body, "");
     }
 
     #[test]
