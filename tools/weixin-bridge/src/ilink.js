@@ -16,6 +16,16 @@ export function buildHeaders(botToken) {
   return h;
 }
 
+// 真实 fetch 的 Response 带布尔 ok；非 2xx 时把状态码暴露成清晰错误，
+// 而不是让上层对错误体做 res.json() 抛出不透明的 SyntaxError。
+// 测试 mock 不含 ok 字段(undefined)，此时跳过检查。
+async function ensureOk(res, path) {
+  if (res.ok === false) {
+    throw new Error(`iLink ${path} HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
 export class IlinkClient {
   constructor({ baseUrl, fetchImpl, channelVersion = '1.0.2' } = {}) {
     this.baseUrl = baseUrl;
@@ -27,7 +37,7 @@ export class IlinkClient {
 
   async _get(path) {
     const res = await this.fetch(`${this.baseUrl}/${path}`, { headers: buildHeaders(this.token) });
-    return res.json();
+    return ensureOk(res, path);
   }
   async _post(path, body) {
     const res = await this.fetch(`${this.baseUrl}/${path}`, {
@@ -35,7 +45,7 @@ export class IlinkClient {
       headers: buildHeaders(this.token),
       body: JSON.stringify(body),
     });
-    return res.json();
+    return ensureOk(res, path);
   }
 
   getBotQrcode() { return this._get('ilink/bot/get_bot_qrcode?bot_type=3'); }

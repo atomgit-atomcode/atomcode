@@ -52,3 +52,10 @@ test('sendMessage 构造带 context_token 的 msg', async () => {
     },
   });
 });
+
+test('非 2xx 抛出带状态码的清晰错误', async () => {
+  const fetchImpl = async () => ({ ok: false, status: 401, json: async () => ({}) });
+  const c = new IlinkClient({ baseUrl: 'https://x', fetchImpl });
+  c.setToken('TOK');
+  await assert.rejects(() => c.getUpdates(''), /HTTP 401/);
+});

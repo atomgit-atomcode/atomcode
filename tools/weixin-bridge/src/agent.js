@@ -41,6 +41,12 @@ export class AgentClient {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message, session_id: sessionId, working_dir: workingDir }),
     });
+    // 非 2xx：daemon 出错时把它转成一条 onError，让用户在微信里看到反馈，
+    // 而不是 res.body 为 null 直接 getReader() 崩、或消息静默消失。
+    if (res.ok === false) {
+      dispatch({ type: 'error', message: `daemon /chat HTTP ${res.status}` }, handlers);
+      return;
+    }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';

@@ -24,6 +24,11 @@ npm run smoke
 npm test
 ```
 
+## 已知约束（PoC）
+- 审批进行中（收到「回复 y 同意 / n 拒绝」后），你的**下一条消息会被当成审批答复**（y→同意，其它→拒绝），不会开启新对话。请先回完 y/n 再发新请求。
+- HTTP 非 2xx 会作为错误暴露：iLink 报错（如 token 失效 401）会在日志打印 `HTTP 4xx/5xx`；daemon `/chat` 报错会回一条「出错了：…」到微信。
+
 ## 故障
 - token 失效 / 想重新登录：删除 `~/.atomcode/weixin/bot.json` 后重跑，会重新扫码。
 - 收不到消息：确认 `allowlist` 含你的 `from_user_id`（或先留空放行所有人）。
+- 日志反复打印 `getUpdates 失败 … HTTP 401`：token 已失效，按上一条重新登录。

@@ -47,3 +47,11 @@ test('sendPermission POST 正确 body', async () => {
   assert.equal(captured.url, 'http://d/chat/permission');
   assert.deepEqual(JSON.parse(captured.opts.body), { session_id: 's1', decision: 'allow' });
 });
+
+test('streamChat 非 2xx 走 onError 且不崩', async () => {
+  const fetchImpl = async () => ({ ok: false, status: 500 });
+  const c = new AgentClient({ baseUrl: 'http://d', fetchImpl });
+  let errMsg;
+  await c.streamChat({ message: 'hi' }, { onError: (m) => { errMsg = m; } });
+  assert.match(errMsg, /500/);
+});
