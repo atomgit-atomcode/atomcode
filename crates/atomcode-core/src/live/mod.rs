@@ -91,10 +91,16 @@ pub struct LiveSession {
 impl LiveSession {
     /// 用注入的执行器与初始消息建会话，并 spawn 协调器任务。返回 `Arc` 以便多视图共享。
     pub fn new(executor: Arc<dyn TurnExecutor>, initial: Vec<Message>) -> Arc<Self> {
+        Self::new_with_cold_summaries(executor, initial, Vec::new())
+    }
+
+    pub fn new_with_cold_summaries(
+        executor: Arc<dyn TurnExecutor>,
+        initial: Vec<Message>,
+        cold_summaries: Vec<String>,
+    ) -> Arc<Self> {
         let conversation = Arc::new(Mutex::new({
-            let mut c = Conversation::new();
-            c.messages = initial.clone();
-            c
+            Conversation::from_messages_and_cold_summaries(initial.clone(), cold_summaries)
         }));
         let snapshot = Arc::new(Mutex::new(initial));
         let (events, _rx) = broadcast::channel(BROADCAST_CAPACITY);

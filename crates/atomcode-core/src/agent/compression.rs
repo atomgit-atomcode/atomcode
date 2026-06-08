@@ -291,7 +291,7 @@ pub async fn maybe_compress_history(
     // the &mut conv borrow is released.
     let keep_ceiling = compaction_keep_ceiling(ctx, system_prompt, tools, &conv.cold_summaries).await;
     let plan = ctx.compression_plan(conv, keep_ceiling);
-    let (content, n_turns) = match plan {
+    let (content, n_msgs) = match plan {
         Some(p) => p,
         None => return,
     };
@@ -306,5 +306,5 @@ pub async fn maybe_compress_history(
         summary
     };
 
-    let _ = try_apply_compression(ctx, conv, system_prompt, n_turns, final_summary, post_compress_state);
+    let _ = try_apply_compression(ctx, conv, system_prompt, n_msgs, final_summary, post_compress_state);
 }

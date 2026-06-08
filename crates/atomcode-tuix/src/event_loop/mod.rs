@@ -817,7 +817,7 @@ pub struct LoopCtx {
     pub caps: crate::terminal::TerminalCaps,
     /// Session loaded by the CLI auto-continue path (`atomcode -c` /
     /// `--continue`). Replayed into scrollback AND restored into the
-    /// agent's model context via `AgentCommand::SetMessages` on first
+    /// agent's model context via `AgentCommand::SetConversation` on first
     /// `run_loop` entry, then dropped — matching `/resume` behaviour.
     pub replay_on_start: Option<atomcode_core::session::Session>,
     /// Lazy file/dir index for `@`-mention popup. Built on first `@`
@@ -2950,14 +2950,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // working dir (via `atomcode -c` / `--continue`), replay its messages
     // into scrollback AND restore the agent's model context so follow-up
     // questions can reference prior conversation. This mirrors the `/resume`
-    // slash command's behaviour: visual replay + AgentCommand::SetMessages.
+    // slash command's behaviour: visual replay + AgentCommand::SetConversation.
     if let Some(session) = ctx.replay_on_start.take() {
         if !session.messages.is_empty() {
             crate::modals::session_picker::replay_session(renderer, &session, false);
             // Sync messages into the agent loop so the LLM has full context.
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SetMessages(session.messages.clone()))
+                .send(AgentCommand::SetConversation(
+                    session.to_conversation_snapshot(),
+                ))
                 .ok();
             // Continue accumulating into the same session file — future
             // TurnComplete saves overwrite it instead of creating a new one.
@@ -6705,12 +6707,12 @@ fn handle_agent_event(
             let _ = name;
         }
         AgentEvent::ApprovalNeeded {
-            tool_name, call, messages, ..
+            tool_name, call, snapshot, ..
         } => {
             // Persist mid-turn messages to session so /bg can recover
             // the conversation even when the turn hasn't finished yet.
-            if !messages.is_empty() {
-                apply_session_messages(&mut ctx.current_session, messages);
+            if !snapshot.messages.is_empty() {
+                apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone());
             }
@@ -6799,7 +6801,7 @@ fn handle_agent_event(
             turn_count,
             tool_call_count,
             stop_reason,
-            messages,
+            snapshot,
         } => {
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
@@ -6861,7 +6863,7 @@ fn handle_agent_event(
             // sessions persist only `messages`, so without this the per-turn
             // token/duration numbers are lost on reload and turns butt together.
             ctx.current_session.turn_stats.push(atomcode_core::session::TurnStat {
-                after_message: messages.len(),
+                after_message: snapshot.messages.len(),
                 turn_count,
                 tool_call_count,
                 duration_ms: duration.as_millis() as u64,
@@ -6870,7 +6872,7 @@ fn handle_agent_event(
             });
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
-            persist_current_session(ctx, messages, renderer);
+            persist_current_session(ctx, snapshot, renderer);
 
             // CodingPlan usage refresh — fire after each completed turn
             // (with cooldown) so the right-aligned hint reflects the
@@ -6933,7 +6935,7 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
-        AgentEvent::TurnCancelled { messages } => {
+        AgentEvent::TurnCancelled { snapshot } => {
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
                 atomcode_core::notify::NotificationEvent::TurnFinished(
@@ -6980,19 +6982,19 @@ fn handle_agent_event(
             think.reset();
             // Save what we did have — a user who Ctrl+C'd mid-stream
             // should still be able to /resume the cleaned conversation.
-            persist_current_session(ctx, messages, renderer);
+            persist_current_session(ctx, snapshot, renderer);
         }
         AgentEvent::ConversationTruncated {
-            messages,
+            snapshot,
             restored_prompt,
             target_n,
             prompts_before,
         } => {
-            let new_len = messages.len();
+            let new_len = snapshot.messages.len();
             // Persist the truncated conversation: messages + prune stale
             // per-turn dividers (anchored by message-count) so /resume won't
             // replay dividers for removed turns.
-            ctx.current_session.messages = messages.clone();
+            ctx.current_session.update_from_conversation_snapshot(snapshot);
             ctx.current_session
                 .turn_stats
                 .retain(|s| s.after_message <= new_len);
@@ -7036,7 +7038,7 @@ fn handle_agent_event(
             renderer.render(UiLine::CommandOutput(line));
             renderer.flush();
         }
-        AgentEvent::Error { error, messages } => {
+        AgentEvent::Error { error, snapshot } => {
             renderer.render(UiLine::Error(error));
             renderer.flush();
             fixissue_pending.take();
@@ -7053,7 +7055,7 @@ fn handle_agent_event(
             // nothing for that conversation. Empty `messages` from
             // the streaming-error forwarder is treated as a no-op
             // by persist_current_session.
-            persist_current_session(ctx, messages, renderer);
+            persist_current_session(ctx, snapshot, renderer);
         }
         AgentEvent::Warning(w) => {
             // Non-fatal — flush a yellow advisory line and let the turn
@@ -7433,12 +7435,12 @@ fn handle_agent_event(
             }
             renderer.flush();
         }
-        AgentEvent::MessagesSync { messages } => {
+        AgentEvent::MessagesSync { snapshot } => {
             // Response to AgentCommand::SyncMessages. Persist the
             // snapshot to the current session so /bg can recover
             // the conversation state.
-            if !messages.is_empty() {
-                apply_session_messages(&mut ctx.current_session, messages);
+            if !snapshot.messages.is_empty() {
+                apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone());
             }
@@ -7509,13 +7511,13 @@ fn handle_agent_event(
 /// conversation is empty (don't save a blank session).
 fn persist_current_session(
     ctx: &mut LoopCtx,
-    messages: Vec<atomcode_core::conversation::message::Message>,
+    snapshot: atomcode_core::conversation::ConversationSnapshot,
     renderer: &mut dyn Renderer,
 ) {
-    if messages.is_empty() {
+    if snapshot.messages.is_empty() {
         return;
     }
-    apply_session_messages(&mut ctx.current_session, messages);
+    apply_session_snapshot(&mut ctx.current_session, snapshot);
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
     // Surface save failures instead of silently swallowing them.
@@ -7532,14 +7534,14 @@ fn persist_current_session(
     }
 }
 
-pub(crate) fn apply_session_messages(
+pub(crate) fn apply_session_snapshot(
     session: &mut atomcode_core::session::Session,
-    messages: Vec<atomcode_core::conversation::message::Message>,
+    snapshot: atomcode_core::conversation::ConversationSnapshot,
 ) {
-    if messages.is_empty() {
+    if snapshot.messages.is_empty() {
         return;
     }
-    session.messages = messages;
+    session.update_from_conversation_snapshot(snapshot);
     session.touch();
     // Triggers for renaming:
     //   * `default` / `session-<ts>` — never renamed yet
@@ -7587,10 +7589,10 @@ fn is_synthetic_user_text(text: &str) -> bool {
 
 #[cfg(test)]
 mod session_naming_tests {
-    use super::{apply_session_messages, is_synthetic_user_text};
+    use super::{apply_session_snapshot, is_synthetic_user_text};
 
     #[test]
-    fn apply_session_messages_renames_from_first_real_user() {
+    fn apply_session_snapshot_renames_from_first_real_user() {
         use atomcode_core::conversation::message::{Message, Role};
         let mut session = atomcode_core::session::Session::default_session(
             std::path::PathBuf::from("/tmp/project"),
@@ -7600,23 +7602,56 @@ mod session_naming_tests {
             Message::new(Role::User, "implement background sessions\nwith tests"),
         ];
 
-        apply_session_messages(&mut session, messages);
+        apply_session_snapshot(
+            &mut session,
+            atomcode_core::conversation::ConversationSnapshot {
+                messages,
+                cold_summaries: Vec::new(),
+            },
+        );
 
         assert_eq!(session.name, "implement background sessions");
         assert_eq!(session.messages.len(), 2);
     }
 
     #[test]
-    fn apply_session_messages_preserves_custom_name() {
+    fn apply_session_snapshot_preserves_custom_name() {
         use atomcode_core::conversation::message::{Message, Role};
         let mut session = atomcode_core::session::Session::default_session(
             std::path::PathBuf::from("/tmp/project"),
         );
         session.name = "manual name".to_string();
 
-        apply_session_messages(&mut session, vec![Message::new(Role::User, "new task")]);
+        apply_session_snapshot(
+            &mut session,
+            atomcode_core::conversation::ConversationSnapshot {
+                messages: vec![Message::new(Role::User, "new task")],
+                cold_summaries: Vec::new(),
+            },
+        );
 
         assert_eq!(session.name, "manual name");
+    }
+
+    #[test]
+    fn apply_session_snapshot_preserves_cold_summaries() {
+        use atomcode_core::conversation::{
+            message::{Message, Role},
+            ConversationSnapshot,
+        };
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+
+        apply_session_snapshot(
+            &mut session,
+            ConversationSnapshot {
+                messages: vec![Message::new(Role::User, "new task")],
+                cold_summaries: vec!["compressed context".to_string()],
+            },
+        );
+
+        assert_eq!(session.cold_summaries, vec!["compressed context"]);
     }
 
     #[test]

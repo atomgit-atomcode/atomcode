@@ -799,16 +799,14 @@ impl TurnRunner {
         //    (datalog `log_text`, ATLAS plan extraction, telemetry)
         //    see clean prose, not raw text_buf with leaked XML
         //    tool_call blocks.
+        // 5. If no tool calls, we're done — LLM produced text only.
+        //    Use the FILTERED accumulator so downstream consumers
+        //    (datalog `log_text`, ATLAS plan extraction, telemetry)
+        //    see clean prose, not raw text_buf with leaked XML
+        //    tool_call blocks. Earlier bug: 5-7 atomgr datalog
+        //    20-14-23 Turn 5 logged `### 3. 传输层安全<tool_call>grep
+        //    <arg_key>...` because Responded.text was raw.
         if tool_calls_buf.is_empty() {
-            // Trigger post-turn hooks for Responded, THEN emit telemetry.
-            // Order is load-bearing: tel_return! tracks the LlmChat event and
-            // returns, so any code after it never runs — the hooks must come
-            // first. Emitting via tel_return! (not a bare `return`) is what
-            // restores the LlmChat event for text-only turns; the previous bare
-            // return silently dropped it, so every text-only turn went
-            // unreported. visible_text_buf (filtered) is used so downstream
-            // consumers (datalog `log_text`, ATLAS plan extraction, telemetry)
-            // see clean prose, not raw text_buf with leaked <tool_call> XML.
             self.trigger_post_turn_hooks("Responded").await;
             tel_return!(
                 TurnResult::Responded {
@@ -992,7 +990,9 @@ impl TurnRunner {
             // Dup-in-batch was already short-circuited above (before the
             // ToolCallStarted emit), so by the time we reach here this is
             // a real, non-duplicate call to execute.
-            let result = self.execute_single_tool(call, event_tx, &cancel, &conversation.messages).await;
+            let result = self
+                .execute_single_tool(call, event_tx, &cancel, &conversation.snapshot())
+                .await;
             if active_batch_id.is_some() && result.success {
                 batch_ok_count += 1;
             }
@@ -1146,7 +1146,7 @@ impl TurnRunner {
         call: &ToolCall,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
         cancel: &CancellationToken,
-        conversation_messages: &[crate::conversation::message::Message],
+        conversation_snapshot: &crate::conversation::ConversationSnapshot,
     ) -> ToolResult {
         // Auto-fix common tool name aliases (models trained on other agents use different names)
         // Case-insensitive matching: models may output "Run", "Bash", "Edit_File", etc.
@@ -1307,13 +1307,13 @@ impl TurnRunner {
             let needs_prompt = !self.permission.will_auto_approve(call, &approval);
             if needs_prompt {
                 // Emit an informational event carrying a snapshot of
-                // conversation.messages so the TUI can persist mid-turn
+                // conversation state so the TUI can persist mid-turn
                 // session state (e.g. for `/bg`).
                 let _ = event_tx.send(TurnEvent::ApprovalRequested {
                     tool_name: call.name.clone(),
                     reason: reason.clone(),
                     call: call.clone(),
-                    messages: conversation_messages.to_vec(),
+                    snapshot: conversation_snapshot.clone(),
                 });
             }
 

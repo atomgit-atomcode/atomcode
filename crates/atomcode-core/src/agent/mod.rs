@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::conversation::Conversation;
+use crate::conversation::{Conversation, ConversationSnapshot};
 use crate::hook::HookEngine;
 use crate::provider::LlmProvider;
 use crate::skill::SkillRegistry;
@@ -69,8 +69,8 @@ pub enum AgentCommand {
     AppendInput(String),
     /// Clear conversation history.
     ClearConversation,
-    /// Set messages from a resumed session.
-    SetMessages(Vec<crate::conversation::message::Message>),
+    /// Set conversation state from a resumed session.
+    SetConversation(ConversationSnapshot),
     /// Bind the per-conversation session id (the session file's id) so the
     /// `x-atomcode-session-id` header tracks the persistent conversation
     /// identity. Sent by the UI whenever the current session is established
@@ -110,11 +110,10 @@ pub enum AgentCommand {
     /// or other change to plugin state. Cheap (just re-reads JSON files);
     /// does NOT touch provider/model state, unlike ReloadConfig.
     ReloadHooks,
-    /// Request a snapshot of the current conversation messages.
-    /// The agent responds with `AgentEvent::MessagesSync` carrying
-    /// `conversation.messages`. Used by the TUI before `/bg` to ensure
-    /// the session has up-to-date message history even when a turn is
-    /// still in progress (e.g. waiting for tool approval).
+    /// Request a snapshot of the current conversation state.
+    /// The agent responds with `AgentEvent::MessagesSync`. Used by the TUI
+    /// before `/bg` to ensure the session has up-to-date history even when
+    /// a turn is still in progress (e.g. waiting for tool approval).
     SyncMessages,
     /// Roll conversation memory back to just before the `nth` real user
     /// prompt (1-based). `None` targets the last prompt (bare `/undo`). The
@@ -235,11 +234,11 @@ pub enum AgentEvent {
         tool_name: String,
         reason: String,
         call: ToolCall,
-        /// Snapshot of `conversation.messages` at the time the approval
+        /// Snapshot of conversation state at the time the approval
         /// request was raised. Lets the TUI persist mid-turn session
         /// state (e.g. when `/bg` backgrounds a session that is waiting
         /// for approval).
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     },
     /// Token usage update.
     TokenUsage(crate::stream::TokenUsage),
@@ -256,23 +255,23 @@ pub enum AgentEvent {
         /// Why the loop stopped. `Natural` for ordinary completion; see
         /// TurnStopReason for budget / cancel / error variants.
         stop_reason: TurnStopReason,
-        /// Snapshot of the conversation messages at the moment the turn
+        /// Snapshot of the conversation state at the moment the turn
         /// ended. Mirrors `TurnCancelled.messages` so UIs have one uniform
         /// path for persisting session state on either terminal event.
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     },
     /// Turn was cancelled by user before completion.
     /// The conversation has been cleaned up - partial messages removed.
-    /// Contains the cleaned message list for TUI to sync.
+    /// Contains the cleaned conversation state for TUI to sync.
     TurnCancelled {
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     },
     /// Conversation memory was rolled back by `/undo`. Carries the truncated
     /// message list (for the TUI to persist + replay), the removed prompt's
     /// text (to restore into the input box), and turn numbers for the
     /// confirmation line (`target_n..=prompts_before` were removed).
     ConversationTruncated {
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
         restored_prompt: String,
         target_n: usize,
         prompts_before: usize,
@@ -281,11 +280,11 @@ pub enum AgentEvent {
     /// `available` real prompts exist (0 = nothing to undo).
     UndoFailed { requested: usize, available: usize },
     /// Response to `AgentCommand::SyncMessages`. Carries a snapshot of
-    /// `conversation.messages` at the time the agent processed the command.
+    /// conversation state at the time the agent processed the command.
     /// Used by the TUI to sync session state before backgrounding a session
     /// that is mid-turn (e.g. waiting for tool approval).
     MessagesSync {
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     },
     /// An error occurred. Carries a snapshot of `conversation.messages`
     /// so the TUI can persist mid-turn state even when the turn dies
@@ -298,7 +297,7 @@ pub enum AgentEvent {
     /// `handle_send_message` provides the full snapshot.
     Error {
         error: String,
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     },
     /// Non-fatal advisory from a provider or other subsystem. UI renders
     /// this as a one-line yellow banner; does not abort the turn.
@@ -1173,8 +1172,8 @@ impl AgentLoop {
                     // (cancelled) for unpaired tool calls, and mark turn as Completed.
                     self.conversation.cancel_current_turn();
                     // Sync the preserved messages to TUI
-                    let messages = self.conversation.messages.clone();
-                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { messages });
+                    let snapshot = self.conversation.snapshot();
+                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
                 }
                 AgentCommand::ApproveTool => {
                     // Approval handled inside run_turn_loop via channels
@@ -1304,16 +1303,11 @@ impl AgentLoop {
                         self.turn_runner.context.telemetry.set_session_id(uuid);
                     }
                 }
-                AgentCommand::SetMessages(messages) => {
-                    // Set messages from a resumed session.
-                    // Rebuild turn_tracker so the context builder can use
-                    // proper turn-based windowing instead of the fallback path.
-                    let turn_tracker =
-                        crate::conversation::turn::TurnTracker::rebuild(&messages);
-                    self.conversation.messages = messages;
-                    self.conversation.turn_tracker = turn_tracker;
+                AgentCommand::SetConversation(snapshot) => {
+                    // Set conversation state from a resumed session.
+                    self.conversation = Conversation::from_snapshot(snapshot);
                     // NOTE: deliberately do NOT regenerate session_id here.
-                    // SetMessages also fires on `-c`/`--continue` auto-restore
+                    // SetConversation also fires on `-c`/`--continue` auto-restore
                     // and `/resume` of the current session — those CONTINUE an
                     // existing conversation, so a new id would fragment one
                     // logical session into two on the gateway. Only an explicit
@@ -1325,7 +1319,7 @@ impl AgentLoop {
                     match self.conversation.undo_to_prompt(target) {
                         Some(restored_prompt) => {
                             let _ = self.event_tx.send(AgentEvent::ConversationTruncated {
-                                messages: self.conversation.messages.clone(),
+                                snapshot: self.conversation.snapshot(),
                                 restored_prompt,
                                 target_n: target,
                                 prompts_before: available,
@@ -1478,7 +1472,7 @@ impl AgentLoop {
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: "A background task is already running. Wait for it to finish."
                                 .to_string(),
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
                         });
                     } else {
                         let provider = self.turn_runner.provider.clone();
@@ -1563,8 +1557,8 @@ impl AgentLoop {
                     self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
                 }
                 AgentCommand::SyncMessages => {
-                    let messages = self.conversation.messages.clone();
-                    let _ = self.event_tx.send(AgentEvent::MessagesSync { messages });
+                    let snapshot = self.conversation.snapshot();
+                    let _ = self.event_tx.send(AgentEvent::MessagesSync { snapshot });
                 }
                 AgentCommand::Shutdown => {
                     // --- SessionEnd Hook ---
@@ -1602,7 +1596,7 @@ impl AgentLoop {
         if let Some(reason) = self.turn_runner.provider.availability_error() {
             let _ = self.event_tx.send(AgentEvent::Error {
                 error: reason.to_string(),
-                messages: self.conversation.messages.clone(),
+                snapshot: self.conversation.snapshot(),
             });
             self.finish_turn(TurnStopReason::Error);
             return;
@@ -1634,7 +1628,7 @@ impl AgentLoop {
             crate::hook::UserPromptHookResult::Block(reason) => {
                 let _ = self.event_tx.send(AgentEvent::Error {
                     error: format!("hook blocked: {}", reason),
-                    messages: self.conversation.messages.clone(),
+                    snapshot: self.conversation.snapshot(),
                 });
                 self.finish_turn(TurnStopReason::Error);
                 return;
@@ -2347,7 +2341,7 @@ impl AgentLoop {
                                     // turn_fut completes with the proper snapshot.
                                     let _ = event_tx.send(AgentEvent::Error {
                                         error: e,
-                                        messages: Vec::new(),
+                                        snapshot: ConversationSnapshot::default(),
                                     });
                                 }
                                 TurnEvent::Warning(w) => {
@@ -2364,15 +2358,15 @@ impl AgentLoop {
                                     // when the LLM is just navigating.
                                     let _ = event_tx.send(AgentEvent::WorkingDirChanged(new_dir));
                                 }
-                                TurnEvent::ApprovalRequested { tool_name, reason, call, messages } => {
+                                TurnEvent::ApprovalRequested { tool_name, reason, call, snapshot } => {
                                     // Forward approval request to TUI, including
-                                    // a snapshot of conversation.messages so the
+                                    // a snapshot of conversation state so the
                                     // TUI can persist mid-turn session state.
                                     let _ = event_tx.send(AgentEvent::ApprovalNeeded {
                                         tool_name,
                                         reason,
                                         call,
-                                        messages,
+                                        snapshot,
                                     });
                                     *phase = AgentPhase::WaitingApproval;
                                     let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
@@ -2700,7 +2694,7 @@ impl AgentLoop {
                         self.report_error("codingplan_unavailable", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return;
@@ -2743,7 +2737,7 @@ impl AgentLoop {
                         let shown = e.strip_prefix("[429] ").unwrap_or(&e).to_string();
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: shown,
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return;
@@ -2770,7 +2764,7 @@ impl AgentLoop {
                         self.report_error("auth_error", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return;
@@ -2789,7 +2783,7 @@ impl AgentLoop {
                         self.report_error("api_error", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return;
@@ -2805,8 +2799,8 @@ impl AgentLoop {
                     // Preserve completed content + backfill (cancelled) for unpaired tool calls
                     self.conversation.cancel_current_turn();
                     // Send TurnCancelled event for TUI to sync
-                    let messages = self.conversation.messages.clone();
-                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { messages });
+                    let snapshot = self.conversation.snapshot();
+                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
                     // Do finish_turn's bookkeeping WITHOUT emitting TurnComplete.
                     // TurnCancelled already tells the TUI the turn ended; emitting
                     // TurnComplete on top buffers a stale "✓ done · N rounds" line
@@ -3221,7 +3215,7 @@ impl AgentLoop {
             turn_count: self.turn_count,
             tool_call_count: self.tool_call_count,
             stop_reason,
-            messages: self.conversation.messages.clone(),
+            snapshot: self.conversation.snapshot(),
         });
         let _ = self
             .event_tx
@@ -4739,4 +4733,3 @@ mod hard_truncate_tests {
         assert_eq!(conv.messages.len(), 0);
     }
 }
-

@@ -1935,7 +1935,7 @@ async fn run_headless(
                 turn_count,
                 tool_call_count,
                 stop_reason,
-                messages: _,
+                ..
             } => {
                 close_thinking_line(&mut thinking_line_open);
                 atomcode_core::notify::notify_turn_finished(
@@ -1984,7 +1984,7 @@ async fn run_headless(
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
-            AgentEvent::Error { error, messages: _ } => {
+            AgentEvent::Error { error, .. } => {
                 close_thinking_line(&mut thinking_line_open);
                 // Always shown — errors are not noise.
                 eprintln!("[error] {}", error);

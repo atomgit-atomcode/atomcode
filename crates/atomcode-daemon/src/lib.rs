@@ -2160,11 +2160,7 @@ async fn process_chat_request(
     let perm_session_key = session.id.to_string();
 
     // Create conversation from session messages
-    let conversation = Arc::new(tokio::sync::Mutex::new({
-        let mut conv = Conversation::new();
-        conv.messages = session.messages.clone();
-        conv
-    }));
+    let conversation = Arc::new(tokio::sync::Mutex::new(session.to_conversation()));
     // 构造用户消息：带图走 MultiPart（vision）；模型不支持视觉时经 vision_preprocessor
     // 用 VL 模型把图片转文字（与 TUI/agent 行为一致）。无图则纯文本。
     {
@@ -2438,7 +2434,7 @@ async fn process_chat_request(
         // conversation should still be resumable via /resume.
         {
             let conv = conversation.lock().await;
-            session.messages = conv.messages.clone();
+            session.update_from_conversation(&conv);
             session.auto_name_from_messages();
             session.touch();
             if let Err(e) = session_manager.save(&session) {
@@ -2705,7 +2701,7 @@ async fn process_chat_request(
         if was_stopped {
             conv.cancel_current_turn();
         }
-        session.messages = conv.messages.clone();
+        session.update_from_conversation(&conv);
     }
     session.auto_name_from_messages();
     session.touch();

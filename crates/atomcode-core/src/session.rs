@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::conversation::message::{Message, Role};
+use crate::conversation::{
+    message::{Message, Role},
+    Conversation, ConversationSnapshot,
+};
 
 /// Unique identifier for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -82,6 +85,9 @@ pub struct Session {
     pub updated_at: u64,
     /// Conversation messages.
     pub messages: Vec<Message>,
+    /// Compressed summaries of older conversation history.
+    #[serde(default)]
+    pub cold_summaries: Vec<String>,
     /// True once the user has explicitly run `/rename`. Drives the
     /// session-name badge above the input box: auto-named sessions
     /// (default / session-* / first-message-derived) stay badge-less
@@ -110,6 +116,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            cold_summaries: Vec::new(),
             user_renamed: false,
             turn_stats: Vec::new(),
         }
@@ -124,6 +131,7 @@ impl Session {
             created_at: current_timestamp(),
             updated_at: current_timestamp(),
             messages: Vec::new(),
+            cold_summaries: Vec::new(),
             user_renamed: false,
             turn_stats: Vec::new(),
         }
@@ -136,6 +144,26 @@ impl Session {
         self.name = name;
         self.user_renamed = true;
         self.touch();
+    }
+
+    pub fn to_conversation(&self) -> Conversation {
+        Conversation::from_snapshot(self.to_conversation_snapshot())
+    }
+
+    pub fn update_from_conversation(&mut self, conversation: &Conversation) {
+        self.update_from_conversation_snapshot(conversation.snapshot());
+    }
+
+    pub fn to_conversation_snapshot(&self) -> ConversationSnapshot {
+        ConversationSnapshot {
+            messages: self.messages.clone(),
+            cold_summaries: self.cold_summaries.clone(),
+        }
+    }
+
+    pub fn update_from_conversation_snapshot(&mut self, snapshot: ConversationSnapshot) {
+        self.messages = snapshot.messages;
+        self.cold_summaries = snapshot.cold_summaries;
     }
 
     /// Auto-name an untouched session from the first real user message.
@@ -495,6 +523,44 @@ mod tests {
         let old = r#"{"id":"abc","name":"x","working_dir":"/tmp/x","created_at":0,"updated_at":0,"messages":[]}"#;
         let loaded: Session = serde_json::from_str(old).unwrap();
         assert!(loaded.turn_stats.is_empty());
+    }
+
+    #[test]
+    fn cold_summaries_round_trip_and_default_empty_for_old_sessions() {
+        let mut s = Session::new(PathBuf::from("/tmp/x"));
+        s.cold_summaries
+            .push("older compressed context".to_string());
+
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cold_summaries, vec!["older compressed context"]);
+
+        let old = r#"{"id":"abc","name":"x","working_dir":"/tmp/x","created_at":0,"updated_at":0,"messages":[]}"#;
+        let loaded: Session = serde_json::from_str(old).unwrap();
+        assert!(loaded.cold_summaries.is_empty());
+    }
+
+    #[test]
+    fn session_conversation_conversion_preserves_cold_summaries() {
+        let mut session = Session::new(PathBuf::from("/tmp/x"));
+        session
+            .messages
+            .push(Message::new(Role::User, "current task"));
+        session
+            .cold_summaries
+            .push("compressed history".to_string());
+
+        let mut conversation = session.to_conversation();
+        conversation
+            .cold_summaries
+            .push("new compressed history".to_string());
+
+        session.update_from_conversation(&conversation);
+
+        assert_eq!(
+            session.cold_summaries,
+            vec!["compressed history", "new compressed history"]
+        );
     }
 
     #[test]

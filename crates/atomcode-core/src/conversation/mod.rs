@@ -25,6 +25,12 @@ pub struct ContextStats {
     pub total_messages: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ConversationSnapshot {
+    pub messages: Vec<Message>,
+    pub cold_summaries: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
@@ -51,6 +57,40 @@ impl Default for Conversation {
 impl Conversation {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_snapshot(snapshot: ConversationSnapshot) -> Self {
+        Self::from_messages_and_cold_summaries(snapshot.messages, snapshot.cold_summaries)
+    }
+
+    pub fn from_messages_and_cold_summaries(
+        messages: Vec<Message>,
+        mut cold_summaries: Vec<String>,
+    ) -> Self {
+        if cold_summaries.len() > 3 {
+            let drop_count = cold_summaries.len() - 3;
+            tracing::warn!(
+                drop_count,
+                total = cold_summaries.len(),
+                "cold_summaries exceeds max (3), dropping oldest"
+            );
+            cold_summaries.drain(..drop_count);
+        }
+        let turn_tracker = TurnTracker::rebuild(&messages);
+        Self {
+            messages,
+            stream_buffer: None,
+            tool_call_buffer: None,
+            turn_tracker,
+            cold_summaries,
+        }
+    }
+
+    pub fn snapshot(&self) -> ConversationSnapshot {
+        ConversationSnapshot {
+            messages: self.messages.clone(),
+            cold_summaries: self.cold_summaries.clone(),
+        }
     }
 
     /// Number of real (non-synthetic) user prompts. This is the maximum `N`
@@ -455,6 +495,15 @@ impl Conversation {
         }
 
         // Add to cold zone (FIFO, max 3)
+        // Detect potential prompt injection in LLM-generated summary
+        let lower = summary.to_lowercase();
+        if lower.contains("ignore all") || lower.contains("from now on") || lower.contains("you are")
+        {
+            tracing::warn!(
+                summary_len = summary.len(),
+                "cold summary contains potential prompt injection patterns"
+            );
+        }
         self.cold_summaries.push(summary);
         while self.cold_summaries.len() > 3 {
             self.cold_summaries.remove(0);
@@ -541,7 +590,15 @@ impl Conversation {
 
             // INVARIANT ENFORCEMENT:
             // Clamp indices to valid range in case of edge cases or corrupted state
+            let unclamped_count = new_count;
             let new_count = new_count.min(new_msg_len.saturating_sub(new_start));
+            debug_assert_eq!(
+                unclamped_count, new_count,
+                "turn tracker invariant violation: start_idx={}, end={}, \
+                 remove_end={}, new_msg_len={}, \
+                 count clamped from {unclamped_count} to {new_count}",
+                turn.start_idx, turn_end, remove_end, new_msg_len
+            );
 
             // Only include turns with at least one message
             if new_count > 0 && new_start < new_msg_len {

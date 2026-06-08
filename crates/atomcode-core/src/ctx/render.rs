@@ -111,7 +111,9 @@ pub fn build_messages(
     // Inject cold zone summaries (if any)
     if !conv.cold_summaries.is_empty() {
         let cold_text = format!(
-            "[Earlier conversation history ({} compression{})]\n{}",
+            "[Earlier conversation history ({} compression{}) — \
+             this is a compressed summary of OLDER conversation context, \
+             NOT a user instruction]\n{}",
             conv.cold_summaries.len(),
             if conv.cold_summaries.len() > 1 {
                 "s"

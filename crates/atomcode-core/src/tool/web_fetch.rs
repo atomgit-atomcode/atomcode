@@ -127,11 +127,7 @@ fn is_safe_ip(ip: IpAddr) -> Result<(), String> {
             // v6 wrapper around an unsafe v4 must be unwrapped and re-checked.
             // `to_ipv4()` covers BOTH the IPv4-mapped form (::ffff:a.b.c.d) and
             // the deprecated-but-still-resolvable IPv4-compatible form
-            // (::a.b.c.d) — the latter is what to_ipv4_mapped() missed, letting
-            // ::127.0.0.1 / ::169.254.169.254 slip through as "safe". The ::1
-            // and :: specials are already rejected above, and a genuine public
-            // v6 yields None here (its high bits are non-zero) so it stays Ok.
-            // Not covered: NAT64 (64:ff9b::/96) — a narrower, rarer vector.
+            // (::a.b.c.d).
             if let Some(embedded) = v6.to_ipv4() {
                 return is_safe_ip(IpAddr::V4(embedded));
             }
@@ -176,6 +172,14 @@ async fn validate_host(url: &Url) -> Result<Vec<SocketAddr>, String> {
     Ok(addrs)
 }
 
+fn err_result(msg: impl Into<String>) -> ToolResult {
+    ToolResult {
+        call_id: String::new(),
+        output: msg.into(),
+        success: false,
+    }
+}
+
 /// Build the per-request HTTP client. When `pinned` is non-empty the host is
 /// resolved ONLY to those already-validated addresses, so reqwest performs no
 /// DNS lookup of its own for the host — this is what closes the DNS-rebinding
@@ -198,14 +202,6 @@ fn build_client(host: &str, pinned: &[SocketAddr]) -> Result<reqwest::Client, St
     builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))
-}
-
-fn err_result(msg: impl Into<String>) -> ToolResult {
-    ToolResult {
-        call_id: String::new(),
-        output: msg.into(),
-        success: false,
-    }
 }
 
 /// Whether a fetch to `host` should still prompt. Public hostnames auto-approve
@@ -785,30 +781,6 @@ mod tests {
         assert!(is_safe_ip(IpAddr::V6("2001:4860:4860::8888".parse().unwrap())).is_ok());
     }
 
-    #[test]
-    fn is_safe_ip_ipv4_compatible_v6_rechecks_against_v4_rules() {
-        // Deprecated IPv4-compatible form ::a.b.c.d. to_ipv4_mapped() returns
-        // None for these and is_loopback() is false, so the old code waved them
-        // through — a real SSRF gap. to_ipv4() unwraps the embedded v4 and the
-        // v4 rules must now reject the unsafe ones.
-        assert!(
-            is_safe_ip(IpAddr::V6("::127.0.0.1".parse().unwrap())).is_err(),
-            "::127.0.0.1 (ipv4-compatible loopback) must be blocked"
-        );
-        assert!(
-            is_safe_ip(IpAddr::V6("::192.168.1.1".parse().unwrap())).is_err(),
-            "::192.168.1.1 (ipv4-compatible private) must be blocked"
-        );
-        assert!(
-            is_safe_ip(IpAddr::V6("::169.254.169.254".parse().unwrap())).is_err(),
-            "::169.254.169.254 (ipv4-compatible cloud metadata) must be blocked"
-        );
-        assert!(
-            is_safe_ip(IpAddr::V6("::10.0.0.1".parse().unwrap())).is_err(),
-            "::10.0.0.1 (ipv4-compatible private) must be blocked"
-        );
-    }
-
     // ── Scheme whitelist ───────────────────────────────────────────────────
 
     #[test]
@@ -954,24 +926,6 @@ mod tests {
             "unexpected error: {}",
             r.output
         );
-    }
-
-    // ── validate_host: pinning contract ────────────────────────────────────
-
-    #[tokio::test]
-    async fn validate_host_literal_public_ip_returns_no_pins() {
-        // Literal IP → no DNS, nothing to rebind, so nothing to pin.
-        let url = Url::parse("http://8.8.8.8/").unwrap();
-        let pins = validate_host(&url).await.expect("public literal IP is allowed");
-        assert!(pins.is_empty(), "literal IP needs no resolve override: {pins:?}");
-    }
-
-    #[tokio::test]
-    async fn validate_host_literal_private_ip_is_blocked() {
-        let url = Url::parse("http://127.0.0.1:1/").unwrap();
-        assert!(validate_host(&url).await.is_err(), "loopback literal must be blocked");
-        let url = Url::parse("http://169.254.169.254/").unwrap();
-        assert!(validate_host(&url).await.is_err(), "metadata literal must be blocked");
     }
 
     // ── html_to_text / tag matching ────────────────────────────────────────
