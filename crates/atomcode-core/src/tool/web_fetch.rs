@@ -948,6 +948,24 @@ mod tests {
         );
     }
 
+    // ── validate_host: pinning contract ────────────────────────────────────
+
+    #[tokio::test]
+    async fn validate_host_literal_public_ip_returns_no_pins() {
+        // Literal IP → no DNS, nothing to rebind, so nothing to pin.
+        let url = Url::parse("http://8.8.8.8/").unwrap();
+        let pins = validate_host(&url).await.expect("public literal IP is allowed");
+        assert!(pins.is_empty(), "literal IP needs no resolve override: {pins:?}");
+    }
+
+    #[tokio::test]
+    async fn validate_host_literal_private_ip_is_blocked() {
+        let url = Url::parse("http://127.0.0.1:1/").unwrap();
+        assert!(validate_host(&url).await.is_err(), "loopback literal must be blocked");
+        let url = Url::parse("http://169.254.169.254/").unwrap();
+        assert!(validate_host(&url).await.is_err(), "metadata literal must be blocked");
+    }
+
     // ── html_to_text / tag matching ────────────────────────────────────────
 
     #[test]
