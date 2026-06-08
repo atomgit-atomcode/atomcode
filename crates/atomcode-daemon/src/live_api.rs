@@ -528,7 +528,7 @@ impl TurnExecutor for DaemonTurnExecutor {
                         .messages
                         .iter()
                         .rev()
-                        .find(|m| matches!(m.role, atomcode_core::conversation::message::Role::User))
+                        .find(|m| matches!(m.role, atomcode_core::conversation::message::Role::User) && !m.synthetic)
                         .and_then(|m| m.text())
                         .map(|text| {
                             if text.chars().count() > 200 {

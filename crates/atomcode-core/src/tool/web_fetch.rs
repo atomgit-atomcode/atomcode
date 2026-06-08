@@ -519,16 +519,12 @@ fn render_body(format: FetchFormat, is_html: bool, body: String) -> String {
 /// truncates at a UTF-8 char boundary and appends a note when over the limit.
 fn apply_char_cap(text: String, max_chars: Option<usize>) -> String {
     match max_chars {
-        Some(max) if text.len() > max => {
-            let mut end = max;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
+        Some(max) if text.chars().count() > max => {
+            let total_chars = text.chars().count();
+            let truncated: String = text.chars().take(max).collect();
             format!(
                 "{}\n\n[Truncated at {} chars, {} total]",
-                &text[..end],
-                max,
-                text.len()
+                truncated, max, total_chars
             )
         }
         _ => text,
@@ -773,6 +769,30 @@ mod tests {
         // ::ffff:8.8.8.8 is public — must pass
         let public_mapped = IpAddr::V6("::ffff:8.8.8.8".parse().unwrap());
         assert!(is_safe_ip(public_mapped).is_ok());
+    }
+
+    #[test]
+    fn is_safe_ip_ipv4_compatible_v6_rechecks_against_v4_rules() {
+        // Deprecated IPv4-compatible form ::a.b.c.d. to_ipv4_mapped() returns
+        // None for these, but to_ipv4() unwraps the embedded v4 and re-checks
+        // against v4 rules. This test prevents accidental regression to
+        // to_ipv4_mapped() which silently passes all such addresses.
+        assert!(
+            is_safe_ip(IpAddr::V6("::127.0.0.1".parse().unwrap())).is_err(),
+            "::127.0.0.1 (ipv4-compatible loopback) must be blocked"
+        );
+        assert!(
+            is_safe_ip(IpAddr::V6("::192.168.1.1".parse().unwrap())).is_err(),
+            "::192.168.1.1 (ipv4-compatible private) must be blocked"
+        );
+        assert!(
+            is_safe_ip(IpAddr::V6("::169.254.169.254".parse().unwrap())).is_err(),
+            "::169.254.169.254 (ipv4-compatible cloud metadata) must be blocked"
+        );
+        assert!(
+            is_safe_ip(IpAddr::V6("::10.0.0.1".parse().unwrap())).is_err(),
+            "::10.0.0.1 (ipv4-compatible private) must be blocked"
+        );
     }
 
     #[test]

@@ -244,7 +244,13 @@ impl WebSearchTool {
     async fn search_ddg(&self, query: &str, max: usize) -> ToolResult {
         // Use curl for the HTTP request — reqwest gets blocked by DuckDuckGo's
         // TLS fingerprint detection, but curl works reliably.
-        let query_encoded = query.replace(' ', "+");
+        // Encode the query value for application/x-www-form-urlencoded POST data.
+        // Spaces → `+`; `&`, `%`, `=` → percent-encoded to avoid malformed payloads.
+        let query_encoded = query
+            .replace('%', "%25")
+            .replace('&', "%26")
+            .replace('=', "%3D")
+            .replace(' ', "+");
         let curl_bin = if cfg!(target_os = "windows") {
             "curl.exe"
         } else {
