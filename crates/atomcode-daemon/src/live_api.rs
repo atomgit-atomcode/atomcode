@@ -514,7 +514,7 @@ impl TurnExecutor for DaemonTurnExecutor {
             let mut c = conv.lock().await;
             // 设置 telemetry mode：取 live_message 端点在 LIVE_MODE 写入的 client 来源，
             // 使本轮 turn 内 TurnRunner 发出的遥测事件携带正确的 envelope.mode。
-            let live_mode = *LIVE_MODE.lock().unwrap();
+            let live_mode = *LIVE_MODE.lock().unwrap_or_else(|e| e.into_inner());
             let scope_ctx = atomcode_telemetry::CurrentContext {
                 mode: live_mode,
                 session_id: uuid::Uuid::parse_str(self.session_id.as_str()).ok(),
@@ -532,7 +532,7 @@ impl TurnExecutor for DaemonTurnExecutor {
                         .and_then(|m| m.text())
                         .map(|text| {
                             if text.chars().count() > 200 {
-                                format!("TASK: {}...", text.chars().take(200).collect::<String>())
+                                format!("TASK: {}...", text.chars().take(197).collect::<String>())
                             } else {
                                 format!("TASK: {}", text)
                             }

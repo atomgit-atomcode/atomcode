@@ -2212,10 +2212,6 @@ async fn process_chat_request(
             conv.turn_tracker.on_user_message(idx);
         }
     }
-    // Capture the user message before req is consumed, so we can pass a
-    // lightweight task hint to post-compress state restoration.
-    let user_message = req.message.clone();
-
     // Build tool registry and context — use real telemetry from AppState (R11.1, R11.2, R11.3)
     let mut tool_context = ToolContext::with_telemetry(
         working_dir.clone(),
@@ -2479,18 +2475,32 @@ async fn process_chat_request(
                 // ── Context compression check before each turn ──
                 // Uses the same two-tier strategy as CLI (T1: tool_result stubs,
                 // T2: LLM summarization into cold zone).
+                // Task hint is extracted dynamically from the last non-synthetic
+                // user message so it stays current across multi-tool turns and
+                // includes VL-preprocessed image descriptions (matching live_api.rs).
                 {
-                    let task_hint = if user_message.chars().count() > 200 {
-                        format!(
-                            "TASK: {}...",
-                            user_message.chars().take(197).collect::<String>()
-                        )
-                    } else if !user_message.is_empty() {
-                        format!("TASK: {}", user_message)
-                    } else {
-                        String::new()
-                    };
-                    let state_hint = if task_hint.is_empty() { None } else { Some(task_hint.as_str()) };
+                    let task_hint = conv
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|m| {
+                            matches!(
+                                m.role,
+                                atomcode_core::conversation::message::Role::User
+                            ) && !m.synthetic
+                        })
+                        .and_then(|m| m.text())
+                        .map(|text| {
+                            if text.chars().count() > 200 {
+                                format!(
+                                    "TASK: {}...",
+                                    text.chars().take(197).collect::<String>()
+                                )
+                            } else {
+                                format!("TASK: {}", text)
+                            }
+                        });
+                    let state_hint = task_hint.as_deref();
                     atomcode_core::agent::compression::maybe_compress_history(
                         &*turn_runner.ctx,
                         &mut conv,
