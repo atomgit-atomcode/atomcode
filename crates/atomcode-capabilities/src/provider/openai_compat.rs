@@ -576,20 +576,37 @@ impl SseDecoder {
                         .push((String::new(), String::new(), String::new()));
                 }
                 let entry = &mut self.tool_calls[idx];
+                let mut delta_id: Option<String> = None;
+                let mut delta_name: Option<String> = None;
+                let mut delta_args = String::new();
                 if let Some(id) = tc.id {
                     if !id.is_empty() {
-                        entry.0 = id; // first non-empty wins (ModelScope sends "" later)
+                        entry.0 = id.clone(); // first non-empty wins (ModelScope sends "" later)
+                        delta_id = Some(id);
                     }
                 }
                 if let Some(f) = tc.function {
                     if let Some(name) = f.name {
                         if !name.is_empty() {
-                            entry.1 = name; // guard: GPT-5 repeats name as "" after chunk 1
+                            entry.1 = name.clone(); // guard: GPT-5 repeats name as "" after chunk 1
+                            delta_name = Some(name);
                         }
                     }
                     if let Some(args) = f.arguments {
                         entry.2.push_str(&args);
+                        delta_args = args;
                     }
+                }
+                // Emit the STREAMING fragment for live display — the WHOLE ToolCall is
+                // still buffered + emitted at finish_reason for EXECUTION. Skip a no-op
+                // fragment that carried nothing new this chunk.
+                if delta_id.is_some() || delta_name.is_some() || !delta_args.is_empty() {
+                    out.push(StreamEvent::ToolCallDelta {
+                        index: idx as u32,
+                        id: delta_id,
+                        name: delta_name,
+                        arguments: delta_args,
+                    });
                 }
             }
         }
@@ -933,6 +950,7 @@ mod tests {
                 StreamEvent::Reasoning(_) => "reason",
                 StreamEvent::TextDelta(_) => "text",
                 StreamEvent::ToolCall(_) => "tool",
+                StreamEvent::ToolCallDelta { .. } => "tooldelta",
                 StreamEvent::Usage(_) => "usage",
                 StreamEvent::ResponseId(_) => "response_id",
                 StreamEvent::Done { .. } => "done",
@@ -1045,12 +1063,48 @@ mod tests {
 
         let mut d = SseDecoder::new();
         let ev = d.feed(sse.as_bytes());
-        assert_eq!(kinds(&ev), vec!["reason", "text", "text", "tool", "usage", "done"]);
+        // The tool_calls delta chunk now also emits a streaming `tooldelta` fragment
+        // (live display) BEFORE the whole `tool` call is emitted at finish_reason.
+        assert_eq!(kinds(&ev), vec!["reason", "text", "text", "tooldelta", "tool", "usage", "done"]);
         let usage = ev
             .iter()
             .find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None })
             .unwrap();
         assert_eq!(usage.cached, 8);
+    }
+
+    #[test]
+    fn streaming_tool_call_emits_deltas_then_whole_call() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        // id+name arrive first, then arguments stream across two chunks.
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"search","arguments":"{\"q\":"}}]}}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]}}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()));
+
+        // Streaming fragments (live display): id/name on the first, args chunks on both.
+        let deltas: Vec<(u32, Option<String>, Option<String>, String)> = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallDelta { index, id, name, arguments } => {
+                    Some((*index, id.clone(), name.clone(), arguments.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0], (0, Some("c1".into()), Some("search".into()), "{\"q\":".into()));
+        assert_eq!(deltas[1], (0, None, None, "\"hi\"}".into()));
+
+        // The WHOLE call (execution) is emitted once at finish, args reassembled.
+        let whole: Vec<_> = ev
+            .iter()
+            .filter_map(|e| if let StreamEvent::ToolCall(c) = e { Some(c.clone()) } else { None })
+            .collect();
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].id, "c1");
+        assert_eq!(whole[0].name, "search");
+        assert_eq!(whole[0].arguments, "{\"q\":\"hi\"}");
     }
 
     #[test]

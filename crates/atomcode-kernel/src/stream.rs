@@ -36,6 +36,19 @@ pub enum StreamEvent {
     /// can echo the prior turn's reasoning back next turn (thinking models require it).
     Reasoning(String),
     ToolCall(ToolCall),
+    /// A STREAMING fragment of a tool call the model is still emitting. `index` groups
+    /// fragments of the SAME call (providers stream `tool_calls` by index); `id`/`name`
+    /// typically arrive in the first fragment; `arguments` is a PARTIAL chunk of the
+    /// JSON-arguments string. OBSERVATIONAL / display-only: the kernel forwards it as
+    /// `AgentEvent::ToolCallStreaming` for live UI but EXECUTES the WHOLE [`ToolCall`]
+    /// (still emitted separately at end). An adapter that cannot stream tool calls simply
+    /// never emits this — the complete-`ToolCall` path is entirely unchanged.
+    ToolCallDelta {
+        index: u32,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: String,
+    },
     Usage(TokenUsage),
     /// The provider's OWN response/completion id (opaque upstream handle, e.g. the
     /// OpenAI/DeepSeek `id`). Emitted ONCE when first seen, for cross-referencing the

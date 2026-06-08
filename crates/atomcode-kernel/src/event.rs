@@ -71,6 +71,16 @@ pub enum AgentEvent {
     /// A turn began (perception granularity).
     TurnStarted,
     TextDelta(String),
+    /// A STREAMING fragment of a tool call the model is still emitting — live display of
+    /// the tool name / arguments as they arrive. `index` groups fragments of the same
+    /// call. Purely observational: the tool is EXECUTED later (see `ToolStarted` + the
+    /// complete call); a driver may render the partial args or ignore this entirely.
+    ToolCallStreaming {
+        index: u32,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: String,
+    },
     ToolStarted { call: ToolCall },
     ToolResult { result: ToolResult },
     /// Generic middleware ↔ driver round-trip. Kernel is agnostic to kind/payload.

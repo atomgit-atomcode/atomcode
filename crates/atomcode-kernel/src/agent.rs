@@ -708,6 +708,12 @@ impl RunningAgent {
                         }
                     }
                     StreamEvent::ToolCall(c) => pending_calls.push(c),
+                    // Live DISPLAY of a tool call as it streams; the WHOLE call is still
+                    // collected via StreamEvent::ToolCall above for execution. Pure
+                    // forward — never touches pending_calls or the executed call.
+                    StreamEvent::ToolCallDelta { index, id, name, arguments } => {
+                        self.rt.emit(AgentEvent::ToolCallStreaming { index, id, name, arguments });
+                    }
                     StreamEvent::Usage(u) => usage = u,
                     StreamEvent::ResponseId(id) => response_id = Some(id),
                     // A mid-stream error CLEANLY FAILS the turn: surface it and end —
