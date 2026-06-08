@@ -13,7 +13,7 @@ use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Instant;
+use crate::clock::{Clock, SystemClock};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 /// Default kernel cap on a single tool result's `content` byte length.
@@ -181,6 +181,10 @@ pub struct Agent {
     /// `AgentBuilder::session_id`). Threaded into `TurnCtx`/`MessageMeta` so hooks and
     /// logs can correlate by session. The kernel never mints it.
     session_id: Option<Arc<str>>,
+    /// Injectable monotonic clock for the turn `elapsed_ms` sidecar — the kernel's one
+    /// TIME-determinism seam (default [`SystemClock`]; a `FixedClock` makes a run's
+    /// snapshots byte-reproducible for eval/replay). See [`crate::clock`].
+    clock: Arc<dyn Clock>,
 }
 
 impl Agent {
@@ -212,6 +216,7 @@ impl Agent {
             session_id: self.session_id,
             turn_counter: AtomicU64::new(0),
             request_counter: AtomicU64::new(0),
+            clock: self.clock,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -297,6 +302,8 @@ struct RunningAgent {
     /// Monotonic request counter (one LLM call). `fetch_add`ed once per round, unique
     /// across the whole session.
     request_counter: AtomicU64,
+    /// Injectable monotonic clock for `elapsed_ms` (see [`crate::clock`]).
+    clock: Arc<dyn Clock>,
 }
 
 impl RunningAgent {
@@ -605,7 +612,7 @@ impl RunningAgent {
                 max_rounds: self.max_rounds,
                 cache_epoch: convo.cache_epoch,
             };
-            let start = Instant::now();
+            let start = self.clock.now_millis();
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
             // READ-ONLY wire observation of the FINAL outgoing request (post
@@ -756,7 +763,7 @@ impl RunningAgent {
             .to_string();
             let meta = MessageMeta {
                 tokens: usage,
-                elapsed_ms: start.elapsed().as_millis() as u64,
+                elapsed_ms: self.clock.now_millis().saturating_sub(start),
                 ctx_window,
                 used_tokens,
                 utilization,
@@ -1013,6 +1020,8 @@ pub struct AgentBuilder {
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     /// Optional injected session identity for observability (see `Agent::session_id`).
     session_id: Option<Arc<str>>,
+    /// Injectable monotonic clock (see [`crate::clock`]). Default [`SystemClock`].
+    clock: Arc<dyn Clock>,
 }
 
 impl Default for AgentBuilder {
@@ -1053,6 +1062,9 @@ impl Default for AgentBuilder {
             working_dir: None,
             cancel_token: None,
             session_id: None,
+            // NEUTRAL default: the real monotonic clock. An eval/replay swaps in a
+            // FixedClock so the elapsed_ms sidecar (and thus snapshots) is reproducible.
+            clock: Arc::new(SystemClock::new()),
         }
     }
 }
@@ -1248,6 +1260,13 @@ impl AgentBuilder {
         self.session_id = Some(Arc::from(id.into()));
         self
     }
+    /// Inject a custom [`Clock`] — e.g. a [`FixedClock`](crate::clock::FixedClock) so the
+    /// turn `elapsed_ms` sidecar (and thus snapshots) is reproducible for eval/replay.
+    /// The default is [`SystemClock`]. Nothing else in the kernel reads time.
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -1270,6 +1289,7 @@ impl AgentBuilder {
             working_dir: self.working_dir,
             cancel_token: self.cancel_token,
             session_id: self.session_id,
+            clock: self.clock,
         }
     }
 }

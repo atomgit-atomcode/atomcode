@@ -5,6 +5,7 @@
 //! Phase A1 carries the proven hot-path code into. The kernel knows nothing
 //! about approval, persona, or code-intelligence.
 
+pub mod clock;
 pub mod message;
 pub mod tool;
 pub mod stream;
