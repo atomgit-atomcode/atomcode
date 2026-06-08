@@ -1,0 +1,16 @@
+{
+  "name": "weixin-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PoC bridge: WeChat (iLink Bot API) <-> atomcode daemon",
+  "scripts": {
+    "test": "node --test test/",
+    "smoke": "node src/smoke-echo.js",
+    "start": "node src/index.js"
+  },
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  }
+}

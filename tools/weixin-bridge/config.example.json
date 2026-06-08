@@ -1,0 +1,8 @@
+{
+  "ilinkBaseUrl": "https://ilinkai.weixin.qq.com",
+  "daemonBaseUrl": "http://127.0.0.1:13456",
+  "tokenPath": "~/.atomcode/weixin/bot.json",
+  "channelVersion": "1.0.2",
+  "workingDir": "/absolute/path/to/sandbox/workdir",
+  "allowlist": []
+}
