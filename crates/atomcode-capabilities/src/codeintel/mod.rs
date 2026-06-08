@@ -33,6 +33,12 @@ pub mod trace_callees;
 pub mod trace_callers;
 pub mod trace_chain;
 
+/// LSP diagnostics (spawns external language servers). Opt-in `lsp` feature.
+#[cfg(feature = "lsp")]
+pub mod diagnostics;
+#[cfg(feature = "lsp")]
+pub mod lsp;
+
 pub use blast_radius::BlastRadiusTool;
 pub use file_deps::FileDependenciesTool;
 pub use find_references::FindReferencesTool;
@@ -46,8 +52,29 @@ pub use trace_callees::TraceCalleesTool;
 pub use trace_callers::TraceCallersTool;
 pub use trace_chain::TraceChainTool;
 
+#[cfg(feature = "lsp")]
+pub use diagnostics::DiagnosticsTool;
+#[cfg(feature = "lsp")]
+pub use lsp::LspManager;
+
 /// Names of the code-intelligence tools — pass to
-/// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).
+/// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount). Includes
+/// `diagnostics` only when the `lsp` feature is enabled.
+#[cfg(feature = "lsp")]
+pub fn codeintel_tool_names() -> &'static [&'static str] {
+    &[
+        "list_symbols",
+        "read_symbol",
+        "find_references",
+        "trace_callers",
+        "trace_callees",
+        "trace_chain",
+        "blast_radius",
+        "file_dependencies",
+        "diagnostics",
+    ]
+}
+#[cfg(not(feature = "lsp"))]
 pub fn codeintel_tool_names() -> &'static [&'static str] {
     &[
         "list_symbols",
@@ -62,8 +89,8 @@ pub fn codeintel_tool_names() -> &'static [&'static str] {
 }
 
 /// Register all code-intelligence tools. The 5 graph tools SHARE one lazily-built
-/// [`CodeIndex`] (built on first use, rebuilt when files change); the symbol tools and
-/// `find_references` are stateless.
+/// [`CodeIndex`]; the symbol tools and `find_references` are stateless. With the `lsp`
+/// feature, the `diagnostics` tool (sharing one [`LspManager`]) is also registered.
 pub fn register_codeintel_tools(reg: &mut ToolRegistry) {
     reg.register(Arc::new(ListSymbolsTool));
     reg.register(Arc::new(ReadSymbolTool));
@@ -74,6 +101,8 @@ pub fn register_codeintel_tools(reg: &mut ToolRegistry) {
     reg.register(Arc::new(TraceChainTool::new(index.clone())));
     reg.register(Arc::new(BlastRadiusTool::new(index.clone())));
     reg.register(Arc::new(FileDependenciesTool::new(index)));
+    #[cfg(feature = "lsp")]
+    reg.register(Arc::new(DiagnosticsTool::new(Arc::new(LspManager::new()))));
 }
 
 // Local path/result helpers (kept independent of the `tools` feature).

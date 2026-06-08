@@ -37,6 +37,9 @@ tree-sitter-cpp = { version = "0.23", optional = true }
 tree-sitter-c-sharp = { version = "0.23", optional = true }
 tree-sitter-html = { version = "0.23", optional = true }
 tree-sitter-php = { version = "0.24", optional = true }
+# `lsp` capability deps: detect whether a language server is installed + file:// URIs.
+which = { version = "7", optional = true }
+url = { version = "2", optional = true }
 
 [features]
 default = ["provider", "tools"]
@@ -55,6 +58,11 @@ codeintel = [
     # the cross-file graph layer (build_graph) walks the repo gitignore-aware
     "dep:ignore",
 ]
+# LSP diagnostics (spawns external language servers, JSON-RPC over stdio). Opt-in on top
+# of codeintel; needs the language servers installed (graceful "not available" if not).
+lsp = ["codeintel", "dep:which", "dep:url", "tokio/process", "tokio/io-util", "tokio/fs"]
+# Real-server LSP e2e (needs rust-analyzer etc. installed) — default-off, on demand.
+lsp-e2e = ["lsp"]
 # E2E tests that hit a REAL provider (network + API key). Separate from the default
 # suite; run on demand: `cargo test -p atomcode-capabilities --features e2e --test e2e`.
 e2e = ["provider"]
