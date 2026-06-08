@@ -97,3 +97,8 @@ build-official-vscode.sh
 
 # git worktrees
 .worktrees/
+
+extensions/vscode/webview/webview.css
+extensions/vscode/webview/webview.css.map
+extensions/vscode/webview/webview.js
+extensions/vscode/webview/webview.js.map
