@@ -567,15 +567,20 @@ impl TurnExecutor for DaemonTurnExecutor {
         let _ = forward.await;
 
         // 每轮结束后持久化会话（稳定 id → 覆盖同一文件，一会话=一条记录）。
+        // 加载已有 session 以保留 turn_stats 等累积字段，而非每轮 Session::new()
+        // 重置为空。process_chat_request 采用相同模式复用 session 对象。
         {
             use atomcode_core::session::{Session, SessionManager};
             let conv_guard = conv.lock().await;
-            let mut session = Session::new(self.working_dir.clone());
+            let manager = SessionManager::new(&self.working_dir);
+            let mut session = manager
+                .load(&self.session_id)
+                .unwrap_or_else(|_| Session::new(self.working_dir.clone()));
             session.id = self.session_id.clone();
             session.update_from_conversation(&conv_guard);
             session.auto_name_from_messages();
             session.touch();
-            if let Err(e) = SessionManager::new(&self.working_dir).save(&session) {
+            if let Err(e) = manager.save(&session) {
                 eprintln!("Warning: failed to save live session: {e}");
             }
         }

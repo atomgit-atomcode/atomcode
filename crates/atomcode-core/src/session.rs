@@ -564,6 +564,51 @@ mod tests {
     }
 
     #[test]
+    fn session_reload_preserves_turn_stats_across_saves() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        // Simulate first turn: create + save with turn_stats
+        let mut s = Session::new(wd.clone());
+        s.id = SessionId::from_string("test-turn-accum".to_string());
+        s.messages.push(Message::new(Role::User, "hello"));
+        s.turn_stats.push(TurnStat {
+            after_message: 1,
+            duration_ms: 500,
+            total_tokens: 100,
+            tool_call_count: 0,
+            turn_count: 1,
+            errored: false,
+        });
+        s.touch();
+        manager.save(&s).unwrap();
+
+        // Simulate second turn: load existing, update, save — should keep first turn_stats
+        let mut loaded = manager.load(&s.id).unwrap();
+        assert_eq!(loaded.turn_stats.len(), 1, "first turn_stats must survive load");
+        loaded.messages.push(Message::new(Role::Assistant, "hi back"));
+        loaded.turn_stats.push(TurnStat {
+            after_message: 2,
+            duration_ms: 300,
+            total_tokens: 50,
+            tool_call_count: 1,
+            turn_count: 2,
+            errored: false,
+        });
+        loaded.touch();
+        manager.save(&loaded).unwrap();
+
+        // Reload: both turn_stats must still be there
+        let reloaded = manager.load(&s.id).unwrap();
+        assert_eq!(reloaded.turn_stats.len(), 2, "accumulated turn_stats must survive save/load cycle");
+        assert_eq!(reloaded.turn_stats[0].after_message, 1);
+        assert_eq!(reloaded.turn_stats[1].after_message, 2);
+        assert_eq!(reloaded.messages.len(), 2);
+    }
+
+    #[test]
     fn test_session_new() {
         let session = Session::new(PathBuf::from("/tmp/test"));
         assert!(!session.id.0.is_empty());

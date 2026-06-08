@@ -2369,8 +2369,9 @@ async fn process_chat_request(
         )
     };
     // Same ctx selection as interactive AgentLoop: walk config.providers
-    // for the active provider, fallback to synthetic 128K config if absent.
-    let daemon_ctx = match config.providers.get(&config.default_provider) {
+    // for the active provider (the one actually selected for this turn,
+    // not config.default_provider), fallback to synthetic 128K config if absent.
+    let daemon_ctx = match config.providers.get(&provider_name) {
         Some(pc) => atomcode_core::ctx::for_provider(pc),
         None => {
             atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {

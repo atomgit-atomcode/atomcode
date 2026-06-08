@@ -986,7 +986,7 @@ impl TurnRunner {
             // ToolCallStarted emit), so by the time we reach here this is
             // a real, non-duplicate call to execute.
             let result = self
-                .execute_single_tool(call, event_tx, &cancel, &conversation.snapshot())
+                .execute_single_tool(call, event_tx, &cancel, &conversation)
                 .await;
             if active_batch_id.is_some() && result.success {
                 batch_ok_count += 1;
@@ -1141,7 +1141,7 @@ impl TurnRunner {
         call: &ToolCall,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
         cancel: &CancellationToken,
-        conversation_snapshot: &crate::conversation::ConversationSnapshot,
+        conversation: &crate::conversation::Conversation,
     ) -> ToolResult {
         // Auto-fix common tool name aliases (models trained on other agents use different names)
         // Case-insensitive matching: models may output "Run", "Bash", "Edit_File", etc.
@@ -1303,12 +1303,15 @@ impl TurnRunner {
             if needs_prompt {
                 // Emit an informational event carrying a snapshot of
                 // conversation state so the TUI can persist mid-turn
-                // session state (e.g. for `/bg`).
+                // session state (e.g. for `/bg`). Only clone here
+                // (lazily, when approval is actually needed) instead
+                // of per-tool-call — avoids O(N) full message-list
+                // clones for batch turns with many tools.
                 let _ = event_tx.send(TurnEvent::ApprovalRequested {
                     tool_name: call.name.clone(),
                     reason: reason.clone(),
                     call: call.clone(),
-                    snapshot: conversation_snapshot.clone(),
+                    snapshot: conversation.snapshot(),
                 });
             }
 
