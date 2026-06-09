@@ -783,10 +783,11 @@ fn snap_to_valid_boundary(messages: &[Message], idx: usize) -> usize {
 /// well under this size, so re-running compaction never re-stubs.
 pub(crate) const MIN_COLLAPSE_SIZE: usize = 500;
 
-/// Build the generic compaction stub used by both microcompact (render
-/// time, ephemeral) and the conv-level Tier 1 (destructive). Tool name
-/// comes from the model's own tool_calls so the framework adds zero
-/// hardcoded tool knowledge — every tool gets the same shape.
+/// Build the generic compaction stub used by both `collapse_committed`
+/// (normal-path committed collapse) and the emergency
+/// `compact_old_tool_results_in_place`. Tool name comes from the model's
+/// own tool_calls so the framework adds zero hardcoded tool knowledge —
+/// every tool gets the same shape.
 ///
 /// **First-line picking**: skips `[elapsed: ...]` framework metadata.
 /// `tool::bash` prepends `[elapsed: Xs, exit: N]\n<actual output>` to
@@ -801,7 +802,7 @@ pub(crate) const MIN_COLLAPSE_SIZE: usize = 500;
 /// **Hardcoding note**: matching `[elapsed:` is framework-internal
 /// knowledge of our own bash tool's output format, not tech-stack
 /// hardcoding (the prefix is the same regardless of cargo/npm/etc).
-/// Same category as the `read_file` skip in microcompact.
+/// Same category as the `read_file` exemption in `collapse_committed`.
 pub(crate) fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
     let line_count = output.lines().count();
     let first_line: String = {
@@ -840,11 +841,12 @@ fn build_call_id_to_tool_map(
 
 /// Conv-level Tier 1 compaction. Replaces tool_result bodies in turns
 /// older than `keep_recent_turns` with the same generic stub used by
-/// microcompact. This is the destructive counterpart: microcompact runs
-/// every render and is ephemeral (only mutates the rendered Vec); this
-/// runs from the agent emergency path and permanently shrinks
-/// `conv.messages` so the next `needs_compression` check sees the
-/// freed budget.
+/// `collapse_committed`. This is the destructive emergency counterpart:
+/// the former ephemeral `microcompact` (render-time, non-committed) no
+/// longer exists — `collapse_committed` is the normal committed path
+/// called before each render. This function runs from the agent emergency
+/// path and permanently shrinks `conv.messages` so the next
+/// `needs_compression` check sees the freed budget.
 ///
 /// Idempotent: stubs already in place are smaller than MIN_COLLAPSE_SIZE
 /// and skip the rewrite.
@@ -1955,10 +1957,11 @@ mod tests {
         // non-empty is the precondition that disables the earlier cap.
         conv.cold_summaries.push("earlier task summary".to_string());
 
-        // 20 turns, each with a 6K-char bash result. microcompact's
-        // OTHER_KEEP=20 leaves the trailing 20 messages (≈ last 6-7 turns)
-        // untouched — those alone sum to > 36K chars ≈ 9K+ est tokens,
-        // which exceeds the 80% ceiling of the chosen budget.
+        // 20 turns, each with a 6K-char bash result. `collapse_committed`
+        // only runs before rendering (called from turn/runner.rs) so it
+        // does not fire here; the recent window (≈ last 6-7 turns / 20
+        // messages) sums to > 36K chars ≈ 9K+ est tokens, which exceeds
+        // the 80% FINAL BYTE CEILING backstop exercised by this test.
         for turn in 0..20 {
             conv.add_user_message(&format!("task {}", turn));
             conv.add_assistant_tool_calls(

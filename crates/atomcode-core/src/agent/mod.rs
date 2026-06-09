@@ -2828,10 +2828,11 @@ impl AgentLoop {
     /// Pro-active context compaction. Two-stage:
     ///
     /// 1. **Tier 1 (cheap, mechanical):** collapse old `ToolResult`
-    ///    bodies into stubs (`compact_old_tool_results_in_place`, the
-    ///    same generic stub format `microcompact` uses at render time;
-    ///    keeps the last 3 turns full). Zero LLM calls. Cheap to fire,
-    ///    easy to revert if model needs the bytes back via re-read.
+    ///    bodies into stubs (`compact_old_tool_results_in_place`, using
+    ///    the same `build_compact_stub` format shared with the normal-path
+    ///    `collapse_committed`; keeps the last 3 turns full). Zero LLM
+    ///    calls. Cheap to fire, easy to revert if model needs the bytes
+    ///    back via re-read.
     ///
     /// 2. **Tier 2 (expensive, LLM-driven):** if Tier 1 didn't bring
     ///    the context under threshold, fall through to LLM-summarize
@@ -2986,10 +2987,10 @@ impl AgentLoop {
     /// the dropped messages, so compaction would silently inflate the
     /// prompt. We measure before/after token totals via `build_messages`
     /// (post all render-pipeline effects — `clean_message_pipeline`,
-    /// microcompact, etc.) and roll the conversation back if the
-    /// operation didn't actually shrink the wire payload. Analytical
-    /// projection was tried first but too many render-pipeline branches
-    /// made it unreliable.
+    /// `collapse_committed`, final-byte ceiling, etc.) and roll the
+    /// conversation back if the operation didn't actually shrink the wire
+    /// payload. Analytical projection was tried first but too many
+    /// render-pipeline branches made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
         let system_prompt = self.build_system_prompt();
         let keep_ceiling = compression::compaction_keep_ceiling(
