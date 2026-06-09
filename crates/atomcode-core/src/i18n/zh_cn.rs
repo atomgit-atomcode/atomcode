@@ -309,6 +309,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("保存会话失败：{error}。未持久化新名称。").into(),
         Msg::SessionNoneSelected =>
             "未选中会话".into(),
+        Msg::SessionDeleted { name } =>
+            format!("「{name}」已删除").into(),
+        Msg::SessionDeleteConfirm { name } =>
+            format!("再按 Ctrl+D 确认删除「{name}」").into(),
+        Msg::SessionDeleteFailed { error } =>
+            format!("删除会话失败：{error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: 确认, Esc: 取消]").into(),
 
@@ -648,7 +654,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SetupFailedRow { kind, slug, error } =>
             format!("  × {}:{} — {}\n", kind, slug, error).into(),
         Msg::CmdSetupTip =>
-            "\u{1f4a1} 提示：运行 \x1b[1;96m/setup\x1b[0m 可自动为该项目配置 hooks、skills 和 MCP。".into(),
+            // No leading emoji — U+1F4A1 has ambiguous terminal display
+            // width and desynced the line's cell layout on some terminals.
+            // CJK chars below have stable width-2 so they're fine.
+            "提示：运行 \x1b[1;96m/setup\x1b[0m 可自动为该项目配置 hooks、skills 和 MCP。".into(),
         Msg::CmdSetupRunning =>
             "正在运行 atomcode setup...".into(),
         Msg::CmdSetupSkillsReloaded { count } =>
@@ -713,9 +722,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrHintUrl => "输入/粘贴 git URL · ⏎ 添加 · esc 取消".into(),
 Msg::PluginMgrHintPending => "安装中，请稍候… · esc 返回".into(),
 Msg::PluginMgrInstallingLabel => "安装中…".into(),
-        Msg::PluginMgrEmptyMarketplaces => "暂无市场，请选「添加市场…」".into(),
-        Msg::PluginMgrEmptyPlugins => "该市场暂无插件。".into(),
-        Msg::PluginMgrEmptyInstalled => "暂无已安装插件。".into(),
+        Msg::PluginMgrEmptyMarketplaces => "暂无市场，请选「添加市场…」 · esc 返回".into(),
+        Msg::PluginMgrEmptyPlugins => "该市场暂无插件 · esc 返回".into(),
+        Msg::PluginMgrEmptyInstalled => "暂无已安装插件 · esc 返回".into(),
         Msg::PluginMgrCloning => "正在克隆市场…".into(),
         Msg::PluginMgrInstalling { plugin } => format!("正在安装 {plugin}…").into(),
 Msg::PluginMgrEscToCancel => "Esc 取消".into(),
@@ -782,6 +791,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescPlan => "切换到 Plan 模式（只读探索）".into(),
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),
+        Msg::CmdDescEffort => "DeepSeek 推理强度控制（high / max / off）".into(),
         Msg::CmdDescHelp => "显示帮助".into(),
         Msg::CmdDescKeys => "显示键盘快捷键".into(),
         Msg::CmdDescLanguage => "切换显示语言".into(),
@@ -815,6 +825,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdGuideInstallFailed { error } =>
             format!("安装 ask skill 失败: {}. 请手动运行 /plugin install atomcode@atomcode-skills", error).into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
+
+        // ── reasoning effort ──
+        Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 有效）".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>
@@ -901,6 +914,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "[headless] --dangerously-skip-permissions：所有工具调用将自动批准".into(),
         Msg::BypassBadge =>
             "\u{26a0} BYPASS".into(),
+
+        Msg::AdminWarningBanner =>
+            "\x1b[33m\u{26a0} 警告：正在以管理员权限运行。\n   模型可能可以访问系统文件。\n   请在 /codingplan 中配置\"信任目录\"以限制文件访问。\x1b[39m\n".into(),
+        Msg::AdminWarningHeadless =>
+            "[warning] 正在以管理员权限运行 — 模型可能可以访问系统文件。".into(),
 
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
         Msg::HintMultiLineInput =>

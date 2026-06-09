@@ -469,14 +469,18 @@ mod tests {
     }
 
     #[test]
-    fn grep_sensitive_path_still_requires_always() {
+    fn grep_sensitive_path_is_path_scoped() {
         let workspace = TempDir::new().unwrap();
         let ctx = ToolContext::new(workspace.path().to_path_buf());
-        // /etc is in the system-protected prefixes list.
+        // /etc is in the system-protected prefixes list. Reading is
+        // non-destructive, so a sensitive read is PATH-SCOPED: pressing [A]
+        // remembers this exact path for the session (no re-prompt on repeat
+        // reads of the same file) while every other sensitive path still
+        // prompts. Destructive ops keep RequireApprovalAlways.
         let args = r#"{"pattern":"PermitRoot","path":"/etc"}"#;
         assert!(matches!(
             GrepTool.approval_with_context(args, &ctx),
-            ApprovalRequirement::RequireApprovalAlways(_)
+            ApprovalRequirement::RequireApprovalScoped { .. }
         ));
     }
 

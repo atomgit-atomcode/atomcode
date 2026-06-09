@@ -319,6 +319,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Failed to save session: {error}. The name was not persisted.").into(),
         Msg::SessionNoneSelected =>
             "No session selected".into(),
+        Msg::SessionDeleted { name } =>
+            format!("\"{name}\" deleted").into(),
+        Msg::SessionDeleteConfirm { name } =>
+            format!("Press Ctrl+D again to delete \"{name}\"").into(),
+        Msg::SessionDeleteFailed { error } =>
+            format!("Failed to delete session: {error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: confirm, Esc: cancel]").into(),
 
@@ -660,7 +666,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SetupFailedRow { kind, slug, error } =>
             format!("  × {}:{} — {}\n", kind, slug, error).into(),
         Msg::CmdSetupTip =>
-            "\u{1f4a1} Tip: Run \x1b[1;96m/setup\x1b[0m to auto-configure hooks, skills, and MCP for this project.".into(),
+            // No leading emoji: U+1F4A1 has terminal/font-dependent display
+            // width (1 vs 2 cells), which desynced this line's cell layout
+            // on some terminals (garbled "TTip:RRun…" over SSH). ASCII-only
+            // prefix keeps the width unambiguous.
+            "Tip: Run \x1b[1;96m/setup\x1b[0m to auto-configure hooks, skills, and MCP for this project.".into(),
         Msg::CmdSetupRunning =>
             "Running atomcode setup...".into(),
         Msg::CmdSetupSkillsReloaded { count } =>
@@ -725,9 +735,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrHintUrl => "type/paste git URL · ⏎ add · esc cancel".into(),
 Msg::PluginMgrHintPending => "Installing, please wait… · esc back".into(),
 Msg::PluginMgrInstallingLabel => "Installing…".into(),
-        Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…”".into(),
-        Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace.".into(),
-        Msg::PluginMgrEmptyInstalled => "No plugins installed.".into(),
+        Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…” · esc back".into(),
+        Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace · esc back".into(),
+        Msg::PluginMgrEmptyInstalled => "No plugins installed · esc back".into(),
         Msg::PluginMgrCloning => "Cloning marketplace…".into(),
         Msg::PluginMgrInstalling { plugin } => format!("Installing {plugin}…").into(),
         Msg::PluginMgrEscToCancel => "Esc to cancel".into(),
@@ -794,6 +804,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescPlan => "Switch to Plan mode (read-only exploration)".into(),
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
+        Msg::CmdDescEffort => "DeepSeek reasoning effort control (high / max / off)".into(),
         Msg::CmdDescHelp => "Show this help".into(),
         Msg::CmdDescKeys => "Show keyboard shortcuts".into(),
         Msg::CmdDescLanguage => "Switch display language".into(),
@@ -827,6 +838,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdGuideInstallFailed { error } =>
             format!("ask skill install failed: {}. Run /plugin install atomcode@atomcode-skills manually", error).into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
+
+        // ── reasoning effort ──
+        Msg::ReasoningEffortNoEffect => "reasoning_effort has no effect on the current model (only DeepSeek V4)".into(),
 
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>
@@ -917,6 +931,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "[headless] --dangerously-skip-permissions: all tool calls are auto-approved".into(),
         Msg::BypassBadge =>
             "\u{26a0} BYPASS".into(),
+
+        Msg::AdminWarningBanner =>
+            "\x1b[33m\u{26a0} Warning: Running with Administrator privileges.\n   The model may have access to system files.\n   Use \"Trusted Directories\" in /codingplan to restrict file access.\x1b[39m\n".into(),
+        Msg::AdminWarningHeadless =>
+            "[warning] Running with Administrator privileges — model may have access to system files.".into(),
 
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
         Msg::HintMultiLineInput =>

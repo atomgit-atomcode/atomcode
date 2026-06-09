@@ -18,7 +18,7 @@ interface PermissionCardProps {
   /** Optional override for the decision action. When provided, replaces the
    *  default respondPermission call. Used by live-session approval (POST /live/permission)
    *  so the non-sync /chat path is unchanged. */
-  onDecide?: (decision: 'allow' | 'deny' | 'always_allow') => Promise<void>;
+  onDecide?: (decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist', toolName?: string) => Promise<void>;
 }
 
 function formatArgs(args: unknown): string {
@@ -42,14 +42,14 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
   const t = useT();
   const [loading, setLoading] = useState(false);
 
-  async function decide(decision: 'allow' | 'deny' | 'always_allow') {
+  async function decide(decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist') {
     if (loading) return;
     setLoading(true);
     try {
       if (onDecide) {
-        await onDecide(decision);
+        await onDecide(decision, req.tool_name);
       } else {
-        await respondPermission(req.session_id, decision);
+        await respondPermission(req.session_id, decision, req.tool_name);
       }
     } catch {
       // Best-effort; proceed to dismiss regardless
@@ -88,6 +88,11 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
           <button class="btn btn-success" disabled={loading} onClick={() => decide('always_allow')}>
             {t('perm.alwaysAllow')}
           </button>
+          {req.tool_name.startsWith('mcp__') && (
+            <button class="btn btn-success" disabled={loading} onClick={() => decide('allow_persist')}>
+              {t('perm.allowPersist')}
+            </button>
+          )}
         </div>
       </div>
     </div>

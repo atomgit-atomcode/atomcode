@@ -134,6 +134,12 @@ pub struct Telemetry {
     launch_id: Uuid,
     session_id: std::sync::Arc<std::sync::RwLock<Uuid>>,
     account_id: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    /// Launch-level session mode (Tui / Headless / Ide / …). Like `account_id`,
+    /// this outlives any single `CurrentContext` scope: it is set once at
+    /// startup and used as the envelope `mode` fallback whenever a task emits
+    /// outside a mode-bearing scope (e.g. a spawned task that forgot to
+    /// re-apply the task-local). A per-scope `CurrentContext.mode` still wins.
+    default_mode: std::sync::Arc<std::sync::RwLock<Option<crate::event::SessionMode>>>,
     app_version: String,
     os: &'static str,
     arch: &'static str,
@@ -151,6 +157,8 @@ pub enum TelemetryError {
     Disabled,
     #[error("telemetry queue unavailable")]
     QueueUnavailable,
+    #[error("telemetry queue busy")]
+    QueueBusy,
     #[error("telemetry queue append failed: {0}")]
     QueueAppend(#[source] anyhow::Error),
     #[error("telemetry queue roll failed: {0}")]
@@ -173,6 +181,7 @@ impl Telemetry {
                 launch_id,
                 session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
                 account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
                 app_version,
                 os,
                 arch,
@@ -205,6 +214,7 @@ impl Telemetry {
                     launch_id,
                     session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
                     account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                    default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
                     app_version,
                     os,
                     arch,
@@ -238,6 +248,7 @@ impl Telemetry {
             launch_id,
             session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
             account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
             app_version,
             os,
             arch,
@@ -292,6 +303,29 @@ impl Telemetry {
         q.force_roll().map_err(TelemetryError::QueueRoll)?;
         self.counters.events_tracked.fetch_add(1, Ordering::Relaxed);
         tracing::debug!("telemetry event durably queued");
+        Ok(())
+    }
+
+    /// Best-effort synchronous durable emit for legacy blocking flows.
+    ///
+    /// This is intentionally non-blocking on the async queue mutex: login runs
+    /// through a few synchronous call paths, including TUI rendering code, and
+    /// blocking a Tokio worker here would be riskier than falling back to the
+    /// regular async queue at the call site.
+    pub fn track_durable_sync(&self, event: Event) -> Result<(), TelemetryError> {
+        if !self.enabled {
+            return Err(TelemetryError::Disabled);
+        }
+        let queue = self
+            .queue
+            .as_ref()
+            .ok_or(TelemetryError::QueueUnavailable)?;
+        let record = self.build_record(event);
+        let mut q = queue.try_lock().map_err(|_| TelemetryError::QueueBusy)?;
+        q.append(&record).map_err(TelemetryError::QueueAppend)?;
+        q.force_roll().map_err(TelemetryError::QueueRoll)?;
+        self.counters.events_tracked.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("telemetry event durably queued synchronously");
         Ok(())
     }
 
@@ -359,7 +393,11 @@ impl Telemetry {
             provider_host: ctx.provider_host,
             model: ctx.model,
             repo_origin: ctx.repo_origin,
-            mode: ctx.mode,
+            // Fall back to the launch-level default when no scope set a mode —
+            // otherwise an un-scoped spawned task would emit `mode: null`.
+            mode: ctx
+                .mode
+                .or_else(|| self.default_mode.read().ok().and_then(|g| *g)),
         }
     }
 
@@ -392,6 +430,17 @@ impl Telemetry {
     pub fn set_account_id(&self, id: Option<String>) {
         if let Ok(mut g) = self.account_id.write() {
             *g = id;
+        }
+    }
+
+    /// Set the launch-level default session mode (Tui / Headless / Ide / …).
+    /// Call once at startup: the CLI passes its resolved session mode, the
+    /// daemon passes its startup mode. Events emitted outside a mode-bearing
+    /// `CurrentContext` scope fall back to this instead of `mode: null`; an
+    /// explicit per-scope `CurrentContext.mode` still overrides it.
+    pub fn set_default_mode(&self, mode: Option<crate::event::SessionMode>) {
+        if let Ok(mut g) = self.default_mode.write() {
+            *g = mode;
         }
     }
 
@@ -452,6 +501,7 @@ impl Telemetry {
             launch_id,
             session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
             account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            default_mode: std::sync::Arc::new(std::sync::RwLock::new(None)),
             app_version,
             os: os_str(),
             arch: arch_str(),
@@ -703,6 +753,85 @@ mod session_id_tests {
 }
 
 #[cfg(test)]
+mod default_mode_tests {
+    use super::*;
+    use crate::event::{Event, SessionMode};
+
+    /// The bug fix: `mode` is a launch-level attribute (like `account_id`). When
+    /// a spawned task forgets to re-apply the task-local `CurrentContext` scope,
+    /// the envelope must fall back to the process default instead of emitting
+    /// `mode: null`. (Real impact: IDE-daemon turns whose telemetry escaped the
+    /// per-request scope were landing as null instead of `ide`.)
+    #[tokio::test]
+    async fn default_mode_fills_envelope_when_no_scope_mode() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        tel.set_default_mode(Some(SessionMode::Ide));
+
+        // Emit OUTSIDE any CurrentContext::scope — the failure mode of an
+        // un-scoped spawned task.
+        tel.track(Event::OpenAtomcode {
+            dangerously_skip_permissions: false,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].envelope.mode,
+            Some(SessionMode::Ide),
+            "envelope must fall back to the launch-level default mode"
+        );
+    }
+
+    /// A per-request scope (e.g. the daemon's `daemon_scope` with the client's
+    /// X-AtomCode-Client header) must still override the process default, so
+    /// vscode/webui clients are attributed correctly.
+    #[tokio::test]
+    async fn current_context_mode_overrides_default_mode() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        tel.set_default_mode(Some(SessionMode::Ide));
+
+        CurrentContext::scope(
+            CurrentContext {
+                mode: Some(SessionMode::Vscode),
+                ..Default::default()
+            },
+            || async {
+                tel.track(Event::OpenAtomcode {
+                    dangerously_skip_permissions: false,
+                });
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].envelope.mode,
+            Some(SessionMode::Vscode),
+            "an explicit per-scope mode must win over the launch default"
+        );
+    }
+
+    /// Without a default set and without a scope, mode stays `None` (unchanged
+    /// behavior — the default is opt-in).
+    #[tokio::test]
+    async fn no_default_and_no_scope_stays_none() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+
+        tel.track(Event::OpenAtomcode {
+            dangerously_skip_permissions: false,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].envelope.mode, None);
+    }
+}
+
+#[cfg(test)]
 mod install_completed_tests {
     use super::*;
     use crate::config::{ResolvedConfig, TelemetryState};
@@ -746,7 +875,7 @@ mod install_completed_tests {
         .unwrap();
     }
 
-    fn install_completed_records(dir: &TempDir) -> Vec<Value> {
+    fn records_for_event(dir: &TempDir, event_id: &str) -> Vec<Value> {
         let queue_dir = dir.path().join("telemetry/queue");
         let mut records = Vec::new();
         for entry in std::fs::read_dir(queue_dir).unwrap() {
@@ -757,12 +886,16 @@ mod install_completed_tests {
             let contents = std::fs::read_to_string(path).unwrap();
             for line in contents.lines().filter(|line| !line.is_empty()) {
                 let value: Value = serde_json::from_str(line).unwrap();
-                if value.get("event_id").and_then(|v| v.as_str()) == Some("install_completed") {
+                if value.get("event_id").and_then(|v| v.as_str()) == Some(event_id) {
                     records.push(value);
                 }
             }
         }
         records
+    }
+
+    fn install_completed_records(dir: &TempDir) -> Vec<Value> {
+        records_for_event(dir, "install_completed")
     }
 
     fn referral_state_uuid(dir: &TempDir) -> Uuid {
@@ -787,6 +920,30 @@ mod install_completed_tests {
 
         assert_eq!(referral_state_uuid(&dir), install_uuid);
         let records = install_completed_records(&dir);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("invite_code").and_then(|v| v.as_str()),
+            Some("ABC12345")
+        );
+        assert_eq!(
+            records[0].get("install_uuid").and_then(|v| v.as_str()),
+            Some(install_uuid.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_durable_login_success_rolls_ready_segment() {
+        let dir = TempDir::new().unwrap();
+        let tel = enabled_telemetry(&dir);
+        let install_uuid = Uuid::new_v4();
+
+        tel.track_durable_sync(Event::LoginSuccess {
+            invite_code: Some("ABC12345".into()),
+            install_uuid: Some(install_uuid),
+        })
+        .unwrap();
+
+        let records = records_for_event(&dir, "login_success");
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].get("invite_code").and_then(|v| v.as_str()),

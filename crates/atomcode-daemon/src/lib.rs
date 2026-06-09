@@ -13,11 +13,10 @@ mod api_provider;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
-pub use live_api::ensure_live_session_seeded;
 pub use live_api::live_set_provider;
-mod telemetry_scope;
 pub mod auth_token;
 pub mod permission_bridge;
+mod telemetry_scope;
 pub mod webui;
 
 pub(crate) use telemetry_scope::daemon_scope;
@@ -40,12 +39,14 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use atomcode_core::auth;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
+use atomcode_core::telemetry_bootstrap::detect_repo_origin;
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
@@ -56,11 +57,8 @@ use atomcode_core::turn::permission::{
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
-    CliOverride, CurrentContext, Event, RepoOrigin, SessionMode,
-    Telemetry, TelemetryState,
+    CliOverride, CurrentContext, Event, RepoOrigin, SessionMode, Telemetry, TelemetryState,
 };
-use atomcode_core::auth;
-use atomcode_core::telemetry_bootstrap::detect_repo_origin;
 
 // ============================================================================
 // Shared DTOs for P0 API endpoints
@@ -99,6 +97,7 @@ pub(crate) struct ProviderInfo {
     pub thinking_type: Option<String>,
     pub thinking_keep: Option<String>,
     pub reasoning_history: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub skip_tls_verify: bool,
     pub ephemeral: bool,
 }
@@ -457,7 +456,10 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                 let display = if images.is_empty() {
                     raw
                 } else {
-                    match raw.find("[图片内容（由").or_else(|| raw.find("[图片识别失败]")) {
+                    match raw
+                        .find("[图片内容（由")
+                        .or_else(|| raw.find("[图片识别失败]"))
+                    {
                         Some(i) => raw[..i].trim_end().to_string(),
                         None => raw,
                     }
@@ -467,11 +469,11 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
         };
 
         // 提取 MultiPart 的图片，供 webui 历史渲染缩略图。
-        let images = match &msg.content {
-            atomcode_core::conversation::message::MessageContent::MultiPart { images, .. }
-                if !images.is_empty() =>
-            {
-                Some(
+        let images =
+            match &msg.content {
+                atomcode_core::conversation::message::MessageContent::MultiPart {
+                    images, ..
+                } if !images.is_empty() => Some(
                     images
                         .iter()
                         .map(|i| ImageData {
@@ -479,10 +481,9 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                             data: i.data.clone(),
                         })
                         .collect(),
-                )
-            }
-            _ => None,
-        };
+                ),
+                _ => None,
+            };
 
         Self {
             role: role.to_string(),
@@ -1076,6 +1077,82 @@ async fn health() -> impl IntoResponse {
     })
 }
 
+/// Webui index route with one-time-token → HttpOnly-cookie handoff.
+///
+/// `/webui` opens `http://host:port/?token=<uuid>`. Serving index.html
+/// straight from that URL would leave the token in the address bar and
+/// browser history, where a malicious extension could read it off
+/// `location.search` (CWE-598). Instead, when a valid `?token=` is
+/// present we move it into an HttpOnly `atomcode_webui` cookie and 302 to
+/// a token-less URL; the browser then loads the SPA cookie-only and every
+/// same-origin API/SSE request carries the cookie automatically.
+///
+/// Non-token requests (the post-redirect load, SPA navigations, the
+/// VSCode/standalone daemon where `enforce_token=false`) fall straight
+/// through to the static asset server.
+///
+/// `Secure` is intentionally omitted: the webui is served over plain HTTP
+/// on localhost/LAN, where a `Secure` cookie would never be sent.
+/// `HttpOnly` (blocks JS/extension reads) + `SameSite=Strict` (blocks
+/// cross-site sends) carry the protection.
+async fn serve_webui_index(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    if state.enforce_token {
+        if let Some(query) = uri.query() {
+            if let Some(token) = first_query_value(query, "token") {
+                if !token.is_empty() && state.webui_tokens.is_valid(&token) {
+                    let rest = strip_query_key(query, "token");
+                    let location = if rest.is_empty() {
+                        "/".to_string()
+                    } else {
+                        format!("/?{rest}")
+                    };
+                    let cookie = format!(
+                        "{}={}; Path=/; HttpOnly; SameSite=Strict",
+                        auth_token::WEBUI_COOKIE,
+                        token
+                    );
+                    return axum::response::Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(header::LOCATION, location)
+                        .header(header::SET_COOKIE, cookie)
+                        .body(axum::body::Body::empty())
+                        .map(IntoResponse::into_response)
+                        .unwrap_or_else(|_| {
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        });
+                }
+            }
+        }
+    }
+    webui::serve_webui(uri).await
+}
+
+/// First value for `key` in a raw `a=b&c=d` query string. Returns the raw
+/// (still percent-encoded) value; the webui token is a hex UUID so no
+/// decoding is needed.
+fn first_query_value(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let mut it = pair.splitn(2, '=');
+        match (it.next(), it.next()) {
+            (Some(k), Some(v)) if k == key => Some(v.to_string()),
+            _ => None,
+        }
+    })
+}
+
+/// Drop every `key=…` pair from a raw query string, preserving the rest
+/// verbatim so `session` / `sync` survive the token-stripping redirect.
+fn strip_query_key(query: &str, key: &str) -> String {
+    query
+        .split('&')
+        .filter(|pair| pair.split('=').next().unwrap_or("") != key)
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// POST /shutdown - Trigger graceful shutdown via HTTP (R7.1, R7.2)
 async fn shutdown_handler(State(state): State<AppState>) -> impl IntoResponse {
     state.shutdown_tx.send(true).ok();
@@ -1188,7 +1265,18 @@ async fn change_dir(
         }
 
         let hash = hash_path(&new_path);
-        state.telemetry.track(Event::UseCommand { type_: "cd".into(), success: Some(true), error_kind: None, error_data: None });
+        state.telemetry.track(Event::UseCommand {
+            type_: "cd".into(),
+            success: Some(true),
+            error_kind: None,
+            error_data: None,
+        });
+
+        // Broadcast to other in-process views (sync-mode TUI) so they follow the
+        // switch: change cwd + open a fresh session in the new dir. No-op when no
+        // LiveSession is attached (headless daemon). Cross-process clients are not
+        // covered — that would need a /live SSE wire event + client subscription.
+        crate::live_api::live_set_working_dir(new_path.clone());
 
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
 
@@ -1416,7 +1504,12 @@ async fn delete_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         match delete_session_file(&hash, &id) {
             Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into(), success: Some(true), error_kind: None, error_data: None });
+                state_clone.telemetry.track(Event::UseCommand {
+                    type_: "delete_session".into(),
+                    success: Some(true),
+                    error_kind: None,
+                    error_data: None,
+                });
                 let msg = format!("Session {} deleted successfully", id);
                 (StatusCode::OK, Json(msg)).into_response()
             }
@@ -1475,7 +1568,12 @@ async fn rename_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         match rename_session_file(&hash, &id, &req.name) {
             Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand { type_: "rename".into(), success: Some(true), error_kind: None, error_data: None });
+                state_clone.telemetry.track(Event::UseCommand {
+                    type_: "rename".into(),
+                    success: Some(true),
+                    error_kind: None,
+                    error_data: None,
+                });
                 let msg = format!("Session {} renamed to '{}'", id, req.name);
                 (StatusCode::OK, Json(msg)).into_response()
             }
@@ -1499,6 +1597,14 @@ pub struct ModelInfo {
     pub provider_type: String,
     /// Whether this is the default provider
     pub is_default: bool,
+    /// Whether this model accepts the DeepSeek `reasoning_effort` control
+    /// (the deepseek-v4 family). The webui shows the effort selector only
+    /// for models where this is true.
+    pub effort_applicable: bool,
+    /// Current `reasoning_effort` for this provider: `"high"`, `"max"`, or
+    /// `null` (the model's own default). Lets the webui reflect the active
+    /// effort in the selector.
+    pub reasoning_effort: Option<String>,
 }
 
 /// GET /models - List all available models from configured providers
@@ -1523,6 +1629,9 @@ async fn get_models() -> impl IntoResponse {
             model: p.model.clone(),
             provider_type: p.provider_type.clone(),
             is_default: name == &config.default_provider,
+            effort_applicable:
+                atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(&p.model),
+            reasoning_effort: p.reasoning_effort.clone(),
         })
         .collect();
 
@@ -1578,7 +1687,11 @@ pub enum ChatEvent {
     ReasoningDelta { content: String },
     /// Tool call started
     #[serde(rename = "tool_start")]
-    ToolCallStarted { id: String, name: String, arguments: String },
+    ToolCallStarted {
+        id: String,
+        name: String,
+        arguments: String,
+    },
     /// Real-time tool output chunk
     #[serde(rename = "tool_output")]
     ToolOutputChunk { chunk: String },
@@ -1878,7 +1991,10 @@ async fn chat_stream(
     Json(mut req): Json<ChatRequest>,
 ) -> impl IntoResponse {
     // Parse session UUID for telemetry scope
-    let session_uuid = req.session_id.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let session_uuid = req
+        .session_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
     // Use current project working directory if not specified
     if req.working_dir.is_none() {
@@ -1913,7 +2029,9 @@ async fn chat_stream(
     // Use the request's working_dir to detect repo_origin dynamically (not the
     // startup-time cached value), because the user may switch projects via /cd.
     let chat_repo_origin = detect_repo_origin(
-        req.working_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."))
+        req.working_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(".")),
     );
     let ctx_for_task = CurrentContext {
         mode: Some(client_mode),
@@ -1946,7 +2064,8 @@ async fn chat_stream(
             if let Some(sid) = session_id {
                 chat_tasks.write().await.remove(&sid);
             }
-        }).await;
+        })
+        .await;
     });
 
     // Track active SSE connections for idle timeout using a Drop guard
@@ -1965,7 +2084,7 @@ async fn chat_stream(
     let conn_guard = SseConnectionGuard(active_conns);
     let guarded_stream = stream.chain(futures::stream::once(async move {
         drop(conn_guard); // explicitly drop to decrement
-        // This event is never actually sent because the stream ends here
+                          // This event is never actually sent because the stream ends here
         Ok(axum::response::sse::Event::default().comment("bye"))
     }));
 
@@ -2098,8 +2217,11 @@ async fn process_chat_request(
         }
     }
     // Build tool registry and context — use real telemetry from AppState (R11.1, R11.2, R11.3)
-    let mut tool_context =
-        ToolContext::with_telemetry(working_dir.clone(), req.session_id.as_deref().unwrap_or("default"), telemetry);
+    let mut tool_context = ToolContext::with_telemetry(
+        working_dir.clone(),
+        req.session_id.as_deref().unwrap_or("default"),
+        telemetry,
+    );
     let mut tool_registry = ToolRegistry::new();
     // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
     // the CLI's --disable-tools behaviour. Comma-separated tool names.
@@ -2169,7 +2291,9 @@ async fn process_chat_request(
             drop(cache);
             // Cache miss — create new registry for this project
             let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
-            new_registry.wait_for_initial_connections(Duration::from_secs(5)).await;
+            new_registry
+                .wait_for_initial_connections(Duration::from_secs(5))
+                .await;
             // Store in cache
             let mut cache = mcp_cache.write().await;
             // Evict LRU if cache is full
@@ -2182,10 +2306,13 @@ async fn process_chat_request(
                     cache.remove(&oldest_key);
                 }
             }
-            cache.insert(working_dir.clone(), CachedMcpRegistry {
-                registry: new_registry.clone(),
-                last_used: std::time::Instant::now(),
-            });
+            cache.insert(
+                working_dir.clone(),
+                CachedMcpRegistry {
+                    registry: new_registry.clone(),
+                    last_used: std::time::Instant::now(),
+                },
+            );
             new_registry
         }
     };
@@ -2224,8 +2351,7 @@ async fn process_chat_request(
     // approver, so it must keep the prior BypassAll behaviour — otherwise any
     // tool requiring approval would block the turn forever.
     let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = if webui_mode {
-        let (perm_req_tx, perm_req_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+        let (perm_req_tx, perm_req_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
         let (perm_resp_tx, perm_resp_rx) =
             tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
         let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
@@ -2233,7 +2359,11 @@ async fn process_chat_request(
         ));
         pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
         (
-            Box::new(InteractivePermissionDecider::new(perm_req_tx, perm_resp_rx, perm_store)),
+            Box::new(InteractivePermissionDecider::new(
+                perm_req_tx,
+                perm_resp_rx,
+                perm_store,
+            )),
             Some(perm_req_rx),
         )
     } else {
@@ -2259,12 +2389,12 @@ async fn process_chat_request(
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: true,
-
-})
+            })
         }
     };
     // Load configured hooks for this session (JSON/TOML/builtins/webhooks),
@@ -2285,7 +2415,8 @@ async fn process_chat_request(
     };
 
     // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
-    let system_prompt = build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
+    let system_prompt =
+        build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
@@ -2341,35 +2472,36 @@ async fn process_chat_request(
         // In standalone (BypassAll) mode there is no channel — this is `None`.
         let _keep_perm_req_rx = perm_req_rx;
         CurrentContext::scope(tel_ctx, || async move {
-        let mut conv = conversation_clone.lock().await;
+            let mut conv = conversation_clone.lock().await;
 
-        // Loop until LLM produces text without tool calls
-        loop {
-            let result = turn_runner
-                .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
-                .await;
+            // Loop until LLM produces text without tool calls
+            loop {
+                let result = turn_runner
+                    .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
+                    .await;
 
-            match result {
-                TurnResult::Responded { .. } => {
-                    // LLM produced text, turn is complete
-                    break;
-                }
-                TurnResult::UsedTools { .. } => {
-                    // Truncation of tool outputs is handled inside
-                    // TurnRunner::run_with_filter now. Nothing to do
-                    // here — just loop back for the next LLM call.
-                    continue;
-                }
-                TurnResult::Failed(e) => {
-                    let _ = turn_tx.send(TurnEvent::Error(e));
-                    break;
-                }
-                TurnResult::Cancelled => {
-                    break;
+                match result {
+                    TurnResult::Responded { .. } => {
+                        // LLM produced text, turn is complete
+                        break;
+                    }
+                    TurnResult::UsedTools { .. } => {
+                        // Truncation of tool outputs is handled inside
+                        // TurnRunner::run_with_filter now. Nothing to do
+                        // here — just loop back for the next LLM call.
+                        continue;
+                    }
+                    TurnResult::Failed(e) => {
+                        let _ = turn_tx.send(TurnEvent::Error(e));
+                        break;
+                    }
+                    TurnResult::Cancelled => {
+                        break;
+                    }
                 }
             }
-        }
-        }).await;
+        })
+        .await;
     });
 
     // Forward turn events to chat events
@@ -2730,7 +2862,12 @@ async fn stop_chat(
         // Cancel the chat task if it exists
         if let Some(cancel_token) = state_clone.chat_tasks.read().await.get(&req.session_id) {
             cancel_token.cancel();
-            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
+            state_clone.telemetry.track(Event::UseCommand {
+                type_: "stop".into(),
+                success: Some(true),
+                error_kind: None,
+                error_data: None,
+            });
             (
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
@@ -2740,7 +2877,12 @@ async fn stop_chat(
             )
         } else {
             // Session wasn't running, but we marked it as stopped
-            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
+            state_clone.telemetry.track(Event::UseCommand {
+                type_: "stop".into(),
+                success: Some(true),
+                error_kind: None,
+                error_data: None,
+            });
             (
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
@@ -2757,9 +2899,7 @@ async fn stop_chat(
 }
 
 /// GET /chat/active - Return list of session IDs currently generating
-async fn active_chat_sessions(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn active_chat_sessions(State(state): State<AppState>) -> impl IntoResponse {
     let sessions: Vec<String> = state.chat_tasks.read().await.keys().cloned().collect();
     Json(sessions)
 }
@@ -2772,22 +2912,37 @@ async fn active_chat_sessions(
 #[derive(Debug, serde::Deserialize)]
 pub struct PermissionDecisionRequest {
     pub session_id: String,
-    /// "allow" | "deny" | "always_allow"
+    /// "allow" | "deny" | "always_allow" | "allow_persist"
     pub decision: String,
+    /// Full MCP tool name (`mcp__{server}__{tool}`); required for `allow_persist`.
+    #[serde(default)]
+    pub tool_name: Option<String>,
 }
 
 async fn chat_permission(
     State(state): State<AppState>,
     Json(req): Json<PermissionDecisionRequest>,
 ) -> impl IntoResponse {
-    use atomcode_core::tool::PermissionDecision;
-    let decision = match req.decision.as_str() {
-        "allow" => PermissionDecision::Allow,
-        // Phase 1: always_allow 暂按 Allow 处理；本会话"总是允许"语义（PermissionStore 持久化）
-        // 留待后续增强，此处保持决定路由职责单一。
-        "always_allow" => PermissionDecision::Allow,
-        _ => PermissionDecision::Deny,
-    };
+    use atomcode_core::tool::{parse_permission_decision, PermissionDecision};
+    if req.decision == "allow_persist" {
+        if let Some(full) = req.tool_name.as_deref() {
+            let reg = state.mcp_registry.read().await.clone();
+            if let Some((server, tool)) = reg.split_tool_name(full).await {
+                let project_dir = state.project.read().await.working_dir.clone();
+                if let Err(e) =
+                    atomcode_core::mcp::config::add_auto_approved_tool(&project_dir, &server, &tool)
+                {
+                    tracing::warn!("[permission] persist autoApprove failed: {e}");
+                }
+                reg.mark_tool_auto_approved(full);
+            }
+        }
+        let ok = state
+            .pending_permissions
+            .deliver(&req.session_id, PermissionDecision::Allow);
+        return Json(serde_json::json!({ "success": ok }));
+    }
+    let decision = parse_permission_decision(&req.decision);
     if state.pending_permissions.deliver(&req.session_id, decision) {
         Json(serde_json::json!({ "success": true }))
     } else {
@@ -2916,12 +3071,15 @@ fn install_panic_hook(telemetry: Arc<Telemetry>) {
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
             error_kind: Some("panic".to_string()),
-            error_data: Some(serde_json::json!({
-                "session_duration_secs": telemetry.uptime().as_secs() as u32,
-                "turns_completed": null,
-                "last_tool_name": null,
-                "last_event": null,
-            }).to_string()),
+            error_data: Some(
+                serde_json::json!({
+                    "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                    "turns_completed": null,
+                    "last_tool_name": null,
+                    "last_event": null,
+                })
+                .to_string(),
+            ),
         });
         default_hook(info); // R9.4: preserve stderr output
     }));
@@ -3020,9 +3178,7 @@ async fn bind_scanning(
         "no free port in [{}, {}){}",
         start_port,
         start_port.saturating_add(max_tries),
-        last_err
-            .map(|e| format!(": {e}"))
-            .unwrap_or_default()
+        last_err.map(|e| format!(": {e}")).unwrap_or_default()
     ))
 }
 
@@ -3063,7 +3219,7 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
     // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
     //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
     let reuse = {
-        let guard = WEBUI.lock().unwrap();
+        let guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(handle) if !handle.abort.is_finished() => {
                 Some((handle.tokens.clone(), handle.port, handle.host.clone()))
@@ -3111,7 +3267,7 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
             }
         });
         {
-            let mut guard = WEBUI.lock().unwrap();
+            let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(WebuiHandle {
                 tokens: tokens.clone(),
                 port: actual_port,
@@ -3127,16 +3283,29 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
     // - 回环（127.0.0.1/localhost/::1）或通配（0.0.0.0/::）绑定时，回环都在监听集合内，用 127.0.0.1；
     // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在
     //   监听集合内，用它打开会 ERR_CONNECTION_REFUSED。此时必须用真实绑定地址打开。
-    let open_host: &str = if is_loopback_authority(&bound_host)
-        || bound_host == "0.0.0.0"
-        || bound_host == "::"
-    {
-        "127.0.0.1"
-    } else {
-        bound_host.as_str()
-    };
     let sync_suffix = if sync { "&sync=1" } else { "" };
-    let local_url = format!("http://{}:{}/?token={}{}", open_host, actual_port, token, sync_suffix);
+    let is_wildcard = bound_host == "0.0.0.0" || bound_host == "::";
+    // 通配绑定（用户意在暴露到网络）时探测本机局域网 IP。
+    let lan_ip = if is_wildcard { primary_lan_ipv4() } else { None };
+    // 选择自动打开浏览器 + 主显示用的地址：
+    // - 回环绑定：127.0.0.1。
+    // - 通配绑定（0.0.0.0/::）：优先用局域网 IP —— 它在本机和其它设备上都可访问，
+    //   契合 `--host 0.0.0.0` 暴露到网络的意图；用 127.0.0.1 只在本机有效、对远端
+    //   设备（手机/另一台机器）打开就是连接被拒。探测不到局域网 IP 时才回退 127.0.0.1。
+    // - 绑定具体非回环地址（如 Tailscale 100.x）：socket 只监听该地址，必须用它。
+    let open_host: String = if is_loopback_authority(&bound_host) {
+        "127.0.0.1".to_string()
+    } else if let Some(ip) = lan_ip.clone() {
+        ip
+    } else if is_wildcard {
+        "127.0.0.1".to_string()
+    } else {
+        bound_host.clone()
+    };
+    let local_url = format!(
+        "http://{}:{}/?token={}{}",
+        open_host, actual_port, token, sync_suffix
+    );
     let opened = atomcode_core::auth::oauth::open_browser(&local_url).is_ok();
     let mut msg = if opened {
         format!("已在浏览器打开 webui：{local_url}")
@@ -3153,17 +3322,14 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
 
     // 绑定了非回环地址：给出访问 URL + 安全/作用域提示。
     if !is_loopback_authority(&bound_host) {
-        if bound_host == "0.0.0.0" || bound_host == "::" {
-            // 绑定通配地址：探测本机局域网 IP 作为可访问地址。
-            if let Some(ip) = primary_lan_ipv4() {
-                msg.push_str(&format!("\n局域网访问：http://{ip}:{actual_port}/?token={token}"));
-            }
+        if is_wildcard {
+            // 主 URL（local_url）已是局域网 IP（若探测到），它在本机自身也可访问
+            // （0.0.0.0 监听所有接口，含回环），故无需再单列 127.0.0.1 那条冗余链接。
             msg.push_str(
-                "\n⚠️ 上面是局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
+                "\n⚠️ 主地址为局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
             );
         } else {
-            // 显式指定了具体地址。
-            msg.push_str(&format!("\n访问地址：http://{bound_host}:{actual_port}/?token={token}"));
+            // 显式指定了具体地址：local_url 已是该地址，这里仅补安全提示。
             msg.push_str(
                 "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
             );
@@ -3175,7 +3341,7 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
 
 /// 停止进程内 webui server（若在运行）。返回状态串。
 pub fn stop_server() -> String {
-    let mut guard = WEBUI.lock().unwrap();
+    let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.take() {
         handle.abort.abort();
         "已停止 webui server".to_string()
@@ -3304,7 +3470,11 @@ fn pgy_ipv4_candidates(ifconfig_output: &str) -> Vec<String> {
     let mut in_p2p = false; // 当前接口块是否为 POINTOPOINT
     for line in ifconfig_output.lines() {
         // 接口块以非空白字符开头（如 `utun7: flags=...`）；缩进行是其属性。
-        let is_header = line.chars().next().map(|c| !c.is_whitespace()).unwrap_or(false);
+        let is_header = line
+            .chars()
+            .next()
+            .map(|c| !c.is_whitespace())
+            .unwrap_or(false);
         if is_header {
             in_p2p = line.contains("POINTOPOINT");
             continue;
@@ -3335,7 +3505,9 @@ fn extract_ip_eq(line: &str) -> Option<String> {
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .unwrap_or(rest.len());
     let cand = &rest[..end];
-    cand.parse::<std::net::Ipv4Addr>().ok().map(|_| cand.to_string())
+    cand.parse::<std::net::Ipv4Addr>()
+        .ok()
+        .map(|_| cand.to_string())
 }
 
 /// 兜底:从蒲公英日志抓自报虚拟 IP（段无关、权威），取最后一条 `ip=`。
@@ -3409,7 +3581,10 @@ async fn get_tunnel_status(
 ) -> impl IntoResponse {
     let pgy = tokio::task::spawn_blocking(pgy_probe)
         .await
-        .unwrap_or(PgyInfo { installed: false, ipv4: None });
+        .unwrap_or(PgyInfo {
+            installed: false,
+            ipv4: None,
+        });
 
     let reachable = !is_loopback_authority(&state.bind_host);
 
@@ -3418,12 +3593,20 @@ async fn get_tunnel_status(
     let pgy_reachable = matches!(state.bind_host.as_str(), "0.0.0.0" | "::")
         || pgy.ipv4.as_deref() == Some(state.bind_host.as_str());
 
-    // 复用请求自带的 token（与当前页面同一 token）拼远程 URL。
+    // 复用请求自带的 token（与当前页面同一 token）拼远程 URL。Cookie 交接后
+    // SPA 的请求把 token 放在 HttpOnly Cookie 里而非 Authorization 头，所以两处都取。
     let token = auth_token::token_from_header(
         headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok()),
-    );
+    )
+    .or_else(|| {
+        auth_token::token_from_cookie(
+            headers
+                .get(axum::http::header::COOKIE)
+                .and_then(|h| h.to_str().ok()),
+        )
+    });
 
     let (remote_url, qr_svg) = match (&pgy.ipv4, &token) {
         (Some(ip), Some(tok)) if pgy_reachable => {
@@ -3553,7 +3736,9 @@ async fn fs_list(
 }
 
 #[derive(serde::Deserialize)]
-pub struct FsMkdirRequest { pub path: String }
+pub struct FsMkdirRequest {
+    pub path: String,
+}
 
 async fn fs_mkdir(
     State(_state): State<AppState>,
@@ -3634,7 +3819,12 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     };
 
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
-    let resolved = resolve(&cfg_telemetry, &cli_override, Config::config_dir(), &ProcessEnv);
+    let resolved = resolve(
+        &cfg_telemetry,
+        &cli_override,
+        Config::config_dir(),
+        &ProcessEnv,
+    );
 
     // Step 3: Print telemetry status line (R2.6) — suppressed in quiet (TUI) mode.
     if !quiet {
@@ -3649,6 +3839,13 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     // Step 4: Initialize telemetry runtime (R1.3, R1.6)
     let atomcode_dir = resolved.atomcode_dir.clone();
     let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
+
+    // Launch-level fallback mode (Ide for the standalone daemon, Webui for the
+    // in-process webui). Per-request `daemon_scope` overrides this with the
+    // client's X-AtomCode-Client mode; the fallback only kicks in for telemetry
+    // emitted outside any per-request scope (e.g. an un-scoped spawned task),
+    // which previously landed as `mode: null`.
+    telemetry.set_default_mode(Some(startup_mode));
 
     // Step 4.5: Install panic hook (R9.1, R9.2, R9.3, R9.4)
     install_panic_hook(telemetry.clone());
@@ -3694,13 +3891,16 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         bind_port: port,
     };
 
-    // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。
-    // 页面必须可加载，SPA 才能读取 ?token= 并在后续 API 调用中携带。
+    // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。页面必须可加载，
+    // 其中 `/` 把首次访问的 `?token=` 交接成 HttpOnly Cookie（见 serve_webui_index），
+    // 之后 SPA 的同源请求自动携带该 Cookie 完成鉴权。
     let public = Router::new()
         // Health check
         .route("/health", get(health))
-        // WebUI static assets + SPA fallback (Task 3/4)
-        .route("/", axum::routing::get(webui::serve_webui))
+        // WebUI static assets + SPA fallback (Task 3/4). The `/` route
+        // does the one-time-token → HttpOnly-cookie handoff (CWE-598); the
+        // fallback serves SPA routes/assets and never carries a token.
+        .route("/", axum::routing::get(serve_webui_index))
         .fallback(webui::serve_webui);
 
     // 受保护路由：所有数据/API 端点。仅 webui 模式（enforce_token=true）强制 token 鉴权；
@@ -3737,6 +3937,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/provider", post(live_api::live_provider))
         .route("/live/cancel", post(live_api::live_cancel))
+        .route(
+            "/live/reasoning_effort",
+            post(live_api::live_reasoning_effort),
+        )
         // Skills API
         .route("/skills", get(get_skills))
         // Filesystem API
@@ -3887,7 +4091,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
                         ..CurrentContext::default()
                     },
                     || async {
-                        telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
+                        telemetry.track(Event::OpenAtomcode {
+                            dangerously_skip_permissions: false,
+                        });
                     },
                 )
                 .await;
@@ -3906,7 +4112,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             ..CurrentContext::default()
         },
         || async {
-            telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
+            telemetry.track(Event::OpenAtomcode {
+                dangerously_skip_permissions: false,
+            });
         },
     )
     .await;
@@ -3938,8 +4146,8 @@ mod fs_list_tests {
     #[test]
     fn lists_subdirs_of_temp() {
         // create a temp dir with a child dir + a file; expect only the child dir name
-        let base = std::env::temp_dir()
-            .join(format!("atomcode_fslist_test_{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("atomcode_fslist_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(base.join("childdir"));
         let _ = std::fs::write(base.join("afile.txt"), b"x");
         let dirs = list_subdirs(&base).unwrap();
@@ -3957,6 +4165,33 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_query_value_extracts_token() {
+        assert_eq!(first_query_value("token=abc", "token"), Some("abc".into()));
+        assert_eq!(
+            first_query_value("session=Y&token=abc&sync=1", "token"),
+            Some("abc".into())
+        );
+        assert_eq!(first_query_value("session=Y", "token"), None);
+        assert_eq!(first_query_value("", "token"), None);
+        // A bare key with no `=` is not a value.
+        assert_eq!(first_query_value("token", "token"), None);
+    }
+
+    #[test]
+    fn strip_query_key_preserves_other_params() {
+        assert_eq!(strip_query_key("token=abc", "token"), "");
+        assert_eq!(
+            strip_query_key("token=abc&session=Y", "token"),
+            "session=Y"
+        );
+        assert_eq!(
+            strip_query_key("session=Y&token=abc&sync=1", "token"),
+            "session=Y&sync=1"
+        );
+        assert_eq!(strip_query_key("session=Y", "token"), "session=Y");
+    }
 
     fn origin_is_allowed(origin: &str) -> bool {
         let origin = HeaderValue::from_str(origin).unwrap();
@@ -4018,10 +4253,7 @@ mod tests {
 
     #[test]
     fn list_files_returns_files_skips_dirs_and_hidden() {
-        let tmp = std::env::temp_dir().join(format!(
-            "atomcode_list_files_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("atomcode_list_files_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("b.txt"), b"x").unwrap();
@@ -4131,7 +4363,10 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
             pgy_pick_ipv4(cands.clone(), Some("10.99.0.5".into())),
             Some("10.99.0.5".into())
         );
-        assert_eq!(pgy_pick_ipv4(cands.clone(), Some("172.31.9.9".into())), None);
+        assert_eq!(
+            pgy_pick_ipv4(cands.clone(), Some("172.31.9.9".into())),
+            None
+        );
         assert_eq!(pgy_pick_ipv4(cands, None), None);
     }
 

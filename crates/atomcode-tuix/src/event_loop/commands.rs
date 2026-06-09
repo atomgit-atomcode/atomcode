@@ -16,7 +16,9 @@ use std::path::PathBuf;
 
 use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
-use crate::modals::{DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
+use crate::modals::{
+    DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker,
+};
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
@@ -66,8 +68,8 @@ pub(crate) fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
 /// `ToolResult` entries.  Returns `(display_name, detail)` of the first
 /// unpaired tool call, or `None` if all tool calls have results.
 fn find_pending_approval(session: &Session) -> Option<(String, String)> {
-    use atomcode_core::conversation::message::{MessageContent, Role};
     use crate::event_loop::format_tool_detail;
+    use atomcode_core::conversation::message::{MessageContent, Role};
 
     // Collect all call_ids that already have a ToolResult.
     let mut answered_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -79,10 +81,8 @@ fn find_pending_approval(session: &Session) -> Option<(String, String)> {
 
     // Walk messages in reverse to find the most recent unpaired tool call.
     for m in session.messages.iter().rev() {
-        if let (
-            Role::Assistant,
-            MessageContent::AssistantWithToolCalls { tool_calls, .. },
-        ) = (&m.role, &m.content)
+        if let (Role::Assistant, MessageContent::AssistantWithToolCalls { tool_calls, .. }) =
+            (&m.role, &m.content)
         {
             for tc in tool_calls.iter().rev() {
                 if !answered_ids.contains(&tc.id) {
@@ -152,7 +152,12 @@ pub fn validate_session_name(name: &str) -> Option<String> {
         return Some(t(Msg::SessionNameEmpty).into_owned());
     }
     if trimmed.chars().count() > MAX_SESSION_NAME_LEN {
-        return Some(t(Msg::SessionNameTooLong { max: MAX_SESSION_NAME_LEN }).into_owned());
+        return Some(
+            t(Msg::SessionNameTooLong {
+                max: MAX_SESSION_NAME_LEN,
+            })
+            .into_owned(),
+        );
     }
     if trimmed.chars().any(char::is_control) {
         return Some(t(Msg::SessionNameControlChars).into_owned());
@@ -170,9 +175,12 @@ pub fn perform_session_rename(
         return Err(err);
     }
     let new_name = new_name.trim().to_string();
-    let session = session_manager
-        .load(session_id)
-        .map_err(|e| t(Msg::SessionLoadFailed { error: &e.to_string() }).into_owned())?;
+    let session = session_manager.load(session_id).map_err(|e| {
+        t(Msg::SessionLoadFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
     let old_name = session.name.clone();
     let renamed_session = atomcode_core::session::Session {
         name: new_name.clone(),
@@ -183,9 +191,12 @@ pub fn perform_session_rename(
         user_renamed: true,
         ..session
     };
-    session_manager
-        .save(&renamed_session)
-        .map_err(|e| t(Msg::SessionSaveFailed { error: &e.to_string() }).into_owned())?;
+    session_manager.save(&renamed_session).map_err(|e| {
+        t(Msg::SessionSaveFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
     Ok((old_name, new_name))
 }
 
@@ -203,7 +214,9 @@ fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
                 path: &p.display().to_string(),
                 label: level.label(),
             })),
-            None => out.push_str(&t(Msg::StatusInstructionMissing { label: level.label() })),
+            None => out.push_str(&t(Msg::StatusInstructionMissing {
+                label: level.label(),
+            })),
         }
     }
     out
@@ -248,7 +261,9 @@ fn attach_live_session(
                 }
                 (
                     Role::Assistant,
-                    MessageContent::AssistantWithToolCalls { text, tool_calls, .. },
+                    MessageContent::AssistantWithToolCalls {
+                        text, tool_calls, ..
+                    },
                 ) => {
                     if let Some(t) = text {
                         if !t.is_empty() {
@@ -266,7 +281,7 @@ fn attach_live_session(
                 (Role::Tool, MessageContent::ToolResult(r)) => {
                     renderer.render(UiLine::ToolResult {
                         success: r.success,
-                        summary: super::summarise(&r.output, r.success),
+                        summary: super::summarise(&r.output),
                     });
                 }
                 _ => {}
@@ -320,7 +335,12 @@ pub(super) fn execute_slash_command(
     {
         use atomcode_telemetry::Event;
         let cmd_name = cmd.trim_start_matches('/').to_string();
-        ctx.telemetry.track(Event::UseCommand { type_: cmd_name, success: Some(true), error_kind: None, error_data: None });
+        ctx.telemetry.track(Event::UseCommand {
+            type_: cmd_name,
+            success: Some(true),
+            error_kind: None,
+            error_data: None,
+        });
     }
 
     match cmd {
@@ -450,9 +470,7 @@ pub(super) fn execute_slash_command(
             // i18n string owns column alignment so translators can adjust
             // per locale without touching this arm. /help complements
             // this with the slash-command list.
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::KeybindingsHelp).into_owned(),
-            ));
+            renderer.render(UiLine::CommandOutput(t(Msg::KeybindingsHelp).into_owned()));
             renderer.flush();
         }
         "plan" => {
@@ -478,7 +496,8 @@ pub(super) fn execute_slash_command(
             let mut txt = t(Msg::ConfigProviderLabel {
                 provider: &ctx.config.default_provider,
                 path: &config_path,
-            }).into_owned();
+            })
+            .into_owned();
             // Body: one minimal runnable example + pointer to the full
             // reference so users know where to get Claude / OpenAI /
             // Ollama variants without flooding the terminal here.
@@ -526,8 +545,10 @@ pub(super) fn execute_slash_command(
                         .ok();
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::CmdReloadDone {
-                            provider: &new_default, model: &new_model,
-                        }).into_owned(),
+                            provider: &new_default,
+                            model: &new_model,
+                        })
+                        .into_owned(),
                     ));
                 }
                 Err(e) => {
@@ -553,51 +574,14 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "session" => {
-            // Start fresh: tell the agent to drop conversation history,
-            // clear the scrollback + type-ahead queue + UI state, and
-            // redraw the welcome screen so the user sees they're in a
-            // brand-new session. Ports `/session` from the legacy TUI.
-            ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
-            ctx.current_session_id = None;
-            state.total_tokens = 0;
-            state.prompt_tokens = 0;
-            state.completion_tokens = 0;
-            state.cached_tokens = 0;
-            state.last_context = None;
-            state.pending_context_render = None;
-            state.thinking_idx = 0;
-            state.on_turn_complete();
-            // New session = new session file on disk. Old session
-            // (already saved at its last TurnComplete) stays on disk so
-            // it can still be `/resume`d; we just stop writing into it.
-            ctx.current_session =
-                atomcode_core::session::Session::default_session(ctx.working_dir.clone());
-            ctx.bg_manager
-                .set_foreground_session(ctx.current_session.clone());
-            // Bind telemetry + agent session id to the new session's UUID
-            // (the ClearConversation above intentionally leaves the id alone;
-            // this is the single source of truth).
-            bind_telemetry_to_session(ctx, &ctx.current_session);
-            // `reset()` wipes the terminal AND the renderer's cached
-            // footer/stream state, so the next Welcome renders against
-            // a known (row 1, col 1) anchor. This is what makes
-            // /session behave like a fresh launch.
-            renderer.reset();
-            let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-            renderer.render(UiLine::Welcome {
-                model: ctx.model_name.clone(),
-                working_dir: dir_display,
-            });
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdNewSession).into_owned(),
-            ));
-            renderer.flush();
+            // Start fresh in the current directory. Ports `/session` from the
+            // legacy TUI. Shared with the webui-driven project switch via
+            // `reset_to_new_session`.
+            reset_to_new_session(ctx, state, renderer);
         }
         "model" => {
             if ctx.config.providers.is_empty() {
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::CmdNoProviders).into_owned(),
-                ));
+                renderer.render(UiLine::CommandOutput(t(Msg::CmdNoProviders).into_owned()));
                 renderer.flush();
             } else {
                 *active_modal = Some(Box::new(ModelPicker::open(&ctx.config)));
@@ -644,9 +628,7 @@ pub(super) fn execute_slash_command(
             Ok(all) => {
                 let sessions: Vec<_> = all.into_iter().filter(|s| s.message_count > 0).collect();
                 if sessions.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::CmdNoSessions).into_owned(),
-                    ));
+                    renderer.render(UiLine::CommandOutput(t(Msg::CmdNoSessions).into_owned()));
                     renderer.flush();
                 } else {
                     *active_modal = Some(Box::new(SessionPicker::open(sessions)));
@@ -654,7 +636,10 @@ pub(super) fn execute_slash_command(
             }
             Err(e) => {
                 renderer.render(UiLine::Error(
-                    t(Msg::SessionListFailed { error: &e.to_string() }).into_owned(),
+                    t(Msg::SessionListFailed {
+                        error: &e.to_string(),
+                    })
+                    .into_owned(),
                 ));
                 renderer.flush();
             }
@@ -675,8 +660,11 @@ pub(super) fn execute_slash_command(
                 match ctx.session_manager.save(&ctx.current_session) {
                     Ok(()) => {
                         renderer.render(UiLine::CommandOutput(
-                            t(Msg::SessionRenamed { old: &old_name, new: &new_name })
-                                .into_owned(),
+                            t(Msg::SessionRenamed {
+                                old: &old_name,
+                                new: &new_name,
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                     }
@@ -685,8 +673,10 @@ pub(super) fn execute_slash_command(
                         // still reports the original name.
                         ctx.current_session.name = old_name;
                         renderer.render(UiLine::Error(
-                            t(Msg::SessionSaveFailed { error: &e.to_string() })
-                                .into_owned(),
+                            t(Msg::SessionSaveFailed {
+                                error: &e.to_string(),
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                     }
@@ -706,7 +696,8 @@ pub(super) fn execute_slash_command(
                 dir: &ctx.working_dir.display().to_string(),
                 config: &Config::default_path().display().to_string(),
                 tokens: state.total_tokens,
-            }).into_owned();
+            })
+            .into_owned();
             txt.push_str(&render_codingplan_status_for_status_cmd());
 
             txt.push('\n');
@@ -730,16 +721,19 @@ pub(super) fn execute_slash_command(
                     }));
                 }
                 Err(e) => {
-                    renderer.render(UiLine::Error(t(Msg::DiffFailed { error: &format!("{}", e) }).into_owned()));
+                    renderer.render(UiLine::Error(
+                        t(Msg::DiffFailed {
+                            error: &format!("{}", e),
+                        })
+                        .into_owned(),
+                    ));
                 }
             }
             renderer.flush();
         }
         "undo" => {
             if state.phase != crate::state::UiPhase::Idle {
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::CmdUndoBusy).into_owned(),
-                ));
+                renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBusy).into_owned()));
                 renderer.flush();
             } else {
                 let a = arg.trim();
@@ -760,9 +754,7 @@ pub(super) fn execute_slash_command(
                             .ok();
                     }
                     Err(()) => {
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::CmdUndoBadArg).into_owned(),
-                        ));
+                        renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBadArg).into_owned()));
                         renderer.flush();
                     }
                 }
@@ -790,7 +782,8 @@ pub(super) fn execute_slash_command(
                     cache_rate,
                     total,
                     cost: &cost_str,
-                }).into_owned(),
+                })
+                .into_owned(),
             ));
             renderer.flush();
         }
@@ -895,31 +888,22 @@ pub(super) fn execute_slash_command(
                     "127.0.0.1".to_string()
                 }
                 let host = parse_host(a);
-                // 先用 TUI 当前会话（如 `atomcode -c` 续聊的会话）播种 LiveSession，
-                // 并在开浏览器**之前**完成——否则浏览器可能抢先连上 /live、先建出一个空
-                // LiveSession，webui 就落到空白新页面而非当前会话。仅当前会话非空时才复用
-                // 其 id（让后续每轮覆盖同一文件、不产生重复会话）。
-                let (initial, sid) = if ctx.current_session.messages.is_empty() {
-                    (Vec::new(), None)
-                } else {
-                    (
-                        ctx.current_session.messages.clone(),
-                        Some(ctx.current_session.id.clone()),
-                    )
-                };
-                let session = atomcode_daemon::ensure_live_session_seeded(
+                // #561 修复：先用 TUI 当前会话播种 LiveSession（session_id + 历史），
+                // 再开浏览器——否则浏览器抢先连 /live 会建出空白 LiveSession。
+                let session = atomcode_daemon::ensure_live_session(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
-                    initial,
-                    sid,
+                    Some(ctx.current_session.id.clone()),
+                    ctx.current_session.messages.clone(),
                 );
                 let open_msg = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(atomcode_daemon::ensure_server_and_open(
+                    tokio::runtime::Handle::current().block_on(
+                        atomcode_daemon::ensure_server_and_open(
                             &host,
                             atomcode_daemon::WEBUI_DEFAULT_PORT,
                             true,
-                        ))
+                        ),
+                    )
                 });
                 // 附着把 TUI 接入同步。画面里已有当前会话（播种来源），故 render_snapshot=false
                 // 跳过快照回放，避免把同一段对话重复刷一遍。
@@ -939,17 +923,16 @@ pub(super) fn execute_slash_command(
                     "已退出同步，回到独立会话".to_string(),
                 ));
             } else {
-                match atomcode_daemon::current_live_session() {
-                    Some(session) => {
-                        // 重新附着：TUI 可能错过了 webui 期间的对话，回放快照补上。
-                        attach_live_session(ctx, renderer, session, true);
-                    }
-                    None => {
-                        renderer.render(UiLine::CommandOutput(
-                            "没有活动的 webui 会话，请先运行 /webui".to_string(),
-                        ));
-                    }
-                }
+                // #561 修复：始终用 ensure_live_session 把当前会话上下文传给 LiveSession，
+                // 这样即使 WebUI 先启动了 LiveSession（用不同 session_id），/sync 也能
+                // 把它替换为 TUI 的会话。
+                let session = atomcode_daemon::ensure_live_session(
+                    ctx.working_dir.clone(),
+                    ctx.telemetry.clone(),
+                    Some(ctx.current_session.id.clone()),
+                    ctx.current_session.messages.clone(),
+                );
+                attach_live_session(ctx, renderer, session, true);
             }
             renderer.flush();
         }
@@ -1152,9 +1135,7 @@ pub(super) fn execute_slash_command(
                         .agent
                         .cmd_tx
                         .send(AgentCommand::ReloadConfig(ctx.config.clone()));
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::CmdLogoutDone).into_owned(),
-                    ));
+                    renderer.render(UiLine::CommandOutput(t(Msg::CmdLogoutDone).into_owned()));
                 }
                 Err(e) => {
                     let msg = format!("{}", e);
@@ -1312,7 +1293,10 @@ pub(super) fn execute_slash_command(
                     sync_bg_foreground(ctx);
                     if !ctx.bg_manager.has_capacity() {
                         renderer.render(UiLine::Error(
-                            t(Msg::BgSlotLimitReached { max: bg_runtime::MAX_BACKGROUND_SLOTS }).into_owned(),
+                            t(Msg::BgSlotLimitReached {
+                                max: bg_runtime::MAX_BACKGROUND_SLOTS,
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
@@ -1352,7 +1336,8 @@ pub(super) fn execute_slash_command(
                             slot,
                             old_id: &old_short_id,
                             state: &old_state.localised(),
-                        }).into_owned(),
+                        })
+                        .into_owned(),
                     ));
                 }
                 bg_runtime::BgCommand::Resume(slot) => {
@@ -1364,7 +1349,11 @@ pub(super) fn execute_slash_command(
                         Ok(outcome) => outcome,
                         Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
                             renderer.render(UiLine::Error(
-                                t(Msg::BgInvalidSlot { slot, available: len }).into_owned(),
+                                t(Msg::BgInvalidSlot {
+                                    slot,
+                                    available: len,
+                                })
+                                .into_owned(),
                             ));
                             renderer.flush();
                             return Ok(());
@@ -1378,9 +1367,7 @@ pub(super) fn execute_slash_command(
                         }
                     };
                     let Some(client) = outcome.resumed_client else {
-                        renderer.render(UiLine::Error(
-                            t(Msg::BgNoRuntimeClient).into_owned(),
-                        ));
+                        renderer.render(UiLine::Error(t(Msg::BgNoRuntimeClient).into_owned()));
                         renderer.flush();
                         return Ok(());
                     };
@@ -1403,14 +1390,26 @@ pub(super) fn execute_slash_command(
                     // lack corresponding ToolResult entries.
                     let pending_approval = find_pending_approval(&ctx.current_session);
                     if let Some((tool_name, detail)) = pending_approval {
-                        renderer.render(UiLine::ApprovalPrompt { tool: tool_name, detail });
+                        renderer.render(UiLine::ApprovalPrompt {
+                            tool: tool_name,
+                            detail,
+                        });
                         state.on_approval_needed("");
                     }
 
                     let short_id = ctx.current_session.short_id().to_string();
-                    let mut msg = t(Msg::BgResumed { slot, short_id: &short_id }).into_owned();
+                    let mut msg = t(Msg::BgResumed {
+                        slot,
+                        short_id: &short_id,
+                    })
+                    .into_owned();
                     if let Some(previous_slot) = outcome.previous_foreground_slot {
-                        msg.push_str(&t(Msg::BgPreviousForegroundMoved { slot: previous_slot }).into_owned());
+                        msg.push_str(
+                            &t(Msg::BgPreviousForegroundMoved {
+                                slot: previous_slot,
+                            })
+                            .into_owned(),
+                        );
                     }
                     renderer.render(UiLine::CommandOutput(msg));
                 }
@@ -1419,7 +1418,11 @@ pub(super) fn execute_slash_command(
                         Ok(dropped) => dropped,
                         Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
                             renderer.render(UiLine::Error(
-                                t(Msg::BgInvalidSlot { slot, available: len }).into_owned(),
+                                t(Msg::BgInvalidSlot {
+                                    slot,
+                                    available: len,
+                                })
+                                .into_owned(),
                             ));
                             renderer.flush();
                             return Ok(());
@@ -1436,7 +1439,11 @@ pub(super) fn execute_slash_command(
                     }
                     let short_id = dropped.session.short_id().to_string();
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::BgDropped { slot, short_id: &short_id }).into_owned(),
+                        t(Msg::BgDropped {
+                            slot,
+                            short_id: &short_id,
+                        })
+                        .into_owned(),
                     ));
                 }
             }
@@ -1447,15 +1454,16 @@ pub(super) fn execute_slash_command(
             // real background runtime, keep the current foreground active.
             let task = arg.trim();
             if task.is_empty() {
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::BackgroundUsage).into_owned(),
-                ));
+                renderer.render(UiLine::CommandOutput(t(Msg::BackgroundUsage).into_owned()));
                 renderer.flush();
                 return Ok(());
             }
             if !ctx.bg_manager.has_capacity() {
                 renderer.render(UiLine::Error(
-                    t(Msg::BgSlotLimitReached { max: bg_runtime::MAX_BACKGROUND_SLOTS }).into_owned(),
+                    t(Msg::BgSlotLimitReached {
+                        max: bg_runtime::MAX_BACKGROUND_SLOTS,
+                    })
+                    .into_owned(),
                 ));
                 renderer.flush();
                 return Ok(());
@@ -1482,10 +1490,18 @@ pub(super) fn execute_slash_command(
             };
             client
                 .cmd_tx
-                .send(AgentCommand::SendMessage { text: task.to_string(), images: Vec::new(), image_markers: Vec::new() })
+                .send(AgentCommand::SendMessage {
+                    text: task.to_string(),
+                    images: Vec::new(),
+                    image_markers: Vec::new(),
+                })
                 .ok();
             renderer.render(UiLine::CommandOutput(
-                t(Msg::BgTaskStarted { slot, short_id: &short_id }).into_owned(),
+                t(Msg::BgTaskStarted {
+                    slot,
+                    short_id: &short_id,
+                })
+                .into_owned(),
             ));
             renderer.flush();
         }
@@ -1509,7 +1525,11 @@ pub(super) fn execute_slash_command(
                 Ok(()) => {
                     let path_str = target.display().to_string();
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::InitWrote { path: &path_str, bytes: content.len() }).into_owned(),
+                        t(Msg::InitWrote {
+                            path: &path_str,
+                            bytes: content.len(),
+                        })
+                        .into_owned(),
                     ));
                     // Confirm the file is reachable for the prompt-builder by
                     // re-running the same load that `/status` uses. If the
@@ -1517,13 +1537,16 @@ pub(super) fn execute_slash_command(
                     // the user knows immediately — instead of asking the AI
                     // a question and trying to infer load state from its
                     // answer.
-                    renderer.render(UiLine::CommandOutput(
-                        render_instruction_status_block(&ctx.working_dir),
-                    ));
+                    renderer.render(UiLine::CommandOutput(render_instruction_status_block(
+                        &ctx.working_dir,
+                    )));
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::InitFailed { error: &format!("{}", e) }).into_owned(),
+                        t(Msg::InitFailed {
+                            error: &format!("{}", e),
+                        })
+                        .into_owned(),
                     ));
                 }
             }
@@ -1544,7 +1567,10 @@ pub(super) fn execute_slash_command(
                     Ok(configs) => configs,
                     Err(e) => {
                         renderer.render(UiLine::Error(
-                            t(Msg::McpOAuthLoadConfigFailed { error: &format!("{:#}", e) }).into_owned(),
+                            t(Msg::McpOAuthLoadConfigFailed {
+                                error: &format!("{:#}", e),
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
@@ -1584,10 +1610,17 @@ pub(super) fn execute_slash_command(
                 });
                 match result {
                     Ok(token) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthSaved { provider: &token.provider, server }).into_owned(),
+                        t(Msg::McpOAuthSaved {
+                            provider: &token.provider,
+                            server,
+                        })
+                        .into_owned(),
                     )),
                     Err(e) => renderer.render(UiLine::Error(
-                        t(Msg::McpOAuthFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::McpOAuthFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     )),
                 }
                 renderer.flush();
@@ -1611,7 +1644,10 @@ pub(super) fn execute_slash_command(
                         t(Msg::McpOAuthNoToken { server }).into_owned(),
                     )),
                     Err(e) => renderer.render(UiLine::Error(
-                        t(Msg::McpOAuthLogoutFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::McpOAuthLogoutFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     )),
                 }
                 renderer.flush();
@@ -1625,14 +1661,20 @@ pub(super) fn execute_slash_command(
                     Ok(c) => c,
                     Err(e) => {
                         renderer.render(UiLine::Error(
-                            t(Msg::McpReloadFailed { error: &format!("{:#}", e) }).into_owned(),
+                            t(Msg::McpReloadFailed {
+                                error: &format!("{:#}", e),
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
                     }
                 };
 
-                let mut header = t(Msg::McpReloading { count: configs.len() }).into_owned();
+                let mut header = t(Msg::McpReloading {
+                    count: configs.len(),
+                })
+                .into_owned();
 
                 if !configs.is_empty() {
                     header.push_str(&t(Msg::McpConnecting));
@@ -1699,9 +1741,7 @@ pub(super) fn execute_slash_command(
             if let Some(rest) = sub.strip_prefix("tools") {
                 let server = rest.trim();
                 if server.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpToolsUsage).into_owned(),
-                    ));
+                    renderer.render(UiLine::CommandOutput(t(Msg::McpToolsUsage).into_owned()));
                     renderer.flush();
                     return Ok(());
                 }
@@ -1748,12 +1788,13 @@ pub(super) fn execute_slash_command(
                         }
                     });
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpToolsListing { server: &server_for_msg }).into_owned(),
+                        t(Msg::McpToolsListing {
+                            server: &server_for_msg,
+                        })
+                        .into_owned(),
                     ));
                 } else {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpNoRegistry).into_owned(),
-                    ));
+                    renderer.render(UiLine::CommandOutput(t(Msg::McpNoRegistry).into_owned()));
                 }
                 renderer.flush();
                 return Ok(());
@@ -1806,9 +1847,7 @@ pub(super) fn execute_slash_command(
             let provider = ctx.config.providers.get_mut(&provider_name);
             match provider {
                 None => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::CmdNoActiveProvider).into_owned(),
-                    ));
+                    renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
                     renderer.flush();
                 }
                 Some(p) => {
@@ -1818,7 +1857,12 @@ pub(super) fn execute_slash_command(
                         let budget = p.thinking_budget.unwrap_or(10_000);
                         let status = if enabled { "enabled" } else { "disabled" };
                         renderer.render(UiLine::CommandOutput(
-                            t(Msg::ThinkStatus { status, budget, provider: &provider_name }).into_owned(),
+                            t(Msg::ThinkStatus {
+                                status,
+                                budget,
+                                provider: &provider_name,
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                     } else if sub == "on" {
@@ -1832,9 +1876,7 @@ pub(super) fn execute_slash_command(
                     } else if sub == "off" {
                         p.thinking_enabled = Some(false);
                         save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::ThinkDisabled).into_owned(),
-                        ));
+                        renderer.render(UiLine::CommandOutput(t(Msg::ThinkDisabled).into_owned()));
                         renderer.flush();
                     } else if let Some(rest) = sub.strip_prefix("budget") {
                         let num_str = rest.trim();
@@ -1854,16 +1896,65 @@ pub(super) fn execute_slash_command(
                                 renderer.flush();
                             }
                             Err(_) => {
-                                renderer.render(UiLine::Error(
-                                    t(Msg::ThinkBudgetUsage).into_owned(),
-                                ));
+                                renderer
+                                    .render(UiLine::Error(t(Msg::ThinkBudgetUsage).into_owned()));
 
                                 renderer.flush();
                             }
                         }
                     } else {
+                        renderer.render(UiLine::CommandOutput(t(Msg::ThinkUsage).into_owned()));
+                        renderer.flush();
+                    }
+                }
+            }
+        }
+        "effort" => {
+            let sub = arg.trim().to_ascii_lowercase();
+            let provider_name = ctx.config.default_provider.clone();
+            let applicable = crate::event_loop::reasoning_effort_applicable_on_provider(ctx);
+            if !applicable {
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::ReasoningEffortNoEffect).into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+            let provider = ctx.config.providers.get_mut(&provider_name);
+            match provider {
+                None => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::CmdNoActiveProvider).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                Some(p) => {
+                    if sub.is_empty() {
+                        // Show current status
+                        let current = p.reasoning_effort.as_deref().unwrap_or("off (API default)");
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Current reasoning effort: {current}\n  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n"
+                        )));
+                        renderer.flush();
+                    } else if sub == "high" || sub == "max" {
+                        p.reasoning_effort = Some(sub.to_string());
+                        ctx.reasoning_effort = Some(sub.to_string());
+                        crate::event_loop::save_and_reload(ctx, renderer);
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  ○ Reasoning effort set to: {sub}\n"
+                        )));
+                        renderer.flush();
+                    } else if sub == "off" {
+                        p.reasoning_effort = None;
+                        ctx.reasoning_effort = None;
+                        crate::event_loop::save_and_reload(ctx, renderer);
                         renderer.render(UiLine::CommandOutput(
-                            t(Msg::ThinkUsage).into_owned(),
+                            "  ○ Reasoning effort: default (API auto)\n".to_string(),
+                        ));
+                        renderer.flush();
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            "  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n".into(),
                         ));
                         renderer.flush();
                     }
@@ -1909,9 +2000,7 @@ pub(super) fn execute_slash_command(
                     })
                     .unwrap_or_default();
                 if lines.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::SkillsNone).into_owned(),
-                    ));
+                    renderer.render(UiLine::CommandOutput(t(Msg::SkillsNone).into_owned()));
                 } else {
                     renderer.render(UiLine::CommandOutput(format!(
                         "{}{}\n",
@@ -1933,7 +2022,11 @@ pub(super) fn execute_slash_command(
                 if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
                     ctx.agent
                         .cmd_tx
-                        .send(AgentCommand::SendMessage { text: rendered, images: vec![], image_markers: vec![] })
+                        .send(AgentCommand::SendMessage {
+                            text: rendered,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
                         .ok();
                     state.on_submit();
                 } else {
@@ -1972,16 +2065,12 @@ pub(super) fn execute_slash_command(
                     *setup_pending = true;
                     state.on_submit();
                 } else {
-                    renderer.render(UiLine::Error(
-                        t(Msg::CmdSetupSkillMissing).into_owned(),
-                    ));
+                    renderer.render(UiLine::Error(t(Msg::CmdSetupSkillMissing).into_owned()));
                     renderer.flush();
                 }
             } else {
                 // First run: install seeds, reload, then invoke.
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::CmdSetupRunning).into_owned(),
-                ));
+                renderer.render(UiLine::CommandOutput(t(Msg::CmdSetupRunning).into_owned()));
                 renderer.flush();
 
                 let project_root = ctx.working_dir.clone();
@@ -1990,9 +2079,7 @@ pub(super) fn execute_slash_command(
                 // `setup::run` is synchronous (file I/O only). Run it on the
                 // current thread via `block_in_place` to avoid blocking the
                 // tokio runtime — no `block_on` needed since it's not async.
-                let result = tokio::task::block_in_place(|| {
-                    atomcode_core::setup::run(opts)
-                });
+                let result = tokio::task::block_in_place(|| atomcode_core::setup::run(opts));
 
                 match result {
                     Ok(report) => {
@@ -2005,7 +2092,10 @@ pub(super) fn execute_slash_command(
                         // to restart AtomCode to see them in /skills.
                         let (skills_loaded, _) = super::reload_plugins(ctx);
                         renderer.render(UiLine::CommandOutput(
-                            t(Msg::CmdSetupSkillsReloaded { count: skills_loaded }).into_owned(),
+                            t(Msg::CmdSetupSkillsReloaded {
+                                count: skills_loaded,
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
 
@@ -2029,15 +2119,17 @@ pub(super) fn execute_slash_command(
                             *setup_pending = true;
                             state.on_submit();
                         } else {
-                            renderer.render(UiLine::Error(
-                                t(Msg::CmdSetupSkillMissing).into_owned(),
-                            ));
+                            renderer
+                                .render(UiLine::Error(t(Msg::CmdSetupSkillMissing).into_owned()));
                             renderer.flush();
                         }
                     }
                     Err(e) => {
                         renderer.render(UiLine::Error(
-                            t(Msg::CmdSetupError { error: &e.to_string() }).into_owned(),
+                            t(Msg::CmdSetupError {
+                                error: &e.to_string(),
+                            })
+                            .into_owned(),
                         ));
                     }
                 }
@@ -2052,36 +2144,73 @@ pub(super) fn execute_slash_command(
             if let Some(rendered) = ctx.custom_commands.render(other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage { text: rendered, images: vec![], image_markers: vec![] })
+                    .send(AgentCommand::SendMessage {
+                        text: rendered,
+                        images: vec![],
+                        image_markers: vec![],
+                    })
                     .ok();
                 state.on_submit();
             } else if let Some(rendered) = expand_skill(ctx, other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage { text: rendered, images: vec![], image_markers: vec![] })
+                    .send(AgentCommand::SendMessage {
+                        text: rendered,
+                        images: vec![],
+                        image_markers: vec![],
+                    })
                     .ok();
                 state.on_submit();
             } else {
                 // Unknown command — emit failure telemetry
                 let available_commands: Vec<&str> = vec![
-                    "help", "quit", "exit", "clear", "compact", "reload", "config",
-                    "plan", "build", "session", "model", "language", "resume",
-                    "rename", "provider", "status", "diff", "undo", "cost",
-                    "context", "remember", "forget", "memory", "login", "logout",
-                    "whoami", "upgrade", "issue", "cd", "bg", "codingplan",
+                    "help",
+                    "quit",
+                    "exit",
+                    "clear",
+                    "compact",
+                    "reload",
+                    "config",
+                    "plan",
+                    "build",
+                    "session",
+                    "model",
+                    "language",
+                    "resume",
+                    "rename",
+                    "provider",
+                    "status",
+                    "diff",
+                    "undo",
+                    "cost",
+                    "context",
+                    "remember",
+                    "forget",
+                    "memory",
+                    "login",
+                    "logout",
+                    "whoami",
+                    "upgrade",
+                    "issue",
+                    "cd",
+                    "bg",
+                    "codingplan",
                 ];
                 ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
                     type_: other.to_string(),
                     success: Some(false),
                     error_kind: Some(atomcode_telemetry::UseCommandErrorKind::NotFound),
-                    error_data: Some(serde_json::json!({
-                        "command": other,
-                        "duration_ms": 0,
-                        "message": format!("Unknown command: {}", other),
-                        "reason": "用户输入了不存在的斜杠命令",
-                        "resolution": "使用 /help 查看所有可用命令",
-                        "available_commands": available_commands,
-                    }).to_string()),
+                    error_data: Some(
+                        serde_json::json!({
+                            "command": other,
+                            "duration_ms": 0,
+                            "message": format!("Unknown command: {}", other),
+                            "reason": "用户输入了不存在的斜杠命令",
+                            "resolution": "使用 /help 查看所有可用命令",
+                            "available_commands": available_commands,
+                        })
+                        .to_string(),
+                    ),
                 });
                 renderer.render(UiLine::Error(
                     t(Msg::CmdUnknownCommand { name: other }).into_owned(),
@@ -2134,10 +2263,15 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                     // consumed by handle_plugin_job_event and rendered there.
                     let url = arg.to_string();
                     let tx = ctx.plugin_job_tx.clone();
-                    ok(renderer, t(Msg::PluginMarketplaceCloning { url: &url }).into_owned());
+                    ok(
+                        renderer,
+                        t(Msg::PluginMarketplaceCloning { url: &url }).into_owned(),
+                    );
                     tokio::task::spawn_blocking(move || {
                         let ev = match atomcode_core::plugin::marketplace::add_marketplace(&url) {
-                            Ok(info) => atomcode_core::plugin::PluginJobEvent::MarketplaceAdded(info),
+                            Ok(info) => {
+                                atomcode_core::plugin::PluginJobEvent::MarketplaceAdded(info)
+                            }
                             Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
                                 op: "add marketplace".into(),
                                 msg: format!("{:#}", e),
@@ -2149,17 +2283,32 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 "remove" => match atomcode_core::plugin::marketplace::remove_marketplace(arg) {
                     Ok(()) => {
                         super::reload_plugins(ctx);
-                        ok(renderer, t(Msg::PluginMarketplaceRemoved { name: arg }).into_owned());
+                        ok(
+                            renderer,
+                            t(Msg::PluginMarketplaceRemoved { name: arg }).into_owned(),
+                        );
                     }
-                    Err(e) => err(renderer, t(Msg::PluginMarketplaceRemoveFailed { error: &e.to_string() }).into_owned()),
+                    Err(e) => err(
+                        renderer,
+                        t(Msg::PluginMarketplaceRemoveFailed {
+                            error: &e.to_string(),
+                        })
+                        .into_owned(),
+                    ),
                 },
                 "update" => {
                     let name = arg.to_string();
                     let tx = ctx.plugin_job_tx.clone();
-                    ok(renderer, t(Msg::PluginMarketplaceUpdating { name: &name }).into_owned());
+                    ok(
+                        renderer,
+                        t(Msg::PluginMarketplaceUpdating { name: &name }).into_owned(),
+                    );
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name) {
-                            Ok(info) => atomcode_core::plugin::PluginJobEvent::MarketplaceUpdated(info),
+                        let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name)
+                        {
+                            Ok(info) => {
+                                atomcode_core::plugin::PluginJobEvent::MarketplaceUpdated(info)
+                            }
                             Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
                                 op: "update marketplace".into(),
                                 msg: format!("{:#}", e),
@@ -2183,18 +2332,19 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                                 m.plugins.len()
                             ));
                         }
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  {}\n",
-                            lines.join("\n  ")
-                        )));
+                        renderer
+                            .render(UiLine::CommandOutput(format!("  {}\n", lines.join("\n  "))));
                         renderer.flush();
                     }
-                    Err(e) => err(renderer, t(Msg::PluginMarketplaceListFailed { error: &e.to_string() }).into_owned()),
+                    Err(e) => err(
+                        renderer,
+                        t(Msg::PluginMarketplaceListFailed {
+                            error: &e.to_string(),
+                        })
+                        .into_owned(),
+                    ),
                 },
-                _ => err(
-                    renderer,
-                    t(Msg::PluginMarketplaceUsage).into_owned(),
-                ),
+                _ => err(renderer, t(Msg::PluginMarketplaceUsage).into_owned()),
             }
         }
         "install" => {
@@ -2203,10 +2353,20 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             let scope_arg = parts.next().unwrap_or("").trim();
             let scope = parse_scope_arg(scope_arg);
             match parse_plugin_arg(rest) {
-                Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
+                Some(PluginArg::Qualified {
+                    plugin,
+                    marketplace: mp,
+                }) => {
                     // Explicit plugin@marketplace — install directly.
                     let tx = ctx.plugin_job_tx.clone();
-                    ok(renderer, t(Msg::PluginInstalling { plugin: &plugin, marketplace: &mp }).into_owned());
+                    ok(
+                        renderer,
+                        t(Msg::PluginInstalling {
+                            plugin: &plugin,
+                            marketplace: &mp,
+                        })
+                        .into_owned(),
+                    );
                     tokio::task::spawn_blocking(move || {
                         let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
                             Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
@@ -2234,7 +2394,10 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                             let mp = m.marketplace.clone();
                             let resolved_plugin = m.plugin.clone();
                             let tx = ctx.plugin_job_tx.clone();
-                            ok(renderer, t(Msg::PluginInstallingByName { plugin: &plugin }).into_owned());
+                            ok(
+                                renderer,
+                                t(Msg::PluginInstallingByName { plugin: &plugin }).into_owned(),
+                            );
                             tokio::task::spawn_blocking(move || {
                                 let ev = match atomcode_core::plugin::installer::install(&resolved_plugin, &mp, scope) {
                                     Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
@@ -2257,63 +2420,113 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         Ok(matches) if matches.len() > 1 => {
                             // Multiple marketplaces contain this plugin — show a
                             // disambiguation list with the install command to use.
-                            let mut msg = t(Msg::PluginInstallAmbiguous { plugin: &plugin }).into_owned();
+                            let mut msg =
+                                t(Msg::PluginInstallAmbiguous { plugin: &plugin }).into_owned();
                             for m in &matches {
-                                msg.push_str(&format!("  /plugin install {}@{}\n", m.plugin, m.marketplace));
+                                msg.push_str(&format!(
+                                    "  /plugin install {}@{}\n",
+                                    m.plugin, m.marketplace
+                                ));
                             }
                             err(renderer, msg);
                         }
                         _ => {
-                            ok(renderer, t(Msg::PluginInstallNotFound { plugin: &plugin }).into_owned());
+                            ok(
+                                renderer,
+                                t(Msg::PluginInstallNotFound { plugin: &plugin }).into_owned(),
+                            );
                         }
                     }
                 }
                 None => err(renderer, t(Msg::PluginInstallUsage).into_owned()),
             }
-        },
+        }
         "uninstall" => match parse_plugin_arg(parts.next().unwrap_or("").trim()) {
-            Some(PluginArg::Qualified { plugin, marketplace: mp }) => {
-                match atomcode_core::plugin::installer::uninstall(&plugin, &mp, atomcode_core::plugin::InstallScope::User) {
+            Some(PluginArg::Qualified {
+                plugin,
+                marketplace: mp,
+            }) => {
+                match atomcode_core::plugin::installer::uninstall(
+                    &plugin,
+                    &mp,
+                    atomcode_core::plugin::InstallScope::User,
+                ) {
                     Ok(()) => {
                         super::reload_plugins(ctx);
-                        ok(renderer, t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned());
+                        ok(
+                            renderer,
+                            t(Msg::PluginUninstalled {
+                                plugin: &plugin,
+                                marketplace: &mp,
+                            })
+                            .into_owned(),
+                        );
                     }
-                    Err(e) => err(renderer, t(Msg::PluginUninstallFailed { error: &e.to_string() }).into_owned()),
+                    Err(e) => err(
+                        renderer,
+                        t(Msg::PluginUninstallFailed {
+                            error: &e.to_string(),
+                        })
+                        .into_owned(),
+                    ),
                 }
             }
             Some(PluginArg::Bare { plugin }) => {
                 // Look up which installed plugins match this name.
-                let installed = atomcode_core::plugin::installer::list_installed().unwrap_or_default();
+                let installed =
+                    atomcode_core::plugin::installer::list_installed().unwrap_or_default();
                 let matches: Vec<_> = installed
                     .into_iter()
-                    .filter(|p| p.plugin == plugin || p.plugin == atomcode_core::plugin::marketplace::sanitize_name(&plugin))
+                    .filter(|p| {
+                        p.plugin == plugin
+                            || p.plugin
+                                == atomcode_core::plugin::marketplace::sanitize_name(&plugin)
+                    })
                     .collect();
                 match matches.len() {
-                    0 => ok(renderer, t(Msg::PluginUninstallNotFound { plugin: &plugin }).into_owned()),
+                    0 => ok(
+                        renderer,
+                        t(Msg::PluginUninstallNotFound { plugin: &plugin }).into_owned(),
+                    ),
                     1 => {
                         let p = &matches[0];
-                        let (plug, mp, scope) = (p.plugin.clone(), p.marketplace.clone(), p.scope.clone());
+                        let (plug, mp, scope) =
+                            (p.plugin.clone(), p.marketplace.clone(), p.scope.clone());
                         match atomcode_core::plugin::installer::uninstall(&plug, &mp, scope) {
                             Ok(()) => {
                                 super::reload_plugins(ctx);
-                                ok(renderer, t(Msg::PluginUninstalled { plugin: &plug, marketplace: &mp }).into_owned());
+                                ok(
+                                    renderer,
+                                    t(Msg::PluginUninstalled {
+                                        plugin: &plug,
+                                        marketplace: &mp,
+                                    })
+                                    .into_owned(),
+                                );
                             }
-                            Err(e) => err(renderer, t(Msg::PluginUninstallFailed { error: &e.to_string() }).into_owned()),
+                            Err(e) => err(
+                                renderer,
+                                t(Msg::PluginUninstallFailed {
+                                    error: &e.to_string(),
+                                })
+                                .into_owned(),
+                            ),
                         }
                     }
                     _ => {
-                        let mut msg = t(Msg::PluginUninstallAmbiguous { plugin: &plugin }).into_owned();
+                        let mut msg =
+                            t(Msg::PluginUninstallAmbiguous { plugin: &plugin }).into_owned();
                         for p in &matches {
-                            msg.push_str(&format!("  /plugin uninstall {}@{}\n", p.plugin, p.marketplace));
+                            msg.push_str(&format!(
+                                "  /plugin uninstall {}@{}\n",
+                                p.plugin, p.marketplace
+                            ));
                         }
                         err(renderer, msg);
                     }
                 }
             }
-            None => err(
-                renderer,
-                t(Msg::PluginUninstallUsage).into_owned(),
-            ),
+            None => err(renderer, t(Msg::PluginUninstallUsage).into_owned()),
         },
         "list" => match atomcode_core::plugin::installer::list_installed() {
             Ok(items) if items.is_empty() => {
@@ -2322,33 +2535,40 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             Ok(items) => {
                 let mut lines = vec![t(Msg::PluginInstalledHeader).into_owned()];
                 for p in items {
-                    lines.push(format!("  {}@{}  {}", p.plugin, p.marketplace, p.plugin_dir));
+                    lines.push(format!(
+                        "  {}@{}  {}",
+                        p.plugin, p.marketplace, p.plugin_dir
+                    ));
                 }
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  {}\n",
-                    lines.join("\n  ")
-                )));
+                renderer.render(UiLine::CommandOutput(format!("  {}\n", lines.join("\n  "))));
                 renderer.flush();
             }
-            Err(e) => err(renderer, t(Msg::PluginListFailed { error: &e.to_string() }).into_owned()),
+            Err(e) => err(
+                renderer,
+                t(Msg::PluginListFailed {
+                    error: &e.to_string(),
+                })
+                .into_owned(),
+            ),
         },
         "reload" => {
             let (skills_loaded, warnings) = super::reload_plugins(ctx);
             let warn_count = warnings.len();
-            ok(renderer, t(Msg::PluginReloadDone {
-                skills: skills_loaded,
-                warnings: warn_count,
-            }).into_owned());
+            ok(
+                renderer,
+                t(Msg::PluginReloadDone {
+                    skills: skills_loaded,
+                    warnings: warn_count,
+                })
+                .into_owned(),
+            );
             if !warnings.is_empty() {
                 for w in &warnings {
                     err(renderer, w.clone());
                 }
             }
         }
-        _ => err(
-            renderer,
-            t(Msg::PluginUsage).into_owned(),
-        ),
+        _ => err(renderer, t(Msg::PluginUsage).into_owned()),
     }
 }
 
@@ -2420,7 +2640,10 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 Ok(mgr) => mgr,
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::WorktreeCreateFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::WorktreeCreateFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
@@ -2433,12 +2656,20 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                     apply_cd(ctx, wt.path.clone());
                     let path_str = wt.path.display().to_string();
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::WorktreeCreated { branch: &wt.branch, base: &wt.base_branch, path: &path_str }).into_owned(),
+                        t(Msg::WorktreeCreated {
+                            branch: &wt.branch,
+                            base: &wt.base_branch,
+                            path: &path_str,
+                        })
+                        .into_owned(),
                     ));
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::WorktreeCreateFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::WorktreeCreateFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     ));
                 }
             }
@@ -2449,7 +2680,10 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 Ok(mgr) => mgr,
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::WorktreeListFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::WorktreeListFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
@@ -2458,10 +2692,8 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             match mgr.list() {
                 Ok(worktrees) => {
                     if worktrees.is_empty() {
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::WorktreeNoActive).into_owned(),
-                        ));
-
+                        renderer
+                            .render(UiLine::CommandOutput(t(Msg::WorktreeNoActive).into_owned()));
                     } else {
                         let mut txt = t(Msg::WorktreeActiveHeader).into_owned();
                         for (branch, path, has_changes) in &worktrees {
@@ -2492,7 +2724,10 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::WorktreeListFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::WorktreeListFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     ));
                 }
             }
@@ -2542,7 +2777,10 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 Ok(mgr) => mgr,
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::WorktreeCleanupFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::WorktreeCleanupFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
@@ -2595,9 +2833,7 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             renderer.flush();
         }
         _ => {
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::WorktreeUsage).into_owned(),
-            ));
+            renderer.render(UiLine::CommandOutput(t(Msg::WorktreeUsage).into_owned()));
             renderer.flush();
         }
     }
@@ -2660,7 +2896,10 @@ fn render_codingplan_status_for_status_cmd() -> String {
     let status = match client.status_v2() {
         Ok(s) => s,
         Err(e) => {
-            return t(Msg::StatusCpFetchFailed { error: &format!("{:#}", e) }).into_owned();
+            return t(Msg::StatusCpFetchFailed {
+                error: &format!("{:#}", e),
+            })
+            .into_owned();
         }
     };
     let plan = match &status.codingplan_free {
@@ -2675,7 +2914,8 @@ fn render_codingplan_status_for_status_cmd() -> String {
         expires_at: &plan.expires_at,
         remaining_days: plan.remaining_days,
         total_days: plan.total_days,
-    }).into_owned();
+    })
+    .into_owned();
     // Prefer the per-window `rate_limit_windows` schema when present, mirroring
     // `/login` (setup.rs). When the monthly cap is exhausted the server flags it
     // via `quota_exhausted` while hiding the window (`show_enable=0`) and leaving
@@ -2688,7 +2928,11 @@ fn render_codingplan_status_for_status_cmd() -> String {
                 duration: &format_duration_secs(w.seconds_until_reset),
             }));
         } else {
-            for w in status.rate_limit_windows.iter().filter(|w| w.show_enable == 1) {
+            for w in status
+                .rate_limit_windows
+                .iter()
+                .filter(|w| w.show_enable == 1)
+            {
                 out.push_str(&t(Msg::StatusCpUsage {
                     usage: &w.usage_status_desc,
                     reset_at: &w.reset_at_display,
@@ -2857,7 +3101,9 @@ fn format_context_report(
         msgs_p = pct(messages),
         free_s = k(free),
         free_p = pct(free),
-        msg_count = t(Msg::CtxMessagesInWindow { n: snap.total_messages }),
+        msg_count = t(Msg::CtxMessagesInWindow {
+            n: snap.total_messages
+        }),
     );
 
     // `/context prompt` — append the full system-prompt bytes the last
@@ -2926,7 +3172,11 @@ pub(crate) fn launch_fixissue(
             fixissue_buffer.clear();
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SendMessage { text: prompt, images: vec![], image_markers: vec![] })
+                .send(AgentCommand::SendMessage {
+                    text: prompt,
+                    images: vec![],
+                    image_markers: vec![],
+                })
                 .ok();
             state.on_submit();
         }
@@ -2948,6 +3198,53 @@ pub(crate) fn launch_fixissue(
 /// previous_dir on the shared context, push the new entry into the
 /// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
 /// DirPicker modal's Enter handler so both paths keep state coherent.
+/// Drop the current conversation and start a brand-new session in the current
+/// `ctx.working_dir`: tell the agent to clear history, reset token/context UI
+/// state, make a fresh `Session`, rebind telemetry, and redraw the welcome
+/// screen so it behaves like a fresh launch.
+///
+/// Shared by the `/session` command and the webui-driven project switch
+/// (`AgentEvent::ProjectSwitched`). For the project-switch case, call
+/// `apply_cd` FIRST so `ctx.working_dir` is the new dir before the new
+/// `Session` is bound to it.
+pub(crate) fn reset_to_new_session(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+) {
+    ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+    ctx.current_session_id = None;
+    state.total_tokens = 0;
+    state.prompt_tokens = 0;
+    state.completion_tokens = 0;
+    state.cached_tokens = 0;
+    state.last_context = None;
+    state.pending_context_render = None;
+    state.thinking_idx = 0;
+    state.on_turn_complete();
+    // New session = new session file on disk. Old session (already saved at its
+    // last TurnComplete) stays on disk so it can still be `/resume`d; we just
+    // stop writing into it.
+    ctx.current_session =
+        atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    // Bind telemetry + agent session id to the new session's UUID (the
+    // ClearConversation above intentionally leaves the id alone; this is the
+    // single source of truth).
+    bind_telemetry_to_session(ctx, &ctx.current_session);
+    // `reset()` wipes the terminal AND the renderer's cached footer/stream
+    // state, so the next Welcome renders against a known (row 1, col 1) anchor.
+    renderer.reset();
+    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    renderer.render(UiLine::Welcome {
+        model: ctx.model_name.clone(),
+        working_dir: dir_display,
+    });
+    renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
+    renderer.flush();
+}
+
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     ctx.agent
         .cmd_tx
@@ -2955,6 +3252,10 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
         .ok();
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
     ctx.runtime_factory.set_working_dir(path.clone());
+    // Re-index the @-mention file index for the new working directory.
+    // Without this, the popup continues showing files from the original
+    // startup directory after the user runs `/cd`.
+    ctx.file_index.reset(path.clone());
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
 }
@@ -3029,7 +3330,10 @@ fn resolve_cd(
         .canonicalize()
         .map_err(|e| format!("{}: {}", target.display(), e))?;
     if !canon.is_dir() {
-        return Err(t(Msg::DirNotADirectory { path: &canon.display().to_string() }).into_owned());
+        return Err(t(Msg::DirNotADirectory {
+            path: &canon.display().to_string(),
+        })
+        .into_owned());
     }
     Ok(canon)
 }
@@ -3265,10 +3569,7 @@ mod compose_login_chrome_tests {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
         let s = compose_login_chrome_inner(URL, false, true);
-        assert!(
-            !s.contains(URL),
-            "URL must not appear when omit_url:\n{s}"
-        );
+        assert!(!s.contains(URL), "URL must not appear when omit_url:\n{s}");
         assert!(
             s.contains("Unicode-capable terminal"),
             "must guide the user to a unicode terminal:\n{s}"
@@ -3389,7 +3690,10 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
             // skip the rest of setup since claim/models/status all
             // need a token.
             renderer.render(UiLine::Error(
-                t(Msg::CodingPlanSetupFailed { error: &e.to_string() }).into_owned(),
+                t(Msg::CodingPlanSetupFailed {
+                    error: &e.to_string(),
+                })
+                .into_owned(),
             ));
             renderer.flush();
             return Ok(());
@@ -3410,9 +3714,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // manually what `/codingplan` could do itself.
     let mut report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
     if matches!(&report, Ok(r) if r.auth_expired) {
-        renderer.render(UiLine::CommandOutput(
-            t(Msg::CpReauthAfter401).into_owned(),
-        ));
+        renderer.render(UiLine::CommandOutput(t(Msg::CpReauthAfter401).into_owned()));
         renderer.flush();
         match run_oauth_with_renderer(renderer, ctx)
             .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
@@ -3429,7 +3731,10 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
                     renderer.render(UiLine::CommandOutput(r.render()));
                 }
                 renderer.render(UiLine::Error(
-                    t(Msg::CodingPlanSetupFailed { error: &e.to_string() }).into_owned(),
+                    t(Msg::CodingPlanSetupFailed {
+                        error: &e.to_string(),
+                    })
+                    .into_owned(),
                 ));
                 renderer.flush();
                 return Ok(());
@@ -3478,7 +3783,10 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         }
         Err(e) => {
             renderer.render(UiLine::Error(
-                t(Msg::CodingPlanSetupFailed { error: &format!("{:#}", e) }).into_owned(),
+                t(Msg::CodingPlanSetupFailed {
+                    error: &format!("{:#}", e),
+                })
+                .into_owned(),
             ));
             renderer.flush();
         }

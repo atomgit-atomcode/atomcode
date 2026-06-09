@@ -43,6 +43,13 @@ pub struct ProviderConfig {
     /// Lets users work around new provider quirks without a code change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_history: Option<String>,
+    /// DeepSeek V4 reasoning effort control ("high" | "max").
+    /// Sent as top-level `reasoning_effort` in the request body.
+    /// None = don't send the field (API uses its own default).
+    /// Only emitted when the provider's base_url or model name
+    /// matches the applicable heuristic (see OpenAiProvider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Whether extended thinking is enabled for this provider.
     /// For Claude: sends `thinking.type = "enabled"` in request body.
     /// Default: not set (thinking disabled).
@@ -153,7 +160,10 @@ mod tests {
             api_key = "sk-test"
         "#;
         let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
-        assert!(!cfg.skip_tls_verify, "skip_tls_verify should default to false");
+        assert!(
+            !cfg.skip_tls_verify,
+            "skip_tls_verify should default to false"
+        );
     }
 
     #[test]
@@ -183,12 +193,12 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-
-};
+        };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
             !serialized.contains("skip_tls_verify"),
@@ -210,12 +220,12 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: true,
             ephemeral: false,
-
-};
+        };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
             serialized.contains("skip_tls_verify = true"),

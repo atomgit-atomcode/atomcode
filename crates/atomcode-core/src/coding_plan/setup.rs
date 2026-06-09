@@ -1132,6 +1132,7 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        reasoning_effort: None,
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,

@@ -106,10 +106,17 @@ pub(crate) async fn codingplan_setup(
                                 .telemetry
                                 .set_account_id(Some(user.id.clone()));
                             let (invite_code, install_uuid) = pending_invite_for_login();
-                            state.telemetry.track(Event::LoginSuccess {
+                            let event = Event::LoginSuccess {
                                 invite_code,
                                 install_uuid,
-                            });
+                            };
+                            if let Err(e) = state.telemetry.track_durable(event.clone()).await {
+                                tracing::warn!(
+                                    ?e,
+                                    "login_success durable enqueue failed; falling back to async telemetry"
+                                );
+                                state.telemetry.track(event);
+                            }
                         }
                         Err((status, message)) => {
                             state.telemetry.track(Event::TakeCodingplan {

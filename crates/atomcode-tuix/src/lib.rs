@@ -178,6 +178,7 @@ pub async fn run(
     lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     dangerously_skip_permissions: bool,
+    is_admin: bool,
 ) -> Result<()> {
     let mut caps = TerminalCaps::probe();
 
@@ -264,16 +265,14 @@ pub async fn run(
     // reaches us before timeout).
     //
     // - `Light` / `Dark`: explicit, skip detection.
-    // - `Auto`: query the terminal background; fall back to `dark` if
-    //   it doesn't reply within 60ms. Responsive emulators (iTerm2,
-    //   WezTerm, Alacritty, Kitty, Windows Terminal, VSCode integrated)
-    //   reply on first byte well under the budget — local TTY round
-    //   trips are <10ms in practice. Non-responsive terminals (macOS
-    //   Terminal.app, Windows conhost, SSH through relays that strip
-    //   OSC) silently default to dark. The 60ms initial deadline + 80ms
-    //   tail-drain in `terminal_bg::detect_light` together cover slow
-    //   responders up to ~140ms; the previous 100ms initial was
-    //   over-budget for what local terminals actually need.
+    // - `Auto`: query the terminal background, falling back to `dark`.
+    //   `detect_light` pairs the OSC 11 query with a DA1 query and drains
+    //   until the DA1 reply, so the wait is one round-trip on any
+    //   responsive terminal regardless of latency (SSH / tmux included) —
+    //   the `60ms` here is just the first-byte floor (raised internally to
+    //   ~400ms so an SSH RTT can't beat it) and never leaks the OSC reply
+    //   into the input box. Terminals that answer neither query default to
+    //   dark after the internal cap.
     let theme_light = match config.ui.theme {
         atomcode_core::config::UiTheme::Light => true,
         atomcode_core::config::UiTheme::Dark => false,
@@ -584,10 +583,13 @@ pub async fn run(
         )),
         is_plain_renderer,
         dangerously_skip_permissions,
+        is_admin,
         pending_guide_topic: None,
         sync_session: None,
         sync_forwarder: None,
         app_relay_child: None,
+        reasoning_effort: None,
+        transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

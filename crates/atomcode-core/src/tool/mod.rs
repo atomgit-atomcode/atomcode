@@ -26,7 +26,7 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -405,6 +405,32 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Does `raw_path` (as the model wrote it) or `canonical_path` (the
+/// resolved form) live under AtomCode's own config dir?
+///
+/// Both forms are checked because of #222: a user can keep an AtomCode
+/// data symlink (e.g. `~/.atomcode/cj -> /mnt/d/.../md/`) that points
+/// at a project they edit. The raw `~/.atomcode/...` prefix is enough
+/// evidence that the model is acting on AtomCode-managed storage, even
+/// if the canonical target lives outside the home dir. We still pass
+/// the canonical form through `starts_with` so a pure target like
+/// `~/.atomcode/memory.md` (no symlink) also matches.
+fn is_under_atomcode_home(raw_path: &str, canonical_path: &Path) -> bool {
+    let home = crate::config::Config::config_dir();
+    // Canonicalise the config dir so the `starts_with` comparison
+    // works even when `~/.atomcode` itself contains intermediate
+    // symlinks (macOS `/var → /private/var` is the common case).
+    let home_canon = std::fs::canonicalize(&home).unwrap_or(home.clone());
+
+    if canonical_path.starts_with(&home_canon) || canonical_path.starts_with(&home) {
+        return true;
+    }
+
+    let expanded = expand_user_path(raw_path);
+    let normalized = normalize_path(&expanded);
+    normalized.starts_with(&home_canon) || normalized.starts_with(&home)
+}
+
 fn canonicalize_candidate_path(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         return std::fs::canonicalize(path)
@@ -519,7 +545,7 @@ fn is_sensitive_path(path: &Path) -> bool {
     ];
     #[cfg(target_os = "windows")]
     const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[];
-    const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config"];
+    const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg"];
     const SECRET_FILE_NAMES: &[&str] = &[
         ".bashrc",
         ".bash_profile",
@@ -531,7 +557,6 @@ fn is_sensitive_path(path: &Path) -> bool {
         ".env",
         ".env.local",
         "credentials",
-        "config",
         "id_rsa",
         "id_dsa",
         "id_ecdsa",
@@ -610,6 +635,18 @@ pub fn approval_for_path(
         return Ok(ApprovalRequirement::AutoApprove);
     }
 
+    // Cross-workspace writes to AtomCode's own config dir (default
+    // `~/.atomcode/`, or whatever `Config::config_dir()` resolves to via
+    // `ATOMCODE_HOME`) are part of how memory / skills / plugin state
+    // is stored. The user expects `memory.md`, `skills/*.md`, etc. to
+    // be writable from any project without a per-tool approval prompt
+    // (#222). Detect that here — both for the raw path the model
+    // produced (covers `~/.atomcode/...` when the user keeps a symlink
+    // there) and for the canonicalised target.
+    if is_under_atomcode_home(raw_path, &access.path) {
+        return Ok(ApprovalRequirement::AutoApprove);
+    }
+
     let sensitive = is_sensitive_path(&access.path);
     let action_label = match action {
         ExternalPathAction::Enumerate => "Accessing",
@@ -626,20 +663,32 @@ pub fn approval_for_path(
     Ok(match action {
         ExternalPathAction::Enumerate => {
             if sensitive {
-                ApprovalRequirement::RequireApprovalAlways(format!(
-                    "{}. This path looks sensitive and always requires confirmation.",
-                    base_reason
-                ))
+                // Listing a sensitive dir is less dangerous than reading its
+                // contents — match Read's scoped behaviour: one [A] remembers
+                // this exact path, every other sensitive path still prompts.
+                ApprovalRequirement::RequireApprovalScoped {
+                    reason: format!(
+                        "{base_reason}. This path looks sensitive and requires confirmation."
+                    ),
+                    scope: access.path.to_string_lossy().into_owned(),
+                }
             } else {
                 ApprovalRequirement::AutoApprove
             }
         }
         ExternalPathAction::Read => {
             if sensitive {
-                ApprovalRequirement::RequireApprovalAlways(format!(
-                    "{}. This path looks sensitive and always requires confirmation.",
-                    base_reason
-                ))
+                // Reading is non-destructive, so re-confirming the SAME file on
+                // every chunk adds no safety. Scope the approval to this exact
+                // path: a session [A] remembers this file (so segmented reads
+                // stop re-prompting) while every other sensitive path still
+                // prompts. The canonical path is the scope key.
+                ApprovalRequirement::RequireApprovalScoped {
+                    reason: format!(
+                        "{base_reason}. This path looks sensitive and requires confirmation."
+                    ),
+                    scope: access.path.to_string_lossy().into_owned(),
+                }
             } else {
                 ApprovalRequirement::RequireApproval(format!("{base_reason}."))
             }
@@ -685,49 +734,72 @@ pub enum ApprovalRequirement {
     AutoApprove,
     RequireApproval(String),
     RequireApprovalAlways(String),
+    /// Prompt the user, but a session [A] remembers this exact `scope` (a
+    /// canonical resource key, e.g. a file path) rather than the whole tool.
+    /// Used for sensitive reads: re-reading the same file in segments stops
+    /// re-prompting once approved, while every other sensitive resource still
+    /// requires its own confirmation. Unlike a tool-wide grant, a scoped grant
+    /// only covers the matching `scope`.
+    RequireApprovalScoped { reason: String, scope: String },
 }
 
-/// Coarse-grained permission level for a tool, stored in `PermissionStore`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PermissionLevel {
-    /// Never ask — always execute automatically.
-    AlwaysAllow,
-    /// Ask every time (default for destructive operations).
-    Ask,
-    /// Allowed for the duration of the current session.
-    SessionAllow,
-    /// Never execute.
-    AlwaysDeny,
-}
-
-/// The resolved decision returned by `PermissionStore::check`.
+/// The resolved decision returned by `PermissionStore::check` or by an
+/// interactive responder.
 #[derive(Debug, Clone)]
 pub enum PermissionDecision {
     Allow,
+    /// Allow AND remember for the session (tool-wide, or scoped — decided by
+    /// the responder's context). Returned over the approval channel when the
+    /// user picks "always allow"; `PermissionStore::check` never returns it.
+    AllowAlways,
     /// Ask the user — carries the reason string from `ApprovalRequirement`.
     Ask(String),
     Deny,
 }
 
-/// Stores per-tool permission overrides and session-level grants.
+/// Parse the wire string used by the daemon's permission endpoints
+/// (`/chat/permission`, `/live/permission`) into a decision.
+pub fn parse_permission_decision(s: &str) -> PermissionDecision {
+    match s {
+        "allow" => PermissionDecision::Allow,
+        "always_allow" => PermissionDecision::AllowAlways,
+        _ => PermissionDecision::Deny,
+    }
+}
+
+/// Stores per-tool session-level grants.
 pub struct PermissionStore {
-    /// Per-tool level overrides: tool_name → level.
-    overrides: HashMap<String, PermissionLevel>,
     /// Session-level grants: tool names approved with [A]lways for this session.
     session_grants: HashSet<String>,
+    /// Session-level scoped grants: resource keys (e.g. canonical file paths)
+    /// approved with [A] for a `RequireApprovalScoped` call. Covers only the
+    /// matching scope, never a whole tool.
+    session_scope_grants: HashSet<String>,
 }
 
 impl PermissionStore {
     pub fn new() -> Self {
         Self {
-            overrides: HashMap::new(),
             session_grants: HashSet::new(),
+            session_scope_grants: HashSet::new(),
         }
     }
 
     /// Check whether a tool call should be auto-approved, needs asking, or denied.
     pub fn check(&self, tool_name: &str, approval: &ApprovalRequirement) -> PermissionDecision {
         if let ApprovalRequirement::RequireApprovalAlways(reason) = approval {
+            return PermissionDecision::Ask(reason.clone());
+        }
+
+        // Path-scoped approval (e.g. sensitive reads). Allowed ONLY by an exact
+        // per-scope session grant — deliberately NOT covered by a tool-wide [A]
+        // (`session_grants`), so pressing [A] on an innocuous external file can
+        // never silently unlock reads of ~/.ssh/id_rsa etc. Re-reading the same
+        // file in segments yields the same scope, so one [A] stops the prompts.
+        if let ApprovalRequirement::RequireApprovalScoped { reason, scope } = approval {
+            if self.session_scope_grants.contains(scope) {
+                return PermissionDecision::Allow;
+            }
             return PermissionDecision::Ask(reason.clone());
         }
 
@@ -745,18 +817,8 @@ impl PermissionStore {
         if let ApprovalRequirement::RequireApproval(reason) = approval {
             return PermissionDecision::Ask(reason.clone());
         }
-        // 3. Explicit per-tool override (only reached for AutoApprove tools).
-        if let Some(level) = self.overrides.get(tool_name) {
-            match level {
-                PermissionLevel::AlwaysAllow | PermissionLevel::SessionAllow => {
-                    return PermissionDecision::Allow;
-                }
-                PermissionLevel::AlwaysDeny => return PermissionDecision::Deny,
-                PermissionLevel::Ask => {} // fall through to normal logic
-            }
-        }
 
-        // 4. Defer to the tool's own approval requirement.
+        // 3. Defer to the tool's own approval requirement (AutoApprove path).
         PermissionDecision::Allow
     }
 
@@ -765,10 +827,12 @@ impl PermissionStore {
         self.session_grants.insert(tool_name.to_string());
     }
 
-    /// Set an explicit override level for a tool.
-    pub fn set_override(&mut self, tool_name: &str, level: PermissionLevel) {
-        self.overrides.insert(tool_name.to_string(), level);
+    /// Grant session-level permission for a single scope key (user pressed [A]
+    /// on a `RequireApprovalScoped` call). Only this exact scope is unlocked.
+    pub fn grant_session_scope(&mut self, scope: &str) {
+        self.session_scope_grants.insert(scope.to_string());
     }
+
 }
 
 /// Shared execution context passed to every tool invocation.
@@ -1483,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_for_sensitive_read_outside_workspace_requires_always() {
+    fn approval_for_sensitive_read_outside_workspace_is_path_scoped() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         let target = outside.path().join("id_rsa");
@@ -1495,10 +1559,16 @@ mod tests {
             ExternalPathAction::Read,
         )
         .unwrap();
-        assert!(matches!(
-            approval,
-            ApprovalRequirement::RequireApprovalAlways(_)
-        ));
+        // Sensitive reads are PATH-SCOPED, not blanket "always ask": a session
+        // [A] remembers THIS exact file so re-reading it in segments doesn't
+        // re-prompt, while every other sensitive file still requires its own
+        // confirmation. The scope key is the canonical path.
+        match approval {
+            ApprovalRequirement::RequireApprovalScoped { scope, .. } => {
+                assert_eq!(Path::new(&scope), target.canonicalize().unwrap());
+            }
+            _ => panic!("expected RequireApprovalScoped for a sensitive external read"),
+        }
     }
 
     #[test]
@@ -1526,6 +1596,27 @@ mod tests {
     }
 
     #[test]
+    fn enumerate_sensitive_outside_workspace_is_scoped_not_always() {
+        let workspace = TempDir::new().unwrap();
+        let home = real_home_dir().expect("home");
+        let ssh = home.join(".ssh");
+        let approval = approval_for_path(
+            &ssh.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Enumerate,
+        )
+        .expect("approval");
+        match approval {
+            ApprovalRequirement::RequireApprovalScoped { scope, .. } => {
+                // scope is the canonical path; .ssh may or may not exist on
+                // this machine, so just assert the scope string is non-empty.
+                assert!(!scope.is_empty(), "scope should be a non-empty path");
+            }
+            _ => panic!("expected RequireApprovalScoped for sensitive enumeration outside workspace"),
+        }
+    }
+
+    #[test]
     fn approval_for_write_outside_workspace_requires_always() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
@@ -1541,6 +1632,95 @@ mod tests {
             approval,
             ApprovalRequirement::RequireApprovalAlways(_)
         ));
+    }
+
+    /// Serialise ATOMCODE_HOME-mutating tests. `cargo test` runs in
+    /// parallel by default, and `std::env::set_var` is a process-wide
+    /// mutation — two of these tests racing flipped each other's
+    /// `Config::config_dir()` mid-call, producing a flaky failure
+    /// (test passes solo, fails in the suite).
+    static ATOMCODE_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Writing into AtomCode's own config dir from outside the
+    /// workspace must auto-approve — memory.md, skills, plugin state
+    /// are all expected to land there without per-call prompts (#222).
+    /// We exercise both an existing path and a not-yet-created one.
+    #[test]
+    fn approval_for_write_under_atomcode_home_is_auto() {
+        let _guard = ATOMCODE_HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("ATOMCODE_HOME").ok();
+        unsafe {
+            std::env::set_var("ATOMCODE_HOME", home.path());
+        }
+
+        let workspace = TempDir::new().unwrap();
+        let memory_file = home.path().join("memory.md");
+        std::fs::write(&memory_file, "scratch").unwrap();
+
+        let approval = approval_for_path(
+            &memory_file.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Write,
+        )
+        .unwrap();
+        assert!(matches!(approval, ApprovalRequirement::AutoApprove));
+
+        // Not-yet-created path under the home dir is also auto.
+        let new_file = home.path().join("skills").join("new.md");
+        let approval_new = approval_for_path(
+            &new_file.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Write,
+        )
+        .unwrap();
+        assert!(matches!(approval_new, ApprovalRequirement::AutoApprove));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+                None => std::env::remove_var("ATOMCODE_HOME"),
+            }
+        }
+    }
+
+    /// Regression for #222: a symlink that the user manually placed
+    /// inside `~/.atomcode/` to point at a separate project dir must
+    /// still auto-approve writes — the raw `~/.atomcode/<symlink>/...`
+    /// form is enough evidence that this is AtomCode-managed storage.
+    #[cfg(unix)]
+    #[test]
+    fn approval_for_write_through_atomcode_home_symlink_is_auto() {
+        let _guard = ATOMCODE_HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("ATOMCODE_HOME").ok();
+        unsafe {
+            std::env::set_var("ATOMCODE_HOME", home.path());
+        }
+
+        let project = TempDir::new().unwrap();
+        let link = home.path().join("cj");
+        std::os::unix::fs::symlink(project.path(), &link).unwrap();
+        let memory_path = link.join("memory").join("notes.md");
+
+        let workspace = TempDir::new().unwrap();
+        let approval = approval_for_path(
+            &memory_path.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Write,
+        )
+        .unwrap();
+        assert!(
+            matches!(approval, ApprovalRequirement::AutoApprove),
+            "expected AutoApprove for ~/.atomcode/cj symlink write"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+                None => std::env::remove_var("ATOMCODE_HOME"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -1635,27 +1815,6 @@ mod tests {
         assert!(matches!(decision, PermissionDecision::Allow));
     }
 
-    #[test]
-    fn test_permission_store_always_deny_override() {
-        let mut store = PermissionStore::new();
-        store.set_override("bash", PermissionLevel::AlwaysDeny);
-        // Even AutoApprove is blocked.
-        let decision = store.check("bash", &ApprovalRequirement::AutoApprove);
-        assert!(matches!(decision, PermissionDecision::Deny));
-    }
-
-    #[test]
-    fn test_permission_store_always_allow_cannot_bypass_destructive() {
-        // Even AlwaysAllow override must NOT bypass RequireApproval.
-        let mut store = PermissionStore::new();
-        store.set_override("bash", PermissionLevel::AlwaysAllow);
-        let decision = store.check(
-            "bash",
-            &ApprovalRequirement::RequireApproval("Destructive".into()),
-        );
-        assert!(matches!(decision, PermissionDecision::Ask(_)));
-    }
-
     #[tokio::test]
     async fn test_tool_context_isolate() {
         let ctx = ToolContext::new(PathBuf::from("/original"));
@@ -1684,6 +1843,60 @@ mod tests {
             reg2.register_arc(name, arc).await;
         }
         assert!(reg2.get("dummy").await.is_some());
+    }
+
+    #[test]
+    fn test_permission_store_scoped_grant_allows_same_scope() {
+        // The user's bug: reading the SAME file in segments re-prompts on every
+        // chunk even after pressing [A]. With path-scoped grants, pressing [A]
+        // remembers the file's canonical path; subsequent reads (any
+        // offset/limit → same scope) auto-approve.
+        let mut store = PermissionStore::new();
+        let approval = ApprovalRequirement::RequireApprovalScoped {
+            reason: "sensitive read".into(),
+            scope: "/home/u/.config/notes.md".into(),
+        };
+        assert!(matches!(
+            store.check("read_file", &approval),
+            PermissionDecision::Ask(_)
+        ));
+        store.grant_session_scope("/home/u/.config/notes.md");
+        assert!(matches!(
+            store.check("read_file", &approval),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn test_permission_store_scoped_grant_does_not_cover_other_scopes() {
+        // Granting one file must not auto-approve a DIFFERENT sensitive file.
+        let mut store = PermissionStore::new();
+        store.grant_session_scope("/home/u/.config/notes.md");
+        let other = ApprovalRequirement::RequireApprovalScoped {
+            reason: "sensitive read".into(),
+            scope: "/home/u/.ssh/id_rsa".into(),
+        };
+        assert!(matches!(
+            store.check("read_file", &other),
+            PermissionDecision::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn test_permission_store_tool_grant_does_not_cover_scoped() {
+        // A tool-wide [A] (grant_session) must NOT auto-approve a path-scoped
+        // sensitive read — otherwise pressing [A] on an innocuous external file
+        // would silently allow reading ~/.ssh/id_rsa for the rest of the session.
+        let mut store = PermissionStore::new();
+        store.grant_session("read_file");
+        let approval = ApprovalRequirement::RequireApprovalScoped {
+            reason: "sensitive read".into(),
+            scope: "/home/u/.ssh/id_rsa".into(),
+        };
+        assert!(matches!(
+            store.check("read_file", &approval),
+            PermissionDecision::Ask(_)
+        ));
     }
 
     #[test]
@@ -1983,5 +2196,22 @@ mod tests {
         assert!(is_sensitive_path(Path::new("/System/Library/CoreServices/boot.efi")));
         assert!(is_sensitive_path(Path::new("/etc/passwd")));
         assert!(is_sensitive_path(Path::new("/var/log/syslog")));
+    }
+
+    #[test]
+    fn config_dir_and_bare_config_no_longer_sensitive() {
+        let home = real_home_dir().expect("home");
+        // ~/.config/<app>/settings is ordinary app config, not a secret.
+        assert!(!is_sensitive_path(&home.join(".config").join("app").join("settings.toml")));
+        // A bare file named `config` outside the workspace is not a secret.
+        assert!(!is_sensitive_path(std::path::Path::new("/tmp/somewhere/config")));
+    }
+
+    #[test]
+    fn real_secrets_still_sensitive() {
+        let home = real_home_dir().expect("home");
+        assert!(is_sensitive_path(&home.join(".ssh").join("id_rsa")));
+        assert!(is_sensitive_path(&home.join(".aws").join("credentials")));
+        assert!(is_sensitive_path(std::path::Path::new("/tmp/x/server.key")));
     }
 }

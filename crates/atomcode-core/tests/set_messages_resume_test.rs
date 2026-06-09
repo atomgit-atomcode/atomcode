@@ -177,6 +177,7 @@ fn context_builds_with_turn_tracking_after_set_messages() {
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        reasoning_effort: None,
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -252,6 +253,7 @@ fn context_uses_fallback_when_turn_tracker_is_empty() {
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        reasoning_effort: None,
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -456,6 +458,7 @@ fn restored_context_contains_same_user_messages_as_original() {
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        reasoning_effort: None,
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -527,12 +530,13 @@ fn empty_turn_tracker_loses_windowing_precision() {
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        reasoning_effort: None,
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
 
-};
+    };
     let ctx_builder = DefaultCtx::new(&provider_config);
 
     let conv = build_multi_turn_conversation(3);

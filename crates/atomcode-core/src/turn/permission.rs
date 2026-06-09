@@ -78,6 +78,10 @@ impl PermissionDecider for AutoPermissionDecider {
 pub struct ApprovalRequest {
     pub call: ToolCall,
     pub reason: String,
+    /// For `RequireApprovalScoped` calls: the scope key (e.g. canonical file
+    /// path) that an [A]lways press should remember for the session, instead
+    /// of granting the whole tool. `None` for tool-wide approvals.
+    pub scope: Option<String>,
 }
 
 /// Interactive permission decider (used by AgentLoop).
@@ -147,14 +151,20 @@ impl PermissionDecider for InteractivePermissionDecider {
         if let Ok(store) = self.permission_store.read() {
             match store.check(&call.name, approval) {
                 PermissionDecision::Allow => return PermissionDecision::Allow,
+                // `check()` never returns AllowAlways, but the match must be
+                // exhaustive — treat it as Allow defensively.
+                PermissionDecision::AllowAlways => return PermissionDecision::Allow,
                 PermissionDecision::Deny => return PermissionDecision::Deny,
                 PermissionDecision::Ask(_) => {} // fall through to interactive
             }
         }
 
-        let reason = match approval {
+        let (reason, scope) = match approval {
             ApprovalRequirement::RequireApproval(r)
-            | ApprovalRequirement::RequireApprovalAlways(r) => r.clone(),
+            | ApprovalRequirement::RequireApprovalAlways(r) => (r.clone(), None),
+            ApprovalRequirement::RequireApprovalScoped { reason, scope } => {
+                (reason.clone(), Some(scope.clone()))
+            }
             ApprovalRequirement::AutoApprove => return PermissionDecision::Allow,
         };
 
@@ -162,12 +172,30 @@ impl PermissionDecider for InteractivePermissionDecider {
         let request = ApprovalRequest {
             call: call.clone(),
             reason,
+            scope: scope.clone(),
         };
         if self.request_tx.send(request).is_err() {
             return PermissionDecision::Deny;
         }
-        let mut rx = self.response_rx.lock().await;
-        rx.recv().await.unwrap_or(PermissionDecision::Deny)
+        let resp = {
+            let mut rx = self.response_rx.lock().await;
+            rx.recv().await.unwrap_or(PermissionDecision::Deny)
+        };
+        match resp {
+            // "Always allow" from the responder: persist the grant for the
+            // session (scoped if the approval carried a scope, else tool-wide)
+            // then act as a normal Allow for this call.
+            PermissionDecision::AllowAlways => {
+                if let Ok(mut store) = self.permission_store.write() {
+                    match &scope {
+                        Some(s) => store.grant_session_scope(s),
+                        None => store.grant_session(&call.name),
+                    }
+                }
+                PermissionDecision::Allow
+            }
+            other => other,
+        }
     }
 
     fn will_auto_approve(&self, call: &ToolCall, approval: &ApprovalRequirement) -> bool {
@@ -450,6 +478,42 @@ mod tests {
         assert!(d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("mcp tool".into())));
     }
 
+    #[test]
+    fn test_will_auto_approve_scoped_same_path_after_grant() {
+        // The reported bug: after pressing [A] on a sensitive read, re-reading
+        // the SAME file in segments (any offset/limit → identical scope) must
+        // auto-approve without re-prompting — while a DIFFERENT sensitive file
+        // still requires its own confirmation.
+        let (req_tx, _req_rx) = mpsc::unbounded_channel();
+        let (_resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let store =
+            std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        store
+            .write()
+            .unwrap()
+            .grant_session_scope("/home/u/.config/notes.md");
+        let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
+        let call = make_call("read_file");
+
+        let same = ApprovalRequirement::RequireApprovalScoped {
+            reason: "sensitive".into(),
+            scope: "/home/u/.config/notes.md".into(),
+        };
+        assert!(
+            d.will_auto_approve(&call, &same),
+            "re-reading the granted file must not re-prompt"
+        );
+
+        let other = ApprovalRequirement::RequireApprovalScoped {
+            reason: "sensitive".into(),
+            scope: "/home/u/.ssh/id_rsa".into(),
+        };
+        assert!(
+            !d.will_auto_approve(&call, &other),
+            "a different sensitive file must still require approval"
+        );
+    }
+
     // ── dangerously-skip-permissions tests ──
 
     /// Helper: create an InteractivePermissionDecider with skip_permissions=true.
@@ -637,5 +701,41 @@ mod tests {
             d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("test".into())),
             "new_with_skip_permissions(true) should set skip_permissions=true"
         );
+    }
+
+    #[tokio::test]
+    async fn allow_always_grants_session_for_tool() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let store = std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        let d = InteractivePermissionDecider::new(req_tx, resp_rx, store.clone());
+        let call = make_call("mcp__srv__q");
+        let approval = ApprovalRequirement::RequireApproval("mcp".into());
+        let fut = d.decide(&call, &approval);
+        tokio::spawn(async move {
+            let _req = req_rx.recv().await.unwrap();
+            resp_tx.send(PermissionDecision::AllowAlways).unwrap();
+        });
+        assert!(matches!(fut.await, PermissionDecision::Allow));
+        let call2 = make_call("mcp__srv__q");
+        assert!(d.will_auto_approve(&call2, &ApprovalRequirement::RequireApproval("mcp".into())));
+    }
+
+    #[tokio::test]
+    async fn allow_always_grants_scope_for_scoped_approval() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let store = std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        let d = InteractivePermissionDecider::new(req_tx, resp_rx, store.clone());
+        let call = make_call("read_file");
+        let approval = ApprovalRequirement::RequireApprovalScoped { reason: "sensitive".into(), scope: "/home/u/.ssh/id_rsa".into() };
+        let fut = d.decide(&call, &approval);
+        tokio::spawn(async move {
+            let _req = req_rx.recv().await.unwrap();
+            resp_tx.send(PermissionDecision::AllowAlways).unwrap();
+        });
+        assert!(matches!(fut.await, PermissionDecision::Allow));
+        assert!(d.will_auto_approve(&call, &ApprovalRequirement::RequireApprovalScoped { reason: "sensitive".into(), scope: "/home/u/.ssh/id_rsa".into() }));
+        assert!(!d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("x".into())));
     }
 }

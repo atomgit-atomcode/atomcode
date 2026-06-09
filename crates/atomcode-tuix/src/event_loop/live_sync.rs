@@ -82,6 +82,17 @@ pub(crate) fn spawn_live_forwarder(
                         break;
                     }
                 }
+                // webui /cd → follow it: TUI changes cwd + opens a fresh session.
+                // Mapped to ProjectSwitched (not WorkingDirChanged) so the agent's
+                // own in-turn `cd` never triggers a session reset.
+                Ok(LiveEvent::WorkingDirChanged(dir)) => {
+                    if fan_tx
+                        .send(RuntimeEvent { runtime_id, event: AgentEvent::ProjectSwitched(dir) })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }

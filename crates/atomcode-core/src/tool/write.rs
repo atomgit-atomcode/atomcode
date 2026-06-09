@@ -99,6 +99,11 @@ impl Tool for WriteFileTool {
             Ok(ApprovalRequirement::RequireApproval(reason)) => {
                 ApprovalRequirement::RequireApproval(reason)
             }
+            // Writes never path-scope; treat a scoped result (the Write action
+            // doesn't produce one today) as the strictest always-ask.
+            Ok(ApprovalRequirement::RequireApprovalScoped { reason, .. }) => {
+                ApprovalRequirement::RequireApprovalAlways(reason)
+            }
             Ok(ApprovalRequirement::AutoApprove) => match base {
                 ApprovalRequirement::RequireApproval(reason) => {
                     ApprovalRequirement::RequireApprovalAlways(reason)

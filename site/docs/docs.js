@@ -62,6 +62,7 @@
     'side.keybindings':{zh:'快捷键',en:'Keybindings'},
     'side.sessions':{zh:'会话与撤销',en:'Sessions & Undo'},
     'side.tools':{zh:'内置工具',en:'Built-in Tools'},
+    'side.approvals':{zh:'权限审批',en:'Permissions'},
     'side.skills':{zh:'Skills 扩展',en:'Skills'},
     'side.mcp':{zh:'MCP 集成',en:'MCP Integration'},
     'side.plugins':{zh:'Plugin 系统',en:'Plugin System'},
