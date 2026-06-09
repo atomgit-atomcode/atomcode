@@ -3374,7 +3374,7 @@ static APP_SERVER: std::sync::Mutex<Option<AppServerHandle>> = std::sync::Mutex:
 ///   中继的 route token + 本机回环绑定（server 只听 127.0.0.1，仅本机隧道可达）。
 /// - **不开浏览器**：App 用二维码配对，不需要打开网页。
 ///
-/// 与 `/webui` 共用进程内全局 LiveSession（见 [ensure_live_session_seeded]），所以
+/// 与 `/webui` 共用进程内全局 LiveSession（见 [ensure_live_session]），所以
 /// TUI / 浏览器 / App 看到的是**同一段对话**，双向实时同步。
 pub async fn ensure_app_server(host: &str, port: u16) -> Result<(String, u16), String> {
     // 复用仍在运行的实例（含其绑定地址/端口）。

@@ -1019,11 +1019,13 @@ pub(super) fn execute_slash_command(
                                 Some(ctx.current_session.id.clone()),
                             )
                         };
-                        let session = atomcode_daemon::ensure_live_session_seeded(
+                        // 合并 main 后函数更名为 ensure_live_session,且 session_id
+                        // 与 initial_messages 参数顺序对调(先 sid 后 initial)。
+                        let session = atomcode_daemon::ensure_live_session(
                             ctx.working_dir.clone(),
                             ctx.telemetry.clone(),
-                            initial,
                             sid,
+                            initial,
                         );
                         // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
                         let started = tokio::task::block_in_place(|| {
