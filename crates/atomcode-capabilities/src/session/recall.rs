@@ -330,7 +330,7 @@ mod tests {
             dir.path(),
             "a.jsonl",
             &[
-                rec("s", 1 * day, "alpha early", "x"),
+                rec("s", day, "alpha early", "x"),
                 rec("s", 3 * day, "alpha mid", "x"),
                 rec("s", 5 * day, "alpha late", "x"),
             ],
