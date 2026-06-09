@@ -123,6 +123,11 @@ impl TurnRunner {
         // the actually-sent messages diverge from what we logged.
         let context_window = self.ctx.ctx_window();
 
+        // Commit-collapse old tool results (idempotent, monotonic) so the
+        // sent prefix stays byte-stable across turns and the provider
+        // prompt-cache holds. Replaces the removed ephemeral microcompact.
+        crate::ctx::render::collapse_committed(conversation, context_window);
+
         let (messages, ctx_stats) =
             self.ctx
                 .build_messages(conversation, system_prompt, turn_reminder);

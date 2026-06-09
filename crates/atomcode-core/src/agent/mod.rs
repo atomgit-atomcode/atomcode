@@ -2828,10 +2828,11 @@ impl AgentLoop {
     /// Pro-active context compaction. Two-stage:
     ///
     /// 1. **Tier 1 (cheap, mechanical):** collapse old `ToolResult`
-    ///    bodies into stubs (`compact_old_tool_results_in_place`, the
-    ///    same generic stub format `microcompact` uses at render time;
-    ///    keeps the last 3 turns full). Zero LLM calls. Cheap to fire,
-    ///    easy to revert if model needs the bytes back via re-read.
+    ///    bodies into stubs (`compact_old_tool_results_in_place`, using
+    ///    the same `build_compact_stub` format shared with the normal-path
+    ///    `collapse_committed`; keeps the last 3 turns full). Zero LLM
+    ///    calls. Cheap to fire, easy to revert if model needs the bytes
+    ///    back via re-read.
     ///
     /// 2. **Tier 2 (expensive, LLM-driven):** if Tier 1 didn't bring
     ///    the context under threshold, fall through to LLM-summarize
@@ -2936,6 +2937,7 @@ impl AgentLoop {
         crate::ctx::render::compact_old_tool_results_in_place(
             &mut self.conversation,
             /* keep_recent_turns */ 3,
+            false,
         );
         if estimate(&self.conversation) <= target_tokens {
             return true;
@@ -2985,10 +2987,10 @@ impl AgentLoop {
     /// the dropped messages, so compaction would silently inflate the
     /// prompt. We measure before/after token totals via `build_messages`
     /// (post all render-pipeline effects — `clean_message_pipeline`,
-    /// microcompact, etc.) and roll the conversation back if the
-    /// operation didn't actually shrink the wire payload. Analytical
-    /// projection was tried first but too many render-pipeline branches
-    /// made it unreliable.
+    /// `collapse_committed`, final-byte ceiling, etc.) and roll the
+    /// conversation back if the operation didn't actually shrink the wire
+    /// payload. Analytical projection was tried first but too many
+    /// render-pipeline branches made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
         let system_prompt = self.build_system_prompt();
         let keep_ceiling = compression::compaction_keep_ceiling(
@@ -4114,7 +4116,7 @@ mod classifier_tests {
         // should be stubs while the 3 RECENT turns retain full
         // payload. Pins the "older=collapsed, newer=intact" split.
         let mut conv = build_conv(/* n_turns */ 6, /* result_size */ 4_000);
-        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3, false);
 
         // Walk the messages: each turn pushes (User, AssistantToolCall,
         // ToolResult). 6 turns × 3 msgs = 18 msgs. The first 3 turns
@@ -4148,7 +4150,7 @@ mod classifier_tests {
     #[test]
     fn collapse_keeps_last_n_turns_full() {
         let mut conv = build_conv(5, 1024);
-        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2, false);
         // 5 turns, keep last 2 → first 3 should have stubbed tool_results.
         assert_eq!(count_collapsed_results(&conv), 3);
     }
@@ -4158,14 +4160,14 @@ mod classifier_tests {
         // Tool results under 200 chars aren't worth collapsing — the stub
         // would weigh more than the original.
         let mut conv = build_conv(5, 50);
-        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2, false);
         assert_eq!(count_collapsed_results(&conv), 0);
     }
 
     #[test]
     fn collapse_no_op_when_under_keep_threshold() {
         let mut conv = build_conv(2, 1024);
-        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3, false);
         // Only 2 turns total, keep 3 — nothing to collapse.
         assert_eq!(count_collapsed_results(&conv), 0);
     }
@@ -4173,7 +4175,7 @@ mod classifier_tests {
     #[test]
     fn collapse_preserves_call_id_and_success_flag() {
         let mut conv = build_conv(3, 1024);
-        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 1);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 1, false);
         // Verify call_0's tool_result still has the right call_id even
         // though its body was stubbed — preserves tool_call/tool_result
         // pairing for OpenAI-style providers.

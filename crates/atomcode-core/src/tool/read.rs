@@ -1314,7 +1314,7 @@ mod tests {
     /// FileStore (via explicit invalidate). This is the load-bearing assumption
     /// for Task 1 of plans/2026-05-07-readfile-skip-and-edit-verify.md — if
     /// this test fails, weak models will read stale post-edit content and
-    /// the read_file-skips-microcompact strategy collapses.
+    /// the read_file-exempt-from-collapse_committed strategy collapses.
     ///
     /// Sequence: write A → read (populates caches) → edit A→B → read again →
     /// must observe B, not cached A.
