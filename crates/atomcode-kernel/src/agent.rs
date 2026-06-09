@@ -615,6 +615,25 @@ impl RunningAgent {
             let start = self.clock.now_millis();
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
+            // CACHE-PREFIX GUARD: pre_request is documented APPEND-ONLY at the tail — it
+            // may add EPHEMERAL reminders but must not mutate / insert / delete WITHIN the
+            // stored history. The hook runs on a per-request CLONE, so STORAGE is safe
+            // regardless (the cache_prefix.rs invariant) — but a non-append projection
+            // still makes THIS round's outgoing wire prefix diverge from prior rounds, so
+            // the provider's prefix cache MISSES (the project's recurring poison). Storage
+            // tests can't see that for a third-party hook; surface it at runtime as a
+            // Warning. Cheap: compares the post-hook prefix against the untouched stored
+            // `convo.messages` (no extra clone); short-circuits on a shrink (no panic).
+            let appended_only = messages.len() >= convo.messages.len()
+                && messages[..convo.messages.len()] == convo.messages[..];
+            if !appended_only {
+                self.rt.emit(AgentEvent::Warning(format!(
+                    "pre_request is not append-only: the outgoing prefix diverges from the \
+                     {} stored message(s) — this poisons the provider prefix cache for this \
+                     request (a pre_request hook may only APPEND tail reminders)",
+                    convo.messages.len()
+                )));
+            }
             // READ-ONLY wire observation of the FINAL outgoing request (post
             // pre_request projection, pre chat_stream): telemetry/datalog/cache-RCA
             // sees the exact bytes about to hit the provider. It gets `&` — it
