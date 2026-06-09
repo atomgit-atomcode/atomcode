@@ -226,6 +226,22 @@
   text-overflow: ellipsis;
 }
 
+.user-message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.user-message-image {
+  width: min(180px, 100%);
+  max-height: 180px;
+  object-fit: contain;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-primary-background);
+}
+
 /* === Assistant Message === */
 .assistant-message-content {
   font-size: 13px;

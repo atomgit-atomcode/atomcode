@@ -4,6 +4,17 @@ export interface ChatRequest {
   working_dir?: string;
   provider?: string;
   session_id?: string;
+  images?: ImageInput[];
+}
+
+export interface ImageInput {
+  media_type: string;
+  data: string;
+}
+
+export interface SkillInfo {
+  name: string;
+  description: string;
 }
 
 export type ChatEvent =
@@ -197,6 +208,7 @@ export interface SessionDetail {
 export interface MessageInfo {
   role: string;
   content: string;
+  images?: ImageInput[];
   tool_calls?: ToolCallInfo[];
   tool_result?: ToolResultInfo;
   artifacts?: ArtifactInfo[];
@@ -230,6 +242,23 @@ export interface CreateSessionResponse {
   working_dir: string;
   project_hash: string;
   created_at: number;
+}
+
+export interface AppendSessionMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface AppendSessionMessagesRequest {
+  working_dir?: string;
+  messages: AppendSessionMessage[];
+}
+
+export interface AppendSessionMessagesResponse {
+  success: boolean;
+  session_id: string;
+  message_count: number;
+  project_hash: string;
 }
 
 // Callbacks for SSE streaming

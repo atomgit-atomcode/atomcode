@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { SkillInfo } from '../state/types';
 
 interface SlashCommand {
   name: string;
@@ -7,29 +8,35 @@ interface SlashCommand {
 }
 
 const slashCommands: SlashCommand[] = [
-  { name: 'login', label: '/login', description: 'Sign in with AtomGit' },
-  { name: 'codingplan', label: '/codingplan', description: 'Sync CodingPlan models' },
-  { name: 'explain', label: '/explain', description: 'Explain selected code' },
-  { name: 'fix', label: '/fix', description: 'Fix issues in code' },
-  { name: 'test', label: '/test', description: 'Write tests' },
-  { name: 'refactor', label: '/refactor', description: 'Refactor code' },
-  { name: 'docs', label: '/docs', description: 'Add documentation' },
-  { name: 'review', label: '/review', description: 'Review code' },
-  { name: 'optimize', label: '/optimize', description: 'Optimize performance' },
+  { name: 'login', label: '/login', description: 'Sign in and sync CodingPlan models' },
+  { name: 'logout', label: '/logout', description: 'Sign out of AtomGit' },
+  { name: 'whoami', label: '/whoami', description: 'Show current logged-in user' },
+  { name: 'status', label: '/status', description: 'Show session status' },
+  { name: 'config', label: '/config', description: 'Show config path' },
+  { name: 'reload', label: '/reload', description: 'Reload config from disk' },
 ];
 
 interface SlashPickerProps {
   filter: string;
+  skills?: SkillInfo[];
   onSelect: (command: string) => void;
   onClose: () => void;
 }
 
-export function SlashPicker({ filter, onSelect, onClose }: SlashPickerProps) {
+export function SlashPicker({ filter, skills = [], onSelect, onClose }: SlashPickerProps) {
   const [activeIndex, setActiveIndex] = useState(0);
 
-  const filtered = slashCommands.filter((cmd) =>
-    cmd.name.startsWith(filter.toLowerCase()),
-  );
+  const localNames = new Set(slashCommands.map((cmd) => cmd.name));
+  const skillCommands: SlashCommand[] = skills
+    .filter((skill) => skill.name && !localNames.has(skill.name))
+    .map((skill) => ({
+      name: skill.name,
+      label: `/${skill.name}`,
+      description: skill.description || 'Skill',
+    }));
+  const commands = [...slashCommands, ...skillCommands];
+  const lowerFilter = filter.toLowerCase();
+  const filtered = commands.filter((cmd) => cmd.name.toLowerCase().startsWith(lowerFilter));
 
   useEffect(() => {
     setActiveIndex(0);

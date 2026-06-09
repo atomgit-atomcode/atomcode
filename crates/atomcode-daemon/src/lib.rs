@@ -208,6 +208,29 @@ pub struct CreateSessionResponse {
     pub created_at: u64,
 }
 
+/// Request to append externally handled messages to a session.
+#[derive(Debug, Deserialize)]
+pub struct AppendSessionMessagesRequest {
+    /// Optional working directory (uses current project dir if not provided)
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    pub messages: Vec<AppendSessionMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AppendSessionMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AppendSessionMessagesResponse {
+    pub success: bool,
+    pub session_id: String,
+    pub message_count: usize,
+    pub project_hash: String,
+}
+
 /// Session detail response
 #[derive(Debug, Serialize)]
 pub struct SessionDetail {
@@ -1316,14 +1339,15 @@ async fn get_project_sessions(Path(hash): Path<String>) -> impl IntoResponse {
 async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
     match load_session(&hash, &id) {
         Ok(session) => {
+            let messages = merge_session_messages_for_display(&session);
             let detail = SessionDetail {
                 id: session.id.to_string(),
                 name: session.name,
                 working_dir: session.working_dir,
                 created_at: session.created_at,
                 updated_at: session.updated_at,
-                message_count: session.messages.len(),
-                messages: session.messages.iter().map(MessageInfo::from).collect(),
+                message_count: messages.len(),
+                messages,
             };
             Json(detail).into_response()
         }
@@ -1332,6 +1356,36 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
             (StatusCode::NOT_FOUND, Json(msg)).into_response()
         }
     }
+}
+
+fn merge_session_messages_for_display(session: &atomcode_core::session::Session) -> Vec<MessageInfo> {
+    let mut messages = Vec::with_capacity(session.messages.len() + session.display_messages.len());
+
+    for display in session.display_messages.iter().filter(|d| d.after_message == 0) {
+        messages.push(MessageInfo::from(&display.message));
+    }
+
+    for (idx, msg) in session.messages.iter().enumerate() {
+        let after_message = idx + 1;
+        messages.push(MessageInfo::from(msg));
+        for display in session
+            .display_messages
+            .iter()
+            .filter(|d| d.after_message == after_message)
+        {
+            messages.push(MessageInfo::from(&display.message));
+        }
+    }
+
+    for display in session
+        .display_messages
+        .iter()
+        .filter(|d| d.after_message > session.messages.len())
+    {
+        messages.push(MessageInfo::from(&display.message));
+    }
+
+    messages
 }
 
 /// GET /sessions - List all sessions across all projects
@@ -1406,6 +1460,68 @@ async fn create_session(
     };
 
     (StatusCode::CREATED, Json(response)).into_response()
+}
+
+/// POST /sessions/:id/messages - Append externally handled, UI-only messages.
+async fn append_session_messages(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<AppendSessionMessagesRequest>,
+) -> impl IntoResponse {
+    let working_dir = match req.working_dir {
+        Some(dir) => dir,
+        None => {
+            let project = state.project.read().await;
+            project.working_dir.clone()
+        }
+    };
+
+    let manager = SessionManager::new(&working_dir);
+    let session_id_obj = SessionId::from_string(session_id.clone());
+    let mut session = match manager.load(&session_id_obj) {
+        Ok(session) => session,
+        Err(e) => {
+            let msg = format!("Session not found: {} ({})", session_id, e);
+            return (StatusCode::NOT_FOUND, Json(msg)).into_response();
+        }
+    };
+
+    let after_message = session.messages.len();
+    for msg in req.messages {
+        let role = match msg.role.to_ascii_lowercase().as_str() {
+            "user" => atomcode_core::conversation::message::Role::User,
+            "assistant" => atomcode_core::conversation::message::Role::Assistant,
+            _ => {
+                let err = format!("Unsupported message role: {}", msg.role);
+                return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+            }
+        };
+        session.display_messages.push(atomcode_core::session::DisplayMessage {
+            after_message,
+            message: atomcode_core::conversation::message::Message::new(role, msg.content),
+        });
+    }
+
+    session.touch();
+    if let Err(e) = manager.save(&session) {
+        let msg = format!("Failed to save session: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
+    }
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    working_dir.hash(&mut hasher);
+    let project_hash = format!("{:016x}", hasher.finish());
+
+    let response = AppendSessionMessagesResponse {
+        success: true,
+        session_id: session.id.to_string(),
+        message_count: session.messages.len() + session.display_messages.len(),
+        project_hash,
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 /// Search sessions by name across all projects
@@ -3871,6 +3987,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Historical projects (from sessions directory)
         .route("/projects", get(get_projects))
         .route("/projects/:hash/sessions", get(get_project_sessions))
+        .route("/sessions/:id/messages", post(append_session_messages))
         .route(
             "/projects/:hash/sessions/:id",
             get(get_session_detail).delete(delete_session),

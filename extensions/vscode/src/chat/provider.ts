@@ -12,11 +12,12 @@ import {
   MessageInfo,
   PatchThinkingRequest,
   ProvidersResponse,
+  ImageInput,
 } from '../daemon/types';
 
 type WebviewMode = 'sidebar' | 'tab';
 type ContextItem = { path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number };
-type QueuedChatMessage = { text: string; context?: ContextItem[]; clientMessageId?: string };
+type QueuedChatMessage = { text: string; context?: ContextItem[]; images?: ImageInput[]; clientMessageId?: string };
 
 interface SessionRuntime {
   abortController?: AbortController;
@@ -256,6 +257,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this._handleSend(
             msg.text,
             msg.context,
+            msg.images,
             msg.clientMessageId,
             msg.sessionId,
           );
@@ -367,6 +369,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'slashCommand':
           await this._handleSlashCommand(msg.command);
           break;
+        case 'getSkills':
+          try {
+            const skills = await this._client.listSkills();
+            this._postMessage({ type: 'skills', skills }, webview);
+          } catch {
+            this._postMessage({ type: 'skills', skills: [] }, webview);
+          }
+          break;
         case 'searchSessions':
           await this._searchSessions(msg.query);
           break;
@@ -384,6 +394,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               fileName,
               language: '',
             });
+          }
+          break;
+        }
+        case 'pickPathForInsert': {
+          const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectFolders: true,
+            canSelectMany: false,
+            openLabel: 'Insert Path',
+          });
+          const picked = uris?.[0]?.fsPath;
+          if (picked) {
+            this._postMessage({ type: 'insertText', text: `${picked} ` }, webview);
+          }
+          break;
+        }
+        case 'pickContextFile': {
+          const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectFolders: false,
+            canSelectMany: true,
+            openLabel: 'Attach File',
+          });
+          for (const uri of uris ?? []) {
+            this._postMessage({
+              type: 'context',
+              filePath: uri.fsPath,
+              fileName: path.basename(uri.fsPath),
+              language: '',
+            }, webview);
           }
           break;
         }
@@ -547,9 +587,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return rt;
   }
 
-  private async _handleSend(text: string, context?: Array<{ path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number }>, clientMessageId?: string, msgSessionId?: string) {
+  private async _handleSend(
+    text: string,
+    context?: Array<{ path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number }>,
+    images?: ImageInput[],
+    clientMessageId?: string,
+    msgSessionId?: string,
+  ) {
     const trimmed = text.trim();
-    if (!trimmed) return;
+    const attachedImages = images?.length ? images : undefined;
+    if (!trimmed && !attachedImages) return;
 
     let sid = msgSessionId ?? this._focusedPanelId;
     if (!sid) {
@@ -559,7 +606,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const rt = this._getRuntime(sid);
 
     if (rt.isGenerating) {
-      rt.queuedMessages.push({ text: trimmed, context, clientMessageId });
+      rt.queuedMessages.push({ text: trimmed, context, images: attachedImages, clientMessageId });
       return;
     }
 
@@ -567,13 +614,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._postMessage({ type: 'queuedMessageSent', id: clientMessageId });
     }
 
-    if (await this._handleLocalCommand(trimmed)) {
+    if (!attachedImages && await this._handleLocalCommand(trimmed, sid)) {
       return;
     }
 
     rt.isGenerating = true;
     rt.eventBuffer = [];  // Start a fresh buffer for this turn
-    rt.eventBuffer.push({ type: 'userMessage', data: { text: trimmed } });
+    rt.eventBuffer.push({ type: 'userMessage', data: { text: trimmed, images: attachedImages } });
     this._postMessage({ type: 'generationStarted' });
 
     let fullMessage = trimmed;
@@ -618,6 +665,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       message: fullMessage,
       working_dir: workspaceFolder,
       session_id: sid,
+      images: attachedImages,
     };
 
     // Capture session ID so callbacks always reference the correct session
@@ -714,7 +762,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!rt || rt.isGenerating) return;
     const next = rt.queuedMessages.shift();
     if (!next) return;
-    await this._handleSend(next.text, next.context, next.clientMessageId);
+    await this._handleSend(next.text, next.context, next.images, next.clientMessageId);
     const rt2 = this._sessionRuntimes.get(sid);
     if (rt2 && !rt2.isGenerating) {
       void this._sendNextQueuedMessage();
@@ -1337,6 +1385,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       refactor: 'Please refactor this code for better readability and maintainability.',
       docs: 'Please add documentation comments to this code.',
       review: 'Please review this code for issues, improvements, and best practices.',
+      optimize: 'Please optimize this code for performance while preserving behavior.',
     };
     const prompt = prompts[action] || action;
     const text = ctx.selection
@@ -1348,48 +1397,147 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleSlashCommand(command: string) {
-    if (await this._handleLocalCommand(command.trim())) {
-      return;
-    }
-
-    const mapping: Record<string, string> = {
-      '/explain': 'explain',
-      '/fix': 'fix',
-      '/test': 'test',
-      '/refactor': 'refactor',
-      '/docs': 'docs',
-      '/review': 'review',
-    };
-    const action = mapping[command];
-    if (action) {
-      await this._handleQuickAction(action);
-    }
+    const sid = this._focusedPanelId ?? await this._ensureSession();
+    if (!sid) return;
+    await this._handleLocalCommand(command.trim(), sid);
   }
 
-  private async _handleLocalCommand(text: string): Promise<boolean> {
+  private async _handleLocalCommand(text: string, sessionId?: string): Promise<boolean> {
     const [command] = text.split(/\s+/, 1);
     switch (command.toLowerCase()) {
       case '/login':
-        this._loginStartedFromCommand = true;
-        this._postMessage({
-          type: 'assistantMessage',
-          text: 'Opening AtomGit sign-in in your browser. Complete authorization there, then return to VS Code.',
-        });
-        await this._startLogin();
-        return true;
-      case '/codingplan':
         {
           const result = await this._setupCodingPlan({ loginIfNeeded: true, announceInChat: true });
           if (result) {
-            this._postMessage({
-              type: 'assistantMessage',
-              text: '```\n' + result.report_text + '\n```',
-            });
+            this._postSlashInfo('```\n' + result.report_text + '\n```', sessionId, text);
           }
+        }
+        return true;
+      case '/logout':
+        try {
+          const auth = await this._client.logout();
+          this._broadcastMessage({ type: 'authStatus', auth });
+          this._postSlashInfo('Signed out of AtomGit.', sessionId, text);
+        } catch (e) {
+          this._postSlashInfo(`Unable to sign out: ${this._messageFromError(e)}`, sessionId, text);
+        }
+        return true;
+      case '/whoami':
+        try {
+          const auth = await this._client.authStatus();
+          if (auth.logged_in && auth.user) {
+            const name = auth.user.name || auth.user.username || auth.user.email || auth.user.id;
+            const lines = [
+              `${name} (${auth.user.username || auth.user.id})`,
+              auth.user.email || 'Email: not provided',
+              `User ID: ${auth.user.id}`,
+              `Auth: ${auth.auth_path}`,
+            ];
+            if (auth.token) {
+              lines.push(`Token: ${auth.token.token_type}`);
+              lines.push(`Created: ${new Date(auth.token.created_at * 1000).toLocaleString()}`);
+              if (auth.token.expires_in !== undefined) {
+                lines.push(`Expires in: ${auth.token.expires_in}s`);
+              }
+              lines.push(`Refresh token: ${auth.token.has_refresh_token ? 'yes' : 'no'}`);
+            }
+            this._postSlashInfo(lines.join('\n'), sessionId, text);
+          } else {
+            this._postSlashInfo('Not signed in.', sessionId, text);
+          }
+        } catch (e) {
+          this._postSlashInfo(`Unable to read auth status: ${this._messageFromError(e)}`, sessionId, text);
+        }
+        return true;
+      case '/status':
+        try {
+          const [health, auth, providers] = await Promise.all([
+            this._client.health(),
+            this._client.authStatus().catch(() => undefined),
+            this._client.listProviders().catch(() => undefined),
+          ]);
+          const provider = providers?.providers.find((p) => p.name === providers.default_provider || p.is_default);
+          this._postSlashInfo([
+            `Daemon: ${health.service} ${health.version}`,
+            `Auth: ${auth?.logged_in ? 'signed in' : 'not signed in'}`,
+            `Provider: ${provider ? `${provider.name} (${provider.model})` : 'not configured'}`,
+          ].join('\n'), sessionId, text);
+        } catch (e) {
+          this._postSlashInfo(`Unable to read status: ${this._messageFromError(e)}`, sessionId, text);
+        }
+        return true;
+      case '/config':
+        try {
+          const config = await this._client.getConfig();
+          const provider = config.providers.find((p) => p.name === config.default_provider || p.is_default);
+          this._postSlashInfo([
+            `Provider: ${provider ? `${provider.name} (${provider.model})` : config.default_provider || 'not configured'}`,
+            `Config: ${config.path}`,
+            '',
+            'Example:',
+            '',
+            '```toml',
+            'default_provider = "deepseek"',
+            '',
+            '[providers.deepseek]',
+            'type           = "openai"',
+            'api_key        = "sk-..."',
+            'model          = "deepseek-chat"',
+            'base_url       = "https://api.deepseek.com/v1"',
+            'context_window = 64000',
+            '```',
+            '',
+            'Full reference: docs/config.example.toml',
+            'Edit the file, then run /reload. No restart needed.',
+          ].join('\n'), sessionId, text);
+        } catch (e) {
+          this._postSlashInfo(`Unable to read config: ${this._messageFromError(e)}`, sessionId, text);
+        }
+        return true;
+      case '/reload':
+        try {
+          const config = await this._client.reloadConfig();
+          const provider = config.providers.find((p) => p.name === config.default_provider || p.is_default);
+          await this._sendSetupState();
+          this._postSlashInfo(
+            `Reloaded config. Default provider: ${provider?.name || config.default_provider || 'none'}.`,
+            sessionId,
+            text,
+          );
+        } catch (e) {
+          this._postSlashInfo(`Unable to reload config: ${this._messageFromError(e)}`, sessionId, text);
         }
         return true;
       default:
         return false;
+    }
+  }
+
+  private _postSlashInfo(text: string, sessionId?: string, userText?: string) {
+    this._postMessage({ type: 'assistantMessage', text });
+    if (sessionId && userText) {
+      void this._persistLocalCommandTranscript(sessionId, userText, text);
+    }
+  }
+
+  private async _persistLocalCommandTranscript(sessionId: string, userText: string, assistantText: string) {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    try {
+      const result = await this._client.appendSessionMessages(sessionId, {
+        working_dir: workspaceFolder,
+        messages: [
+          { role: 'user', content: userText },
+          { role: 'assistant', content: assistantText },
+        ],
+      });
+      const info = this._panelSessions.get(sessionId);
+      if (info) {
+        info.projectHash = result.project_hash;
+      }
+      this._getRuntime(sessionId).projectHash = result.project_hash;
+      await this._refreshSessions();
+    } catch (e) {
+      console.warn(`[AtomCode] Failed to persist local slash command: ${this._messageFromError(e)}`);
     }
   }
 

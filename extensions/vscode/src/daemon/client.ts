@@ -20,6 +20,9 @@ import {
   SessionDetail,
   CreateSessionResponse,
   ChangeDirResponse,
+  SkillInfo,
+  AppendSessionMessagesRequest,
+  AppendSessionMessagesResponse,
 } from './types';
 
 const REST_TIMEOUT = 30000;
@@ -170,6 +173,12 @@ export class DaemonClient {
     return this.get<ModelInfo[]>('/models');
   }
 
+  // ── Skills ───────────────────────────────────────────────────
+
+  listSkills(): Promise<SkillInfo[]> {
+    return this.get<SkillInfo[]>('/skills');
+  }
+
   // ── Config / Providers ───────────────────────────────────────
 
   getConfig(): Promise<ConfigResponse> {
@@ -245,6 +254,16 @@ export class DaemonClient {
       title: name,
       working_dir: workingDir,
     });
+  }
+
+  appendSessionMessages(
+    sessionId: string,
+    req: AppendSessionMessagesRequest,
+  ): Promise<AppendSessionMessagesResponse> {
+    return this.post<AppendSessionMessagesResponse>(
+      `/sessions/${encodeURIComponent(sessionId)}/messages`,
+      req,
+    );
   }
 
   renameSession(projectHash: string, id: string, name: string): Promise<string> {

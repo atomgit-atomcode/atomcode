@@ -110,6 +110,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         role: 'user',
         text: action.text,
         contextFiles: action.contextFiles,
+        images: action.images,
         timestamp: Date.now(),
       };
       return { ...state, messages: [...state.messages, msg] };
@@ -122,6 +123,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         text: action.text,
         queued: true,
         contextFiles: action.contextFiles,
+        images: action.images,
         timestamp: Date.now(),
       };
       return { ...state, queuedMessages: [...state.queuedMessages, msg] };
@@ -484,6 +486,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           text: displayText,
           toolCalls,
           contextFiles: contextFiles.length > 0 ? contextFiles : undefined,
+          images: role === 'user' && m.images && m.images.length > 0 ? m.images : undefined,
           streaming: false,
           timestamp: Date.now(),
         });

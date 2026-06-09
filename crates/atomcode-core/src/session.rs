@@ -70,6 +70,15 @@ pub struct TurnStat {
     pub errored: bool,
 }
 
+/// A UI-only message that should be replayed in session history but must not
+/// be included in model context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayMessage {
+    /// Render after this many real conversation messages.
+    pub after_message: usize,
+    pub message: Message,
+}
+
 /// A session represents an independent conversation context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -85,6 +94,9 @@ pub struct Session {
     pub updated_at: u64,
     /// Conversation messages.
     pub messages: Vec<Message>,
+    /// UI-only messages such as locally handled slash command output.
+    #[serde(default)]
+    pub display_messages: Vec<DisplayMessage>,
     /// Compressed summaries of older conversation history.
     #[serde(default)]
     pub cold_summaries: Vec<String>,
@@ -116,6 +128,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            display_messages: Vec::new(),
             cold_summaries: Vec::new(),
             user_renamed: false,
             turn_stats: Vec::new(),
@@ -131,6 +144,7 @@ impl Session {
             created_at: current_timestamp(),
             updated_at: current_timestamp(),
             messages: Vec::new(),
+            display_messages: Vec::new(),
             cold_summaries: Vec::new(),
             user_renamed: false,
             turn_stats: Vec::new(),
