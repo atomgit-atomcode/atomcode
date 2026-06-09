@@ -43,3 +43,10 @@ pub mod codeintel;
 /// tools (Claude-Code-compatible). Opt-in `skills` feature. See [`skills`].
 #[cfg(feature = "skills")]
 pub mod skills;
+
+/// MCP (Model Context Protocol) capability: connect external MCP servers over
+/// stdio / HTTP(SSE) (with OAuth), discover their tools, and surface them as kernel
+/// [`Tool`](atomcode_kernel::tool::Tool)s (`mcp__{server}__{tool}`). Ported from
+/// `atomcode-core::mcp` with zero core dependency. Opt-in `mcp` feature. See [`mcp`].
+#[cfg(feature = "mcp")]
+pub mod mcp;

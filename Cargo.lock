@@ -213,10 +213,13 @@ dependencies = [
 name = "atomcode-capabilities"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-stream",
  "async-trait",
  "atomcode-kernel",
+ "base64",
  "bytes",
+ "dirs 6.0.0",
  "futures",
  "globset",
  "ignore",
@@ -224,9 +227,11 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-c-sharp",
@@ -240,6 +245,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "url",
+ "uuid",
  "which",
  "wiremock",
 ]
