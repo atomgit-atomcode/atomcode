@@ -160,12 +160,26 @@ impl CustomCommandRegistry {
 
     /// Render the template for `name`, replacing `$ARGUMENTS` /
     /// `${ARGUMENTS}` with the provided args string.
+    ///
+    /// Lookup is by exact key first (`name` or `plugin:name`). If that misses,
+    /// fall back to a **bare-name** match: plugin commands are keyed
+    /// `plugin:name` but listed/typed as just `name` — so `/wechat` should
+    /// resolve to `weixin:wechat` when that bare name is unique. Ambiguous bare
+    /// names (same command name in two plugins) require the full `plugin:name`.
     pub fn render(&self, name: &str, args: &str) -> Option<String> {
-        self.commands.get(name).map(|cmd| {
+        let cmd = self.commands.get(name).or_else(|| {
+            let mut matches = self.commands.values().filter(|c| c.name == name);
+            let first = matches.next();
+            match matches.next() {
+                None => first,   // unique bare-name match
+                Some(_) => None, // ambiguous → require plugin:name
+            }
+        })?;
+        Some(
             cmd.template
                 .replace("$ARGUMENTS", args)
-                .replace("${ARGUMENTS}", args)
-        })
+                .replace("${ARGUMENTS}", args),
+        )
     }
 
     /// All commands, sorted by name.
@@ -423,4 +437,43 @@ mod tests {
 
         std::env::remove_var("ATOMCODE_HOME");
     }
+    #[test]
+    fn render_resolves_bare_name_for_namespaced_command() {
+        let mut reg = CustomCommandRegistry::empty();
+        reg.commands.insert(
+            "weixin:wechat".into(),
+            CustomCommand {
+                name: "wechat".into(),
+                description: "d".into(),
+                args_requirement: ArgsRequirement::Optional,
+                template: "do $ARGUMENTS".into(),
+                source: std::path::PathBuf::from("x"),
+                namespace: Some("weixin".into()),
+            },
+        );
+        assert_eq!(reg.render("wechat", "login").as_deref(), Some("do login"));
+        assert_eq!(reg.render("weixin:wechat", "").as_deref(), Some("do "));
+        assert!(reg.render("nope", "").is_none());
+    }
+
+    #[test]
+    fn render_bare_name_ambiguous_returns_none() {
+        let mut reg = CustomCommandRegistry::empty();
+        for ns in ["a", "b"] {
+            reg.commands.insert(
+                format!("{ns}:wechat"),
+                CustomCommand {
+                    name: "wechat".into(),
+                    description: "d".into(),
+                    args_requirement: ArgsRequirement::None,
+                    template: "t".into(),
+                    source: std::path::PathBuf::from("x"),
+                    namespace: Some(ns.into()),
+                },
+            );
+        }
+        assert!(reg.render("wechat", "").is_none());
+        assert!(reg.render("a:wechat", "").is_some());
+    }
 }
+

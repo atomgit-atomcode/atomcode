@@ -4188,6 +4188,13 @@ fn handle_input(
                 }
             }
             renderer.on_resize(cols, rows);
+            // A resize invalidates any open modal's cached overlay
+            // geometry (it was built for the old size). Rebuild it now so
+            // the window re-centres at the new dimensions instead of
+            // lingering stale / mispositioned until the next keypress.
+            if let Some(m) = app.active_modal.as_ref() {
+                m.draw(&app.buf, &app.state, ctx, renderer);
+            }
             for ev in deferred {
                 handle_input(app, ctx, renderer, ev)?;
             }
