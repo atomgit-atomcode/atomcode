@@ -251,6 +251,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-clix"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atomcode-kernel",
+ "atomcode-review",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "atomcode-coding"
 version = "0.0.0"
 dependencies = [
@@ -364,6 +379,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "atomcode-review"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "atomcode-capabilities",
+ "atomcode-kernel",
+ "futures",
+ "tokio",
 ]
 
 [[package]]
