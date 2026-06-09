@@ -333,8 +333,13 @@ impl Conversation {
     ///    (drain the range; if `summary` is `Some`, insert ONE
     ///    `Message::synthetic_user(summary)` at `drain_from`; apply rewrites;
     ///    append `resume_note` as a trailing `synthetic_user`), then measure a
-    ///    DETERMINISTIC size proxy — the sum of `m.text.len()` over all messages —
-    ///    BEFORE vs AFTER. COMMIT only if AFTER is STRICTLY smaller than BEFORE.
+    ///    DETERMINISTIC size proxy — per message the bytes that ride the wire
+    ///    (`text` + `reasoning` + each `tool_call`'s id/name/arguments + `tool_call_id`),
+    ///    summed over all messages — BEFORE vs AFTER. COMMIT only if AFTER is STRICTLY
+    ///    smaller than BEFORE. Counting tool-call bytes (not just `text`) is load-bearing:
+    ///    a text-light but TOOL-CALL-heavy message (large JSON `arguments`) must register
+    ///    as a reduction when dropped, else the strictly-smaller guard would REFUSE a
+    ///    genuinely shrinking compaction and a tool-heavy history could never compact.
     /// 3. On COMMIT: replace `messages` with the candidate and bump
     ///    `cache_epoch += 1` EXACTLY ONCE (decide commit FIRST, bump only after —
     ///    never bump-then-rollback). On REFUSE (not strictly smaller, or noop):
@@ -345,8 +350,20 @@ impl Conversation {
     /// allowed non-append history change and it opens a new epoch; a REFUSED one
     /// leaves the prefix byte-stable and the epoch unchanged.
     pub fn apply_plan(&mut self, plan: CompactionPlan, sacred_floor: usize) -> CompactReport {
+        // Deterministic size proxy: the bytes that ride the wire for a message — NOT just
+        // `text`. Dropping a text-light, TOOL-CALL-heavy message (big JSON arguments) must
+        // count as a reduction, else the strictly-smaller net-loss guard below would
+        // REFUSE a genuinely shrinking plan and tool-heavy histories could never compact.
+        fn size(m: &Message) -> usize {
+            let tool_calls: usize =
+                m.tool_calls.iter().map(|c| c.id.len() + c.name.len() + c.arguments.len()).sum();
+            m.text.len()
+                + m.reasoning.as_ref().map_or(0, |r| r.len())
+                + tool_calls
+                + m.tool_call_id.as_ref().map_or(0, |id| id.len())
+        }
         let epoch_before = self.cache_epoch;
-        let bytes_before: usize = self.messages.iter().map(|m| m.text.len()).sum();
+        let bytes_before: usize = self.messages.iter().map(size).sum();
         let len_before = self.messages.len();
 
         // 1. Clamp the drain range against the protected prefix and current bounds.
@@ -413,7 +430,7 @@ impl Conversation {
         // original, which was valid).
         Self::repair_pairing(&mut candidate);
 
-        let bytes_after: usize = candidate.iter().map(|m| m.text.len()).sum();
+        let bytes_after: usize = candidate.iter().map(size).sum();
 
         // 3. Decide commit FIRST; bump epoch only after a real commit.
         let committed = bytes_after < bytes_before;
@@ -964,6 +981,42 @@ mod tests {
         assert_eq!(c.messages[3].text, "dddddddddd");
         assert!(report.removed > 0);
         assert!(report.bytes_after < report.bytes_before);
+    }
+
+    // The size proxy counts TOOL-CALL bytes, not just `text`: dropping a text-light but
+    // tool-call-heavy message for a short summary is a NET REDUCTION and must commit (a
+    // text-only proxy would refuse it, so tool-heavy histories could never compact).
+    #[test]
+    fn apply_plan_size_proxy_counts_tool_call_bytes_so_tool_heavy_summary_commits() {
+        let big_args = format!("{{\"data\":\"{}\"}}", "x".repeat(500));
+        let mut c = Conversation::new();
+        c.push(Message::system("sys"));
+        c.push(Message::user("task"));
+        c.push(Message::assistant(
+            "", // text-light…
+            vec![crate::tool::ToolCall { id: "c1".into(), name: "t".into(), arguments: big_args }], // …tool-call-heavy
+        ));
+        c.push(Message::tool_result("c1", "ok", false));
+        c.push(Message::user("next"));
+        let floor = c.sacred_floor(); // 2 (system + first user)
+
+        // Drain the tool-heavy assistant+result pair [2,4), replace with a 100-char
+        // summary. Text-only proxy: ~0 drained text vs +100 summary → would REFUSE.
+        // Counting the ~500-byte tool arguments makes it a clear net reduction.
+        let plan = CompactionPlan {
+            drain_from: 2,
+            drain_to: 4,
+            summary: Some("S".repeat(100)),
+            rewrites: vec![],
+            resume_note: None,
+        };
+        let report = c.apply_plan(plan, floor);
+
+        assert!(
+            report.committed,
+            "dropping a tool-call-heavy message for a short summary must be a net reduction (tool_call bytes counted), not refused by a text-only proxy"
+        );
+        assert!(report.bytes_before > report.bytes_after);
     }
 
     // A plan whose result is NOT smaller (summary longer than what it replaces, or
