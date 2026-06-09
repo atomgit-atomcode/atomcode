@@ -279,7 +279,7 @@ pub async fn maybe_compress_history(
     }
 
     // ── Tier 1: collapse old tool_results (no LLM call) ──
-    crate::ctx::render::compact_old_tool_results_in_place(conv, /* keep_recent_turns */ 3);
+    crate::ctx::render::compact_old_tool_results_in_place(conv, /* keep_recent_turns */ 3, false);
 
     // Re-check: if Tier 1 was enough, stop here.
     if !ctx.needs_compression(conv, sys_tokens) {

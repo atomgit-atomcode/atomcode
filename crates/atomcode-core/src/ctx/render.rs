@@ -869,6 +869,7 @@ fn build_call_id_to_tool_map(
 pub(crate) fn compact_old_tool_results_in_place(
     conv: &mut crate::conversation::Conversation,
     keep_recent_turns: usize,
+    exempt_read_file: bool,
 ) {
     let turns = &conv.turn_tracker.turns;
     if turns.len() <= keep_recent_turns {
@@ -890,6 +891,9 @@ pub(crate) fn compact_old_tool_results_in_place(
             .get(&tr.call_id)
             .map(|s| s.as_str())
             .unwrap_or("tool");
+        if exempt_read_file && tool_name == "read_file" {
+            continue;
+        }
         let summary = build_compact_stub(tool_name, &tr.output, tr.success);
         conv.messages[i].content = MessageContent::ToolResult(crate::tool::ToolResult {
             call_id: tr.call_id.clone(),
@@ -1480,7 +1484,7 @@ mod tests {
             if !needs_compression(conv, sys_tokens, budget) {
                 return;
             }
-            compact_old_tool_results_in_place(conv, 3);
+            compact_old_tool_results_in_place(conv, 3, false);
             if !needs_compression(conv, sys_tokens, budget) {
                 return;
             }
@@ -3366,5 +3370,70 @@ mod tests {
             fired,
             "render-drop must still engage as a last-resort once total exceeds the threshold"
         );
+    }
+
+    #[test]
+    fn compact_old_exempts_read_file_when_flagged() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("t0");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "r".into(), name: "read_file".into(), arguments: "{}".into() }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "r".into(),
+            output: format!("L1\n{}", "x".repeat(2_000)),
+            success: true,
+        });
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "b".into(),
+            output: format!("[elapsed: 0.0s, exit: 0]\n{}", "x".repeat(2_000)),
+            success: true,
+        });
+        conv.add_user_message("t1"); // active turn → kept full
+
+        compact_old_tool_results_in_place(&mut conv, 1, true);
+
+        let get = |cid: &str, conv: &Conversation| {
+            conv.messages.iter().find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
+                _ => None,
+            }).unwrap()
+        };
+        assert!(!get("r", &conv).starts_with('['), "read_file must stay full when exempt");
+        assert!(get("b", &conv).starts_with("[bash "), "bash must be stubbed");
+    }
+
+    #[test]
+    fn compact_old_stubs_read_file_when_not_exempt() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("t0");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "r".into(), name: "read_file".into(), arguments: "{}".into() }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "r".into(),
+            output: format!("L1\n{}", "x".repeat(2_000)),
+            success: true,
+        });
+        conv.add_user_message("t1");
+
+        compact_old_tool_results_in_place(&mut conv, 1, false);
+
+        let out = conv.messages.iter().find_map(|m| match &m.content {
+            MessageContent::ToolResult(r) if r.call_id == "r" => Some(r.output.clone()),
+            _ => None,
+        }).unwrap();
+        assert!(out.starts_with("[read_file "), "emergency path must still stub read_file");
     }
 }
