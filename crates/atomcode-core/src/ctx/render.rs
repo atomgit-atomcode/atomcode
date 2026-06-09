@@ -903,6 +903,32 @@ pub(crate) fn compact_old_tool_results_in_place(
     }
 }
 
+/// Normal-path committed collapse (cache-friendly replacement for the
+/// removed ephemeral `microcompact`). Threshold-gated by the same
+/// `70% × budget × 4` char trigger; below it this is a no-op so short
+/// sessions stay full-fidelity and byte-stable (append-only). Above it,
+/// permanently stubs old (non-active-turn, non-`read_file`) ToolResults in
+/// `conv.messages`. Idempotent + monotonic via `compact_old_tool_results_in_place`
+/// (`keep_recent_turns = 1` → keeps everything after the last `Role::User`,
+/// i.e. the active turn). Because it commits, the stubbed prefix never
+/// changes again across turns — the property `microcompact` violated.
+pub(crate) fn collapse_committed(conv: &mut crate::conversation::Conversation, token_budget: usize) {
+    let threshold_chars = (token_budget as u64 * 4 * 70 / 100) as usize;
+    let total_chars: usize = conv
+        .messages
+        .iter()
+        .map(|m| match &m.content {
+            MessageContent::ToolResult(r) => r.output.len(),
+            MessageContent::Text(t) => t.len(),
+            _ => 100,
+        })
+        .sum();
+    if total_chars < threshold_chars {
+        return;
+    }
+    compact_old_tool_results_in_place(conv, /* keep_recent_turns */ 1, /* exempt_read_file */ true);
+}
+
 /// Microcompact: condense **prior-turn** `ToolResult` messages to one-line
 /// semantic summaries. Zero LLM calls — purely mechanical compression.
 ///
@@ -3435,5 +3461,123 @@ mod tests {
             _ => None,
         }).unwrap();
         assert!(out.starts_with("[read_file "), "emergency path must still stub read_file");
+    }
+
+    #[test]
+    fn collapse_committed_noop_below_threshold() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("t0");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "b".into(),
+            output: format!("[elapsed: 0.0s, exit: 0]\n{}", "x".repeat(1_000)),
+            success: true,
+        });
+        conv.add_user_message("t1");
+
+        // budget 1_000_000 → threshold 2.8M chars; ~1K payload → no-op.
+        collapse_committed(&mut conv, 1_000_000);
+
+        let out = conv.messages.iter().find_map(|m| match &m.content {
+            MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
+            _ => None,
+        }).unwrap();
+        // The original bash output starts with "[elapsed:..." — a stub would start with "[bash ".
+        // Below threshold nothing should be stubbed.
+        assert!(!out.starts_with("[bash "), "below threshold must stay full (append-only)");
+    }
+
+    #[test]
+    fn collapse_committed_stubs_old_keeps_active_and_exempts_read_file() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        // 3 old turns: each a big read_file + big bash; then an active turn.
+        for n in 0..3 {
+            conv.add_user_message(&format!("t{n}"));
+            let r = format!("r{n}");
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall { id: r.clone(), name: "read_file".into(), arguments: "{}".into() }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: r,
+                output: format!("L1\n{}", "x".repeat(6_000)),
+                success: true,
+            });
+            let b = format!("b{n}");
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall { id: b.clone(), name: "bash".into(), arguments: "{}".into() }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: b,
+                output: format!("[elapsed: 0.0s, exit: 0]\n{}", "x".repeat(6_000)),
+                success: true,
+            });
+        }
+        // active turn (kept full): a bash that must NOT be stubbed.
+        conv.add_user_message("active");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "ba".into(), name: "bash".into(), arguments: "{}".into() }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "ba".into(),
+            output: format!("[elapsed: 0.0s, exit: 0]\n{}", "x".repeat(6_000)),
+            success: true,
+        });
+
+        // budget 8_000 → threshold 22_400 chars; payload ~42K → fires.
+        collapse_committed(&mut conv, 8_000);
+
+        let get = |cid: &str, conv: &Conversation| {
+            conv.messages.iter().find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
+                _ => None,
+            }).unwrap()
+        };
+        assert!(get("b0", &conv).starts_with("[bash "), "old bash must be stubbed");
+        // read_file output starts with "L1\n..." — check it was not replaced with a stub.
+        assert!(!get("r0", &conv).starts_with('['), "old read_file must stay full (exempt)");
+        // Active-turn bash output starts with "[elapsed:..." — a stub would start with "[bash ".
+        assert!(!get("ba", &conv).starts_with("[bash "), "active-turn bash must stay full");
+    }
+
+    #[test]
+    fn collapse_committed_is_idempotent() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("t0");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "b".into(),
+            output: format!("[elapsed: 0.0s, exit: 0]\n{}", "x".repeat(30_000)),
+            success: true,
+        });
+        conv.add_user_message("t1");
+
+        collapse_committed(&mut conv, 8_000);
+        let after_first = conv.messages.iter().find_map(|m| match &m.content {
+            MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
+            _ => None,
+        }).unwrap();
+        collapse_committed(&mut conv, 8_000);
+        let after_second = conv.messages.iter().find_map(|m| match &m.content {
+            MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
+            _ => None,
+        }).unwrap();
+        assert_eq!(after_first, after_second, "re-running must not re-stub (idempotent)");
     }
 }
