@@ -15,4 +15,5 @@ pub mod request;
 pub mod middleware;
 pub mod hook;
 pub mod agent;
+pub mod conformance;
 pub mod testkit;
