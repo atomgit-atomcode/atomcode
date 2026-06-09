@@ -3580,4 +3580,67 @@ mod tests {
         }).unwrap();
         assert_eq!(after_first, after_second, "re-running must not re-stub (idempotent)");
     }
+
+    #[test]
+    fn collapse_committed_freezes_stubbed_prefix_across_turns() {
+        use crate::tool::{ToolCall, ToolResult};
+        // Low budget (threshold = 1_000*4*70/100 = 2_800 chars) on purpose:
+        // after the first collapse shrinks the conv, the SECOND collapse must
+        // still be above threshold so it actually re-fires and re-examines the
+        // already-stubbed prefix — otherwise the freeze assertion is vacuous.
+        let budget = 1_000;
+
+        let add_turn = |conv: &mut Conversation, n: usize| {
+            conv.add_user_message(&format!("task {n}"));
+            let id = format!("c{n}");
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall { id: id.clone(), name: "bash".into(), arguments: "{}".into() }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: id,
+                output: format!("[elapsed: 0.0s, exit: 0]\n{}", "x".repeat(6_000)),
+                success: true,
+            });
+        };
+
+        let mut conv = Conversation::new();
+        for n in 0..5 {
+            add_turn(&mut conv, n);
+        }
+        collapse_committed(&mut conv, budget);
+
+        // Snapshot every ALREADY-stubbed tool result (output starts with '[' and
+        // is a real stub, i.e. contains "lines, first:").
+        let stubbed_before: Vec<(usize, String)> = conv
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| match &m.content {
+                MessageContent::ToolResult(r)
+                    if r.output.starts_with('[') && r.output.contains("lines, first:") =>
+                {
+                    Some((i, r.output.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!stubbed_before.is_empty(), "expected stubs after first collapse");
+
+        // A new turn arrives; collapse again (the just-aged turn now stubs).
+        add_turn(&mut conv, 5);
+        collapse_committed(&mut conv, budget);
+
+        // Every previously-stubbed result must be byte-identical (monotonic, frozen).
+        for (i, before) in &stubbed_before {
+            match &conv.messages[*i].content {
+                MessageContent::ToolResult(r) => assert_eq!(
+                    &r.output, before,
+                    "stub at message #{i} mutated across turns — prefix cache would break"
+                ),
+                other => panic!("message #{i} changed content variant: {:?}", other),
+            }
+        }
+    }
 }
