@@ -22,6 +22,37 @@ pub struct ImageContent {
     pub data: String,
 }
 
+/// One unit of an assistant message's REASONING/THINKING, preserved losslessly so a
+/// thinking-block provider adapter (L1) can echo it back VERBATIM next turn.
+///
+/// The flat [`Message::reasoning`] string is sufficient for the OpenAI-compatible
+/// `reasoning_content` path (plain text, no signature). This richer per-unit shape
+/// exists for providers whose thinking carries an OPAQUE round-trip token that must be
+/// replayed exactly — Anthropic extended thinking (`signature`), OpenAI Responses
+/// (`encrypted_content`), Gemini (`thoughtSignature`). The kernel only STORES the
+/// mechanism (text + opaque + attribution); the ECHO policy stays in L1.
+///
+/// INVARIANT: `opaque.is_some()` ⇒ `provider.is_some()`. An opaque token is
+/// PROVIDER-BOUND — replaying it to a different provider (or after a model swap) fails
+/// hard — so an adapter uses `provider` to echo a token back ONLY to its own backend
+/// and to leave another vendor's block untouched. A REDACTED thinking block carries an
+/// empty `text` with `opaque = Some(data)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningBlock {
+    /// Human-readable thinking (may be empty/redacted).
+    pub text: String,
+    /// OPAQUE round-trip payload, stored and echoed VERBATIM (Anthropic `signature` /
+    /// OpenAI `encrypted_content` / Gemini `thoughtSignature`). The kernel NEVER parses
+    /// or re-serializes it (any re-encode invalidates the signature). `None` for a
+    /// plain-text reasoning unit with no signature.
+    #[serde(default)]
+    pub opaque: Option<String>,
+    /// Attribution — which provider produced `opaque`. INVARIANT: `opaque.is_some()` ⇒
+    /// `provider.is_some()`.
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
 /// Kernel-native per-message execution stats, recorded at on_model_response.
 /// A SIDECAR — never part of `text` — so storing it never changes the bytes the
 /// LLM sees (prefix-cache safety). The renderer (pre_request) chooses whether to
@@ -135,22 +166,32 @@ pub struct Message {
     /// makes an adapter switch to the array `content` shape. See [`ImageContent`].
     #[serde(default)]
     pub images: Vec<ImageContent>,
+    /// SIGNED/OPAQUE reasoning units for an ASSISTANT message, in stream order — the
+    /// rich twin of the flat [`Message::reasoning`]. Empty for every message the
+    /// OpenAI-compatible path produces (its reasoning is plain text in `reasoning`);
+    /// an Anthropic-style adapter populates it (one entry per thinking / redacted
+    /// block) so it can replay the signed blocks VERBATIM on the next request. The
+    /// kernel only STORES them; the echo policy is the L1 adapter's. ADDITIVE:
+    /// `#[serde(default)]` so a snapshot without this field still deserializes (→
+    /// empty). See [`ReasoningBlock`].
+    #[serde(default)]
+    pub reasoning_blocks: Vec<ReasoningBlock>,
 }
 
 impl Message {
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![] }
+        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![], reasoning_blocks: vec![] }
     }
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![] }
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![], reasoning_blocks: vec![] }
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![] }
+        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![], reasoning_blocks: vec![] }
     }
     /// A tool RESULT. `is_error` is now STORED (a real adapter must echo it to the
     /// provider) — it was previously dropped, losing tool failure state.
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
-        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), is_error, meta: None, synthetic: false, reasoning: None, images: vec![] }
+        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), is_error, meta: None, synthetic: false, reasoning: None, images: vec![], reasoning_blocks: vec![] }
     }
     /// A KERNEL-INJECTED synthetic `Role::User` message (compaction cold summary or
     /// resume note). It carries `synthetic = true` so `sacred_floor` skips it when
@@ -160,12 +201,12 @@ impl Message {
     /// the whole cached prefix — see `ctx/render.rs` in production. Inserted
     /// after the system message, it preserves the frozen system prefix.
     pub fn synthetic_user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: true, reasoning: None, images: vec![] }
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: true, reasoning: None, images: vec![], reasoning_blocks: vec![] }
     }
     /// A user message carrying inline `images` (multimodal input). Identical to
     /// [`Message::user`] when `images` is empty.
     pub fn user_with_images(text: impl Into<String>, images: Vec<ImageContent>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images }
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images, reasoning_blocks: vec![] }
     }
 }
 
@@ -678,6 +719,32 @@ mod tests {
         );
         let back: Message = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
         assert_eq!(back.images, with.images);
+    }
+
+    #[test]
+    fn reasoning_blocks_default_empty_and_serde_additive() {
+        // A plain assistant message has no signed reasoning blocks.
+        assert!(
+            Message::assistant("ans", vec![]).reasoning_blocks.is_empty(),
+            "a plain assistant message carries no reasoning_blocks"
+        );
+        // An OLD snapshot (no `reasoning_blocks` field) must still deserialize → empty.
+        let old = r#"{"role":"Assistant","text":"ans","tool_calls":[],"tool_call_id":null,"is_error":false,"meta":null}"#;
+        let m: Message = serde_json::from_str(old).unwrap();
+        assert!(m.reasoning_blocks.is_empty(), "missing reasoning_blocks defaults to empty");
+        // A round-trip with blocks preserves text + opaque + provider losslessly.
+        let mut with = Message::assistant("ans", vec![]);
+        with.reasoning_blocks = vec![
+            ReasoningBlock {
+                text: "let me think".into(),
+                opaque: Some("sig-abc".into()),
+                provider: Some("anthropic".into()),
+            },
+            // a redacted block: no readable text, opaque only.
+            ReasoningBlock { text: String::new(), opaque: Some("redacted-data".into()), provider: Some("anthropic".into()) },
+        ];
+        let back: Message = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.reasoning_blocks, with.reasoning_blocks);
     }
 
     // Mirrors production `cancel_backfills_missing_tool_results`: an assistant

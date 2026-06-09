@@ -55,6 +55,21 @@ pub enum StreamEvent {
     /// AND accumulates it onto the assistant `Message.reasoning` so a provider adapter
     /// can echo the prior turn's reasoning back next turn (thinking models require it).
     Reasoning(String),
+    /// END-OF-BLOCK boundary for a SIGNED thinking unit: the OPAQUE round-trip token
+    /// (Anthropic `signature` / OpenAI `encrypted_content` / Gemini `thoughtSignature`)
+    /// plus its `provider` attribution. The block's TEXT arrives BEFORE this as ordinary
+    /// [`StreamEvent::Reasoning`] deltas (kept for the live channel + the flat
+    /// `Message.reasoning`); this event tells the kernel to FINALIZE one
+    /// [`ReasoningBlock`](crate::message::ReasoningBlock) — the reasoning text since the
+    /// previous block, paired with this `opaque`/`provider` — onto
+    /// `Message.reasoning_blocks`. A REDACTED block emits this with NO preceding text
+    /// deltas (→ a block with empty `text`). An adapter with no opaque thinking (the
+    /// OpenAI-compatible `reasoning_content` path) simply NEVER emits this, so
+    /// `reasoning_blocks` stays empty and that path is entirely unchanged.
+    ReasoningSignature {
+        opaque: String,
+        provider: String,
+    },
     ToolCall(ToolCall),
     /// A STREAMING fragment of a tool call the model is still emitting. `index` groups
     /// fragments of the SAME call (providers stream `tool_calls` by index); `id`/`name`

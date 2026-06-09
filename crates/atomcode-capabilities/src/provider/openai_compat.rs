@@ -948,6 +948,7 @@ mod tests {
         ev.iter()
             .map(|e| match e {
                 StreamEvent::Reasoning(_) => "reason",
+                StreamEvent::ReasoningSignature { .. } => "reasonsig",
                 StreamEvent::TextDelta(_) => "text",
                 StreamEvent::ToolCall(_) => "tool",
                 StreamEvent::ToolCallDelta { .. } => "tooldelta",

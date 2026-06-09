@@ -13,7 +13,7 @@
 //! run by default — those are NOT e2e.)
 #![cfg(feature = "e2e")]
 
-use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
+use atomcode_capabilities::provider::{AnthropicConfig, AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::stream::StreamEvent;
@@ -53,6 +53,8 @@ async fn live_smoke_streams_text_and_done() {
                 eprintln!("[live] Done(truncated={truncated})");
             }
             StreamEvent::ToolCall(tc) => eprintln!("[live] unexpected ToolCall: {}", tc.name),
+            StreamEvent::ToolCallDelta { .. } => {}
+            StreamEvent::ReasoningSignature { .. } => {}
             StreamEvent::ResponseId(id) => eprintln!("[live] provider response_id={id}"),
             StreamEvent::Error(e) => panic!("[live] stream error: {}", e.message),
         }
@@ -64,6 +66,98 @@ async fn live_smoke_streams_text_and_done() {
     }
     if let Some(u) = usage {
         eprintln!("[live] usage prompt={} completion={} cached={}", u.prompt, u.completion, u.cached);
+    }
+    assert!(saw_done, "stream must reach Done");
+    assert!(!text.trim().is_empty(), "expected some text content, got empty");
+}
+
+/// Open a REAL Anthropic Messages stream, consume it, assert text + clean Done. Run:
+///
+///   ATOMCODE_ANTHROPIC_KEY=sk-ant-... \
+///   cargo test -p atomcode-capabilities --features e2e --test e2e \
+///     live_anthropic_smoke -- --nocapture --ignored
+///
+/// Optional: ATOMCODE_ANTHROPIC_BASE_URL (default https://api.anthropic.com),
+/// ATOMCODE_ANTHROPIC_MODEL (default claude-haiku-4-5).
+#[tokio::test]
+#[ignore = "hits the real Anthropic API; run explicitly with a key"]
+async fn live_anthropic_smoke_streams_text_and_done() {
+    let base = std::env::var("ATOMCODE_ANTHROPIC_BASE_URL")
+        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    let model = std::env::var("ATOMCODE_ANTHROPIC_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5".to_string());
+    let cfg = AnthropicConfig::new(env("ATOMCODE_ANTHROPIC_KEY"), base, model);
+    let provider = AnthropicProvider::new(cfg).expect("build provider");
+
+    let messages = vec![Message::user("Reply with exactly the single word: pong")];
+    let mut stream = provider
+        .chat_stream(&messages, &[], &ChatOptions::default())
+        .await
+        .expect("open stream");
+
+    let mut text = String::new();
+    let mut usage = None;
+    let mut saw_done = false;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            StreamEvent::TextDelta(t) => text.push_str(&t),
+            StreamEvent::Usage(u) => usage = Some(u),
+            StreamEvent::Done { truncated } => {
+                saw_done = true;
+                eprintln!("[live-anthropic] Done(truncated={truncated})");
+            }
+            StreamEvent::ResponseId(id) => eprintln!("[live-anthropic] response_id={id}"),
+            StreamEvent::Error(e) => panic!("[live-anthropic] stream error: {}", e.message),
+            _ => {}
+        }
+    }
+    eprintln!("[live-anthropic] text={text:?}");
+    if let Some(u) = usage {
+        eprintln!("[live-anthropic] usage prompt={} completion={} cached={}", u.prompt, u.completion, u.cached);
+    }
+    assert!(saw_done, "stream must reach Done");
+    assert!(!text.trim().is_empty(), "expected some text content, got empty");
+}
+
+/// Open a REAL Ollama `/api/chat` stream against a LOCAL daemon, assert text + Done. Run:
+///
+///   cargo test -p atomcode-capabilities --features e2e --test e2e \
+///     live_ollama_smoke -- --nocapture --ignored
+///
+/// Optional: ATOMCODE_OLLAMA_BASE_URL (default http://localhost:11434),
+/// ATOMCODE_OLLAMA_MODEL (default llama3.2). Requires `ollama pull <model>` first.
+#[tokio::test]
+#[ignore = "needs a local Ollama daemon with the model pulled; run explicitly"]
+async fn live_ollama_smoke_streams_text_and_done() {
+    let base = std::env::var("ATOMCODE_OLLAMA_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let model = std::env::var("ATOMCODE_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
+    let provider = OllamaProvider::new(OllamaConfig::new(base, model)).expect("build provider");
+
+    let messages = vec![Message::user("Reply with exactly the single word: pong")];
+    let mut stream = provider
+        .chat_stream(&messages, &[], &ChatOptions::default())
+        .await
+        .expect("open stream");
+
+    let mut text = String::new();
+    let mut usage = None;
+    let mut saw_done = false;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            StreamEvent::TextDelta(t) => text.push_str(&t),
+            StreamEvent::Usage(u) => usage = Some(u),
+            StreamEvent::Done { truncated } => {
+                saw_done = true;
+                eprintln!("[live-ollama] Done(truncated={truncated})");
+            }
+            StreamEvent::Error(e) => panic!("[live-ollama] stream error: {}", e.message),
+            _ => {}
+        }
+    }
+    eprintln!("[live-ollama] text={text:?}");
+    if let Some(u) = usage {
+        eprintln!("[live-ollama] usage prompt={} completion={}", u.prompt, u.completion);
     }
     assert!(saw_done, "stream must reach Done");
     assert!(!text.trim().is_empty(), "expected some text content, got empty");

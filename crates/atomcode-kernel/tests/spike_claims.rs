@@ -752,3 +752,52 @@ async fn no_reasoning_stream_stores_none() {
         "a non-thinking response stores reasoning == None (not Some(\"\"))"
     );
 }
+
+// SIGNED reasoning: a thinking-block provider streams text deltas PLUS a
+// `ReasoningSignature` boundary per block. The kernel finalizes one
+// `ReasoningBlock { text, opaque, provider }` per signature (text = the deltas since
+// the previous block), IN ORDER, while the flat `reasoning` still accumulates ALL
+// text (back-compat). A redacted block (signature with no preceding text) yields a
+// block with empty `text`.
+#[tokio::test]
+async fn signed_reasoning_blocks_are_finalized_per_signature_in_order() {
+    use atomcode_kernel::message::ReasoningBlock;
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        StreamEvent::Reasoning("plan A".into()),
+        StreamEvent::ReasoningSignature { opaque: "sigA".into(), provider: "anthropic".into() },
+        StreamEvent::Reasoning("plan B".into()),
+        StreamEvent::ReasoningSignature { opaque: "sigB".into(), provider: "anthropic".into() },
+        // a redacted block: signature with no preceding text.
+        StreamEvent::ReasoningSignature { opaque: "redacted".into(), provider: "anthropic".into() },
+        StreamEvent::TextDelta("done".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+
+    let mut handle = Agent::builder().provider(provider).tools(reg.mount(&[])).build().spawn();
+    handle.commands.send(AgentCommand::SendMessage { text: "think".into(), images: vec![] }).unwrap();
+    while let Some(ev) = handle.events.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) { break; }
+    }
+    handle.commands.send(AgentCommand::Snapshot).unwrap();
+    let mut messages: Vec<Message> = Vec::new();
+    while let Some(ev) = handle.events.recv().await {
+        if let AgentEvent::Snapshot { snapshot } = ev { messages = snapshot.messages; break; }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let a = messages.iter().rev().find(|m| m.role == Role::Assistant).expect("assistant message");
+    assert_eq!(
+        a.reasoning_blocks,
+        vec![
+            ReasoningBlock { text: "plan A".into(), opaque: Some("sigA".into()), provider: Some("anthropic".into()) },
+            ReasoningBlock { text: "plan B".into(), opaque: Some("sigB".into()), provider: Some("anthropic".into()) },
+            ReasoningBlock { text: String::new(), opaque: Some("redacted".into()), provider: Some("anthropic".into()) },
+        ],
+        "one ReasoningBlock finalized per signature, in order"
+    );
+    // The flat reasoning string still carries ALL the thinking text (OpenAI path back-compat).
+    assert_eq!(a.reasoning.as_deref(), Some("plan Aplan B"), "flat reasoning still accumulates all text");
+    assert_eq!(a.text, "done");
+}

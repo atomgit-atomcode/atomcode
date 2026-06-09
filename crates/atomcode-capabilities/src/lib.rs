@@ -14,7 +14,8 @@
 //! A downstream embedder pulls in only what it needs, so e.g. a build that only
 //! wants providers never compiles the (future) MCP/skills transitive deps:
 //!   - `provider` (default): real [`LlmProvider`](atomcode_kernel::provider::LlmProvider)
-//!     adapters — OpenAI-compatible (GLM / DeepSeek / …).
+//!     adapters — OpenAI-compatible (GLM / DeepSeek / …), Anthropic Messages (Claude),
+//!     and Ollama native (`/api/chat`).
 //!   - (future) `tools`, `mcp`, `skills`, `codeintel`.
 
 /// Reusable, provider-agnostic [`atomcode_kernel::hook::LifecycleHooks`]

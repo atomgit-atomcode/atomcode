@@ -640,6 +640,14 @@ impl RunningAgent {
             // adapter can echo the PRIOR turn's reasoning back next turn (thinking
             // models require it alongside tool calls). The kernel only stores it.
             let mut reasoning = String::new();
+            // SIGNED reasoning blocks (Anthropic-style opaque thinking). `reasoning`
+            // above stays the flat all-text accumulator (OpenAI path); these two track
+            // the per-block finalization driven by `StreamEvent::ReasoningSignature`:
+            // `reasoning_block_text` buffers the text since the last block boundary, and
+            // `reasoning_blocks` collects the finalized units in order. Both stay empty
+            // for a provider that never emits a signature event.
+            let mut reasoning_block_text = String::new();
+            let mut reasoning_blocks: Vec<crate::message::ReasoningBlock> = Vec::new();
             let mut pending_calls = Vec::new();
             let mut usage = TokenUsage::default();
             let mut truncated = false;
@@ -711,8 +719,24 @@ impl RunningAgent {
                         self.hooks.on_reasoning_delta(&mut t).await;
                         if !t.is_empty() {
                             reasoning.push_str(&t);
+                            // Also buffer for the CURRENT signed block (finalized on the
+                            // next ReasoningSignature). Uses the POST-hook bytes so a
+                            // stored block is transformed consistently with the flat
+                            // `reasoning` and the live channel.
+                            reasoning_block_text.push_str(&t);
                             self.rt.emit(AgentEvent::Reasoning(t));
                         }
+                    }
+                    // FINALIZE one signed reasoning block: the text since the last
+                    // boundary, paired with this opaque token + provider. A redacted
+                    // block (no preceding text) yields an empty-text block. Pure storage
+                    // — no live event (the text already streamed via Reasoning above).
+                    StreamEvent::ReasoningSignature { opaque, provider } => {
+                        reasoning_blocks.push(crate::message::ReasoningBlock {
+                            text: std::mem::take(&mut reasoning_block_text),
+                            opaque: Some(opaque),
+                            provider: Some(provider),
+                        });
                     }
                     StreamEvent::ToolCall(c) => pending_calls.push(c),
                     // Live DISPLAY of a tool call as it streams; the WHOLE call is still
@@ -785,6 +809,10 @@ impl RunningAgent {
             // a provider adapter echoes it back next turn. Set after construction so
             // the `on_model_response` hook can observe/transform it.
             assistant_msg.reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
+            // STORE the signed reasoning blocks (empty unless the provider emitted
+            // ReasoningSignature events). Set BEFORE on_model_response so the hook can
+            // observe/transform them, mirroring `reasoning` above.
+            assistant_msg.reasoning_blocks = reasoning_blocks;
             self.hooks.on_model_response(&mut assistant_msg).await;
             self.rt.emit(AgentEvent::Usage(assistant_msg.meta.clone().unwrap_or_default()));
             // Fix #5: the hook may have transformed the response (e.g. dropped a tool
