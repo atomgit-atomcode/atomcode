@@ -1550,6 +1550,52 @@ impl<W: Write + Send> RetainedRenderer<W> {
             row
         };
 
+        // Inner text width: window minus the 2 borders and the 1-col left
+        // pad every row carries. ALL variable-text rows (title, content,
+        // hint) clip to this so none can overflow the frame and shove the
+        // right border out of alignment.
+        let max_inner = (win_w as usize).saturating_sub(3);
+        let clip_cells = |text: &str, style: &CellStyle| -> Vec<Cell> {
+            let mut out = Vec::new();
+            let mut used = 0usize;
+            for ch in text.chars() {
+                if used >= max_inner {
+                    break;
+                }
+                // Normalise control chars exactly like `push_str_cells`
+                // so the cell model stays column-aligned with the
+                // terminal: drop CR/LF, expand TAB to spaces (a raw TAB
+                // would jump the terminal to its hardware tab stop and
+                // shove the right border out of alignment), skip
+                // zero-width combining marks.
+                match ch {
+                    '\n' | '\r' => continue,
+                    '\t' => {
+                        let n = crate::render::cell::SOFT_TAB_WIDTH.min(max_inner - used);
+                        for _ in 0..n {
+                            out.push(Cell { ch: ' ', style: style.clone(), width: 1 });
+                        }
+                        used += n;
+                    }
+                    _ => {
+                        let w = crate::width::cell_char_width(ch).unwrap_or(1);
+                        if w == 0 {
+                            continue;
+                        }
+                        if used + w > max_inner {
+                            break;
+                        }
+                        out.push(Cell { ch, style: style.clone(), width: w as u8 });
+                        used += w;
+                        for _ in 1..w {
+                            out.push(Cell::continuation());
+                        }
+                    }
+                }
+            }
+            out
+        };
+
         // Top border: ┌─────┐
         {
             let mut row = Vec::with_capacity(win_w as usize);
@@ -1561,13 +1607,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             cells.push(row);
         }
 
-        // Title row
+        // Title row (clipped so a long filename can't overflow the frame).
         {
             let safe_title = crate::sanitize::scrub_controls(title);
             let mut content = Vec::new();
             content.push(Cell::blank());
-            push_str_cells(&mut content, " ", &text_style);
-            push_str_cells(&mut content, &safe_title, &title_style);
+            content.extend(clip_cells(&format!(" {}", safe_title), &title_style));
             cells.push(build_row(content));
         }
 
@@ -1588,20 +1633,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let safe = crate::sanitize::scrub_controls(line);
             let mut content = Vec::new();
             content.push(Cell::blank());
-            // Truncate to inner width (win_w - 2 borders - 1 padding)
-            let max_inner = (win_w as usize).saturating_sub(3);
-            let mut used = 0usize;
-            for ch in safe.chars() {
-                let w = crate::width::cell_char_width(ch).unwrap_or(1);
-                if w > 0 && used + w > max_inner {
-                    break;
-                }
-                content.push(Cell { ch, style: text_style.clone(), width: w as u8 });
-                used += w;
-                for _ in 1..w {
-                    content.push(Cell::continuation());
-                }
-            }
+            content.extend(clip_cells(&safe, &text_style));
             cells.push(build_row(content));
         }
 
@@ -1610,12 +1642,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             cells.push(build_row(vec![Cell::blank()]));
         }
 
-        // Bottom hint row: "Line X/Y · Esc to close"
+        // Bottom hint row: "Line X/Y · Esc/q to close" (clipped to width).
         {
             let hint = format!("Line {}/{} · Esc/q to close", scroll + 1, total);
             let mut content = Vec::new();
             content.push(Cell::blank());
-            push_str_cells(&mut content, &hint, &hint_style);
+            content.extend(clip_cells(&hint, &hint_style));
             cells.push(build_row(content));
         }
 
@@ -8867,6 +8899,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn modal_overlay_expands_tabs_no_raw_tab_cells() {
+        // A file line with a leading tab (Go / Makefiles / tab-indented C)
+        // must render as spaces in the overlay cell grid. A raw '\t' cell
+        // would make the terminal jump to its hardware tab stop while the
+        // cell model only advances 1 col, shoving the right border (and
+        // everything after the tab) out of alignment.
+        let (r, _buf) = new_capturing(80, 24);
+        let lines = vec!["\tfn main() {}".to_string()];
+        let overlay = r.build_modal_overlay("t.rs", &lines, 0, 1, 60, 20);
+
+        // No cell anywhere in the overlay may carry a raw tab.
+        for row in &overlay.cells {
+            assert!(
+                row.iter().all(|c| c.ch != '\t'),
+                "overlay cell grid must not contain a raw '\\t'"
+            );
+        }
+
+        // cells: [0]=top border, [1]=title, [2]=separator, [3]=first
+        // content row = │ + leading pad blank + clip_cells(line) + … + │.
+        let content = &overlay.cells[3];
+        let tab_w = crate::render::cell::SOFT_TAB_WIDTH;
+        let tab_region: String = content[2..2 + tab_w].iter().map(|c| c.ch).collect();
+        assert_eq!(
+            tab_region,
+            " ".repeat(tab_w),
+            "leading tab should expand to {tab_w} spaces"
+        );
+        // The first real glyph follows the expanded tab.
+        assert_eq!(content[2 + tab_w].ch, 'f');
     }
 
     // --- width-aware truncation tests (Bug B) ---

@@ -855,6 +855,7 @@ async fn activity_tracker_middleware(
 /// Unknown values fall back to Ide.
 fn resolve_client_mode(header: &str) -> SessionMode {
     match header {
+        "channel" => SessionMode::Channel,
         "vscode" => SessionMode::Vscode,
         "webui" => SessionMode::Webui,
         "atomcode-air" => SessionMode::AtomcodeAir,
@@ -884,6 +885,17 @@ fn is_loopback_authority(authority: &str) -> bool {
 
     let host = authority.split(':').next().unwrap_or(authority);
     matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// 渠道客户端是否启用交互式审批。
+/// - webui token 模式(enforce_token)：始终交互（原行为）。
+/// - SessionMode::Channel：仅当 daemon 绑定回环时交互（免 token 故强制回环守卫）。
+fn channel_interactive_permission(
+    client_mode: SessionMode,
+    enforce_token: bool,
+    bind_host: &str,
+) -> bool {
+    enforce_token || (matches!(client_mode, SessionMode::Channel) && is_loopback_authority(bind_host))
 }
 pub(crate) fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -2139,7 +2151,8 @@ async fn chat_stream(
     let mcp_cache = state.mcp_cache.clone();
     let telemetry = state.telemetry.clone();
     let pending_permissions = state.pending_permissions.clone();
-    let webui_mode = state.enforce_token;
+    let interactive_permission =
+        channel_interactive_permission(client_mode, state.enforce_token, &state.bind_host);
 
     // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
     // Use the request's working_dir to detect repo_origin dynamically (not the
@@ -2167,7 +2180,7 @@ async fn chat_stream(
                 mcp_cache,
                 telemetry,
                 pending_permissions,
-                webui_mode,
+                interactive_permission,
             )
             .await
             {
@@ -2220,7 +2233,7 @@ async fn process_chat_request(
     mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     telemetry: Arc<Telemetry>,
     pending_permissions: permission_bridge::PermissionResponders,
-    webui_mode: bool,
+    interactive_permission: bool,
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
@@ -2456,13 +2469,13 @@ async fn process_chat_request(
     // `/chat/permission`, which is routed back here via `pending_permissions`.
     // The user-facing notification is the `TurnEvent::ApprovalRequested` event
     // forwarded as a `permission_request` SSE event below.
-    // Only webui mode has a human approver (the browser) reachable via
-    // POST /chat/permission, so only there do we use the blocking
+    // Only registered in interactive (webui/channel) mode has a human approver
+    // reachable via POST /chat/permission, so only there do we use the blocking
     // InteractivePermissionDecider + its register/keep-alive/unregister
     // plumbing. The standalone daemon (VSCode extension, no browser) has no
     // approver, so it must keep the prior BypassAll behaviour — otherwise any
     // tool requiring approval would block the turn forever.
-    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = if webui_mode {
+    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = if interactive_permission {
         let (perm_req_tx, perm_req_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
         let (perm_resp_tx, perm_resp_rx) =
             tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
@@ -2562,8 +2575,8 @@ async fn process_chat_request(
         });
         // Turn never ran — drop the permission registration and the request
         // receiver (the decider/perm_req_tx are owned by `turn_runner`, which is
-        // dropped here too). Only registered in webui mode.
-        if webui_mode {
+        // dropped here too). Only registered in interactive (webui/channel) mode.
+        if interactive_permission {
             pending_permissions.unregister(&perm_session_key);
         }
         return Ok(());
@@ -2849,8 +2862,8 @@ async fn process_chat_request(
     });
     // Turn finished (the forwarding loop above exits when turn_rx closes, i.e.
     // when the turn task and its turn_tx are dropped). Drop the permission
-    // registration so it doesn't leak. Only registered in webui mode.
-    if webui_mode {
+    // registration so it doesn't leak. Only registered in interactive (webui/channel) mode.
+    if interactive_permission {
         pending_permissions.unregister(&perm_session_key);
     }
     Ok(())
@@ -4447,5 +4460,25 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
             Some("172.16.2.14".into())
         );
         assert_eq!(extract_ip_eq("no ip here"), None);
+    }
+}
+
+#[cfg(test)]
+mod channel_mode_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_channel_header() {
+        assert_eq!(resolve_client_mode("channel"), SessionMode::Channel);
+        assert_eq!(resolve_client_mode("vscode"), SessionMode::Vscode);
+        assert_eq!(resolve_client_mode("nope"), SessionMode::Ide);
+    }
+
+    #[test]
+    fn channel_interactive_only_on_loopback() {
+        assert!(channel_interactive_permission(SessionMode::Ide, true, "0.0.0.0"));
+        assert!(channel_interactive_permission(SessionMode::Channel, false, "127.0.0.1"));
+        assert!(!channel_interactive_permission(SessionMode::Channel, false, "0.0.0.0"));
+        assert!(!channel_interactive_permission(SessionMode::Ide, false, "127.0.0.1"));
     }
 }
