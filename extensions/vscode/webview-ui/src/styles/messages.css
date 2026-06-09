@@ -59,6 +59,9 @@
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   color: var(--app-primary-foreground);
 }
 
@@ -273,15 +276,20 @@
 /* === Markdown Root === */
 .markdown-root {
   text-wrap: auto;
-  overflow-x: hidden;
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
+  white-space: normal;
+  overflow-wrap: break-word;
 }
 
-.markdown-root p { white-space: pre-wrap; margin-top: 0.1em; margin-bottom: 0.2em; }
+.markdown-root p { white-space: pre-wrap; margin-top: 0.1em; margin-bottom: 0.2em; overflow-wrap: anywhere; }
 .markdown-root ul, .markdown-root ol { padding-inline-start: 2em; margin-bottom: 0.4em; }
-.markdown-root li { margin-bottom: 2px; }
+.markdown-root li { margin-bottom: 2px; overflow-wrap: anywhere; }
 .markdown-root h1, .markdown-root h2, .markdown-root h3, .markdown-root h4 { margin-top: 0.8em; margin-bottom: 0.3em; font-weight: 600; }
 .markdown-root > :first-child { margin-top: 0; }
+.markdown-root > :last-child { margin-bottom: 0; }
 .markdown-root h1 { font-size: 1.3em; }
 .markdown-root h2 { font-size: 1.15em; }
 .markdown-root h3 { font-size: 1.05em; }
@@ -309,6 +317,36 @@
 }
 
 .markdown-root pre code { padding: 0; }
+
+/* GFM tables are often wider than the VS Code sidebar. Keep the message in
+   bounds and make the table itself horizontally scrollable. */
+.markdown-root table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  font-size: 0.95em;
+}
+
+.markdown-root th,
+.markdown-root td {
+  border: 1px solid var(--app-primary-border-color);
+  padding: 5px 10px;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.markdown-root th {
+  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
+  font-weight: 600;
+}
+
+.markdown-root tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--app-secondary-background), transparent 55%);
+}
 
 /* === Code Block === */
 .code-block-wrapper { position: relative; margin: 10px 0; }
