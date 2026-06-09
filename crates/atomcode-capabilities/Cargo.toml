@@ -50,6 +50,10 @@ base64 = { version = "0.22", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 dirs = { version = "6", optional = true }
 toml = { version = "0.8", optional = true }
+# `session` capability deps: chrono for epoch↔ISO + local-time date math (transcript
+# timestamps, current-date injection, recall date filtering). dirs (already optional)
+# resolves $ATOMCODE_HOME/sessions. Matches production's chrono pin.
+chrono = { version = "0.4", optional = true }
 
 [features]
 default = ["provider", "tools"]
@@ -91,6 +95,12 @@ mcp = [
     "dep:reqwest", "reqwest/blocking", "dep:url",
     "tokio/process", "tokio/io-util",
 ]
+# Session persistence + cross-session recall: two-tier on-disk store
+# ($ATOMCODE_HOME/sessions/<project_hash>/ — same scheme as production so old/new
+# coexist) — a per-turn compacted <id>.snapshot for RESUME + an append-only,
+# never-compacted <id>.jsonl transcript for RECALL — plus the SnapshotHook /
+# TranscriptHook / recall tool / current-date hook that drive it. Opt-in (NOT default).
+session = ["dep:dirs", "dep:chrono"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }

@@ -50,3 +50,12 @@ pub mod skills;
 /// `atomcode-core::mcp` with zero core dependency. Opt-in `mcp` feature. See [`mcp`].
 #[cfg(feature = "mcp")]
 pub mod mcp;
+
+/// Session persistence + cross-session recall: a two-tier on-disk store (a per-turn
+/// compacted `<id>.snapshot` for RESUME + an append-only, never-compacted `<id>.jsonl`
+/// transcript for RECALL), driven entirely by kernel seams ([`SnapshotHook`](session::SnapshotHook)
+/// / [`TranscriptHook`](session::TranscriptHook) on the `turn_complete` terminal hook, a
+/// `recall` tool, a current-date injection hook). Wall-clock lives only here (the kernel
+/// is clock-free). Opt-in `session` feature. See [`session`].
+#[cfg(feature = "session")]
+pub mod session;

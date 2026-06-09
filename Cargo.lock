@@ -219,6 +219,7 @@ dependencies = [
  "atomcode-kernel",
  "base64",
  "bytes",
+ "chrono",
  "dirs 6.0.0",
  "futures",
  "globset",
