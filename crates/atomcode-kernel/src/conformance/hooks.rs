@@ -4,14 +4,16 @@
 //! ambient authority and NO panic isolation (see [`crate::hook`]). The seam's contract
 //! for an individual hook is therefore: every method must COMPLETE, BOUNDED, WITHOUT
 //! PANICKING on representative inputs — the must-not-panic posture made executable. The
-//! return-shape obligations (`user_prompt_submit` → `Result`, `turn_end` → `Option`) are
-//! compile-enforced; this harness covers the runtime ones. It exercises all eleven
-//! methods once each with representative inputs, and additionally checks the one
-//! universal STATE obligation an individual hook can violate on its own:
-//! `on_model_response_preserves_meta` (the assistant `meta` is kernel-owned — a hook may
-//! transform text / tool_calls but must not fabricate or overwrite `meta`).
+//! return-shape obligations (`user_prompt_submit` → `Result`, `offer_continuation` → `Option`) are
+//! compile-enforced; this harness covers the runtime ones. It exercises all twelve
+//! methods once each with representative inputs (incl. `turn_complete`, the per-turn
+//! terminal twin of `session_end`), and additionally checks the one universal STATE
+//! obligation an individual hook can violate on its own: `on_model_response_preserves_meta`
+//! (the assistant `meta` is kernel-owned — a hook may transform text / tool_calls but
+//! must not fabricate or overwrite `meta`).
 
 use super::{run_void, ConformanceReport};
+use crate::event::StopReason;
 use crate::hook::{LifecycleHooks, TurnCtx};
 use crate::message::{Conversation, Message, MessageMeta};
 use crate::provider::ChatOptions;
@@ -30,7 +32,7 @@ fn sample_ctx() -> TurnCtx {
     TurnCtx { turn_id: 1, request_id: 1, round: 1, max_rounds: Some(3), ..Default::default() }
 }
 
-/// Run the lifecycle-hooks conformance suite — all eleven methods, bounded + panic-caught.
+/// Run the lifecycle-hooks conformance suite — all twelve methods, bounded + panic-caught.
 pub async fn check(hooks: Arc<dyn LifecycleHooks>) -> ConformanceReport {
     let mut r = ConformanceReport::new("LifecycleHooks", "<hooks>");
     let ctx = sample_ctx();
@@ -105,11 +107,20 @@ pub async fn check(hooks: Arc<dyn LifecycleHooks>) -> ConformanceReport {
         );
     }
 
-    // turn_end — Some(continue) | None(stop); must complete.
+    // offer_continuation — Some(continue) | None(stop); must complete.
     {
         let convo = sample_convo();
-        run_void(&mut r, "turn_end", async {
-            let _ = hooks.turn_end(&convo).await;
+        run_void(&mut r, "offer_continuation", async {
+            let _ = hooks.offer_continuation(&convo).await;
+        })
+        .await;
+    }
+
+    // turn_complete — pure observation of EVERY turn terminal; must complete.
+    {
+        let convo = sample_convo();
+        run_void(&mut r, "turn_complete", async {
+            hooks.turn_complete(&convo, &StopReason::Stopped, &ctx).await
         })
         .await;
     }

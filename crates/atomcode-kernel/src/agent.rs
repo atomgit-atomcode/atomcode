@@ -119,15 +119,15 @@ pub struct Agent {
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     hooks: Arc<dyn LifecycleHooks>,
     max_rounds: Option<u32>,
-    /// SAFETY FUSE (FAILURE PERCEPTION): max times a `turn_end` hook may CONTINUE a
+    /// SAFETY FUSE (FAILURE PERCEPTION): max times a `offer_continuation` hook may CONTINUE a
     /// single turn (inject a synthetic user message and loop again) before the
     /// kernel forcibly stops with `StopReason::MaxContinuations`. `None` = unlimited
     /// (opt-out). UNLIKE `max_rounds`/timeouts (perf/latency policy, default OFF),
-    /// this defaults ON (`Some(50)`): a `turn_end` that always continues is an
+    /// this defaults ON (`Some(50)`): a `offer_continuation` that always continues is an
     /// infinite kernel-driven loop with NO MODEL AGENCY to stop it — a bug, not a
     /// workload. The fuse guarantees that loop terminates. See
-    /// `AgentBuilder::max_turn_end_continuations`.
-    max_turn_end_continuations: Option<u32>,
+    /// `AgentBuilder::max_continuations`.
+    max_continuations: Option<u32>,
     /// When set, the session SEEDS its conversation from this snapshot's messages
     /// instead of `Conversation::new()` + persona (resume path).
     resume: Option<SessionSnapshot>,
@@ -211,7 +211,7 @@ impl Agent {
             hooks: self.hooks,
             rt: RequestCtx::new(ev_tx, self.request_timeout),
             max_rounds: self.max_rounds,
-            max_turn_end_continuations: self.max_turn_end_continuations,
+            max_continuations: self.max_continuations,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
             compaction: self.compaction,
@@ -289,9 +289,9 @@ struct RunningAgent {
     hooks: Arc<dyn LifecycleHooks>,
     rt: RequestCtx,
     max_rounds: Option<u32>,
-    /// SAFETY FUSE: bound on `turn_end` continuations per turn (see `Agent`). `None`
+    /// SAFETY FUSE: bound on `offer_continuation` continuations per turn (see `Agent`). `None`
     /// = unlimited. Default `Some(50)`.
-    max_turn_end_continuations: Option<u32>,
+    max_continuations: Option<u32>,
     resume: Option<SessionSnapshot>,
     max_tool_result_bytes: usize,
     compaction: Arc<dyn CompactionStrategy>,
@@ -593,31 +593,39 @@ impl RunningAgent {
         shutdown
     }
 
+    /// The single funnel for a turn's END: fire the `turn_complete` terminal hook
+    /// (so a persistence / telemetry hook observes EVERY terminal — normal stop,
+    /// fuse, provider error, timeout, cancel — with the conversation + reason + turn
+    /// ctx), THEN emit the `TurnComplete` event to the driver. EVERY terminal path in
+    /// `run_turn` returns through here, so the hook and the driver see EXACTLY the
+    /// same terminals. (A prompt blocked by `user_prompt_submit` is NOT a terminal of
+    /// a turn that ran — it keeps its bare event emit, no `turn_complete`.)
+    async fn finish_turn(&self, convo: &Conversation, reason: StopReason, ctx: &TurnCtx) {
+        self.hooks.turn_complete(convo, &reason, ctx).await;
+        self.rt.emit(AgentEvent::TurnComplete { reason });
+    }
+
     async fn run_turn(&self, convo: &mut Conversation, cancel: tokio_util::sync::CancellationToken) {
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
-        // Mint this turn's id ONCE — constant across all rounds (incl. turn_end
+        // Mint this turn's id ONCE — constant across all rounds (incl. offer_continuation
         // continuations) of this turn. Monotonic counter ⇒ deterministic.
         let turn_id = self.turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let mut round: u32 = 0;
-        // SAFETY FUSE counter (FAILURE PERCEPTION): how many times a `turn_end` hook
+        // SAFETY FUSE counter (FAILURE PERCEPTION): how many times a `offer_continuation` hook
         // has CONTINUED this turn (injected a synthetic user message and looped). A
-        // `turn_end` that always returns Some would otherwise loop forever when
+        // `offer_continuation` that always returns Some would otherwise loop forever when
         // `max_rounds` is None — the model never regains agency to stop. Bounded by
-        // `max_turn_end_continuations` (default Some(50)).
+        // `max_continuations` (default Some(50)).
         let mut continuations: u32 = 0;
         loop {
             round += 1;
-            // Hard cap (safety fuse): stop before exceeding max_rounds.
-            if let Some(max) = self.max_rounds {
-                if round > max {
-                    self.rt.emit(AgentEvent::Error { message: format!("max rounds ({max}) reached"), http_status: None, code: None });
-                    self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::MaxRounds });
-                    return;
-                }
-            }
-            // Mint this request's id (one per LLM call, unique across the session).
+            // Mint this request's id AND build this round's TurnCtx UP FRONT — before
+            // the max_rounds fuse — so EVERY terminal (incl. the fuse) has the ctx for
+            // `finish_turn`'s `turn_complete` hook. (On a max_rounds termination the
+            // minted request_id is simply unused; the counter stays monotonic and
+            // deterministic, so reproducible-eval stitching is unaffected.)
             let request_id = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
             let turn_ctx = TurnCtx {
                 session_id: self.session_id.clone(),
@@ -627,6 +635,14 @@ impl RunningAgent {
                 max_rounds: self.max_rounds,
                 cache_epoch: convo.cache_epoch,
             };
+            // Hard cap (safety fuse): stop before exceeding max_rounds.
+            if let Some(max) = self.max_rounds {
+                if round > max {
+                    self.rt.emit(AgentEvent::Error { message: format!("max rounds ({max}) reached"), http_status: None, code: None });
+                    self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx).await;
+                    return;
+                }
+            }
             let start = self.clock.now_millis();
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
@@ -663,7 +679,7 @@ impl RunningAgent {
                 Err(e) => {
                     self.hooks.on_error(&e.message).await;
                     self.rt.emit(AgentEvent::Error { message: e.message, http_status: e.http_status, code: e.code });
-                    self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::ProviderError });
+                    self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
                     return;
                 }
             };
@@ -707,14 +723,14 @@ impl RunningAgent {
                     biased;
                     _ = cancel.cancelled() => {
                         self.rt.emit(AgentEvent::Cancelled);
-                        self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::Cancelled });
+                        self.finish_turn(convo, StopReason::Cancelled, &turn_ctx).await;
                         return;
                     }
                     _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
                         let msg = "stream timeout".to_string();
                         self.hooks.on_error(&msg).await;
                         self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
-                        self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::Timeout });
+                        self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
                         return;
                     }
                     ev = stream.next() => match ev {
@@ -789,7 +805,7 @@ impl RunningAgent {
                     StreamEvent::Error(e) => {
                         self.hooks.on_error(&e.message).await;
                         self.rt.emit(AgentEvent::Error { message: e.message, http_status: e.http_status, code: e.code });
-                        self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::ProviderError });
+                        self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
                         return;
                     }
                     StreamEvent::Done { truncated: t } => {
@@ -855,20 +871,18 @@ impl RunningAgent {
             let pending_calls = assistant_msg.tool_calls.clone();
             convo.push(assistant_msg);
             if pending_calls.is_empty() {
-                if let Some(reminder) = self.hooks.turn_end(convo).await {
-                    // SAFETY FUSE: a `turn_end` that always continues is an infinite
+                if let Some(reminder) = self.hooks.offer_continuation(convo).await {
+                    // SAFETY FUSE: a `offer_continuation` that always continues is an infinite
                     // kernel-driven loop with no model agency to stop. Before
                     // continuing, check the cap. `None` = unlimited (opt-out).
-                    if let Some(max) = self.max_turn_end_continuations {
+                    if let Some(max) = self.max_continuations {
                         if continuations >= max {
                             self.rt.emit(AgentEvent::Error {
-                                message: format!("max turn_end continuations ({max}) reached"),
+                                message: format!("max offer_continuation continuations ({max}) reached"),
                                 http_status: None,
                                 code: None,
                             });
-                            self.rt.emit(AgentEvent::TurnComplete {
-                                reason: StopReason::MaxContinuations,
-                            });
+                            self.finish_turn(convo, StopReason::MaxContinuations, &turn_ctx).await;
                             return;
                         }
                     }
@@ -876,7 +890,7 @@ impl RunningAgent {
                     convo.push(Message::user(reminder));
                     continue;
                 }
-                self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::Stopped });
+                self.finish_turn(convo, StopReason::Stopped, &turn_ctx).await;
                 return;
             }
             // ── Per-batch dedup state (claim 21 / A1 gap ⑨) ──
@@ -898,7 +912,7 @@ impl RunningAgent {
                 if cancel.is_cancelled() {
                     convo.backfill_cancelled_tool_results();
                     self.rt.emit(AgentEvent::Cancelled);
-                    self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::Cancelled });
+                    self.finish_turn(convo, StopReason::Cancelled, &turn_ctx).await;
                     return;
                 }
 
@@ -1075,7 +1089,7 @@ pub struct AgentBuilder {
     /// an empty Vec yields an empty `HookChain` that behaves exactly like `NoopHooks`.
     hooks: Vec<Arc<dyn LifecycleHooks>>,
     max_rounds: Option<u32>,
-    max_turn_end_continuations: Option<u32>,
+    max_continuations: Option<u32>,
     resume: Option<SessionSnapshot>,
     max_tool_result_bytes: usize,
     compaction: Arc<dyn CompactionStrategy>,
@@ -1106,10 +1120,10 @@ impl Default for AgentBuilder {
             max_rounds: None,
             // SAFETY FUSE DEFAULTS ON (Some(50)). This DIFFERS from `max_rounds` /
             // timeouts (which default None/OFF because they are perf/latency POLICY):
-            // an unbounded `turn_end` continuation loop is a BUG class — the kernel
+            // an unbounded `offer_continuation` continuation loop is a BUG class — the kernel
             // keeps injecting synthetic user messages with NO model agency to stop —
             // so the neutral kernel guards it by default. `None` opts out (unlimited).
-            max_turn_end_continuations: Some(50),
+            max_continuations: Some(50),
             resume: None,
             // BOUNDED by default — a mounted tool's content cannot blow the
             // context window / OOM the host unless the embedder opts into `0`.
@@ -1164,7 +1178,7 @@ impl AgentBuilder {
         self
     }
     /// Append a lifecycle hook. Hooks COMPOSE: many may be registered and they fan
-    /// out per the `HookChain` contract (run in registration order; `turn_end`
+    /// out per the `HookChain` contract (run in registration order; `offer_continuation`
     /// first-`Some` wins; `user_prompt_submit` short-circuits on the first block).
     pub fn hook(mut self, h: Arc<dyn LifecycleHooks>) -> Self {
         self.hooks.push(h);
@@ -1181,7 +1195,7 @@ impl AgentBuilder {
         self.max_rounds = Some(n);
         self
     }
-    /// SAFETY FUSE: max times a `turn_end` hook may CONTINUE a single turn (inject a
+    /// SAFETY FUSE: max times a `offer_continuation` hook may CONTINUE a single turn (inject a
     /// synthetic user message and loop again) before the kernel forcibly stops the
     /// turn with `StopReason::MaxContinuations` (and an `AgentEvent::Error`). `n = 0`
     /// disallows any continuation. To OPT OUT entirely (unlimited), this is the one
@@ -1189,20 +1203,20 @@ impl AgentBuilder {
     /// the builder field by setting an effectively-infinite cap, or see below.
     ///
     /// WHY this defaults ON (`Some(50)`) while `max_rounds`/timeouts default OFF: a
-    /// `turn_end` that always returns `Some` is an INFINITE kernel-driven loop with
+    /// `offer_continuation` that always returns `Some` is an INFINITE kernel-driven loop with
     /// NO model agency to stop it (the kernel, not the model, drives each new round).
     /// That is a bug class, not a workload-tuning knob, so the neutral kernel guards
     /// it by default. `max_rounds`/timeouts are perf/latency policy → neutral OFF.
-    pub fn max_turn_end_continuations(mut self, n: u32) -> Self {
-        self.max_turn_end_continuations = Some(n);
+    pub fn max_continuations(mut self, n: u32) -> Self {
+        self.max_continuations = Some(n);
         self
     }
-    /// OPT OUT of the `turn_end` continuation fuse entirely (UNLIMITED). Only do this
+    /// OPT OUT of the `offer_continuation` continuation fuse entirely (UNLIMITED). Only do this
     /// if a hook is guaranteed to eventually return `None` — otherwise the turn can
-    /// loop forever. The default ([`Self::max_turn_end_continuations`] = `Some(50)`)
+    /// loop forever. The default ([`Self::max_continuations`] = `Some(50)`)
     /// is strongly preferred.
-    pub fn unbounded_turn_end_continuations(mut self) -> Self {
-        self.max_turn_end_continuations = None;
+    pub fn unbounded_continuations(mut self) -> Self {
+        self.max_continuations = None;
         self
     }
     /// Byte cap on a SINGLE tool result's `content`. This is the kernel's ONLY
@@ -1363,7 +1377,7 @@ impl AgentBuilder {
             // run-loop call sites are unchanged — they still call one hook object.
             hooks: Arc::new(HookChain::new(self.hooks)),
             max_rounds: self.max_rounds,
-            max_turn_end_continuations: self.max_turn_end_continuations,
+            max_continuations: self.max_continuations,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
             compaction: self.compaction,

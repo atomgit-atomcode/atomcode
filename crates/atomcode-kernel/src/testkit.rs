@@ -362,7 +362,7 @@ impl Default for ContinueOnceHook {
 
 #[async_trait]
 impl LifecycleHooks for ContinueOnceHook {
-    async fn turn_end(&self, _convo: &Conversation) -> Option<String> {
+    async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> {
         if self.used.swap(true, Ordering::Relaxed) {
             None
         } else {
@@ -460,7 +460,8 @@ impl LifecycleHooks for RecorderHook {
     async fn on_text_delta(&self, _delta: &mut String) { self.record("on_text_delta"); }
     async fn on_reasoning_delta(&self, _delta: &mut String) { self.record("on_reasoning_delta"); }
     async fn on_model_response(&self, _response: &mut Message) { self.record("on_model_response"); }
-    async fn turn_end(&self, _convo: &Conversation) -> Option<String> { self.record("turn_end"); None }
+    async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> { self.record("offer_continuation"); None }
+    async fn turn_complete(&self, _convo: &Conversation, _reason: &StopReason, _ctx: &TurnCtx) { self.record("turn_complete"); }
     async fn on_error(&self, _error: &str) { self.record("on_error"); }
     async fn session_end(&self, _convo: &Conversation) { self.record("session_end"); }
 }
@@ -696,9 +697,9 @@ impl LifecycleHooks for BlockingPromptHook {
     }
 }
 
-/// On `turn_end`, RECORDS it observed (into a shared log) and returns the
+/// On `offer_continuation`, RECORDS it observed (into a shared log) and returns the
 /// configured continuation (`Some(text)` or `None`). Three of these prove every
-/// hook OBSERVES turn_end while only the FIRST `Some` (in registration order)
+/// hook OBSERVES offer_continuation while only the FIRST `Some` (in registration order)
 /// provides the continuation.
 pub struct ObservingTurnEndHook {
     name: String,
@@ -714,7 +715,7 @@ impl ObservingTurnEndHook {
 
 #[async_trait]
 impl LifecycleHooks for ObservingTurnEndHook {
-    async fn turn_end(&self, _convo: &Conversation) -> Option<String> {
+    async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> {
         let mut log = self.log.lock().unwrap();
         log.push(self.name.clone());
         // Reply only the FIRST time this hook observes, so the loop terminates after

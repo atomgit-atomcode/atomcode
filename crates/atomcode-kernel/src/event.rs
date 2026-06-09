@@ -11,17 +11,17 @@ pub type RequestId = u64;
 ///
 /// `#[non_exhaustive]` so new terminal causes don't break downstream matches.
 /// `Stopped` is the NORMAL terminal (the model emitted no tool calls and the
-/// `turn_end` hook did not continue), and is the `Default` so `Outcome::default()`
+/// `offer_continuation` hook did not continue), and is the `Default` so `Outcome::default()`
 /// still compiles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum StopReason {
-    /// Normal completion: model produced no tool calls and `turn_end` returned None.
+    /// Normal completion: model produced no tool calls and `offer_continuation` returned None.
     #[default]
     Stopped,
     /// The `max_rounds` safety fuse tripped (too many LLM rounds this turn).
     MaxRounds,
-    /// The `max_turn_end_continuations` safety fuse tripped (a `turn_end` hook
+    /// The `max_continuations` safety fuse tripped (a `offer_continuation` hook
     /// kept injecting continuations with no model agency to stop — a runaway loop).
     MaxContinuations,
     /// The provider failed to open the stream OR errored mid-stream.

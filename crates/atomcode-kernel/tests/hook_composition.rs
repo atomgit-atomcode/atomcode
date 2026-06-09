@@ -144,16 +144,16 @@ async fn user_prompt_submit_short_circuits_on_first_block() {
     assert_eq!(calls.lock().unwrap().len(), 0, "a blocked prompt must NOT run a turn (no LLM call)");
 }
 
-/// `turn_end`: hook A → None, hook B → Some("continue-B"), hook C → Some("continue-C").
+/// `offer_continuation`: hook A → None, hook B → Some("continue-B"), hook C → Some("continue-C").
 /// Assert the loop continues with the FIRST Some ("continue-B"), C's Some is
-/// ignored this round, and A/B/C ALL observed turn_end (observation runs for all).
+/// ignored this round, and A/B/C ALL observed offer_continuation (observation runs for all).
 #[tokio::test]
 async fn turn_end_first_some_wins() {
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(EchoTool));
-    // Round 1: model stops (no tool calls) → turn_end fires → B injects "continue-B".
-    // Round 2: model stops again → turn_end fires; this time each hook has already
+    // Round 1: model stops (no tool calls) → offer_continuation fires → B injects "continue-B".
+    // Round 2: model stops again → offer_continuation fires; this time each hook has already
     // observed once so they return None → the turn completes.
     let provider = Arc::new(RecordingProvider::new(vec![
         vec![StreamEvent::TextDelta("first".into()), StreamEvent::Done { truncated: false }],
@@ -179,12 +179,12 @@ async fn turn_end_first_some_wins() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    // First round: all three observed turn_end (A, B, C in order).
+    // First round: all three observed offer_continuation (A, B, C in order).
     let fired = log.lock().unwrap().clone();
     assert_eq!(
         &fired[0..3],
         &["A".to_string(), "B".to_string(), "C".to_string()],
-        "all three hooks must OBSERVE turn_end in registration order; fired = {fired:?}"
+        "all three hooks must OBSERVE offer_continuation in registration order; fired = {fired:?}"
     );
 
     // The continuation that got injected is the FIRST Some = "continue-B", NOT C's.

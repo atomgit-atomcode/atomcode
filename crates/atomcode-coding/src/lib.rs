@@ -9,7 +9,7 @@
 //!    approval + persona + the verify discipline into a kernel [`Agent`](atomcode_kernel::agent::Agent).
 //! 2. **Persona** — [`persona::coding_persona`]: the coding system prompt.
 //! 3. **Discipline** — [`discipline::VerifyCadenceHook`]: an edit-then-verify
-//!    `turn_end` hook (the coding self-correction loop).
+//!    `offer_continuation` hook (the coding self-correction loop).
 //!
 //! ```no_run
 //! # async fn demo() -> Result<(), String> {

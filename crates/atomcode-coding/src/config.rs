@@ -24,7 +24,7 @@ pub struct CodingAgentConfig {
     /// Liveness: max wait for a driver approval response before it degrades to deny. Default 300s.
     pub request_timeout: Duration,
     /// Safety fuse: max edit-then-verify continuations per turn (kernel default is 50).
-    pub max_turn_end_continuations: u32,
+    pub max_continuations: u32,
 }
 
 impl CodingAgentConfig {
@@ -43,7 +43,7 @@ impl CodingAgentConfig {
             context_window: 128_000,
             stream_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(300),
-            max_turn_end_continuations: 50,
+            max_continuations: 50,
         }
     }
 }

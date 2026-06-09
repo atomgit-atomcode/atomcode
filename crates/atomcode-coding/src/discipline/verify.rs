@@ -2,8 +2,8 @@
 //!
 //! When the model stops (no more tool calls) having EDITED code but not run a successful
 //! build/check afterward, we inject a one-shot nudge to verify before finishing. This is
-//! the kernel `turn_end` seam: `Some(text)` continues the turn with a synthetic user
-//! message; `None` lets it stop. The kernel's `max_turn_end_continuations` fuse bounds
+//! the kernel `offer_continuation` seam: `Some(text)` continues the turn with a synthetic user
+//! message; `None` lets it stop. The kernel's `max_continuations` fuse bounds
 //! the loop, and our own state nudges ONCE per edit-batch so we never spin.
 //!
 //! Language-agnostic: detection keys only on tool NAMES (edit_file / write_file / bash),
@@ -20,7 +20,7 @@ const NUDGE: &str = "You made code edits but have not verified them. Run a fast 
 (`cargo check`, `tsc --noEmit`, or the equivalent for this project) to catch errors \
 before finishing. Do NOT start a long-running process (dev server, watcher, full build).";
 
-/// `turn_end` hook implementing the edit-then-verify cadence. Holds a small amount of
+/// `offer_continuation` hook implementing the edit-then-verify cadence. Holds a small amount of
 /// interior state so it nudges at most once per unverified edit.
 #[derive(Default)]
 pub struct VerifyCadenceHook {
@@ -85,7 +85,7 @@ fn unverified_edit_id(convo: &Conversation) -> Option<String> {
 
 #[async_trait]
 impl LifecycleHooks for VerifyCadenceHook {
-    async fn turn_end(&self, convo: &Conversation) -> Option<String> {
+    async fn offer_continuation(&self, convo: &Conversation) -> Option<String> {
         let edit_id = unverified_edit_id(convo)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.nudged_for.as_deref() == Some(edit_id.as_str()) {
@@ -113,7 +113,7 @@ mod tests {
         let mut convo = Conversation::new();
         convo.messages = msgs;
         let hook = VerifyCadenceHook::new();
-        let r = hook.turn_end(&convo).await;
+        let r = hook.offer_continuation(&convo).await;
         (hook, r)
     }
 
@@ -125,7 +125,7 @@ mod tests {
         // Calling again on the SAME conversation must NOT nudge twice.
         let mut convo = Conversation::new();
         convo.messages = msgs;
-        assert!(hook.turn_end(&convo).await.is_none(), "must not nudge twice for the same edit");
+        assert!(hook.offer_continuation(&convo).await.is_none(), "must not nudge twice for the same edit");
     }
 
     #[tokio::test]
@@ -180,11 +180,11 @@ mod tests {
         let hook = VerifyCadenceHook::new();
         let mut convo = Conversation::new();
         convo.messages = vec![assistant_call("e1", "edit_file"), tool_result("e1", false)];
-        assert!(hook.turn_end(&convo).await.is_some(), "first edit nudges");
-        assert!(hook.turn_end(&convo).await.is_none(), "same edit, no second nudge");
+        assert!(hook.offer_continuation(&convo).await.is_some(), "first edit nudges");
+        assert!(hook.offer_continuation(&convo).await.is_none(), "same edit, no second nudge");
         // A NEW edit (different id) appears → nudge again.
         convo.messages.push(assistant_call("e2", "edit_file"));
         convo.messages.push(tool_result("e2", false));
-        assert!(hook.turn_end(&convo).await.is_some(), "a fresh unverified edit re-triggers");
+        assert!(hook.offer_continuation(&convo).await.is_some(), "a fresh unverified edit re-triggers");
     }
 }

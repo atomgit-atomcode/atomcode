@@ -45,7 +45,7 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
         .working_dir(cfg.working_dir.clone())
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout)
-        .max_turn_end_continuations(cfg.max_turn_end_continuations)
+        .max_continuations(cfg.max_continuations)
         .build()
 }
 

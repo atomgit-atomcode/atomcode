@@ -4,13 +4,13 @@
 //! Three coupled defects are closed:
 //!   (1) `AgentEvent::TurnComplete` now carries a `StopReason`, so a driver can
 //!       tell WHY a turn ended (normal vs max-rounds / provider-error / timeout /
-//!       cancel / prompt-rejected / runaway turn_end continuation).
+//!       cancel / prompt-rejected / runaway offer_continuation continuation).
 //!   (2) `run_to_completion`'s `Outcome` now carries `stop: StopReason` and
 //!       `error: Option<String>`; it no longer swallows `AgentEvent::Error`. A
 //!       failed run yields `Outcome { stop: ProviderError/.., error: Some(..) }` —
 //!       NOT an empty success (the SWE-bench-grader-facing fix).
-//!   (3) The `turn_end` continuation loop is now BOUNDED by a default-ON fuse
-//!       (`max_turn_end_continuations = Some(50)`); a `turn_end` hook that always
+//!   (3) The `offer_continuation` continuation loop is now BOUNDED by a default-ON fuse
+//!       (`max_continuations = Some(50)`); a `offer_continuation` hook that always
 //!       continues is stopped with `StopReason::MaxContinuations` instead of
 //!       spinning forever with no model agency to stop it.
 
@@ -171,10 +171,10 @@ async fn max_rounds_stop_reason() {
     );
 }
 
-// ── The turn_end continuation fuse stops a runaway loop ───────────────────────
+// ── The offer_continuation continuation fuse stops a runaway loop ───────────────────────
 //
-// A `turn_end` hook that ALWAYS returns Some("more"), with the DEFAULT fuse
-// (max_turn_end_continuations = Some(50)) and max_rounds = None: WITHOUT the fuse
+// A `offer_continuation` hook that ALWAYS returns Some("more"), with the DEFAULT fuse
+// (max_continuations = Some(50)) and max_rounds = None: WITHOUT the fuse
 // this loops forever (the model never gets agency to stop). WITH it, the turn ends
 // after the cap with StopReason::MaxContinuations and an Error is emitted. The
 // outer guard proves it does not hang.
@@ -182,7 +182,7 @@ struct AlwaysContinueHook;
 
 #[async_trait]
 impl LifecycleHooks for AlwaysContinueHook {
-    async fn turn_end(&self, _convo: &Conversation) -> Option<String> {
+    async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> {
         Some("more".to_string())
     }
 }
@@ -221,12 +221,12 @@ async fn turn_end_continuation_fuse_stops_runaway() {
         (reason, error_msg)
     })
     .await
-    .expect("the turn_end fuse must STOP the runaway loop, not hang forever");
+    .expect("the offer_continuation fuse must STOP the runaway loop, not hang forever");
 
     assert_eq!(
         reason,
         Some(StopReason::MaxContinuations),
-        "the runaway turn_end loop must end with StopReason::MaxContinuations"
+        "the runaway offer_continuation loop must end with StopReason::MaxContinuations"
     );
     assert!(
         error_msg.as_deref().is_some_and(|m| m.contains("continuation")),
@@ -244,7 +244,7 @@ async fn turn_end_continuation_fuse_is_configurable() {
         .provider(provider)
         .tools(reg.mount(&[] as &[&str]))
         .hooks(Arc::new(AlwaysContinueHook))
-        .max_turn_end_continuations(3)
+        .max_continuations(3)
         .build()
         .spawn();
     handle.commands.send(send("go")).unwrap();

@@ -123,7 +123,7 @@ fn events_and_commands_are_wire_serializable() {
     let _back2: AgentCommand = serde_json::from_str(&s2).expect("AgentCommand must deserialize");
 }
 
-// CLAIM 6: a turn_end LifecycleHook injects a follow-up that CONTINUES the loop
+// CLAIM 6: a offer_continuation LifecycleHook injects a follow-up that CONTINUES the loop
 // (turn-level injection), and the finer TurnStarted event is observable.
 #[tokio::test]
 async fn lifecycle_hook_injects_and_continues_loop() {
@@ -159,7 +159,7 @@ async fn lifecycle_hook_injects_and_continues_loop() {
         }
     }
     assert!(turn_started, "TurnStarted must be observable (perception granularity)");
-    assert!(echoed, "turn_end injection must continue the loop into another step (the echo step)");
+    assert!(echoed, "offer_continuation injection must continue the loop into another step (the echo step)");
     assert!(completed, "loop must complete after the hook stops injecting");
 }
 
@@ -206,7 +206,7 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
     for point in [
         "session_start", "user_prompt_submit", "turn_start", "pre_request",
         "on_request", "on_text_delta", "on_reasoning_delta", "on_model_response",
-        "on_error", "turn_end", "session_end",
+        "on_error", "offer_continuation", "turn_complete", "session_end",
     ] {
         assert!(fired.contains(&point.to_string()), "hook '{point}' was never called; fired = {fired:?}");
     }

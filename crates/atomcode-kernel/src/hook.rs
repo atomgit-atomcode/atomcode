@@ -1,3 +1,4 @@
+use crate::event::StopReason;
 use crate::message::{Conversation, Message};
 use crate::provider::ChatOptions;
 use crate::tool::ToolDef;
@@ -20,7 +21,7 @@ pub struct TurnCtx {
     /// NEVER mints this — it only forwards what `AgentBuilder::session_id` was given.
     pub session_id: Option<Arc<str>>,
     /// Kernel-minted monotonic id of the current turn (one user message → one turn),
-    /// 1-based within the session. Stays constant across all rounds (incl. `turn_end`
+    /// 1-based within the session. Stays constant across all rounds (incl. `offer_continuation`
     /// continuations) of the same turn.
     pub turn_id: u64,
     /// Kernel-minted monotonic id of THIS LLM request, 1-based and unique across the
@@ -140,9 +141,26 @@ pub trait LifecycleHooks: Send + Sync {
 
     /// The model produced no tool calls (wants to stop). Return `Some(text)` to
     /// inject a follow-up USER message and CONTINUE; `None` to complete. Read-only.
-    async fn turn_end(&self, _convo: &Conversation) -> Option<String> {
+    async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> {
         None
     }
+
+    /// A turn has TERMINATED — fired EXACTLY ONCE per turn on EVERY terminal path
+    /// (normal stop, `max_rounds` / `max_continuations` fuse, provider
+    /// error, stream timeout, cancel), AFTER any `offer_continuation` continuations are
+    /// exhausted. The TERMINAL TWIN of [`session_end`](Self::session_end) (which
+    /// fires once per SESSION): the clean seam for per-turn persistence / telemetry
+    /// that must run HOWEVER the turn ended — not just the success path. Carries the
+    /// read-only `convo` (as it stands at the terminal), the `reason`, and the
+    /// turn's `ctx` (`turn_id` / `session_id` / `round`).
+    ///
+    /// Distinct from [`offer_continuation`](Self::offer_continuation), which fires only on the model-stop
+    /// path to OFFER a continuation; `turn_complete` is the unconditional terminal.
+    /// Distinct from [`on_error`](Self::on_error), which observes a MID-turn tool /
+    /// provider error (the turn may still continue). A prompt blocked by
+    /// `user_prompt_submit` does NOT fire this — no turn ran (no `turn_start` /
+    /// `TurnStarted` either). PURE OBSERVATION — cannot alter flow.
+    async fn turn_complete(&self, _convo: &Conversation, _reason: &StopReason, _ctx: &TurnCtx) {}
 
     /// Observe an error: a tool returned `is_error`, or an unknown/unmounted tool
     /// was called. PURE OBSERVATION — cannot alter flow. (Provider/stream errors
@@ -188,14 +206,15 @@ impl LifecycleHooks for NoopHooks {}
 ///   `Err(reason)` (a block) — the remaining hooks are NOT run and the `Err`
 ///   propagates. Text mutations from earlier hooks chain into later ones until/
 ///   unless one blocks.
-/// - `turn_end`: run ALL hooks in registration order so each OBSERVES the turn end;
+/// - `offer_continuation`: run ALL hooks in registration order so each OBSERVES the turn end;
 ///   the FIRST hook (in order) that returns `Some(text)` provides the continuation.
 ///   Later `Some(_)` values are IGNORED this round (the loop injects exactly one
 ///   follow-up). Returns that first `Some`, else `None`.
-/// - `on_error`, `session_end`: run ALL in registration order (pure observation).
+/// - `turn_complete`, `on_error`, `session_end`: run ALL in registration order (pure
+///   observation).
 ///
 /// An EMPTY `HookChain` behaves exactly like `NoopHooks`: every method is a no-op,
-/// `user_prompt_submit` → `Ok(())`, `turn_end` → `None`.
+/// `user_prompt_submit` → `Ok(())`, `offer_continuation` → `None`.
 pub struct HookChain {
     hooks: Vec<Arc<dyn LifecycleHooks>>,
 }
@@ -265,16 +284,22 @@ impl LifecycleHooks for HookChain {
         }
     }
 
-    async fn turn_end(&self, convo: &Conversation) -> Option<String> {
+    async fn offer_continuation(&self, convo: &Conversation) -> Option<String> {
         // ALL hooks observe (in order); the FIRST `Some` wins, later `Some` ignored.
         let mut continuation = None;
         for h in &self.hooks {
-            let r = h.turn_end(convo).await;
+            let r = h.offer_continuation(convo).await;
             if continuation.is_none() {
                 continuation = r;
             }
         }
         continuation
+    }
+
+    async fn turn_complete(&self, convo: &Conversation, reason: &StopReason, ctx: &TurnCtx) {
+        for h in &self.hooks {
+            h.turn_complete(convo, reason, ctx).await;
+        }
     }
 
     async fn on_error(&self, error: &str) {
@@ -301,6 +326,6 @@ mod tests {
         assert!(chain.user_prompt_submit(&mut text).await.is_ok(), "empty chain must not block");
         assert_eq!(text, "hi", "empty chain must not mutate the prompt");
         let convo = Conversation::new();
-        assert_eq!(chain.turn_end(&convo).await, None, "empty chain turn_end must be None");
+        assert_eq!(chain.offer_continuation(&convo).await, None, "empty chain offer_continuation must be None");
     }
 }

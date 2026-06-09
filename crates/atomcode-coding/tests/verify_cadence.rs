@@ -22,7 +22,7 @@ async fn unverified_edit_drives_a_followup_round() {
             }),
             StreamEvent::Done { truncated: false },
         ],
-        // Round 2: try to STOP (text, no bash) → turn_end should nudge → round 3.
+        // Round 2: try to STOP (text, no bash) → offer_continuation should nudge → round 3.
         vec![StreamEvent::TextDelta("stopping now".into()), StreamEvent::Done { truncated: false }],
         // Round 3: reached ONLY if the nudge fired. A distinctive marker proves it.
         vec![StreamEvent::TextDelta("VERIFIED-MARKER".into()), StreamEvent::Done { truncated: false }],
