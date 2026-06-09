@@ -358,3 +358,44 @@ async fn resume_heals_orphan_tool_result_snapshot() {
         .expect("the well-formed c_good result must survive");
     assert_eq!(good.text, "good output");
 }
+
+// CLAIM 18b addendum: the unsupported-version fallback is a REAL fresh start — the
+// persona is seeded exactly as on a fresh session. `resumed` computes false for this
+// path (seeding hooks fire in fresh mode), so the kernel must seed the persona too;
+// otherwise the session would run with hook injections but NO system identity.
+#[tokio::test]
+async fn unsupported_snapshot_fallback_seeds_persona_like_fresh() {
+    let bogus = SessionSnapshot { version: 9999, messages: vec![Message::user("ghost")], cache_epoch: 0 };
+
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::TextDelta("ok".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+    let calls = provider.calls();
+
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo"]))
+        .persona(PERSONA)
+        .resume(bogus)
+        .build()
+        .spawn();
+
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    while let Some(ev) = handle.events.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            break;
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let calls = calls.lock().unwrap();
+    let first = &calls[0].0;
+    assert_eq!(first.len(), 2, "persona + the new user message");
+    assert_eq!(first[0].role, Role::System);
+    assert_eq!(first[0].text, PERSONA, "fallback must seed the persona like a fresh start");
+    assert!(!first.iter().any(|m| m.text == "ghost"), "ghost history must not leak");
+}

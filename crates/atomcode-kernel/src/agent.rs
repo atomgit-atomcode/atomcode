@@ -431,7 +431,15 @@ impl RunningAgent {
                     "unsupported snapshot version {} (kernel supports {}); starting empty",
                     snap.version, SNAPSHOT_VERSION
                 )));
-                Conversation::new()
+                // Degrade to a REAL fresh start — persona seeded exactly like the
+                // None branch below. `resumed` computes false for this path, so
+                // seeding hooks treat it as fresh; the kernel must agree, or the
+                // session would run with hook injections but NO persona.
+                let mut c = Conversation::new();
+                if !self.persona.is_empty() {
+                    c.push(Message::system(self.persona.clone()));
+                }
+                c
             }
             // FRESH: new conversation + persona injection point. Empty persona by
             // default → neutral kernel.
