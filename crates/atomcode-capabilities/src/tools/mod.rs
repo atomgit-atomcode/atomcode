@@ -30,21 +30,40 @@ use std::sync::Arc;
 
 pub mod approval;
 pub mod bash;
+pub mod cd;
 pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod list;
+pub mod open_file;
+pub mod parallel_edit;
 pub mod read;
+pub mod search_replace;
+pub mod todo;
 pub mod write;
+/// Network tools (`web_fetch` / `web_search`). Opt-in `web` feature (HTTP stack).
+#[cfg(feature = "web")]
+pub mod web_fetch;
+#[cfg(feature = "web")]
+pub mod web_search;
 
 pub use approval::{ApprovalMiddleware, InMemoryPermissionStore, PermissionDecision, PermissionStore};
 pub use bash::BashTool;
+pub use cd::ChangeDirTool;
 pub use edit::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list::ListDirTool;
+pub use open_file::OpenFileTool;
+pub use parallel_edit::ParallelEditTool;
 pub use read::ReadFileTool;
+pub use search_replace::SearchReplaceTool;
+pub use todo::TodoTool;
 pub use write::WriteFileTool;
+#[cfg(feature = "web")]
+pub use web_fetch::WebFetchTool;
+#[cfg(feature = "web")]
+pub use web_search::WebSearchTool;
 
 /// Names of the full neutral coding toolset — pass to
 /// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).

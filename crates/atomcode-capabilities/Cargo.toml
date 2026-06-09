@@ -48,6 +48,10 @@ provider = ["dep:reqwest", "dep:bytes", "dep:async-stream"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
 tools = ["dep:ignore", "dep:regex", "dep:globset", "tokio/fs", "tokio/process", "tokio/io-util"]
+# Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
+# (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
+# that wants no network egress skips it.
+web = ["tools", "dep:reqwest", "dep:url", "tokio/net"]
 # Code-intelligence tools (tree-sitter symbol extraction): list_symbols / read_symbol.
 # Opt-in (NOT default) — pulls 12 tree-sitter grammar crates (heavy C compilation).
 codeintel = [
