@@ -165,6 +165,13 @@ pub struct Agent {
     /// multi-session/process-global-cwd hazard AND letting a CHILD agent (subagent)
     /// be dir-scoped independently of its parent. See `AgentBuilder::working_dir`.
     working_dir: Option<std::path::PathBuf>,
+    /// SEAM 1b (shared_cwd): a SHARED, MUTABLE working dir. When set it WINS over
+    /// `working_dir`, and the agent re-snapshots it into `ToolContext::working_dir` every
+    /// tool call — so a cooperating tool (e.g. `change_dir`) that holds the SAME `Arc`
+    /// can persist a directory change across calls. `None` (default) = the immutable
+    /// `working_dir` pin (or process cwd). The kernel still never chdir's the process.
+    /// See `AgentBuilder::working_dir_shared`.
+    shared_cwd: Option<std::sync::Arc<std::sync::RwLock<std::path::PathBuf>>>,
     /// SEAM 2 (cancel_token): an EXTERNAL cancel source this agent's per-turn tokens
     /// are derived FROM (as `child_token()`s). `None` (default) = each turn mints a
     /// fresh independent `CancellationToken` (the prior behavior). `Some(parent)` =
@@ -211,7 +218,13 @@ impl Agent {
             compact_threshold: self.compact_threshold,
             stream_timeout: self.stream_timeout,
             chat_options: self.chat_options,
-            working_dir: self.working_dir,
+            // Resolve the effective working dir into a single shared handle: an explicit
+            // `shared_cwd` wins; else wrap the immutable `working_dir` pin so the snapshot
+            // path is uniform (a fresh Arc nothing else holds → still effectively pinned).
+            cwd: self
+                .shared_cwd
+                .clone()
+                .or_else(|| self.working_dir.clone().map(|d| std::sync::Arc::new(std::sync::RwLock::new(d)))),
             cancel_token: self.cancel_token,
             session_id: self.session_id,
             turn_counter: AtomicU64::new(0),
@@ -288,9 +301,11 @@ struct RunningAgent {
     /// NEUTRAL per-call provider request knobs forwarded to `chat_stream` every
     /// round (see `Agent::chat_options`). Default = a neutral request.
     chat_options: ChatOptions,
-    /// SEAM 1: per-agent working dir (see `Agent::working_dir`). `None` = read the
-    /// process-global `current_dir()` each turn.
-    working_dir: Option<std::path::PathBuf>,
+    /// SEAM 1/1b: the effective working dir as a shared handle (resolved from
+    /// `Agent::shared_cwd` ⊳ `Agent::working_dir` at spawn). `None` = read the
+    /// process-global `current_dir()` each turn. Re-snapshot into `ToolContext` per call
+    /// so a tool holding the same `Arc` (`change_dir`) can persist a change.
+    cwd: Option<std::sync::Arc<std::sync::RwLock<std::path::PathBuf>>>,
     /// SEAM 2: external cancel source the per-turn tokens derive from (see
     /// `Agent::cancel_token`). `None` = fresh independent token per turn.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
@@ -959,15 +974,19 @@ impl RunningAgent {
                         } else {
                             executed = true;
                             self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
-                            // SEAM 1: a per-agent `working_dir` (when set) PINS the
-                            // tool context's dir instead of reading the process-global
-                            // `current_dir()` — fixing the multi-session cwd hazard and
-                            // letting a subagent be dir-scoped. Unset = prior behavior.
+                            // SEAM 1/1b: a per-agent working dir (when set) PINS the tool
+                            // context's dir instead of reading the process-global
+                            // `current_dir()`. SNAPSHOT the shared `cwd` here so a tool
+                            // (e.g. change_dir) that mutated it on a prior call is
+                            // reflected this call. Unset = prior process-cwd behavior.
                             let ctx = ToolContext {
-                                working_dir: self
-                                    .working_dir
-                                    .clone()
-                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+                                working_dir: match &self.cwd {
+                                    Some(c) => c
+                                        .read()
+                                        .map(|g| g.clone())
+                                        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()),
+                                    None => std::env::current_dir().unwrap_or_default(),
+                                },
                                 cancel: cancel.clone(),
                                 // Live progress seam: a tool MAY report mid-execution status,
                                 // tagged with THIS call's id, straight to the driver (e.g. a
@@ -1066,6 +1085,8 @@ pub struct AgentBuilder {
     chat_options: ChatOptions,
     /// SEAM 1: optional per-agent working dir (see `Agent::working_dir`).
     working_dir: Option<std::path::PathBuf>,
+    /// SEAM 1b: optional SHARED mutable working dir (see `Agent::shared_cwd`).
+    shared_cwd: Option<std::sync::Arc<std::sync::RwLock<std::path::PathBuf>>>,
     /// SEAM 2: optional external cancel source (see `Agent::cancel_token`).
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     /// Optional injected session identity for observability (see `Agent::session_id`).
@@ -1110,6 +1131,7 @@ impl Default for AgentBuilder {
             // current behavior (process-global cwd per turn; a fresh independent
             // per-turn cancel token). An embedder opts in via the builder methods.
             working_dir: None,
+            shared_cwd: None,
             cancel_token: None,
             session_id: None,
             // NEUTRAL default: the real monotonic clock. An eval/replay swaps in a
@@ -1283,6 +1305,19 @@ impl AgentBuilder {
         self.working_dir = Some(dir);
         self
     }
+    /// SEAM 1b: PIN this agent's tool working dir to a SHARED, MUTABLE handle. Like
+    /// [`working_dir`](Self::working_dir), but the agent re-snapshots `cwd` into every
+    /// `ToolContext` — so a cooperating tool that holds the SAME `Arc` (e.g. an L1
+    /// `change_dir`) can PERSIST a directory change across tool calls. Pass the same
+    /// `Arc` to both this builder and the tool. Wins over `working_dir` if both are set.
+    /// The kernel still never chdir's the process; it only reports the snapshot value.
+    pub fn working_dir_shared(
+        mut self,
+        cwd: std::sync::Arc<std::sync::RwLock<std::path::PathBuf>>,
+    ) -> Self {
+        self.shared_cwd = Some(cwd);
+        self
+    }
     /// SEAM 2: DERIVE this agent's per-turn cancellation tokens from an external
     /// cancel source `t`. Each turn's token becomes a `t.child_token()`, so when `t`
     /// is cancelled every in-flight turn (and, via `ToolContext::cancel`, every
@@ -1337,6 +1372,7 @@ impl AgentBuilder {
             request_timeout: self.request_timeout,
             chat_options: self.chat_options,
             working_dir: self.working_dir,
+            shared_cwd: self.shared_cwd,
             cancel_token: self.cancel_token,
             session_id: self.session_id,
             clock: self.clock,

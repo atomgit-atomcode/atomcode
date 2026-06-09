@@ -801,3 +801,84 @@ async fn signed_reasoning_blocks_are_finalized_per_signature_in_order() {
     assert_eq!(a.reasoning.as_deref(), Some("plan Aplan B"), "flat reasoning still accumulates all text");
     assert_eq!(a.text, "done");
 }
+
+// SEAM 1b (shared cwd): a tool holding the SAME `Arc<RwLock<PathBuf>>` as
+// `AgentBuilder::working_dir_shared` can PERSIST a working-dir change — the kernel
+// re-snapshots the shared cwd into each per-call `ToolContext`, so a LATER tool call in
+// the same round sees the directory the EARLIER call switched to.
+#[tokio::test]
+async fn shared_cwd_change_is_reflected_in_a_later_tool_call() {
+    use async_trait::async_trait;
+    use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
+    use std::path::PathBuf;
+    use std::sync::{Mutex, RwLock};
+
+    // Writes a fixed target into the shared cwd handle.
+    struct SetCwd {
+        cwd: Arc<RwLock<PathBuf>>,
+        target: PathBuf,
+    }
+    #[async_trait]
+    impl Tool for SetCwd {
+        fn name(&self) -> &str { "set_cwd" }
+        fn description(&self) -> &str { "test: set the shared cwd" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type":"object"}) }
+        async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+            *self.cwd.write().unwrap() = self.target.clone();
+            ToolResult { call_id: String::new(), content: "set".into(), is_error: false }
+        }
+    }
+    // Records what working_dir the kernel handed it.
+    struct GetCwd {
+        seen: Arc<Mutex<Option<PathBuf>>>,
+    }
+    #[async_trait]
+    impl Tool for GetCwd {
+        fn name(&self) -> &str { "get_cwd" }
+        fn description(&self) -> &str { "test: report ctx.working_dir" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type":"object"}) }
+        async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
+            *self.seen.lock().unwrap() = Some(ctx.working_dir.clone());
+            ToolResult { call_id: String::new(), content: "got".into(), is_error: false }
+        }
+    }
+
+    let start = std::env::temp_dir();
+    let target = std::env::temp_dir().join("atomcode-cwd-seam-test");
+    let _ = std::fs::create_dir_all(&target);
+    let shared = Arc::new(RwLock::new(start.clone()));
+    let seen = Arc::new(Mutex::new(None));
+
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(SetCwd { cwd: shared.clone(), target: target.clone() }));
+    reg.register(Arc::new(GetCwd { seen: seen.clone() }));
+
+    // Round 1: assistant calls set_cwd THEN get_cwd. Round 2: final answer (ends turn).
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "set_cwd".into(), arguments: "{}".into() }),
+            StreamEvent::ToolCall(ToolCall { id: "c2".into(), name: "get_cwd".into(), arguments: "{}".into() }),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+    ]));
+
+    let outcome = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["set_cwd", "get_cwd"]))
+        .working_dir_shared(shared.clone())
+        .max_rounds(5)
+        .build()
+        .run_to_completion("go", AutoRespond::AllowAll)
+        .await;
+
+    assert!(outcome.error.is_none(), "no error: {:?}", outcome.error);
+    // get_cwd ran AFTER set_cwd in the same round; its ToolContext must show the new dir.
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        Some(target.clone()),
+        "the later tool call saw the cwd the earlier call set (kernel re-snapshots shared cwd)"
+    );
+    // And the shared handle holds the new dir.
+    assert_eq!(*shared.read().unwrap(), target);
+}
