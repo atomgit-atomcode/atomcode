@@ -721,7 +721,10 @@ impl RunningAgent {
                     StreamEvent::ToolCallDelta { index, id, name, arguments } => {
                         self.rt.emit(AgentEvent::ToolCallStreaming { index, id, name, arguments });
                     }
-                    StreamEvent::Usage(u) => usage = u,
+                    // Fold MULTIPLE Usage events in one round field-wise (max), so a
+                    // provider that SPLITS usage across events (input early, cumulative
+                    // output later) does not lose the earlier fields to last-wins.
+                    StreamEvent::Usage(u) => usage.merge_max(u),
                     StreamEvent::ResponseId(id) => response_id = Some(id),
                     // A mid-stream error CLEANLY FAILS the turn: surface it and end —
                     // do NOT fall through to a fake empty-success completion.
