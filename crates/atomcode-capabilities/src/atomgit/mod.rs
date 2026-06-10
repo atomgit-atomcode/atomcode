@@ -22,7 +22,7 @@ pub mod models;
 pub mod pr;
 pub mod repo;
 
-// pub use client::AtomgitClient; // enabled in Task 2
+pub use client::AtomgitClient;
 
 use std::sync::Arc;
 
