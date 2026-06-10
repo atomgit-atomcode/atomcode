@@ -13,7 +13,7 @@ use serde_json::json;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult, ToolRegistry};
 
 use super::{err, ok};
-use crate::atomgit::models::Repo;
+use crate::atomgit::models::{Comment, CreatedComment, Issue, PullRequest, Repo};
 use crate::atomgit::AtomgitClient;
 
 /// Pull `action` out of the raw args without failing the whole parse — used by
@@ -186,9 +186,229 @@ async fn clone_repo(
     }
 }
 
-// register fn + pr/issue tools are added in later tasks.
 pub fn register_atomgit_tools(reg: &mut ToolRegistry, client: Arc<AtomgitClient>) {
     reg.register(Arc::new(AtomgitRepoTool::new(client.clone())));
+    reg.register(Arc::new(AtomgitPrTool::new(client.clone())));
+}
+
+// ─────────────────────────── atomgit_pr ───────────────────────────
+
+#[derive(Deserialize)]
+struct PrArgs {
+    action: String,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    head: Option<String>,
+    #[serde(default)]
+    comment_id: Option<u64>,
+    #[serde(default)]
+    parent_id: Option<u64>,
+    #[serde(default)]
+    issues: Vec<u64>,
+    #[serde(default = "default_state")]
+    state: String,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+fn default_state() -> String {
+    "open".to_string()
+}
+
+/// `atomgit_pr` tool.
+pub struct AtomgitPrTool {
+    client: Arc<AtomgitClient>,
+}
+impl AtomgitPrTool {
+    pub fn new(client: Arc<AtomgitClient>) -> Self {
+        Self { client }
+    }
+}
+
+fn render_pr(p: &PullRequest) -> String {
+    format!(
+        "#{} [{}] {}\n  {} ← {}\n  {}",
+        p.number, p.state, p.title, p.base.ref_, p.head.ref_, p.html_url
+    )
+}
+fn render_comments(cs: &[Comment]) -> String {
+    if cs.is_empty() {
+        return "No comments.".to_string();
+    }
+    cs.iter()
+        .map(|c| format!("[{}] @{}: {}", c.id, c.user.login, c.body))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+fn render_created_comment(c: &CreatedComment) -> String {
+    format!("Comment {} created: {}", c.id, c.html_url)
+}
+
+/// Owner+repo+number are required by most pr actions; this extracts them with a
+/// uniform error.
+fn need_owner_repo_number(
+    owner: Option<String>,
+    repo: Option<String>,
+    number: Option<u64>,
+    what: &str,
+) -> Result<(String, String, u64), ToolResult> {
+    match (owner, repo, number) {
+        (Some(o), Some(r), Some(n)) => Ok((o, r, n)),
+        _ => Err(err(format!("atomgit_pr {what}: owner, repo and number are required"))),
+    }
+}
+
+#[async_trait]
+impl Tool for AtomgitPrTool {
+    fn name(&self) -> &str {
+        "atomgit_pr"
+    }
+    fn description(&self) -> &str {
+        "Operate on AtomGit pull requests. action: \"list\" (owner+repo; optional \
+         state=open|closed|all, limit), \"view\" (owner+repo+number), \"create\" \
+         (owner+repo+title+head+base; optional body), \"close\" (owner+repo+number), \
+         \"comment_create\"/\"comment_view\" (owner+repo+number; body for create), \
+         \"comment_edit\"/\"comment_delete\" (owner+repo+comment_id; body for edit), \
+         \"comment_reply\" (owner+repo+number+parent_id+body), \"link_issues\"/\
+         \"unlink_issues\" (owner+repo+number+issues=[numbers])."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": [
+                    "list","view","create","close",
+                    "comment_create","comment_view","comment_edit","comment_delete","comment_reply",
+                    "link_issues","unlink_issues"
+                ]},
+                "owner": { "type": "string" },
+                "repo": { "type": "string" },
+                "number": { "type": "integer", "description": "PR number." },
+                "title": { "type": "string" },
+                "body": { "type": "string" },
+                "base": { "type": "string", "description": "Base branch (create)." },
+                "head": { "type": "string", "description": "Head branch (create), e.g. \"owner/repo:branch\"." },
+                "comment_id": { "type": "integer", "description": "Comment id for comment_edit/comment_delete." },
+                "parent_id": { "type": "integer", "description": "Parent comment id for comment_reply." },
+                "issues": { "type": "array", "items": { "type": "integer" }, "description": "Issue numbers for link/unlink." },
+                "state": { "type": "string", "description": "list filter (default open)." },
+                "limit": { "type": "integer", "description": "Max for list (default 30)." }
+            },
+            "required": ["action"]
+        })
+    }
+    fn risk(&self, args: &str) -> RiskLevel {
+        match action_of(args).as_deref() {
+            Some("list") | Some("view") | Some("comment_view") => RiskLevel::Safe,
+            _ => RiskLevel::Risky,
+        }
+    }
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+        let a: PrArgs = match serde_json::from_str(args) {
+            Ok(a) => a,
+            Err(e) => return err(format!("atomgit_pr: invalid arguments: {e}")),
+        };
+        let c = &self.client;
+        match a.action.as_str() {
+            "list" => match (a.owner, a.repo) {
+                (Some(o), Some(r)) => match c.pr_list(&o, &r, &a.state, a.limit).await {
+                    Ok(prs) if prs.is_empty() => ok("No pull requests.".to_string()),
+                    Ok(prs) => ok(prs.iter().map(render_pr).collect::<Vec<_>>().join("\n\n")),
+                    Err(e) => err(e),
+                },
+                _ => err("atomgit_pr list: owner and repo are required".to_string()),
+            },
+            "view" => match need_owner_repo_number(a.owner, a.repo, a.number, "view") {
+                Ok((o, r, n)) => match c.pr_view(&o, &r, n).await {
+                    Ok(pr) => ok(render_pr(&pr)),
+                    Err(e) => err(e),
+                },
+                Err(e) => e,
+            },
+            "create" => match (a.owner, a.repo, a.title, a.head) {
+                (Some(o), Some(r), Some(t), Some(h)) => {
+                    let base = a.base.as_deref().unwrap_or("master");
+                    match c.pr_create(&o, &r, &t, a.body.as_deref().unwrap_or(""), base, &h).await {
+                        Ok(pr) => ok(format!("Created {}", render_pr(&pr))),
+                        Err(e) => err(e),
+                    }
+                }
+                _ => err("atomgit_pr create: owner, repo, title and head are required".to_string()),
+            },
+            "close" => match need_owner_repo_number(a.owner, a.repo, a.number, "close") {
+                Ok((o, r, n)) => match c.pr_close(&o, &r, n).await {
+                    Ok(pr) => ok(format!("Closed {}", render_pr(&pr))),
+                    Err(e) => err(e),
+                },
+                Err(e) => e,
+            },
+            "comment_create" => match need_owner_repo_number(a.owner, a.repo, a.number, "comment_create") {
+                Ok((o, r, n)) => match a.body {
+                    Some(b) => match c.pr_comment_create(&o, &r, n, &b).await {
+                        Ok(cc) => ok(render_created_comment(&cc)),
+                        Err(e) => err(e),
+                    },
+                    None => err("atomgit_pr comment_create: body is required".to_string()),
+                },
+                Err(e) => e,
+            },
+            "comment_view" => match need_owner_repo_number(a.owner, a.repo, a.number, "comment_view") {
+                Ok((o, r, n)) => match c.pr_comment_view(&o, &r, n).await {
+                    Ok(cs) => ok(render_comments(&cs)),
+                    Err(e) => err(e),
+                },
+                Err(e) => e,
+            },
+            "comment_edit" => match (a.owner, a.repo, a.comment_id, a.body) {
+                (Some(o), Some(r), Some(id), Some(b)) => match c.pr_comment_edit(&o, &r, id, &b).await {
+                    Ok(cm) => ok(format!("Edited comment {}", cm.id)),
+                    Err(e) => err(e),
+                },
+                _ => err("atomgit_pr comment_edit: owner, repo, comment_id and body are required".to_string()),
+            },
+            "comment_delete" => match (a.owner, a.repo, a.comment_id) {
+                (Some(o), Some(r), Some(id)) => match c.pr_comment_delete(&o, &r, id).await {
+                    Ok(()) => ok(format!("Deleted comment {id}")),
+                    Err(e) => err(e),
+                },
+                _ => err("atomgit_pr comment_delete: owner, repo and comment_id are required".to_string()),
+            },
+            "comment_reply" => match (a.owner, a.repo, a.number, a.parent_id, a.body) {
+                (Some(o), Some(r), Some(n), Some(pid), Some(b)) => match c.pr_comment_reply(&o, &r, n, pid, &b).await {
+                    Ok(cm) => ok(format!("Replied (comment {})", cm.id)),
+                    Err(e) => err(e),
+                },
+                _ => err("atomgit_pr comment_reply: owner, repo, number, parent_id and body are required".to_string()),
+            },
+            "link_issues" => match need_owner_repo_number(a.owner, a.repo, a.number, "link_issues") {
+                Ok((o, r, n)) if !a.issues.is_empty() => match c.pr_link_issues(&o, &r, n, &a.issues).await {
+                    Ok(()) => ok(format!("Linked issues {:?} to PR #{n}", a.issues)),
+                    Err(e) => err(e),
+                },
+                Ok(_) => err("atomgit_pr link_issues: issues=[...] is required".to_string()),
+                Err(e) => e,
+            },
+            "unlink_issues" => match need_owner_repo_number(a.owner, a.repo, a.number, "unlink_issues") {
+                Ok((o, r, n)) if !a.issues.is_empty() => match c.pr_unlink_issues(&o, &r, n, &a.issues).await {
+                    Ok(()) => ok(format!("Unlinked issues {:?} from PR #{n}", a.issues)),
+                    Err(e) => err(e),
+                },
+                Ok(_) => err("atomgit_pr unlink_issues: issues=[...] is required".to_string()),
+                Err(e) => e,
+            },
+            other => err(format!("atomgit_pr: unknown action {other:?}")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -267,5 +487,58 @@ mod tests {
         let r = tool(&server).execute(r#"{"action":"frobnicate"}"#, &ctx()).await;
         assert!(r.is_error);
         assert!(r.content.contains("unknown action"), "{}", r.content);
+    }
+
+    fn pr_tool(server: &MockServer) -> AtomgitPrTool {
+        let client = AtomgitClient::new(AtomgitConfig {
+            base_url: format!("{}/api/v5", server.uri()),
+            user_agent: "atomcode/test".into(),
+            token: Arc::new(StaticToken("t")),
+        })
+        .unwrap();
+        AtomgitPrTool::new(Arc::new(client))
+    }
+
+    #[test]
+    fn pr_risk_classification() {
+        let server_url = "http://x/api/v5".to_string();
+        let t = AtomgitPrTool::new(Arc::new(
+            AtomgitClient::new(AtomgitConfig {
+                base_url: server_url,
+                user_agent: "u".into(),
+                token: Arc::new(StaticToken("t")),
+            })
+            .unwrap(),
+        ));
+        assert_eq!(t.risk(r#"{"action":"list"}"#), RiskLevel::Safe);
+        assert_eq!(t.risk(r#"{"action":"comment_view"}"#), RiskLevel::Safe);
+        assert_eq!(t.risk(r#"{"action":"create"}"#), RiskLevel::Risky);
+        assert_eq!(t.risk(r#"{"action":"comment_delete"}"#), RiskLevel::Risky);
+        assert_eq!(t.risk(r#"{"action":"link_issues"}"#), RiskLevel::Risky);
+    }
+
+    #[tokio::test]
+    async fn pr_create_requires_head() {
+        let server = MockServer::start().await;
+        let r = pr_tool(&server)
+            .execute(r#"{"action":"create","owner":"o","repo":"r","title":"T"}"#, &ctx())
+            .await;
+        assert!(r.is_error);
+        assert!(r.content.contains("title and head are required") || r.content.contains("head are required"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn pr_close_renders() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v5/repos/o/r/pulls/5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"number":5,"state":"closed","title":"x"})))
+            .mount(&server)
+            .await;
+        let r = pr_tool(&server)
+            .execute(r#"{"action":"close","owner":"o","repo":"r","number":5}"#, &ctx())
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("Closed"), "{}", r.content);
     }
 }
