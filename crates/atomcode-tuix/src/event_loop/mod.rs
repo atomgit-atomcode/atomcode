@@ -7143,8 +7143,33 @@ fn handle_agent_event(
             // `cd`, conversation preserved). No-op when already there to avoid
             // resetting on a redundant broadcast.
             if ctx.working_dir != new_dir {
-                commands::apply_cd(ctx, new_dir);
+                commands::apply_cd(ctx, new_dir.clone());
+                // 新项目的会话要存进新项目的 hash 目录。session_manager 只在启动
+                // 时按初始目录构建，不重建的话切项目后的新会话会写进旧项目，
+                // /resume 与手机端项目列表都会在错误的项目下看到它。
+                ctx.session_manager = atomcode_core::session::SessionManager::new(&new_dir);
                 commands::reset_to_new_session(ctx, state, renderer);
+            }
+        }
+        AgentEvent::SessionSwitched { dir, session_id } => {
+            // 手机 App 点开了（可能属于另一个项目的）历史对话：cd 过去（如需）
+            // 并**恢复**那条会话，而不是开新会话 —— 与 ProjectSwitched 的关键
+            // 区别。已在该会话上时跳过，避免冗余广播触发重复回放。
+            let already = ctx.working_dir == dir
+                && ctx.current_session.id.to_string() == session_id;
+            if !already {
+                if ctx.working_dir != dir {
+                    commands::apply_cd(ctx, dir.clone());
+                    // 同 ProjectSwitched：恢复/续写的会话必须落在目标项目的目录。
+                    ctx.session_manager =
+                        atomcode_core::session::SessionManager::new(&dir);
+                }
+                let sid = atomcode_core::session::SessionId::from_string(session_id);
+                if !commands::resume_session_here(ctx, state, renderer, sid) {
+                    // 会话文件缺失/损坏：退化为该项目下的全新会话（与切项目一致），
+                    // 至少目录是对的，不至于停在旧项目。
+                    commands::reset_to_new_session(ctx, state, renderer);
+                }
             }
         }
         AgentEvent::ContextStats {

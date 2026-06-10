@@ -93,6 +93,19 @@ pub(crate) fn spawn_live_forwarder(
                         break;
                     }
                 }
+                // 手机 App 点开历史对话（/cd 带 session_id）→ 跟随：cd（如需）
+                // 并恢复该会话（加载历史，而非开新会话）。
+                Ok(LiveEvent::SessionSwitched { dir, session_id }) => {
+                    if fan_tx
+                        .send(RuntimeEvent {
+                            runtime_id,
+                            event: AgentEvent::SessionSwitched { dir, session_id },
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }

@@ -224,7 +224,7 @@ fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
 
 /// 把 TUI 附着到指定的 LiveSession（回放快照 + 启动转发器 + 渲染确认）。
 /// 供 `/webui` 自动附着和 `/sync` 手动附着共用，不重复逻辑。
-fn attach_live_session(
+pub(super) fn attach_live_session(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     session: std::sync::Arc<atomcode_core::live::LiveSession>,
@@ -3255,7 +3255,58 @@ pub(crate) fn reset_to_new_session(
         working_dir: dir_display,
     });
     renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
+    // 同步模式下（/webui /app /sync 附着中）把 LiveSession 也换到这个新会话：
+    // 否则单例仍挂着旧会话的历史与 session_id，手机/浏览器重连后看到的还是
+    // 旧对话，且消息会继续写进旧会话文件。
+    reseed_live_if_attached(ctx, renderer);
     renderer.flush();
+}
+
+/// 同步模式下把进程内 LiveSession 重播种为 TUI 当前会话（session_id + 历史 +
+/// 当前工作目录），并重新附着转发器。未附着（非 sync 模式）时是 no-op。
+/// 会话切换/重置后调用，保证 /live 的下一次 snapshot 反映新会话。
+pub(super) fn reseed_live_if_attached(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    if ctx.sync_session.is_none() {
+        return;
+    }
+    let session = atomcode_daemon::ensure_live_session(
+        ctx.working_dir.clone(),
+        ctx.telemetry.clone(),
+        Some(ctx.current_session.id.clone()),
+        ctx.current_session.messages.clone(),
+    );
+    attach_live_session(ctx, renderer, session, false);
+}
+
+/// 在**当前** `ctx.session_manager` 作用域（即当前项目）下恢复指定会话：
+/// 加载历史、回放到屏幕、同步给本地 agent、绑定遥测、换前台会话，并在
+/// 同步模式下把 LiveSession 重播种为该会话。复刻 SessionPicker 的 Enter
+/// 逻辑（modals/session_picker.rs），供手机端驱动的会话切换
+/// （AgentEvent::SessionSwitched）复用。加载失败返回 false（调用方决定退化策略）。
+pub(super) fn resume_session_here(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    sid: atomcode_core::session::SessionId,
+) -> bool {
+    let session = match ctx.session_manager.load(&sid) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    ctx.current_session_id = Some(sid);
+    crate::modals::session_picker::replay_session(renderer, &session, true);
+    ctx.agent
+        .cmd_tx
+        .send(AgentCommand::SetMessages(session.messages.clone()))
+        .ok();
+    bind_telemetry_to_session(ctx, &session);
+    ctx.current_session = session;
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    state.on_turn_complete();
+    reseed_live_if_attached(ctx, renderer);
+    renderer.flush();
+    true
 }
 
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {

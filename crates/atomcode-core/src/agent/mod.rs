@@ -396,6 +396,13 @@ pub enum AgentEvent {
     /// webui directory switch. Kept distinct from `WorkingDirChanged` precisely
     /// so an agent-driven `cd` mid-task never wipes the conversation.
     ProjectSwitched(PathBuf),
+    /// Another client (e.g. the mobile app opening a historical conversation)
+    /// switched to a specific session of a (possibly different) project. The
+    /// receiving view changes cwd to `dir` if needed and RESUMES the session
+    /// identified by `session_id` (loads its history) instead of opening a
+    /// fresh one. Delivered over the live-sync channel
+    /// (`LiveEvent::SessionSwitched` → here).
+    SessionSwitched { dir: PathBuf, session_id: String },
     /// Context budget stats — piped into datalog and cached by the TUI
     /// for `/context`. Emitted after every turn's `ctx.build_messages`
     /// call, so stats reflect the snapshot the model actually saw.

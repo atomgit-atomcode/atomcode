@@ -169,6 +169,11 @@ pub struct ChangeDirRequest {
     /// rewrite the configured default.
     #[serde(default)]
     pub set_default: bool,
+    /// 可选：切换目录的同时恢复该项目下的指定会话（手机 App 点开历史对话）。
+    /// Some 时广播 SessionSwitched（TUI 跟随 cd + 恢复该会话）而非
+    /// WorkingDirChanged（cd + 开新会话）。
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Response after changing directory
@@ -1273,10 +1278,17 @@ async fn change_dir(
         });
 
         // Broadcast to other in-process views (sync-mode TUI) so they follow the
-        // switch: change cwd + open a fresh session in the new dir. No-op when no
-        // LiveSession is attached (headless daemon). Cross-process clients are not
-        // covered — that would need a /live SSE wire event + client subscription.
-        crate::live_api::live_set_working_dir(new_path.clone());
+        // switch. No-op when no LiveSession is attached (headless daemon).
+        // Cross-process clients are not covered — that would need a /live SSE
+        // wire event + client subscription.
+        // - session_id 为 Some：恢复该项目下的指定会话（手机点开历史对话）。
+        // - 否则：切项目 + 开全新会话（原有语义）。
+        match req.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(sid) => {
+                crate::live_api::live_switch_session(new_path.clone(), sid.to_string())
+            }
+            None => crate::live_api::live_set_working_dir(new_path.clone()),
+        }
 
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
 

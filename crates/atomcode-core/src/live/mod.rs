@@ -50,6 +50,14 @@ pub enum LiveEvent {
     /// 会切到新目录并开一个全新 session（见 event_loop/live_sync 转发）。仅广播
     /// 路径，不触碰 turn 状态。
     WorkingDirChanged(std::path::PathBuf),
+    /// 任一视图（手机 App 点开历史会话）要求切到指定项目的**指定会话**。与
+    /// [`LiveEvent::WorkingDirChanged`]（切项目+开新会话）不同，跟随方应 cd 到
+    /// `dir`（如不同）并**恢复** `session_id` 对应的会话（加载历史，而非新建）。
+    /// 仅进程内广播，不上 /live SSE 线（见 daemon to_wire）。
+    SessionSwitched {
+        dir: std::path::PathBuf,
+        session_id: String,
+    },
 }
 
 /// turn 执行策略。实现者负责对 `conv` 跑一次完整 turn（含工具循环），并把过程
@@ -174,6 +182,15 @@ impl LiveSession {
     /// 让同进程 TUI 跟随切目录并开一个全新会话。返回 false 表示当前无订阅者（无妨）。
     pub fn notify_working_dir_changed(&self, dir: std::path::PathBuf) -> bool {
         self.events.send(LiveEvent::WorkingDirChanged(dir)).is_ok()
+    }
+
+    /// 广播「切到指定项目的指定会话」给所有视图（不触碰 turn 状态）。手机 App
+    /// 点开历史会话（/cd 带 session_id）时调用，让同进程 TUI 跟随 cd 并恢复该
+    /// 会话。返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_session_switched(&self, dir: std::path::PathBuf, session_id: String) -> bool {
+        self.events
+            .send(LiveEvent::SessionSwitched { dir, session_id })
+            .is_ok()
     }
 
     /// 任一视图批准/拒绝，投递决定到执行器持有的审批通道。

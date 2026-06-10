@@ -71,6 +71,16 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
     }
 }
 
+/// 把「切到指定项目的指定会话」广播给所有视图。同进程 sync 模式下的 TUI live
+/// 转发器据此 cd（如需）并**恢复**该会话（加载历史，而非开新会话）。手机 App
+/// 点开历史对话（POST /cd 带 session_id）时走这里。无活动 LiveSession 时静默
+/// 跳过（headless daemon 场景由 GET /live?session_id= 自行换播种，见 live_stream）。
+pub fn live_switch_session(dir: std::path::PathBuf, session_id: String) {
+    if let Some(s) = current_live_session() {
+        s.notify_session_switched(dir, session_id);
+    }
+}
+
 /// 当前生效的 provider 名：优先进程级选择（LIVE_PROVIDER），回退 config 默认。
 /// 供 /live 快照在新 tab 连上时回显正确的选中模型。
 fn live_current_provider() -> String {
@@ -625,6 +635,10 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
         // sync-mode TUI follows it directly via the in-process LiveEvent. Skip
         // the SSE wire (would need a dedicated LiveWireEvent + frontend handler).
         LiveEvent::WorkingDirChanged(_) => return None,
+        // Same as above: the session switch is followed in-process by the
+        // sync-mode TUI; the requesting client (mobile app) reconnects /live
+        // with the session_id itself, so nothing to push on the wire.
+        LiveEvent::SessionSwitched { .. } => return None,
         LiveEvent::Turn(te) => match te {
             TE::TextDelta(content) => LiveWireEvent::TextDelta { content },
             TE::ReasoningDelta(content) => LiveWireEvent::ReasoningDelta { content },
