@@ -232,6 +232,8 @@ mod tests {
         assert_eq!(t.risk(r#"{"action":"view"}"#), RiskLevel::Safe);
         assert_eq!(t.risk(r#"{"action":"create"}"#), RiskLevel::Risky);
         assert_eq!(t.risk(r#"{"action":"delete"}"#), RiskLevel::Risky);
+        assert_eq!(t.risk(r#"{"action":"fork"}"#), RiskLevel::Risky);
+        assert_eq!(t.risk(r#"{"action":"clone"}"#), RiskLevel::Risky);
         // malformed → fail safe to Risky
         assert_eq!(t.risk("not json"), RiskLevel::Risky);
     }
