@@ -168,13 +168,25 @@ async fn clone_repo(
     dir: Option<&str>,
     ctx: &ToolContext,
 ) -> ToolResult {
+    // Defense-in-depth: this runs with host authority and the args are model-
+    // controlled. git parses options even after positionals, so a value starting
+    // with '-' (e.g. dir="--upload-pack=...") would be taken as a git OPTION, not a
+    // path/ref. Reject leading-dash values and pass `--` before the positional URL.
+    // Mirrors the leading-`-` guard the plugin installer uses on git inputs.
+    for (label, val) in [("owner", Some(owner)), ("repo", Some(repo)), ("branch", branch), ("dir", dir)] {
+        if let Some(v) = val {
+            if v.starts_with('-') {
+                return err(format!("atomgit_repo clone: {label} must not start with '-'"));
+            }
+        }
+    }
     let url = format!("https://atomgit.com/{owner}/{repo}.git");
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("clone");
     if let Some(b) = branch {
         cmd.arg("--branch").arg(b);
     }
-    cmd.arg(&url);
+    cmd.arg("--").arg(&url);
     if let Some(d) = dir {
         cmd.arg(d);
     }
@@ -732,5 +744,15 @@ mod tests {
         assert!(names.contains(&"atomgit_repo".to_string()));
         assert!(names.contains(&"atomgit_pr".to_string()));
         assert!(names.contains(&"atomgit_issue".to_string()));
+    }
+
+    #[tokio::test]
+    async fn clone_rejects_leading_dash_arg() {
+        let server = MockServer::start().await;
+        let r = tool(&server)
+            .execute(r#"{"action":"clone","owner":"o","repo":"r","dir":"--upload-pack=evil"}"#, &ctx())
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("must not start with '-'"), "{}", r.content);
     }
 }
