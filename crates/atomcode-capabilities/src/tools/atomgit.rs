@@ -186,9 +186,159 @@ async fn clone_repo(
     }
 }
 
+// ─────────────────────────── atomgit_issue ───────────────────────────
+
+#[derive(Deserialize)]
+struct IssueArgs {
+    action: String,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    comment_id: Option<u64>,
+    #[serde(default = "default_state")]
+    state: String,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+/// `atomgit_issue` tool.
+pub struct AtomgitIssueTool {
+    client: Arc<AtomgitClient>,
+}
+impl AtomgitIssueTool {
+    pub fn new(client: Arc<AtomgitClient>) -> Self {
+        Self { client }
+    }
+}
+
+fn render_issue(i: &Issue) -> String {
+    format!("#{} [{}] {}\n  {}", i.number, i.state, i.title, i.html_url)
+}
+
+#[async_trait]
+impl Tool for AtomgitIssueTool {
+    fn name(&self) -> &str {
+        "atomgit_issue"
+    }
+    fn description(&self) -> &str {
+        "Operate on AtomGit issues. action: \"list\" (owner+repo; optional \
+         state=open|closed|all, limit), \"view\" (owner+repo+number), \"create\" \
+         (owner+repo+title; optional body), \"comment_create\"/\"comment_view\" \
+         (owner+repo+number; body for create), \"comment_edit\"/\"comment_delete\" \
+         (owner+repo+comment_id; body for edit)."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": [
+                    "list","view","create",
+                    "comment_create","comment_view","comment_edit","comment_delete"
+                ]},
+                "owner": { "type": "string" },
+                "repo": { "type": "string" },
+                "number": { "type": "integer", "description": "Issue number." },
+                "title": { "type": "string" },
+                "body": { "type": "string" },
+                "comment_id": { "type": "integer", "description": "Comment id for comment_edit/comment_delete." },
+                "state": { "type": "string", "description": "list filter (default open)." },
+                "limit": { "type": "integer", "description": "Max for list (default 30)." }
+            },
+            "required": ["action"]
+        })
+    }
+    fn risk(&self, args: &str) -> RiskLevel {
+        match action_of(args).as_deref() {
+            Some("list") | Some("view") | Some("comment_view") => RiskLevel::Safe,
+            _ => RiskLevel::Risky,
+        }
+    }
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+        let a: IssueArgs = match serde_json::from_str(args) {
+            Ok(a) => a,
+            Err(e) => return err(format!("atomgit_issue: invalid arguments: {e}")),
+        };
+        let c = &self.client;
+        match a.action.as_str() {
+            "list" => match (a.owner, a.repo) {
+                (Some(o), Some(r)) => match c.issue_list(&o, &r, &a.state, a.limit).await {
+                    Ok(is) if is.is_empty() => ok("No issues.".to_string()),
+                    Ok(is) => ok(is.iter().map(render_issue).collect::<Vec<_>>().join("\n\n")),
+                    Err(e) => err(e),
+                },
+                _ => err("atomgit_issue list: owner and repo are required".to_string()),
+            },
+            "view" => match need_owner_repo_number(a.owner, a.repo, a.number, "view") {
+                Ok((o, r, n)) => match c.issue_view(&o, &r, n).await {
+                    Ok(i) => ok(render_issue(&i)),
+                    Err(e) => err(e),
+                },
+                Err(e) => e,
+            },
+            "create" => match (a.owner, a.repo, a.title) {
+                (Some(o), Some(r), Some(t)) => match c.issue_create(&o, &r, &t, a.body.as_deref().unwrap_or("")).await {
+                    Ok(i) => ok(format!("Created {}", render_issue(&i))),
+                    Err(e) => err(e),
+                },
+                _ => err("atomgit_issue create: owner, repo and title are required".to_string()),
+            },
+            "comment_create" => match need_owner_repo_number(a.owner, a.repo, a.number, "comment_create") {
+                Ok((o, r, n)) => match a.body {
+                    Some(b) => match c.issue_comment_create(&o, &r, n, &b).await {
+                        Ok(cm) => ok(format!("Comment {} created", cm.id)),
+                        Err(e) => err(e),
+                    },
+                    None => err("atomgit_issue comment_create: body is required".to_string()),
+                },
+                Err(e) => e,
+            },
+            "comment_view" => match need_owner_repo_number(a.owner, a.repo, a.number, "comment_view") {
+                Ok((o, r, n)) => match c.issue_comment_view(&o, &r, n).await {
+                    Ok(cs) => ok(render_comments(&cs)),
+                    Err(e) => err(e),
+                },
+                Err(e) => e,
+            },
+            "comment_edit" => match (a.owner, a.repo, a.comment_id, a.body) {
+                (Some(o), Some(r), Some(id), Some(b)) => match c.issue_comment_edit(&o, &r, id, &b).await {
+                    Ok(cm) => ok(format!("Edited comment {}", cm.id)),
+                    Err(e) => err(e),
+                },
+                _ => err("atomgit_issue comment_edit: owner, repo, comment_id and body are required".to_string()),
+            },
+            "comment_delete" => match (a.owner, a.repo, a.comment_id) {
+                (Some(o), Some(r), Some(id)) => match c.issue_comment_delete(&o, &r, id).await {
+                    Ok(()) => ok(format!("Deleted comment {id}")),
+                    Err(e) => err(e),
+                },
+                _ => err("atomgit_issue comment_delete: owner, repo and comment_id are required".to_string()),
+            },
+            other => err(format!("atomgit_issue: unknown action {other:?}")),
+        }
+    }
+}
+
+/// Register `atomgit_repo` / `atomgit_pr` / `atomgit_issue` into `reg`, all sharing
+/// one client. The embedder builds the [`AtomgitClient`] with its own
+/// [`TokenProvider`](crate::atomgit::TokenProvider) and then `mount`s whichever tool
+/// names it wants to expose.
 pub fn register_atomgit_tools(reg: &mut ToolRegistry, client: Arc<AtomgitClient>) {
     reg.register(Arc::new(AtomgitRepoTool::new(client.clone())));
     reg.register(Arc::new(AtomgitPrTool::new(client.clone())));
+    reg.register(Arc::new(AtomgitIssueTool::new(client)));
+}
+
+/// The tool names registered by [`register_atomgit_tools`], for `mount`.
+pub fn atomgit_tool_names() -> &'static [&'static str] {
+    &["atomgit_repo", "atomgit_pr", "atomgit_issue"]
 }
 
 // ─────────────────────────── atomgit_pr ───────────────────────────
@@ -540,5 +690,47 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("Closed"), "{}", r.content);
+    }
+
+    fn issue_tool(server: &MockServer) -> AtomgitIssueTool {
+        let client = AtomgitClient::new(AtomgitConfig {
+            base_url: format!("{}/api/v5", server.uri()),
+            user_agent: "atomcode/test".into(),
+            token: Arc::new(StaticToken("t")),
+        })
+        .unwrap();
+        AtomgitIssueTool::new(Arc::new(client))
+    }
+
+    #[tokio::test]
+    async fn issue_create_renders() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v5/repos/o/r/issues"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"number":4,"title":"T","state":"open"})))
+            .mount(&server)
+            .await;
+        let r = issue_tool(&server)
+            .execute(r#"{"action":"create","owner":"o","repo":"r","title":"T"}"#, &ctx())
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("#4"), "{}", r.content);
+    }
+
+    #[test]
+    fn register_mounts_all_three() {
+        let client = AtomgitClient::new(AtomgitConfig {
+            base_url: "http://x/api/v5".into(),
+            user_agent: "u".into(),
+            token: Arc::new(StaticToken("t")),
+        })
+        .unwrap();
+        let mut reg = ToolRegistry::new();
+        register_atomgit_tools(&mut reg, Arc::new(client));
+        let mounted = reg.mount(atomgit_tool_names());
+        let names: Vec<String> = mounted.defs().into_iter().map(|d| d.name).collect();
+        assert!(names.contains(&"atomgit_repo".to_string()));
+        assert!(names.contains(&"atomgit_pr".to_string()));
+        assert!(names.contains(&"atomgit_issue".to_string()));
     }
 }

@@ -75,7 +75,7 @@ pub use web_fetch::WebFetchTool;
 #[cfg(feature = "web")]
 pub use web_search::WebSearchTool;
 #[cfg(feature = "atomgit")]
-pub use atomgit::{register_atomgit_tools, AtomgitRepoTool};
+pub use atomgit::{atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool};
 
 /// Names of the full neutral coding toolset — pass to
 /// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).
