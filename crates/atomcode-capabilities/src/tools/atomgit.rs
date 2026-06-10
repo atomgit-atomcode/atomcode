@@ -276,7 +276,7 @@ impl Tool for AtomgitIssueTool {
                 },
                 _ => err("atomgit_issue list: owner and repo are required".to_string()),
             },
-            "view" => match need_owner_repo_number(a.owner, a.repo, a.number, "view") {
+            "view" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_issue view") {
                 Ok((o, r, n)) => match c.issue_view(&o, &r, n).await {
                     Ok(i) => ok(render_issue(&i)),
                     Err(e) => err(e),
@@ -290,7 +290,7 @@ impl Tool for AtomgitIssueTool {
                 },
                 _ => err("atomgit_issue create: owner, repo and title are required".to_string()),
             },
-            "comment_create" => match need_owner_repo_number(a.owner, a.repo, a.number, "comment_create") {
+            "comment_create" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_issue comment_create") {
                 Ok((o, r, n)) => match a.body {
                     Some(b) => match c.issue_comment_create(&o, &r, n, &b).await {
                         Ok(cm) => ok(format!("Comment {} created", cm.id)),
@@ -300,7 +300,7 @@ impl Tool for AtomgitIssueTool {
                 },
                 Err(e) => e,
             },
-            "comment_view" => match need_owner_repo_number(a.owner, a.repo, a.number, "comment_view") {
+            "comment_view" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_issue comment_view") {
                 Ok((o, r, n)) => match c.issue_comment_view(&o, &r, n).await {
                     Ok(cs) => ok(render_comments(&cs)),
                     Err(e) => err(e),
@@ -414,7 +414,7 @@ fn need_owner_repo_number(
 ) -> Result<(String, String, u64), ToolResult> {
     match (owner, repo, number) {
         (Some(o), Some(r), Some(n)) => Ok((o, r, n)),
-        _ => Err(err(format!("atomgit_pr {what}: owner, repo and number are required"))),
+        _ => Err(err(format!("{what}: owner, repo and number are required"))),
     }
 }
 
@@ -478,7 +478,7 @@ impl Tool for AtomgitPrTool {
                 },
                 _ => err("atomgit_pr list: owner and repo are required".to_string()),
             },
-            "view" => match need_owner_repo_number(a.owner, a.repo, a.number, "view") {
+            "view" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr view") {
                 Ok((o, r, n)) => match c.pr_view(&o, &r, n).await {
                     Ok(pr) => ok(render_pr(&pr)),
                     Err(e) => err(e),
@@ -495,14 +495,14 @@ impl Tool for AtomgitPrTool {
                 }
                 _ => err("atomgit_pr create: owner, repo, title and head are required".to_string()),
             },
-            "close" => match need_owner_repo_number(a.owner, a.repo, a.number, "close") {
+            "close" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr close") {
                 Ok((o, r, n)) => match c.pr_close(&o, &r, n).await {
                     Ok(pr) => ok(format!("Closed {}", render_pr(&pr))),
                     Err(e) => err(e),
                 },
                 Err(e) => e,
             },
-            "comment_create" => match need_owner_repo_number(a.owner, a.repo, a.number, "comment_create") {
+            "comment_create" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr comment_create") {
                 Ok((o, r, n)) => match a.body {
                     Some(b) => match c.pr_comment_create(&o, &r, n, &b).await {
                         Ok(cc) => ok(render_created_comment(&cc)),
@@ -512,7 +512,7 @@ impl Tool for AtomgitPrTool {
                 },
                 Err(e) => e,
             },
-            "comment_view" => match need_owner_repo_number(a.owner, a.repo, a.number, "comment_view") {
+            "comment_view" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr comment_view") {
                 Ok((o, r, n)) => match c.pr_comment_view(&o, &r, n).await {
                     Ok(cs) => ok(render_comments(&cs)),
                     Err(e) => err(e),
@@ -540,7 +540,7 @@ impl Tool for AtomgitPrTool {
                 },
                 _ => err("atomgit_pr comment_reply: owner, repo, number, parent_id and body are required".to_string()),
             },
-            "link_issues" => match need_owner_repo_number(a.owner, a.repo, a.number, "link_issues") {
+            "link_issues" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr link_issues") {
                 Ok((o, r, n)) if !a.issues.is_empty() => match c.pr_link_issues(&o, &r, n, &a.issues).await {
                     Ok(()) => ok(format!("Linked issues {:?} to PR #{n}", a.issues)),
                     Err(e) => err(e),
@@ -548,7 +548,7 @@ impl Tool for AtomgitPrTool {
                 Ok(_) => err("atomgit_pr link_issues: issues=[...] is required".to_string()),
                 Err(e) => e,
             },
-            "unlink_issues" => match need_owner_repo_number(a.owner, a.repo, a.number, "unlink_issues") {
+            "unlink_issues" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr unlink_issues") {
                 Ok((o, r, n)) if !a.issues.is_empty() => match c.pr_unlink_issues(&o, &r, n, &a.issues).await {
                     Ok(()) => ok(format!("Unlinked issues {:?} from PR #{n}", a.issues)),
                     Err(e) => err(e),
