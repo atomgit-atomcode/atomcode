@@ -33,6 +33,10 @@ impl AtomgitClient {
     }
 
     fn url(&self, path: &str) -> String {
+        // All callers pass an absolute path (e.g. "/repos/{owner}/{repo}"); catch a
+        // future caller that forgets the leading slash before it silently malforms
+        // the URL. No-op in release.
+        debug_assert!(path.starts_with('/'), "atomgit path must start with '/': {path}");
         format!("{}{}", self.base_url, path)
     }
 
