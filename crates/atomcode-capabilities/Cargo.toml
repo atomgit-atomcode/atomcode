@@ -66,6 +66,10 @@ tools = ["dep:ignore", "dep:regex", "dep:globset", "tokio/fs", "tokio/process", 
 # (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
 # that wants no network egress skips it.
 web = ["tools", "dep:reqwest", "dep:url", "tokio/net"]
+# AtomGit REST tools (atomgit_repo / atomgit_pr / atomgit_issue). Opt-in on top of
+# `tools`; pulls the async HTTP stack (reqwest). NOT in default — an embedder that
+# wants no AtomGit egress skips it.
+atomgit = ["tools", "dep:reqwest"]
 # Code-intelligence tools (tree-sitter symbol extraction): list_symbols / read_symbol.
 # Opt-in (NOT default) — pulls 12 tree-sitter grammar crates (heavy C compilation).
 codeintel = [

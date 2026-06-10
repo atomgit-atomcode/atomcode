@@ -39,6 +39,10 @@ pub mod provider;
 #[cfg(feature = "tools")]
 pub mod tools;
 
+/// AtomGit REST tools (repo / pull-request / issue). Opt-in `atomgit` feature.
+#[cfg(feature = "atomgit")]
+pub mod atomgit;
+
 /// Code-intelligence capability: tree-sitter `list_symbols` / `read_symbol` over 12
 /// languages. Single-file + stateless (no shared index, no ctx coupling). Opt-in
 /// `codeintel` feature (heavy grammar compilation). See [`codeintel`].
