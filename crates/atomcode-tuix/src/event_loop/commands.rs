@@ -1073,6 +1073,17 @@ pub(super) fn execute_slash_command(
                                 if let Some(m) = &machine {
                                     cmd.arg("--machine-name").arg(m);
                                 }
+                                // 全局接入口令:中继开启 admin_secret 时必须带匹配值才能注册隧道。
+                                // 优先读 ATOMCODE_APP_RELAY_SECRET,回落 relay-client 原生
+                                // ATOM_RELAY_REGISTER_SECRET。子进程本会继承环境变量,这里显式
+                                // 透传是为了用 ATOMCODE_ 前缀的名字、且行为可见。中继未开启则不传。
+                                if let Some(secret) = std::env::var("ATOMCODE_APP_RELAY_SECRET")
+                                    .ok()
+                                    .or_else(|| std::env::var("ATOM_RELAY_REGISTER_SECRET").ok())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    cmd.arg("--register-secret").arg(secret);
+                                }
                                 match cmd.spawn() {
                                     Err(e) => format!(
                                         "启动 relay-client 失败（{e}）。请确认 `{bin}` \
