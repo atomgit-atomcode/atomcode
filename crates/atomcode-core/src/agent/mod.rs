@@ -2674,6 +2674,7 @@ impl AgentLoop {
                     // delays the same error by ~45s and re-hammers the gateway).
                     let is_quota_exhausted = crate::provider::is_non_retryable_rate_limit(&e);
                     let is_auth_error = is_auth_error(&e);
+                    let is_insufficient_balance = is_insufficient_balance_error(&e);
                     let is_messages_illegal = e.contains("illegal") || e.contains("messages");
                     // Upstream context-length overflow (OpenRouter 400, OpenAI
                     // context_length_exceeded, Anthropic "prompt is too long").
@@ -2738,6 +2739,20 @@ impl AgentLoop {
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: shown,
                             snapshot: self.conversation.snapshot(),
+                        });
+                        self.finish_turn(TurnStopReason::Error);
+                        return;
+                    } else if is_insufficient_balance {
+                        // Non-retryable: no balance means every retry of this
+                        // exact request fails identically. Fail-fast like the
+                        // quota/auth branches and surface the real reason
+                        // ("Insufficient Balance" / 余额不足) instead of 3
+                        // misleading "请求失败，重试" lines.
+                        self.datalog.log_error(&e);
+                        self.report_error("insufficient_balance", &e).await;
+                        let _ = self.event_tx.send(AgentEvent::Error {
+                            error: public_error_message(&e),
+                            messages: self.conversation.messages.clone(),
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return;
@@ -3611,6 +3626,27 @@ fn is_auth_error(e: &str) -> bool {
         || e.contains("incorrect_api_key")
 }
 
+/// True when the upstream error means the account is out of funds — a
+/// **non-retryable** condition for the current request: retrying the same
+/// call cannot make money appear, it only delays the real error behind
+/// misleading "请求失败，重试" lines. Mirrors the `is_quota_exhausted`
+/// fail-fast branch, but for payment/balance rather than rate quota.
+///
+/// HTTP 402 (Payment Required) is the standard code, but providers are
+/// inconsistent: DeepSeek returns `{"error":{"message":"Insufficient
+/// Balance"}}`, OpenAI uses `insufficient_quota`, and Chinese gateways say
+/// 余额不足/欠费. Match the message text plus the canonical status
+/// reason rather than a bare "402" substring (which would false-positive on
+/// token counts in the body).
+fn is_insufficient_balance_error(e: &str) -> bool {
+    e.contains("Insufficient Balance")
+        || e.contains("insufficient_balance")
+        || e.contains("insufficient_quota")
+        || e.contains("Payment Required")
+        || e.contains("余额不足")
+        || e.contains("欠费")
+}
+
 /// True when the error came from `build_codingplan_headers` failing
 /// with `SignError::Unavailable` — i.e. an open-source AtomCode build
 /// tried to issue a request that requires the closed-source signing
@@ -3637,6 +3673,8 @@ fn should_show_raw_api_error() -> bool {
 fn public_error_reason(e: &str) -> &'static str {
     if is_context_overflow_error(e) {
         "上下文过长"
+    } else if is_insufficient_balance_error(e) {
+        "余额不足"
     } else if is_auth_error(e) {
         "认证失败或无权限"
     } else if is_rate_limited_error(e) {
@@ -3675,6 +3713,9 @@ fn public_error_message(e: &str) -> String {
     match public_error_reason(e) {
         "上下文过长" => {
             "请求超过了模型上下文长度限制。请减少附加内容或缩短会话历史后重试。".to_string()
+        }
+        "余额不足" => {
+            "账户余额不足，请前往模型提供方控制台充值后重试。".to_string()
         }
         "认证失败或无权限" => {
             "认证失败或当前账号无权限访问该模型。请检查 API Key 和提供方权限配置。".to_string()
@@ -4318,6 +4359,25 @@ mod classifier_tests {
     #[test]
     fn rate_limit_error_is_detected() {
         assert!(is_rate_limited_error("API error (429 Too Many Requests)"));
+    }
+
+    /// 余额不足 / 402 Payment Required 必须 fail-fast(归类为「余额不足」),
+    /// 不能落入通用重试分支被笼统地报「请求失败」。
+    #[test]
+    fn insufficient_balance_is_classified() {
+        assert_eq!(
+            public_error_reason(
+                "API error (402 Payment Required) at `https://api.deepseek.com/chat/completions`: Insufficient Balance"
+            ),
+            "余额不足"
+        );
+        assert_eq!(public_error_reason("insufficient_quota"), "余额不足");
+        assert_eq!(public_error_reason("账户余额不足"), "余额不足");
+        // 反例:普通限流不应被误判为余额不足。
+        assert_ne!(
+            public_error_reason("API error (429 Too Many Requests)"),
+            "余额不足"
+        );
     }
 
     /// Chinese gateway-side rate-limit blobs streamed in-band by
