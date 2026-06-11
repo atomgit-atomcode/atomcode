@@ -3002,6 +3002,194 @@ mod tests {
     }
 
     #[test]
+    fn compact_old_noop_when_turns_below_keep_recent() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("t0");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "b".into(),
+            output: format!("[elapsed: 0.0s, exit: 0]\n{}", "x".repeat(10_000)),
+            success: true,
+        });
+        // Only 1 turn, keep_recent_turns=1 → early return, no modification.
+        let before_count = conv.messages.len();
+        compact_old_tool_results_in_place(&mut conv, 1, false);
+        assert_eq!(conv.messages.len(), before_count, "must be noop when turns <= keep_recent_turns");
+    }
+
+    #[test]
+    fn compact_old_skips_output_below_min_collapse_size() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("t0");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            None,
+        );
+        // Output smaller than MIN_COLLAPSE_SIZE (500) — must not be stubbed.
+        conv.add_tool_result(ToolResult {
+            call_id: "b".into(),
+            output: "tiny output".into(),
+            success: true,
+        });
+        conv.add_user_message("t1");
+
+        compact_old_tool_results_in_place(&mut conv, 1, false);
+
+        let out = conv.messages.iter().find_map(|m| match &m.content {
+            MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
+            _ => None,
+        }).unwrap();
+        assert_eq!(out, "tiny output", "output below MIN_COLLAPSE_SIZE must stay intact");
+    }
+
+    #[test]
+    fn compact_old_stubs_unknown_tool() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("t0");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "x".into(), name: "mystery_tool".into(), arguments: "{}".into() }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "x".into(),
+            output: format!("{}", "x".repeat(2_000)),
+            success: true,
+        });
+        conv.add_user_message("t1");
+
+        compact_old_tool_results_in_place(&mut conv, 1, true);
+
+        let out = conv.messages.iter().find_map(|m| match &m.content {
+            MessageContent::ToolResult(r) if r.call_id == "x" => Some(r.output.clone()),
+            _ => None,
+        }).unwrap();
+        assert!(out.starts_with("[mystery_tool "), "unknown tool must still be stubbed with its name");
+    }
+
+    #[test]
+    fn collapse_committed_noop_on_empty_conversation() {
+        let mut conv = Conversation::new();
+        // Must not panic on empty conversation.
+        collapse_committed(&mut conv, 8_000);
+        assert!(conv.messages.is_empty(), "empty conv must stay empty");
+    }
+
+    #[test]
+    fn collapse_committed_noop_on_zero_budget() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("t0");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "b".into(),
+            output: format!("{}", "x".repeat(2_000)),
+            success: true,
+        });
+        conv.add_user_message("t1");
+
+        // Zero budget → threshold = 0 → total_chars > 0 → fires, but stub size
+        // (< 500) won't shrink → no-op. This tests the MIN_COLLAPSE_SIZE guard.
+        let snapshot_len = conv.messages.len();
+        collapse_committed(&mut conv, 0);
+        assert_eq!(conv.messages.len(), snapshot_len, "zero budget, but conv unchanged");
+    }
+
+    #[test]
+    fn compact_old_multiple_consecutive_exempt_read_files() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("t0");
+        // Two consecutive read_file calls in the same turn.
+        conv.add_assistant_tool_calls(
+            None,
+            vec![
+                ToolCall { id: "r1".into(), name: "read_file".into(), arguments: "{}".into() },
+                ToolCall { id: "r2".into(), name: "read_file".into(), arguments: "{}".into() },
+            ],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "r1".into(),
+            output: format!("{}", "x".repeat(3_000)),
+            success: true,
+        });
+        conv.add_tool_result(ToolResult {
+            call_id: "r2".into(),
+            output: format!("{}", "y".repeat(3_000)),
+            success: true,
+        });
+        // Followed by a bash that should be stubbed.
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "b".into(),
+            output: format!("[elapsed: 0.0s]\n{}", "z".repeat(3_000)),
+            success: true,
+        });
+        conv.add_user_message("t1");
+
+        compact_old_tool_results_in_place(&mut conv, 1, true);
+
+        let get = |cid: &str| -> String {
+            conv.messages.iter().find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
+                _ => None,
+            }).unwrap()
+        };
+        assert!(!get("r1").starts_with('['), "first read_file must be exempt");
+        assert!(!get("r2").starts_with('['), "second read_file must also be exempt");
+        assert!(get("b").starts_with("[bash "), "bash must still be stubbed");
+    }
+
+    #[test]
+    fn compact_old_keep_one_recent_turn_keeps_last_turn_full() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        // Three turns, keep_recent_turns=1 → first two get stubbed, last stays full.
+        for n in 0..3 {
+            conv.add_user_message(&format!("t{n}"));
+            let id = format!("b{n}");
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall { id: id.clone(), name: "bash".into(), arguments: "{}".into() }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: id,
+                output: format!("[elapsed: 0.{}s, exit: 0]\n{}", n, "x".repeat(3_000)),
+                success: true,
+            });
+        }
+
+        compact_old_tool_results_in_place(&mut conv, 1, false);
+        let get = |cid: &str| -> String {
+            conv.messages.iter().find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
+                _ => None,
+            }).unwrap()
+        };
+        assert!(get("b0").starts_with("[bash "), "b0 must be stubbed");
+        assert!(get("b1").starts_with("[bash "), "b1 must be stubbed");
+        assert!(!get("b2").starts_with("[bash "), "b2 (last turn) must stay full");
+    }
+
+    #[test]
     fn collapse_committed_freezes_stubbed_prefix_across_turns() {
         use crate::tool::{ToolCall, ToolResult};
         // Low budget (threshold = 1_000*4*70/100 = 2_800 chars) on purpose:

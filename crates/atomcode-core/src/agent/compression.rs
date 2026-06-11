@@ -308,3 +308,77 @@ pub async fn maybe_compress_history(
 
     let _ = try_apply_compression(ctx, conv, system_prompt, n_msgs, final_summary, post_compress_state);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_summarize_prompt_includes_content() {
+        let content = "User asked about file X. Agent ran bash to list directory. Found 3 results.";
+        let prompt = default_summarize_prompt(content);
+        assert!(prompt.contains(content), "prompt must include the original content");
+        assert!(prompt.contains("Summarize"), "prompt must start with the instruction");
+        assert!(prompt.contains("3-5 concise sentences"), "prompt must specify length");
+        assert!(prompt.contains("file names"), "prompt must ask for file names");
+        assert!(prompt.contains("key decisions"), "prompt must ask for decisions");
+        assert!(prompt.contains("what was changed"), "prompt must ask for changes");
+    }
+
+    #[test]
+    fn default_summarize_prompt_rejects_exact_code() {
+        let prompt = default_summarize_prompt("some content");
+        assert!(prompt.contains("Drop:"), "prompt must have Drop section");
+        assert!(prompt.contains("exact code content"), "prompt must exclude exact code");
+        assert!(prompt.contains("tool arguments"), "prompt must exclude tool arguments");
+    }
+
+    #[test]
+    fn compression_outcome_applied_vs_rejected() {
+        let applied = CompressionOutcome {
+            applied: true,
+            before_tokens: 10_000,
+            after_tokens: 5_000,
+            removed_messages: 10,
+        };
+        assert!(applied.applied);
+        assert!(applied.before_tokens > applied.after_tokens);
+        assert_eq!(applied.removed_messages, 10);
+
+        let rejected = CompressionOutcome {
+            applied: false,
+            before_tokens: 5_000,
+            after_tokens: 6_000,
+            removed_messages: 0,
+        };
+        assert!(!rejected.applied);
+        assert!(rejected.before_tokens < rejected.after_tokens);
+        assert_eq!(rejected.removed_messages, 0);
+    }
+
+    #[test]
+    fn compression_outcome_no_change() {
+        let outcome = CompressionOutcome {
+            applied: false,
+            before_tokens: 5_000,
+            after_tokens: 5_000,
+            removed_messages: 0,
+        };
+        assert!(!outcome.applied);
+        assert_eq!(outcome.before_tokens, outcome.after_tokens);
+    }
+
+    #[test]
+    fn compression_system_prompt_is_concise() {
+        assert!(!COMPRESSION_SYSTEM_PROMPT.is_empty(), "must not be empty");
+        assert!(
+            COMPRESSION_SYSTEM_PROMPT.len() < 200,
+            "system prompt must be short: got {} chars",
+            COMPRESSION_SYSTEM_PROMPT.len()
+        );
+        assert!(
+            COMPRESSION_SYSTEM_PROMPT.contains("summar"),
+            "must contain summarizer instruction"
+        );
+    }
+}
