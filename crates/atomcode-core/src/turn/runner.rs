@@ -1079,7 +1079,9 @@ impl TurnRunner {
             "".to_string(),
             "".to_string(),
             working_dir.to_string_lossy().to_string(),
-        );
+        )
+        .with_session(self.provider.session_id())
+        .with_turn(self.current_turn_number);
         self.hook_engine.trigger_post_turn(&hook_ctx, turn_result).await;
     }
 
