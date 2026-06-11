@@ -1265,9 +1265,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       rt.abortController?.abort();
       void this._client.stopGeneration(sessionId).catch(() => undefined);
     }
-    this._sessionRuntimes.delete(sessionId);
-
+    // Delete on the server side first; only clear local state after success.
+    // This avoids data loss when the HTTP call fails (e.g. network / daemon crash).
     await this._client.deleteSession(hash, sessionId);
+
+    this._sessionRuntimes.delete(sessionId);
 
     // Clear any panels bound to this session
     let cleared = false;
