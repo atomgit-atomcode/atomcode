@@ -1994,9 +1994,13 @@ impl AgentLoop {
                 .await;
 
             let system_prompt = self.build_system_prompt();
-            // Per-turn reminder removed: verbatim task now rides on the cadence
-            // reflection checkpoint — see agent::discipline::reflection_prompt.
-            let turn_reminder = String::new();
+            // Per-turn reminder: empty in normal (build) mode — the verbatim
+            // task rides the cadence reflection checkpoint (see
+            // agent::discipline::reflection_prompt). In PLAN mode it carries a
+            // standing instruction so the model keeps planning instead of
+            // dumping the implementation inline (the read-only tool gate blocks
+            // file writes, but not writing code into the reply).
+            let turn_reminder = plan_mode_turn_reminder(self.plan_mode);
             let cancel = self.cancel_token.clone();
 
             // Context compression: when > 70% budget, pause and compress
@@ -3737,6 +3741,27 @@ fn public_error_message(e: &str) -> String {
 ///
 /// Extracted as a free function so the truncation / formatting is testable
 /// without building a full `AgentLoop`.
+/// Per-turn reminder injected into the last user message while plan mode is
+/// active (empty otherwise). Plan mode is deliberately kept OUT of the system
+/// prompt to preserve the prefix cache (see `prompt.rs`), and the one-time
+/// toggle notice scrolls out of recency fast — so without a per-turn nudge the
+/// model drifts and writes the whole implementation inline (even as a code
+/// block) instead of presenting a plan and stopping. Riding `turn_reminder`
+/// keeps the constraint fresh every turn without touching the cached system
+/// prompt.
+fn plan_mode_turn_reminder(plan_mode: bool) -> String {
+    if !plan_mode {
+        return String::new();
+    }
+    "<system-reminder>\n\
+     PLAN MODE is active. Do NOT create, edit, or delete files, and do NOT write out the \
+     implementation — not even as code blocks in your reply. Investigate with read-only tools, \
+     then present a concise implementation plan and STOP, waiting for the user to review and \
+     switch to build mode. Writing the full solution now defeats the purpose of plan mode.\n\
+     </system-reminder>"
+        .to_string()
+}
+
 fn build_post_compress_state(
     current_task: &str,
     files_edited: &[String],
@@ -3910,6 +3935,25 @@ mod agent_handle_tests {
             sys3.contains(&new_wd.display().to_string()),
             "the rebuilt prompt should reflect the new cwd"
         );
+    }
+
+    /// Regression: in plan mode the read-only tool gate blocks file writes, but
+    /// not the model writing the implementation into its reply. A per-turn
+    /// reminder must carry the "plan only, don't implement, STOP" constraint so
+    /// the model doesn't drift into dumping the full solution inline. Build mode
+    /// must carry no such reminder (keeps the last user turn clean + cacheable).
+    #[test]
+    fn plan_mode_turn_reminder_present_only_in_plan_mode() {
+        assert!(
+            super::plan_mode_turn_reminder(false).is_empty(),
+            "build mode must not inject a plan reminder"
+        );
+        let r = super::plan_mode_turn_reminder(true);
+        assert!(r.contains("PLAN MODE"), "plan reminder must name plan mode: {r:?}");
+        let low = r.to_lowercase();
+        // The exact failure mode: writing the implementation inline as a code block.
+        assert!(low.contains("code block"), "must forbid inline code-block dumps: {r:?}");
+        assert!(low.contains("stop"), "must tell the model to stop after the plan: {r:?}");
     }
 
     /// Part-2 (systemA): plan mode must NOT live in the system prompt. Toggling
