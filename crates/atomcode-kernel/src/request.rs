@@ -76,4 +76,16 @@ impl RequestCtx {
             let _ = tx.send(value);
         }
     }
+
+    /// Resolve EVERY pending request to `Value::Null` — the same degraded value as
+    /// a dropped sender or a `request_timeout` expiry, so awaiting middlewares
+    /// proceed fail-closed (e.g. an approval sees Null → deny). Called on
+    /// `AgentCommand::Cancel`: a cancel must also unblock a turn parked inside a
+    /// middleware round-trip (the turn token alone cannot — `request` awaits a
+    /// oneshot, not the token). A late `Respond` for a flushed id no-ops.
+    pub(crate) fn cancel_pending(&self) {
+        for (_, tx) in self.pending.lock().unwrap().drain() {
+            let _ = tx.send(Value::Null);
+        }
+    }
 }

@@ -657,17 +657,49 @@ pub struct SessionSnapshot {
     /// defaults it to 0; `from_conversation` copies the live value.
     #[serde(default)]
     pub cache_epoch: u64,
+    /// ID HIGH-WATER MARKS: how many `turn_id`s / `request_id`s the session had
+    /// minted when this snapshot was taken. A resume seeds the kernel's counters
+    /// from these so a resumed session CONTINUES the monotonic id sequence instead
+    /// of restarting at 1 — without this, an append-only per-session transcript
+    /// keyed by `(session_id, turn_id)` collects duplicate keys after the first
+    /// resume. ADDITIVE (`#[serde(default)]` → 0); the resume path additionally
+    /// falls back to the max `meta.turn_id`/`meta.request_id` over `messages`, so
+    /// even an OLD snapshot without these fields resumes monotonically.
+    #[serde(default)]
+    pub turn_counter: u64,
+    #[serde(default)]
+    pub request_counter: u64,
 }
 
 impl SessionSnapshot {
-    /// Stamp the current `SNAPSHOT_VERSION` over the given messages (epoch 0).
+    /// Stamp the current `SNAPSHOT_VERSION` over the given messages (epoch 0,
+    /// counters derived from the messages' metas).
     pub fn new(messages: Vec<Message>) -> Self {
-        Self { version: SNAPSHOT_VERSION, messages, cache_epoch: 0 }
+        let (turn_counter, request_counter) = Self::derive_counters(&messages);
+        Self { version: SNAPSHOT_VERSION, messages, cache_epoch: 0, turn_counter, request_counter }
     }
     /// Snapshot a live conversation losslessly at the current version, carrying its
-    /// `cache_epoch` so a resume restores the same prefix generation.
+    /// `cache_epoch` so a resume restores the same prefix generation. The id
+    /// high-water marks are DERIVED from the stored metas — exact whenever every
+    /// turn stored at least one assistant message; a capturer that knows the live
+    /// counters (e.g. a `turn_complete` hook holding `TurnCtx`) may bump them
+    /// higher for turns that died before any response was stored.
     pub fn from_conversation(convo: &Conversation) -> Self {
-        Self { version: SNAPSHOT_VERSION, messages: convo.messages.clone(), cache_epoch: convo.cache_epoch }
+        let (turn_counter, request_counter) = Self::derive_counters(&convo.messages);
+        Self {
+            version: SNAPSHOT_VERSION,
+            messages: convo.messages.clone(),
+            cache_epoch: convo.cache_epoch,
+            turn_counter,
+            request_counter,
+        }
+    }
+    /// Max `meta.turn_id` / `meta.request_id` over the messages (0 when none carry meta).
+    pub fn derive_counters(messages: &[Message]) -> (u64, u64) {
+        messages
+            .iter()
+            .filter_map(|m| m.meta.as_ref())
+            .fold((0, 0), |(t, r), meta| (t.max(meta.turn_id), r.max(meta.request_id)))
     }
 }
 

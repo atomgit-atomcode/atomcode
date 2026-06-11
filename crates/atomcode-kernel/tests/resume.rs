@@ -199,6 +199,8 @@ async fn unsupported_snapshot_version_errors_and_starts_empty() {
         version: 9999,
         messages: vec![Message::system("should be ignored"), Message::user("ghost")],
         cache_epoch: 0,
+        turn_counter: 0,
+        request_counter: 0,
     };
 
     let provider = Arc::new(RecordingProvider::new(vec![vec![
@@ -365,7 +367,7 @@ async fn resume_heals_orphan_tool_result_snapshot() {
 // otherwise the session would run with hook injections but NO system identity.
 #[tokio::test]
 async fn unsupported_snapshot_fallback_seeds_persona_like_fresh() {
-    let bogus = SessionSnapshot { version: 9999, messages: vec![Message::user("ghost")], cache_epoch: 0 };
+    let bogus = SessionSnapshot { version: 9999, messages: vec![Message::user("ghost")], cache_epoch: 0, turn_counter: 0, request_counter: 0 };
 
     let provider = Arc::new(RecordingProvider::new(vec![vec![
         StreamEvent::TextDelta("ok".into()),
@@ -398,4 +400,136 @@ async fn unsupported_snapshot_fallback_seeds_persona_like_fresh() {
     assert_eq!(first[0].role, Role::System);
     assert_eq!(first[0].text, PERSONA, "fallback must seed the persona like a fresh start");
     assert!(!first.iter().any(|m| m.text == "ghost"), "ghost history must not leak");
+}
+
+// CLAIM 18e: a resume CONTINUES the session's monotonic id sequence. The snapshot
+// carries the id high-water marks (additive fields, with a derive-from-meta fallback
+// for old snapshots), and spawn seeds the counters from them — so an append-only
+// per-session transcript keyed by (session_id, turn_id) never sees duplicate keys
+// across the resume boundary.
+#[tokio::test]
+async fn resume_continues_turn_id_sequence() {
+    use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
+    use atomcode_kernel::message::Conversation;
+    use std::sync::Mutex;
+
+    struct TurnIdRecorder(Arc<Mutex<Vec<(u64, u64)>>>);
+    #[async_trait::async_trait]
+    impl LifecycleHooks for TurnIdRecorder {
+        async fn turn_complete(
+            &self,
+            _convo: &Conversation,
+            _reason: &atomcode_kernel::event::StopReason,
+            ctx: &TurnCtx,
+        ) {
+            self.0.lock().unwrap().push((ctx.turn_id, ctx.request_id));
+        }
+    }
+
+    // --- Session 1: two turns (ids 1, 2).
+    let provider1 = Arc::new(RecordingProvider::new(vec![
+        vec![StreamEvent::TextDelta("t1".into()), StreamEvent::Done { truncated: false }],
+        vec![StreamEvent::TextDelta("t2".into()), StreamEvent::Done { truncated: false }],
+    ]));
+    let ids1 = Arc::new(Mutex::new(Vec::new()));
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    let mut handle1 = Agent::builder()
+        .provider(provider1)
+        .tools(reg.mount(&["echo"]))
+        .hook(Arc::new(TurnIdRecorder(ids1.clone())))
+        .build()
+        .spawn();
+    drive_one_turn(&mut handle1, "one").await;
+    drive_one_turn(&mut handle1, "two").await;
+    let snapshot = capture_snapshot(&mut handle1).await;
+    handle1.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle1.task.await;
+
+    assert_eq!(ids1.lock().unwrap().iter().map(|(t, _)| *t).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(snapshot.turn_counter, 2, "snapshot carries the turn high-water mark");
+    assert!(snapshot.request_counter >= 2, "snapshot carries the request high-water mark");
+
+    // --- Session 2: resume → the next turn must be 3, NOT 1.
+    let provider2 = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::TextDelta("t3".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+    let ids2 = Arc::new(Mutex::new(Vec::new()));
+    let mut reg2 = ToolRegistry::new();
+    reg2.register(Arc::new(EchoTool));
+    let mut handle2 = Agent::builder()
+        .provider(provider2)
+        .tools(reg2.mount(&["echo"]))
+        .hook(Arc::new(TurnIdRecorder(ids2.clone())))
+        .resume(snapshot)
+        .build()
+        .spawn();
+    drive_one_turn(&mut handle2, "three").await;
+    handle2.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle2.task.await;
+
+    let ids2 = ids2.lock().unwrap();
+    assert_eq!(ids2.iter().map(|(t, _)| *t).collect::<Vec<_>>(), vec![3], "turn ids continue across resume");
+    assert!(ids2[0].1 >= 3, "request ids continue across resume too");
+}
+
+// CLAIM 18e addendum: an OLD on-disk snapshot WITHOUT the counter fields (serde
+// default 0) still resumes monotonically via the derive-from-meta fallback.
+#[tokio::test]
+async fn old_snapshot_without_counter_fields_resumes_monotonically() {
+    use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
+    use atomcode_kernel::message::Conversation;
+    use std::sync::Mutex;
+
+    struct TurnIdRecorder(Arc<Mutex<Vec<u64>>>);
+    #[async_trait::async_trait]
+    impl LifecycleHooks for TurnIdRecorder {
+        async fn turn_complete(
+            &self,
+            _convo: &Conversation,
+            _reason: &atomcode_kernel::event::StopReason,
+            ctx: &TurnCtx,
+        ) {
+            self.0.lock().unwrap().push(ctx.turn_id);
+        }
+    }
+
+    // An "old" snapshot: build a current one whose metas say turn 5 happened, then
+    // DELETE the counter fields from its JSON — exactly what a pre-counter on-disk
+    // snapshot looks like (serde default → 0 on load).
+    let mut last = Message::assistant("ok", vec![]);
+    last.meta = Some(atomcode_kernel::message::MessageMeta {
+        turn_id: 5,
+        request_id: 9,
+        ..Default::default()
+    });
+    let snap = SessionSnapshot::new(vec![Message::user("hi"), last]);
+    let mut v = serde_json::to_value(&snap).unwrap();
+    let obj = v.as_object_mut().unwrap();
+    obj.remove("turn_counter");
+    obj.remove("request_counter");
+    let old: SessionSnapshot =
+        serde_json::from_value(v).expect("old-format snapshot must stay loadable");
+    assert_eq!(old.turn_counter, 0, "fields absent → serde default 0");
+
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::TextDelta("next".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo"]))
+        .hook(Arc::new(TurnIdRecorder(ids.clone())))
+        .resume(old)
+        .build()
+        .spawn();
+    drive_one_turn(&mut handle, "go").await;
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    assert_eq!(*ids.lock().unwrap(), vec![6], "derive-from-meta fallback seeds past turn 5");
 }

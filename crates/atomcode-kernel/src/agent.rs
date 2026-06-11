@@ -203,6 +203,19 @@ impl Agent {
     pub fn spawn(self) -> AgentHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        // A resume CONTINUES the session's monotonic id sequence: seed the counters
+        // from the snapshot's high-water marks (additive fields; an OLD snapshot
+        // without them falls back to the max over the stored message metas), so an
+        // append-only per-session transcript keyed by `(session_id, turn_id)` never
+        // collects duplicate keys across resume/respawn. An unsupported-version
+        // snapshot starts FRESH (counters too — consistent with the empty fallback).
+        let (turn_seed, request_seed) = match &self.resume {
+            Some(s) if s.version == SNAPSHOT_VERSION => {
+                let (dt, dr) = SessionSnapshot::derive_counters(&s.messages);
+                (s.turn_counter.max(dt), s.request_counter.max(dr))
+            }
+            _ => (0, 0),
+        };
         let running = RunningAgent {
             provider: self.provider,
             tools: self.tools,
@@ -227,8 +240,8 @@ impl Agent {
                 .or_else(|| self.working_dir.clone().map(|d| std::sync::Arc::new(std::sync::RwLock::new(d)))),
             cancel_token: self.cancel_token,
             session_id: self.session_id,
-            turn_counter: AtomicU64::new(0),
-            request_counter: AtomicU64::new(0),
+            turn_counter: AtomicU64::new(turn_seed),
+            request_counter: AtomicU64::new(request_seed),
             clock: self.clock,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
@@ -482,9 +495,7 @@ impl RunningAgent {
                 AgentCommand::Cancel => {}
                 AgentCommand::Respond { id, value } => self.rt.resolve(id, value),
                 AgentCommand::Snapshot => {
-                    self.rt.emit(AgentEvent::Snapshot {
-                        snapshot: SessionSnapshot::from_conversation(&convo),
-                    });
+                    self.rt.emit(AgentEvent::Snapshot { snapshot: self.capture_snapshot(&convo) });
                 }
                 // MANUAL compaction (idle): run the injected strategy regardless of
                 // any auto threshold. `apply_plan` still refuses a net-loss/no-op
@@ -508,7 +519,7 @@ impl RunningAgent {
                         match queued {
                             AgentCommand::Snapshot => {
                                 self.rt.emit(AgentEvent::Snapshot {
-                                    snapshot: SessionSnapshot::from_conversation(&convo),
+                                    snapshot: self.capture_snapshot(&convo),
                                 });
                             }
                             AgentCommand::SendMessage { text, images } => {
@@ -583,7 +594,16 @@ impl RunningAgent {
                 maybe = cmd_rx.recv() => match maybe {
                     Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
                     Some(AgentCommand::Shutdown) => { shutdown = true; break; }
-                    Some(AgentCommand::Cancel) => turn_token.cancel(),
+                    Some(AgentCommand::Cancel) => {
+                        // Cancel both halves of a parked turn: the token covers the
+                        // stream/between-tools checkpoints; flushing pending requests
+                        // (→ Null, fail-closed) unblocks a middleware round-trip
+                        // (e.g. an approval prompt the user just dismissed) that the
+                        // token cannot reach — otherwise the turn stays frozen until
+                        // request_timeout.
+                        turn_token.cancel();
+                        self.rt.cancel_pending();
+                    }
                     // QUEUE a mid-turn Snapshot/SendMessage rather than dropping it:
                     // a Snapshot reply (driver may be blocking on it) and the user's
                     // next prompt must survive. Drained after the turn completes.
@@ -611,6 +631,19 @@ impl RunningAgent {
     async fn finish_turn(&self, convo: &Conversation, reason: StopReason, ctx: &TurnCtx) {
         self.hooks.turn_complete(convo, &reason, ctx).await;
         self.rt.emit(AgentEvent::TurnComplete { reason });
+    }
+
+    /// Snapshot the conversation, stamping the LIVE id counters over the
+    /// derive-from-meta defaults: a turn that died before storing any assistant
+    /// message is invisible to the derivation, but the counters know it — a resume
+    /// must seed past it (the same correction an L1 `turn_complete` hook applies
+    /// from its `TurnCtx`).
+    fn capture_snapshot(&self, convo: &Conversation) -> SessionSnapshot {
+        let mut snap = SessionSnapshot::from_conversation(convo);
+        snap.turn_counter = snap.turn_counter.max(self.turn_counter.load(Ordering::Relaxed));
+        snap.request_counter =
+            snap.request_counter.max(self.request_counter.load(Ordering::Relaxed));
+        snap
     }
 
     async fn run_turn(&self, convo: &mut Conversation, cancel: tokio_util::sync::CancellationToken) {

@@ -78,8 +78,14 @@ impl LifecycleHooks for SnapshotHook {
     /// The turn TERMINATED: persist the working-set snapshot, then read-modify-write the
     /// session meta (bump turn/message counts, append this turn's stat, stamp updated_at).
     /// Both are best-effort — an IO failure must never panic or break the turn.
-    async fn turn_complete(&self, convo: &Conversation, reason: &StopReason, _ctx: &TurnCtx) {
-        let snap = SessionSnapshot::from_conversation(convo);
+    async fn turn_complete(&self, convo: &Conversation, reason: &StopReason, ctx: &TurnCtx) {
+        let mut snap = SessionSnapshot::from_conversation(convo);
+        // `from_conversation` DERIVES the id high-water marks from stored metas; a
+        // turn that died before any assistant message was stored is invisible to
+        // that derivation. We hold the authoritative live ids — stamp them so a
+        // resume seeds past THIS turn even when it stored nothing.
+        snap.turn_counter = snap.turn_counter.max(ctx.turn_id);
+        snap.request_counter = snap.request_counter.max(ctx.request_id);
         let _ = self.mgr.save_snapshot(&self.session_id, &snap);
 
         let now = now_ms();
@@ -182,6 +188,20 @@ mod tests {
         assert_eq!(st.total_tokens, 1234);
         assert_eq!(st.after_message, 3);
         assert!(!st.errored);
+    }
+
+    #[tokio::test]
+    async fn stamps_live_turn_ids_even_when_turn_stored_no_meta() {
+        let (h, mgr, _d) = hook("s1");
+        h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
+        // The turn died before ANY assistant message was stored — the convo carries
+        // no metas, so derive_counters alone would say 0. The live TurnCtx is
+        // authoritative: a resume must seed PAST this turn.
+        let ctx = TurnCtx { turn_id: 7, request_id: 12, ..Default::default() };
+        h.turn_complete(&convo_with(1), &StopReason::ProviderError, &ctx).await;
+        let snap = mgr.load_snapshot("s1").unwrap();
+        assert_eq!(snap.turn_counter, 7, "ctx.turn_id stamps the high-water mark");
+        assert_eq!(snap.request_counter, 12, "ctx.request_id too");
     }
 
     #[tokio::test]

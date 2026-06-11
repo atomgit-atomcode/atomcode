@@ -245,3 +245,86 @@ fn assert_no_dangling_tool_calls(messages: &[Message]) {
         }
     }
 }
+
+/// A middleware that round-trips EVERY tool call to the driver (an approval gate):
+/// `Null` (driver gone / cancel-flushed / timeout) fail-closes to a block.
+struct GateMiddleware;
+
+#[async_trait]
+impl atomcode_kernel::middleware::ToolMiddleware for GateMiddleware {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        rt: &atomcode_kernel::request::RequestCtx,
+    ) -> Result<(), String> {
+        let v = rt.request("approval", serde_json::json!({"tool": call.name})).await;
+        match v.as_str() {
+            Some("allow") => Ok(()),
+            _ => Err("denied".into()),
+        }
+    }
+}
+
+// CLAIM 17 addendum: `AgentCommand::Cancel` must also unblock a turn parked INSIDE a
+// middleware round-trip (an approval prompt the user dismissed). The turn token alone
+// cannot reach it — `request` awaits a oneshot — so Cancel flushes every pending
+// request to Null (fail-closed deny). NO request_timeout is configured here: before
+// the fix this test parks forever.
+#[tokio::test]
+async fn cancel_unblocks_pending_middleware_request() {
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::ToolCall(ToolCall {
+            id: "c1".into(),
+            name: "echo".into(),
+            arguments: "{\"text\":\"hi\"}".into(),
+        }),
+        StreamEvent::Done { truncated: false },
+    ]]));
+
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo"]))
+        .middleware(Arc::new(GateMiddleware))
+        // Deliberately NO request_timeout: the ONLY thing that can unblock the
+        // approval await is the Cancel flush under test.
+        .build()
+        .spawn();
+
+    handle
+        .commands
+        .send(AgentCommand::SendMessage { text: "go".into(), images: vec![] })
+        .unwrap();
+
+    let drive = async {
+        let mut reason = None;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                // The approval Request arrived → the turn is now parked in the
+                // middleware await. The user dismisses: Cancel, never Respond.
+                AgentEvent::Request { .. } => {
+                    handle.commands.send(AgentCommand::Cancel).unwrap();
+                }
+                AgentEvent::TurnComplete { reason: r } => {
+                    reason = Some(r);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        reason
+    };
+    let reason = tokio::time::timeout(std::time::Duration::from_secs(5), drive)
+        .await
+        .expect("Cancel must unblock the parked approval await — turn may not hang");
+
+    assert_eq!(
+        reason,
+        Some(atomcode_kernel::event::StopReason::Cancelled),
+        "the cancelled turn terminates as Cancelled"
+    );
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
