@@ -37,6 +37,10 @@ pub struct McpRegistry {
     connect_events: Option<mpsc::UnboundedSender<McpConnectEvent>>,
     /// Signals when all initial background connections have completed (or failed).
     initial_ready: Arc<tokio::sync::Notify>,
+    /// LEVEL-triggered mirror of the signal above: the Notify permit is single-use
+    /// (the first `wait_for_initial_connections` consumes it), so repeat callers
+    /// check this flag and return immediately instead of burning their timeout.
+    initial_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl McpRegistry {
@@ -48,6 +52,7 @@ impl McpRegistry {
             failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
             connect_events: None,
             initial_ready: Arc::new(tokio::sync::Notify::new()),
+            initial_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -61,6 +66,7 @@ impl McpRegistry {
                 failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
                 connect_events: Some(tx),
                 initial_ready: Arc::new(tokio::sync::Notify::new()),
+                initial_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             rx,
         )
@@ -98,6 +104,11 @@ impl McpRegistry {
                         error: format!("Failed to load config: {}", e),
                     });
                 }
+                // Nothing will ever connect — mark done + store the ready permit so
+                // a later `wait_for_initial_connections` returns immediately instead
+                // of burning its whole timeout (same as the no-server path below).
+                registry.initial_done.store(true, std::sync::atomic::Ordering::Release);
+                registry.initial_ready.notify_one();
                 return registry;
             }
         };
@@ -107,6 +118,7 @@ impl McpRegistry {
             let server_timeouts_ms = registry.server_timeouts_ms.clone();
             let failed_servers = registry.failed_servers.clone();
             let initial_ready = registry.initial_ready.clone();
+            let initial_done = registry.initial_done.clone();
             tokio::spawn(async move {
                 // Connect servers in parallel
                 let tasks: Vec<_> = configs
@@ -181,12 +193,20 @@ impl McpRegistry {
 
                 // Wait for all connections to complete (each has its own timeout)
                 futures::future::join_all(tasks).await;
-                // Signal that initial connections are done
-                initial_ready.notify_waiters();
+                // Signal that initial connections are done. `notify_one` (NOT
+                // `notify_waiters`): it STORES a permit when nobody is waiting yet,
+                // so a `wait_for_initial_connections` that starts AFTER this still
+                // returns immediately. `notify_waiters` only wakes CURRENT waiters —
+                // with the eager construct-then-wait call pattern (connect_and_adapt)
+                // the signal would fire before the waiter subscribed and every
+                // no-op wait would burn the full timeout.
+                initial_done.store(true, std::sync::atomic::Ordering::Release);
+                initial_ready.notify_one();
             });
         } else {
-            // No servers configured — signal immediately
-            registry.initial_ready.notify_waiters();
+            // No servers configured — signal immediately (permit-storing, see above).
+            registry.initial_done.store(true, std::sync::atomic::Ordering::Release);
+            registry.initial_ready.notify_one();
         }
 
         registry
@@ -414,6 +434,12 @@ impl McpRegistry {
     /// Wait for initial background connections to complete (or timeout).
     /// Returns immediately if no background connections are pending.
     pub async fn wait_for_initial_connections(&self, timeout: Duration) {
+        // Level check first: the Notify permit is single-use, so a SECOND caller
+        // (the registry is handed to drivers) must not burn its timeout re-waiting
+        // for a signal that already fired.
+        if self.initial_done.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let _ = tokio::time::timeout(timeout, self.initial_ready.notified()).await;
     }
 
@@ -425,6 +451,7 @@ impl McpRegistry {
             failed_servers: self.failed_servers.clone(),
             connect_events: self.connect_events.clone(),
             initial_ready: self.initial_ready.clone(),
+            initial_done: self.initial_done.clone(),
         })
     }
 }

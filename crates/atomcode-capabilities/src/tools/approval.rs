@@ -16,8 +16,48 @@ use async_trait::async_trait;
 use atomcode_kernel::middleware::ToolMiddleware;
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+
+/// The default `AgentEvent::Request.kind` of an approval round-trip — what a driver
+/// matches on to render the approval prompt (overridable via
+/// [`ApprovalMiddleware::with_kind`]).
+pub const APPROVAL_KIND: &str = "approval";
+
+/// The TYPED wire contract of the approval round-trip, so a driver never hand-rolls
+/// the JSON shapes. Byte-compatible with what the middleware sends/parses:
+/// the `Request.payload` deserializes into [`ApprovalRequest`]; the driver answers
+/// `AgentCommand::Respond { value: serde_json::to_value(ApprovalResponse)? }`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    /// The tool about to execute.
+    pub tool: String,
+    /// The EXACT argument bytes that will execute (approve-what-runs contract).
+    pub args: String,
+}
+
+/// The driver's answer. `decision` is `"allow"` / `"allow_always"` / `"deny"`
+/// (anything else fail-closes to deny); `remember: true` upgrades an `"allow"` to
+/// allow-always. See [`PermissionDecision::from_value`] for the parse rules.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalResponse {
+    pub decision: String,
+    #[serde(default)]
+    pub remember: bool,
+}
+
+impl ApprovalResponse {
+    pub fn allow() -> Self {
+        Self { decision: "allow".into(), remember: false }
+    }
+    pub fn allow_always() -> Self {
+        Self { decision: "allow_always".into(), remember: false }
+    }
+    pub fn deny() -> Self {
+        Self { decision: "deny".into(), remember: false }
+    }
+}
 
 /// The decision a driver returns for an approval round-trip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +131,7 @@ impl ApprovalMiddleware {
     /// Build over an injected store. `kind` defaults to `"approval"` (the driver
     /// matches `AgentEvent::Request.kind` on it).
     pub fn new(store: Arc<dyn PermissionStore>) -> Self {
-        Self { store, kind: "approval".to_string() }
+        Self { store, kind: APPROVAL_KIND.to_string() }
     }
     /// Convenience: gate with a fresh in-memory store.
     pub fn in_memory() -> Self {
@@ -125,8 +165,13 @@ impl ToolMiddleware for ApprovalMiddleware {
             return Ok(());
         }
         // Round-trip the driver for a decision (the oneshot lives in the kernel's
-        // RequestCtx, never in an event → events stay serializable).
-        let payload = serde_json::json!({ "tool": tool.name(), "args": call.arguments });
+        // RequestCtx, never in an event → events stay serializable). Built from the
+        // exported typed contract so the wire shape can never drift from it.
+        let payload = serde_json::to_value(ApprovalRequest {
+            tool: tool.name().to_string(),
+            args: call.arguments.clone(),
+        })
+        .unwrap_or(serde_json::Value::Null);
         match PermissionDecision::from_value(&rt.request(&self.kind, payload).await) {
             PermissionDecision::AllowOnce => Ok(()),
             PermissionDecision::AllowAlways => {
@@ -212,5 +257,27 @@ mod tests {
         let res = mw.before(&mut call, &tool, &rt).await;
         assert!(res.is_err(), "silent driver must fail closed");
         assert!(res.unwrap_err().contains("denied"));
+    }
+
+    /// The exported typed contract must stay byte-compatible with the wire shapes
+    /// the middleware actually sends / the parser actually accepts.
+    #[test]
+    fn typed_contract_matches_wire_shapes() {
+        // Request side: what the middleware emits parses as ApprovalRequest.
+        let payload =
+            serde_json::to_value(ApprovalRequest { tool: "bash".into(), args: "{\"cmd\":\"ls\"}".into() })
+                .unwrap();
+        assert_eq!(payload, serde_json::json!({ "tool": "bash", "args": "{\"cmd\":\"ls\"}" }));
+
+        // Response side: each constructor round-trips through from_value exactly.
+        let v = serde_json::to_value(ApprovalResponse::allow()).unwrap();
+        assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::AllowOnce);
+        let v = serde_json::to_value(ApprovalResponse::allow_always()).unwrap();
+        assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::AllowAlways);
+        let v = serde_json::to_value(ApprovalResponse { decision: "allow".into(), remember: true }).unwrap();
+        assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::AllowAlways);
+        let v = serde_json::to_value(ApprovalResponse::deny()).unwrap();
+        assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::Deny);
+        assert_eq!(APPROVAL_KIND, "approval");
     }
 }

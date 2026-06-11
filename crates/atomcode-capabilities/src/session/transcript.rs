@@ -20,9 +20,16 @@ use serde::{Deserialize, Serialize};
 
 use super::{now_ms, SessionManager};
 
+pub const RECORD_VERSION: u32 = 1;
+
 /// One completed turn, RAW (no redaction) — one JSON object per `<id>.jsonl` line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnRecord {
+    /// `.jsonl` RECORD SCHEMA VERSION — same forward-compat seam as
+    /// `SessionMeta.v`: new records write 1, pre-version lines read as 0
+    /// (`serde(default)`); additive fields keep the `v`, breaking changes bump it.
+    #[serde(default)]
+    pub v: u32,
     /// epoch MILLISECONDS, UTC — stamped by L1 at flush.
     pub ts: i64,
     /// Human-readable RFC-3339 mirror of `ts` (display / debug).
@@ -138,6 +145,7 @@ impl TranscriptHook {
 
         let ts = now_ms();
         let record = TurnRecord {
+            v: RECORD_VERSION,
             ts,
             iso: chrono::DateTime::from_timestamp_millis(ts)
                 .map(|d| d.to_rfc3339())

@@ -80,11 +80,17 @@ const DEFAULT_LIMIT: usize = 8;
 /// The `recall` tool.
 pub struct RecallTool {
     index: Arc<dyn RecallIndex>,
+    /// PINNED sessions dir. `None` (standalone default) derives the project bucket
+    /// from the live `ToolContext.working_dir` at each call — but that value MOVES
+    /// when the model runs `cd`, silently pointing recall at a different project's
+    /// bucket than the one the session hooks write. An assembly that owns a
+    /// `SessionManager` pins the root here so recall and persistence always agree.
+    sessions_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for RecallTool {
     fn default() -> Self {
-        Self { index: Arc::new(KeywordIndex) }
+        Self { index: Arc::new(KeywordIndex), sessions_dir: None }
     }
 }
 
@@ -95,7 +101,15 @@ impl RecallTool {
 
     /// Use a custom ranking backend (e.g. a future embedding index).
     pub fn with_index(index: Arc<dyn RecallIndex>) -> Self {
-        Self { index }
+        Self { index, sessions_dir: None }
+    }
+
+    /// Pin the sessions dir this tool searches (an assembly passes its
+    /// `SessionManager::root()`), instead of re-deriving it from the live —
+    /// `cd`-movable — working dir at each call.
+    pub fn with_sessions_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.sessions_dir = Some(dir.into());
+        self
     }
 
     /// The testable core: load every `*.jsonl` under `sessions_dir`, time-filter, rank,
@@ -174,7 +188,10 @@ impl Tool for RecallTool {
                 }
             }
         };
-        let sessions_dir = SessionManager::for_project(&ctx.working_dir).root().to_path_buf();
+        let sessions_dir = match &self.sessions_dir {
+            Some(d) => d.clone(),
+            None => SessionManager::for_project(&ctx.working_dir).root().to_path_buf(),
+        };
         let content = self.search_dir(
             &sessions_dir,
             &a.query,
@@ -203,7 +220,11 @@ fn load_records(dir: &Path) -> Vec<TurnRecord> {
         };
         for line in content.lines() {
             if let Ok(rec) = serde_json::from_str::<TurnRecord>(line) {
-                out.push(rec);
+                // Reader-enforced version bound: a future-schema record that still
+                // deserializes under this layout is skipped, not misread.
+                if rec.v <= crate::session::transcript::RECORD_VERSION {
+                    out.push(rec);
+                }
             }
         }
     }
@@ -272,6 +293,7 @@ mod tests {
 
     fn rec(session: &str, ts: i64, user: &str, assistant: &str) -> TurnRecord {
         TurnRecord {
+            v: crate::session::transcript::RECORD_VERSION,
             ts,
             iso: String::new(),
             session_id: session.into(),

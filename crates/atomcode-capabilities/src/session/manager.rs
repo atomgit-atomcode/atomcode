@@ -13,8 +13,17 @@ use serde::{Deserialize, Serialize};
 
 /// Fast-listing metadata for ONE session — read to populate a `/resume` picker WITHOUT
 /// parsing the (large) snapshot / transcript files. Persisted as `<id>.meta`.
+pub const META_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
+    /// `.meta` SCHEMA VERSION — the forward-compat seam (`.snapshot` has
+    /// `SNAPSHOT_VERSION`; this file format was missing one). New files write 1; a
+    /// pre-version file reads as 0 (`serde(default)`). Evolution rule: additive
+    /// fields stay at the same `v` (with their own `serde(default)`); a breaking
+    /// change bumps it and the reader branches.
+    #[serde(default)]
+    pub v: u32,
     pub id: String,
     /// Display title — auto by default, set by a user `/rename` (then `user_renamed`).
     pub name: String,
@@ -41,6 +50,7 @@ impl SessionMeta {
     pub fn new(id: impl Into<String>, working_dir: impl Into<String>, now_ms: i64) -> Self {
         let id = id.into();
         Self {
+            v: META_VERSION,
             name: format!("session-{id}"),
             id,
             user_renamed: false,
@@ -147,7 +157,17 @@ impl SessionManager {
 
     pub fn read_meta(&self, id: &str) -> io::Result<SessionMeta> {
         let bytes = fs::read(self.meta_path(id))?;
-        serde_json::from_slice(&bytes).map_err(invalid_data)
+        let meta: SessionMeta = serde_json::from_slice(&bytes).map_err(invalid_data)?;
+        // The forward-compat seam, READER-ENFORCED (same rule as the kernel's
+        // SNAPSHOT_VERSION check): a file from a future breaking schema may still
+        // deserialize under this layout — refuse rather than silently misinterpret.
+        if meta.v > META_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("meta schema v{} > supported v{META_VERSION}", meta.v),
+            ));
+        }
+        Ok(meta)
     }
 
     /// List all sessions in this project bucket, NEWEST FIRST. Reads ONLY `*.meta`
@@ -165,7 +185,11 @@ impl SessionManager {
             }
             if let Ok(bytes) = fs::read(&path) {
                 if let Ok(meta) = serde_json::from_slice::<SessionMeta>(&bytes) {
-                    out.push(meta);
+                    // Future-schema metas are skipped like malformed ones (reader-
+                    // enforced version bound; see read_meta).
+                    if meta.v <= META_VERSION {
+                        out.push(meta);
+                    }
                 }
             }
         }

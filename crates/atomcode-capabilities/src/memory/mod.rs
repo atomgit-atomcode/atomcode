@@ -27,18 +27,9 @@ pub mod store;
 pub use hook::MemoryHook;
 pub use store::MemoryStore;
 
-/// The atomcode config/data root: `$ATOMCODE_HOME` if set & non-empty, else
-/// `~/.atomcode`. Mirrors `atomcode_core::config::Config::config_dir` minus the
-/// `$SUDO_USER` resolution — the same deliberate simplification (and the same
-/// duplication-pending-a-shared-`paths`-helper) as `session::config_dir` and
-/// `mcp::util::config_dir`.
+/// The atomcode config/data root — delegates to the crate-shared
+/// [`crate::paths::config_dir`] (one home for the rule + its documented `sudo`
+/// divergence from production).
 pub(crate) fn config_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("ATOMCODE_HOME") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".atomcode")
+    crate::paths::config_dir()
 }

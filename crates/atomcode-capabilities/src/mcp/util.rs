@@ -11,17 +11,10 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-/// The atomcode config dir: `$ATOMCODE_HOME` if set & non-empty, else `~/.atomcode`.
-/// Mirrors `atomcode_core::config::Config::config_dir`.
+/// The atomcode config dir — delegates to the crate-shared [`crate::paths::config_dir`]
+/// (one home for the rule + its documented `sudo` divergence).
 pub(crate) fn config_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("ATOMCODE_HOME") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".atomcode")
+    crate::paths::config_dir()
 }
 
 /// Apply `CREATE_NO_WINDOW` to a spawned stdio MCP server on Windows so it does

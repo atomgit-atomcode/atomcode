@@ -718,3 +718,84 @@ async fn compaction_opens_new_epoch_preserving_system_prefix() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 }
+
+// (c) A mid-turn Compact is QUEUED and runs at the turn boundary — the documented
+// cache-safe trigger point — instead of silently vanishing (the old no-op arm). A
+// TUI user's /compact during streaming must eventually happen.
+#[tokio::test]
+async fn mid_turn_compact_is_queued_and_runs_at_turn_boundary() {
+    use atomcode_kernel::testkit::DeferredCommands;
+    use atomcode_kernel::tool::{ToolCall, ToolRegistry};
+
+    let deferred: DeferredCommands = Arc::new(std::sync::Mutex::new(None));
+
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    reg.register(Arc::new(InjectCommandTool::new(
+        deferred.clone(),
+        AgentCommand::Compact { focus: None },
+    )));
+
+    let provider = Arc::new(
+        RecordingProvider::new(vec![
+            // Round 1: call `inject` (sends Compact mid-turn), then end the round.
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "i1".into(),
+                    name: "inject".into(),
+                    arguments: "{}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            // Round 2: a final answer long enough to be drainable, then the turn ends.
+            vec![
+                StreamEvent::TextDelta("a final answer with plenty of bytes to drain".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ])
+        .with_ctx_window(1000),
+    );
+
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo", "inject"]))
+        .persona(PERSONA)
+        // NO compact_threshold: only the queued manual Compact can fire.
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 0 }))
+        .build()
+        .spawn();
+    *deferred.lock().unwrap() = Some(handle.commands.clone());
+
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+
+    // The turn completes FIRST; the queued Compact then runs and emits Compacted.
+    // With the old silent-drop arm this recv hangs until the test timeout.
+    let drive = async {
+        let mut saw_turn_complete = false;
+        let mut compacted = None;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::TurnComplete { .. } => saw_turn_complete = true,
+                AgentEvent::Compacted { committed, .. } => {
+                    compacted = Some(committed);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        (saw_turn_complete, compacted)
+    };
+    let (saw_turn_complete, compacted) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), drive)
+            .await
+            .expect("a mid-turn Compact must run at the turn boundary, not vanish");
+
+    assert!(saw_turn_complete, "the in-flight turn completes first");
+    assert!(
+        compacted.expect("Compacted event must arrive"),
+        "the strategy shrinks → the queued compaction commits"
+    );
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}

@@ -23,6 +23,12 @@
 /// is always available regardless of which capability features are enabled.
 pub mod hooks;
 
+/// Shared `$ATOMCODE_HOME` path resolution for the persisting capabilities — one
+/// home for the rule (and for documenting its single known `sudo` divergence from
+/// production). Internal; compiled only when a feature that persists needs it.
+#[cfg(any(feature = "mcp", feature = "session", feature = "memory"))]
+pub(crate) mod paths;
+
 #[cfg(feature = "provider")]
 pub mod provider;
 

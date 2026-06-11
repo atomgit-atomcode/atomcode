@@ -533,7 +533,13 @@ impl RunningAgent {
                                     break;
                                 }
                             }
-                            // Only Snapshot/SendMessage are ever enqueued.
+                            // A mid-turn /compact runs HERE — the turn boundary, the
+                            // documented cache-safe trigger point.
+                            AgentCommand::Compact { focus } => {
+                                self.run_compaction(&mut convo, CompactTrigger::Manual { focus })
+                                    .await;
+                            }
+                            // Only Snapshot/SendMessage/Compact are ever enqueued.
                             _ => {}
                         }
                     }
@@ -610,10 +616,15 @@ impl RunningAgent {
                     Some(c @ AgentCommand::Snapshot) | Some(c @ AgentCommand::SendMessage { .. }) => {
                         pending.push_back(c);
                     }
-                    // A Compact mid-turn is IGNORED: compacting inside a running turn
-                    // would reopen the within-turn cache break (and `convo` is mutably
-                    // borrowed by run_turn). Manual compaction is honored at IDLE only.
-                    Some(AgentCommand::Compact { .. }) => {}
+                    // A Compact mid-turn is QUEUED, not executed: compacting inside a
+                    // running turn would reopen the within-turn cache break (and
+                    // `convo` is mutably borrowed by run_turn). It runs at the turn
+                    // boundary via the drain loop — the documented cache-safe trigger
+                    // point — instead of silently vanishing (a TUI user's /compact
+                    // during streaming must eventually happen).
+                    Some(c @ AgentCommand::Compact { .. }) => {
+                        pending.push_back(c);
+                    }
                     None => { shutdown = true; break; }
                 }
             }

@@ -43,20 +43,9 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// The atomcode config/data root: `$ATOMCODE_HOME` if set & non-empty, else
-/// `~/.atomcode`. Mirrors `atomcode_core::config::Config::config_dir` so the new
-/// stack's `sessions/` lands in the SAME tree as production's. NOTE: the core helper's
-/// extra `$SUDO_USER`/getpwnam home resolution is intentionally NOT ported (same
-/// deliberate L1 simplification as [`crate::mcp`]'s `util::config_dir`) — under `sudo`
-/// WITHOUT `$ATOMCODE_HOME` set the two roots can diverge; setting `$ATOMCODE_HOME`
-/// (checked first, byte-identical to production) keeps them aligned.
+/// The atomcode config/data root — delegates to the crate-shared
+/// [`crate::paths::config_dir`] (one home for the rule + its documented `sudo`
+/// divergence from production).
 pub(crate) fn config_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("ATOMCODE_HOME") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".atomcode")
+    crate::paths::config_dir()
 }
