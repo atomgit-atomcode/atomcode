@@ -18,6 +18,12 @@ import {
 type WebviewMode = 'sidebar' | 'tab';
 type ContextItem = { path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number };
 type QueuedChatMessage = { text: string; context?: ContextItem[]; images?: ImageInput[]; clientMessageId?: string };
+type PanelSessionInfo = {
+  sessionId: string;
+  projectHash?: string;
+  messages?: MessageInfo[];
+  messagesPromise?: Promise<MessageInfo[] | undefined>;
+};
 
 interface SessionRuntime {
   abortController?: AbortController;
@@ -35,11 +41,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'atomcode.chatView';
   private _view?: vscode.WebviewView;
   private _panels = new Map<string, vscode.WebviewPanel>();
-  private _panelSessions = new Map<string, { sessionId: string; projectHash?: string; messages?: MessageInfo[] }>();
+  private _panelSessions = new Map<string, PanelSessionInfo>();
   private _panelReady = new Map<string, boolean>();
   private _activeSessionId?: string;
   private _focusedPanelId?: string;
-  private _groupLocked = false;
   private _sessionRuntimes = new Map<string, SessionRuntime>();
   private _pendingMessages = new Map<string, any[]>();
   private _loginId?: string;
@@ -64,12 +69,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     return undefined;
-  }
-
-  private _lockGroupOnce() {
-    if (this._groupLocked) return;
-    this._groupLocked = true;
-    vscode.commands.executeCommand('workbench.action.lockEditorGroup');
   }
 
   public openInTab(sessionId?: string) {
@@ -105,9 +104,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
     panel.webview.html = this._getHtml(panel.webview, 'tab');
     this._setupWebviewMessageHandler(panel.webview, 'tab');
-
-    // Lock the editor group on first panel creation
-    this._lockGroupOnce();
 
     // Track the panel — required for message routing, size check, and lookup
     if (sessionId) {
@@ -198,14 +194,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (sessionId && projectHash) {
-      this._panelSessions.set(sessionId, { sessionId, projectHash });
-      // Async: load messages from daemon when ready
-      this._client.getSession(projectHash, sessionId).then(detail => {
+      const messagesPromise = this._client.getSession(projectHash, sessionId)
+        .then(detail => detail?.messages)
+        .catch(() => undefined);
+      this._panelSessions.set(sessionId, { sessionId, projectHash, messagesPromise });
+      messagesPromise.then(messages => {
         const info = this._panelSessions.get(sessionId);
-        if (info && detail?.messages) {
-          info.messages = detail.messages;
+        if (info) {
+          info.messages = messages;
+          info.messagesPromise = undefined;
         }
-      }).catch(() => { /* session may not exist yet */ });
+      });
     }
 
     // When user switches to this tab in VS Code, sync sidebar selection
@@ -282,6 +281,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'selectModel':
           await this._setDefaultProvider(msg.provider || msg.model);
+          break;
+        case 'selectReasoningEffort':
+          await this._setReasoningEffort(msg.provider, msg.effort);
           break;
         case 'authLoginStart':
           await this._startLogin();
@@ -492,7 +494,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.stopGeneration();
       }
       await this._ensureSession(sid);
-      this._postMessageToPanel(sid, { type: 'clearChat' });
+      this._postMessage({ type: 'clearChat' });
     }
 
     this._postOrQueueToPanel(sid!, { type: 'userMessage', text });
@@ -567,13 +569,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     rt.isGenerating = false;
     rt.eventBuffer = [];
     void this._client.stopGeneration(sid).catch(() => undefined);
-    this._postMessageToPanel(sid, { type: 'generationStopped' });
+    this._postMessage({ type: 'generationStopped' });
   }
 
   public focusInput() {
     const sid = this._focusedPanelId;
     if (sid) {
-      this._postMessageToPanel(sid, { type: 'focusInput' });
+      this._postMessage({ type: 'focusInput' });
     }
   }
 
@@ -703,11 +705,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessageToPanel(streamSessionId, { type: 'tokens', prompt, completion, total });
       },
       onArtifactStart: (id, artifactType, language, title) =>
-        this._postMessage({ type: 'artifactStart', id, artifactType, language, title }),
+        this._postMessageToPanel(streamSessionId, { type: 'artifactStart', id, artifactType, language, title }),
       onArtifactContent: (id, content) =>
-        this._postMessage({ type: 'artifactContent', id, content }),
+        this._postMessageToPanel(streamSessionId, { type: 'artifactContent', id, content }),
       onArtifactEnd: (id) =>
-        this._postMessage({ type: 'artifactEnd', id }),
+        this._postMessageToPanel(streamSessionId, { type: 'artifactEnd', id }),
       onDone: (tokens, toolCalls, sessionId) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
@@ -720,6 +722,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           // Update panel bindings
           this._panels.set(sessionId, this._panels.get(streamSessionId)!);
           this._panels.delete(streamSessionId);
+          this._panelReady.set(sessionId, this._panelReady.get(streamSessionId)!);
+          this._panelReady.delete(streamSessionId);
           const info = this._panelSessions.get(streamSessionId);
           if (info) {
             info.sessionId = sessionId;
@@ -806,8 +810,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const panel = this._panels.get(s);
         if (panel?.webview === webview) {
           sid = info.sessionId;
-          messagesToLoad = info.messages;
+          messagesToLoad = info.messages ?? await info.messagesPromise;
           info.messages = undefined;
+          info.messagesPromise = undefined;
           break;
         }
       }
@@ -1084,6 +1089,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._sendSetupState();
     } catch (e) {
       this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+    }
+  }
+
+  private async _setReasoningEffort(provider: string, effort: string | null) {
+    if (!provider) return;
+    try {
+      await this._client.setReasoningEffort(provider, effort);
+      const models = await this._client.listModels();
+      this._broadcastMessage({ type: 'models', models });
+    } catch {
+      // Re-fetch current models to revert the optimistic UI update
+      try {
+        const models = await this._client.listModels();
+        this._broadcastMessage({ type: 'models', models });
+      } catch {
+        // Recovery failed — silently ignore
+      }
     }
   }
 
@@ -1533,6 +1555,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const info = this._panelSessions.get(sessionId);
       if (info) {
         info.projectHash = result.project_hash;
+        // Ensure cached messages are loaded before appending
+        if (!info.messages && info.messagesPromise) {
+          info.messages = (await info.messagesPromise) ?? [];
+          info.messagesPromise = undefined;
+        }
+        if (info.messages) {
+          info.messages = [
+            ...info.messages,
+            { role: 'user', content: userText },
+            { role: 'assistant', content: assistantText },
+          ];
+        }
       }
       this._getRuntime(sessionId).projectHash = result.project_hash;
       await this._refreshSessions();

@@ -173,6 +173,13 @@ export class DaemonClient {
     return this.get<ModelInfo[]>('/models');
   }
 
+  setReasoningEffort(provider: string, effort: string | null): Promise<{ ok: boolean }> {
+    return this.post<{ ok: boolean }>('/live/reasoning_effort', {
+      provider,
+      reasoning_effort: effort,
+    });
+  }
+
   // ── Skills ───────────────────────────────────────────────────
 
   listSkills(): Promise<SkillInfo[]> {

@@ -58,6 +58,8 @@ export interface ModelInfo {
   model: string;
   provider_type: string;
   is_default: boolean;
+  effort_applicable?: boolean;
+  reasoning_effort?: string | null;
   has_api_key?: boolean;
   base_url?: string;
   thinking_enabled?: boolean;
@@ -110,6 +112,7 @@ export interface ProviderInfo {
   thinking_type?: string;
   thinking_keep?: string;
   reasoning_history?: string;
+  reasoning_effort?: string | null;
   skip_tls_verify: boolean;
   ephemeral: boolean;
 }

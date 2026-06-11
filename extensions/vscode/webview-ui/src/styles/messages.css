@@ -334,6 +334,23 @@
 
 .markdown-root pre code { padding: 0; }
 
+.markdown-root .ansi-fg-black { color: var(--vscode-terminal-ansiBlack, #000000); }
+.markdown-root .ansi-fg-red { color: var(--vscode-terminal-ansiRed, #cd3131); }
+.markdown-root .ansi-fg-green { color: var(--vscode-terminal-ansiGreen, #00bc00); }
+.markdown-root .ansi-fg-yellow { color: var(--vscode-terminal-ansiYellow, #949800); }
+.markdown-root .ansi-fg-blue { color: var(--vscode-terminal-ansiBlue, #0451a5); }
+.markdown-root .ansi-fg-magenta { color: var(--vscode-terminal-ansiMagenta, #bc05bc); }
+.markdown-root .ansi-fg-cyan { color: var(--vscode-terminal-ansiCyan, #0598bc); }
+.markdown-root .ansi-fg-white { color: var(--vscode-terminal-ansiWhite, #555555); }
+.markdown-root .ansi-fg-bright-black { color: var(--vscode-terminal-ansiBrightBlack, #666666); }
+.markdown-root .ansi-fg-bright-red { color: var(--vscode-terminal-ansiBrightRed, #cd3131); }
+.markdown-root .ansi-fg-bright-green { color: var(--vscode-terminal-ansiBrightGreen, #14ce14); }
+.markdown-root .ansi-fg-bright-yellow { color: var(--vscode-terminal-ansiBrightYellow, #b5ba00); }
+.markdown-root .ansi-fg-bright-blue { color: var(--vscode-terminal-ansiBrightBlue, #0451a5); }
+.markdown-root .ansi-fg-bright-magenta { color: var(--vscode-terminal-ansiBrightMagenta, #bc05bc); }
+.markdown-root .ansi-fg-bright-cyan { color: var(--vscode-terminal-ansiBrightCyan, #0598bc); }
+.markdown-root .ansi-fg-bright-white { color: var(--vscode-terminal-ansiBrightWhite, #a5a5a5); }
+
 /* GFM tables are often wider than the VS Code sidebar. Keep the message in
    bounds and make the table itself horizontally scrollable. */
 .markdown-root table {

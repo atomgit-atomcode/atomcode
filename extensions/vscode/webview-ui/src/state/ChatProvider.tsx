@@ -12,6 +12,7 @@ interface ChatContextValue {
   stop: () => void;
   newConversation: () => void;
   selectModel: (provider: string, model?: string) => void;
+  selectReasoningEffort: (provider: string, effort: string | null) => void;
   loadSession: (sessionId: string, projectHash?: string) => void;
   openSidebar: () => void;
   openSessionInTab: (sessionId?: string, projectHash?: string) => void;
@@ -265,6 +266,11 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     postMessage({ type: 'selectModel', provider, model });
   }, []);
 
+  const selectReasoningEffort = useCallback((provider: string, effort: string | null) => {
+    dispatch({ type: 'SET_REASONING_EFFORT', provider, effort });
+    postMessage({ type: 'selectReasoningEffort', provider, effort });
+  }, []);
+
   const loadSession = useCallback((sessionId: string, projectHash?: string) => {
     postMessage({ type: 'loadSession', sessionId, projectHash });
   }, []);
@@ -334,6 +340,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     openSidebar,
     newConversation,
     selectModel,
+    selectReasoningEffort,
     loadSession,
     openSessionInTab,
     renameSession,

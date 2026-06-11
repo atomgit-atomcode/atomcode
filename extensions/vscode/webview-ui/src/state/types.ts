@@ -8,6 +8,8 @@ export interface ModelInfo {
   model: string;
   provider_type?: string;
   is_default: boolean;
+  effort_applicable?: boolean;
+  reasoning_effort?: string | null;
 }
 
 export interface UserInfo {
@@ -157,6 +159,7 @@ export type ChatAction =
   | { type: 'SET_SETUP_STATUS'; status?: string; error?: string; loginUrl?: string }
   | { type: 'SET_CURRENT_MODEL'; model: string }
   | { type: 'SET_CURRENT_PROVIDER'; provider: string; model?: string }
+  | { type: 'SET_REASONING_EFFORT'; provider: string; effort: string | null }
   | { type: 'SET_SESSIONS'; sessions: SessionMeta[] }
   | { type: 'SET_ACTIVE_SESSION'; sessionId?: string; projectHash?: string }
   | { type: 'ADD_CONTEXT_FILE'; file: ContextFile }

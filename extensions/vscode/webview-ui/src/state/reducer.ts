@@ -321,8 +321,18 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'CLEAR_CHAT':
       return { ...state, messages: [], queuedMessages: [], tokenCount: undefined, contextFiles: [], isGenerating: false };
 
-    case 'SET_MODELS':
-      return { ...state, models: action.models };
+    case 'SET_MODELS': {
+      const hasCurrent = action.models.some((m) => m.provider === state.currentProvider);
+      const current = hasCurrent
+        ? action.models.find((m) => m.provider === state.currentProvider)
+        : action.models.find((m) => m.is_default);
+      return {
+        ...state,
+        models: action.models,
+        currentProvider: current?.provider ?? state.currentProvider,
+        currentModel: current?.model ?? state.currentModel,
+      };
+    }
 
     case 'SET_PROVIDERS': {
       const current = action.providers.find((p) => p.name === action.defaultProvider)
@@ -377,6 +387,14 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         currentModel: action.model ?? provider?.model ?? state.currentModel,
       };
     }
+
+    case 'SET_REASONING_EFFORT':
+      return {
+        ...state,
+        models: state.models.map((m) =>
+          m.provider === action.provider ? { ...m, reasoning_effort: action.effort } : m,
+        ),
+      };
 
     case 'SET_SESSIONS':
       return { ...state, sessions: action.sessions };
