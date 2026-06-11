@@ -20,6 +20,16 @@ use ignore::WalkBuilder;
 /// walk completes).
 const STALE_TTL: Duration = Duration::from_secs(3);
 
+/// Hard cap on how many entries a single index walk collects. The `@`-mention
+/// popup only ever shows 30 rows and substring-searches the cache, so any real
+/// project is served fine well below this. Its purpose is a CPU/memory
+/// backstop: the gitignore-aware walk is otherwise unbounded, so launching
+/// atomcode in a giant tree (an accidental `~` / `/`, or a repo with a huge
+/// non-ignored generated dir) used to peg a core at 100% for minutes walking
+/// millions of files (macOS `~/Library` alone). Stopping at this many entries
+/// keeps the worst case sub-second.
+const MAX_INDEX_ENTRIES: usize = 50_000;
+
 // ---------------------------------------------------------------------------
 // Token detection
 // ---------------------------------------------------------------------------
@@ -302,7 +312,35 @@ impl FileIndex {
     }
 
     fn walk_inner(root: PathBuf) -> Vec<Entry> {
-        Self::walk_with_depth(root, None)
+        // A full recursive index of an entire home directory or filesystem
+        // root is never a useful `@`-mention scope, and traverses millions of
+        // files (macOS `~/Library`, caches, every node_modules outside a repo)
+        // — pegging a core at 100% CPU for minutes. Serve only the top level
+        // there; `MAX_INDEX_ENTRIES` still backstops any other huge tree.
+        if Self::is_home_or_filesystem_root(&root) {
+            return Self::walk_with_depth(root, Some(1), MAX_INDEX_ENTRIES);
+        }
+        Self::walk_with_depth(root, None, MAX_INDEX_ENTRIES)
+    }
+
+    /// True when `root` is a filesystem root (`/`, `C:\`, …) or the user's
+    /// home directory — the two cases where a full recursive walk is both
+    /// pathologically expensive and useless for `@`-mentions.
+    fn is_home_or_filesystem_root(root: &Path) -> bool {
+        // Filesystem roots have no parent component.
+        if root.parent().is_none() {
+            return true;
+        }
+        if let Some(home) = crate::platform::home_dir() {
+            // Prefer canonical comparison (resolves symlinks / trailing
+            // slashes); fall back to a literal match if either path can't be
+            // canonicalised.
+            return match (std::fs::canonicalize(root), std::fs::canonicalize(&home)) {
+                (Ok(rc), Ok(hc)) => rc == hc,
+                _ => root == home,
+            };
+        }
+        false
     }
 
     /// Gitignore-respecting walk shared by the full index (`max_depth = None`)
@@ -311,7 +349,7 @@ impl FileIndex {
     /// shallow and full views apply identical filtering (gitignore, `.git/`,
     /// whitespace), so warm-up results never include entries the full index
     /// later hides.
-    fn walk_with_depth(root: PathBuf, max_depth: Option<usize>) -> Vec<Entry> {
+    fn walk_with_depth(root: PathBuf, max_depth: Option<usize>, max_entries: usize) -> Vec<Entry> {
         let mut out = Vec::new();
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -361,6 +399,13 @@ impl FileIndex {
                 is_dir,
                 depth,
             });
+
+            // CPU/memory backstop: stop the (otherwise unbounded) walk once
+            // we've collected enough. Dropping the `walker` iterator here stops
+            // further filesystem traversal, so a giant tree can't peg a core.
+            if out.len() >= max_entries {
+                break;
+            }
         }
         out
     }
@@ -375,7 +420,7 @@ impl FileIndex {
     /// vanishing once the full walk replaces the cache. Still bounded to one
     /// directory level, so it stays effectively instant.
     fn scan_shallow(root: &Path) -> Vec<Entry> {
-        Self::walk_with_depth(root.to_path_buf(), Some(1))
+        Self::walk_with_depth(root.to_path_buf(), Some(1), MAX_INDEX_ENTRIES)
     }
 
     /// Re-point the index to a new root directory and clear all cached
@@ -922,6 +967,40 @@ mod tests {
             !names.contains(&"a.txt"),
             "after reset mid-flight should NOT see dir_a files, got: {:?}",
             names
+        );
+    }
+
+    // Regression: the gitignore-aware walk is otherwise unbounded, so a giant
+    // tree (an accidental run in `~` / `/`, a repo with a huge generated dir)
+    // pegged a core at 100% CPU walking millions of files. The walk must stop
+    // once it has collected `max_entries`.
+    #[test]
+    fn walk_with_depth_caps_entry_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            write_file(&tmp.path().join(format!("f{i}.txt")), "x");
+        }
+        let capped = FileIndex::walk_with_depth(tmp.path().to_path_buf(), None, 3);
+        assert!(
+            capped.len() <= 3,
+            "walk must stop at the cap, got {} entries",
+            capped.len()
+        );
+    }
+
+    // The home directory and filesystem roots must be detected so `walk_inner`
+    // serves only the shallow view instead of a full (pathological) recursive
+    // walk. A normal project dir must NOT be flagged.
+    #[test]
+    fn detects_filesystem_root_but_not_a_project_dir() {
+        assert!(
+            FileIndex::is_home_or_filesystem_root(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            "filesystem root must be flagged"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            !FileIndex::is_home_or_filesystem_root(tmp.path()),
+            "a normal project dir must not be flagged"
         );
     }
 
