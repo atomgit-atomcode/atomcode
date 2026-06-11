@@ -11,7 +11,9 @@ use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, ToolRegistry};
 use std::sync::Arc;
 
-/// Assemble a runnable, self-correcting coding agent from `cfg`.
+/// Assemble a runnable, self-correcting coding agent from `cfg` — the MINIMAL sync
+/// path (tools + codeintel only). For the FULL agent (web / skills / mcp / session
+/// persistence / memory) use the two-phase [`crate::prepare`] → [`crate::assemble`].
 ///
 /// Wires, all through existing kernel seams (no kernel change):
 /// - **provider**: OpenAI-compatible adapter (L1) from the config's creds.

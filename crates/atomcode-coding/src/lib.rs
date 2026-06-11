@@ -4,6 +4,10 @@
 //! capabilities ([`atomcode_capabilities`]) into a runnable coding agent that
 //! **self-corrects** — and it does so with ZERO `atomcode-core` involvement.
 //!
+//! NOTE: [`build_coding_agent`] is the MINIMAL sync assembly (tools + codeintel
+//! only). The FULL agent — web/skills/mcp/session persistence/memory wired — is the
+//! two-phase [`prepare`] → [`assemble`] in [`parts`].
+//!
 //! L2 owns three things, all mounted via existing kernel seams (no new kernel surface):
 //! 1. **Assembly** — [`build_coding_agent`]: wires provider + tools + codeintel +
 //!    approval + persona + the verify discipline into a kernel [`Agent`](atomcode_kernel::agent::Agent).
@@ -26,6 +30,7 @@
 
 pub mod config;
 pub mod discipline;
+pub mod parts;
 pub mod persona;
 
 mod assemble;
@@ -33,4 +38,5 @@ mod assemble;
 pub use assemble::{build_coding_agent, build_coding_agent_with};
 pub use config::CodingAgentConfig;
 pub use discipline::VerifyCadenceHook;
+pub use parts::{assemble, prepare, CodingParts, PrepareOptions, SessionBinding, SessionMode};
 pub use persona::coding_persona;

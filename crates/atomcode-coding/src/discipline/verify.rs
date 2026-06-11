@@ -85,6 +85,18 @@ fn unverified_edit_id(convo: &Conversation) -> Option<String> {
 
 #[async_trait]
 impl LifecycleHooks for VerifyCadenceHook {
+    /// The hook instance is REUSED across respawns (it lives in `CodingParts`), but
+    /// `nudged_for` is per-CONVERSATION state keyed by tool_call_id — and providers
+    /// with sequential per-conversation ids (`call_0`, `call_1`, …) would collide a
+    /// FRESH conversation's first edit with the old one's last nudge, wrongly
+    /// suppressing it once. A fresh session start resets; a resume keeps the state
+    /// (same conversation → an already-nudged edit must stay nudged).
+    async fn session_start(&self, _convo: &mut Conversation, resumed: bool) {
+        if !resumed {
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).nudged_for = None;
+        }
+    }
+
     async fn offer_continuation(&self, convo: &Conversation) -> Option<String> {
         let edit_id = unverified_edit_id(convo)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
