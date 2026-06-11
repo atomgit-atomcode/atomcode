@@ -256,6 +256,8 @@ name = "atomcode-clix"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atomcode-capabilities",
+ "atomcode-coding",
  "atomcode-kernel",
  "atomcode-review",
  "clap",

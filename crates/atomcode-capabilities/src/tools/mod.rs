@@ -49,7 +49,10 @@ pub mod web_fetch;
 #[cfg(feature = "web")]
 pub mod web_search;
 
-pub use approval::{ApprovalMiddleware, InMemoryPermissionStore, PermissionDecision, PermissionStore};
+pub use approval::{
+    ApprovalMiddleware, ApprovalRequest, ApprovalResponse, InMemoryPermissionStore,
+    PermissionDecision, PermissionStore, APPROVAL_KIND,
+};
 pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
 pub use cd::ChangeDirTool;

@@ -11,6 +11,8 @@
 //! an `api_key` of the form `$VAR` is expanded from the environment. `api_key` is optional
 //! (some gateways need none).
 
+mod code;
+
 use anyhow::{bail, Context, Result};
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
@@ -22,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Parser)]
-#[command(name = "atomcodex", about = "AtomCode standalone CLI (review only)")]
+#[command(name = "atomcodex", about = "AtomCode standalone CLI (new stack)")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -30,6 +32,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Interactive coding agent (full assembly: tools+codeintel+web+skills+mcp+session+memory).
+    Code(code::CodeArgs),
+    /// List this project's resumable sessions.
+    Sessions(code::SessionsArgs),
     /// Review the local git diff and report structured findings.
     Review(ReviewArgs),
 }
@@ -89,6 +95,8 @@ struct ReviewArgs {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Code(args) => code::code(args).await,
+        Cmd::Sessions(args) => code::sessions(args),
         Cmd::Review(args) => review(args).await,
     }
 }
@@ -256,7 +264,7 @@ async fn run_review_streaming(agent: Agent, task: String) -> ReviewRun {
 }
 
 /// A short, human one-liner describing a tool call's salient argument, for the live trace.
-fn tool_hint(name: &str, args_json: &str) -> String {
+pub(crate) fn tool_hint(name: &str, args_json: &str) -> String {
     let v: serde_json::Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
         Err(_) => return String::new(),
@@ -277,7 +285,7 @@ fn tool_hint(name: &str, args_json: &str) -> String {
     String::new()
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -287,18 +295,18 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// First non-empty value in precedence order.
-fn first_nonempty(vals: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+pub(crate) fn first_nonempty(vals: impl IntoIterator<Item = Option<String>>) -> Option<String> {
     vals.into_iter().flatten().find(|s| !s.trim().is_empty())
 }
 
 /// Read an env var, returning `None` when unset or empty.
-fn env(name: &str) -> Option<String> {
+pub(crate) fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }
 
 /// True if `base_url`'s host is an AtomGit/gitcode signing-enforced LLM gateway — those
 /// require AtomCode's proprietary request signing, which this neutral CLI cannot produce.
-fn is_signing_gateway(base_url: &str) -> bool {
+pub(crate) fn is_signing_gateway(base_url: &str) -> bool {
     const HOSTS: &[&str] =
         &["llm-api.atomgit.com", "api-ai.gitcode.com", "pre-llm-api-cce.atomgit.com"];
     // Match on host, not a bare substring, so a lookalike path can't trip it.
@@ -310,7 +318,7 @@ fn is_signing_gateway(base_url: &str) -> bool {
 /// Expand a WHOLE-VALUE env reference, consistent with the rest of the ecosystem:
 /// `$VAR`, `${VAR}`, or `${VAR:-default}`. Any other value passes through unchanged
 /// (no inline/partial substitution).
-fn expand_env(value: &str) -> String {
+pub(crate) fn expand_env(value: &str) -> String {
     if value.starts_with("${") {
         // `${VAR}` or `${VAR:-default}` — only when cleanly closed; else pass through.
         if let Some(inner) = value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
@@ -330,15 +338,15 @@ fn expand_env(value: &str) -> String {
 /// A `[providers.<name>]` entry in `~/.atomcode/config.toml`. All fields optional so a
 /// partial/foreign config still parses (extra keys like `type` are ignored).
 #[derive(Deserialize, Clone, Default)]
-struct ProviderEntry {
+pub(crate) struct ProviderEntry {
     #[serde(default)]
-    api_key: Option<String>,
+    pub(crate) api_key: Option<String>,
     #[serde(default)]
-    model: Option<String>,
+    pub(crate) model: Option<String>,
     #[serde(default)]
-    base_url: Option<String>,
+    pub(crate) base_url: Option<String>,
     #[serde(default)]
-    context_window: Option<u32>,
+    pub(crate) context_window: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -375,7 +383,7 @@ fn default_config_path() -> Option<PathBuf> {
 /// - file present but MALFORMED → `Err` (don't silently fall through to a confusing
 ///   "missing base URL" later);
 /// - file parses but has no matching provider → `Ok(None)`.
-fn load_provider_entry(
+pub(crate) fn load_provider_entry(
     config_override: Option<&Path>,
     provider: Option<&str>,
 ) -> Result<Option<ProviderEntry>> {
