@@ -860,7 +860,12 @@ pub(crate) fn compact_old_tool_results_in_place(
         return;
     }
     let cutoff_turn = turns.len() - keep_recent_turns;
-    let cutoff_msg = turns[cutoff_turn].start_idx.min(conv.messages.len());
+    let cutoff_msg = if cutoff_turn < turns.len() {
+        turns[cutoff_turn].start_idx.min(conv.messages.len())
+    } else {
+        // keep_recent_turns == 0: no turn is "recent", stub everything.
+        conv.messages.len()
+    };
 
     let call_id_to_tool = build_call_id_to_tool_map(&conv.messages);
 
@@ -3187,6 +3192,33 @@ mod tests {
         assert!(get("b0").starts_with("[bash "), "b0 must be stubbed");
         assert!(get("b1").starts_with("[bash "), "b1 must be stubbed");
         assert!(!get("b2").starts_with("[bash "), "b2 (last turn) must stay full");
+    }
+
+    #[test]
+    fn compact_old_keep_zero_recent_turns_stubs_all() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        // Three turns, keep_recent_turns=0 → ALL turns get stubbed.
+        for n in 0..3 {
+            conv.add_user_message(&format!("t{n}"));
+            let id = format!("b{n}");
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall { id: id.clone(), name: "bash".into(), arguments: "{}".into() }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: id,
+                output: format!("[elapsed: 0.{}s, exit: 0]\n{}", n, "x".repeat(3_000)),
+                success: true,
+            });
+        }
+
+        compact_old_tool_results_in_place(&mut conv, 0, false);
+        assert!(conv.messages.iter().any(|m| match &m.content {
+            MessageContent::ToolResult(r) => r.output.starts_with("[bash "),
+            _ => false,
+        }), "all bash results must be stubbed when keep_recent_turns=0");
     }
 
     #[test]
