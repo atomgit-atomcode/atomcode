@@ -106,6 +106,22 @@ pub(crate) fn spawn_live_forwarder(
                         break;
                     }
                 }
+                // 手机 App 请求执行斜杠命令（如 /status）→ TUI 白名单校验后执行，
+                // 输出经 CommandOutput 广播回去。
+                Ok(LiveEvent::RemoteCommand(line)) => {
+                    if fan_tx
+                        .send(RuntimeEvent {
+                            runtime_id,
+                            event: AgentEvent::RemoteSlashCommand(line),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                // 命令输出广播：TUI 自己执行命令时已在本地渲染过（或经
+                // RemoteSlashCommand 路径渲染），这里忽略，避免重复刷屏。
+                Ok(LiveEvent::CommandOutput(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }

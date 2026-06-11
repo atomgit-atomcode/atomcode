@@ -303,7 +303,109 @@ pub(super) fn attach_live_session(
     ));
 }
 
+/// 把 `CommandOutput` / `Error` 行旁路抄一份的渲染器包装：斜杠命令在同步模式
+/// 下执行时，文本输出经 LiveSession 广播给手机/webui（"电脑敲 /status，手机
+/// 也能看到"）。其余渲染行为全部透传给真实渲染器。
+struct CaptureRenderer<'a> {
+    inner: &'a mut dyn Renderer,
+    captured: String,
+}
+
+impl Renderer for CaptureRenderer<'_> {
+    fn render(&mut self, line: UiLine) {
+        if let UiLine::CommandOutput(s) | UiLine::Error(s) = &line {
+            if !self.captured.is_empty() {
+                self.captured.push('\n');
+            }
+            self.captured.push_str(s);
+        }
+        self.inner.render(line);
+    }
+    fn flush(&mut self) {
+        self.inner.flush();
+    }
+    fn shutdown(&mut self) {
+        self.inner.shutdown();
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn clear_screen(&mut self) {
+        self.inner.clear_screen();
+    }
+    fn suspend_for_external(&mut self) {
+        self.inner.suspend_for_external();
+    }
+    fn resume_from_external(&mut self) {
+        self.inner.resume_from_external();
+    }
+    fn flush_deferred(&mut self) {
+        self.inner.flush_deferred();
+    }
+    fn pop_approval_prompt(&mut self) {
+        self.inner.pop_approval_prompt();
+    }
+    fn on_resize(&mut self, cols: u16, rows: u16) {
+        self.inner.on_resize(cols, rows);
+    }
+}
+
+/// 同步模式下输出**不**镜像到手机的命令：它们的输出是桌面侧的接入引导
+/// （二维码、浏览器地址、同步提示），对手机端没有意义甚至是噪音。
+const MIRROR_EXCLUDED: &[&str] = &["app", "webui", "sync", "login", "logout"];
+
 pub(super) fn execute_slash_command(
+    cmd: &str,
+    arg: &str,
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    active_modal: &mut Option<Box<dyn Modal>>,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
+    setup_pending: &mut bool,
+) -> Result<()> {
+    // 同步模式（/app /webui /sync 附着中）：命令的文本输出抄送 LiveSession，
+    // 让手机/webui 同步看到桌面端执行了什么。非同步模式零开销直通。
+    let mirror = ctx
+        .sync_session
+        .clone()
+        .filter(|_| !MIRROR_EXCLUDED.contains(&cmd.to_ascii_lowercase().as_str()));
+    let Some(live) = mirror else {
+        return execute_slash_command_impl(
+            cmd,
+            arg,
+            state,
+            ctx,
+            renderer,
+            active_modal,
+            fixissue_pending,
+            fixissue_buffer,
+            setup_pending,
+        );
+    };
+    let mut cap = CaptureRenderer {
+        inner: renderer,
+        captured: String::new(),
+    };
+    let result = execute_slash_command_impl(
+        cmd,
+        arg,
+        state,
+        ctx,
+        &mut cap,
+        active_modal,
+        fixissue_pending,
+        fixissue_buffer,
+        setup_pending,
+    );
+    if !cap.captured.is_empty() {
+        live.notify_command_output(format!("/{}\n{}", cmd.trim_start_matches('/'), cap.captured));
+    }
+    result
+}
+
+fn execute_slash_command_impl(
     cmd: &str,
     arg: &str,
     state: &mut UiState,
@@ -691,43 +793,13 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "status" => {
-            let mut txt = t(Msg::StatusBody {
-                model: &ctx.model_name,
-                dir: &ctx.working_dir.display().to_string(),
-                config: &Config::default_path().display().to_string(),
-                tokens: state.total_tokens,
-            })
-            .into_owned();
-            txt.push_str(&render_codingplan_status_for_status_cmd());
-
-            txt.push('\n');
-            txt.push_str(&render_instruction_status_block(&ctx.working_dir));
-
-            renderer.render(UiLine::CommandOutput(txt));
+            renderer.render(UiLine::CommandOutput(build_status_text(ctx, state)));
             renderer.flush();
         }
         "diff" => {
-            let out = std::process::Command::new("git")
-                .args(["diff", "--stat"])
-                .current_dir(&ctx.working_dir)
-                .output();
-            match out {
-                Ok(o) => {
-                    let s = String::from_utf8_lossy(&o.stdout).to_string();
-                    renderer.render(UiLine::CommandOutput(if s.is_empty() {
-                        t(Msg::CmdNoChanges).into_owned()
-                    } else {
-                        s
-                    }));
-                }
-                Err(e) => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::DiffFailed {
-                            error: &format!("{}", e),
-                        })
-                        .into_owned(),
-                    ));
-                }
+            match build_diff_text(ctx) {
+                Ok(s) => renderer.render(UiLine::CommandOutput(s)),
+                Err(e) => renderer.render(UiLine::Error(e)),
             }
             renderer.flush();
         }
@@ -761,30 +833,7 @@ pub(super) fn execute_slash_command(
             }
         }
         "cost" => {
-            let total = state.prompt_tokens + state.completion_tokens;
-            let cache_rate = if state.prompt_tokens > 0 {
-                ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
-            } else {
-                0
-            };
-            let cost = atomcode_core::pricing::calculate_cost(
-                &ctx.model_name,
-                state.prompt_tokens,
-                state.completion_tokens,
-                state.cached_tokens,
-            );
-            let cost_str = atomcode_core::pricing::format_cost(cost);
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CostReport {
-                    prompt: state.prompt_tokens,
-                    completion: state.completion_tokens,
-                    cached: state.cached_tokens,
-                    cache_rate,
-                    total,
-                    cost: &cost_str,
-                })
-                .into_owned(),
-            ));
+            renderer.render(UiLine::CommandOutput(build_cost_text(ctx, state)));
             renderer.flush();
         }
         "context" => {
@@ -997,17 +1046,21 @@ pub(super) fn execute_slash_command(
                     "App 远程访问未在运行".to_string()
                 }
             } else {
-                // 中继地址：命令参数优先，否则读 ATOMCODE_APP_RELAY 环境变量。
+                // 官方生产中继。用户直接敲 `/app` 即可，无需选择/配置中继地址；
+                // 命令参数与 ATOMCODE_APP_RELAY 环境变量仅留作内部联调覆盖用。
+                const APP_DEFAULT_RELAY: &str = "https://relay-atomcode.atomgit.com";
+                // 中继地址：命令参数 > ATOMCODE_APP_RELAY 环境变量 > 生产默认。
                 let relay_base = if a.is_empty() {
-                    std::env::var("ATOMCODE_APP_RELAY").ok()
+                    std::env::var("ATOMCODE_APP_RELAY")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| Some(APP_DEFAULT_RELAY.to_string()))
                 } else {
                     Some(a.trim_start_matches("--relay").trim().to_string())
                 };
                 match relay_base.filter(|s| !s.is_empty()) {
-                    None => "用法：/app <中继地址>，或先设环境变量 \
-                             ATOMCODE_APP_RELAY=https://你的中继域名\n\
-                             （中继地址 = 你部署的 relay-server 公网根地址，\
-                             例如 https://relay.example.com）"
+                    // 仅在显式给了空参数（如 `/app --relay`）时可达。
+                    None => "用法：/app（默认连官方中继），或 /app <中继地址> 覆盖"
                         .to_string(),
                     Some(relay) => {
                         // 1) 用当前会话播种全局 LiveSession（与 /webui 同源）。
@@ -1160,20 +1213,7 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "whoami" => {
-            let txt = if let Some(auth) = atomcode_core::auth::get_stored_auth() {
-                let email = auth.user.email.as_deref().unwrap_or("—");
-                let name = auth.user.name.as_deref().unwrap_or(&auth.user.username);
-                format!(
-                    "  {} ({})\n  {}\n  auth: {}\n",
-                    name,
-                    auth.user.username,
-                    email,
-                    atomcode_core::auth::auth_file_path().display(),
-                )
-            } else {
-                t(Msg::CmdWhoamiNotSignedIn).into_owned()
-            };
-            renderer.render(UiLine::CommandOutput(txt));
+            renderer.render(UiLine::CommandOutput(build_whoami_text()));
             renderer.flush();
         }
         "upgrade" => {
@@ -3220,6 +3260,98 @@ pub(crate) fn launch_fixissue(
 /// (`AgentEvent::ProjectSwitched`). For the project-switch case, call
 /// `apply_cd` FIRST so `ctx.working_dir` is the new dir before the new
 /// `Session` is bound to it.
+/// `/status` 的报告文本。TUI arm 与手机远程执行（run_remote_command）共用。
+pub(super) fn build_status_text(ctx: &LoopCtx, state: &UiState) -> String {
+    let mut txt = t(Msg::StatusBody {
+        model: &ctx.model_name,
+        dir: &ctx.working_dir.display().to_string(),
+        config: &Config::default_path().display().to_string(),
+        tokens: state.total_tokens,
+    })
+    .into_owned();
+    txt.push_str(&render_codingplan_status_for_status_cmd());
+    txt.push('\n');
+    txt.push_str(&render_instruction_status_block(&ctx.working_dir));
+    txt
+}
+
+/// `/cost` 的用量报告文本。TUI arm 与手机远程执行共用。
+pub(super) fn build_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
+    let total = state.prompt_tokens + state.completion_tokens;
+    let cache_rate = if state.prompt_tokens > 0 {
+        ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
+    } else {
+        0
+    };
+    let cost = atomcode_core::pricing::calculate_cost(
+        &ctx.model_name,
+        state.prompt_tokens,
+        state.completion_tokens,
+        state.cached_tokens,
+    );
+    let cost_str = atomcode_core::pricing::format_cost(cost);
+    t(Msg::CostReport {
+        prompt: state.prompt_tokens,
+        completion: state.completion_tokens,
+        cached: state.cached_tokens,
+        cache_rate,
+        total,
+        cost: &cost_str,
+    })
+    .into_owned()
+}
+
+/// `/whoami` 的账号信息文本。TUI arm 与手机远程执行共用。
+pub(super) fn build_whoami_text() -> String {
+    if let Some(auth) = atomcode_core::auth::get_stored_auth() {
+        let email = auth.user.email.as_deref().unwrap_or("—");
+        let name = auth.user.name.as_deref().unwrap_or(&auth.user.username);
+        format!(
+            "  {} ({})\n  {}\n  auth: {}\n",
+            name,
+            auth.user.username,
+            email,
+            atomcode_core::auth::auth_file_path().display(),
+        )
+    } else {
+        t(Msg::CmdWhoamiNotSignedIn).into_owned()
+    }
+}
+
+/// `/diff` 的改动概要文本（Err = 渲染为错误行的文案）。TUI arm 与手机远程执行共用。
+pub(super) fn build_diff_text(ctx: &LoopCtx) -> Result<String, String> {
+    match std::process::Command::new("git")
+        .args(["diff", "--stat"])
+        .current_dir(&ctx.working_dir)
+        .output()
+    {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            Ok(if s.is_empty() {
+                t(Msg::CmdNoChanges).into_owned()
+            } else {
+                s
+            })
+        }
+        Err(e) => Err(t(Msg::DiffFailed {
+            error: &format!("{}", e),
+        })
+        .into_owned()),
+    }
+}
+
+/// 手机端可远程触发的**只读信息类**命令白名单。返回 None = 不允许远程执行
+/// （交互式/桌面专属命令一律拒绝，由调用方回话术）。
+pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> Option<String> {
+    match cmd.trim().trim_start_matches('/').to_ascii_lowercase().as_str() {
+        "status" => Some(build_status_text(ctx, state)),
+        "cost" => Some(build_cost_text(ctx, state)),
+        "whoami" => Some(build_whoami_text()),
+        "diff" => Some(build_diff_text(ctx).unwrap_or_else(|e| e)),
+        _ => None,
+    }
+}
+
 pub(crate) fn reset_to_new_session(
     ctx: &mut LoopCtx,
     state: &mut UiState,

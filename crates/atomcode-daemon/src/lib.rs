@@ -3949,6 +3949,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/provider", post(live_api::live_provider))
         .route("/live/cancel", post(live_api::live_cancel))
+        .route("/live/command", post(live_api::live_command))
         .route(
             "/live/reasoning_effort",
             post(live_api::live_reasoning_effort),

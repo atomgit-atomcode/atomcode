@@ -7172,6 +7172,32 @@ fn handle_agent_event(
                 }
             }
         }
+        AgentEvent::RemoteSlashCommand(line) => {
+            // 手机端发来的斜杠命令：只放行只读信息类白名单（status/cost/whoami/
+            // diff），在桌面同样渲染一份（让桌面用户知道手机做了什么），输出经
+            // CommandOutput 广播回手机。交互式/桌面专属命令礼貌拒绝。
+            let display = format!("/{}", line.trim().trim_start_matches('/'));
+            match commands::run_remote_command(ctx, state, &line) {
+                Some(txt) => {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "（手机端执行 {display}）"
+                    )));
+                    renderer.render(UiLine::CommandOutput(txt.clone()));
+                    renderer.flush();
+                    if let Some(live) = &ctx.sync_session {
+                        live.notify_command_output(format!("{display}\n{txt}"));
+                    }
+                }
+                None => {
+                    if let Some(live) = &ctx.sync_session {
+                        live.notify_command_output(format!(
+                            "{display}\n  该命令需要在桌面端执行（手机端仅支持 \
+                             /status /cost /whoami /diff）"
+                        ));
+                    }
+                }
+            }
+        }
         AgentEvent::ContextStats {
             system_tokens,
             sent_tokens,

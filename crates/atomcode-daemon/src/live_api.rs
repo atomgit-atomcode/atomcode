@@ -569,6 +569,10 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
+    /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
+    /// 前端整体显示为一条系统消息即可。
+    #[serde(rename = "command_output")]
+    CommandOutput { text: String },
     #[serde(rename = "user")]
     UserMessage {
         text: String,
@@ -639,6 +643,9 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
         // sync-mode TUI; the requesting client (mobile app) reconnects /live
         // with the session_id itself, so nothing to push on the wire.
         LiveEvent::SessionSwitched { .. } => return None,
+        // 仅进程内：由 TUI 执行，结果走 CommandOutput 回来。
+        LiveEvent::RemoteCommand(_) => return None,
+        LiveEvent::CommandOutput(text) => LiveWireEvent::CommandOutput { text },
         LiveEvent::Turn(te) => match te {
             TE::TextDelta(content) => LiveWireEvent::TextDelta { content },
             TE::ReasoningDelta(content) => LiveWireEvent::ReasoningDelta { content },
@@ -754,7 +761,7 @@ pub(crate) async fn live_stream(
             None => Vec::new(),
         },
     );
-    let (snapshot, mut rx) = session.join().await;
+    let (snapshot, replay, mut rx) = session.join_with_replay().await;
 
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
     let _ = tx.send(LiveWireEvent::Snapshot {
@@ -763,6 +770,14 @@ pub(crate) async fn live_stream(
         project_hash,
         provider: live_current_provider(),
     });
+    // 进行中回合的事件回放（StateChanged(Running) + 本回合 Turn 事件）：snapshot
+    // 只到上一个 turn 边界，这段补上当前回合已发生的执行过程（工具卡片、流式
+    // 文本、待审批请求），手机退后台回来/新 tab 中途加入不再丢进度。
+    for ev in replay {
+        if let Some(w) = to_wire(ev) {
+            let _ = tx.send(w);
+        }
+    }
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -1020,6 +1035,29 @@ pub(crate) async fn live_permission(
             false
         }
     };
+    Json(serde_json::json!({ "accepted": ok }))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct LiveCommandReq {
+    /// 形如 `/status` 的斜杠命令行（带不带前导 `/` 都接受）。
+    pub command: String,
+}
+
+/// POST /live/command —— 手机 App 请求桌面 TUI 执行一条斜杠命令。
+/// 白名单（只读信息类）在 TUI 侧校验；输出经 /live 的 `command_output` 事件
+/// 广播回来。返回 `{"accepted": bool}`：false 表示没有 TUI 附着（headless），
+/// 命令无人执行。
+pub(crate) async fn live_command(
+    State(_state): State<AppState>,
+    Json(req): Json<LiveCommandReq>,
+) -> impl IntoResponse {
+    let line = req.command.trim().to_string();
+    let ok = !line.is_empty()
+        && match current_live_session() {
+            Some(s) => s.notify_remote_command(line),
+            None => false,
+        };
     Json(serde_json::json!({ "accepted": ok }))
 }
 

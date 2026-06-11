@@ -403,6 +403,11 @@ pub enum AgentEvent {
     /// fresh one. Delivered over the live-sync channel
     /// (`LiveEvent::SessionSwitched` → here).
     SessionSwitched { dir: PathBuf, session_id: String },
+    /// The mobile app asked the desktop TUI to run a slash command (e.g.
+    /// `/status`). Whitelist-checked on the TUI side; the textual output is
+    /// broadcast back via `LiveEvent::CommandOutput`. Delivered over the
+    /// live-sync channel (`LiveEvent::RemoteCommand` → here).
+    RemoteSlashCommand(String),
     /// Context budget stats — piped into datalog and cached by the TUI
     /// for `/context`. Emitted after every turn's `ctx.build_messages`
     /// call, so stats reflect the snapshot the model actually saw.
