@@ -2752,7 +2752,7 @@ impl AgentLoop {
                         self.report_error("insufficient_balance", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return;
