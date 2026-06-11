@@ -279,7 +279,7 @@
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
             <span data-i18n="panel.login.title">登录后领取专属邀请链接</span>
           </div>
-          <div class="panel-meta" data-i18n="panel.meta.login">数据更新时间：登录后可见</div>
+          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span class="js-updated-at">--</span></div>
         </div>
         <div class="login-card">
           <p data-i18n="login.desc">使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。</p>
@@ -297,7 +297,7 @@
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
             <span data-i18n="panel.mine">我的专属邀请面板</span>
           </div>
-          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span>刚刚</span></div>
+          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span class="js-updated-at">--</span></div>
         </div>
         <div class="panel-body">
           <div class="user-strip">
@@ -321,7 +321,7 @@
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
             <span data-i18n="panel.mine">我的专属邀请面板</span>
           </div>
-          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span id="updated-at">刚刚</span></div>
+          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span class="js-updated-at">--</span></div>
         </div>
         <div class="panel-body">
           <div class="user-strip">
@@ -391,7 +391,6 @@ const T = {
   'hero.title': { zh: '邀请有礼：AtomCode 星推官计划', en: 'Referral Rewards: AtomCode Star Promoter Program' },
   'hero.sub': { zh: '获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。', en: 'Get your official invite link and invite developers to install and use AtomCode. High conversion earns bonus rewards, with weekly leaderboard updates.' },
   'panel.login.title': { zh: '登录后领取专属邀请链接', en: 'Sign in to get your invite link' },
-  'panel.meta.login': { zh: '数据更新时间：登录后可见', en: 'Updated: visible after sign-in' },
   'panel.mine': { zh: '我的专属邀请面板', en: 'My Referral Dashboard' },
   'panel.meta.prefix': { zh: '数据更新时间：', en: 'Updated: ' },
   'time.now': { zh: '刚刚', en: 'just now' },
@@ -673,7 +672,6 @@ function renderSummary(s) {
   document.getElementById('rate-card').classList.toggle('warn', !healthy);
   document.getElementById('rate-note').textContent = healthy ? t('note.healthy') : t('note.unhealthy');
   document.getElementById('amount-note').textContent = healthy ? t('note.amount.healthy') : t('note.amount.unhealthy') + ' (' + s.active + '\xd75)';
-  document.getElementById('updated-at').textContent = timeAgo(s.refreshedAt);
 }
 function timeAgo(isoStr) {
   if (!isoStr) return t('time.now');
@@ -706,6 +704,10 @@ async function loadLeaderboard(weekStart, targetId, rulesId) {
       weekLabel: weekLabelFromStart(resolvedWeekStart),
       weekStart: resolvedWeekStart,
     });
+    if (data.refreshed_at) {
+      const t = timeAgo(data.refreshed_at);
+      document.querySelectorAll('.js-updated-at').forEach(el => el.textContent = t);
+    }
   } catch (e) {
     console.error('Failed to load leaderboard', e);
     const resolvedWeekStart = weekStart || formatLocalDate(getMonday());
