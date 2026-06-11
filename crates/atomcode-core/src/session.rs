@@ -460,7 +460,7 @@ fn hash_path(path: &Path) -> String {
     // 2. Replace backslashes with forward slashes (Windows)
     // 3. Remove trailing slash (but keep root "/" or "C:/")
     // 4. Lowercase on Windows (case-insensitive filesystem)
-    let normalized = path.to_string_lossy();
+    let normalized = crate::tool::strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
     let mut normalized = normalized.replace('\\', "/");
 
     if normalized.len() > 1 && normalized.ends_with('/') {
@@ -713,6 +713,32 @@ mod tests {
             hash_path(path4),
             hash_path(path5),
             "Backslashes and trailing slash should both be normalized"
+        );
+    }
+
+    #[test]
+    fn test_hash_path_strips_windows_verbatim_prefix() {
+        // Regression: webui's /fs/list ran the chosen dir through
+        // `canonicalize()`, which on Windows yields a `\\?\D:\path` verbatim
+        // path. That round-tripped into the session cwd and hashed into a
+        // different bucket than the TUI's plain `D:\path`, so the two ends
+        // could never see each other's sessions. The verbatim and plain forms
+        // must now hash identically.
+        let verbatim = Path::new(r"\\?\D:\code\project");
+        let plain = Path::new(r"D:\code\project");
+        assert_eq!(
+            hash_path(verbatim),
+            hash_path(plain),
+            r"`\\?\` extended-length prefix must not change the session hash"
+        );
+
+        // UNC verbatim form `\\?\UNC\server\share` collapses to `\\server\share`.
+        let unc_verbatim = Path::new(r"\\?\UNC\server\share\proj");
+        let unc_plain = Path::new(r"\\server\share\proj");
+        assert_eq!(
+            hash_path(unc_verbatim),
+            hash_path(unc_plain),
+            r"`\\?\UNC\` prefix must collapse to a plain UNC path before hashing"
         );
     }
 

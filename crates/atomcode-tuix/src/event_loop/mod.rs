@@ -5334,7 +5334,12 @@ fn handle_idle_key(
             // "Unknown command: /foo" dead-end.
             let as_slash = parse_slash_line(&line).filter(|(cmd, _)| {
                 ctx.commands.find(cmd).is_some()
-                    || ctx.custom_commands.get(&cmd.to_ascii_lowercase()).is_some()
+                    // Use `resolve()` (not exact-key `get()`) so a plugin
+                    // command keyed `plugin:name` is recognised when typed as
+                    // the bare `/name` — matching how dispatch renders it.
+                    // Otherwise `/wechat` (keyed `weixin:wechat`) fails the
+                    // gate and falls through to the agent as plain text.
+                    || ctx.custom_commands.resolve(cmd).is_some()
                     || ctx
                         .skill_registry
                         .read()

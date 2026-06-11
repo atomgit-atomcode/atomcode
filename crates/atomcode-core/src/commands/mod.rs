@@ -158,23 +158,35 @@ impl CustomCommandRegistry {
         self.commands.get(name)
     }
 
-    /// Render the template for `name`, replacing `$ARGUMENTS` /
-    /// `${ARGUMENTS}` with the provided args string.
+    /// Resolve `name` to a command: by exact key first (`name` or
+    /// `plugin:name`), then falling back to a **bare-name** match. Plugin
+    /// commands are keyed `plugin:name` but listed/typed as just `name` — so
+    /// `/wechat` resolves to `weixin:wechat` when that bare name is unique.
+    /// Ambiguous bare names (same command name in two plugins) require the
+    /// full `plugin:name`.
     ///
-    /// Lookup is by exact key first (`name` or `plugin:name`). If that misses,
-    /// fall back to a **bare-name** match: plugin commands are keyed
-    /// `plugin:name` but listed/typed as just `name` — so `/wechat` should
-    /// resolve to `weixin:wechat` when that bare name is unique. Ambiguous bare
-    /// names (same command name in two plugins) require the full `plugin:name`.
-    pub fn render(&self, name: &str, args: &str) -> Option<String> {
-        let cmd = self.commands.get(name).or_else(|| {
+    /// This is the single source of truth for "is `name` a known custom
+    /// command?" — both the TUI submit gate (which decides whether to treat
+    /// `/name` as a slash command vs. a chat message) and [`render`] go
+    /// through it, so they can never disagree. Using exact-key [`get`] in the
+    /// gate while rendering via the bare-name path here was the bug that sent
+    /// `/wechat` to the agent as plain text.
+    pub fn resolve(&self, name: &str) -> Option<&CustomCommand> {
+        self.commands.get(name).or_else(|| {
             let mut matches = self.commands.values().filter(|c| c.name == name);
             let first = matches.next();
             match matches.next() {
                 None => first,   // unique bare-name match
                 Some(_) => None, // ambiguous → require plugin:name
             }
-        })?;
+        })
+    }
+
+    /// Render the template for `name`, replacing `$ARGUMENTS` /
+    /// `${ARGUMENTS}` with the provided args string. Name resolution follows
+    /// [`resolve`].
+    pub fn render(&self, name: &str, args: &str) -> Option<String> {
+        let cmd = self.resolve(name)?;
         Some(
             cmd.template
                 .replace("$ARGUMENTS", args)
@@ -454,6 +466,39 @@ mod tests {
         assert_eq!(reg.render("wechat", "login").as_deref(), Some("do login"));
         assert_eq!(reg.render("weixin:wechat", "").as_deref(), Some("do "));
         assert!(reg.render("nope", "").is_none());
+    }
+
+    #[test]
+    fn resolve_bare_name_matches_render_for_gate() {
+        // The TUI submit gate decides "is `/x` a slash command?" via
+        // `resolve()`, while dispatch renders via `render()`. They MUST
+        // agree, or a plugin command typed as `/wechat` (keyed
+        // `weixin:wechat`) passes neither/one and gets sent to the agent
+        // as plain text. `get()` is exact-key only and intentionally does
+        // NOT do bare-name fallback — so the gate must use `resolve()`.
+        let mut reg = CustomCommandRegistry::empty();
+        reg.commands.insert(
+            "weixin:wechat".into(),
+            CustomCommand {
+                name: "wechat".into(),
+                description: "d".into(),
+                args_requirement: ArgsRequirement::Optional,
+                template: "do $ARGUMENTS".into(),
+                source: std::path::PathBuf::from("x"),
+                namespace: Some("weixin".into()),
+            },
+        );
+        // The asymmetry that caused the bug: exact-key lookup misses.
+        assert!(reg.get("wechat").is_none());
+        // resolve() bridges it via the same bare-name fallback render() uses.
+        assert!(reg.resolve("wechat").is_some());
+        assert!(reg.resolve("weixin:wechat").is_some());
+        assert!(reg.resolve("nope").is_none());
+        // resolve() and render() must agree on what is a known command.
+        assert_eq!(
+            reg.resolve("wechat").is_some(),
+            reg.render("wechat", "").is_some()
+        );
     }
 
     #[test]

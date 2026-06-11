@@ -905,7 +905,7 @@ pub(crate) fn hash_path(path: &std::path::Path) -> String {
     // - Different path separators (Windows: `\` vs `/`)
     // - Case sensitivity (Windows paths are case-insensitive)
     // - Trailing slashes
-    let normalized = path.to_string_lossy();
+    let normalized = atomcode_core::tool::strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
     let mut normalized = normalized.replace('\\', "/");
 
     // Remove trailing slash (but keep root "/" or "C:/")
@@ -1273,6 +1273,11 @@ async fn change_dir(
 
             resolved
         };
+
+        // Strip any `\\?\` verbatim prefix before it reaches working_dir /
+        // session cwd / hash, so a path that round-tripped through a
+        // `canonicalize()`-based client still groups with the plain TUI form.
+        let new_path = atomcode_core::tool::strip_verbatim_prefix_path(&new_path);
 
         // Update state
         let old_dir = project.working_dir.clone();
@@ -3803,9 +3808,12 @@ async fn fs_list(
     State(_state): State<AppState>,
     Query(q): Query<FsListQuery>,
 ) -> impl IntoResponse {
-    // canonicalize 消解 `..`/符号链接；失败时退回展开后的路径
+    // canonicalize 消解 `..`/符号链接；失败时退回展开后的路径。
+    // Windows 上 canonicalize 会加 `\\?\` 扩展长度前缀，剥掉它，否则 webui
+    // 拿到 `\\?\D:\path` 回传给 /cd，会与 TUI 的 `D:\path` 落进不同的会话 hash 桶。
     let expanded = normalize_dir_arg(&q.path);
     let dir = expanded.canonicalize().unwrap_or(expanded);
+    let dir = atomcode_core::tool::strip_verbatim_prefix_path(&dir);
     match list_subdirs(&dir) {
         Ok(dirs) => Json(serde_json::json!({
             "path": dir.to_string_lossy(),
