@@ -32,12 +32,14 @@
 pub mod config;
 pub mod diff;
 pub mod persona;
+pub mod rules;
 
 mod assemble;
 
 pub use assemble::{build_review_agent, build_review_agent_with};
 pub use config::ReviewAgentConfig;
 pub use diff::annotate_diff_line_numbers;
+pub use rules::{changed_files_from_diff, render_rules_section};
 pub use persona::review_persona;
 
 /// Re-exported so a driver (CLI) can read findings without depending on

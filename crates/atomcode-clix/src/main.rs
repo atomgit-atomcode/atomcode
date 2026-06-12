@@ -91,6 +91,15 @@ struct ReviewArgs {
     /// Like --append-system-prompt, but read the section from a file (`-` for stdin).
     #[arg(long, conflicts_with = "append_system_prompt")]
     append_system_prompt_file: Option<String>,
+    /// Override built-in language review rules from this directory (`<dir>/<name>.md`,
+    /// e.g. go.md / sql.md) — hot-tune rules without a rebuild. Missing names fall back
+    /// to the built-ins.
+    #[arg(long)]
+    rules_dir: Option<PathBuf>,
+    /// Disable the built-in language-rules injection entirely (e.g. for prompt A/B
+    /// experiments that need a clean prompt).
+    #[arg(long)]
+    no_rules: bool,
     /// Run a CUSTOM task instead of diff review (for chat / explain / summary). Replaces the
     /// built-in "review this diff" task with this text and SKIPS diff computation — the caller
     /// puts everything the model needs (question, target code, any diff context) into the text.
@@ -136,6 +145,8 @@ async fn review(args: ReviewArgs) -> Result<()> {
 
     // Two modes: a CUSTOM task (chat/explain/summary — no diff) or the built-in diff review.
     let custom_task = resolve_task(args.task.clone(), args.task_file.clone())?;
+    // Language-rules section matched against the diff's changed files (diff mode only).
+    let mut rules_section: Option<String> = None;
     let (task, trace_label) = match custom_task {
         Some(t) => {
             let label = format!("custom task ({} chars)", t.len());
@@ -148,6 +159,15 @@ async fn review(args: ReviewArgs) -> Result<()> {
                 return Ok(());
             }
             let label = format!("{} changed line(s)", diff.lines().count());
+            // Language rules matched against the changed files (before annotation; the
+            // `+++` lines carry the names either way).
+            if !args.no_rules {
+                let files = atomcode_review::changed_files_from_diff(&diff);
+                let section = atomcode_review::render_rules_section(&files, args.rules_dir.as_deref());
+                if !section.is_empty() {
+                    rules_section = Some(section);
+                }
+            }
             // Prefix every hunk line with its REAL file line number so the model anchors
             // findings precisely instead of counting lines itself.
             let diff = atomcode_review::annotate_diff_line_numbers(&diff);
@@ -204,9 +224,15 @@ async fn review(args: ReviewArgs) -> Result<()> {
     cfg.stream_timeout = std::time::Duration::from_secs(args.stream_timeout);
     // Full system-prompt override (flag text > file/stdin). None ⇒ built-in reviewer persona.
     cfg.persona = resolve_system_prompt(args.system_prompt.clone(), args.system_prompt_file.clone())?;
-    // Appended section (domain rules / ignore lists / PR metadata) — composes on top.
-    cfg.persona_append =
+    // Appended sections compose after the persona: engine-injected language rules first,
+    // then the caller's append (later text wins when guidance overlaps).
+    let user_append =
         resolve_system_prompt(args.append_system_prompt.clone(), args.append_system_prompt_file.clone())?;
+    cfg.persona_append = match (rules_section, user_append) {
+        (Some(r), Some(u)) => Some(format!("{r}\n\n{u}")),
+        (Some(r), None) => Some(r),
+        (None, u) => u,
+    };
     let model_label = cfg.model.clone();
     let (agent, report) = build_review_agent(cfg).map_err(|e| anyhow::anyhow!(e))?;
 
