@@ -32,6 +32,73 @@ use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{Tool, ToolCall, ToolDef, ToolResult};
 use atomcode_telemetry::{CurrentContext, Event, LlmErrorKind, Telemetry, ToolErrorKind};
 
+/// Estimate the tokens a single outgoing message contributes — the byte/4
+/// heuristic the legacy `Message::estimate_tokens` uses, adapted to the kernel's
+/// FLAT message shape (text + tool_calls + reasoning + images). Approximate by
+/// design: the EXACT prompt total comes from the provider's usage report; this only
+/// apportions it across zones for the LlmChat breakdown.
+fn estimate_message_tokens(m: &Message) -> u32 {
+    use atomcode_kernel::message::Role;
+    // Images dominate when present (vision ≈ 1600 tok each), mirroring legacy.
+    if !m.images.is_empty() {
+        return ((m.text.len() / 4).max(1) + m.images.len() * 1600 + 4) as u32;
+    }
+    let byte_count = if m.role == Role::Tool {
+        m.text.len() + 10 // tool result + small wrapper overhead
+    } else if !m.tool_calls.is_empty() {
+        let calls: usize = m
+            .tool_calls
+            .iter()
+            .map(|tc| tc.name.len() + tc.arguments.len() + 20)
+            .sum();
+        m.text.len() + calls + m.reasoning.as_ref().map_or(0, |r| r.len())
+    } else {
+        m.text.len()
+    };
+    ((byte_count / 4).max(1) + 4) as u32
+}
+
+/// Scale per-zone estimates so they sum to EXACTLY `target` (the rounding residual
+/// lands on the largest zone). Returns the raw estimates when there's nothing to
+/// scale to (`target == 0` or all-zero estimates).
+fn scale_to(target: u32, est: [u32; 4]) -> (u32, u32, u32, u32) {
+    let sum: u32 = est.iter().sum();
+    if target == 0 || sum == 0 {
+        return (est[0], est[1], est[2], est[3]);
+    }
+    let scale = target as f64 / sum as f64;
+    let mut out = [0u32; 4];
+    for i in 0..4 {
+        out[i] = (est[i] as f64 * scale).round() as u32;
+    }
+    let residual = target as i64 - out.iter().map(|&x| x as i64).sum::<i64>();
+    if residual != 0 {
+        let max_i = (0..4).max_by_key(|&i| out[i]).unwrap_or(0);
+        out[max_i] = (out[max_i] as i64 + residual).max(0) as u32;
+    }
+    (out[0], out[1], out[2], out[3])
+}
+
+/// Split the EXACT prompt `total` into (system, message, tool_result, tool_def).
+/// `anchored` is the message zone's REAL-measured portion (assistant tokens from
+/// usage reports) — it is preserved untouched; only the UNMEASURED remainder
+/// (`total - anchored`) is distributed across the byte/4 `est` zones. The four always
+/// sum to `total`. (`est` = [system, message(non-anchored), tool_result, tool_def].)
+fn apportion(total: u32, anchored: u32, est: [u32; 4]) -> (u32, u32, u32, u32) {
+    if total == 0 {
+        // Failed round (no usage): raw estimates, the anchor folded into the message zone.
+        return (est[0], est[1].saturating_add(anchored), est[2], est[3]);
+    }
+    if anchored >= total || est.iter().sum::<u32>() == 0 {
+        // The real anchor alone meets the budget (or nothing to estimate): the whole
+        // total is the message zone. Keeps the sum exact. (Effectively unreachable —
+        // assistant history can't exceed a prompt that contains it plus system/tools.)
+        return (0, total, 0, 0);
+    }
+    let (s, msg, tr, td) = scale_to(total - anchored, est);
+    (s, msg + anchored, tr, td)
+}
+
 /// Map a provider/stream error message onto a telemetry `LlmErrorKind`. Mirrors the
 /// legacy `classify_llm_error` (which lives in core, off-limits here).
 fn classify_llm_error(reason: &str) -> LlmErrorKind {
@@ -102,8 +169,21 @@ impl Attribution {
 /// `on_request`.
 pub struct TelemetryHook {
     attr: Attribution,
+    /// Per-zone prompt token estimates captured at `on_request` and read by the
+    /// matching `on_model_response` (same round; one round at a time, so plain
+    /// atomics suffice). The EXACT prompt TOTAL still comes from the usage report —
+    /// these only break it down by zone for the LlmChat fields.
     last_messages_count: AtomicU32,
-    last_tool_def_bytes: AtomicU32,
+    last_system_tokens: AtomicU32,
+    /// byte/4 estimate of the message zone EXCLUDING real-anchored assistant tokens
+    /// (user messages + any assistant message missing a real count).
+    last_message_tokens: AtomicU32,
+    /// REAL assistant tokens (sum of stored `meta.tokens.completion`) — the message
+    /// zone's measured portion, preserved (never re-scaled), per the compaction
+    /// subsystem's "trust real usage, estimate only the rest" principle.
+    last_anchored_tokens: AtomicU32,
+    last_tool_result_tokens: AtomicU32,
+    last_tool_def_tokens: AtomicU32,
     /// Last error observed via `on_error`, consumed by `turn_complete` to classify a
     /// failed turn. (`on_error` also fires for tool errors, but `turn_complete` only
     /// reads it on a PROVIDER terminal reason — so tool errors never become LlmChat.)
@@ -120,7 +200,11 @@ impl TelemetryHook {
         Self {
             attr: Attribution::new(telemetry, vendor, base_url, model),
             last_messages_count: AtomicU32::new(0),
-            last_tool_def_bytes: AtomicU32::new(0),
+            last_system_tokens: AtomicU32::new(0),
+            last_message_tokens: AtomicU32::new(0),
+            last_anchored_tokens: AtomicU32::new(0),
+            last_tool_result_tokens: AtomicU32::new(0),
+            last_tool_def_tokens: AtomicU32::new(0),
             last_error: StdMutex::new(None),
         }
     }
@@ -135,18 +219,68 @@ impl LifecycleHooks for TelemetryHook {
         _options: &ChatOptions,
         _ctx: &TurnCtx,
     ) {
+        use atomcode_kernel::message::Role;
         self.last_messages_count
             .store(messages.len() as u32, Ordering::Relaxed);
-        let bytes: usize = tools
+
+        // Apportion the prompt across zones. system / user / tool-result are byte/4
+        // estimates; an ASSISTANT message instead contributes its REAL token count
+        // (the provider's `meta.tokens.completion` recorded when it was generated) —
+        // anchoring the measured portion instead of re-estimating it.
+        let mut system = 0u32;
+        let mut msg = 0u32;
+        let mut anchored = 0u32;
+        let mut tool_result = 0u32;
+        for m in messages {
+            match m.role {
+                Role::System => system += estimate_message_tokens(m),
+                Role::Tool => tool_result += estimate_message_tokens(m),
+                Role::User => msg += estimate_message_tokens(m),
+                Role::Assistant => {
+                    match m.meta.as_ref().map(|mm| mm.tokens.completion).filter(|&c| c > 0) {
+                        Some(real) => anchored += real,
+                        None => msg += estimate_message_tokens(m),
+                    }
+                }
+            }
+        }
+        // tool_def: name + description + serialized params, ~4 chars/token + overhead.
+        let tool_def: u32 = tools
             .iter()
-            .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+            .map(|t| {
+                ((t.name.len() + t.description.len() + t.parameters.to_string().len()) / 4 + 4)
+                    as u32
+            })
             .sum();
-        self.last_tool_def_bytes.store(bytes as u32, Ordering::Relaxed);
+
+        self.last_system_tokens.store(system, Ordering::Relaxed);
+        self.last_message_tokens.store(msg, Ordering::Relaxed);
+        self.last_anchored_tokens.store(anchored, Ordering::Relaxed);
+        self.last_tool_result_tokens.store(tool_result, Ordering::Relaxed);
+        self.last_tool_def_tokens.store(tool_def, Ordering::Relaxed);
     }
 
     async fn on_model_response(&self, response: &mut Message) {
         // No meta (e.g. a synthesized/empty response) ⇒ nothing to report.
         let Some(m) = response.meta.as_ref() else { return };
+
+        // Apportion the EXACT prompt total across zones: the byte/4 estimates only
+        // give the RELATIVE split (the provider's true tokenizer is unknown), but the
+        // absolute total IS known (the usage report). Scaling the estimates to sum to
+        // that total anchors the breakdown to ground truth — strictly more precise
+        // than a raw heuristic that can drift 0.7–1.3× from the real total.
+        let (system_tokens, message_tokens, tool_result_tokens, tool_def_tokens) =
+            apportion(
+                m.tokens.prompt,
+                self.last_anchored_tokens.load(Ordering::Relaxed),
+                [
+                    self.last_system_tokens.load(Ordering::Relaxed),
+                    self.last_message_tokens.load(Ordering::Relaxed),
+                    self.last_tool_result_tokens.load(Ordering::Relaxed),
+                    self.last_tool_def_tokens.load(Ordering::Relaxed),
+                ],
+            );
+
         let event = Event::LlmChat {
             duration_ms: m.elapsed_ms as u32,
             tool_calls_count: response.tool_calls.len() as u32,
@@ -155,11 +289,10 @@ impl LifecycleHooks for TelemetryHook {
             cached_tokens: m.tokens.cached,
             had_error: false,
             context_window: m.ctx_window,
-            // Not broken down by the kernel — only the totals above are exact.
-            system_tokens: 0,
-            tool_def_tokens: self.last_tool_def_bytes.load(Ordering::Relaxed) / 4,
-            tool_result_tokens: 0,
-            message_tokens: 0,
+            system_tokens,
+            tool_def_tokens,
+            tool_result_tokens,
+            message_tokens,
             messages_count: self.last_messages_count.load(Ordering::Relaxed),
             error_kind: None,
             error_data: None,
@@ -333,6 +466,127 @@ mod tests {
         }
         assert_eq!(records[0].envelope.provider.as_deref(), Some("openai"));
         assert_eq!(records[0].envelope.model.as_deref(), Some("deepseek-v4"));
+    }
+
+    #[tokio::test]
+    async fn breaks_down_prompt_zones() {
+        use atomcode_kernel::message::Role;
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m");
+
+        let mut sys = Message::user("you are a helpful coding agent");
+        sys.role = Role::System;
+        let user = Message::user("hello there");
+        let tool_res = Message::tool_result("c1", "a chunk of tool output text", false);
+        let tools = vec![ToolDef {
+            name: "bash".into(),
+            description: "run a shell command".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        hook.on_request(&[sys, user, tool_res], &tools, &ChatOptions::default(), &TurnCtx::default())
+            .await;
+
+        let mut resp = Message::assistant("ok", vec![]);
+        resp.meta = Some(MessageMeta {
+            tokens: TokenUsage { prompt: 50, completion: 5, cached: 0 },
+            ctx_window: 1000,
+            ..Default::default()
+        });
+        hook.on_model_response(&mut resp).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = captured.lock().await;
+        match &records[0].event {
+            Event::LlmChat {
+                input_tokens,
+                system_tokens,
+                message_tokens,
+                tool_result_tokens,
+                tool_def_tokens,
+                messages_count,
+                ..
+            } => {
+                assert!(*system_tokens > 0, "system zone");
+                assert!(*message_tokens > 0, "user/assistant zone");
+                assert!(*tool_result_tokens > 0, "tool-result zone");
+                assert!(*tool_def_tokens > 0, "tool-def zone");
+                assert_eq!(*messages_count, 3);
+                // The precision property: zones sum to the EXACT prompt total.
+                assert_eq!(
+                    system_tokens + message_tokens + tool_result_tokens + tool_def_tokens,
+                    *input_tokens,
+                    "zones must sum to the provider-reported prompt total"
+                );
+            }
+            other => panic!("expected LlmChat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apportion_anchors_real_and_sums_to_total() {
+        // No anchor: pure scale of the byte/4 estimates to the exact total.
+        let (a, b, c, d) = apportion(100, 0, [10, 20, 30, 40]);
+        assert_eq!(a + b + c + d, 100);
+        assert!(d > a && d > b && d > c, "largest estimate keeps the largest share");
+
+        // With an anchor: the REAL portion is preserved untouched in the message zone,
+        // only the remainder (60) is distributed across the estimates; sum stays exact.
+        let (s, msg, tr, td) = apportion(100, 40, [10, 0, 10, 10]);
+        assert_eq!(s + msg + tr + td, 100, "zones sum to the exact total");
+        assert!(msg >= 40, "real anchor is preserved in the message zone");
+
+        // Failed round (total 0): estimates pass through, anchor folds into message.
+        assert_eq!(apportion(0, 5, [1, 2, 3, 4]), (1, 7, 3, 4));
+    }
+
+    #[tokio::test]
+    async fn anchors_real_assistant_tokens_in_breakdown() {
+        use atomcode_kernel::message::Role;
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m");
+
+        let mut sys = Message::user("system persona");
+        sys.role = Role::System;
+        // A past assistant reply carrying a REAL provider completion-token count.
+        let mut past = Message::assistant("a prior reply", vec![]);
+        past.meta = Some(MessageMeta {
+            tokens: TokenUsage { prompt: 0, completion: 30, cached: 0 },
+            ..Default::default()
+        });
+        let user = Message::user("next question");
+        hook.on_request(&[sys, past, user], &[], &ChatOptions::default(), &TurnCtx::default())
+            .await;
+
+        let mut resp = Message::assistant("ok", vec![]);
+        resp.meta = Some(MessageMeta {
+            tokens: TokenUsage { prompt: 100, completion: 5, cached: 0 },
+            ctx_window: 1000,
+            ..Default::default()
+        });
+        hook.on_model_response(&mut resp).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = captured.lock().await;
+        match &records[0].event {
+            Event::LlmChat {
+                input_tokens,
+                system_tokens,
+                message_tokens,
+                tool_result_tokens,
+                tool_def_tokens,
+                ..
+            } => {
+                assert_eq!(*input_tokens, 100);
+                assert!(*system_tokens > 0, "system zone scaled from estimate");
+                assert!(*message_tokens >= 30, "real assistant tokens preserved, not scaled away");
+                assert_eq!(
+                    system_tokens + message_tokens + tool_result_tokens + tool_def_tokens,
+                    100,
+                    "zones still sum to the exact total"
+                );
+            }
+            other => panic!("expected LlmChat, got {other:?}"),
+        }
     }
 
     #[tokio::test]
