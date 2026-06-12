@@ -843,7 +843,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     }
                 } else {
                     push_str_cells(&mut row, &cont_pad, &pad);
-                    push_str_cells(&mut row, chunk, detail_style);
+                    // Continuation chunks: track cumulative width so we know
+                    // whether we're still within the tool name or past it.
+                    let chunk_dw = crate::width::display_width(chunk);
+                    let consumed_dw: usize = chunks[..i]
+                        .iter()
+                        .map(|c| crate::width::display_width(c))
+                        .sum();
+                    if consumed_dw + chunk_dw <= name_dw {
+                        // Entire chunk is still within the tool name
+                        push_str_cells(&mut row, chunk, name_style);
+                    } else if consumed_dw < name_dw {
+                        // Chunk straddles name/detail boundary
+                        let name_remain = name_dw - consumed_dw;
+                        let name_part = crate::width::truncate_to_width(chunk, name_remain);
+                        push_str_cells(&mut row, &name_part, name_style);
+                        let rest = &chunk[name_part.len()..];
+                        if !rest.is_empty() {
+                            push_str_cells(&mut row, rest, detail_style);
+                        }
+                    } else {
+                        // Chunk is entirely past the tool name
+                        push_str_cells(&mut row, chunk, detail_style);
+                    }
                 }
                 rows.push(row);
             }
@@ -6945,7 +6967,7 @@ mod tests {
         let (mut r, _buf) = new_capturing(80, 24);
         let before = r.body_lines.len();
         r.render(UiLine::CommandOutput(
-            "  ○ Press Ctrl+O to show real-time output\n".into(),
+            "  ○ Press Ctrl+o to show real-time output\n".into(),
         ));
         let pushed = r.body_lines.len() - before;
         assert_eq!(
