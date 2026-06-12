@@ -30,6 +30,9 @@ pub struct BridgeConfig {
     pub context_window: u32,
     /// Disable MCP connection (mirrors the legacy `--no-mcp` style switches).
     pub mcp: bool,
+    /// Telemetry sink forwarded to the coding assembly (→ a `LlmChat`-emitting
+    /// hook). `None` ⇒ no telemetry. The driver supplies its own `Telemetry`.
+    pub telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -110,6 +113,7 @@ impl Bridge {
             &cfg.working_dir,
         );
         coding_cfg.context_window = cfg.context_window;
+        coding_cfg.telemetry = cfg.telemetry.clone();
 
         let opts_template = PrepareOptions {
             session: SessionMode::Fresh,

@@ -200,6 +200,18 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
     // date in a Disabled-session CI run too.
     hooks.push(Arc::new(CurrentDateHook::new()));
     hooks.push(Arc::new(VerifyCadenceHook::new()));
+    // 6. TelemetryHook — observation-only (on_request + on_model_response): emits
+    //    LlmChat per round. Last in the chain; it mutates nothing, so order is moot.
+    //    Only when the driver supplied a telemetry sink (kernel stays zero-telemetry
+    //    otherwise). The new stack always speaks OpenAI-compat → vendor "openai".
+    if let Some(tel) = &cfg.telemetry {
+        hooks.push(Arc::new(crate::telemetry::TelemetryHook::new(
+            tel.clone(),
+            "openai",
+            &cfg.base_url,
+            &cfg.model,
+        )));
+    }
 
     Ok(CodingParts {
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
@@ -262,9 +274,23 @@ pub fn assemble(
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
-        .persona(coding_persona(&cfg.model))
-        // Approval FIRST — a later arg-rewriting middleware can never change what
-        // the user approved (the approve-what-runs contract).
+        .persona(coding_persona(&cfg.model));
+    // Tool telemetry registers BEFORE approval. It is observation-only — it never
+    // rewrites args or blocks — so it does NOT affect the approve-what-runs contract
+    // (which only requires ARG-REWRITING middleware to sit after approval). Going
+    // first means its `before` always stamps the call, so a tool that approval then
+    // DENIES is still recorded (the after-chain runs for every middleware).
+    if let Some(tel) = &cfg.telemetry {
+        builder = builder.middleware(Arc::new(crate::telemetry::ToolTelemetryMiddleware::new(
+            tel.clone(),
+            "openai",
+            &cfg.base_url,
+            &cfg.model,
+        )));
+    }
+    let mut builder = builder
+        // Approval BEFORE any arg-rewriting middleware — the user approves the exact
+        // bytes that run.
         .middleware(parts.approval.clone())
         // LIVE cwd handle (not the immutable pin): /cd mutates parts.shared_cwd.
         .working_dir_shared(parts.shared_cwd.clone())

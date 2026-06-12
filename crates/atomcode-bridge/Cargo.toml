@@ -12,6 +12,7 @@ atomcode-core = { path = "../atomcode-core" }
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "session", "memory", "mcp"] }
 atomcode-coding = { path = "../atomcode-coding" }
+atomcode-telemetry = { path = "../atomcode-telemetry" }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 serde_json = "1"
 anyhow = "1"

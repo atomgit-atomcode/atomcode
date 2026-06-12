@@ -219,6 +219,7 @@ dependencies = [
  "atomcode-coding",
  "atomcode-core",
  "atomcode-kernel",
+ "atomcode-telemetry",
  "getrandom 0.2.17",
  "serde_json",
  "tempfile",
@@ -292,6 +293,7 @@ dependencies = [
  "async-trait",
  "atomcode-capabilities",
  "atomcode-kernel",
+ "atomcode-telemetry",
  "dirs 6.0.0",
  "serde_json",
  "tempfile",
@@ -372,6 +374,7 @@ version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "atomcode-bridge",
  "atomcode-core",
  "atomcode-telemetry",
  "axum",

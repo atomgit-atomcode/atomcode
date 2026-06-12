@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::Conversation;
@@ -151,14 +152,25 @@ pub(crate) fn ensure_live_session_global(
     let session_id = session_id.unwrap_or_default();
     // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
     *LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
-    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(DaemonTurnExecutor {
-        working_dir,
-        provider_name: None,
-        mcp_cache,
-        telemetry,
-        auto_approve: false,
-        session_id,
-    });
+    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = if live_engine_v2() {
+        eprintln!("[engine v2] daemon live turns on the new stack");
+        Arc::new(KernelTurnExecutor::new(
+            working_dir,
+            None,
+            false,
+            session_id,
+            telemetry,
+        ))
+    } else {
+        Arc::new(DaemonTurnExecutor {
+            working_dir,
+            provider_name: None,
+            mcp_cache,
+            telemetry,
+            auto_approve: false,
+            session_id,
+        })
+    };
     // 历史在锁内、确认要建会话后才求值——既省掉无谓读盘，也避免「锁外判定、锁内已被
     // 别的请求替换」的 TOCTOU：是否新建与用什么历史新建是同一临界区里的决定。
     let session = atomcode_core::live::LiveSession::new(executor, initial_messages());
@@ -517,6 +529,279 @@ impl TurnExecutor for DaemonTurnExecutor {
             session.touch();
             if let Err(e) = SessionManager::new(&self.working_dir).save(&session) {
                 eprintln!("Warning: failed to save live session: {e}");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Engine v2: kernel-backed TurnExecutor (via atomcode-bridge)
+// ============================================================================
+
+/// True when the daemon should run live turns on the NEW stack (kernel +
+/// capabilities + coding) via atomcode-bridge. Selected by `$ATOMCODE_ENGINE`
+/// (same switch the cli uses); off by default → the legacy `DaemonTurnExecutor`.
+pub(crate) fn live_engine_v2() -> bool {
+    matches!(
+        std::env::var("ATOMCODE_ENGINE").ok().as_deref(),
+        Some("v2" | "2" | "new")
+    )
+}
+
+/// `TurnExecutor` backed by the new stack, presented through atomcode-bridge's
+/// legacy channel protocol. ONE bridge runtime per LiveSession (persistent across
+/// turns) so MCP/memory are prepared once, not per message. `conv` stays the
+/// source of truth: the bridge is seeded from it on the first turn, then each turn
+/// sends only the new user message and the engine's resulting snapshot is written
+/// back.
+pub(crate) struct KernelTurnExecutor {
+    working_dir: PathBuf,
+    provider_name: Option<String>,
+    /// Phase-2 default false (interactive); the approver slot is wired to the
+    /// bridge's ApproveTool/DenyTool exactly as the legacy executor wires it to
+    /// the PermissionDecider.
+    auto_approve: bool,
+    session_id: atomcode_core::session::SessionId,
+    telemetry: Arc<Telemetry>,
+    /// Persistent bridge runtime; built lazily on the first turn.
+    bridge: Mutex<Option<BridgeState>>,
+}
+
+struct BridgeState {
+    client: AgentClient,
+    events: mpsc::UnboundedReceiver<AgentEvent>,
+    /// Whether the pre-existing history has been seeded into the bridge.
+    seeded: bool,
+}
+
+impl KernelTurnExecutor {
+    pub(crate) fn new(
+        working_dir: PathBuf,
+        provider_name: Option<String>,
+        auto_approve: bool,
+        session_id: atomcode_core::session::SessionId,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
+        Self {
+            working_dir,
+            provider_name,
+            auto_approve,
+            session_id,
+            telemetry,
+            bridge: Mutex::new(None),
+        }
+    }
+
+    /// Resolve the bridge config from the live provider selection + on-disk config.
+    /// Mirrors `build_turn_parts`' provider resolution (LIVE_PROVIDER → executor
+    /// default → config default).
+    fn bridge_config(&self) -> Option<atomcode_bridge::BridgeConfig> {
+        let config = Config::load(&Config::default_path()).ok()?;
+        let live = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let name = live
+            .or_else(|| self.provider_name.clone())
+            .unwrap_or_else(|| config.default_provider.clone());
+        let p = config.providers.get(&name)?;
+        Some(atomcode_bridge::BridgeConfig {
+            api_key: p.api_key.clone().unwrap_or_default(),
+            base_url: p.base_url.clone().unwrap_or_default(),
+            model: p.model.clone(),
+            working_dir: self.working_dir.clone(),
+            context_window: p.context_window as u32,
+            mcp: true,
+            telemetry: Some(self.telemetry.clone()),
+        })
+    }
+}
+
+/// Pull the text + images out of the just-appended user message.
+fn extract_user_input(
+    m: &atomcode_core::conversation::message::Message,
+) -> (String, Vec<ImagePart>) {
+    use atomcode_core::conversation::message::MessageContent;
+    match &m.content {
+        MessageContent::Text(t) => (t.clone(), Vec::new()),
+        MessageContent::MultiPart { text, images } => {
+            (text.clone().unwrap_or_default(), images.clone())
+        }
+        _ => (String::new(), Vec::new()),
+    }
+}
+
+#[async_trait]
+impl TurnExecutor for KernelTurnExecutor {
+    async fn preprocess_input(&self, input: UserInput) -> UserInput {
+        if input.images.is_empty() {
+            return input;
+        }
+        let live_provider = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
+        let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
+        UserInput { text, images: input.images }
+    }
+
+    async fn run_turn(
+        &self,
+        conv: &Arc<Mutex<Conversation>>,
+        events: broadcast::Sender<LiveEvent>,
+        approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+        cancel: CancellationToken,
+    ) {
+        let emit = |te: TurnEvent| {
+            let _ = events.send(LiveEvent::Turn(te));
+        };
+
+        // Lazily build the persistent bridge for this LiveSession.
+        let mut guard = self.bridge.lock().await;
+        if guard.is_none() {
+            let Some(cfg) = self.bridge_config() else {
+                emit(TurnEvent::Error("engine v2：provider 未配置".into()));
+                return;
+            };
+            let (client, rx) = atomcode_bridge::spawn_bridged_runtime(cfg);
+            *guard = Some(BridgeState { client, events: rx, seeded: false });
+        }
+        let state = guard.as_mut().unwrap();
+        let client = state.client.clone();
+
+        // `conv` already has the just-typed user message appended (coordinator).
+        // Split it off: the prefix seeds the bridge (first turn only), the last
+        // message is sent as this turn's input.
+        let (prefix, user_text, user_images) = {
+            let c = conv.lock().await;
+            let mut msgs = c.messages.clone();
+            let last = msgs.pop();
+            let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
+            (msgs, text, images)
+        };
+
+        if !state.seeded {
+            let _ = client.cmd_tx.send(AgentCommand::SetMessages(prefix));
+            state.seeded = true;
+        }
+        let _ = client.cmd_tx.send(AgentCommand::SendMessage {
+            text: user_text,
+            images: user_images,
+            image_markers: Vec::new(),
+        });
+
+        // Interactive approval: register the response sender so any view's
+        // `LiveSession.approve()` delivers the decision here.
+        let mut perm_rx = if self.auto_approve {
+            None
+        } else {
+            let (tx, rx) = mpsc::unbounded_channel::<PermissionDecision>();
+            *approver.lock().await = Some(tx);
+            Some(rx)
+        };
+
+        let mut cancelled = false;
+        let final_messages = loop {
+            let ev = tokio::select! {
+                _ = cancel.cancelled(), if !cancelled => {
+                    cancelled = true;
+                    let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                    continue;
+                }
+                ev = state.events.recv() => ev,
+            };
+            let Some(ev) = ev else { break None };
+            match ev {
+                AgentEvent::TextDelta(t) => emit(TurnEvent::TextDelta(t)),
+                AgentEvent::ReasoningDelta(t) => emit(TurnEvent::ReasoningDelta(t)),
+                AgentEvent::ToolCallStreaming { name, hint } => {
+                    emit(TurnEvent::ToolCallStreaming { name, hint })
+                }
+                AgentEvent::ToolCallStarted { id, name, arguments } => {
+                    emit(TurnEvent::ToolCallStarted { id, name, arguments })
+                }
+                AgentEvent::ToolOutputChunk { call_id, chunk } => {
+                    emit(TurnEvent::ToolOutputChunk { call_id, chunk })
+                }
+                AgentEvent::ToolCallResult { call_id, name, output, success, duration } => emit(
+                    TurnEvent::ToolCallResult { call_id, name, output, success, duration },
+                ),
+                AgentEvent::TokenUsage(u) => emit(TurnEvent::TokenUsage {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    total_tokens: u.prompt_tokens + u.completion_tokens,
+                    cached_tokens: u.cached_tokens,
+                }),
+                AgentEvent::ContextStats {
+                    system_tokens,
+                    sent_tokens,
+                    dropped_tokens,
+                    working_set_tokens,
+                    total_messages,
+                    ..
+                } => emit(TurnEvent::ContextStats {
+                    system_tokens,
+                    sent_tokens,
+                    dropped_tokens,
+                    working_set_tokens,
+                    total_messages,
+                }),
+                AgentEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
+                AgentEvent::Warning(w) => emit(TurnEvent::Warning(w)),
+                AgentEvent::ApprovalNeeded { tool_name, reason, call, messages } => {
+                    emit(TurnEvent::ApprovalRequested {
+                        tool_name,
+                        reason,
+                        call,
+                        messages,
+                    });
+                    let decision = if self.auto_approve {
+                        PermissionDecision::Allow
+                    } else {
+                        tokio::select! {
+                            _ = cancel.cancelled(), if !cancelled => {
+                                cancelled = true;
+                                PermissionDecision::Deny
+                            }
+                            d = async { perm_rx.as_mut().unwrap().recv().await } => {
+                                d.unwrap_or(PermissionDecision::Deny)
+                            }
+                        }
+                    };
+                    let cmd = match decision {
+                        PermissionDecision::Allow => AgentCommand::ApproveTool,
+                        PermissionDecision::Ask(_) | PermissionDecision::Deny => {
+                            AgentCommand::DenyTool
+                        }
+                    };
+                    let _ = client.cmd_tx.send(cmd);
+                }
+                AgentEvent::Error { error, messages } => {
+                    emit(TurnEvent::Error(error));
+                    break Some(messages);
+                }
+                AgentEvent::TurnCancelled { messages } => break Some(messages),
+                AgentEvent::TurnComplete { messages, .. } => break Some(messages),
+                _ => {}
+            }
+        };
+
+        // The approval slot is per-turn; clear it so a stale sender can't leak.
+        *approver.lock().await = None;
+
+        // Writeback: the engine's snapshot becomes the conversation of record.
+        if let Some(msgs) = final_messages {
+            let mut c = conv.lock().await;
+            c.messages = msgs;
+        }
+
+        // Persist (stable session id → one file per session). Mirrors the legacy
+        // executor so /resume sees the conversation after a quit.
+        {
+            use atomcode_core::session::{Session, SessionManager};
+            let conv_guard = conv.lock().await;
+            let mut session = Session::new(self.working_dir.clone());
+            session.id = self.session_id.clone();
+            session.messages = conv_guard.messages.clone();
+            session.auto_name_from_messages();
+            session.touch();
+            if let Err(e) = SessionManager::new(&self.working_dir).save(&session) {
+                eprintln!("Warning: failed to save live session (v2): {e}");
             }
         }
     }

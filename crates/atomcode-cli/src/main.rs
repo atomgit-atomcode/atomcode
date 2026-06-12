@@ -1436,7 +1436,7 @@ async fn run() -> Result<i32> {
         .or_else(|| std::env::var("ATOMCODE_ENGINE").ok());
     let engine_v2 = matches!(engine_choice.as_deref(), Some("v2" | "2" | "new"));
     let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if engine_v2 {
-        let bridge_cfg = bridge_config_from(&config, &working_dir);
+        let bridge_cfg = bridge_config_from(&config, &working_dir, Some(telemetry.clone()));
         eprintln!("[engine v2] new stack active (model {})", bridge_cfg.model);
         let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
         Some(atomcode_core::agent::AgentHandle { client, event_rx })
@@ -1447,9 +1447,14 @@ async fn run() -> Result<i32> {
     // each one builds a fresh bridge from the CURRENT config, so the new engine —
     // not the v1 factory — backs those runtimes too. `None` in v1 keeps the factory.
     let runtime_spawn_override: Option<atomcode_tuix::RuntimeSpawnOverride> = if engine_v2 {
+        let tel = telemetry.clone();
         Some(std::sync::Arc::new(
-            |config: &atomcode_core::config::Config, working_dir: &std::path::Path| {
-                atomcode_bridge::spawn_bridged_runtime(bridge_config_from(config, working_dir))
+            move |config: &atomcode_core::config::Config, working_dir: &std::path::Path| {
+                atomcode_bridge::spawn_bridged_runtime(bridge_config_from(
+                    config,
+                    working_dir,
+                    Some(tel.clone()),
+                ))
             },
         ))
     } else {
@@ -1714,6 +1719,7 @@ fn redirect_stderr_to_log_file() {
 fn bridge_config_from(
     config: &atomcode_core::config::Config,
     working_dir: &std::path::Path,
+    telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
 ) -> atomcode_bridge::BridgeConfig {
     let p = config.providers.get(&config.default_provider);
     atomcode_bridge::BridgeConfig {
@@ -1723,6 +1729,7 @@ fn bridge_config_from(
         working_dir: working_dir.to_path_buf(),
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
         mcp: true,
+        telemetry,
     }
 }
 
