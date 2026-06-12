@@ -118,6 +118,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "language", desc: "Switch display language", needs_args: false },
     Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
+    Command { name: "exit",    desc: "Exit AtomCode", needs_args: false },
     // Gateway entry that opens a second-level palette listing all
     // user-invocable skills. needs_args=true so Enter rewrites the
     // buffer to `/skills ` and lets the sub-mode menu render the
@@ -186,6 +187,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "language" => Msg::CmdDescLanguage,
         "welcome" => Msg::CmdWelcomeDescription,
         "quit" => Msg::CmdDescQuit,
+        "exit" => Msg::CmdDescQuit,
         "skills" => Msg::CmdDescSkills,
         "plugin" => Msg::CmdDescPlugin,
         "paste" => Msg::CmdDescPaste,
