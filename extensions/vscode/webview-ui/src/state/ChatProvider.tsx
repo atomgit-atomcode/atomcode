@@ -219,8 +219,8 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   const send = useCallback(
     (text: string) => {
       const state = stateRef.current;
-      const ctx = stateRef.current.contextFiles.length > 0
-        ? stateRef.current.contextFiles.map((f) => ({
+      const ctx = state.contextFiles.length > 0
+        ? state.contextFiles.map((f) => ({
             path: f.path,
             type: f.type,
             fileName: f.fileName,
@@ -230,7 +230,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             endLine: f.endLine,
           }))
         : undefined;
-      const contextFiles = stateRef.current.contextFiles;
+      const contextFiles = state.contextFiles;
       const isQueued = state.isGenerating;
       const clientMessageId = `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       if (isQueued) {
