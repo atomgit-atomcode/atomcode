@@ -119,10 +119,35 @@ cat reviewer.md | atomcodex review --system-prompt-file -
 
 ---
 
+## 4.5 自定义 task(chat / explain / summary)
+
+默认 task 写死为"评审下面这段 diff"。`--task` **替换**它,跑任意单轮任务并**跳过 diff 计算**——
+调用方把模型需要的一切(用户问题、目标代码、任何 diff 上下文)都放进 task 文本里。配合
+`--system-prompt` 设 persona、`--json` 从 `text` 字段取自由文本答案:
+
+```bash
+# explain:解释某段代码
+atomcodex review --repo . \
+  --task '一句话解释这段代码做什么：func Sum(...) {...}' \
+  --system-prompt '你是简洁的代码讲解员，直接作答，不要调用 report_finding。' --json
+
+# chat:带 diff 上下文回答用户问题
+cat task.txt | atomcodex review --repo . --task-file - \
+  --system-prompt-file ./chat_persona.md --json
+```
+
+- `--task` 与 `--base/--staged/--pr/--diff-file` 互斥(自定义 task 模式不算 diff)。
+- review agent 壳不变:`report_finding` 工具仍挂着但 persona 让它"直接答、别报 finding"即可绕开;
+  `read_file`/`grep`/codeintel 等只读工具正好给 chat/explain 读上下文用。
+- `--json` 下 findings 通常为空,答案在 `text`;空 findings + 无错误 → 退 `0`。
+
+---
+
 ## 5. 输出、退出码、调优
 
-- **stdout** —— findings(人类可读报告;`--json` 则输出 `Finding[]` 数组)。按优先级(P0→P3)、
-  再按置信度排序。
+- **stdout** —— 人类可读报告;`--json` 则输出一个结构化对象(便于嵌入者一次取齐):
+  `{ "findings": [...], "text": "<agent 最终自由文本>", "usage": {"prompt":N,"completion":N,"cached":N} | null }`。
+  `findings` 按优先级(P0→P3)、再按置信度排序;`usage` 在 provider 未上报时为 `null`。
 - **stderr** —— 实时执行轨迹(每次工具调用 + 结果),收尾给出工具用量画像 + token 统计。(让 stdout
   在 `--json` 时保持纯净。)
 
@@ -160,6 +185,8 @@ Reviewing 120 changed line(s) with deepseek-chat …
 --model / --api-key / --base-url   provider 覆盖项
 --system-prompt <text>            全量覆盖 persona
 --system-prompt-file <path|->     从文件/stdin 全量覆盖 persona
+--task <text>                     自定义 task(替换 diff 评审,跳过 diff;chat/explain/summary 用)
+--task-file <path|->              从文件/stdin 读取自定义 task
 --stream-timeout <秒>             单事件存活上限(默认 180)
 --json                            findings 以 JSON 输出
 ```

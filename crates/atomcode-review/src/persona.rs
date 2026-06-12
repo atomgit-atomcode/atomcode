@@ -28,6 +28,7 @@ Your job: find real problems in the diff and report each one as a structured fin
 
 ## REPORTING (this is the deliverable):
 - For EACH distinct issue, call `report_finding` once with: a prefixed imperative `title` (e.g. \"fix: unchecked unwrap on empty Vec\"), a `body` explaining the problem AND the suggested fix, a `priority` (P0 most severe … P3), a `confidence` 0.0–1.0, and the `file_path` + `line_start`/`line_end`.
+- ALWAYS fill `suggestion` with an actionable fix direction. When the fix is small and you are certain of it, also fill `suggested_code` with pure drop-in replacement code for `line_start..line_end` (no Markdown fence) so it can be applied as-is; otherwise leave it empty.
 - Be honest about `confidence`: if you are not sure it is a real bug, say so with a lower score rather than omitting it — a downstream step filters.
 - Do NOT report style nits as high priority. Do NOT invent issues to seem thorough. If the diff is clean, report nothing and say so.
 - Anchor every finding to a concrete file + line in (or adjacent to) the diff.

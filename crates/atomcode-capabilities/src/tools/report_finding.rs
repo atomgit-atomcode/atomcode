@@ -26,6 +26,11 @@ pub struct Finding {
     pub file_path: String,
     pub line_start: u32,
     pub line_end: u32,
+    /// Actionable fix direction (may be empty when none was given).
+    pub suggestion: String,
+    /// Drop-in replacement code for `line_start..=line_end` (pure code, no Markdown
+    /// fence). Empty when the fix is too large / imprecise to express as a patch.
+    pub suggested_code: String,
 }
 
 const PRIORITIES: &[&str] = &["P0", "P1", "P2", "P3"];
@@ -60,6 +65,10 @@ struct Args {
     line_start: u32,
     #[serde(default)]
     line_end: Option<u32>,
+    #[serde(default)]
+    suggestion: Option<String>,
+    #[serde(default)]
+    suggested_code: Option<String>,
 }
 
 #[async_trait]
@@ -71,22 +80,26 @@ impl Tool for ReportFindingTool {
         "Report ONE code-review finding as a structured record. Call once per distinct \
          issue; the findings are aggregated for the final report. `priority` is P0 (most \
          severe) to P3; `confidence` is 0.0–1.0; `line_end` defaults to `line_start` for a \
-         single-line finding. Give a prefixed imperative `title` and a `body` that explains \
-         the problem (and ideally the fix)."
+         single-line finding. Give a prefixed imperative `title`, a `body` that explains \
+         the problem, and a `suggestion` with the actionable fix direction. When the fix is \
+         small and you are certain of it, also give `suggested_code`: pure replacement code \
+         for `line_start..line_end` (no Markdown fence) that can be applied as-is."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
                 "title": { "type": "string", "description": "Prefixed imperative title, e.g. \"fix: unchecked unwrap on None\"" },
-                "body": { "type": "string", "description": "Problem explanation (and suggested fix)" },
+                "body": { "type": "string", "description": "Problem explanation: why it is a problem and the likely consequence" },
                 "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3"], "description": "P0 (most severe) … P3" },
                 "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "Confidence 0.0–1.0" },
                 "file_path": { "type": "string", "description": "File the finding is in" },
                 "line_start": { "type": "integer", "description": "Start line (1-based)" },
-                "line_end": { "type": "integer", "description": "End line (1-based); defaults to line_start" }
+                "line_end": { "type": "integer", "description": "End line (1-based); defaults to line_start" },
+                "suggestion": { "type": "string", "description": "Actionable fix direction (how to fix it)" },
+                "suggested_code": { "type": "string", "description": "Drop-in replacement code for line_start..line_end, pure code without Markdown fence; only when the fix is small and exact, else omit" }
             },
-            "required": ["title", "body", "priority", "confidence", "file_path", "line_start"]
+            "required": ["title", "body", "priority", "confidence", "file_path", "line_start", "suggestion"]
         })
     }
     // recording only → Safe.
@@ -118,6 +131,8 @@ impl Tool for ReportFindingTool {
             file_path: a.file_path,
             line_start: a.line_start,
             line_end,
+            suggestion: a.suggestion.unwrap_or_default(),
+            suggested_code: a.suggested_code.unwrap_or_default(),
         };
         let mut g = self.findings.lock().unwrap();
         g.push(finding.clone());
@@ -203,9 +218,30 @@ mod tests {
         let f = Finding {
             title: "t".into(), body: "b".into(), priority: "P0".into(), confidence: 0.8,
             file_path: "x.rs".into(), line_start: 1, line_end: 2,
+            suggestion: "fix it".into(), suggested_code: "let x = 1;".into(),
         };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["priority"], "P0");
         assert_eq!(v["line_end"], 2);
+        assert_eq!(v["suggestion"], "fix it");
+        assert_eq!(v["suggested_code"], "let x = 1;");
+    }
+
+    #[tokio::test]
+    async fn suggestion_fields_recorded_and_default_empty() {
+        let t = ReportFindingTool::new();
+        t.execute(
+            r#"{"title":"a","body":"b","priority":"P1","confidence":0.5,"file_path":"f","line_start":1,"suggestion":"check nil first","suggested_code":"if x == nil { return }"}"#,
+            &ctx(),
+        )
+        .await;
+        // 旧调用方 / 模型偶尔缺省字段时容忍为空，不拒绝 finding。
+        t.execute(r#"{"title":"c","body":"d","priority":"P2","confidence":0.4,"file_path":"g","line_start":2}"#, &ctx()).await;
+
+        let all = t.findings();
+        assert_eq!(all[0].suggestion, "check nil first");
+        assert_eq!(all[0].suggested_code, "if x == nil { return }");
+        assert_eq!(all[1].suggestion, "");
+        assert_eq!(all[1].suggested_code, "");
     }
 }
