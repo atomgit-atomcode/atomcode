@@ -148,10 +148,15 @@ async fn review(args: ReviewArgs) -> Result<()> {
                 return Ok(());
             }
             let label = format!("{} changed line(s)", diff.lines().count());
+            // Prefix every hunk line with its REAL file line number so the model anchors
+            // findings precisely instead of counting lines itself.
+            let diff = atomcode_review::annotate_diff_line_numbers(&diff);
             let t = format!(
-                "Review the following diff. Investigate the surrounding code with your read-only \
-                 tools, then report each issue via `report_finding`. Report only real issues, each \
-                 anchored to a concrete file and line.\n\n```diff\n{diff}\n```"
+                "Review the following diff. Each hunk line is prefixed with its real file \
+                 line number (`N: `) — use these numbers for `line_start`/`line_end`. \
+                 Investigate the surrounding code with your read-only tools, then report \
+                 each issue via `report_finding`. Report only real issues, each anchored \
+                 to a concrete file and line.\n\n```diff\n{diff}\n```"
             );
             (t, label)
         }
