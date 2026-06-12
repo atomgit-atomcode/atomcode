@@ -5817,12 +5817,20 @@ fn handle_streaming_key(
     if code == KeyCode::Char('o') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         app.state.toggle_tool_output();
         // Show feedback to the user about the current state
-        let status = if app.state.show_tool_output {
-            "  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+O to hide)\n"
+        // Use muted style matching ToolResult's summary_style:
+        // light theme → SGR 90 (DarkGrey), dark theme → SGR 2 (faint)
+        let reset = "\x1b[0m";
+        let mute = if crate::highlight::theme::is_light_for_render() {
+            "\x1b[90m"
         } else {
-            "  ○ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
+            "\x1b[2m"
         };
-        renderer.render(UiLine::CommandOutput(status.to_string()));
+        let status = if app.state.show_tool_output {
+            format!("{mute}  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+o to hide){reset}\n")
+        } else {
+            format!("{mute}  ○ Verbose mode disabled (Ctrl+o to show tool output + reasoning){reset}\n")
+        };
+        renderer.render(UiLine::CommandOutput(status));
         renderer.flush();
         draw_spinner_now(
             &mut app.state,
