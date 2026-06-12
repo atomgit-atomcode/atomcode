@@ -25,6 +25,10 @@ pub struct CodingAgentConfig {
     pub request_timeout: Duration,
     /// Safety fuse: max edit-then-verify continuations per turn (kernel default is 50).
     pub max_continuations: u32,
+    /// Per-call provider options (reasoning effort / max_tokens / temperature).
+    /// Default = no opinion. A respawn (re-`assemble` on the same parts) picks up
+    /// changes — how a driver implements `/effort`.
+    pub chat_options: atomcode_kernel::provider::ChatOptions,
 }
 
 impl CodingAgentConfig {
@@ -44,6 +48,7 @@ impl CodingAgentConfig {
             stream_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(300),
             max_continuations: 50,
+            chat_options: Default::default(),
         }
     }
 }

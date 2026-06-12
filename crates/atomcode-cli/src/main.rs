@@ -425,6 +425,13 @@ const VERSION: &str = concat!(
 #[derive(Parser)]
 #[command(name = "atomcode", version = VERSION, about = "AI coding assistant in your terminal")]
 struct Cli {
+    /// Engine selection: "v1" (legacy, default) or "v2" (new kernel stack via
+    /// atomcode-bridge). Also settable via $ATOMCODE_ENGINE. v2 runs the same
+    /// drivers (headless + TUI) over the new engine; /session and /resume inside
+    /// the TUI still spawn v1 runtimes in this build.
+    #[arg(long)]
+    engine: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -1420,6 +1427,31 @@ async fn run() -> Result<i32> {
     agent_loop.set_max_turns(cli.max_turns);
     let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
 
+    // ── Engine selection (the strangler switch) ──────────────────────────────
+    // v2 = the NEW stack behind the legacy channel protocol (atomcode-bridge).
+    // The drivers below (headless loop / tuix) are untouched either way.
+    let engine_choice = cli
+        .engine
+        .clone()
+        .or_else(|| std::env::var("ATOMCODE_ENGINE").ok());
+    let engine_v2 = matches!(engine_choice.as_deref(), Some("v2" | "2" | "new"));
+    let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if engine_v2 {
+        let p = config.providers.get(&config.default_provider);
+        let bridge_cfg = atomcode_bridge::BridgeConfig {
+            api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
+            base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+            model: p.map(|p| p.model.clone()).unwrap_or_default(),
+            working_dir: working_dir.clone(),
+            context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
+            mcp: true,
+        };
+        eprintln!("[engine v2] new stack active (model {})", bridge_cfg.model);
+        let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
+        Some(atomcode_core::agent::AgentHandle { client, event_rx })
+    } else {
+        None
+    };
+
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
     // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
     // precedence — when it's set we've already committed to headless mode.
@@ -1504,9 +1536,16 @@ async fn run() -> Result<i32> {
             // Capture the assistant's streamed text only when we need to post
             // it back to AtomGit (fixissue). Plain `-p` stays zero-alloc.
             let capture = fixissue_ref.is_some();
+            let notifications_cfg = config.notifications.clone();
+            let (engine_loop, engine_handle) = if engine_v2 {
+                (None, v2_handle.take().expect("v2 handle built above"))
+            } else {
+                (Some(agent_loop), agent_handle)
+            };
             let (ec, captured) = run_headless(
-                agent_loop,
-                agent_handle,
+                engine_loop,
+                notifications_cfg,
+                engine_handle,
                 prompt,
                 cli.provider.as_deref(),
                 verbose,
@@ -1576,11 +1615,20 @@ async fn run() -> Result<i32> {
             // actual errors in their shell/CI output.
             redirect_stderr_to_log_file();
 
-            let ctx = atomcode_telemetry::CurrentContext::current();
-            tokio::spawn(async move {
-                atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
-            });
-            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions).await?;
+            let tui_handle = if let Some(h) = v2_handle.take() {
+                // engine v2: the bridge task already runs the engine; the legacy
+                // loop is never started. (/session and /resume inside the TUI go
+                // through runtime_factory and thus still spawn v1 runtimes — the
+                // factory seam is the next strangler step.)
+                h
+            } else {
+                let ctx = atomcode_telemetry::CurrentContext::current();
+                tokio::spawn(async move {
+                    atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
+                });
+                agent_handle
+            };
+            atomcode_tuix::run(config, model_name, tui_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions).await?;
             Ok(0)
         };
 
@@ -1669,7 +1717,10 @@ fn redirect_stderr_to_log_file() {
 /// `verbose=true`: also emit tool calls, token usage, [done] summary, working
 /// dir changes, and sub-agent progress on stderr.
 async fn run_headless(
-    agent_loop: AgentLoop,
+    // `None` = engine v2: the bridged engine task is ALREADY running behind the
+    // handle's channels (atomcode-bridge); only the legacy engine needs spawning.
+    agent_loop: Option<AgentLoop>,
+    notifications_cfg: atomcode_core::config::NotificationConfig,
     agent_handle: atomcode_core::agent::AgentHandle,
     prompt: String,
     _provider_name: Option<&str>,
@@ -1695,23 +1746,39 @@ async fn run_headless(
         );
     }
 
-    let notifications = agent_loop.config.notifications.clone();
+    let notifications = notifications_cfg;
     let (cmd_tx, mut event_rx) = {
         let handle = agent_handle;
         (handle.client.cmd_tx, handle.event_rx)
     };
 
-    let ctx = atomcode_telemetry::CurrentContext::current();
-    tokio::spawn(async move {
-        atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
-    });
-    cmd_tx.send(AgentCommand::SendMessage {
-        text: prompt,
-        images: vec![],
-        image_markers: vec![],
-    })?;
-
+    if let Some(agent_loop) = agent_loop {
+        let ctx = atomcode_telemetry::CurrentContext::current();
+        tokio::spawn(async move {
+            atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
+        });
+    }
     let mut exit_code: i32 = 0;
+
+    // NON-FATAL on a closed channel: with engine v2 the bridged task may have
+    // already exited (e.g. a fatal provider-init error like an unsigned AtomGit
+    // gateway) AFTER buffering a `CoreEv::Error`. Propagating the send error here
+    // with `?` would surface a generic "channel closed" and SWALLOW that specific,
+    // actionable error. Instead, fall through to the event loop — it drains the
+    // buffered `Error` (printed below), then sees the channel close.
+    if cmd_tx
+        .send(AgentCommand::SendMessage {
+            text: prompt,
+            images: vec![],
+            image_markers: vec![],
+        })
+        .is_err()
+    {
+        // Channel already closed: drain whatever the engine buffered before exiting.
+        // If it buffered nothing, this non-error default is overridden to 1.
+        exit_code = 1;
+    }
+
     let mut had_denial = false;
     let mut last_text_ended_with_newline = true;
     // Tracks whether we're inside a streaming `[thinking]` line. When true, the

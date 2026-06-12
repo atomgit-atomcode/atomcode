@@ -17,6 +17,7 @@
 
 use super::reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
 use super::retry::{self, RetryPolicy};
+use super::sign::RequestSigner;
 use async_trait::async_trait;
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort, ToolChoice};
@@ -49,6 +50,9 @@ pub struct OpenAiCompatConfig {
     pub connect_timeout: Duration,
     /// Retry policy for the OPEN call only (mid-stream errors are never retried).
     pub retry: RetryPolicy,
+    /// Optional per-request auth seam. `None` (default) ⇒ plain
+    /// `bearer_auth(api_key)`. See [`RequestSigner`].
+    pub request_signer: Option<std::sync::Arc<dyn RequestSigner>>,
 }
 
 impl OpenAiCompatConfig {
@@ -67,6 +71,7 @@ impl OpenAiCompatConfig {
             idle_timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
+            request_signer: None,
         }
     }
 }
@@ -113,19 +118,41 @@ impl LlmProvider for OpenAiCompatProvider {
         options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg, self.policy);
+        // Serialize once and reuse the exact bytes across retries (hence `.body()`
+        // with an explicit content-type rather than re-serializing via `.json()`).
+        let body_bytes = match serde_json::to_vec(&body) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(ProviderError {
+                    retryable: false,
+                    message: format!("request body serialization failed: {e}"),
+                    ..Default::default()
+                })
+            }
+        };
 
         // Retry the OPEN only (transient status / transport). Once bytes flow, any
         // mid-stream error surfaces as StreamEvent::Error and is never retried.
         let policy = &self.cfg.retry;
         let mut attempt = 1u32;
         let resp = loop {
-            let send = self
+            // Build fresh each attempt so a signer (if any) can re-auth per attempt.
+            let mut req = self
                 .client
                 .post(&self.url)
-                .bearer_auth(&self.cfg.api_key)
-                .json(&body)
-                .send()
-                .await;
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body_bytes.clone());
+            match &self.cfg.request_signer {
+                Some(signer) => {
+                    let auth = signer.sign(&body_bytes);
+                    req = req.bearer_auth(auth.bearer.as_deref().unwrap_or(&self.cfg.api_key));
+                    for (name, value) in auth.headers {
+                        req = req.header(name, value);
+                    }
+                }
+                None => req = req.bearer_auth(&self.cfg.api_key),
+            }
+            let send = req.send().await;
             match send {
                 Ok(resp) => {
                     let code = resp.status().as_u16();

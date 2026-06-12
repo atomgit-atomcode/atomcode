@@ -20,9 +20,11 @@ mod ollama;
 mod openai_compat;
 mod reasoning;
 mod retry;
+mod sign;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use ollama::{OllamaConfig, OllamaProvider};
 pub use openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 pub use reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
 pub use retry::RetryPolicy;
+pub use sign::{RequestSigner, SignedAuth};

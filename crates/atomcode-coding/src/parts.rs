@@ -103,6 +103,11 @@ pub struct CodingParts {
     /// What happened during MCP connect — the DRIVER observes/renders these
     /// (seam-first: telemetry belongs to the driver, not the capability).
     pub mcp_events: Vec<McpConnectEvent>,
+    /// The agent's tool working dir as a LIVE handle (kernel Seam 1b): the driver
+    /// mutates it to implement `/cd` — tools resolve against the new dir from the
+    /// next call. Session/memory/recall stay anchored to the PREPARE-time project
+    /// root by design (the per-project stores don't follow a mid-session cd).
+    pub shared_cwd: std::sync::Arc<std::sync::RwLock<std::path::PathBuf>>,
 }
 
 /// Phase 1 — gather + connect everything the agent needs (async: MCP connect,
@@ -197,6 +202,7 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
     hooks.push(Arc::new(VerifyCadenceHook::new()));
 
     Ok(CodingParts {
+        shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         registry,
         tool_names: names,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
@@ -260,7 +266,9 @@ pub fn assemble(
         // Approval FIRST — a later arg-rewriting middleware can never change what
         // the user approved (the approve-what-runs contract).
         .middleware(parts.approval.clone())
-        .working_dir(cfg.working_dir.clone())
+        // LIVE cwd handle (not the immutable pin): /cd mutates parts.shared_cwd.
+        .working_dir_shared(parts.shared_cwd.clone())
+        .chat_options(cfg.chat_options.clone())
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout)
         .max_continuations(cfg.max_continuations);
