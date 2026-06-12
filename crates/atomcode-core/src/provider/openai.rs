@@ -313,16 +313,20 @@ impl OpenAiProvider {
                         // turn had tool_calls ANYWHERE, ALL reasoning_content from
                         // that turn (including the final-answer text's reasoning)
                         // must be echoed in every subsequent request — 400
-                        // otherwise. Our Text variant doesn't persist per-turn
-                        // reasoning, so emit a placeholder under Include. The
-                        // no-tool-call case (image: 思维链 dropped) is a "may be
-                        // sent, will be ignored" spec, not a rejection — safe to
-                        // always emit. Kimi only validates tool_call messages, so
-                        // the extra key on Text is accepted there too.
+                        // otherwise. A plain `Text` variant can't persist per-turn
+                        // reasoning (c61bfd07 routes final answers that DID capture
+                        // reasoning through AssistantWithToolCalls instead), so by
+                        // the time we land here there is no real reasoning to echo —
+                        // emit the shared non-prose REASONING_PLACEHOLDER under
+                        // Include: present + non-empty for the 400 contract, but
+                        // nothing the thinking model can mimic back as its output
+                        // (the old fluent English sentence got reproduced verbatim
+                        // at high context, stalling the turn). Kimi only validates
+                        // tool_call messages, so the extra key on Text is fine there.
                         if matches!(m.role, Role::Assistant)
                             && matches!(reasoning_policy, ReasoningPolicy::Include)
                         {
-                            obj["reasoning_content"] = json!("(no reasoning recorded)");
+                            obj["reasoning_content"] = json!(super::REASONING_PLACEHOLDER);
                         }
                         Some(obj)
                     }
@@ -346,7 +350,7 @@ impl OpenAiProvider {
                                 let echo = reasoning_content
                                     .as_deref()
                                     .filter(|s| !s.is_empty())
-                                    .unwrap_or("(no reasoning recorded)");
+                                    .unwrap_or(super::REASONING_PLACEHOLDER);
                                 obj["reasoning_content"] = json!(echo);
                             }
                             return Some(obj);
@@ -369,7 +373,7 @@ impl OpenAiProvider {
                             let echo = reasoning_content
                                 .as_deref()
                                 .filter(|s| !s.is_empty())
-                                .unwrap_or("(no reasoning recorded)");
+                                .unwrap_or(super::REASONING_PLACEHOLDER);
                             msg["reasoning_content"] = json!(echo);
                         }
                         msg["tool_calls"] = json!(tool_calls
@@ -2015,6 +2019,31 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_placeholder_is_non_prose_anti_mimicry() {
+        // Regression for the DeepSeek V4 Flash mimicry bug: the outbound
+        // placeholder must satisfy DeepSeek's non-empty reasoning_content
+        // contract WITHOUT being natural language a thinking model can copy
+        // back as its own output (which surfaced "(no reasoning recorded)" as
+        // the only reply and stalled the turn at high context). Pin it as a
+        // short, whitespace-free, non-English sentinel so a future edit can't
+        // silently regress to a mimicable phrase.
+        use crate::provider::REASONING_PLACEHOLDER as P;
+        assert!(!P.is_empty(), "must be non-empty for the 400 contract");
+        assert!(
+            !P.chars().any(|c| c.is_whitespace()),
+            "must not contain whitespace — a multi-word phrase is mimicable: {P:?}"
+        );
+        assert!(
+            P.chars().count() <= 4,
+            "must be a short sentinel, not prose: {P:?}"
+        );
+        assert_ne!(
+            P, "(no reasoning recorded)",
+            "the old fluent English phrase is exactly what the model mimicked"
+        );
+    }
+
+    #[test]
     fn format_messages_include_with_none_reasoning_emits_placeholder() {
         // Kimi's check is "field missing" (empty ok). DeepSeek V4's check is
         // stricter — rejects an empty string on tool_call messages. When we
@@ -2036,11 +2065,14 @@ mod tests {
         // DeepSeek V4 tool-call round contract (per official docs): in every
         // subsequent request, ALL reasoning_content from the tool-call turn
         // must be echoed — including the reasoning for the FINAL TEXT answer
-        // (思维链1.3 → 回答1 in the docs diagram). Our Text variant doesn't
-        // persist per-turn reasoning, so under Include we emit a placeholder.
-        // Regression for the "second prompt 400" bug.
+        // (思维链1.3 → 回答1 in the docs diagram). A plain Text variant carries
+        // no reasoning, so under Include we emit the shared non-prose
+        // REASONING_PLACEHOLDER: present + non-empty (the "second prompt 400"
+        // contract) but NOT the old fluent sentence the thinking model mimicked
+        // back as its own output. Regression for both the 400 bug AND mimicry.
         use super::{OpenAiProvider, ReasoningPolicy};
         use crate::conversation::message::{Message, MessageContent, Role};
+        use crate::provider::REASONING_PLACEHOLDER;
         let msgs = vec![Message {
             role: Role::Assistant,
             content: MessageContent::Text("当前系统时间是 …".into()),
@@ -2048,10 +2080,10 @@ mod tests {
         }];
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
-        let rc = out[0]["reasoning_content"].as_str();
-        assert!(
-            rc.map_or(false, |s| !s.is_empty()),
-            "assistant Text under Include must carry a non-empty reasoning_content, got: {}",
+        assert_eq!(
+            out[0]["reasoning_content"].as_str(),
+            Some(REASONING_PLACEHOLDER),
+            "assistant Text under Include must carry the shared placeholder, got: {}",
             out[0]
         );
 
