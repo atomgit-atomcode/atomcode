@@ -16,7 +16,7 @@ use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_review::{build_review_agent, Finding, ReviewAgentConfig};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -76,6 +76,15 @@ struct ReviewArgs {
     /// Like --system-prompt, but read the full prompt from a file (`-` for stdin).
     #[arg(long, conflicts_with = "system_prompt")]
     system_prompt_file: Option<String>,
+    /// Run a CUSTOM task instead of diff review (for chat / explain / summary). Replaces the
+    /// built-in "review this diff" task with this text and SKIPS diff computation — the caller
+    /// puts everything the model needs (question, target code, any diff context) into the text.
+    /// Pair with --system-prompt to set the persona and --json to read the answer from `text`.
+    #[arg(long, conflicts_with_all = ["base", "staged", "pr", "diff_file"])]
+    task: Option<String>,
+    /// Like --task, but read the task from a file (`-` for stdin).
+    #[arg(long, conflicts_with_all = ["task", "base", "staged", "pr", "diff_file"])]
+    task_file: Option<String>,
     /// Max seconds to wait for each stream event before failing the run (liveness guard
     /// against a stalled provider). Raise it for slow providers / very large contexts.
     #[arg(long, default_value_t = 180)]
@@ -94,17 +103,37 @@ async fn main() -> Result<()> {
 }
 
 async fn review(args: ReviewArgs) -> Result<()> {
-    // `-` means stdin for both flags; they can't both read it.
+    // `-` means stdin; the persona and the diff/task can't both read it.
     if args.diff_file.as_deref() == Some("-") && args.system_prompt_file.as_deref() == Some("-") {
         bail!("--diff-file - and --system-prompt-file - both read stdin; give one of them a file path");
     }
+    if args.task_file.as_deref() == Some("-") && args.system_prompt_file.as_deref() == Some("-") {
+        bail!("--task-file - and --system-prompt-file - both read stdin; give one of them a file path");
+    }
     let repo = args.repo.canonicalize().with_context(|| format!("repo not found: {}", args.repo.display()))?;
 
-    let diff = obtain_diff(&repo, &args)?;
-    if diff.trim().is_empty() {
-        println!("No changes to review.");
-        return Ok(());
-    }
+    // Two modes: a CUSTOM task (chat/explain/summary — no diff) or the built-in diff review.
+    let custom_task = resolve_task(args.task.clone(), args.task_file.clone())?;
+    let (task, trace_label) = match custom_task {
+        Some(t) => {
+            let label = format!("custom task ({} chars)", t.len());
+            (t, label)
+        }
+        None => {
+            let diff = obtain_diff(&repo, &args)?;
+            if diff.trim().is_empty() {
+                println!("No changes to review.");
+                return Ok(());
+            }
+            let label = format!("{} changed line(s)", diff.lines().count());
+            let t = format!(
+                "Review the following diff. Investigate the surrounding code with your read-only \
+                 tools, then report each issue via `report_finding`. Report only real issues, each \
+                 anchored to a concrete file and line.\n\n```diff\n{diff}\n```"
+            );
+            (t, label)
+        }
+    };
 
     // Provider creds: flag > env (ATOMCODE_*) > config.toml provider entry.
     let entry = load_provider_entry(args.config.as_deref(), args.provider.as_deref())?;
@@ -151,15 +180,9 @@ async fn review(args: ReviewArgs) -> Result<()> {
     let model_label = cfg.model.clone();
     let (agent, report) = build_review_agent(cfg).map_err(|e| anyhow::anyhow!(e))?;
 
-    let task = format!(
-        "Review the following diff. Investigate the surrounding code with your read-only \
-         tools, then report each issue via `report_finding`. Report only real issues, each \
-         anchored to a concrete file and line.\n\n```diff\n{diff}\n```"
-    );
-
     // Live trace on stderr (stdout stays clean for findings / --json). The run is one LLM
     // turn loop — without this the terminal looks frozen while the model thinks + calls tools.
-    eprintln!("Reviewing {} changed line(s) with {model_label} …", diff.lines().count());
+    eprintln!("Running {trace_label} with {model_label} …");
     let run = run_review_streaming(agent, task).await;
 
     // Trace summary: tool-usage profile + token spend — exactly what you need to optimize.
@@ -175,7 +198,7 @@ async fn review(args: ReviewArgs) -> Result<()> {
     sort_findings(&mut findings);
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&findings)?);
+        println!("{}", render_json(&findings, &run.text, run.usage)?);
     } else if !findings.is_empty() {
         print!("{}", render_findings(&findings));
     } else if run.error.is_some() {
@@ -240,7 +263,15 @@ async fn run_review_streaming(agent: Agent, task: String) -> ReviewRun {
                 eprintln!("    {mark} {name} ({} chars)", result.content.chars().count());
             }
             AgentEvent::TextDelta(t) => run.text.push_str(&t),
-            AgentEvent::Usage(meta) => run.usage = Some(meta.tokens),
+            // Each turn emits ONE per-turn usage figure; SUM across turns for the run total.
+            // (Last-wins kept only the final turn and silently under-reported the whole
+            // agentic run — e.g. a 40-turn review looked like one 50k-prompt call.)
+            AgentEvent::Usage(meta) => {
+                let u = run.usage.get_or_insert(Default::default());
+                u.prompt += meta.tokens.prompt;
+                u.completion += meta.tokens.completion;
+                u.cached += meta.tokens.cached;
+            }
             AgentEvent::Error { message, .. } => {
                 eprintln!("    [error] {message}");
                 run.error = Some(message);
@@ -407,6 +438,29 @@ fn obtain_diff(repo: &Path, args: &ReviewArgs) -> Result<String> {
     git_diff(repo, args.base.as_deref(), args.staged)
 }
 
+/// Resolve the custom task: inline `--task` text wins; else read `--task-file` (`-` = stdin).
+/// `None` ⇒ no custom task, fall back to the built-in diff-review task.
+fn resolve_task(text: Option<String>, file: Option<String>) -> Result<Option<String>> {
+    if let Some(t) = text.filter(|s| !s.trim().is_empty()) {
+        return Ok(Some(t));
+    }
+    if let Some(f) = file {
+        let content = if f == "-" {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf).context("failed to read task from stdin")?;
+            buf
+        } else {
+            std::fs::read_to_string(&f).with_context(|| format!("failed to read task file: {f}"))?
+        };
+        if content.trim().is_empty() {
+            bail!("task file is empty: {f}");
+        }
+        return Ok(Some(content));
+    }
+    Ok(None)
+}
+
 /// Resolve a FULL system-prompt override: inline `--system-prompt` text wins; else read
 /// `--system-prompt-file` (path, or `-` for stdin); else `None` (use the built-in persona).
 fn resolve_system_prompt(text: Option<String>, file: Option<String>) -> Result<Option<String>> {
@@ -535,6 +589,23 @@ fn render_findings(findings: &[Finding]) -> String {
     out
 }
 
+/// Structured `--json` payload: findings plus the agent's final prose and token usage,
+/// so an embedder gets the whole review from stdout (stderr stays human-only trace).
+#[derive(Serialize)]
+struct ReviewJson<'a> {
+    findings: &'a [Finding],
+    text: &'a str,
+    usage: Option<atomcode_kernel::stream::TokenUsage>,
+}
+
+fn render_json(
+    findings: &[Finding],
+    text: &str,
+    usage: Option<atomcode_kernel::stream::TokenUsage>,
+) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(&ReviewJson { findings, text: text.trim(), usage })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,7 +619,61 @@ mod tests {
             file_path: "src/a.rs".into(),
             line_start: 1,
             line_end: 1,
+            suggestion: String::new(),
+            suggested_code: String::new(),
         }
+    }
+
+    #[test]
+    fn resolve_task_inline_text_wins() {
+        let got = resolve_task(Some("answer this".into()), Some("ignored.txt".into())).unwrap();
+        assert_eq!(got.as_deref(), Some("answer this"));
+    }
+
+    #[test]
+    fn resolve_task_none_when_unset() {
+        assert!(resolve_task(None, None).unwrap().is_none());
+        // blank inline text is treated as unset (falls back to diff review)
+        assert!(resolve_task(Some("   ".into()), None).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_task_reads_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("task.txt");
+        std::fs::write(&p, "explain this line").unwrap();
+        let got = resolve_task(None, Some(p.to_string_lossy().into_owned())).unwrap();
+        assert_eq!(got.as_deref(), Some("explain this line"));
+    }
+
+    #[test]
+    fn resolve_task_empty_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("empty.txt");
+        std::fs::write(&p, "   \n").unwrap();
+        assert!(resolve_task(None, Some(p.to_string_lossy().into_owned())).is_err());
+    }
+
+    #[test]
+    fn json_envelope_carries_findings_text_usage() {
+        let fs = vec![finding("P0", 0.9, "x")];
+        let usage = atomcode_kernel::stream::TokenUsage { prompt: 10, completion: 5, cached: 2 };
+        let out = render_json(&fs, "  summary prose  ", Some(usage)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["findings"][0]["title"], "x");
+        assert_eq!(v["text"], "summary prose", "text is trimmed");
+        assert_eq!(v["usage"]["prompt"], 10);
+        assert_eq!(v["usage"]["completion"], 5);
+        assert_eq!(v["usage"]["cached"], 2);
+    }
+
+    #[test]
+    fn json_envelope_usage_null_when_absent() {
+        let out = render_json(&[], "", None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["findings"].as_array().unwrap().is_empty());
+        assert_eq!(v["text"], "");
+        assert!(v["usage"].is_null());
     }
 
     #[test]
