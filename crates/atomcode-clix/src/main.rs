@@ -113,6 +113,10 @@ struct ReviewArgs {
     /// against a stalled provider). Raise it for slow providers / very large contexts.
     #[arg(long, default_value_t = 180)]
     stream_timeout: u64,
+    /// Sampling temperature (e.g. 0.2). Omit ⇒ provider/server default (usually higher →
+    /// more run-to-run variance). Lower it to make reviews more deterministic/stable.
+    #[arg(long)]
+    temperature: Option<f32>,
     /// Emit findings as JSON instead of a human-readable report.
     #[arg(long)]
     json: bool,
@@ -250,6 +254,7 @@ async fn review(args: ReviewArgs) -> Result<()> {
     let mut cfg = ReviewAgentConfig::new(api_key, base_url, model, &repo);
     cfg.context_window = context_window;
     cfg.stream_timeout = std::time::Duration::from_secs(args.stream_timeout);
+    cfg.temperature = args.temperature;
     // Full system-prompt override (flag text > file/stdin). None ⇒ built-in reviewer persona.
     cfg.persona = resolve_system_prompt(args.system_prompt.clone(), args.system_prompt_file.clone())?;
     // Appended sections compose after the persona: engine-injected language rules first,

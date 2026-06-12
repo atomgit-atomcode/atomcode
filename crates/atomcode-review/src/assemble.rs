@@ -46,6 +46,10 @@ pub fn build_review_agent_with(
     let report = ReportFindingTool::new();
     let tools = mount_review_tools(&report);
     let persona = compose_persona(cfg);
+    let chat_options = atomcode_kernel::provider::ChatOptions {
+        temperature: cfg.temperature,
+        ..Default::default()
+    };
     let agent = Agent::builder()
         .provider(provider)
         .tools(tools)
@@ -53,6 +57,7 @@ pub fn build_review_agent_with(
         .working_dir(cfg.working_dir.clone())
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout)
+        .chat_options(chat_options)
         .build();
     (agent, report)
 }
