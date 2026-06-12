@@ -220,8 +220,8 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   const send = useCallback(
     (text: string, images?: ImageData[]) => {
       const state = stateRef.current;
-      const ctx = stateRef.current.contextFiles.length > 0
-        ? stateRef.current.contextFiles.map((f) => ({
+      const ctx = state.contextFiles.length > 0
+        ? state.contextFiles.map((f) => ({
             path: f.path,
             type: f.type,
             fileName: f.fileName,
