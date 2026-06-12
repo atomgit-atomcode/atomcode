@@ -536,7 +536,7 @@ const T = {
   'payment.edit': { zh: '修改', en: 'Edit' },
   'payment.save': { zh: '保存', en: 'Save' },
   'payment.saving': { zh: '保存中...', en: 'Saving...' },
-  'payment.hint': { zh: '用于发放京东E卡奖励，请确保信息准确', en: 'Used for JD E-Card reward distribution. Please ensure accuracy.' },
+  'payment.hint': { zh: '京东E卡卡密将通过短信下发，请确认姓名及手机号无误并留意查收', en: 'JD E-Card codes will be sent via SMS. Please verify your name and phone number are correct.' },
   'payment.saved': { zh: '收款信息已保存', en: 'Payment info saved.' },
 };
 function t(key) { const item = T[key]; return item ? (item[LANG] || item.zh || key) : key; }
@@ -1264,7 +1264,7 @@ initPage();
         </div>
       </div>
 
-      <p class="modal-hint" data-i18n="payment.hint">用于发放京东E卡奖励，请确保信息准确</p>
+      <p class="modal-hint" data-i18n="payment.hint">京东E卡卡密将通过短信下发，请确认姓名及手机号无误并留意查收</p>
     </div>
   </div>
 </div>
