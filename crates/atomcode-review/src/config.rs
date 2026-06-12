@@ -30,10 +30,6 @@ pub struct ReviewAgentConfig {
     /// PR metadata — without copying or replacing the built-in reviewer instructions.
     /// Composes with `persona`: final prompt = (override or built-in) + "\n\n" + append.
     pub persona_append: Option<String>,
-    /// Sampling temperature forwarded to the provider every round. `None` (default) ⇒ no
-    /// opinion (provider/server default, usually fairly high → more run-to-run variance).
-    /// Lower it (e.g. 0.2) to make reviews more deterministic/stable.
-    pub temperature: Option<f32>,
 }
 
 impl ReviewAgentConfig {
@@ -54,14 +50,7 @@ impl ReviewAgentConfig {
             request_timeout: Duration::from_secs(300),
             persona: None,
             persona_append: None,
-            temperature: None,
         }
-    }
-
-    /// Set the sampling temperature (lower = more deterministic/stable reviews).
-    pub fn with_temperature(mut self, t: f32) -> Self {
-        self.temperature = Some(t);
-        self
     }
 
     /// Set a FULL system-prompt override (replaces the built-in reviewer persona).
