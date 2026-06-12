@@ -4349,6 +4349,13 @@ mod classifier_tests {
             public_error_reason("Stream timeout: no event for 300s"),
             "模型响应超时"
         );
+        // The provider-layer byte-idle timeout (now 300s, env-configurable via
+        // ATOMCODE_IDLE_TIMEOUT_SECS) emits a different phrasing — it must still
+        // route to the same reason so the retry/UX path is unchanged.
+        assert_eq!(
+            public_error_reason("Stream timeout: no data received for 300s"),
+            "模型响应超时"
+        );
     }
 
     #[test]

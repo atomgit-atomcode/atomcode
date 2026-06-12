@@ -898,20 +898,28 @@ impl LlmProvider for OpenAiProvider {
                 // and the truncation detector see real numbers.
                 let mut pending_finish: Option<crate::stream::StreamEvent> = None;
 
+            // Idle timeout: abort only if NO bytes arrive for this long.
+            // Defaults to 300s (override via ATOMCODE_IDLE_TIMEOUT_SECS) to
+            // match the runner's first-token / stream timeout. Thinking models
+            // (DeepSeek V4 Flash etc.) can take >3min to emit the FIRST byte
+            // after a large (~200K) prompt; the old hard-coded 120s guard
+            // preempted that window and killed legitimately-slow requests
+            // mid-prefill, surfacing as "模型响应超时" + a full-context resend
+            // on retry. 300s here no longer undercuts the runner's 300s
+            // first-token allowance.
+            let idle_timeout_secs = std::env::var("ATOMCODE_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300);
+            let idle_timeout = std::time::Duration::from_secs(idle_timeout_secs);
             loop {
-                // 120s idle timeout: if no data arrives for 2 minutes, treat as dead connection.
-                let chunk = match tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
-                    byte_stream.next(),
-                )
-                .await
-                {
+                let chunk = match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break, // stream ended
                     Err(_) => {
-                        let _ = tx.send(Ok(StreamEvent::Error(
-                            "Stream timeout: no data received for 120 seconds".to_string(),
-                        )));
+                        let _ = tx.send(Ok(StreamEvent::Error(format!(
+                            "Stream timeout: no data received for {idle_timeout_secs}s"
+                        ))));
                         return;
                     }
                 };
