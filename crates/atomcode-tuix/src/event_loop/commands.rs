@@ -114,7 +114,13 @@ fn spawn_runtime(
     Session,
 ) {
     let runtime_id = ctx.bg_manager.allocate_runtime_id();
-    let (client, event_rx) = ctx.runtime_factory.spawn_runtime(Conversation::new());
+    // Engine v2: spawn through the injected bridge so in-TUI session switches run
+    // on the new stack too. The override reads the CURRENT config/working_dir (the
+    // same values the v1 factory would), keeping /model /provider /cd honoured.
+    let (client, event_rx) = match &ctx.runtime_spawn_override {
+        Some(spawn) => spawn(&ctx.config, &ctx.working_dir),
+        None => ctx.runtime_factory.spawn_runtime(Conversation::new()),
+    };
     bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
     (runtime_id, client, session)
 }

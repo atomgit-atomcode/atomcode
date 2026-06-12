@@ -649,12 +649,27 @@ pub struct McpReloadProgress {
     pub started_at: std::time::Instant,
 }
 
+/// Optional override for spawning agent runtimes. `None` ⇒ use
+/// `runtime_factory.spawn_runtime` (the v1 engine). When set, in-TUI session
+/// switches (`/session`, `/bg`, disk `/resume`) spawn through it instead — the
+/// cli injects the engine-v2 bridge here. It receives the CURRENT config +
+/// working dir (so it tracks `/model` / `/provider` / `/cd`) and returns the same
+/// `(client, event_rx)` pair the factory does.
+pub type RuntimeSpawnOverride = std::sync::Arc<
+    dyn Fn(&Config, &std::path::Path) -> (AgentClient, mpsc::UnboundedReceiver<AgentEvent>)
+        + Send
+        + Sync,
+>;
+
 /// Bag of handles passed into the loop.
 pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
     pub agent: AgentClient,
     pub runtime_factory: AgentRuntimeFactory,
+    /// Optional engine-v2 spawner; `None` ⇒ the v1 `runtime_factory`. See
+    /// [`RuntimeSpawnOverride`].
+    pub runtime_spawn_override: Option<RuntimeSpawnOverride>,
     pub bg_manager: bg_runtime::BgRuntimeManager,
     pub foreground_runtime_id: bg_runtime::RuntimeId,
     pub runtime_event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,

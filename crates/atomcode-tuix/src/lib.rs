@@ -34,6 +34,7 @@ use tokio::sync::mpsc;
 
 use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
+pub use crate::event_loop::RuntimeSpawnOverride;
 use crate::input::history::History;
 use crate::input::reader;
 use crate::render::{
@@ -171,6 +172,7 @@ pub async fn run(
     model_name: String,
     agent_handle: AgentHandle,
     runtime_factory: AgentRuntimeFactory,
+    runtime_spawn_override: Option<RuntimeSpawnOverride>,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
@@ -531,6 +533,7 @@ pub async fn run(
         model_name,
         agent: agent_client,
         runtime_factory,
+        runtime_spawn_override,
         bg_manager,
         foreground_runtime_id,
         runtime_event_tx,

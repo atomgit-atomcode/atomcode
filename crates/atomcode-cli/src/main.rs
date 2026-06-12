@@ -1436,18 +1436,22 @@ async fn run() -> Result<i32> {
         .or_else(|| std::env::var("ATOMCODE_ENGINE").ok());
     let engine_v2 = matches!(engine_choice.as_deref(), Some("v2" | "2" | "new"));
     let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if engine_v2 {
-        let p = config.providers.get(&config.default_provider);
-        let bridge_cfg = atomcode_bridge::BridgeConfig {
-            api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
-            base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
-            model: p.map(|p| p.model.clone()).unwrap_or_default(),
-            working_dir: working_dir.clone(),
-            context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
-            mcp: true,
-        };
+        let bridge_cfg = bridge_config_from(&config, &working_dir);
         eprintln!("[engine v2] new stack active (model {})", bridge_cfg.model);
         let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
         Some(atomcode_core::agent::AgentHandle { client, event_rx })
+    } else {
+        None
+    };
+    // Engine-v2 spawner for in-TUI session switches (/session, /bg, disk /resume):
+    // each one builds a fresh bridge from the CURRENT config, so the new engine —
+    // not the v1 factory — backs those runtimes too. `None` in v1 keeps the factory.
+    let runtime_spawn_override: Option<atomcode_tuix::RuntimeSpawnOverride> = if engine_v2 {
+        Some(std::sync::Arc::new(
+            |config: &atomcode_core::config::Config, working_dir: &std::path::Path| {
+                atomcode_bridge::spawn_bridged_runtime(bridge_config_from(config, working_dir))
+            },
+        ))
     } else {
         None
     };
@@ -1628,7 +1632,7 @@ async fn run() -> Result<i32> {
                 });
                 agent_handle
             };
-            atomcode_tuix::run(config, model_name, tui_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions).await?;
+            atomcode_tuix::run(config, model_name, tui_handle, runtime_factory, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions).await?;
             Ok(0)
         };
 
@@ -1702,6 +1706,24 @@ fn redirect_stderr_to_log_file() {
     // Windows: NSPasteboard is mac-only; arboard on Windows uses
     // OpenClipboard which doesn't NSLog. Not a known leak path.
     // No-op for now; revisit if a similar Windows issue surfaces.
+}
+
+/// Derive the engine-v2 bridge config from the current config + working dir.
+/// Shared by the initial bridge handle and the in-TUI runtime-spawn override so
+/// both resolve the provider identically.
+fn bridge_config_from(
+    config: &atomcode_core::config::Config,
+    working_dir: &std::path::Path,
+) -> atomcode_bridge::BridgeConfig {
+    let p = config.providers.get(&config.default_provider);
+    atomcode_bridge::BridgeConfig {
+        api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
+        base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+        model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        working_dir: working_dir.to_path_buf(),
+        context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
+        mcp: true,
+    }
 }
 
 /// Run agent in headless mode (pipe-friendly: stdout = LLM text only,
