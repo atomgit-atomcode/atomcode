@@ -203,6 +203,18 @@ pub enum UiLine {
     TurnSeparator {
         label: String,
     },
+    /// Overlay modal: a floating window drawn on top of body+footer.
+    /// RetainedRenderer paints this after the normal frame; PlainRenderer ignores it.
+    ModalOverlay {
+        title: String,
+        lines: Vec<String>,
+        scroll: usize,
+        total: usize,
+        win_width: u16,
+        win_height: u16,
+    },
+    /// Clear the overlay modal and restore the underlying frame.
+    ModalOverlayClear,
 }
 
 pub trait Renderer: Send {

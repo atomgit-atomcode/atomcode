@@ -430,7 +430,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── Approval prompt ──
         Msg::ApprovalPromptAlt { tool, detail } =>
-            format!("Allow {}({})? [Y]es / [N]o / [A]lways", tool, detail).into(),
+            format!("Allow {}({})? [Y]es=Enter / [N]o / [A]lways", tool, detail).into(),
         Msg::ApprovalWaitingLabel =>
             "▶ Waiting for approval: ".into(),
         Msg::ApprovalAllow => " Allow  ".into(),
@@ -813,6 +813,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
         Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
+        Msg::CmdDescView => "View file content in an overlay modal".into(),
+        Msg::ViewUsage => "Usage: /view <filepath>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
         Msg::GuideMenuTopics => "Common topics:".into(),
         Msg::GuideMenuGettingStarted => "Getting started          First install, login, config".into(),

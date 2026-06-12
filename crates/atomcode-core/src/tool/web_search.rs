@@ -31,7 +31,67 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
-pub struct WebSearchTool;
+/// Which backend `web_search` queries. Selected via `[web_search] provider`
+/// in config (default `exa`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchProvider {
+    /// Exa MCP search API (mcp.exa.ai) — reachable without a VPN and returns
+    /// clean, LLM-ready result text. The default.
+    Exa,
+    /// Legacy DuckDuckGo HTML scraping (html.duckduckgo.com). Blocked in some
+    /// regions; kept for users who prefer a keyless, no-third-party backend.
+    DuckDuckGo,
+}
+
+impl SearchProvider {
+    fn from_config_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "duckduckgo" | "ddg" => SearchProvider::DuckDuckGo,
+            // Unknown / "exa" / empty → Exa, the globally-reachable default.
+            _ => SearchProvider::Exa,
+        }
+    }
+}
+
+/// `web_search` tool. The backend + optional Exa key are resolved once at
+/// construction (from `[web_search]` config) rather than per call.
+#[derive(Debug, Clone)]
+pub struct WebSearchTool {
+    provider: SearchProvider,
+    /// Exa API key (config `api_key`, overridden by `EXA_API_KEY` env at
+    /// construction). `None` → Exa's keyless tier.
+    exa_api_key: Option<String>,
+}
+
+impl Default for WebSearchTool {
+    fn default() -> Self {
+        // Resolve EXA_API_KEY here too so even a keyless `default()`
+        // construction (e.g. the daemon) picks up an env key when present.
+        Self {
+            provider: SearchProvider::Exa,
+            exa_api_key: env_exa_key(),
+        }
+    }
+}
+
+impl WebSearchTool {
+    /// Build from the `[web_search]` config block. `EXA_API_KEY` env var
+    /// takes precedence over a configured `api_key`.
+    pub fn from_config(cfg: &crate::config::WebSearchConfig) -> Self {
+        let exa_api_key =
+            env_exa_key().or_else(|| cfg.api_key.clone().filter(|s| !s.trim().is_empty()));
+        Self {
+            provider: SearchProvider::from_config_str(&cfg.provider),
+            exa_api_key,
+        }
+    }
+}
+
+fn env_exa_key() -> Option<String> {
+    std::env::var("EXA_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
 
 #[derive(Deserialize)]
 struct WebSearchArgs {
@@ -75,10 +135,122 @@ impl Tool for WebSearchTool {
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: WebSearchArgs = serde_json::from_str(args)?;
         let max = parsed.max_results.min(20);
+        Ok(match self.provider {
+            SearchProvider::Exa => self.search_exa(&parsed.query, max).await,
+            SearchProvider::DuckDuckGo => self.search_ddg(&parsed.query, max).await,
+        })
+    }
+}
 
+/// Guidance appended to every failed search result: when the built-in search
+/// can't reach the network (e.g. behind the GFW), steer the model to the
+/// browser-based `web-access` skill instead of fruitlessly retrying.
+const SKILL_FALLBACK_HINT: &str = "\n\nIf web search keeps failing here (blocked / unreachable network) and a `web-access` skill is listed under Available Skills, call `use_skill web-access` to perform this via a real browser instead of retrying web_search.";
+
+/// Build a failed `ToolResult`, appending the web-access skill fallback hint.
+fn fail(msg: String) -> ToolResult {
+    ToolResult {
+        call_id: String::new(),
+        output: format!("{msg}{SKILL_FALLBACK_HINT}"),
+        success: false,
+    }
+}
+
+impl WebSearchTool {
+    /// Exa MCP search backend. POSTs a JSON-RPC `tools/call` to mcp.exa.ai and
+    /// returns the LLM-ready text payload from the SSE response. Reachable
+    /// without a VPN; keyless unless an Exa key is configured.
+    async fn search_exa(&self, query: &str, max: usize) -> ToolResult {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "web_search_exa",
+                "arguments": { "query": query, "numResults": max }
+            }
+        })
+        .to_string();
+
+        let url = match &self.exa_api_key {
+            Some(k) => format!("https://mcp.exa.ai/mcp?exaApiKey={}", k),
+            None => "https://mcp.exa.ai/mcp".to_string(),
+        };
+
+        // curl (not reqwest) for parity with the DDG path and to dodge TLS
+        // fingerprinting; args go straight to argv (no shell), so the JSON
+        // body and URL are passed verbatim without quoting hazards.
+        let curl_bin = if cfg!(target_os = "windows") {
+            "curl.exe"
+        } else {
+            "curl"
+        };
+        let mut cmd = Command::new(curl_bin);
+        cmd.args(&[
+            "-s",
+            "-X",
+            "POST",
+            &url,
+            "-H",
+            "content-type: application/json",
+            "-H",
+            "accept: application/json, text/event-stream",
+            "-d",
+            &body,
+            "--max-time",
+            "25",
+        ]);
+        cmd.kill_on_drop(true);
+        crate::process_utils::suppress_console_window(&mut cmd);
+
+        let output =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return fail(format!("Exa web search timed out after 30s for '{}'.", query))
+                }
+            };
+        let sse = match output {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            // curl exits non-zero only on transport failure (DNS / connect /
+            // TLS) — exactly the GFW-block signature. HTTP-level errors exit 0
+            // and fall through to the empty-parse branch below.
+            Ok(o) => {
+                return fail(format!(
+                    "Exa web search could not reach mcp.exa.ai for '{}' (curl exit {:?}): {}",
+                    query,
+                    o.status.code(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ))
+            }
+            Err(e) => return fail(format!("Exa web search failed to spawn curl: {}", e)),
+        };
+
+        match parse_exa_sse(&sse) {
+            Some(text) if !text.trim().is_empty() => ToolResult {
+                call_id: String::new(),
+                output: format!("Search results for \"{}\":\n\n{}", query, text.trim()),
+                success: true,
+            },
+            _ => fail(format!(
+                "Exa web search returned no usable results for '{}' ({} bytes received).",
+                query,
+                sse.len()
+            )),
+        }
+    }
+
+    /// Legacy DuckDuckGo HTML-scraping backend.
+    async fn search_ddg(&self, query: &str, max: usize) -> ToolResult {
         // Use curl for the HTTP request — reqwest gets blocked by DuckDuckGo's
         // TLS fingerprint detection, but curl works reliably.
-        let query_encoded = parsed.query.replace(' ', "+");
+        // Encode the query value for application/x-www-form-urlencoded POST data.
+        // Spaces → `+`; `&`, `%`, `=` → percent-encoded to avoid malformed payloads.
+        let query_encoded = query
+            .replace('%', "%25")
+            .replace('&', "%26")
+            .replace('=', "%3D")
+            .replace(' ', "+");
         let curl_bin = if cfg!(target_os = "windows") {
             "curl.exe"
         } else {
@@ -103,7 +275,7 @@ impl Tool for WebSearchTool {
         // On Windows, prevent the spawned curl.exe from creating a visible console window.
         crate::process_utils::suppress_console_window(&mut cmd);
 
-        crate::ctrace!("TOOL", "web_search before cmd.output().await query={:?}", parsed.query);
+        crate::ctrace!("TOOL", "web_search before cmd.output().await query={:?}", query);
         // tokio-level hard timeout (20s) on top of curl's own `--max-time 15`.
         // Belt-and-suspenders: if curl somehow doesn't honour its flag (DNS
         // wedge, broken pipe edge cases, child-reap stuck), the tokio future
@@ -121,51 +293,33 @@ impl Tool for WebSearchTool {
             }
             Err(_) => {
                 crate::ctrace!("TOOL", "web_search tokio timeout (20s) fired");
-                return Ok(ToolResult {
-                    call_id: String::new(),
-                    output: format!(
-                        "Search timed out after 20s for '{}'. Network may be unreachable or DuckDuckGo is slow — try a different query or use web_fetch on a known URL.",
-                        parsed.query
-                    ),
-                    success: false,
-                });
+                return fail(format!(
+                    "Search timed out after 20s for '{}'. Network may be unreachable or DuckDuckGo is slow.",
+                    query
+                ));
             }
         };
 
         let html = match output {
             Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-            Err(e) => {
-                return Ok(ToolResult {
-                    call_id: String::new(),
-                    output: format!("Search failed: {}", e),
-                    success: false,
-                });
-            }
+            Err(e) => return fail(format!("Search failed: {}", e)),
         };
 
         if html.is_empty() {
-            return Ok(ToolResult {
-                call_id: String::new(),
-                output: format!("Search returned empty response for '{}'", parsed.query),
-                success: false,
-            });
+            return fail(format!("Search returned empty response for '{}'", query));
         }
 
         let results = parse_ddg_results(&html, max);
 
         if results.is_empty() {
-            return Ok(ToolResult {
-                call_id: String::new(),
-                output: format!(
-                    "No results found for '{}' ({} bytes received)",
-                    parsed.query,
-                    html.len()
-                ),
-                success: false,
-            });
+            return fail(format!(
+                "No results found for '{}' ({} bytes received)",
+                query,
+                html.len()
+            ));
         }
 
-        let mut out = format!("Search results for \"{}\":\n\n", parsed.query);
+        let mut out = format!("Search results for \"{}\":\n\n", query);
         for (i, r) in results.iter().enumerate() {
             out.push_str(&format!(
                 "{}. {}\n   {}\n   {}\n\n",
@@ -176,12 +330,42 @@ impl Tool for WebSearchTool {
             ));
         }
 
-        Ok(ToolResult {
+        ToolResult {
             call_id: String::new(),
             output: out,
             success: true,
-        })
+        }
     }
+}
+
+/// Parse Exa's MCP Server-Sent-Events response, returning the concatenated
+/// text payload from the first `data:` line carrying `result.content[].text`.
+/// Non-`data:` lines (`event:` etc.) and error frames are skipped.
+fn parse_exa_sse(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let payload = match line.strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        if let Some(content) = json.pointer("/result/content").and_then(|c| c.as_array()) {
+            let mut combined = String::new();
+            for item in content {
+                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                    if !combined.is_empty() {
+                        combined.push_str("\n\n");
+                    }
+                    combined.push_str(t);
+                }
+            }
+            if !combined.is_empty() {
+                return Some(combined);
+            }
+        }
+    }
+    None
 }
 
 struct SearchResult {
@@ -383,5 +567,59 @@ mod tests {
     fn test_strip_html_tags() {
         assert_eq!(strip_html_tags("hello <b>world</b>"), "hello world");
         assert_eq!(strip_html_tags("&amp; &lt;"), "& <");
+    }
+
+    #[test]
+    fn test_parse_exa_sse_extracts_text() {
+        // Shape mirrors a real mcp.exa.ai response: an `event:` line then a
+        // `data:` line carrying JSON-RPC with result.content[].text.
+        let sse = "event: message\n\
+            data: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Title: Foo\\nURL: https://foo.example\"}]},\"jsonrpc\":\"2.0\",\"id\":1}\n";
+        let text = parse_exa_sse(sse).expect("should extract text");
+        assert!(text.contains("Title: Foo"));
+        assert!(text.contains("https://foo.example"));
+    }
+
+    #[test]
+    fn test_parse_exa_sse_concatenates_multiple_text_items() {
+        let sse = "data: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"one\"},{\"type\":\"text\",\"text\":\"two\"}]}}\n";
+        assert_eq!(parse_exa_sse(sse).as_deref(), Some("one\n\ntwo"));
+    }
+
+    #[test]
+    fn test_parse_exa_sse_no_data_returns_none() {
+        // tools list / heartbeat with no content payload → None (caller fails
+        // and surfaces the skill fallback hint).
+        assert_eq!(parse_exa_sse("event: ping\n: keepalive\n"), None);
+        assert_eq!(
+            parse_exa_sse("data: {\"error\":{\"code\":-32600,\"message\":\"bad\"}}\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn fail_appends_skill_hint() {
+        let r = fail("boom".to_string());
+        assert!(!r.success);
+        assert!(r.output.starts_with("boom"));
+        assert!(r.output.contains("use_skill web-access"));
+    }
+
+    #[test]
+    fn provider_from_config_str_defaults_to_exa() {
+        assert_eq!(SearchProvider::from_config_str("exa"), SearchProvider::Exa);
+        assert_eq!(SearchProvider::from_config_str(""), SearchProvider::Exa);
+        assert_eq!(
+            SearchProvider::from_config_str("garbage"),
+            SearchProvider::Exa
+        );
+        assert_eq!(
+            SearchProvider::from_config_str("DuckDuckGo"),
+            SearchProvider::DuckDuckGo
+        );
+        assert_eq!(
+            SearchProvider::from_config_str(" ddg "),
+            SearchProvider::DuckDuckGo
+        );
     }
 }

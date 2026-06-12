@@ -342,15 +342,12 @@ impl Tool for EditFileTool {
     }
 
     fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
-        // Same merge contract as `write.rs::approval_with_context`. Two checks
-        // need to combine: `approval()` flags sensitive targets (.env, id_rsa,
-        // *.pem, /etc/*, ~/.ssh/*) regardless of workspace; `approval_for_path`
-        // flags out-of-workspace writes. When the path is in-workspace but
-        // sensitive, `approval_for_path` returns AutoApprove and the base's
-        // `RequireApproval` MUST be upgraded to `RequireApprovalAlways` —
-        // otherwise a prior session [A] on edit_file would let the model edit
-        // an in-workspace `.env` without prompting (same class of bypass as
-        // the bash rmdir incident; see bash.rs:115).
+        // Two checks combine: `approval()` flags sensitive targets (.env,
+        // id_rsa, *.pem, /etc/*, ~/.ssh/*) regardless of workspace;
+        // `scoped_write_approval` adds the out-of-workspace boundary check and
+        // scopes any prompt to the exact file — so pressing [A] remembers THAT
+        // file for the session (re-editing it stops re-prompting) while a
+        // tool-wide grant can never bypass a sensitive write.
         let base = self.approval(args);
         let parsed = match serde_json::from_str::<EditFileArgs>(args) {
             Ok(parsed) => parsed,
@@ -360,30 +357,7 @@ impl Tool for EditFileTool {
             Ok(wd) => wd.clone(),
             Err(_) => return base,
         };
-        match super::approval_for_path(
-            &parsed.file_path,
-            &working_dir,
-            super::ExternalPathAction::Write,
-        ) {
-            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => {
-                ApprovalRequirement::RequireApprovalAlways(reason)
-            }
-            Ok(ApprovalRequirement::RequireApproval(reason)) => {
-                ApprovalRequirement::RequireApproval(reason)
-            }
-            // Writes never path-scope; treat a scoped result (the Write action
-            // doesn't produce one today) as the strictest always-ask.
-            Ok(ApprovalRequirement::RequireApprovalScoped { reason, .. }) => {
-                ApprovalRequirement::RequireApprovalAlways(reason)
-            }
-            Ok(ApprovalRequirement::AutoApprove) => match base {
-                ApprovalRequirement::RequireApproval(reason) => {
-                    ApprovalRequirement::RequireApprovalAlways(reason)
-                }
-                other => other,
-            },
-            Err(_) => base,
-        }
+        super::scoped_write_approval(&parsed.file_path, &working_dir, base)
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
@@ -1731,16 +1705,17 @@ mod security_tests {
     }
 
     // Regression: a single `[A]` on edit_file for a safe edit must NOT
-    // silently disarm the sensitive-path guard for later calls. Pre-fix
+    // silently disarm the sensitive-path guard for OTHER files. Pre-fix
     // `approval_with_context` only ran the workspace-boundary check and
     // dropped the `is_sensitive_input_path` result from `approval()`, so
     // editing a workspace-local `.env` came back as AutoApprove — worse
     // than the bash session-grant bypass (no prompt at all). Fix contract:
-    // sensitive in-workspace paths upgrade to RequireApprovalAlways so
-    // PermissionStore::check routes to Ask regardless of session grants.
-    // Mirrors `bash_destructive_command_through_store_with_session_grant_asks`.
+    // sensitive in-workspace paths return RequireApprovalScoped so a
+    // tool-wide session grant on edit_file cannot bypass approval, while a
+    // per-file [A] is remembered for that exact file (see
+    // `edit_file_always_grant_persists_for_same_file_only`).
     #[test]
-    fn edit_file_sensitive_in_workspace_path_returns_require_approval_always() {
+    fn edit_file_sensitive_in_workspace_path_returns_scoped_approval() {
         let workspace = TempDir::new().unwrap();
         let dotenv = workspace.path().join(".env");
         let args = serde_json::json!({
@@ -1753,10 +1728,58 @@ mod security_tests {
         assert!(
             matches!(
                 EditFileTool.approval_with_context(&args, &ctx),
-                ApprovalRequirement::RequireApprovalAlways(_)
+                ApprovalRequirement::RequireApprovalScoped { .. }
             ),
-            "sensitive in-workspace path (.env) must return RequireApprovalAlways so a \
-             session grant on edit_file cannot bypass approval",
+            "sensitive in-workspace path (.env) must return RequireApprovalScoped so a \
+             tool-wide session grant on edit_file cannot bypass approval",
+        );
+    }
+
+    // Regression for the reported bug: editing the SAME file repeatedly,
+    // pressing [A] (Always) must stop re-prompting for THAT file — while a
+    // different sensitive/external file still prompts. Pre-fix the approval
+    // was RequireApprovalAlways, which `PermissionStore::check` routes to Ask
+    // unconditionally, so the recorded grant was dead and every edit
+    // re-prompted.
+    #[test]
+    fn edit_file_always_grant_persists_for_same_file_only() {
+        use crate::tool::{ApprovalRequirement, PermissionDecision, PermissionStore};
+        let workspace = TempDir::new().unwrap();
+        let dotenv = workspace.path().join(".env"); // sensitive → prompts
+        let other = workspace.path().join("secret.pem"); // different sensitive file
+        let mk = |p: &std::path::Path| {
+            serde_json::json!({
+                "file_path": p.to_string_lossy(),
+                "old_string": "old",
+                "new_string": "new"
+            })
+            .to_string()
+        };
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let mut store = PermissionStore::new();
+
+        // First edit of .env prompts; simulate the user pressing [A] by
+        // recording the scoped grant the decider would store.
+        let approval = EditFileTool.approval_with_context(&mk(&dotenv), &ctx);
+        assert!(matches!(store.check("edit_file", &approval), PermissionDecision::Ask(_)));
+        match &approval {
+            ApprovalRequirement::RequireApprovalScoped { scope, .. } => {
+                store.grant_session_scope(scope)
+            }
+            other => panic!("expected scoped approval, got {other:?}"),
+        }
+
+        // Re-editing the SAME file no longer prompts.
+        let again = EditFileTool.approval_with_context(&mk(&dotenv), &ctx);
+        assert!(
+            matches!(store.check("edit_file", &again), PermissionDecision::Allow),
+            "[A] on a file must stop re-prompting for the SAME file",
+        );
+        // A DIFFERENT sensitive file still prompts (scope is per-file).
+        let different = EditFileTool.approval_with_context(&mk(&other), &ctx);
+        assert!(
+            matches!(store.check("edit_file", &different), PermissionDecision::Ask(_)),
+            "a [A] on one file must NOT unlock edits to a different sensitive file",
         );
     }
 

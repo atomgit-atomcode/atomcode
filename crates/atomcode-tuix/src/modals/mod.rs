@@ -20,6 +20,7 @@ use crate::render::Renderer;
 use crate::state::UiState;
 
 pub mod dir_picker;
+pub mod file_viewer;
 pub mod issue_wizard;
 pub mod language_picker;
 pub mod model_picker;
@@ -29,6 +30,7 @@ mod qr;
 pub mod provider_wizard;
 pub mod session_picker;
 pub use dir_picker::DirPicker;
+pub use file_viewer::FileViewer;
 pub use issue_wizard::IssueWizard;
 pub use language_picker::LanguagePicker;
 pub use model_picker::ModelPicker;

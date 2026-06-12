@@ -410,6 +410,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// no-op since the group rows are no longer at the bottom and may
     /// have scrolled out of the visible body strip).
     live_group: Option<LiveGroup>,
+    /// Modal overlay state: a floating window drawn on top of body+footer.
+    /// When Some, `paint_frame` paints the overlay cells after the normal
+    /// body+footer, so the diff sees the combined frame.
+    modal_overlay: Option<ModalOverlayState>,
     /// Windows only: the STD_INPUT_HANDLE console mode value saved by
     /// `enable_conhost_mouse_capture`. Currently always `None` — mouse
     /// capture is intentionally disabled (see `with_writer` comment),
@@ -420,6 +424,14 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// only on one side of the lifecycle).
     #[cfg(windows)]
     prior_console_in_mode: Option<u32>,
+}
+
+/// Pre-computed overlay cell grid + screen position for a modal window.
+#[derive(Debug, Clone)]
+struct ModalOverlayState {
+    cells: Vec<Vec<Cell>>,
+    x: u16,
+    y: u16,
 }
 
 /// Tracking state for an active multi-row live group. Populated by
@@ -509,7 +521,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self {
             out,
             caps,
-            screen: Screen::new(w, h),
+            screen: Screen::new(w, h).with_jediterm(caps.jediterm),
             input_buf: String::new(),
             input_cursor_byte: 0,
             menu: None,
@@ -530,6 +542,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_tool: None,
             inflight_tool_rows: 0,
             live_group: None,
+            modal_overlay: None,
             #[cfg(windows)]
             prior_console_in_mode,
         }
@@ -803,8 +816,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
             rows.push(row);
         } else {
-            // Wrapping: first chunk splits at name boundary;
-            // meta is short, append to first row in meta_style.
+            // Wrapping: first chunk splits at the name boundary; continuation
+            // chunks are padded under the name. `full_body` excludes `meta`
+            // (the ` · 12s` time anchor) — it's appended AFTER the wrapped body
+            // below, matching the single-line order (name → detail → meta).
             let chunks: Vec<String> =
                 crate::width::wrap_line_to_width(full_body, first_budget.max(1))
                     .into_iter()
@@ -826,14 +841,57 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             push_str_cells(&mut row, rest, detail_style);
                         }
                     }
-                    if !meta.is_empty() {
-                        push_str_cells(&mut row, meta, meta_style);
-                    }
                 } else {
                     push_str_cells(&mut row, &cont_pad, &pad);
-                    push_str_cells(&mut row, chunk, detail_style);
+                    // Continuation chunks: track cumulative width so we know
+                    // whether we're still within the tool name or past it.
+                    let chunk_dw = crate::width::display_width(chunk);
+                    let consumed_dw: usize = chunks[..i]
+                        .iter()
+                        .map(|c| crate::width::display_width(c))
+                        .sum();
+                    if consumed_dw + chunk_dw <= name_dw {
+                        // Entire chunk is still within the tool name
+                        push_str_cells(&mut row, chunk, name_style);
+                    } else if consumed_dw < name_dw {
+                        // Chunk straddles name/detail boundary
+                        let name_remain = name_dw - consumed_dw;
+                        let name_part = crate::width::truncate_to_width(chunk, name_remain);
+                        push_str_cells(&mut row, &name_part, name_style);
+                        let rest = &chunk[name_part.len()..];
+                        if !rest.is_empty() {
+                            push_str_cells(&mut row, rest, detail_style);
+                        }
+                    } else {
+                        // Chunk is entirely past the tool name
+                        push_str_cells(&mut row, chunk, detail_style);
+                    }
                 }
                 rows.push(row);
+            }
+            // Append `meta` after the wrapped body. Appending it to the FIRST
+            // row (as the old code did) overflowed the screen by meta's width —
+            // the first chunk already fills `first_budget`, so `prefix + chunk +
+            // meta` exceeds `w` and the terminal clips or re-wraps it, dropping
+            // the `· 93.7s` time anchor on narrow windows. Put it on the last
+            // row when it fits, otherwise on its own continuation row.
+            if !meta.is_empty() {
+                let last_w: usize = rows
+                    .last()
+                    .map(|r| r.iter().map(|c| c.width as usize).sum())
+                    .unwrap_or(0);
+                if last_w + meta_dw <= w {
+                    if let Some(last) = rows.last_mut() {
+                        push_str_cells(last, meta, meta_style);
+                    }
+                } else {
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, &cont_pad, &CellStyle::default());
+                    // meta is typically " · 12s"; drop the leading space so it
+                    // lines up under the body on its own row.
+                    push_str_cells(&mut row, meta.trim_start(), meta_style);
+                    rows.push(row);
+                }
             }
         }
         rows
@@ -1488,6 +1546,168 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn paint_frame(&mut self) {
         self.paint_body_into_cells();
         self.paint_footer();
+        // Overlay modal drawn on top of body+footer so the diff sees
+        // the combined frame. When modal_overlay is None this is a no-op.
+        if let Some(ref overlay) = self.modal_overlay {
+            for (dy, row) in overlay.cells.iter().enumerate() {
+                self.screen.draw_row(overlay.y as usize + dy, overlay.x as usize, row);
+            }
+        }
+    }
+
+    /// Build a modal overlay cell grid from the given title + content lines.
+    /// The window is centred on the current screen and bounded to fit.
+    fn build_modal_overlay(
+        &self,
+        title: &str,
+        lines: &[String],
+        scroll: usize,
+        total: usize,
+        win_width: u16,
+        win_height: u16,
+    ) -> ModalOverlayState {
+        let screen_w = self.screen.width();
+        let screen_h = self.screen.height();
+
+        // Clamp to screen bounds with a small margin.
+        let win_w = win_width.min(screen_w.saturating_sub(4)).max(20);
+        let win_h = win_height.min(screen_h.saturating_sub(4)).max(6);
+        let x = (screen_w.saturating_sub(win_w)) / 2;
+        let y = (screen_h.saturating_sub(win_h)) / 2;
+
+        let mut cells: Vec<Vec<Cell>> = Vec::with_capacity(win_h as usize);
+        let border_style = self.style_for(Role::Muted);
+        let title_style = self.style_bold(Role::Brand);
+        let text_style = CellStyle::default();
+        let hint_style = self.style_for(Role::Muted);
+
+        // Helper to build a full-width row padded with spaces.
+        let build_row = |content: Vec<Cell>| -> Vec<Cell> {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '│', style: border_style.clone(), width: 1 });
+            row.extend(content);
+            let filled: usize = row.iter().map(|c| c.width as usize).sum();
+            let pad = (win_w as usize).saturating_sub(filled).saturating_sub(1); // -1 for right border
+            for _ in 0..pad {
+                row.push(Cell::blank());
+            }
+            row.push(Cell { ch: '│', style: border_style.clone(), width: 1 });
+            row
+        };
+
+        // Inner text width: window minus the 2 borders and the 1-col left
+        // pad every row carries. ALL variable-text rows (title, content,
+        // hint) clip to this so none can overflow the frame and shove the
+        // right border out of alignment.
+        let max_inner = (win_w as usize).saturating_sub(3);
+        let clip_cells = |text: &str, style: &CellStyle| -> Vec<Cell> {
+            let mut out = Vec::new();
+            let mut used = 0usize;
+            for ch in text.chars() {
+                if used >= max_inner {
+                    break;
+                }
+                // Normalise control chars exactly like `push_str_cells`
+                // so the cell model stays column-aligned with the
+                // terminal: drop CR/LF, expand TAB to spaces (a raw TAB
+                // would jump the terminal to its hardware tab stop and
+                // shove the right border out of alignment), skip
+                // zero-width combining marks.
+                match ch {
+                    '\n' | '\r' => continue,
+                    '\t' => {
+                        let n = crate::render::cell::SOFT_TAB_WIDTH.min(max_inner - used);
+                        for _ in 0..n {
+                            out.push(Cell { ch: ' ', style: style.clone(), width: 1 });
+                        }
+                        used += n;
+                    }
+                    _ => {
+                        let w = crate::width::cell_char_width(ch).unwrap_or(1);
+                        if w == 0 {
+                            continue;
+                        }
+                        if used + w > max_inner {
+                            break;
+                        }
+                        out.push(Cell { ch, style: style.clone(), width: w as u8 });
+                        used += w;
+                        for _ in 1..w {
+                            out.push(Cell::continuation());
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        // Top border: ┌─────┐
+        {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '┌', style: border_style.clone(), width: 1 });
+            for _ in 0..(win_w as usize).saturating_sub(2) {
+                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+            }
+            row.push(Cell { ch: '┐', style: border_style.clone(), width: 1 });
+            cells.push(row);
+        }
+
+        // Title row (clipped so a long filename can't overflow the frame).
+        {
+            let safe_title = crate::sanitize::scrub_controls(title);
+            let mut content = Vec::new();
+            content.push(Cell::blank());
+            content.extend(clip_cells(&format!(" {}", safe_title), &title_style));
+            cells.push(build_row(content));
+        }
+
+        // Separator line
+        {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '├', style: border_style.clone(), width: 1 });
+            for _ in 0..(win_w as usize).saturating_sub(2) {
+                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+            }
+            row.push(Cell { ch: '┤', style: border_style.clone(), width: 1 });
+            cells.push(row);
+        }
+
+        // Content rows
+        let content_height = (win_h as usize).saturating_sub(5); // top + title + sep + hint + bottom
+        for line in lines.iter().take(content_height) {
+            let safe = crate::sanitize::scrub_controls(line);
+            let mut content = Vec::new();
+            content.push(Cell::blank());
+            content.extend(clip_cells(&safe, &text_style));
+            cells.push(build_row(content));
+        }
+
+        // Pad remaining content rows with blank lines
+        for _ in lines.len()..content_height {
+            cells.push(build_row(vec![Cell::blank()]));
+        }
+
+        // Bottom hint row: "Line X/Y · Esc/q to close" (clipped to width).
+        {
+            let hint = format!("Line {}/{} · Esc/q to close", scroll + 1, total);
+            let mut content = Vec::new();
+            content.push(Cell::blank());
+            content.extend(clip_cells(&hint, &hint_style));
+            cells.push(build_row(content));
+        }
+
+        // Bottom border: └─────┘
+        {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '└', style: border_style.clone(), width: 1 });
+            for _ in 0..(win_w as usize).saturating_sub(2) {
+                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+            }
+            row.push(Cell { ch: '┘', style: border_style.clone(), width: 1 });
+            cells.push(row);
+        }
+
+        ModalOverlayState { cells, x, y }
     }
 
     /// Append-only model: copy the body_lines tail into screen.cells
@@ -3177,15 +3397,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             UiLine::ApprovalPrompt { tool, detail } => {
                 let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
+                // Truecolor so the chips read as vivid green / blue / red on
+                // EVERY terminal theme. The 16-colour bright variants the rest
+                // of the UI uses (Color::Green/Cyan/Red) render muddy and
+                // near-indistinguishable on some dark palettes — user report:
+                // allow+always both looked grey, deny orange. These chips are
+                // safety-critical (allow vs deny must be unmistakable), so pin
+                // exact RGB. Same approach markdown highlighting already takes;
+                // `caps.colors` still gates all colour output.
+                let approve_green = Color::Rgb { r: 0x30, g: 0xD1, b: 0x58 };
+                let always_blue = Color::Rgb { r: 0x2B, g: 0xB8, b: 0xE0 };
+                let deny_red = Color::Rgb { r: 0xFF, g: 0x45, b: 0x3A };
                 let chip = |c: Color| CellStyle {
                     fg: Some(c),
                     bold: true,
                     reverse: true,
                     faint: false,
                 };
-                let chip_y = chip(Color::Green);
-                let chip_a = chip(Color::Cyan);
-                let chip_n = chip(Color::Red);
+                let chip_y = chip(approve_green);
+                let chip_a = chip(always_blue);
+                let chip_n = chip(deny_red);
 
                 let waiting = t(Msg::ApprovalWaitingLabel);
                 let prefix_w = crate::width::display_width(&waiting);
@@ -3196,9 +3427,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let deny = t(Msg::ApprovalDeny);
 
                 // Build the Y/A/N chips cells once — reused whether
-                // we place them inline or on a separate line.
+                // we place them inline or on a separate line. The `↵` marker
+                // after the Y chip flags Allow(once) as the DEFAULT: pressing
+                // Enter triggers it (see `handle_approval_key`), so the user
+                // doesn't have to reach for an explicit key/chord. ASCII
+                // terminals (no `unicode_symbols`) fall back to "Enter".
+                let enter_marker = if self.caps.unicode_symbols { " ↵" } else { " Enter" };
+                let enter_style = CellStyle {
+                    fg: Some(approve_green), // match the Allow chip
+                    bold: true,
+                    reverse: false,
+                    faint: false,
+                };
                 let mut chips_cells: Vec<Cell> = Vec::new();
                 push_str_cells(&mut chips_cells, " Y ", &chip_y);
+                push_str_cells(&mut chips_cells, enter_marker, &enter_style);
                 push_str_cells(&mut chips_cells, &allow, &plain);
                 push_str_cells(&mut chips_cells, " A ", &chip_a);
                 push_str_cells(&mut chips_cells, &always, &plain);
@@ -3353,6 +3596,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let prefix = format!("{msg}  ");
                 self.push_body_prefixed(&prefix, &default_style, &model, &muted_style);
                 self.push_body_row(Vec::new());
+            }
+            UiLine::ModalOverlay {
+                title,
+                lines,
+                scroll,
+                total,
+                win_width,
+                win_height,
+            } => {
+                self.modal_overlay = Some(self.build_modal_overlay(
+                    &title,
+                    &lines,
+                    scroll,
+                    total,
+                    win_width,
+                    win_height,
+                ));
+            }
+            UiLine::ModalOverlayClear => {
+                self.modal_overlay = None;
             }
         }
         // Phase 5: widget state updated → mark frame dirty. No
@@ -3614,7 +3877,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         seq.push_str("\x1b[H");
         let _ = self.out.write_all(seq.as_bytes());
-        self.screen = Screen::new(self.screen.width(), self.screen.height());
+        self.screen =
+            Screen::new(self.screen.width(), self.screen.height()).with_jediterm(self.caps.jediterm);
         self.body_lines.clear();
         self.scrolled_off = 0;
         self.welcome_line_count = 0;
@@ -6703,7 +6967,7 @@ mod tests {
         let (mut r, _buf) = new_capturing(80, 24);
         let before = r.body_lines.len();
         r.render(UiLine::CommandOutput(
-            "  ○ Press Ctrl+O to show real-time output\n".into(),
+            "  ○ Press Ctrl+o to show real-time output\n".into(),
         ));
         let pushed = r.body_lines.len() - before;
         assert_eq!(
@@ -6809,6 +7073,38 @@ mod tests {
         assert_eq!(
             before2, after2,
             "pop_approval_prompt must not drop non-approval rows"
+        );
+    }
+
+    /// The Allow/Always/Deny chips must be unmistakable green/blue/red on EVERY
+    /// theme. The 16-colour bright variants (Color::Green/Cyan/Red) render muddy
+    /// / near-identical on some dark palettes (user report), so the chips pin
+    /// exact truecolor RGB. Inspect the cell model so a regression back to
+    /// 16-colour is caught.
+    #[test]
+    fn approval_chips_use_vivid_truecolor() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        let fgs: Vec<Color> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter_map(|c| c.style.fg)
+            .collect();
+        assert!(
+            fgs.contains(&Color::Rgb { r: 0x30, g: 0xD1, b: 0x58 }),
+            "Allow chip must be truecolor green, got fgs: {fgs:?}",
+        );
+        assert!(
+            fgs.contains(&Color::Rgb { r: 0x2B, g: 0xB8, b: 0xE0 }),
+            "Always chip must be truecolor blue, got fgs: {fgs:?}",
+        );
+        assert!(
+            fgs.contains(&Color::Rgb { r: 0xFF, g: 0x45, b: 0x3A }),
+            "Deny chip must be truecolor red, got fgs: {fgs:?}",
         );
     }
 
@@ -8705,6 +9001,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn modal_overlay_expands_tabs_no_raw_tab_cells() {
+        // A file line with a leading tab (Go / Makefiles / tab-indented C)
+        // must render as spaces in the overlay cell grid. A raw '\t' cell
+        // would make the terminal jump to its hardware tab stop while the
+        // cell model only advances 1 col, shoving the right border (and
+        // everything after the tab) out of alignment.
+        let (r, _buf) = new_capturing(80, 24);
+        let lines = vec!["\tfn main() {}".to_string()];
+        let overlay = r.build_modal_overlay("t.rs", &lines, 0, 1, 60, 20);
+
+        // No cell anywhere in the overlay may carry a raw tab.
+        for row in &overlay.cells {
+            assert!(
+                row.iter().all(|c| c.ch != '\t'),
+                "overlay cell grid must not contain a raw '\\t'"
+            );
+        }
+
+        // cells: [0]=top border, [1]=title, [2]=separator, [3]=first
+        // content row = │ + leading pad blank + clip_cells(line) + … + │.
+        let content = &overlay.cells[3];
+        let tab_w = crate::render::cell::SOFT_TAB_WIDTH;
+        let tab_region: String = content[2..2 + tab_w].iter().map(|c| c.ch).collect();
+        assert_eq!(
+            tab_region,
+            " ".repeat(tab_w),
+            "leading tab should expand to {tab_w} spaces"
+        );
+        // The first real glyph follows the expanded tab.
+        assert_eq!(content[2 + tab_w].ch, 'f');
+    }
+
     // --- width-aware truncation tests (Bug B) ---
     //
     // ToolGroup rows are forced to single terminal lines so child indices map
@@ -8725,6 +9054,35 @@ mod tests {
             total_cols <= 38,
             "row width {} cols exceeds avail 38 (screen=40, PAD_COL=2)",
             total_cols
+        );
+    }
+
+    #[test]
+    fn inflight_tool_meta_survives_wrapping_without_overflow() {
+        // Regression (narrow window): an in-flight tool row with a long detail
+        // wrapped, and the ` · 93.7s` duration was appended to the FIRST
+        // already-full-width row, overflowing the screen — the terminal then
+        // clipped/re-wrapped it and the time anchor vanished. The meta must
+        // survive, and NO row may exceed the available width.
+        let (r, _sink) = new_capturing(40, 24);
+        let plain = CellStyle::default();
+        let detail = "(mod.rs, publish_service.rs, publish_service.rs, PublishSkill.tsx, skill.ts)";
+        let rows = r.build_mixed_style_rows(
+            "◑ ", &plain,
+            "ParallelEditFiles", &plain,
+            detail, &plain,
+            " · 93.7s", &plain,
+            &format!("ParallelEditFiles{detail}"),
+        );
+        let avail = 40usize - PAD_COL;
+        for row in &rows {
+            let w: usize = row.iter().map(|c| c.width as usize).sum();
+            assert!(w <= avail, "row width {w} exceeds avail {avail}: {row:?}");
+        }
+        let all: String = rows.iter().flat_map(|row| row.iter().map(|c| c.ch)).collect();
+        assert!(
+            all.contains("93.7s"),
+            "duration must survive wrapping, got: {all:?}",
         );
     }
 

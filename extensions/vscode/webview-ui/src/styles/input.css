@@ -154,6 +154,131 @@
   color: var(--app-primary-foreground);
 }
 
+.hidden-file-input {
+  display: none;
+}
+
+.attach-menu-popover {
+  position: absolute;
+  bottom: 34px;
+  left: 8px;
+  width: min(280px, calc(100% - 16px));
+  max-height: min(360px, calc(100vh - 120px));
+  padding: 4px;
+  background: var(--app-menu-background);
+  border: 1px solid var(--app-menu-border);
+  border-radius: var(--corner-radius-medium);
+  box-shadow: 0 4px 12px #0000004d;
+  z-index: 40;
+  overflow: auto;
+}
+
+.attach-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 8px;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-menu-foreground);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.attach-menu-item:hover {
+  background: var(--app-menu-selection-background);
+  color: var(--app-menu-selection-foreground);
+}
+
+.attach-menu-item:hover .attach-menu-icon {
+  color: inherit;
+}
+
+.attach-menu-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  color: var(--app-brand);
+  font-family: var(--app-monospace-font-family);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.input-attach-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 8px 0;
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--app-error-foreground, #f85149) 35%, transparent);
+  border-radius: var(--corner-radius-small);
+  background: color-mix(in srgb, var(--app-error-foreground, #f85149) 12%, transparent);
+  color: var(--app-error-foreground, #f85149);
+  font-size: 12px;
+}
+
+.input-attach-error span {
+  flex: 1;
+}
+
+.input-attach-error button {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+}
+
+.input-image-previews {
+  display: flex;
+  gap: 6px;
+  padding: 8px 8px 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.input-image-preview {
+  position: relative;
+  flex: none;
+  width: 58px;
+  height: 58px;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  overflow: hidden;
+  background: var(--app-input-background);
+}
+
+.input-image-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.input-image-preview button {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--app-primary-background) 82%, transparent);
+  color: var(--app-primary-foreground);
+  cursor: pointer;
+  line-height: 1;
+  padding: 0;
+}
+
 .footer-spacer { flex: 1; }
 .footer-tokens { opacity: 0.6; font-size: 11px; }
 
@@ -222,9 +347,18 @@
   text-align: left;
 }
 
-.slash-item:hover, .slash-item.active { background: var(--app-menu-selection-background); }
+.slash-item:hover, .slash-item.active {
+  background: var(--app-menu-selection-background);
+  color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #fff));
+}
 .slash-item-label { color: var(--app-brand); font-weight: 600; }
 .slash-item-desc { color: var(--app-secondary-foreground); }
+.slash-item:hover .slash-item-label,
+.slash-item.active .slash-item-label,
+.slash-item:hover .slash-item-desc,
+.slash-item.active .slash-item-desc {
+  color: inherit;
+}
 
 /* ── File picker ──────────────────────────────────────────── */
 

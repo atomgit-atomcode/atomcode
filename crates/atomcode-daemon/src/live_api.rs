@@ -44,6 +44,11 @@ static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
 /// 因此在 sync/live 模式下切换模型才能对下一轮生效（执行器是 Arc<dyn> 不可变，故用进程级覆盖）。
 static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
 
+/// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
+/// live_message / live_stream 端点写入；DaemonTurnExecutor::run_turn 读取后设置
+/// CurrentContext.mode，确保 live 路径发出的遥测事件携带正确的 client 来源。
+static LIVE_MODE: StdMutex<Option<atomcode_telemetry::SessionMode>> = StdMutex::new(None);
+
 /// 设置当前 LiveSession 选中的 provider（None 时不覆盖，保留既有选择）。
 fn set_live_provider(provider: Option<String>) {
     if let Some(p) = provider {
@@ -122,7 +127,7 @@ pub fn ensure_live_session(
         live_mcp_cache(),
         telemetry,
         session_id,
-        move || initial_messages,
+        move || (initial_messages, Vec::new()),
     )
 }
 
@@ -130,7 +135,7 @@ pub fn ensure_live_session(
 ///
 /// `session_id`：若提供且与现有 LiveSession 不同，则替换（解决 #561：TUI/WebUI
 /// 切换到新会话后 sync 应跟随）。None 时复用已有 LiveSession 或新建。
-/// `initial_messages`：**惰性**闭包，仅在确实要新建/替换 LiveSession 时（持锁内）
+/// `initial_session`：**惰性**闭包，仅在确实要新建/替换 LiveSession 时（持锁内）
 /// 求值。复用既有会话时根本不会调用，从而避免 webui 每条消息都为被丢弃的历史读盘。
 pub(crate) fn ensure_live_session_global(
     working_dir: std::path::PathBuf,
@@ -141,7 +146,10 @@ pub(crate) fn ensure_live_session_global(
     >,
     telemetry: Arc<atomcode_telemetry::Telemetry>,
     session_id: Option<atomcode_core::session::SessionId>,
-    initial_messages: impl FnOnce() -> Vec<atomcode_core::conversation::message::Message>,
+    initial_session: impl FnOnce() -> (
+        Vec<atomcode_core::conversation::message::Message>,
+        Vec<String>,
+    ),
 ) -> Arc<atomcode_core::live::LiveSession> {
     let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     // 若已有 LiveSession 且 session_id 匹配（或调用方未指定），直接复用。
@@ -171,7 +179,12 @@ pub(crate) fn ensure_live_session_global(
     });
     // 历史在锁内、确认要建会话后才求值——既省掉无谓读盘，也避免「锁外判定、锁内已被
     // 别的请求替换」的 TOCTOU：是否新建与用什么历史新建是同一临界区里的决定。
-    let session = atomcode_core::live::LiveSession::new(executor, initial_messages());
+    let (initial_messages, cold_summaries) = initial_session();
+    let session = atomcode_core::live::LiveSession::new_with_cold_summaries(
+        executor,
+        initial_messages,
+        cold_summaries,
+    );
     *g = Some(session.clone());
     session
 }
@@ -264,7 +277,7 @@ pub(crate) async fn build_turn_parts(
         tool_registry.register_sync(Box::new(ListDirTool));
     }
     if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool));
+        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
     }
     if enabled("web_fetch") {
         tool_registry.register_sync(Box::new(WebFetchTool));
@@ -499,7 +512,43 @@ impl TurnExecutor for DaemonTurnExecutor {
 
         {
             let mut c = conv.lock().await;
+            // 设置 telemetry mode：取 live_message 端点在 LIVE_MODE 写入的 client 来源，
+            // 使本轮 turn 内 TurnRunner 发出的遥测事件携带正确的 envelope.mode。
+            let live_mode = *LIVE_MODE.lock().unwrap_or_else(|e| e.into_inner());
+            let scope_ctx = atomcode_telemetry::CurrentContext {
+                mode: live_mode,
+                session_id: uuid::Uuid::parse_str(self.session_id.as_str()).ok(),
+                ..atomcode_telemetry::CurrentContext::current()
+            };
+            atomcode_telemetry::CurrentContext::scope(scope_ctx, || async {
             loop {
+                // ── Context compression check before each turn ──
+                {
+                    let task_hint = c
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|m| matches!(m.role, atomcode_core::conversation::message::Role::User) && !m.synthetic)
+                        .and_then(|m| m.text())
+                        .map(|text| {
+                            if text.chars().count() > 200 {
+                                format!("TASK: {}...", text.chars().take(197).collect::<String>())
+                            } else {
+                                format!("TASK: {}", text)
+                            }
+                        });
+                    let state_hint = task_hint.as_deref();
+                    atomcode_core::agent::compression::maybe_compress_history(
+                        &*runner.ctx,
+                        &mut c,
+                        &*runner.provider,
+                        &runner.tools,
+                        &parts.system_prompt,
+                        state_hint,
+                    )
+                    .await;
+                }
+
                 let result = runner
                     .run(&mut c, &parts.system_prompt, &turn_tx, cancel.clone())
                     .await;
@@ -512,20 +561,26 @@ impl TurnExecutor for DaemonTurnExecutor {
                     }
                 }
             }
+            }).await;
         }
         drop(turn_tx);
         let _ = forward.await;
 
         // 每轮结束后持久化会话（稳定 id → 覆盖同一文件，一会话=一条记录）。
+        // 加载已有 session 以保留 turn_stats 等累积字段，而非每轮 Session::new()
+        // 重置为空。process_chat_request 采用相同模式复用 session 对象。
         {
             use atomcode_core::session::{Session, SessionManager};
             let conv_guard = conv.lock().await;
-            let mut session = Session::new(self.working_dir.clone());
+            let manager = SessionManager::new(&self.working_dir);
+            let mut session = manager
+                .load(&self.session_id)
+                .unwrap_or_else(|_| Session::new(self.working_dir.clone()));
             session.id = self.session_id.clone();
-            session.messages = conv_guard.messages.clone();
+            session.update_from_conversation(&conv_guard);
             session.auto_name_from_messages();
             session.touch();
-            if let Err(e) = SessionManager::new(&self.working_dir).save(&session) {
+            if let Err(e) = manager.save(&session) {
                 eprintln!("Warning: failed to save live session: {e}");
             }
         }
@@ -534,7 +589,7 @@ impl TurnExecutor for DaemonTurnExecutor {
 
 use crate::AppState;
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json,
@@ -690,7 +745,7 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
 // ============================================================================
 
 /// 把前端传来的 session_id 字符串解析为 `SessionId`（None/空字符串 → None）。
-/// 仅做解析、不读盘——历史加载留给 `load_session_messages`，且仅在 LiveSession
+/// 仅做解析、不读盘——历史加载留给 `load_session_seed`，且仅在 LiveSession
 /// 确实要新建/替换时经惰性闭包触发（见 ensure_live_session_global）。
 fn parse_session_id(session_id_str: Option<String>) -> Option<atomcode_core::session::SessionId> {
     let id_str = session_id_str?;
@@ -700,15 +755,18 @@ fn parse_session_id(session_id_str: Option<String>) -> Option<atomcode_core::ses
     Some(atomcode_core::session::SessionId::from_string(id_str))
 }
 
-/// 从 SessionManager 加载指定会话的历史消息作为 LiveSession 种子；
+/// 从 SessionManager 加载指定会话的历史作为 LiveSession 种子；
 /// 加载失败时降级为空历史（不阻断）。
-fn load_session_messages(
+fn load_session_seed(
     working_dir: &std::path::Path,
     sid: &atomcode_core::session::SessionId,
-) -> Vec<atomcode_core::conversation::message::Message> {
+) -> (
+    Vec<atomcode_core::conversation::message::Message>,
+    Vec<String>,
+) {
     atomcode_core::session::SessionManager::new(working_dir)
         .load(sid)
-        .map(|s| s.messages)
+        .map(|s| (s.messages, s.cold_summaries))
         .unwrap_or_default()
 }
 
@@ -736,8 +794,8 @@ pub(crate) async fn live_stream(
         state.telemetry.clone(),
         sid,
         move || match load_sid {
-            Some(s) => load_session_messages(&load_dir, &s),
-            None => Vec::new(),
+            Some(s) => load_session_seed(&load_dir, &s),
+            None => (Vec::new(), Vec::new()),
         },
     );
     let (snapshot, mut rx) = session.join().await;
@@ -842,8 +900,11 @@ async fn preprocess_live_caption(
 
 pub(crate) async fn live_message(
     State(state): State<AppState>,
+    Extension(client_mode): Extension<atomcode_telemetry::SessionMode>,
     Json(req): Json<LiveMessageReq>,
 ) -> impl IntoResponse {
+    // 更新进程级 live mode，使 DaemonTurnExecutor::run_turn 能用它设置 telemetry envelope mode。
+    *LIVE_MODE.lock().unwrap() = Some(client_mode);
     let working_dir = { state.project.read().await.working_dir.clone() };
     // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
     set_live_provider(req.provider);
@@ -858,8 +919,8 @@ pub(crate) async fn live_message(
         state.telemetry.clone(),
         sid,
         move || match load_sid {
-            Some(s) => load_session_messages(&load_dir, &s),
-            None => Vec::new(),
+            Some(s) => load_session_seed(&load_dir, &s),
+            None => (Vec::new(), Vec::new()),
         },
     );
     // 视觉预处理在 coordinator 经 executor.preprocess_input 统一做（TUI / webui 共享），

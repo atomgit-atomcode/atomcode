@@ -8,6 +8,8 @@ export interface ModelInfo {
   model: string;
   provider_type?: string;
   is_default: boolean;
+  effort_applicable?: boolean;
+  reasoning_effort?: string | null;
 }
 
 export interface UserInfo {
@@ -61,6 +63,16 @@ export interface ContextFile {
   type: 'file' | 'selection';
 }
 
+export interface ImageData {
+  media_type: string;
+  data: string;
+}
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+}
+
 /** Tool call data (collapsed section in the UI) */
 export interface ToolCallData {
   id: string;
@@ -89,6 +101,7 @@ export interface ChatMessage {
   toolCalls?: ToolCallData[];
   permissionRequest?: PermissionRequestData;
   contextFiles?: ContextFile[];
+  images?: ImageData[];
   streaming?: boolean;
   timestamp: number;
 }
@@ -123,8 +136,8 @@ export interface ChatState {
 // ─── Actions dispatched by the reducer ──────────────────────────
 
 export type ChatAction =
-  | { type: 'ADD_USER_MESSAGE'; text: string; contextFiles?: ContextFile[] }
-  | { type: 'ADD_QUEUED_MESSAGE'; id: string; text: string; contextFiles?: ContextFile[] }
+  | { type: 'ADD_USER_MESSAGE'; text: string; contextFiles?: ContextFile[]; images?: ImageData[] }
+  | { type: 'ADD_QUEUED_MESSAGE'; id: string; text: string; contextFiles?: ContextFile[]; images?: ImageData[] }
   | { type: 'SEND_QUEUED_MESSAGE'; id: string }
   | { type: 'CLEAR_QUEUED_MESSAGES' }
   | { type: 'ADD_ASSISTANT_MESSAGE'; text: string }
@@ -135,7 +148,7 @@ export type ChatAction =
   | { type: 'TOOL_RESULT'; id: string; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'SET_TOKENS'; prompt: number; completion: number; total: number }
   | { type: 'GENERATION_DONE'; tokens?: number }
-  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: unknown; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number } }> }
+  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: unknown; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number } }> }
   | { type: 'GENERATION_STOPPED' }
   | { type: 'GENERATION_ERROR'; message: string }
   | { type: 'CLEAR_CHAT' }
@@ -146,6 +159,7 @@ export type ChatAction =
   | { type: 'SET_SETUP_STATUS'; status?: string; error?: string; loginUrl?: string }
   | { type: 'SET_CURRENT_MODEL'; model: string }
   | { type: 'SET_CURRENT_PROVIDER'; provider: string; model?: string }
+  | { type: 'SET_REASONING_EFFORT'; provider: string; effort: string | null }
   | { type: 'SET_SESSIONS'; sessions: SessionMeta[] }
   | { type: 'SET_ACTIVE_SESSION'; sessionId?: string; projectHash?: string }
   | { type: 'ADD_CONTEXT_FILE'; file: ContextFile }
@@ -164,7 +178,7 @@ export type ChatAction =
 
 export type ExtensionMessage =
   | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean }
-  | { type: 'userMessage'; text: string }
+  | { type: 'userMessage'; text: string; images?: ImageData[] }
   | { type: 'queuedMessageSent'; id: string }
   | { type: 'assistantMessage'; text: string }
   | { type: 'generationStarted' }
@@ -174,7 +188,7 @@ export type ExtensionMessage =
   | { type: 'toolResult'; id?: string; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'done'; tokens?: number; toolCalls?: number; sessionId?: string }
-  | { type: 'sessionMessages'; messages: Array<{ role: string; content: unknown; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number } }> }
+  | { type: 'sessionMessages'; messages: Array<{ role: string; content: unknown; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number } }> }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'generationStopped' }
@@ -193,6 +207,8 @@ export type ExtensionMessage =
   | { type: 'codingPlanResult'; result: { success: boolean; report_text: string } }
   | { type: 'setupError'; message: string }
   | { type: 'context'; filePath: string; fileName: string; selection?: string; language?: string; startLine?: number; endLine?: number }
+  | { type: 'insertText'; text: string }
+  | { type: 'skills'; skills: SkillInfo[] }
   | { type: 'permissionRequest'; id: string; toolName: string; args: string; isDestructive: boolean }
   | { type: 'resumeStreaming' }
   | { type: 'setDraft'; text: string };

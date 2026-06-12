@@ -78,12 +78,15 @@ impl ScriptHook {
         };
 
         // 启动子进程
-        let mut child = tokio::process::Command::new(cmd)
+        let mut cmd_builder = tokio::process::Command::new(cmd);
+        cmd_builder
             .args(&args)
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::process_utils::suppress_console_window(&mut cmd_builder);
+        let mut child = cmd_builder
             .spawn()
             .map_err(|e| format!("Failed to spawn script: {}", e))?;
 

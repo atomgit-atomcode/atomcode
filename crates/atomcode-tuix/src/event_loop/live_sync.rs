@@ -26,10 +26,13 @@ pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
                 cached_tokens,
             }),
         // TurnEvent::Error is a tuple variant Error(String)
-        TurnEvent::Error(e) => AgentEvent::Error { error: e, messages: Vec::new() },
+        TurnEvent::Error(e) => AgentEvent::Error {
+            error: e,
+            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+        },
         TurnEvent::Warning(w) => AgentEvent::Warning(w),
-        TurnEvent::ApprovalRequested { tool_name, reason, call, messages } =>
-            AgentEvent::ApprovalNeeded { tool_name, reason, call, messages },
+        TurnEvent::ApprovalRequested { tool_name, reason, call, snapshot } =>
+            AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot },
         // 不需要的：忽略
         TurnEvent::ToolCallStreaming { .. }
         | TurnEvent::ToolBatchStarted { .. }

@@ -420,7 +420,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 审批提示 ──
         Msg::ApprovalPromptAlt { tool, detail } =>
-            format!("允许 {}（{}）？[Y]是 / [N]否 / [A]总是", tool, detail).into(),
+            format!("允许 {}（{}）？[Y]是=回车 / [N]否 / [A]总是", tool, detail).into(),
         Msg::ApprovalWaitingLabel =>
             "▶ 等待审批：".into(),
         Msg::ApprovalAllow => " 允许  ".into(),
@@ -800,6 +800,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
         Msg::CmdDescGuide => "向 atomcode-guide 提问使用方法".into(),
+        Msg::CmdDescView => "在浮层窗口中查看文件内容".into(),
+        Msg::ViewUsage => "用法：/view <文件路径>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
         Msg::GuideMenuTopics => "常用话题：".into(),
         Msg::GuideMenuGettingStarted => "怎么开始使用          首次安装、登录、配置".into(),

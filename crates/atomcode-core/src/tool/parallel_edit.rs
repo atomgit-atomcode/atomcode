@@ -522,6 +522,7 @@ mod validate_args_tests {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         }
     }
 

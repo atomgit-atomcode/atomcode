@@ -305,6 +305,7 @@ fn test_config() -> Config {
         language: None,
         ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
     }
 }
 

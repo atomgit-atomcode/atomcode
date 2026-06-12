@@ -4,7 +4,7 @@
 //
 // Lists all sessions for the current project (pre-filtered to >0 msgs)
 // with type-to-filter search. Up/Down navigates, Enter loads + replays
-// into scrollback + syncs the agent via `AgentCommand::SetMessages`,
+// into scrollback + syncs the agent via `AgentCommand::SetConversation`,
 // Esc cancels, printable chars + Backspace edit the filter query.
 // F2 renames the selected session.
 
@@ -289,7 +289,9 @@ impl Modal for SessionPicker {
                         replay_session(renderer, &session, true);
                         ctx.agent
                             .cmd_tx
-                            .send(AgentCommand::SetMessages(session.messages.clone()))
+                            .send(AgentCommand::SetConversation(
+                                session.to_conversation_snapshot(),
+                            ))
                             .ok();
                         // Continue accumulating into the same session file —
                         // future TurnComplete saves overwrite it. Bind

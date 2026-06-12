@@ -1562,6 +1562,7 @@ mod tests {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         }
     }
 

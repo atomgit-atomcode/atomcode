@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.25.0</span>
+    <span class="dhdr-ver">v4.25.1</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -100,6 +100,7 @@
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
         <tbody>
+          <tr><td><code>/view &lt;filepath&gt;</code></td><td>Open a read-only overlay to view a file's content (supports arrow keys, PageUp/Down, g/G to jump to top/bottom)</td></tr>
           <tr><td><code>/undo</code> · <code>/undo N</code></td><td>Roll conversation memory back to before the last turn (or turn N) and restore that prompt into the input box; rewinds memory only — does not revert files on disk</td></tr>
           <tr><td><code>/diff</code></td><td>Show the git diff of uncommitted changes in the working directory</td></tr>
           <tr><td><code>/cost</code></td><td>Show output tokens for the current session. APIs without usage reporting are estimated automatically</td></tr>

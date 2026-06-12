@@ -945,6 +945,33 @@ mod tests {
     }
 
     #[test]
+    fn flush_aligned_table_with_emoji_symbol_keeps_rows_aligned() {
+        // ☀ (U+2600) is a legacy-block pictographic emoji that GUI terminals
+        // paint at 2 cells. The renderer must SIZE and PAD the column with the
+        // same width metric (crate::width::display_width) so every row's
+        // border lands in the same column. Regression for the emoji-symbol
+        // table-misalignment bug (stray `│` shifted right of "☀ 晴").
+        let rows = vec![
+            "| 时段 | 天气 |".to_string(),
+            "| --- | --- |".to_string(),
+            "| 早上 | ☀ 晴 |".to_string(),
+            "| 中午 | 多云 |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "every table row must share one display width; got {:?} for\n{}",
+            widths,
+            out
+        );
+    }
+
+    #[test]
     fn inline_bold() {
         assert_eq!(
             render_inline_line("**bold**", caps()),

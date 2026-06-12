@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useReducer, useEffect, useCallback, useRef } from 'react';
-import { ChatState, ChatAction, ExtensionMessage } from './types';
+import { ChatState, ChatAction, ExtensionMessage, ImageData } from './types';
 import { chatReducer, initialState } from './reducer';
 import { postMessage, getVSCodeApi } from '../vscode';
 
@@ -8,10 +8,11 @@ import { postMessage, getVSCodeApi } from '../vscode';
 interface ChatContextValue {
   state: ChatState;
   dispatch: React.Dispatch<ChatAction>;
-  send: (text: string) => void;
+  send: (text: string, images?: ImageData[]) => void;
   stop: () => void;
   newConversation: () => void;
   selectModel: (provider: string, model?: string) => void;
+  selectReasoningEffort: (provider: string, effort: string | null) => void;
   loadSession: (sessionId: string, projectHash?: string) => void;
   openSidebar: () => void;
   openSessionInTab: (sessionId?: string, projectHash?: string) => void;
@@ -63,7 +64,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           }
           break;
         case 'userMessage':
-          dispatch({ type: 'ADD_USER_MESSAGE', text: msg.text });
+          dispatch({ type: 'ADD_USER_MESSAGE', text: msg.text, images: msg.images });
           break;
         case 'queuedMessageSent':
           dispatch({ type: 'SEND_QUEUED_MESSAGE', id: msg.id });
@@ -217,10 +218,10 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
 
   // ── Outbound actions ──
   const send = useCallback(
-    (text: string) => {
+    (text: string, images?: ImageData[]) => {
       const state = stateRef.current;
-      const ctx = stateRef.current.contextFiles.length > 0
-        ? stateRef.current.contextFiles.map((f) => ({
+      const ctx = state.contextFiles.length > 0
+        ? state.contextFiles.map((f) => ({
             path: f.path,
             type: f.type,
             fileName: f.fileName,
@@ -234,11 +235,18 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
       const isQueued = state.isGenerating;
       const clientMessageId = `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       if (isQueued) {
-        dispatch({ type: 'ADD_QUEUED_MESSAGE', id: clientMessageId, text, contextFiles });
+        dispatch({ type: 'ADD_QUEUED_MESSAGE', id: clientMessageId, text, contextFiles, images });
       } else {
-        dispatch({ type: 'ADD_USER_MESSAGE', text, contextFiles });
+        dispatch({ type: 'ADD_USER_MESSAGE', text, contextFiles, images });
       }
-      postMessage({ type: 'send', text, context: ctx, clientMessageId: isQueued ? clientMessageId : undefined, sessionId: state.activeSessionId });
+      postMessage({
+        type: 'send',
+        text,
+        context: ctx,
+        images,
+        clientMessageId: isQueued ? clientMessageId : undefined,
+        sessionId: state.activeSessionId,
+      });
       // Clear context after sending
       dispatch({ type: 'CLEAR_CONTEXT' });
     },
@@ -256,6 +264,11 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   const selectModel = useCallback((provider: string, model?: string) => {
     dispatch({ type: 'SET_CURRENT_PROVIDER', provider, model });
     postMessage({ type: 'selectModel', provider, model });
+  }, []);
+
+  const selectReasoningEffort = useCallback((provider: string, effort: string | null) => {
+    dispatch({ type: 'SET_REASONING_EFFORT', provider, effort });
+    postMessage({ type: 'selectReasoningEffort', provider, effort });
   }, []);
 
   const loadSession = useCallback((sessionId: string, projectHash?: string) => {
@@ -327,6 +340,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     openSidebar,
     newConversation,
     selectModel,
+    selectReasoningEffort,
     loadSession,
     openSessionInTab,
     renameSession,

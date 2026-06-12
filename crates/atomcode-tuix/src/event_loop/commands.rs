@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::{
-    DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker,
+    DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
@@ -472,6 +472,28 @@ pub(super) fn execute_slash_command(
             // this with the slash-command list.
             renderer.render(UiLine::CommandOutput(t(Msg::KeybindingsHelp).into_owned()));
             renderer.flush();
+        }
+        "view" => {
+            let trimmed = arg.trim();
+            if trimmed.is_empty() {
+                renderer.render(UiLine::Error(
+                    t(Msg::ViewUsage).into_owned(),
+                ));
+                renderer.flush();
+            } else {
+                let path = ctx.working_dir.join(trimmed);
+                match FileViewer::open(&path) {
+                    Ok(viewer) => {
+                        *active_modal = Some(Box::new(viewer));
+                    }
+                    Err(e) => {
+                        renderer.render(UiLine::Error(
+                            format!("{}", e),
+                        ));
+                        renderer.flush();
+                    }
+                }
+            }
         }
         "plan" => {
             state.agent_mode = AgentMode::Plan;

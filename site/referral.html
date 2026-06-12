@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <title>邀请有礼 · AtomCode</title>
-<meta name="description" content="邀请开发者安装并使用 AtomCode，按双周结算安装与活跃奖励。">
+<meta name="description" content="邀请开发者安装并使用 AtomCode，按每月（4周）结算安装与活跃奖励。">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <style>
   *,*::before,*::after{box-sizing:border-box}
@@ -28,8 +28,8 @@
   .aurora{position:fixed;inset:0;z-index:9000;pointer-events:none;background:radial-gradient(circle 360px at var(--mx,-200px) var(--my,-200px),rgba(232,160,80,.18) 0%,rgba(232,160,80,.06) 30%,rgba(232,160,80,0) 60%);mix-blend-mode:screen}
   .ripple{position:fixed;left:0;top:0;width:8px;height:8px;border-radius:50%;pointer-events:none;z-index:9100;background:rgba(232,160,80,.55);transform:translate(-50%,-50%);animation:rip .65s cubic-bezier(.22,1,.36,1) forwards}
   @keyframes rip{0%{width:6px;height:6px;background:rgba(232,160,80,.85)}100%{width:160px;height:160px;background:rgba(232,160,80,0)}}
-  .toast{position:fixed;bottom:40px;left:50%;transform:translateX(-50%);z-index:2000;padding:12px 24px;font-size:13px;letter-spacing:1px;background:#000;color:#f6f3ec;border:1px solid var(--accent);border-radius:6px;font-family:var(--mono);opacity:0;transition:opacity .2s,transform .2s;white-space:nowrap}
-  .toast.show{opacity:1;transform:translateX(-50%) translateY(-6px)}
+  .toast{position:fixed;top:100px;left:50%;transform:translateX(-50%);z-index:2000;padding:12px 24px;font-size:13px;letter-spacing:1px;background:#000;color:#f6f3ec;border:1px solid var(--accent);border-radius:6px;font-family:var(--mono);opacity:0;transition:opacity .2s,transform .2s;white-space:nowrap}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(6px)}
   [data-magnetic]{transition:transform .35s cubic-bezier(.22,1,.36,1);will-change:transform}
 
   /* ---------- header ---------- */
@@ -103,6 +103,8 @@
   .user-id{margin-top:3px;font-family:var(--mono);font-size:11px;color:var(--faint)}
   .logout-btn{margin-left:auto;height:32px;padding:0 14px;border:1px solid var(--line);font-family:var(--mono);font-size:11px;color:var(--muted);transition:all .2s}
   .logout-btn:hover{border-color:rgba(255,255,255,.35);color:#fff}
+  html.light .logout-btn{color:rgba(0,0,0,.5);border-color:rgba(0,0,0,.16)}
+  html.light .logout-btn:hover{color:#0d0d0d;border-color:rgba(0,0,0,.32);background:rgba(0,0,0,.04)}
   .invite-code-box{display:flex;align-items:center;gap:12px;margin:14px 0 8px;flex-wrap:wrap}
   .invite-code{font-family:var(--mono);font-size:28px;font-weight:700;letter-spacing:4px;color:var(--accent);background:rgba(232,160,80,.10);padding:11px 18px;border:1px solid rgba(232,160,80,.32);border-radius:8px}
   .copy-btn{height:38px;padding:0 15px;border-radius:6px;font-size:12px;font-weight:600;background:rgba(255,255,255,.08);color:#fff;border:1px solid var(--line);transition:all .2s;white-space:nowrap}
@@ -213,6 +215,65 @@
     .invite-link-box{padding:12px 14px}.invite-url{font-size:13px}
     .invite-code{font-size:24px;max-width:100%;word-break:break-all}.sub{font-size:13px}
   }
+
+  /* ---------- payment-info button ---------- */
+  .payment-btn{height:32px;padding:0 14px;display:inline-flex;align-items:center;gap:5px;border:1px solid var(--accent);background:var(--accent);color:#000;font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:1px;white-space:nowrap;transition:all .2s}
+  .payment-btn.init-hidden{visibility:hidden}
+  .payment-btn:hover{background:#fff;color:#000;border-color:#fff;transform:translateY(-1px);box-shadow:0 8px 22px rgba(232,160,80,.18)}
+  .payment-btn.filled{background:rgba(255,255,255,.04);color:rgba(255,255,255,.7);border-color:rgba(255,255,255,.18);font-weight:400}
+  .payment-btn.filled:hover{background:rgba(255,255,255,.10);color:#fff;border-color:rgba(255,255,255,.35);transform:none;box-shadow:none}
+  html.light .payment-btn.filled{background:rgba(0,0,0,.04);color:rgba(0,0,0,.6);border-color:rgba(0,0,0,.18)}
+  html.light .payment-btn.filled:hover{background:rgba(0,0,0,.08);color:#0d0d0d;border-color:rgba(0,0,0,.35)}
+
+  /* ---------- modal ---------- */
+  .modal-overlay{position:fixed;inset:0;z-index:5000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.68);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);opacity:0;pointer-events:none;transition:opacity .25s}
+  .modal-overlay.open{opacity:1;pointer-events:auto}
+  html.light .modal-overlay{background:rgba(0,0,0,.38)}
+  .modal-panel{width:min(420px,100%);border:1px solid rgba(255,255,255,.16);border-radius:12px;background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.02));box-shadow:0 22px 60px rgba(0,0,0,.5);overflow:hidden;transform:translateY(12px);transition:transform .25s}
+  .modal-overlay.open .modal-panel{transform:translateY(0)}
+  html.light .modal-panel{border-color:rgba(0,0,0,.14);background:linear-gradient(180deg,rgba(255,255,255,.88),rgba(255,255,255,.72));box-shadow:0 22px 60px rgba(0,0,0,.18)}
+  .modal-head{display:flex;align-items:center;justify-content:space-between;padding:15px 20px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.025)}
+  html.light .modal-head{background:rgba(0,0,0,.02);border-color:rgba(0,0,0,.10)}
+  .modal-head-title{font-size:15px;font-weight:700;color:#fff}
+  html.light .modal-head-title{color:#0d0d0d}
+  .modal-close{width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border-radius:6px;color:rgba(255,255,255,.45);font-size:16px;transition:all .2s;cursor:pointer;background:none;border:none}
+  .modal-close:hover{color:#fff;background:rgba(255,255,255,.08)}
+  html.light .modal-close{color:rgba(0,0,0,.45)}html.light .modal-close:hover{color:#0d0d0d;background:rgba(0,0,0,.06)}
+  .modal-body{padding:22px 20px}
+  .modal-field{margin-bottom:18px}
+  .modal-label{display:block;margin-bottom:6px;font-size:12px;color:var(--muted)}
+  html.light .modal-label{color:rgba(0,0,0,.52)}
+  .modal-label .req{color:var(--red)}
+  .modal-input{width:100%;padding:10px 12px;background:#000;border:1px solid rgba(255,255,255,.12);border-radius:6px;color:#fff;font-size:13px;transition:border-color .2s}
+  .modal-input:focus{border-color:var(--accent);outline:none}
+  .modal-input.error{border-color:var(--red)}
+  .modal-input::placeholder{color:rgba(255,255,255,.28)}
+  html.light .modal-input{background:#fff;border-color:rgba(0,0,0,.14);color:#0d0d0d}
+  html.light .modal-input:focus{border-color:var(--accent)}html.light .modal-input.error{border-color:var(--red)}
+  html.light .modal-input::placeholder{color:rgba(0,0,0,.3)}
+  .modal-input:disabled{opacity:.55;cursor:not-allowed}
+  .field-error{margin-top:5px;font-size:11px;color:var(--red);display:none}
+  .field-error.show{display:block}
+  .modal-actions{display:flex;gap:10px;margin-top:4px}
+  .modal-btn{flex:1;padding:10px;border-radius:6px;font-size:12px;font-weight:600;letter-spacing:.5px;cursor:pointer;text-align:center;transition:all .2s}
+  .modal-btn-cancel{background:rgba(255,255,255,.06);color:#fff;border:1px solid rgba(255,255,255,.15)}
+  .modal-btn-cancel:hover{background:rgba(255,255,255,.12)}
+  html.light .modal-btn-cancel{background:rgba(0,0,0,.04);color:#0d0d0d;border-color:rgba(0,0,0,.16)}html.light .modal-btn-cancel:hover{background:rgba(0,0,0,.08)}
+  .modal-btn-primary{background:var(--accent);color:#000;border:none}
+  .modal-btn-primary:hover{background:#fff;box-shadow:0 8px 22px rgba(232,160,80,.22)}
+  html.light .modal-btn-primary:hover{background:#0d0d0d;color:#f6f3ec;box-shadow:0 8px 22px rgba(200,118,24,.28)}
+  .modal-btn-primary:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:none}
+  .modal-hint{margin-top:12px;font-size:11px;color:rgba(255,255,255,.3);text-align:center}
+  html.light .modal-hint{color:rgba(0,0,0,.38)}
+  .modal-readonly{padding:10px 12px;background:rgba(255,255,255,.04);border-radius:6px;color:#fff;font-size:13px}
+  html.light .modal-readonly{background:rgba(0,0,0,.04);color:#0d0d0d}
+
+  @media (max-width:640px){
+    .modal-overlay{padding:16px;align-items:flex-end}
+    .modal-overlay .modal-panel{border-radius:12px 12px 0 0;transform:translateY(24px)}
+    .modal-overlay.open .modal-panel{transform:translateY(0)}
+    .modal-body{padding:18px 16px}
+  }
 </style>
 </head>
 <body>
@@ -225,7 +286,7 @@
   <a class="hdr-logo" href="/index.html">
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
-    <span class="ver" id="verBadge" title="当前版本">v4.25.0</span>
+    <span class="ver" id="verBadge" title="当前版本">v4.25.1</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="/index.html#features" data-i18n="nav.features">功能</a>
@@ -265,9 +326,9 @@
 <main class="main">
   <div class="wrap">
     <section class="hero">
-      <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">长期进行中 · 每双周结算现金打款</span></div>
+      <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">长期进行中 · 每月（4周）结算发放京东E卡</span></div>
       <h1 data-i18n="hero.title">邀请有礼：AtomCode 星推官计划</h1>
-      <p class="sub" data-i18n="hero.sub">获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。</p>
+      <p class="sub" data-i18n="hero.sub">获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍京东E卡奖励，排行榜每周公示。</p>
     </section>
 
     <div id="loading-state" class="state active"><div class="spinner"></div></div>
@@ -279,7 +340,7 @@
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
             <span data-i18n="panel.login.title">登录后领取专属邀请链接</span>
           </div>
-          <div class="panel-meta" data-i18n="panel.meta.login">数据更新时间：登录后可见</div>
+          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span class="js-updated-at">--</span></div>
         </div>
         <div class="login-card">
           <p data-i18n="login.desc">使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。</p>
@@ -297,13 +358,16 @@
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
             <span data-i18n="panel.mine">我的专属邀请面板</span>
           </div>
-          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span>刚刚</span></div>
+          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span class="js-updated-at">--</span></div>
         </div>
         <div class="panel-body">
           <div class="user-strip">
             <img id="user-avatar-1" class="user-avatar" src="" referrerpolicy="no-referrer" alt="">
             <div><div class="user-name" id="user-name-1"></div><div class="user-id" id="user-id-1"></div></div>
-            <button class="logout-btn" onclick="logout()" data-i18n="logout">退出</button>
+            <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+              <button class="payment-btn init-hidden" id="payment-btn-1" onclick="openPaymentModal()"></button>
+              <button class="logout-btn" onclick="logout()" data-i18n="logout">退出</button>
+            </div>
           </div>
           <p class="cmd-label" data-i18n="invite.none">你还没有邀请码，生成后即可复制官网邀请链接分享给其他开发者。</p>
           <button class="gen-btn" id="gen-btn" onclick="generateCode()" data-magnetic data-i18n="invite.generate">生成邀请码</button>
@@ -321,13 +385,16 @@
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
             <span data-i18n="panel.mine">我的专属邀请面板</span>
           </div>
-          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span id="updated-at">刚刚</span></div>
+          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span class="js-updated-at">--</span></div>
         </div>
         <div class="panel-body">
           <div class="user-strip">
             <img id="user-avatar-2" class="user-avatar" src="" referrerpolicy="no-referrer" alt="">
             <div><div class="user-name" id="user-name-2"></div><div class="user-id" id="user-id-2"></div></div>
-            <button class="logout-btn" onclick="logout()" data-i18n="logout">退出</button>
+            <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+              <button class="payment-btn init-hidden" id="payment-btn-2" onclick="openPaymentModal()"></button>
+              <button class="logout-btn" onclick="logout()" data-i18n="logout">退出</button>
+            </div>
           </div>
           <p class="cmd-label" data-i18n="cmd.label">复制官网邀请链接，分享给其他开发者</p>
           <div class="invite-link-box">
@@ -366,6 +433,7 @@ const BASE_URL = ENV === 'local' ? 'http://localhost:8765'
   : ENV === 'pre' ? 'https://pre-acs.atomgit.com'
   : 'https://acs.atomgit.com';
 const API_BASE = BASE_URL + '/api/v1/referral';
+const PAYMENT_API = BASE_URL + '/api/v1/payment/receipt';
 const LOGIN_URL = BASE_URL + '/auth/login?provider=atomgit&redirect_to=' + encodeURIComponent(
   ENV ? window.location.origin + '/referral.html?env=' + ENV
       : 'https://atomcode.atomgit.com/referral.html'
@@ -387,11 +455,10 @@ const T = {
   'nav.referral': { zh: '邀请推荐', en: 'Referral' },
   'nav.codingplan': { zh: 'Coding Plan', en: 'Coding Plan' },
   'btn.repo': { zh: '开源仓库', en: 'Repository' },
-  'hero.badge': { zh: '长期进行中 · 每双周结算现金打款', en: 'Ongoing · settled bi-weekly' },
+  'hero.badge': { zh: '长期进行中 · 每月（4周）结算发放京东E卡', en: 'Ongoing · JD E-Card issued monthly (4 weeks)' },
   'hero.title': { zh: '邀请有礼：AtomCode 星推官计划', en: 'Referral Rewards: AtomCode Star Promoter Program' },
-  'hero.sub': { zh: '获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍现金奖励，排行榜每周公示。', en: 'Get your official invite link and invite developers to install and use AtomCode. High conversion earns bonus rewards, with weekly leaderboard updates.' },
+  'hero.sub': { zh: '获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍京东E卡奖励，排行榜每周公示。', en: 'Get your official invite link and invite developers to install and use AtomCode. High conversion earns double JD E-Card rewards, with weekly leaderboard updates.' },
   'panel.login.title': { zh: '登录后领取专属邀请链接', en: 'Sign in to get your invite link' },
-  'panel.meta.login': { zh: '数据更新时间：登录后可见', en: 'Updated: visible after sign-in' },
   'panel.mine': { zh: '我的专属邀请面板', en: 'My Referral Dashboard' },
   'panel.meta.prefix': { zh: '数据更新时间：', en: 'Updated: ' },
   'time.now': { zh: '刚刚', en: 'just now' },
@@ -422,7 +489,7 @@ const T = {
   'toast.copied': { zh: '✓ 已复制 · 粘贴到终端运行', en: '✓ Copied · paste into your terminal' },
   'board.empty': { zh: '本周排行榜暂无数据', en: 'No leaderboard data this week' },
   'board.title': { zh: '每周邀请风云榜', en: 'Weekly Referral Leaderboard' },
-  'board.hint': { zh: '按"本周新增活跃设备数"降序排列。每周日 23:59 截榜，现金奖励每双周结算打款。', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59, with cash rewards settled bi-weekly.' },
+  'board.hint': { zh: '按"本周新增活跃设备数"降序排列。每周日 23:59 截榜，京东E卡奖励每月（4周）结算发放。', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59, with JD E-Card rewards issued monthly (4 weeks).' },
   'board.prev': { zh: '上一周', en: 'Previous week' },
   'board.next': { zh: '下一周', en: 'Next week' },
   'board.week.label': { zh: '第 {week} 周 ({range})', en: 'Week {week} ({range})' },
@@ -444,17 +511,39 @@ const T = {
   'rules.good': { zh: '当 <b>R ≥ 25%</b> 时，视为优质推广，结算公式为：<code>安装数×2元 + 活跃数×5元</code>', en: 'When <b>R ≥ 25%</b>, it is counted as quality promotion: <code>installs×2 + active×5</code>.' },
   'rules.bad': { zh: '当 <span class="red">R &lt; 25%</span> 时，触发质量防刷熔断，安装量清零，仅保留有效活跃结算：<code>活跃数×5元</code>', en: 'When <span class="red">R &lt; 25%</span>, the quality guard is triggered: installs are cleared and only active referrals count: <code>active×5</code>.' },
   'rules.reward': { zh: '每周邀请风云榜 Top5 额外赠送 <code>CodingPlan Pro 30 天</code>，包含 GLM-5.1、Deepseek-v4 flash、Qwen3.6。', en: 'Weekly leaderboard Top 5 also receive <code>30 days of CodingPlan Pro</code>, including GLM-5.1, Deepseek-v4 flash, and Qwen3.6.' },
-  'rules.cash': { zh: '所有现金奖励每双周汇总结算，并统一收集收款信息进行打款。', en: 'All cash rewards are summarized and settled bi-weekly, with payment details collected uniformly for disbursement.' },
+  'rules.cash': { zh: '所有京东E卡奖励每月（4周）汇总结算，请及时填写接收信息。', en: 'All JD E-Card rewards are summarized and settled monthly (4 weeks). Please fill in your receipt details promptly.' },
   'rules.anti.title': { zh: '严禁以下作弊行为', en: 'The following cheating behaviors are strictly prohibited:' },
   'rules.anti.1': { zh: '使用虚拟机、模拟器、设备指纹修改工具等在同一台物理设备上重复安装激活。', en: 'Using VMs, emulators, or device fingerprint spoofing tools to repeatedly install and activate on the same physical device.' },
   'rules.anti.2': { zh: '批量注册虚假账号、使用自动化脚本刷量。', en: 'Registering fake accounts in bulk or using automated scripts to inflate numbers.' },
   'rules.anti.3': { zh: '通过机房 IP、公共代理、云服务器（VPS）等高风险网络环境恶意挂机。', en: 'Maliciously idling via high-risk network environments such as data center IPs, public proxies, or cloud servers (VPS).' },
   'rules.anti.penalty': { zh: '处罚措施：系统识别到中高风险样本后，该笔奖励将自动转入人工深度审核队列，审核耗时可能延长。一经核实为恶意刷量，平台有权清空该邀请人的全部未发放奖励、收回邀请资格，情节严重者将依法封禁 AtomCode 账号。', en: 'Penalties: When the system detects medium-to-high risk samples, the reward will be automatically routed to a manual deep review queue, which may delay processing. Once confirmed as fraudulent, the platform reserves the right to forfeit all unpaid rewards of the inviter, revoke their invitation eligibility, and in severe cases, ban the AtomCode account in accordance with the law.' },
+  'rules.jd.title': { zh: '发放规则：京东E卡', en: 'Distribution Rules: JD E-Card' },
+  'rules.jd.cycle': { zh: '结算周期：每月（4周）进行一次结算打款。', en: 'Settlement cycle: disbursed once per month (4 weeks).' },
+  'rules.jd.amount': { zh: '金额规则：单期发放金额向下取10的整数倍，结余部分将自动滚入下一结算池。', en: 'Amount rule: the issued amount per period is rounded down to the nearest multiple of 10; any remainder automatically rolls over into the next settlement pool.' },
+
+  /* payment info */
+  'payment.fill': { zh: '完善收款信息', en: 'Add Payment Info' },
+  'payment.filled': { zh: '收款信息 ✓', en: 'Payment Info ✓' },
+  'payment.title': { zh: '收款信息', en: 'Payment Info' },
+  'payment.name': { zh: '真实姓名', en: 'Full Name' },
+  'payment.name.placeholder': { zh: '请输入真实姓名', en: 'Enter your full name' },
+  'payment.name.required': { zh: '请输入真实姓名', en: 'Please enter your full name' },
+  'payment.phone': { zh: '手机号', en: 'Phone Number' },
+  'payment.phone.placeholder': { zh: '请输入手机号', en: 'Enter your phone number' },
+  'payment.phone.required': { zh: '请输入手机号', en: 'Please enter your phone number' },
+  'payment.close': { zh: '关闭', en: 'Close' },
+  'payment.cancel': { zh: '取消', en: 'Cancel' },
+  'payment.edit': { zh: '修改', en: 'Edit' },
+  'payment.save': { zh: '保存', en: 'Save' },
+  'payment.saving': { zh: '保存中...', en: 'Saving...' },
+  'payment.hint': { zh: '京东E卡卡密将通过短信下发，请确认姓名及手机号无误并留意查收', en: 'JD E-Card codes will be sent via SMS. Please verify your name and phone number are correct.' },
+  'payment.saved': { zh: '收款信息已保存', en: 'Payment info saved.' },
 };
 function t(key) { const item = T[key]; return item ? (item[LANG] || item.zh || key) : key; }
 function applyI18n() {
   document.documentElement.lang = LANG === 'zh' ? 'zh-CN' : 'en';
   document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => { el.placeholder = t(el.dataset.i18nPlaceholder); });
   document.querySelectorAll('[data-copy-label="short"]').forEach(el => { el.textContent = t('cmd.copy'); });
   const langBtn = document.getElementById('langBtn');
   if (langBtn) {
@@ -505,9 +594,10 @@ function currentSiteBase() {
 }
 function inviteLandingUrl(code) {
   if (!/^[A-Za-z0-9]{8}$/.test(String(code || ''))) return '';
-  const params = new URLSearchParams({ invite: code });
+  const params = new URLSearchParams();
   if (ENV) params.set('env', ENV);
-  return currentSiteBase() + '?' + params.toString();
+  const qs = params.toString();
+  return currentSiteBase() + '/invite/' + code + (qs ? '?' + qs : '');
 }
 function renderInviteLink() {
   const el = document.getElementById('invite-url-text');
@@ -592,6 +682,10 @@ async function initPage() {
 
 function renderAuthenticated(data) {
   currentUser = data.user || {};
+  if (data.receipt) {
+    paymentInfo = { real_name: data.receipt.real_name, phone: data.receipt.phone };
+  }
+  updatePaymentButtons();
   if (data.invite_code) {
     currentCode = data.invite_code;
     fillUser('2', currentUser);
@@ -673,7 +767,6 @@ function renderSummary(s) {
   document.getElementById('rate-card').classList.toggle('warn', !healthy);
   document.getElementById('rate-note').textContent = healthy ? t('note.healthy') : t('note.unhealthy');
   document.getElementById('amount-note').textContent = healthy ? t('note.amount.healthy') : t('note.amount.unhealthy') + ' (' + s.active + '\xd75)';
-  document.getElementById('updated-at').textContent = timeAgo(s.refreshedAt);
 }
 function timeAgo(isoStr) {
   if (!isoStr) return t('time.now');
@@ -706,6 +799,10 @@ async function loadLeaderboard(weekStart, targetId, rulesId) {
       weekLabel: weekLabelFromStart(resolvedWeekStart),
       weekStart: resolvedWeekStart,
     });
+    if (data.refreshed_at) {
+      const t = timeAgo(data.refreshed_at);
+      document.querySelectorAll('.js-updated-at').forEach(el => el.textContent = t);
+    }
   } catch (e) {
     console.error('Failed to load leaderboard', e);
     const resolvedWeekStart = weekStart || formatLocalDate(getMonday());
@@ -837,6 +934,9 @@ function renderRules(targetId) {
     '<li>' + t('rules.bad') + '</li>' +
     '<li>' + t('rules.reward') + '</li>' +
     '<li>' + t('rules.cash') + '</li></ul>' +
+    '<div class="rules-title" style="margin-top:18px"><span class="info" style="background:#e8a050">￥</span>' + esc(t('rules.jd.title')) + '</div>' +
+    '<ul><li>' + t('rules.jd.cycle') + '</li>' +
+    '<li>' + t('rules.jd.amount') + '</li></ul>' +
     '<div class="rules-title" style="margin-top:18px"><span class="info" style="background:#ff4f4f">!</span>' + esc(t('rules.anti.title')) + '</div>' +
     '<ul><li>' + t('rules.anti.1') + '</li>' +
     '<li>' + t('rules.anti.2') + '</li>' +
@@ -1001,7 +1101,6 @@ function reloadVisibleLeaderboard() {
     syncBtn();
     renderInviteLink();
     renderSummary(currentSummary);
-    reloadVisibleLeaderboard();
   }
   applyAll();
   btn.addEventListener('click',()=>{
@@ -1012,7 +1111,164 @@ function reloadVisibleLeaderboard() {
   });
 })();
 
+/* ========== payment-info ========== */
+let paymentInfo = null; // { real_name, phone } or null
+
+function openPaymentModal() {
+  const overlay = document.getElementById('payment-modal-overlay');
+  if (paymentInfo) {
+    document.getElementById('view-real-name').textContent = paymentInfo.real_name;
+    document.getElementById('view-phone').textContent = paymentInfo.phone;
+    document.getElementById('payment-view-mode').style.display = 'block';
+    document.getElementById('payment-edit-mode').style.display = 'none';
+  } else {
+    document.getElementById('input-real-name').value = '';
+    document.getElementById('input-phone').value = '';
+    clearFieldErrors();
+    document.getElementById('payment-view-mode').style.display = 'none';
+    document.getElementById('payment-edit-mode').style.display = 'block';
+  }
+  overlay.classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closePaymentModal() {
+  const overlay = document.getElementById('payment-modal-overlay');
+  overlay.classList.remove('open');
+  document.body.style.overflow = '';
+  clearFieldErrors();
+}
+
+function onOverlayClick(e) {
+  if (e.target === document.getElementById('payment-modal-overlay')) {
+    closePaymentModal();
+  }
+}
+
+function switchToEditMode() {
+  document.getElementById('input-real-name').value = paymentInfo ? paymentInfo.real_name : '';
+  document.getElementById('input-phone').value = paymentInfo ? paymentInfo.phone : '';
+  clearFieldErrors();
+  document.getElementById('payment-view-mode').style.display = 'none';
+  document.getElementById('payment-edit-mode').style.display = 'block';
+}
+
+function clearFieldErrors() {
+  document.querySelectorAll('.field-error').forEach(el => el.classList.remove('show'));
+  document.querySelectorAll('.modal-input.error').forEach(el => el.classList.remove('error'));
+}
+
+function showFieldError(inputId, errId) {
+  document.getElementById(inputId).classList.add('error');
+  document.getElementById(errId).classList.add('show');
+}
+
+function updatePaymentButtons() {
+  const filled = !!paymentInfo;
+  document.querySelectorAll('.payment-btn').forEach(btn => {
+    btn.classList.remove('init-hidden');
+    btn.textContent = t(filled ? 'payment.filled' : 'payment.fill');
+    btn.classList.toggle('filled', filled);
+  });
+}
+
+async function savePaymentInfo() {
+  const nameInput = document.getElementById('input-real-name');
+  const phoneInput = document.getElementById('input-phone');
+  const saveBtn = document.getElementById('save-payment-btn');
+  let valid = true;
+  clearFieldErrors();
+  const realName = nameInput.value.trim();
+  if (!realName) { showFieldError('input-real-name', 'err-real-name'); valid = false; }
+  const phone = phoneInput.value.trim();
+  if (!phone) { showFieldError('input-phone', 'err-phone'); valid = false; }
+  if (!valid) return;
+
+  saveBtn.disabled = true;
+  saveBtn.textContent = t('payment.saving');
+  try {
+    const resp = await fetch(PAYMENT_API + '?sid=' + encodeURIComponent(getSid()), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ real_name: realName, phone: phone })
+    });
+    if (!resp.ok) {
+      const msg = await resp.text();
+      throw new Error(msg || 'HTTP ' + resp.status);
+    }
+    paymentInfo = { real_name: realName, phone: phone };
+    updatePaymentButtons();
+    document.getElementById('view-real-name').textContent = realName;
+    document.getElementById('view-phone').textContent = phone;
+    document.getElementById('payment-view-mode').style.display = 'block';
+    document.getElementById('payment-edit-mode').style.display = 'none';
+    showToast(t('payment.saved'));
+    closePaymentModal();
+  } catch (e) {
+    showToast(e.message || '保存失败');
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.textContent = t('payment.save');
+  }
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') {
+    const overlay = document.getElementById('payment-modal-overlay');
+    if (overlay.classList.contains('open')) closePaymentModal();
+  }
+});
+
 initPage();
 </script>
+
+<!-- payment-info modal -->
+<div class="modal-overlay" id="payment-modal-overlay" onclick="onOverlayClick(event)">
+  <div class="modal-panel">
+    <div class="modal-head">
+      <span class="modal-head-title" data-i18n="payment.title">收款信息</span>
+      <button class="modal-close" onclick="closePaymentModal()" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <!-- view mode -->
+      <div id="payment-view-mode">
+        <div class="modal-field">
+          <span class="modal-label" data-i18n="payment.name">真实姓名</span>
+          <div class="modal-readonly" id="view-real-name">--</div>
+        </div>
+        <div class="modal-field">
+          <span class="modal-label" data-i18n="payment.phone">手机号</span>
+          <div class="modal-readonly" id="view-phone">--</div>
+        </div>
+        <div class="modal-actions">
+          <button class="modal-btn modal-btn-cancel" onclick="closePaymentModal()" data-i18n="payment.close">关闭</button>
+          <button class="modal-btn modal-btn-primary" onclick="switchToEditMode()" data-i18n="payment.edit">修改</button>
+        </div>
+      </div>
+
+      <!-- edit mode -->
+      <div id="payment-edit-mode" style="display:none">
+        <div class="modal-field">
+          <label class="modal-label" for="input-real-name"><span data-i18n="payment.name">真实姓名</span> <span class="req">*</span></label>
+          <input class="modal-input" id="input-real-name" type="text" maxlength="60" autocomplete="name" data-i18n-placeholder="payment.name.placeholder" placeholder="请输入真实姓名">
+          <div class="field-error" id="err-real-name" data-i18n="payment.name.required">请输入真实姓名</div>
+        </div>
+        <div class="modal-field">
+          <label class="modal-label" for="input-phone"><span data-i18n="payment.phone">手机号</span> <span class="req">*</span></label>
+          <input class="modal-input" id="input-phone" type="text" maxlength="30" autocomplete="tel" data-i18n-placeholder="payment.phone.placeholder" placeholder="请输入手机号">
+          <div class="field-error" id="err-phone" data-i18n="payment.phone.required">请输入手机号</div>
+        </div>
+        <div class="modal-actions">
+          <button class="modal-btn modal-btn-cancel" onclick="closePaymentModal()" data-i18n="payment.cancel">取消</button>
+          <button class="modal-btn modal-btn-primary" id="save-payment-btn" onclick="savePaymentInfo()" data-i18n="payment.save">保存</button>
+        </div>
+      </div>
+
+      <p class="modal-hint" data-i18n="payment.hint">京东E卡卡密将通过短信下发，请确认姓名及手机号无误并留意查收</p>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>

@@ -5,6 +5,7 @@
 pub mod background;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
+pub mod compression;
 pub mod parallel_edit;
 pub mod subtask_driver;
 
@@ -25,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::conversation::Conversation;
+use crate::conversation::{Conversation, ConversationSnapshot};
 use crate::hook::HookEngine;
 use crate::provider::LlmProvider;
 use crate::skill::SkillRegistry;
@@ -68,8 +69,8 @@ pub enum AgentCommand {
     AppendInput(String),
     /// Clear conversation history.
     ClearConversation,
-    /// Set messages from a resumed session.
-    SetMessages(Vec<crate::conversation::message::Message>),
+    /// Set conversation state from a resumed session.
+    SetConversation(ConversationSnapshot),
     /// Bind the per-conversation session id (the session file's id) so the
     /// `x-atomcode-session-id` header tracks the persistent conversation
     /// identity. Sent by the UI whenever the current session is established
@@ -109,11 +110,10 @@ pub enum AgentCommand {
     /// or other change to plugin state. Cheap (just re-reads JSON files);
     /// does NOT touch provider/model state, unlike ReloadConfig.
     ReloadHooks,
-    /// Request a snapshot of the current conversation messages.
-    /// The agent responds with `AgentEvent::MessagesSync` carrying
-    /// `conversation.messages`. Used by the TUI before `/bg` to ensure
-    /// the session has up-to-date message history even when a turn is
-    /// still in progress (e.g. waiting for tool approval).
+    /// Request a snapshot of the current conversation state.
+    /// The agent responds with `AgentEvent::MessagesSync`. Used by the TUI
+    /// before `/bg` to ensure the session has up-to-date history even when
+    /// a turn is still in progress (e.g. waiting for tool approval).
     SyncMessages,
     /// Roll conversation memory back to just before the `nth` real user
     /// prompt (1-based). `None` targets the last prompt (bare `/undo`). The
@@ -148,13 +148,7 @@ pub enum TurnStopReason {
     Error,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CompressionOutcome {
-    applied: bool,
-    before_tokens: usize,
-    after_tokens: usize,
-    removed_messages: usize,
-}
+pub use compression::CompressionOutcome;
 
 impl TurnStopReason {
     /// Short machine-parseable tag (snake_case) for logs / CLI output.
@@ -240,11 +234,11 @@ pub enum AgentEvent {
         tool_name: String,
         reason: String,
         call: ToolCall,
-        /// Snapshot of `conversation.messages` at the time the approval
+        /// Snapshot of conversation state at the time the approval
         /// request was raised. Lets the TUI persist mid-turn session
         /// state (e.g. when `/bg` backgrounds a session that is waiting
         /// for approval).
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     },
     /// Token usage update.
     TokenUsage(crate::stream::TokenUsage),
@@ -261,23 +255,23 @@ pub enum AgentEvent {
         /// Why the loop stopped. `Natural` for ordinary completion; see
         /// TurnStopReason for budget / cancel / error variants.
         stop_reason: TurnStopReason,
-        /// Snapshot of the conversation messages at the moment the turn
+        /// Snapshot of the conversation state at the moment the turn
         /// ended. Mirrors `TurnCancelled.messages` so UIs have one uniform
         /// path for persisting session state on either terminal event.
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     },
     /// Turn was cancelled by user before completion.
     /// The conversation has been cleaned up - partial messages removed.
-    /// Contains the cleaned message list for TUI to sync.
+    /// Contains the cleaned conversation state for TUI to sync.
     TurnCancelled {
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     },
     /// Conversation memory was rolled back by `/undo`. Carries the truncated
     /// message list (for the TUI to persist + replay), the removed prompt's
     /// text (to restore into the input box), and turn numbers for the
     /// confirmation line (`target_n..=prompts_before` were removed).
     ConversationTruncated {
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
         restored_prompt: String,
         target_n: usize,
         prompts_before: usize,
@@ -286,11 +280,11 @@ pub enum AgentEvent {
     /// `available` real prompts exist (0 = nothing to undo).
     UndoFailed { requested: usize, available: usize },
     /// Response to `AgentCommand::SyncMessages`. Carries a snapshot of
-    /// `conversation.messages` at the time the agent processed the command.
+    /// conversation state at the time the agent processed the command.
     /// Used by the TUI to sync session state before backgrounding a session
     /// that is mid-turn (e.g. waiting for tool approval).
     MessagesSync {
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     },
     /// An error occurred. Carries a snapshot of `conversation.messages`
     /// so the TUI can persist mid-turn state even when the turn dies
@@ -303,7 +297,7 @@ pub enum AgentEvent {
     /// `handle_send_message` provides the full snapshot.
     Error {
         error: String,
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     },
     /// Non-fatal advisory from a provider or other subsystem. UI renders
     /// this as a one-line yellow banner; does not abort the turn.
@@ -1178,8 +1172,8 @@ impl AgentLoop {
                     // (cancelled) for unpaired tool calls, and mark turn as Completed.
                     self.conversation.cancel_current_turn();
                     // Sync the preserved messages to TUI
-                    let messages = self.conversation.messages.clone();
-                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { messages });
+                    let snapshot = self.conversation.snapshot();
+                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
                 }
                 AgentCommand::ApproveTool => {
                     // Approval handled inside run_turn_loop via channels
@@ -1309,16 +1303,11 @@ impl AgentLoop {
                         self.turn_runner.context.telemetry.set_session_id(uuid);
                     }
                 }
-                AgentCommand::SetMessages(messages) => {
-                    // Set messages from a resumed session.
-                    // Rebuild turn_tracker so the context builder can use
-                    // proper turn-based windowing instead of the fallback path.
-                    let turn_tracker =
-                        crate::conversation::turn::TurnTracker::rebuild(&messages);
-                    self.conversation.messages = messages;
-                    self.conversation.turn_tracker = turn_tracker;
+                AgentCommand::SetConversation(snapshot) => {
+                    // Set conversation state from a resumed session.
+                    self.conversation = Conversation::from_snapshot(snapshot);
                     // NOTE: deliberately do NOT regenerate session_id here.
-                    // SetMessages also fires on `-c`/`--continue` auto-restore
+                    // SetConversation also fires on `-c`/`--continue` auto-restore
                     // and `/resume` of the current session — those CONTINUE an
                     // existing conversation, so a new id would fragment one
                     // logical session into two on the gateway. Only an explicit
@@ -1330,7 +1319,7 @@ impl AgentLoop {
                     match self.conversation.undo_to_prompt(target) {
                         Some(restored_prompt) => {
                             let _ = self.event_tx.send(AgentEvent::ConversationTruncated {
-                                messages: self.conversation.messages.clone(),
+                                snapshot: self.conversation.snapshot(),
                                 restored_prompt,
                                 target_n: target,
                                 prompts_before: available,
@@ -1483,7 +1472,7 @@ impl AgentLoop {
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: "A background task is already running. Wait for it to finish."
                                 .to_string(),
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
                         });
                     } else {
                         let provider = self.turn_runner.provider.clone();
@@ -1568,8 +1557,8 @@ impl AgentLoop {
                     self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
                 }
                 AgentCommand::SyncMessages => {
-                    let messages = self.conversation.messages.clone();
-                    let _ = self.event_tx.send(AgentEvent::MessagesSync { messages });
+                    let snapshot = self.conversation.snapshot();
+                    let _ = self.event_tx.send(AgentEvent::MessagesSync { snapshot });
                 }
                 AgentCommand::Shutdown => {
                     // --- SessionEnd Hook ---
@@ -1607,7 +1596,7 @@ impl AgentLoop {
         if let Some(reason) = self.turn_runner.provider.availability_error() {
             let _ = self.event_tx.send(AgentEvent::Error {
                 error: reason.to_string(),
-                messages: self.conversation.messages.clone(),
+                snapshot: self.conversation.snapshot(),
             });
             self.finish_turn(TurnStopReason::Error);
             return;
@@ -1639,7 +1628,7 @@ impl AgentLoop {
             crate::hook::UserPromptHookResult::Block(reason) => {
                 let _ = self.event_tx.send(AgentEvent::Error {
                     error: format!("hook blocked: {}", reason),
-                    messages: self.conversation.messages.clone(),
+                    snapshot: self.conversation.snapshot(),
                 });
                 self.finish_turn(TurnStopReason::Error);
                 return;
@@ -1746,11 +1735,24 @@ impl AgentLoop {
             // No LLM call — the compressed content is already
             // one-line-per-round summaries (DefaultCtx) compact enough
             // for cold zone.
-            let keep_ceiling = self.compaction_keep_ceiling(&system_prompt).await;
+            let keep_ceiling = compression::compaction_keep_ceiling(
+                &*self.ctx,
+                &system_prompt,
+                &self.turn_runner.tools,
+                &self.conversation.cold_summaries,
+            )
+            .await;
             if let Some((content, n_msgs)) =
                 self.ctx.compression_plan(&self.conversation, keep_ceiling)
             {
-                let _ = self.try_apply_compression(&system_prompt, n_msgs, content, false);
+                let _ = compression::try_apply_compression(
+                    &*self.ctx,
+                    &mut self.conversation,
+                    &system_prompt,
+                    n_msgs,
+                    content,
+                    None, // no post-compress state at task boundary
+                );
             }
         }
 
@@ -1992,15 +1994,34 @@ impl AgentLoop {
                 .await;
 
             let system_prompt = self.build_system_prompt();
-            // Per-turn reminder removed: verbatim task now rides on the cadence
-            // reflection checkpoint — see agent::discipline::reflection_prompt.
-            let turn_reminder = String::new();
+            // Per-turn reminder: empty in normal (build) mode — the verbatim
+            // task rides the cadence reflection checkpoint (see
+            // agent::discipline::reflection_prompt). In PLAN mode it carries a
+            // standing instruction so the model keeps planning instead of
+            // dumping the implementation inline (the read-only tool gate blocks
+            // file writes, but not writing code into the reply).
+            let turn_reminder = plan_mode_turn_reminder(self.plan_mode);
             let cancel = self.cancel_token.clone();
 
             // Context compression: when > 70% budget, pause and compress
             // old turns via LLM call. Keeps last 5 turns full, compressed
             // history goes to cold zone (FIFO, max 3 entries).
-            self.maybe_compress_history(&system_prompt).await;
+            {
+                let state = build_post_compress_state(
+                    &self.current_task,
+                    &self.files_edited_this_turn,
+                    &self.files_read_this_turn,
+                );
+                compression::maybe_compress_history(
+                    &*self.ctx,
+                    &mut self.conversation,
+                    &*self.turn_runner.provider,
+                    &self.turn_runner.tools,
+                    &system_prompt,
+                    state.as_deref(),
+                )
+                .await;
+            }
 
             // Batch reminder: REMOVED.
             // Was injecting fake user messages ("[Batch reminder: call MULTIPLE tools...]")
@@ -2324,7 +2345,7 @@ impl AgentLoop {
                                     // turn_fut completes with the proper snapshot.
                                     let _ = event_tx.send(AgentEvent::Error {
                                         error: e,
-                                        messages: Vec::new(),
+                                        snapshot: ConversationSnapshot::default(),
                                     });
                                 }
                                 TurnEvent::Warning(w) => {
@@ -2341,15 +2362,15 @@ impl AgentLoop {
                                     // when the LLM is just navigating.
                                     let _ = event_tx.send(AgentEvent::WorkingDirChanged(new_dir));
                                 }
-                                TurnEvent::ApprovalRequested { tool_name, reason, call, messages } => {
+                                TurnEvent::ApprovalRequested { tool_name, reason, call, snapshot } => {
                                     // Forward approval request to TUI, including
-                                    // a snapshot of conversation.messages so the
+                                    // a snapshot of conversation state so the
                                     // TUI can persist mid-turn session state.
                                     let _ = event_tx.send(AgentEvent::ApprovalNeeded {
                                         tool_name,
                                         reason,
                                         call,
-                                        messages,
+                                        snapshot,
                                     });
                                     *phase = AgentPhase::WaitingApproval;
                                     let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
@@ -2657,6 +2678,7 @@ impl AgentLoop {
                     // delays the same error by ~45s and re-hammers the gateway).
                     let is_quota_exhausted = crate::provider::is_non_retryable_rate_limit(&e);
                     let is_auth_error = is_auth_error(&e);
+                    let is_insufficient_balance = is_insufficient_balance_error(&e);
                     let is_messages_illegal = e.contains("illegal") || e.contains("messages");
                     // Upstream context-length overflow (OpenRouter 400, OpenAI
                     // context_length_exceeded, Anthropic "prompt is too long").
@@ -2677,7 +2699,7 @@ impl AgentLoop {
                         self.report_error("codingplan_unavailable", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return;
@@ -2720,7 +2742,21 @@ impl AgentLoop {
                         let shown = e.strip_prefix("[429] ").unwrap_or(&e).to_string();
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: shown,
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
+                        });
+                        self.finish_turn(TurnStopReason::Error);
+                        return;
+                    } else if is_insufficient_balance {
+                        // Non-retryable: no balance means every retry of this
+                        // exact request fails identically. Fail-fast like the
+                        // quota/auth branches and surface the real reason
+                        // ("Insufficient Balance" / 余额不足) instead of 3
+                        // misleading "请求失败，重试" lines.
+                        self.datalog.log_error(&e);
+                        self.report_error("insufficient_balance", &e).await;
+                        let _ = self.event_tx.send(AgentEvent::Error {
+                            error: public_error_message(&e),
+                            snapshot: self.conversation.snapshot(),
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return;
@@ -2747,7 +2783,7 @@ impl AgentLoop {
                         self.report_error("auth_error", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return;
@@ -2766,7 +2802,7 @@ impl AgentLoop {
                         self.report_error("api_error", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
-                            messages: self.conversation.messages.clone(),
+                            snapshot: self.conversation.snapshot(),
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return;
@@ -2782,8 +2818,8 @@ impl AgentLoop {
                     // Preserve completed content + backfill (cancelled) for unpaired tool calls
                     self.conversation.cancel_current_turn();
                     // Send TurnCancelled event for TUI to sync
-                    let messages = self.conversation.messages.clone();
-                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { messages });
+                    let snapshot = self.conversation.snapshot();
+                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
                     // Do finish_turn's bookkeeping WITHOUT emitting TurnComplete.
                     // TurnCancelled already tells the TUI the turn ended; emitting
                     // TurnComplete on top buffers a stale "✓ done · N rounds" line
@@ -2811,10 +2847,11 @@ impl AgentLoop {
     /// Pro-active context compaction. Two-stage:
     ///
     /// 1. **Tier 1 (cheap, mechanical):** collapse old `ToolResult`
-    ///    bodies into stubs (`compact_old_tool_results_in_place`, the
-    ///    same generic stub format `microcompact` uses at render time;
-    ///    keeps the last 3 turns full). Zero LLM calls. Cheap to fire,
-    ///    easy to revert if model needs the bytes back via re-read.
+    ///    bodies into stubs (`compact_old_tool_results_in_place`, using
+    ///    the same `build_compact_stub` format shared with the normal-path
+    ///    `collapse_committed`; keeps the last 3 turns full). Zero LLM
+    ///    calls. Cheap to fire, easy to revert if model needs the bytes
+    ///    back via re-read.
     ///
     /// 2. **Tier 2 (expensive, LLM-driven):** if Tier 1 didn't bring
     ///    the context under threshold, fall through to LLM-summarize
@@ -2835,78 +2872,6 @@ impl AgentLoop {
     /// it scales correctly from 128K to 1M — a fixed fraction would not
     /// (it would waste ~460K on a 1M model, the same class of bug as the
     /// old 60K drop cap).
-    async fn compaction_keep_ceiling(&self, system_prompt: &str) -> usize {
-        let window = self.ctx.ctx_window();
-        let system_tokens = system_prompt.len() / 4 + 4;
-        let tool_def_tokens: usize = self
-            .turn_runner
-            .tools
-            .get_definitions()
-            .await
-            .iter()
-            .map(|d| {
-                let params = serde_json::to_string(&d.parameters).unwrap_or_default();
-                (d.name.len() + d.description.len() + params.len()) / 4 + 4
-            })
-            .sum();
-        let cold_zone_tokens: usize = self
-            .conversation
-            .cold_summaries
-            .iter()
-            .map(|s| s.len() / 4 + 4)
-            .sum();
-        let output_reserve = (window / 4).clamp(8_000, 16_384);
-        window
-            .saturating_sub(system_tokens)
-            .saturating_sub(tool_def_tokens)
-            .saturating_sub(cold_zone_tokens)
-            .saturating_sub(output_reserve)
-            .max(window / 4) // defensive floor: tail never below 25% of window
-    }
-
-    async fn maybe_compress_history(&mut self, system_prompt: &str) {
-        let sys_tokens = system_prompt.len() / 4 + 4;
-        if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
-            return;
-        }
-
-        // ── Tier 1: collapse old tool_results (no LLM call) ──
-        // Keep the most recent 3 turns at full fidelity; older
-        // turns get their tool_result bodies replaced with the same
-        // generic stub microcompact uses at render time. One stub
-        // format, one place to maintain.
-        crate::ctx::render::compact_old_tool_results_in_place(
-            &mut self.conversation,
-            /* keep_recent_turns */ 3,
-        );
-
-        // Re-check: if Tier 1 was enough, stop here and skip the
-        // LLM summarization round-trip. This is the common case for
-        // sessions where the bulk of context is heavy bash/cargo
-        // outputs.
-        if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
-            return;
-        }
-
-        // ── Tier 2: LLM-summarize oldest turns into cold zone ──
-        let keep_ceiling = self.compaction_keep_ceiling(system_prompt).await;
-        let (content, n_turns) = match self.ctx.compression_plan(&self.conversation, keep_ceiling) {
-            Some(plan) => plan,
-            None => return,
-        };
-
-        let summarize_prompt = Self::default_summarize_prompt(&content);
-
-        let summary = self.run_llm_summary(&summarize_prompt).await;
-        let final_summary = if summary.trim().is_empty() {
-            content
-        } else {
-            summary
-        };
-
-        let _ = self.try_apply_compression(system_prompt, n_turns, final_summary, true);
-    }
-
     /// Emit a full ContextStats snapshot for the `/context` command.
     /// Callers pass the conversation and the already-built `msgs` (from
     /// `self.ctx.build_messages`) so the estimate reflects exactly what
@@ -2958,75 +2923,6 @@ impl AgentLoop {
         });
     }
 
-    /// Post-compression task state restoration. After compression the model
-    /// loses track of what it was doing — inject a short status so it can
-    /// resume without re-exploring. Shared by auto-compact (threshold-driven
-    /// in `maybe_compress_history`) and manual `/compact`.
-    fn inject_post_compress_state(&mut self) {
-        if let Some(msg) = build_post_compress_state(
-            &self.current_task,
-            &self.files_edited_this_turn,
-            &self.files_read_this_turn,
-        ) {
-            self.conversation.add_synthetic_user_message(&msg);
-        }
-    }
-
-    fn rendered_token_count(&self, system_prompt: &str) -> usize {
-        self.ctx
-            .build_messages(&self.conversation, system_prompt, "")
-            .0
-            .iter()
-            .map(|m| m.estimate_tokens())
-            .sum()
-    }
-
-    /// Apply a compression candidate only when it reduces the next request
-    /// payload. This is the single success criterion for all compression
-    /// entry points: manual `/compact`, threshold-driven auto-compression,
-    /// and task-boundary cleanup.
-    fn try_apply_compression(
-        &mut self,
-        system_prompt: &str,
-        remove_count: usize,
-        summary: String,
-        inject_state: bool,
-    ) -> CompressionOutcome {
-        let before_msg_count = self.conversation.messages.len();
-        let before_tokens = self.rendered_token_count(system_prompt);
-
-        let msgs_snapshot = self.conversation.messages.clone();
-        let cold_snapshot = self.conversation.cold_summaries.clone();
-        let turns_snapshot = self.conversation.turn_tracker.clone();
-
-        self.conversation.apply_compression(remove_count, summary);
-        if inject_state {
-            self.inject_post_compress_state();
-        }
-
-        let after_tokens = self.rendered_token_count(system_prompt);
-        let removed_messages = before_msg_count.saturating_sub(self.conversation.messages.len());
-
-        if after_tokens >= before_tokens {
-            self.conversation.messages = msgs_snapshot;
-            self.conversation.cold_summaries = cold_snapshot;
-            self.conversation.turn_tracker = turns_snapshot;
-            CompressionOutcome {
-                applied: false,
-                before_tokens,
-                after_tokens,
-                removed_messages: 0,
-            }
-        } else {
-            CompressionOutcome {
-                applied: true,
-                before_tokens,
-                after_tokens,
-                removed_messages,
-            }
-        }
-    }
-
     /// D2 emergency compact — layered, measured, never combines destructive
     /// ops. Replaces the previous "LLM-compress + blind truncate(len-4)"
     /// path that destroyed last-turn context (datalog atomgr-2d99b47d/
@@ -3060,6 +2956,7 @@ impl AgentLoop {
         crate::ctx::render::compact_old_tool_results_in_place(
             &mut self.conversation,
             /* keep_recent_turns */ 3,
+            false,
         );
         if estimate(&self.conversation) <= target_tokens {
             return true;
@@ -3068,7 +2965,25 @@ impl AgentLoop {
         // Tier 2: LLM-summarize older turns into the cold zone. This is
         // the most expensive tier (it makes a network round trip), so
         // we only reach it after Tier 1 already failed.
-        self.maybe_compress_history(system_prompt).await;
+        // Use a minimal task-only hint — emergency compaction needs max
+        // compression rate; full file lists would consume precious tokens.
+        {
+            let minimal_state = if !self.current_task.is_empty() {
+                let task_short: String = self.current_task.chars().take(120).collect();
+                Some(format!("TASK: {}", task_short))
+            } else {
+                None
+            };
+            compression::maybe_compress_history(
+                &*self.ctx,
+                &mut self.conversation,
+                &*self.turn_runner.provider,
+                &self.turn_runner.tools,
+                system_prompt,
+                minimal_state.as_deref(),
+            )
+            .await;
+        }
         if estimate(&self.conversation) <= target_tokens {
             return true;
         }
@@ -3091,13 +3006,19 @@ impl AgentLoop {
     /// the dropped messages, so compaction would silently inflate the
     /// prompt. We measure before/after token totals via `build_messages`
     /// (post all render-pipeline effects — `clean_message_pipeline`,
-    /// microcompact, etc.) and roll the conversation back if the
-    /// operation didn't actually shrink the wire payload. Analytical
-    /// projection was tried first but too many render-pipeline branches
-    /// made it unreliable.
+    /// `collapse_committed`, final-byte ceiling, etc.) and roll the
+    /// conversation back if the operation didn't actually shrink the wire
+    /// payload. Analytical projection was tried first but too many
+    /// render-pipeline branches made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
         let system_prompt = self.build_system_prompt();
-        let keep_ceiling = self.compaction_keep_ceiling(&system_prompt).await;
+        let keep_ceiling = compression::compaction_keep_ceiling(
+            &*self.ctx,
+            &system_prompt,
+            &self.turn_runner.tools,
+            &self.conversation.cold_summaries,
+        )
+        .await;
         let Some((mechanical_content, n_msgs)) =
             self.ctx.compression_plan(&self.conversation, keep_ceiling)
         else {
@@ -3120,17 +3041,29 @@ impl AgentLoop {
                 custom, mechanical_content
             )
         } else {
-            Self::default_summarize_prompt(&mechanical_content)
+            compression::default_summarize_prompt(&mechanical_content)
         };
 
-        let summary = self.run_llm_summary(&summarize_prompt).await;
+        let summary = self.run_llm_summary_with_telemetry(&summarize_prompt).await;
         let content = if summary.trim().is_empty() {
             mechanical_content
         } else {
             summary
         };
 
-        let outcome = self.try_apply_compression(&system_prompt, n_msgs, content, true);
+        let state = build_post_compress_state(
+            &self.current_task,
+            &self.files_edited_this_turn,
+            &self.files_read_this_turn,
+        );
+        let outcome = compression::try_apply_compression(
+            &*self.ctx,
+            &mut self.conversation,
+            &system_prompt,
+            n_msgs,
+            content,
+            state.as_deref(),
+        );
 
         if !outcome.applied {
             let before = fmt_k_tokens(outcome.before_tokens);
@@ -3167,94 +3100,17 @@ impl AgentLoop {
             .await;
     }
 
-    fn default_summarize_prompt(content: &str) -> String {
-        format!(
-            "Summarize this conversation history in 3-5 concise sentences. \
-             Keep: file names, what was changed, key decisions, errors encountered. \
-             Drop: exact code content, tool arguments, line numbers.\n\n{}",
-            content
-        )
-    }
-
-    /// Run a lightweight LLM call to summarize content. Returns empty string on failure.
-    async fn run_llm_summary(&self, prompt: &str) -> String {
-        // System prompt kept in a local so the telemetry `system_tokens`
-        // estimate below matches exactly what is sent on the wire.
-        let sys = "You are a conversation summarizer. Output ONLY the summary.";
-        let mut mini_conv = crate::conversation::Conversation::new();
-        mini_conv.add_user_message(prompt);
-        let msgs = mini_conv.to_provider_messages(sys);
-
+    /// Run LLM summary with telemetry reporting.
+    /// Thin wrapper around [`compression::run_llm_summary`] that adds
+    /// provider/host/model attribution and tracks the call in telemetry.
+    async fn run_llm_summary_with_telemetry(&self, prompt: &str) -> String {
+        let sys = compression::COMPRESSION_SYSTEM_PROMPT;
         let started = std::time::Instant::now();
-        // Telemetry token counters: populated from StreamEvent::Usage when the
-        // provider reports it, estimated otherwise (mirrors TurnRunner's
-        // no-usage fallback). This summary/compaction call goes to the SAME
-        // provider/base_url as a normal turn, so the upstream proxy logs it —
-        // but it bypasses `run_with_filter`, so the `tel_return!` macro never
-        // fires and the request was previously invisible to our telemetry,
-        // making AtomCode under-report vs the proxy by exactly these calls.
-        let mut tel_input: u32 = 0;
-        let mut tel_output: u32 = 0;
-        let mut tel_cached: u32 = 0;
-        let mut got_usage = false;
-        let mut errored = false;
 
-        let mut summary = String::new();
-        match self.turn_runner.provider.chat_stream(&msgs, None) {
-            Ok(mut stream) => {
-                use futures::StreamExt;
-                let first_timeout = std::time::Duration::from_secs(30);
-                let stream_timeout = std::time::Duration::from_secs(30);
-                let mut got_token = false;
-                loop {
-                    let timeout = if got_token {
-                        stream_timeout
-                    } else {
-                        first_timeout
-                    };
-                    match tokio::time::timeout(timeout, stream.next()).await {
-                        Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
-                            got_token = true;
-                            let clean = text
-                                .replace("<think>", "")
-                                .replace("</think>", "")
-                                .replace("<|im_start|>", "")
-                                .replace("<|im_end|>", "");
-                            summary.push_str(&clean);
-                        }
-                        Ok(Some(Ok(crate::stream::StreamEvent::Usage(u)))) => {
-                            tel_input = tel_input.saturating_add(u.prompt_tokens as u32);
-                            tel_output = tel_output.saturating_add(u.completion_tokens as u32);
-                            tel_cached = tel_cached.saturating_add(u.cached_tokens as u32);
-                            got_usage = true;
-                        }
-                        Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
-                        Ok(Some(Ok(_))) => continue,
-                        Ok(Some(Err(_))) => {
-                            errored = true;
-                            break;
-                        }
-                        // timeout (Err) or end-of-stream (Ok(None))
-                        _ => break,
-                    }
-                }
-            }
-            Err(_) => {
-                errored = true;
-            }
-        }
+        let (summary, tel_input, tel_output, tel_cached, had_error) =
+            compression::run_llm_summary(&*self.turn_runner.provider, prompt).await;
 
-        // Estimate tokens when the provider didn't report usage (many
-        // OpenAI-compatible gateways ignore stream_options). ~4 chars/token in,
-        // ~3 out — same heuristic class as TurnRunner.
-        if !got_usage {
-            tel_input = ((sys.len() + prompt.len()) / 4) as u32;
-            tel_output = (summary.len() / 3) as u32;
-        }
-        let had_error = errored || (summary.trim().is_empty() && !got_usage);
-
-        // Build the same envelope context a normal turn would carry, so this
-        // request is attributed to the right provider/host/model/session.
+        // Build the same envelope context a normal turn would carry.
         let pcfg = self.config.providers.get(&self.config.default_provider);
         let vendor = pcfg.map(|p| p.provider_type.clone());
         let host = pcfg.and_then(|p| {
@@ -3283,7 +3139,7 @@ impl AgentLoop {
             tool_def_tokens: 0,
             tool_result_tokens: 0,
             message_tokens: (prompt.len() / 4) as u32,
-            messages_count: msgs.len() as u32,
+            messages_count: 2, // system + user
             error_kind: None,
             error_data: None,
         };
@@ -3380,7 +3236,7 @@ impl AgentLoop {
             turn_count: self.turn_count,
             tool_call_count: self.tool_call_count,
             stop_reason,
-            messages: self.conversation.messages.clone(),
+            snapshot: self.conversation.snapshot(),
         });
         let _ = self
             .event_tx
@@ -3774,6 +3630,27 @@ fn is_auth_error(e: &str) -> bool {
         || e.contains("incorrect_api_key")
 }
 
+/// True when the upstream error means the account is out of funds — a
+/// **non-retryable** condition for the current request: retrying the same
+/// call cannot make money appear, it only delays the real error behind
+/// misleading "请求失败，重试" lines. Mirrors the `is_quota_exhausted`
+/// fail-fast branch, but for payment/balance rather than rate quota.
+///
+/// HTTP 402 (Payment Required) is the standard code, but providers are
+/// inconsistent: DeepSeek returns `{"error":{"message":"Insufficient
+/// Balance"}}`, OpenAI uses `insufficient_quota`, and Chinese gateways say
+/// 余额不足/欠费. Match the message text plus the canonical status
+/// reason rather than a bare "402" substring (which would false-positive on
+/// token counts in the body).
+fn is_insufficient_balance_error(e: &str) -> bool {
+    e.contains("Insufficient Balance")
+        || e.contains("insufficient_balance")
+        || e.contains("insufficient_quota")
+        || e.contains("Payment Required")
+        || e.contains("余额不足")
+        || e.contains("欠费")
+}
+
 /// True when the error came from `build_codingplan_headers` failing
 /// with `SignError::Unavailable` — i.e. an open-source AtomCode build
 /// tried to issue a request that requires the closed-source signing
@@ -3800,6 +3677,8 @@ fn should_show_raw_api_error() -> bool {
 fn public_error_reason(e: &str) -> &'static str {
     if is_context_overflow_error(e) {
         "上下文过长"
+    } else if is_insufficient_balance_error(e) {
+        "余额不足"
     } else if is_auth_error(e) {
         "认证失败或无权限"
     } else if is_rate_limited_error(e) {
@@ -3839,6 +3718,9 @@ fn public_error_message(e: &str) -> String {
         "上下文过长" => {
             "请求超过了模型上下文长度限制。请减少附加内容或缩短会话历史后重试。".to_string()
         }
+        "余额不足" => {
+            "账户余额不足，请前往模型提供方控制台充值后重试。".to_string()
+        }
         "认证失败或无权限" => {
             "认证失败或当前账号无权限访问该模型。请检查 API Key 和提供方权限配置。".to_string()
         }
@@ -3859,6 +3741,27 @@ fn public_error_message(e: &str) -> String {
 ///
 /// Extracted as a free function so the truncation / formatting is testable
 /// without building a full `AgentLoop`.
+/// Per-turn reminder injected into the last user message while plan mode is
+/// active (empty otherwise). Plan mode is deliberately kept OUT of the system
+/// prompt to preserve the prefix cache (see `prompt.rs`), and the one-time
+/// toggle notice scrolls out of recency fast — so without a per-turn nudge the
+/// model drifts and writes the whole implementation inline (even as a code
+/// block) instead of presenting a plan and stopping. Riding `turn_reminder`
+/// keeps the constraint fresh every turn without touching the cached system
+/// prompt.
+fn plan_mode_turn_reminder(plan_mode: bool) -> String {
+    if !plan_mode {
+        return String::new();
+    }
+    "<system-reminder>\n\
+     PLAN MODE is active. Do NOT create, edit, or delete files, and do NOT write out the \
+     implementation — not even as code blocks in your reply. Investigate with read-only tools, \
+     then present a concise implementation plan and STOP, waiting for the user to review and \
+     switch to build mode. Writing the full solution now defeats the purpose of plan mode.\n\
+     </system-reminder>"
+        .to_string()
+}
+
 fn build_post_compress_state(
     current_task: &str,
     files_edited: &[String],
@@ -4032,6 +3935,25 @@ mod agent_handle_tests {
             sys3.contains(&new_wd.display().to_string()),
             "the rebuilt prompt should reflect the new cwd"
         );
+    }
+
+    /// Regression: in plan mode the read-only tool gate blocks file writes, but
+    /// not the model writing the implementation into its reply. A per-turn
+    /// reminder must carry the "plan only, don't implement, STOP" constraint so
+    /// the model doesn't drift into dumping the full solution inline. Build mode
+    /// must carry no such reminder (keeps the last user turn clean + cacheable).
+    #[test]
+    fn plan_mode_turn_reminder_present_only_in_plan_mode() {
+        assert!(
+            super::plan_mode_turn_reminder(false).is_empty(),
+            "build mode must not inject a plan reminder"
+        );
+        let r = super::plan_mode_turn_reminder(true);
+        assert!(r.contains("PLAN MODE"), "plan reminder must name plan mode: {r:?}");
+        let low = r.to_lowercase();
+        // The exact failure mode: writing the implementation inline as a code block.
+        assert!(low.contains("code block"), "must forbid inline code-block dumps: {r:?}");
+        assert!(low.contains("stop"), "must tell the model to stop after the plan: {r:?}");
     }
 
     /// Part-2 (systemA): plan mode must NOT live in the system prompt. Toggling
@@ -4279,7 +4201,7 @@ mod classifier_tests {
         // should be stubs while the 3 RECENT turns retain full
         // payload. Pins the "older=collapsed, newer=intact" split.
         let mut conv = build_conv(/* n_turns */ 6, /* result_size */ 4_000);
-        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3, false);
 
         // Walk the messages: each turn pushes (User, AssistantToolCall,
         // ToolResult). 6 turns × 3 msgs = 18 msgs. The first 3 turns
@@ -4313,7 +4235,7 @@ mod classifier_tests {
     #[test]
     fn collapse_keeps_last_n_turns_full() {
         let mut conv = build_conv(5, 1024);
-        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2, false);
         // 5 turns, keep last 2 → first 3 should have stubbed tool_results.
         assert_eq!(count_collapsed_results(&conv), 3);
     }
@@ -4323,14 +4245,14 @@ mod classifier_tests {
         // Tool results under 200 chars aren't worth collapsing — the stub
         // would weigh more than the original.
         let mut conv = build_conv(5, 50);
-        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2, false);
         assert_eq!(count_collapsed_results(&conv), 0);
     }
 
     #[test]
     fn collapse_no_op_when_under_keep_threshold() {
         let mut conv = build_conv(2, 1024);
-        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3, false);
         // Only 2 turns total, keep 3 — nothing to collapse.
         assert_eq!(count_collapsed_results(&conv), 0);
     }
@@ -4338,7 +4260,7 @@ mod classifier_tests {
     #[test]
     fn collapse_preserves_call_id_and_success_flag() {
         let mut conv = build_conv(3, 1024);
-        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 1);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 1, false);
         // Verify call_0's tool_result still has the right call_id even
         // though its body was stubbed — preserves tool_call/tool_result
         // pairing for OpenAI-style providers.
@@ -4481,6 +4403,25 @@ mod classifier_tests {
     #[test]
     fn rate_limit_error_is_detected() {
         assert!(is_rate_limited_error("API error (429 Too Many Requests)"));
+    }
+
+    /// 余额不足 / 402 Payment Required 必须 fail-fast(归类为「余额不足」),
+    /// 不能落入通用重试分支被笼统地报「请求失败」。
+    #[test]
+    fn insufficient_balance_is_classified() {
+        assert_eq!(
+            public_error_reason(
+                "API error (402 Payment Required) at `https://api.deepseek.com/chat/completions`: Insufficient Balance"
+            ),
+            "余额不足"
+        );
+        assert_eq!(public_error_reason("insufficient_quota"), "余额不足");
+        assert_eq!(public_error_reason("账户余额不足"), "余额不足");
+        // 反例:普通限流不应被误判为余额不足。
+        assert_ne!(
+            public_error_reason("API error (429 Too Many Requests)"),
+            "余额不足"
+        );
     }
 
     /// Chinese gateway-side rate-limit blobs streamed in-band by
@@ -4898,4 +4839,3 @@ mod hard_truncate_tests {
         assert_eq!(conv.messages.len(), 0);
     }
 }
-
