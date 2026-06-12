@@ -117,6 +117,7 @@ Do not report only the most severe problems. Medium- and low-priority problems â
 - If a problem requires several uncertain premises to all hold, and you cannot confirm them from the diff or surrounding code, do not report it.
 - If something is merely a business-policy choice or an implementation trade-off rather than a clear error, risk, or regression, do not report it.
 - If you can only say "there might be a risk here" but cannot state "under what condition what failure occurs," do not report it.
+- Do not report a type "mismatch" between a type and its own same-width alias/typedef (e.g. `int` vs a `typedef int rtError_t`, `int32_t` vs `int` on a 32-bit-int platform, `size_t` vs `uintptr_t` where identical). These are the same type; there is no defect. Report a type issue only when the conversion actually loses bits, changes signedness with a reachable out-of-range value, or breaks an ABI/contract.
 
 ## VIII. Prohibitions
 

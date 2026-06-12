@@ -147,6 +147,9 @@ async fn review(args: ReviewArgs) -> Result<()> {
     let custom_task = resolve_task(args.task.clone(), args.task_file.clone())?;
     // Language-rules section matched against the diff's changed files (diff mode only).
     let mut rules_section: Option<String> = None;
+    // Changed-file set of the diff (diff mode only) — used to drop findings anchored to
+    // files OUTSIDE the diff (a common hallucination: judging un-changed code as broken).
+    let mut changed_files: Vec<String> = Vec::new();
     let (task, trace_label) = match custom_task {
         Some(t) => {
             let label = format!("custom task ({} chars)", t.len());
@@ -159,15 +162,16 @@ async fn review(args: ReviewArgs) -> Result<()> {
                 return Ok(());
             }
             let label = format!("{} changed line(s)", diff.lines().count());
-            // Language rules matched against the changed files (before annotation; the
-            // `+++` lines carry the names either way).
+            // Changed-file set (from the `+++` lines) — drives rule matching AND the
+            // out-of-diff finding filter below.
+            changed_files = atomcode_review::changed_files_from_diff(&diff);
+            // Language rules matched against the changed files.
             if !args.no_rules {
-                let files = atomcode_review::changed_files_from_diff(&diff);
-                let section = atomcode_review::render_rules_section(&files, args.rules_dir.as_deref());
+                let section = atomcode_review::render_rules_section(&changed_files, args.rules_dir.as_deref());
                 if !section.is_empty() {
                     // Observability: confirm on stderr that rules actually got injected
                     // (the composed system prompt is not otherwise visible to callers).
-                    eprintln!("[rules] injected for {} changed file(s) ({} chars)", files.len(), section.len());
+                    eprintln!("[rules] injected for {} changed file(s) ({} chars)", changed_files.len(), section.len());
                     rules_section = Some(section);
                 } else {
                     eprintln!("[rules] no language rules matched the changed files");
@@ -256,6 +260,15 @@ async fn review(args: ReviewArgs) -> Result<()> {
     }
 
     let mut findings = report.findings();
+    // Drop findings anchored to files OUTSIDE the diff's changed set — the reviewer is
+    // scoped to diff-introduced problems, but the model occasionally reads an un-changed
+    // file and reports it (e.g. "this component is never rendered" anchored to a file not
+    // in the diff). Deterministic guard, only when the changed set is known & non-empty
+    // (empty ⇒ we can't trust it, so we don't filter).
+    let dropped = drop_out_of_scope(&mut findings, &changed_files);
+    if dropped > 0 {
+        eprintln!("[scope] dropped {dropped} finding(s) anchored outside the {} changed file(s)", changed_files.len());
+    }
     sort_findings(&mut findings);
 
     if args.json {
@@ -650,6 +663,18 @@ fn render_findings(findings: &[Finding]) -> String {
     out
 }
 
+/// Drop findings anchored to files OUTSIDE the diff's changed set; returns how many were
+/// dropped. Safety valve: an empty `changed_files` (unknown / task mode) disables the
+/// filter entirely — we never treat "we don't know the changed set" as "drop everything".
+fn drop_out_of_scope(findings: &mut Vec<Finding>, changed_files: &[String]) -> usize {
+    if changed_files.is_empty() {
+        return 0;
+    }
+    let before = findings.len();
+    findings.retain(|f| changed_files.iter().any(|c| c == &f.file_path));
+    before - findings.len()
+}
+
 /// Structured `--json` payload: findings plus the agent's final prose and token usage,
 /// so an embedder gets the whole review from stdout (stderr stays human-only trace).
 #[derive(Serialize)]
@@ -683,6 +708,30 @@ mod tests {
             suggestion: String::new(),
             suggested_code: String::new(),
         }
+    }
+
+    fn finding_in(file: &str) -> Finding {
+        let mut f = finding("P1", 0.9, "t");
+        f.file_path = file.into();
+        f
+    }
+
+    #[test]
+    fn scope_drops_findings_outside_changed_set() {
+        let changed = vec!["a.go".to_string(), "pkg/b.go".to_string()];
+        let mut fs = vec![finding_in("a.go"), finding_in("pkg/b.go"), finding_in("untouched.go")];
+        let dropped = drop_out_of_scope(&mut fs, &changed);
+        assert_eq!(dropped, 1, "the out-of-diff finding is dropped");
+        assert!(fs.iter().all(|f| f.file_path != "untouched.go"));
+        assert_eq!(fs.len(), 2);
+    }
+
+    #[test]
+    fn scope_empty_changed_set_disables_filter() {
+        // Unknown changed set (e.g. task mode) must NOT drop everything.
+        let mut fs = vec![finding_in("x.go"), finding_in("y.go")];
+        assert_eq!(drop_out_of_scope(&mut fs, &[]), 0);
+        assert_eq!(fs.len(), 2, "nothing dropped when the changed set is unknown");
     }
 
     #[test]
