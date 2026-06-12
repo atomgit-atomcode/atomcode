@@ -594,9 +594,10 @@ function currentSiteBase() {
 }
 function inviteLandingUrl(code) {
   if (!/^[A-Za-z0-9]{8}$/.test(String(code || ''))) return '';
-  const params = new URLSearchParams({ invite: code });
+  const params = new URLSearchParams();
   if (ENV) params.set('env', ENV);
-  return currentSiteBase() + '?' + params.toString();
+  const qs = params.toString();
+  return currentSiteBase() + '/invite/' + code + (qs ? '?' + qs : '');
 }
 function renderInviteLink() {
   const el = document.getElementById('invite-url-text');
