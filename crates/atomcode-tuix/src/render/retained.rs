@@ -3394,9 +3394,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let deny = t(Msg::ApprovalDeny);
 
                 // Build the Y/A/N chips cells once — reused whether
-                // we place them inline or on a separate line.
+                // we place them inline or on a separate line. The `↵` marker
+                // after the Y chip flags Allow(once) as the DEFAULT: pressing
+                // Enter triggers it (see `handle_approval_key`), so the user
+                // doesn't have to reach for an explicit key/chord. ASCII
+                // terminals (no `unicode_symbols`) fall back to "Enter".
+                let enter_marker = if self.caps.unicode_symbols { " ↵" } else { " Enter" };
+                let enter_style = CellStyle {
+                    fg: Some(Color::Green),
+                    bold: true,
+                    reverse: false,
+                    faint: false,
+                };
                 let mut chips_cells: Vec<Cell> = Vec::new();
                 push_str_cells(&mut chips_cells, " Y ", &chip_y);
+                push_str_cells(&mut chips_cells, enter_marker, &enter_style);
                 push_str_cells(&mut chips_cells, &allow, &plain);
                 push_str_cells(&mut chips_cells, " A ", &chip_a);
                 push_str_cells(&mut chips_cells, &always, &plain);

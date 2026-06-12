@@ -420,7 +420,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 审批提示 ──
         Msg::ApprovalPromptAlt { tool, detail } =>
-            format!("允许 {}（{}）？[Y]是 / [N]否 / [A]总是", tool, detail).into(),
+            format!("允许 {}（{}）？[Y]是=回车 / [N]否 / [A]总是", tool, detail).into(),
         Msg::ApprovalWaitingLabel =>
             "▶ 等待审批：".into(),
         Msg::ApprovalAllow => " 允许  ".into(),

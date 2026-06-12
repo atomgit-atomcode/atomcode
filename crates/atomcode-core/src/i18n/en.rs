@@ -430,7 +430,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── Approval prompt ──
         Msg::ApprovalPromptAlt { tool, detail } =>
-            format!("Allow {}({})? [Y]es / [N]o / [A]lways", tool, detail).into(),
+            format!("Allow {}({})? [Y]es=Enter / [N]o / [A]lways", tool, detail).into(),
         Msg::ApprovalWaitingLabel =>
             "▶ Waiting for approval: ".into(),
         Msg::ApprovalAllow => " Allow  ".into(),
