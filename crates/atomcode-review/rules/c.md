@@ -28,3 +28,6 @@
 
 #### Naming Conventions
 - snake_case naming, meaningful variable names, constants in UPPER_CASE
+
+#### Size-Type Narrowing
+- Buffer sizes and lengths must use `size_t`: receiving `strlen`/`sizeof` results or a buffer-size parameter in `int`/`int32_t`/`uint32_t` silently truncates on large inputs and breaks bounds checks built on it — report the declaration site

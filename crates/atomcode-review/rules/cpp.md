@@ -35,3 +35,6 @@
 - Out-of-bounds (array/container index, iterator invalidation), uninitialized variables, dangling references, returning references to local objects, integer overflow / signed-unsigned mixing
 - C string/parsing: unbounded `sprintf`/`strcat`, off-by-one, returning success after truncation, `strtol` without checking `endptr`/`errno` should all be reported separately
 - If multiple independent defects such as null pointer, overflow, leak, and return-value errors exist in the same function, report them separately; do not keep only the most severe one
+
+#### Size-Type Narrowing
+- Buffer sizes and lengths must use `size_t`: receiving `strlen`/`sizeof` results or a buffer-size parameter in `int`/`int32_t`/`uint32_t` silently truncates on large inputs and breaks bounds checks built on it — report the declaration site

@@ -25,6 +25,8 @@
 - `WaitGroup.Add` called inside goroutine, `sync.Mutex` copied by value
 - Shutdown path: does `Stop/Close` wait for goroutines to exit, does it still access closed resources
 
+- For each shared variable with a reported race: check ALL of its access points, not just the flagged write — an unsynchronized READ (a getter, a stats/Count method) of the same variable is a SEPARATE defect at a different line; report it separately
+
 Do not report the following: local variables, no evidence of multi-goroutine calls, read-only access, already correct synchronization (Mutex/atomic/channel)
 
 #### Resources and Performance

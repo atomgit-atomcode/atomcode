@@ -36,3 +36,6 @@
 
 #### Performance
 - Database queries inside loops (N+1), string `+` concatenation inside loops, building large lists when generators should be used
+
+#### Ineffective Defenses
+- A function whose NAME claims sanitizing/validating/escaping must be verified to actually do it: replacing a string with itself, a no-op regex, escaping the wrong characters, or returning the input unchanged are real vulnerabilities hiding behind a reassuring name — report them as the security issue they mask, not as style
