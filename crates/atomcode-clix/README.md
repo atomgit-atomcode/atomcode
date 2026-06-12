@@ -119,6 +119,23 @@ cat reviewer.md | atomcodex review --system-prompt-file -
 
 ---
 
+## 4.1 追加 system prompt(推荐:保留内置 + 叠加)
+
+大多数定制不需要全量覆盖。`--append-system-prompt[-file]` 在内置 reviewer 提示词
+(或 `--system-prompt` 覆盖后的提示词)**之后追加**一段,**内置工具说明与 `report_finding`
+协议原样保留** —— 适合塞领域规则、忽略清单、仓库风格指南、PR 元信息等。
+
+```bash
+atomcodex review --append-system-prompt "本仓库忽略 vendor/ 下的改动;命名遵循 snake_case。"
+atomcodex review --append-system-prompt-file ./team-rules.md
+cat team-rules.md | atomcodex review --append-system-prompt-file -
+```
+
+> 与 `--system-prompt`(全量覆盖)的区别:覆盖会丢掉内置说明,追加不会。日常定制优先用追加。
+> 二者可叠加:`--system-prompt` 换 persona 后,`--append-system-prompt` 再补充。
+
+---
+
 ## 4.5 自定义 task(chat / explain / summary)
 
 默认 task 写死为"评审下面这段 diff"。`--task` **替换**它,跑任意单轮任务并**跳过 diff 计算**——
@@ -140,6 +157,31 @@ cat task.txt | atomcodex review --repo . --task-file - \
 - review agent 壳不变:`report_finding` 工具仍挂着但 persona 让它"直接答、别报 finding"即可绕开;
   `read_file`/`grep`/codeintel 等只读工具正好给 chat/explain 读上下文用。
 - `--json` 下 findings 通常为空,答案在 `text`;空 findings + 无错误 → 退 `0`。
+
+---
+
+## 4.6 内置语言规则(按改动文件自动匹配)
+
+每次评审会根据**本次改动的文件类型**,自动在 system prompt 后追加一段"针对性审查重点"——
+改了 `.go` 注入 Go 规则、改了 `.sql` 注入 SQL 规则,混合改动各自只作用于对应文件、互不污染。
+无需配置,默认生效。
+
+目前内置覆盖 **40+ 种语言/文件类型**:Go / Rust / TS·JS / Python / Java / Kotlin / C / C++ /
+C# / Swift / Objective-C / Dart / Scala / Ruby / PHP / Groovy / Lua / Perl / R / Elixir /
+Erlang / Haskell / Clojure / Solidity / ArkTS / SQL / Shell,以及 Dockerfile / Terraform /
+HTML / CSS / XML / YAML / JSON / TOML / Protobuf / GraphQL / Makefile / CMake / properties /
+Maven·Gradle / MyBatis mapper 等。
+
+```bash
+# 热调优:用 <dir>/<name>.md 覆盖任意内置规则,无需重新编译(缺的名字回退内置)
+atomcodex review --rules-dir ./my-rules     # 例如放一个 go.md 覆盖内置 Go 规则
+
+# 完全关闭规则注入(需要干净 prompt 的 A/B 实验等)
+atomcodex review --no-rules
+```
+
+> 规则名即文件名:`go.md` / `sql.md` / `csharp.md`……与
+> [`atomcode-review/rules/`](../atomcode-review/rules) 内的内置文件一一对应。
 
 ---
 
@@ -185,6 +227,10 @@ Reviewing 120 changed line(s) with deepseek-chat …
 --model / --api-key / --base-url   provider 覆盖项
 --system-prompt <text>            全量覆盖 persona
 --system-prompt-file <path|->     从文件/stdin 全量覆盖 persona
+--append-system-prompt <text>     在 persona 之后追加一段(保留内置说明;日常定制首选)
+--append-system-prompt-file <path|->  从文件/stdin 追加
+--rules-dir <dir>                 覆盖内置语言规则目录(<dir>/<name>.md;缺的回退内置)
+--no-rules                        关闭内置语言规则注入
 --task <text>                     自定义 task(替换 diff 评审,跳过 diff;chat/explain/summary 用)
 --task-file <path|->              从文件/stdin 读取自定义 task
 --stream-timeout <秒>             单事件存活上限(默认 180)
