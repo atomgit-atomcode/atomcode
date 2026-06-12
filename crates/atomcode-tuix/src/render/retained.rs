@@ -3375,15 +3375,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             UiLine::ApprovalPrompt { tool, detail } => {
                 let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
+                // Truecolor so the chips read as vivid green / blue / red on
+                // EVERY terminal theme. The 16-colour bright variants the rest
+                // of the UI uses (Color::Green/Cyan/Red) render muddy and
+                // near-indistinguishable on some dark palettes — user report:
+                // allow+always both looked grey, deny orange. These chips are
+                // safety-critical (allow vs deny must be unmistakable), so pin
+                // exact RGB. Same approach markdown highlighting already takes;
+                // `caps.colors` still gates all colour output.
+                let approve_green = Color::Rgb { r: 0x30, g: 0xD1, b: 0x58 };
+                let always_blue = Color::Rgb { r: 0x2B, g: 0xB8, b: 0xE0 };
+                let deny_red = Color::Rgb { r: 0xFF, g: 0x45, b: 0x3A };
                 let chip = |c: Color| CellStyle {
                     fg: Some(c),
                     bold: true,
                     reverse: true,
                     faint: false,
                 };
-                let chip_y = chip(Color::Green);
-                let chip_a = chip(Color::Cyan);
-                let chip_n = chip(Color::Red);
+                let chip_y = chip(approve_green);
+                let chip_a = chip(always_blue);
+                let chip_n = chip(deny_red);
 
                 let waiting = t(Msg::ApprovalWaitingLabel);
                 let prefix_w = crate::width::display_width(&waiting);
@@ -3401,7 +3412,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // terminals (no `unicode_symbols`) fall back to "Enter".
                 let enter_marker = if self.caps.unicode_symbols { " ↵" } else { " Enter" };
                 let enter_style = CellStyle {
-                    fg: Some(Color::Green),
+                    fg: Some(approve_green), // match the Allow chip
                     bold: true,
                     reverse: false,
                     faint: false,
@@ -7040,6 +7051,38 @@ mod tests {
         assert_eq!(
             before2, after2,
             "pop_approval_prompt must not drop non-approval rows"
+        );
+    }
+
+    /// The Allow/Always/Deny chips must be unmistakable green/blue/red on EVERY
+    /// theme. The 16-colour bright variants (Color::Green/Cyan/Red) render muddy
+    /// / near-identical on some dark palettes (user report), so the chips pin
+    /// exact truecolor RGB. Inspect the cell model so a regression back to
+    /// 16-colour is caught.
+    #[test]
+    fn approval_chips_use_vivid_truecolor() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        let fgs: Vec<Color> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter_map(|c| c.style.fg)
+            .collect();
+        assert!(
+            fgs.contains(&Color::Rgb { r: 0x30, g: 0xD1, b: 0x58 }),
+            "Allow chip must be truecolor green, got fgs: {fgs:?}",
+        );
+        assert!(
+            fgs.contains(&Color::Rgb { r: 0x2B, g: 0xB8, b: 0xE0 }),
+            "Always chip must be truecolor blue, got fgs: {fgs:?}",
+        );
+        assert!(
+            fgs.contains(&Color::Rgb { r: 0xFF, g: 0x45, b: 0x3A }),
+            "Deny chip must be truecolor red, got fgs: {fgs:?}",
         );
     }
 
