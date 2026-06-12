@@ -696,6 +696,7 @@ impl TurnExecutor for KernelTurnExecutor {
         };
 
         let mut cancelled = false;
+        let mut bridge_dead = false;
         let final_messages = loop {
             let ev = tokio::select! {
                 _ = cancel.cancelled(), if !cancelled => {
@@ -705,7 +706,12 @@ impl TurnExecutor for KernelTurnExecutor {
                 }
                 ev = state.events.recv() => ev,
             };
-            let Some(ev) = ev else { break None };
+            let Some(ev) = ev else {
+                // Bridge task exited (channel closed). Drop it after the loop so the
+                // next turn respawns instead of no-op'ing on a dead bridge forever.
+                bridge_dead = true;
+                break None;
+            };
             match ev {
                 AgentEvent::TextDelta(t) => emit(TurnEvent::TextDelta(t)),
                 AgentEvent::ReasoningDelta(t) => emit(TurnEvent::ReasoningDelta(t)),
@@ -750,16 +756,21 @@ impl TurnExecutor for KernelTurnExecutor {
                         call,
                         messages,
                     });
-                    let decision = if self.auto_approve {
-                        PermissionDecision::Allow
-                    } else {
-                        tokio::select! {
-                            _ = cancel.cancelled(), if !cancelled => {
-                                cancelled = true;
-                                PermissionDecision::Deny
-                            }
-                            d = async { perm_rx.as_mut().unwrap().recv().await } => {
-                                d.unwrap_or(PermissionDecision::Deny)
+                    let decision = match &mut perm_rx {
+                        // auto-approve (no interactive channel): allow.
+                        None => PermissionDecision::Allow,
+                        Some(rx) => {
+                            tokio::select! {
+                                _ = cancel.cancelled(), if !cancelled => {
+                                    cancelled = true;
+                                    // Deny this tool AND stop the turn — without the
+                                    // Cancel the outer cancel branch is now disabled
+                                    // (`if !cancelled`) so the turn would otherwise run
+                                    // on after a single denied tool.
+                                    let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                                    PermissionDecision::Deny
+                                }
+                                d = rx.recv() => d.unwrap_or(PermissionDecision::Deny),
                             }
                         }
                     };
@@ -771,9 +782,14 @@ impl TurnExecutor for KernelTurnExecutor {
                     };
                     let _ = client.cmd_tx.send(cmd);
                 }
-                AgentEvent::Error { error, messages } => {
+                AgentEvent::Error { error, .. } => {
+                    // NON-terminal. The bridge forwards the kernel error HERE and then
+                    // still emits a terminal TurnComplete/TurnCancelled (or closes the
+                    // channel). Breaking now would (a) write back the bridge's empty
+                    // `messages` and WIPE the conversation + on-disk session, and (b)
+                    // leave the bridge's later terminal events to be mis-read by the
+                    // NEXT turn. Surface the error and keep draining to the real end.
                     emit(TurnEvent::Error(error));
-                    break Some(messages);
                 }
                 AgentEvent::TurnCancelled { messages } => break Some(messages),
                 AgentEvent::TurnComplete { messages, .. } => break Some(messages),
@@ -785,6 +801,8 @@ impl TurnExecutor for KernelTurnExecutor {
         *approver.lock().await = None;
 
         // Writeback: the engine's snapshot becomes the conversation of record.
+        // (Empty/None never reaches here for a real turn — Error is non-terminal and
+        // channel-close breaks with None — so this never clobbers `conv`.)
         if let Some(msgs) = final_messages {
             let mut c = conv.lock().await;
             c.messages = msgs;
@@ -803,6 +821,12 @@ impl TurnExecutor for KernelTurnExecutor {
             if let Err(e) = SessionManager::new(&self.working_dir).save(&session) {
                 eprintln!("Warning: failed to save live session (v2): {e}");
             }
+        }
+
+        // A dead bridge can't serve another turn — drop it so the next run_turn
+        // rebuilds a fresh one (see the `guard.is_none()` lazy-init above).
+        if bridge_dead {
+            *guard = None;
         }
     }
 }

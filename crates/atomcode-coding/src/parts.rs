@@ -210,6 +210,7 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
             "openai",
             &cfg.base_url,
             &cfg.model,
+            session.as_ref().map(|b| b.id.as_str()),
         )));
     }
 
@@ -286,6 +287,7 @@ pub fn assemble(
             "openai",
             &cfg.base_url,
             &cfg.model,
+            parts.session.as_ref().map(|b| b.id.as_str()),
         )));
     }
     let mut builder = builder

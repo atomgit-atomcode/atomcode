@@ -130,20 +130,32 @@ struct Attribution {
     provider: Option<String>,
     provider_host: Option<String>,
     model: String,
+    /// The agent's session id, so every event groups under THIS session instead of
+    /// falling back to the process launch id. `None` for a Disabled-session agent or
+    /// an id that isn't a uuid.
+    session_id: Option<uuid::Uuid>,
 }
 
 impl Attribution {
     /// `vendor` is the provider family (e.g. `"openai"`); `base_url` lets the
-    /// telemetry envelope resolve a stable provider host.
+    /// telemetry envelope resolve a stable provider host. `session_id` is the agent's
+    /// session id string (parsed to a uuid for correlation).
     fn new(
         telemetry: Arc<Telemetry>,
         vendor: impl Into<String>,
         base_url: &str,
         model: impl Into<String>,
+        session_id: Option<&str>,
     ) -> Self {
         let vendor = vendor.into();
         let provider_host = atomcode_telemetry::resolve_provider_host(&vendor, Some(base_url));
-        Self { telemetry, provider: Some(vendor), provider_host, model: model.into() }
+        Self {
+            telemetry,
+            provider: Some(vendor),
+            provider_host,
+            model: model.into(),
+            session_id: session_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
+        }
     }
 
     fn scope_ctx(&self) -> CurrentContext {
@@ -151,6 +163,7 @@ impl Attribution {
             provider: self.provider.clone(),
             provider_host: self.provider_host.clone(),
             model: Some(self.model.clone()),
+            session_id: self.session_id,
             ..Default::default()
         }
     }
@@ -196,9 +209,10 @@ impl TelemetryHook {
         vendor: impl Into<String>,
         base_url: &str,
         model: impl Into<String>,
+        session_id: Option<&str>,
     ) -> Self {
         Self {
-            attr: Attribution::new(telemetry, vendor, base_url, model),
+            attr: Attribution::new(telemetry, vendor, base_url, model, session_id),
             last_messages_count: AtomicU32::new(0),
             last_system_tokens: AtomicU32::new(0),
             last_message_tokens: AtomicU32::new(0),
@@ -357,9 +371,10 @@ impl ToolTelemetryMiddleware {
         vendor: impl Into<String>,
         base_url: &str,
         model: impl Into<String>,
+        session_id: Option<&str>,
     ) -> Self {
         Self {
-            attr: Attribution::new(telemetry, vendor, base_url, model),
+            attr: Attribution::new(telemetry, vendor, base_url, model, session_id),
             inflight: StdMutex::new(HashMap::new()),
         }
     }
@@ -391,15 +406,14 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
             return;
         };
         let success = !result.is_error;
-        // The kernel sets a deterministic `content` for non-executing paths: a
-        // middleware block (e.g. approval deny) → "blocked: …"; an unknown tool →
-        // "unknown or unmounted tool…". Classify from that, else a real failure.
+        // A middleware block (e.g. approval deny) yields a deterministic
+        // "blocked: …" content. (Unknown/unmounted tools never reach the middleware
+        // `before` chain — the kernel builds their error result directly — so there's
+        // no NotFound case to classify here.)
         let error_kind = if success {
             None
         } else if result.content.starts_with("blocked:") {
             Some(ToolErrorKind::DeniedByUser)
-        } else if result.content.starts_with("unknown or unmounted tool") {
-            Some(ToolErrorKind::NotFound)
         } else {
             Some(ToolErrorKind::ExecutionFailed)
         };
@@ -423,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn emits_one_llm_chat_per_response_with_attribution() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://api.example.com/v1", "deepseek-v4");
+        let hook = TelemetryHook::new(tel, "openai", "https://api.example.com/v1", "deepseek-v4", None);
 
         hook.on_request(
             &[Message::user("hi"), Message::user("there")],
@@ -472,7 +486,7 @@ mod tests {
     async fn breaks_down_prompt_zones() {
         use atomcode_kernel::message::Role;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m");
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
 
         let mut sys = Message::user("you are a helpful coding agent");
         sys.role = Role::System;
@@ -543,7 +557,7 @@ mod tests {
     async fn anchors_real_assistant_tokens_in_breakdown() {
         use atomcode_kernel::message::Role;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m");
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
 
         let mut sys = Message::user("system persona");
         sys.role = Role::System;
@@ -592,7 +606,7 @@ mod tests {
     #[tokio::test]
     async fn no_meta_emits_nothing() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m");
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
         let mut resp = Message::assistant("hi", vec![]); // meta = None
         hook.on_model_response(&mut resp).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -602,7 +616,7 @@ mod tests {
     #[tokio::test]
     async fn provider_error_turn_emits_had_error_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m");
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
 
         hook.on_error("HTTP 429: rate limited").await;
         hook.turn_complete(&Conversation::default(), &StopReason::ProviderError, &TurnCtx::default())
@@ -623,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn normal_stop_emits_no_extra_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m");
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
         // A tool error fired on_error, but the turn stopped normally → no LlmChat.
         hook.on_error("tool failed").await;
         hook.turn_complete(&Conversation::default(), &StopReason::Stopped, &TurnCtx::default())
@@ -636,7 +650,7 @@ mod tests {
     async fn denied_tool_emits_tool_call_denied() {
         use atomcode_kernel::testkit::EchoTool;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let mw = ToolTelemetryMiddleware::new(tel, "openai", "https://x/v1", "m");
+        let mw = ToolTelemetryMiddleware::new(tel, "openai", "https://x/v1", "m", None);
 
         let tool: Arc<dyn Tool> = Arc::new(EchoTool);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -665,7 +679,7 @@ mod tests {
     async fn tool_middleware_emits_tool_call() {
         use atomcode_kernel::testkit::EchoTool;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let mw = ToolTelemetryMiddleware::new(tel, "openai", "https://x/v1", "m");
+        let mw = ToolTelemetryMiddleware::new(tel, "openai", "https://x/v1", "m", None);
 
         let tool: Arc<dyn Tool> = Arc::new(EchoTool);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();

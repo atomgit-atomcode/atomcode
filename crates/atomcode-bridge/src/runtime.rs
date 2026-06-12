@@ -185,6 +185,14 @@ impl Bridge {
                 ev = bridge.handle.events.recv() => match ev {
                     Some(e) => bridge.on_kernel_event(e).await,
                     None => {
+                        // Kernel task ended. If a turn was awaiting its deferred
+                        // Snapshot to finalize, close its lifecycle (no Snapshot will
+                        // ever come) so the driver isn't stranded in a busy phase.
+                        if let Some(reason) = bridge.pending_finish.take() {
+                            bridge.finish_turn(reason, Vec::new());
+                        } else if bridge.turn_running {
+                            bridge.finish_turn(StopReason::Cancelled, Vec::new());
+                        }
                         let _ = bridge.ev_tx.send(CoreEv::Error {
                             error: "engine v2 agent terminated".into(),
                             messages: vec![],
@@ -415,6 +423,13 @@ impl Bridge {
     }
 
     async fn respawn(&mut self, session: SessionMode) {
+        // If a turn (or an approval) was still live, tearing the kernel down would
+        // drop its in-flight events and strand the driver in a busy/waiting phase.
+        // Close the lifecycle FIRST so the driver returns to Idle.
+        if self.turn_running || self.pending_approval.is_some() {
+            self.pending_approval = None;
+            self.finish_turn(StopReason::Cancelled, Vec::new());
+        }
         let _ = self.handle.commands.send(KCmd::Shutdown);
         let task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
         let _ = task.await;
@@ -452,6 +467,10 @@ impl Bridge {
     }
 
     fn finish_turn(&mut self, reason: StopReason, messages: Vec<atomcode_core::conversation::message::Message>) {
+        // Idempotent terminal: also reached from respawn / channel-close, where a turn
+        // may still be marked running.
+        self.turn_running = false;
+        self.pending_finish = None;
         let duration = self.stats.started.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
         match reason {
             StopReason::Cancelled => {
@@ -465,12 +484,12 @@ impl Bridge {
                     StopReason::Cancelled => TurnStopReason::Cancelled,
                     _ => TurnStopReason::Error,
                 };
-                if matches!(stop_reason, TurnStopReason::Error) {
-                    self.emit(CoreEv::Error {
-                        error: format!("turn ended: {other:?}"),
-                        messages: messages.clone(),
-                    });
-                }
+                // NOTE: a provider/stream error already surfaced as a `CoreEv::Error`
+                // (forwarded from `KEv::Error` with the real message + http_status +
+                // code) BEFORE this terminal. We do NOT re-emit a synthetic
+                // "turn ended: …" error here — that double-reported the failure and
+                // dropped the structured code. `stop_reason` on TurnComplete carries
+                // the terminal classification.
                 self.emit(CoreEv::TurnComplete {
                     duration,
                     total_tokens: self.stats.total_tokens,
@@ -563,6 +582,18 @@ impl Bridge {
                         return;
                     }
                 };
+                // The legacy protocol has exactly one bare Approve/Deny in flight (no
+                // request id). If a SECOND approval arrives while one is pending, the
+                // driver could only ever answer the latest — so fail the displaced one
+                // CLOSED (deny) instead of silently overwriting it and leaving the
+                // kernel's first request() to hang until its timeout.
+                if let Some((old_id, _)) = self.pending_approval.take() {
+                    let _ = self.handle.commands.send(KCmd::Respond {
+                        id: old_id,
+                        value: serde_json::to_value(ApprovalResponse::deny())
+                            .unwrap_or(serde_json::Value::Null),
+                    });
+                }
                 self.pending_approval = Some((id, req.tool.clone()));
                 self.emit(CoreEv::PhaseChange(AgentPhase::WaitingApproval));
                 self.emit(CoreEv::ApprovalNeeded {
