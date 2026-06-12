@@ -45,142 +45,95 @@ fn detect_light_unix(timeout: Duration) -> Option<bool> {
     use std::os::unix::io::AsRawFd;
 
     let mut stdout = std::io::stdout();
-    // OSC 11 query — request background colour. BEL terminator
-    // (`\x07`) is the de-facto default for xterm-family terminals;
-    // emulators that prefer ST (`\x1b\\`) accept BEL too in practice.
-    stdout.write_all(b"\x1b]11;?\x07").ok()?;
+    // OSC 11 query (request background colour) IMMEDIATELY followed by a
+    // Primary Device Attributes query (DA1, `ESC [ c`). The DA1 reply is
+    // our drain anchor:
+    //
+    //   * Terminals answer queries strictly in order, so the OSC 11 reply
+    //     (if the terminal supports it) is ALWAYS already buffered by the
+    //     time the DA1 reply arrives.
+    //   * DA1 is supported by virtually every terminal (xterm, VTE,
+    //     Konsole, kitty, WezTerm, Alacritty, Windows Terminal, tmux/
+    //     screen passthrough, …) and round-trips in ~1 RTT.
+    //
+    // So instead of betting a fixed timeout against the reply latency —
+    // which a high-latency SSH session (or tmux passthrough) reliably
+    // beats, leaving `]11;rgb:ffff/ffff/ffff\` to leak into the input
+    // box once the crossterm reader thread starts — we drain until the
+    // DA1 terminator (`c`) and KNOW the OSC 11 reply is fully consumed.
+    // The wait is exactly one round-trip on a responsive terminal; only
+    // a terminal that answers NEITHER query pays the absolute cap below.
+    stdout.write_all(b"\x1b]11;?\x07\x1b[c").ok()?;
     stdout.flush().ok()?;
 
     let stdin = std::io::stdin();
     let fd = stdin.as_raw_fd();
 
-    // Two-phase budget.
-    //
-    // Phase 1 (main read): caller's contract — up to `timeout` for the
-    // FIRST byte. If nothing arrives in this window the terminal is
-    // non-responsive (macOS Terminal.app, classic conhost, OSC-stripping
-    // SSH relays) and we fall straight through to the dark-mode default
-    // without blocking startup further. If we DO see an OSC opener
-    // (`\x1b]`) within `timeout`, we extend by 250ms so the trailing
-    // bytes of a slow / chunked response can land — without this a
-    // partial OSC 11 reply (e.g. JediTerm, remote relays, Windows
-    // Terminal under load) leaks past the original single-shot read
-    // and the crossterm reader thread later picks those bytes up as
-    // keystrokes. The visible bug was `]11;rgb:0000/0000/0000\` (and
-    // shorter prefixes like `0c/0c0c\`) appearing in the input box.
-    //
-    // Phase 2 (tail-drain): handles the case where the OSC response
-    // started arriving AFTER `timeout` — Phase 1 already broke out
-    // empty-handed, but the bytes are about to land. We spend an extra
-    // 80ms peeking; we only commit to bulk-draining once we've confirmed
-    // a `\x1b]` opener, so a user keystroke that happens to land in
-    // this window loses at most one or two bytes (vs. the bulk read in
-    // Phase 1 which would swallow up to 128). In practice the input
-    // prompt isn't on screen during the 100–180ms window so the user
-    // hasn't started typing yet, but the byte-at-a-time probe keeps
-    // the worst case bounded if they have.
     let start = std::time::Instant::now();
-    let initial_deadline = start + timeout;
-    let extended_deadline = initial_deadline + Duration::from_millis(250);
+    // First-byte budget: generous enough for an SSH round-trip. We only
+    // pay this in full when the terminal answers neither query (rare for
+    // an interactive TTY); a responsive terminal returns the instant the
+    // DA1 terminator lands, regardless of how large this is.
+    let first_byte_deadline = start + timeout.max(Duration::from_millis(400));
+    // Absolute safety cap so a malformed / never-terminating reply (or a
+    // terminal that streams without ever sending `c`) can't hang startup.
+    let hard_deadline = start + Duration::from_millis(800);
 
     let mut buf: Vec<u8> = Vec::with_capacity(64);
-    let mut saw_osc_start = false;
-
-    // Phase 1.
+    let mut got_any = false;
     loop {
-        let deadline = if saw_osc_start { extended_deadline } else { initial_deadline };
+        let deadline = if got_any { hard_deadline } else { first_byte_deadline };
         let mut chunk = [0u8; 128];
-        // SAFETY: chunk is stack-allocated and lives for the call; fd
-        // is owned by stdin for the process lifetime.
+        // SAFETY: chunk is stack-allocated and lives for the call; fd is
+        // owned by stdin for the process lifetime.
         let nread = unsafe { poll_read(fd, deadline, &mut chunk) };
         if nread == 0 {
-            break;
+            break; // timeout / EOF — terminal answered neither query
         }
+        got_any = true;
         buf.extend_from_slice(&chunk[..nread]);
-
-        // Lock in the deadline extension the first time we see the OSC
-        // opener; from here on Phase 1 keeps draining until terminator.
-        if !saw_osc_start {
-            saw_osc_start = buf.windows(2).any(|w| w == b"\x1b]");
-            // First bytes weren't an OSC opener — almost certainly a
-            // stray keystroke that landed in the input queue before
-            // our query. Don't keep slurping their input in bulk-read
-            // mode; if the OSC reply is still coming, Phase 2 will
-            // catch it.
-            if !saw_osc_start {
-                break;
-            }
-        }
-
-        if has_osc_terminator(&buf) {
+        // DA1 terminator seen ⇒ any preceding OSC 11 reply is fully
+        // buffered ⇒ nothing left to leak.
+        if has_da1_terminator(&buf) {
             break;
         }
-    }
-
-    // Phase 2: tail-drain. Only runs when Phase 1 didn't already
-    // consume a complete OSC reply (terminator absent from `buf`).
-    if !has_osc_terminator(&buf) {
-        let tail_deadline = std::time::Instant::now() + Duration::from_millis(80);
-        // If Phase 1 already saw the opener, we're committed to bulk
-        // draining. Otherwise we probe a byte at a time.
-        let mut committed = saw_osc_start;
-        loop {
-            if committed {
-                let mut chunk = [0u8; 128];
-                // SAFETY: same invariants as the Phase 1 read.
-                let nread = unsafe { poll_read(fd, tail_deadline, &mut chunk) };
-                if nread == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..nread]);
-            } else {
-                // Peek the first byte. Anything other than ESC means
-                // it's not an OSC reply — stop immediately so we don't
-                // keep eating user input.
-                let mut probe = [0u8; 1];
-                // SAFETY: see Phase 1.
-                let nread = unsafe { poll_read(fd, tail_deadline, &mut probe) };
-                if nread == 0 {
-                    break;
-                }
-                if probe[0] != b'\x1b' {
-                    buf.push(probe[0]);
-                    break;
-                }
-                buf.push(probe[0]);
-                // ESC seen — disambiguate `\x1b]` (OSC, what we want)
-                // from `\x1b[` / `\x1bO` / bare ESC (which we leave
-                // alone). The terminal may send ESC and pause briefly
-                // before the next byte; poll again with what's left
-                // of the tail budget.
-                let mut probe2 = [0u8; 1];
-                // SAFETY: see Phase 1.
-                let nread2 = unsafe { poll_read(fd, tail_deadline, &mut probe2) };
-                if nread2 == 0 {
-                    break;
-                }
-                buf.push(probe2[0]);
-                if probe2[0] != b']' {
-                    break;
-                }
-                committed = true;
-            }
-
-            if has_osc_terminator(&buf) {
-                break;
-            }
+        if std::time::Instant::now() >= hard_deadline {
+            break;
         }
     }
 
     parse_osc11_response(&buf)
 }
 
-/// True when `buf` contains an OSC terminator (BEL or ESC \). Used by
-/// both phases of [`detect_light_unix`] to know when an in-flight OSC
-/// reply is fully drained.
-#[cfg(unix)]
-fn has_osc_terminator(buf: &[u8]) -> bool {
-    buf.contains(&b'\x07') || buf.windows(2).any(|w| w == b"\x1b\\")
+/// True when `buf` contains a complete Primary Device Attributes (DA1)
+/// reply: `ESC [ … c`, where the parameter bytes between `[` and the
+/// final `c` are only digits, `;`, or `?` (the DA1 reply shape, e.g.
+/// `ESC [ ? 6 2 ; c`). Used as the drain anchor in [`detect_light_unix`]:
+/// because terminals answer queries in order, seeing the DA1 terminator
+/// guarantees any preceding OSC 11 reply is already buffered.
+///
+/// Scanning for a *well-formed* DA1 reply (rather than any byte `c`)
+/// avoids false-positives on a stray keystroke like a cursor key
+/// (`ESC [ A`) that lands in stdin before the replies.
+#[cfg(any(unix, test))]
+fn has_da1_terminator(buf: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'[' {
+            for &b in &buf[i + 2..] {
+                if b == b'c' {
+                    return true;
+                }
+                // DA1 params are digits / ';' / '?'. Anything else means
+                // this CSI isn't a DA1 reply — stop scanning this one.
+                if !(b.is_ascii_digit() || b == b';' || b == b'?') {
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Wait until `deadline` for `fd` to be readable, then read up to
@@ -373,5 +326,33 @@ mod tests {
         // Pure blue: 255 * 0.0722 = 18.4 → dark.
         let pure_blue = b"\x1b]11;rgb:0000/0000/ffff\x07";
         assert_eq!(parse_osc11_response(pure_blue), Some(false));
+    }
+
+    #[test]
+    fn da1_terminator_detected() {
+        // Typical DA1 replies.
+        assert!(has_da1_terminator(b"\x1b[?62;c"));
+        assert!(has_da1_terminator(b"\x1b[?1;2c"));
+        assert!(has_da1_terminator(b"\x1b[?64;1;2;6;9;15;22c"));
+    }
+
+    #[test]
+    fn da1_terminator_after_osc11_reply() {
+        // The real on-the-wire shape: OSC 11 reply (ST-terminated) then
+        // the DA1 reply. The anchor must fire, and the OSC 11 reply must
+        // still parse out of the combined buffer.
+        let combined = b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[?62;c";
+        assert!(has_da1_terminator(combined));
+        assert_eq!(parse_osc11_response(combined), Some(true));
+    }
+
+    #[test]
+    fn da1_terminator_not_falsely_triggered() {
+        // Incomplete / unrelated input must NOT look like a DA1 reply.
+        assert!(!has_da1_terminator(b""));
+        assert!(!has_da1_terminator(b"\x1b[?62;")); // no final `c` yet
+        assert!(!has_da1_terminator(b"\x1b[A")); // cursor-up keystroke
+        assert!(!has_da1_terminator(b"abc")); // bare `c`, no CSI opener
+        assert!(!has_da1_terminator(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\")); // OSC only
     }
 }

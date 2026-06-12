@@ -185,6 +185,34 @@ mod tests {
     }
 
     #[test]
+    fn plugin_manager_empty_hints_advertise_esc() {
+        // Regression: every plugin-manager screen advertises Esc-to-go-back in
+        // its hint, EXCEPT these empty-state hints once did not — so an empty
+        // list (e.g. /plugin → Installed with 0 plugins) looked frozen with no
+        // visible way out. Keep the Esc affordance on the empty states too.
+        fn has_esc(s: &str) -> bool {
+            s.to_lowercase().contains("esc")
+        }
+        for (en, zh) in [
+            (
+                t_with(Locale::En, Msg::PluginMgrEmptyInstalled),
+                t_with(Locale::ZhCn, Msg::PluginMgrEmptyInstalled),
+            ),
+            (
+                t_with(Locale::En, Msg::PluginMgrEmptyMarketplaces),
+                t_with(Locale::ZhCn, Msg::PluginMgrEmptyMarketplaces),
+            ),
+            (
+                t_with(Locale::En, Msg::PluginMgrEmptyPlugins),
+                t_with(Locale::ZhCn, Msg::PluginMgrEmptyPlugins),
+            ),
+        ] {
+            assert!(has_esc(&en), "EN empty hint missing esc: {en}");
+            assert!(has_esc(&zh), "ZH empty hint missing esc: {zh}");
+        }
+    }
+
+    #[test]
     fn cli_flag_wins_over_everything() {
         let env = |_: &str| Some("zh_CN.UTF-8".to_string());
         assert_eq!(

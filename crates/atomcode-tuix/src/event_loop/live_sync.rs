@@ -26,10 +26,13 @@ pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
                 cached_tokens,
             }),
         // TurnEvent::Error is a tuple variant Error(String)
-        TurnEvent::Error(e) => AgentEvent::Error { error: e, messages: Vec::new() },
+        TurnEvent::Error(e) => AgentEvent::Error {
+            error: e,
+            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+        },
         TurnEvent::Warning(w) => AgentEvent::Warning(w),
-        TurnEvent::ApprovalRequested { tool_name, reason, call, messages } =>
-            AgentEvent::ApprovalNeeded { tool_name, reason, call, messages },
+        TurnEvent::ApprovalRequested { tool_name, reason, call, snapshot } =>
+            AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot },
         // 不需要的：忽略
         TurnEvent::ToolCallStreaming { .. }
         | TurnEvent::ToolBatchStarted { .. }
@@ -77,6 +80,17 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::ProviderChanged(provider)) => {
                     if fan_tx
                         .send(RuntimeEvent { runtime_id, event: AgentEvent::ProviderChanged(provider) })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                // webui /cd → follow it: TUI changes cwd + opens a fresh session.
+                // Mapped to ProjectSwitched (not WorkingDirChanged) so the agent's
+                // own in-turn `cd` never triggers a session reset.
+                Ok(LiveEvent::WorkingDirChanged(dir)) => {
+                    if fan_tx
+                        .send(RuntimeEvent { runtime_id, event: AgentEvent::ProjectSwitched(dir) })
                         .is_err()
                     {
                         break;

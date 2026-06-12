@@ -27,6 +27,18 @@ export function UserMessage({ message, className = '' }: UserMessageProps) {
             ))}
           </div>
         )}
+        {message.images && message.images.length > 0 && (
+          <div className="user-message-images">
+            {message.images.map((img, index) => (
+              <img
+                key={`${img.media_type}-${index}`}
+                className="user-message-image"
+                src={`data:${img.media_type};base64,${img.data}`}
+                alt=""
+              />
+            ))}
+          </div>
+        )}
         <div className={`user-message-text${shouldCollapse && !expanded ? ' is-collapsed' : ''}`}>
           {message.text}
         </div>

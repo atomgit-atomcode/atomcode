@@ -110,28 +110,32 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # 3️⃣ 安装交叉编译工具链
+      # 3️⃣ 安装 musl 交叉编译工具链
       - name: Install cross-compilation tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y musl-tools
+          # 下载 aarch64 musl 交叉编译器
+          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar xz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
 
-      # 4️⃣ 添加 Linux 双架构 target
+      # 4️⃣ 添加 Linux 双架构 musl target
       - name: Add Linux targets
         run: |
-          rustup target add x86_64-unknown-linux-gnu
-          rustup target add aarch64-unknown-linux-gnu
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
 
-      # 5️⃣ 编译 x86_64
+      # 5️⃣ 编译 x86_64（静态链接 musl）
       - name: Build x86_64
-        run: cargo build --release --target x86_64-unknown-linux-gnu
-
-      # 6️⃣ 编译 ARM64
-      - name: Build ARM64
-        run: cargo build --release --target aarch64-unknown-linux-gnu
+        run: cargo build --release --target x86_64-unknown-linux-musl
         env:
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+
+      # 6️⃣ 编译 ARM64（静态链接 musl）
+      - name: Build ARM64
+        run: cargo build --release --target aarch64-unknown-linux-musl
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
 
       # 7️⃣ 生成带版本号的二进制
       - name: Prepare binaries
@@ -140,8 +144,8 @@ jobs:
 
           mkdir -p dist
 
-          cp target/x86_64-unknown-linux-gnu/release/atomcode dist/atomcode-${TAG_NAME}-linux-x64
-          cp target/aarch64-unknown-linux-gnu/release/atomcode dist/atomcode-${TAG_NAME}-linux-arm64
+          cp target/x86_64-unknown-linux-musl/release/atomcode dist/atomcode-${TAG_NAME}-linux-x64
+          cp target/aarch64-unknown-linux-musl/release/atomcode dist/atomcode-${TAG_NAME}-linux-arm64
 
           chmod +x dist/*
 
@@ -150,7 +154,7 @@ jobs:
         run: |
           TAG_NAME=${GITHUB_REF#refs/tags/}
           strip dist/atomcode-${TAG_NAME}-linux-x64 || true
-          aarch64-linux-gnu-strip dist/atomcode-${TAG_NAME}-linux-arm64 || true
+          aarch64-linux-musl-strip dist/atomcode-${TAG_NAME}-linux-arm64 || true
 
       # 9️⃣ 安装 Python
       - name: Setup Python

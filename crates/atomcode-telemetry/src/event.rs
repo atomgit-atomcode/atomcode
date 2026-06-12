@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 // ---------- SessionMode ----------
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
     Headless,
@@ -21,6 +21,7 @@ pub enum SessionMode {
     #[serde(rename = "webui")]
     Webui,
     AtomcodeAir,
+    Channel,
 }
 
 // ---------- Envelope (common to every event) ----------
@@ -805,6 +806,11 @@ mod tests {
     #[test]
     fn session_mode_webui_serializes_as_webui() {
         assert_eq!(serde_json::to_string(&SessionMode::Webui).unwrap(), "\"webui\"");
+    }
+
+    #[test]
+    fn session_mode_channel_serializes_snake_case() {
+        assert_eq!(serde_json::to_string(&SessionMode::Channel).unwrap(), "\"channel\"");
     }
 }
 

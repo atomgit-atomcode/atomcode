@@ -203,6 +203,18 @@ pub enum UiLine {
     TurnSeparator {
         label: String,
     },
+    /// Overlay modal: a floating window drawn on top of body+footer.
+    /// RetainedRenderer paints this after the normal frame; PlainRenderer ignores it.
+    ModalOverlay {
+        title: String,
+        lines: Vec<String>,
+        scroll: usize,
+        total: usize,
+        win_width: u16,
+        win_height: u16,
+    },
+    /// Clear the overlay modal and restore the underlying frame.
+    ModalOverlayClear,
 }
 
 pub trait Renderer: Send {
@@ -311,6 +323,34 @@ pub enum MenuKind {
     /// `$`-trigger skills picker. Rows show the bare skill name + description,
     /// no `/`, `/skills`, or `$` prefix; selection marked with `▸`.
     Skill,
+    /// Two-column list: name left-aligned, desc right-aligned,
+    /// selected row uses reverse-video (no prefix, no arrow).
+    /// Used by session picker.
+    /// `row_prefix` is prepended before the name (e.g. `/`).
+    /// `selected_marker` is shown before the prefix for the selected row;
+    /// unselected rows get `display_width(marker)` spaces.
+    TwoColumn {
+        row_prefix: &'static str,
+        selected_marker: &'static str,
+    },
+}
+
+impl MenuKind {
+    /// Max visible rows for this menu kind. Both `paint_footer` and
+    /// `current_footer_rows` use this so the estimate matches actual
+    /// rendering.
+    pub fn max_visible_rows(&self, screen_height: usize, item_count: usize) -> usize {
+        match self {
+            MenuKind::SlashCommand | MenuKind::AtMention | MenuKind::Skill => item_count.min(4),
+            // Window cap is `max(h/2, 4)`, but never reserve more rows than
+            // there are items — `paint_footer` only paints `item_count`
+            // rows when there are fewer than the cap, so `.max(4)` MUST
+            // apply to the cap, not the final value, or `current_footer_rows`
+            // over-estimates the footer height for short lists (< 4 items)
+            // and desyncs from the actual paint.
+            MenuKind::TwoColumn { .. } => item_count.min((screen_height / 2).max(4)),
+        }
+    }
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.
@@ -378,6 +418,9 @@ pub struct StatusLine {
     /// auto-named / default sessions leave this `None` to keep the
     /// chrome quiet on fresh conversations.
     pub session_name: Option<String>,
+    /// Current reasoning_effort for the active provider's model.
+    /// None = not set (API uses its own default). Cycled via Ctrl+T.
+    pub reasoning_effort: Option<String>,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.
@@ -405,5 +448,57 @@ pub fn fmt_dur(d: Duration) -> String {
         format!("{}ms", ms)
     } else {
         format!("{:.1}s", d.as_secs_f64())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_column() -> MenuKind {
+        MenuKind::TwoColumn {
+            row_prefix: "",
+            selected_marker: "▸",
+        }
+    }
+
+    // `current_footer_rows` reserves `max_visible_rows` rows while
+    // `paint_footer` only paints `min(item_count, cap)` rows. For the two
+    // to agree, `max_visible_rows` must never exceed `item_count`.
+    #[test]
+    fn two_column_never_reserves_more_than_item_count() {
+        let k = two_column();
+        // Short lists: must equal item_count, NOT the 4-row floor.
+        assert_eq!(k.max_visible_rows(40, 0), 0);
+        assert_eq!(k.max_visible_rows(40, 1), 1);
+        assert_eq!(k.max_visible_rows(40, 2), 2);
+        assert_eq!(k.max_visible_rows(40, 3), 3);
+    }
+
+    #[test]
+    fn two_column_caps_at_half_screen_for_long_lists() {
+        let k = two_column();
+        // 50 items, height 40 → window cap = max(20, 4) = 20.
+        assert_eq!(k.max_visible_rows(40, 50), 20);
+        // At the cap boundary.
+        assert_eq!(k.max_visible_rows(40, 20), 20);
+        assert_eq!(k.max_visible_rows(40, 19), 19);
+    }
+
+    #[test]
+    fn two_column_floor_keeps_at_least_four_on_tiny_screens() {
+        let k = two_column();
+        // Tiny screen (h/2 = 3) with plenty of items → floor lifts cap to 4.
+        assert_eq!(k.max_visible_rows(6, 50), 4);
+        // ...but still never more than the item count.
+        assert_eq!(k.max_visible_rows(6, 2), 2);
+    }
+
+    #[test]
+    fn fixed_kinds_cap_at_four() {
+        for k in [MenuKind::SlashCommand, MenuKind::AtMention, MenuKind::Skill] {
+            assert_eq!(k.max_visible_rows(40, 2), 2);
+            assert_eq!(k.max_visible_rows(40, 10), 4);
+        }
     }
 }

@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.24.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -84,7 +84,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 |----------|:---:|---|
 | Claude（Anthropic） | 支持 | Claude Sonnet 4.5/4.6、Opus 4.6 |
 | OpenAI | 支持 | GPT-4o、GPT-4.1 |
-| DeepSeek | 支持 | DeepSeek V3、DeepSeek R1 |
+| DeepSeek | 支持 | DeepSeek V3、DeepSeek R1、DeepSeek V4 |
 | 智谱（GLM） | 支持 | GLM-4、GLM-5 |
 | 通义千问（阿里） | 支持 | Qwen-Plus、Qwen-Max |
 | SiliconFlow | 支持 | 多种开源模型 |
@@ -325,6 +325,7 @@ atomcode --prompt-file task.md
 | `/login` | 通过 AtomGit OAuth 登录 |
 | `/cd` | 切换工作目录 |
 | `/paste` | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
+| `/view &lt;filepath&gt;` | 在浮层窗口中查看文件内容 |
 | `/undo` | 撤销上一轮的文件编辑 |
 | `/diff` | 显示当前修改的 git diff |
 | `/cost` | 显示本次会话的 token 消耗 |
@@ -334,6 +335,8 @@ atomcode --prompt-file task.md
 | `/config` | 编辑配置文件 |
 | `/status` | 查看登录状态和模型信息 |
 | `/logout` | 退出 AtomGit 登录 |
+| `/think` | 控制深度思考（on/off/budget N） |
+| `/effort` | DeepSeek 推理努力控制（high / max / off） |
 | `/help` | 查看命令与快捷键 |
 | `/quit` | 退出程序（或连按 Ctrl+C） |
 

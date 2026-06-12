@@ -137,6 +137,8 @@ pub struct OpenAiProvider {
     /// `ProviderConfig::reasoning_history` at construction so bad values
     /// fail early at load time with a clear error, not silently mid-turn.
     reasoning_history_override: Option<ReasoningPolicy>,
+    /// DeepSeek V4 reasoning effort control (high / max / off).
+    reasoning_effort: Option<String>,
     /// Whether the active model accepts image inputs. Drives `MultiPart`
     /// serialisation: vision-capable → OpenAI image_url schema, text-only
     /// → flat string. Computed once from `ProviderConfig::accepts_images()`
@@ -173,6 +175,22 @@ impl OpenAiProvider {
                 ),
             },
         };
+        // Validate at load time (like `reasoning_history`) so a typo fails
+        // fast with a clear error instead of silently 400-ing mid-turn.
+        // Normalised to lowercase so config casing ("High") doesn't matter.
+        let reasoning_effort = match config.reasoning_effort.as_deref() {
+            None => None,
+            Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "high" => Some("high".to_string()),
+                "max" => Some("max".to_string()),
+                other => anyhow::bail!(
+                    "Invalid `reasoning_effort` value {:?} for provider type '{}' — \
+                     expected \"high\" or \"max\" (unset = use API default)",
+                    other,
+                    config.provider_type,
+                ),
+            },
+        };
         Ok(Self {
             client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify),
             api_key: std::sync::Arc::new(tokio::sync::RwLock::new(api_key)),
@@ -189,6 +207,7 @@ impl OpenAiProvider {
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
+            reasoning_effort,
             supports_vision: config.accepts_images(),
             session_id: std::sync::Arc::new(std::sync::RwLock::new(String::new())),
         })
@@ -227,6 +246,15 @@ impl OpenAiProvider {
             return ReasoningPolicy::Include;
         }
         ReasoningPolicy::Exclude
+    }
+
+    /// Check whether the model supports DeepSeek's `reasoning_effort` field.
+    /// Only DeepSeek V4 (and V4-derived, e.g. `deepseek-v4-pro`) models accept
+    /// it. Single source of truth for the gate — the TUI's
+    /// `reasoning_effort_applicable_on_provider` delegates here so the
+    /// "applicable" hint and the actual send stay in lock-step.
+    pub fn reason_effort_applicable(model: &str) -> bool {
+        model.to_ascii_lowercase().contains("deepseek-v4")
     }
 
     /// Build Kimi's `thinking` request-body object from the two flat
@@ -548,6 +576,13 @@ impl LlmProvider for OpenAiProvider {
             Self::thinking_body_value(self.thinking_type.as_deref(), self.thinking_keep.as_deref())
         {
             body["thinking"] = th;
+        }
+
+        // DeepSeek V4 reasoning_effort: only emitted when applicable
+        if let Some(ref effort) = self.reasoning_effort {
+            if Self::reason_effort_applicable(&self.model) {
+                body["reasoning_effort"] = json!(effort);
+            }
         }
 
         let policy = crate::provider::retry::RetryPolicy::default_policy();
@@ -1777,6 +1812,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("exclude".into()),
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -1816,6 +1852,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("always".into()),
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -1830,6 +1867,59 @@ mod tests {
         assert!(
             msg.contains("reasoning_history") && msg.contains("always"),
             "error must name the bad field and value, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reason_effort_applicable_only_for_deepseek_v4() {
+        use super::OpenAiProvider;
+        // V4 family (case-insensitive) → applicable.
+        assert!(OpenAiProvider::reason_effort_applicable("deepseek-v4"));
+        assert!(OpenAiProvider::reason_effort_applicable("deepseek-v4-pro"));
+        assert!(OpenAiProvider::reason_effort_applicable("DeepSeek-V4-Flash"));
+        // Everything else → no effect (must match the `ReasoningEffortNoEffect`
+        // hint, which advertises DeepSeek V4 only — NOT reasoner/chat).
+        assert!(!OpenAiProvider::reason_effort_applicable("deepseek-chat"));
+        assert!(!OpenAiProvider::reason_effort_applicable("deepseek-reasoner"));
+        assert!(!OpenAiProvider::reason_effort_applicable("gpt-4o"));
+    }
+
+    #[test]
+    fn reasoning_effort_config_validates_and_normalises() {
+        use super::OpenAiProvider;
+        use crate::config::provider::ProviderConfig;
+        let mut cfg = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-test".into()),
+            model: "deepseek-v4-pro".into(),
+            base_url: Some("https://api.deepseek.com".into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: Some("ultra".into()),
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        };
+        // Bad value rejected at load with a naming error (no silent mid-turn 400).
+        let msg = match OpenAiProvider::new(&cfg) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("bad reasoning_effort value must reject"),
+        };
+        assert!(
+            msg.contains("reasoning_effort") && msg.contains("ultra"),
+            "error must name field+value, got: {msg}"
+        );
+        // Valid value, any casing, loads (and normalises to lowercase).
+        cfg.reasoning_effort = Some("HIGH".into());
+        assert!(
+            OpenAiProvider::new(&cfg).is_ok(),
+            "HIGH should normalise and load"
         );
     }
 
@@ -1875,6 +1965,34 @@ mod tests {
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["reasoning_content"], "thinking text");
+    }
+
+    #[test]
+    fn format_messages_no_tool_call_turn_echoes_real_reasoning_not_placeholder() {
+        // The fix for the DeepSeek V4 Flash "(no reasoning recorded)" bug: a
+        // final-answer (no tool_calls) turn that captured real reasoning is
+        // stored as AssistantWithToolCalls with an empty tool_calls list, so
+        // format_messages echoes the REAL reasoning back (satisfying the
+        // thinking-mode contract) instead of the placeholder that flash mimics.
+        use super::{OpenAiProvider, ReasoningPolicy};
+        use crate::conversation::message::{Message, MessageContent, Role};
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: Some("当前系统时间是 …".into()),
+                tool_calls: Vec::new(), // no tool calls — final answer
+                reasoning_content: Some("用户问时间，直接回答".into()),
+                thinking_blocks: Vec::new(),
+            },
+            synthetic: false,
+        }];
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
+        assert_eq!(out.len(), 1, "must not be dropped");
+        assert!(out[0].get("tool_calls").is_none(), "empty tool_calls omitted");
+        assert_eq!(
+            out[0]["reasoning_content"], "用户问时间，直接回答",
+            "must echo the REAL reasoning, not the placeholder",
+        );
     }
 
     #[test]
@@ -2229,6 +2347,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,

@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Permissions &amp; Approvals · AtomCode Docs</title>
+<meta name="description" content="AtomCode's approval model: the four approval levels, which actions hit which level, the choices on a prompt, two-tier consent for MCP tools, sensitive paths and web fetching, and how to make it ask less — safely.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="approvals">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.25.1</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Permissions &amp; Approvals</h1>
+      <p class="lede">AtomCode runs tools on your behalf — editing files, running shell commands, fetching the web, calling MCP servers. Its safety model fits in one sentence: <strong>every tool call is sorted into one of four “approval levels,”</strong> and the level decides whether it runs straight away, pauses to ask you, and whether choosing “Always allow” can remember it. This page starts with that <strong>model</strong>, then unfolds it: which actions hit which level, the choices you get on a prompt, and how to make it ask less — without giving away the safety net.</p>
+
+      <h2 id="model">The core: four approval levels</h2>
+      <p>This is the spine of the whole page. Before any tool runs, it lands in one of these four levels:</p>
+      <table>
+        <thead>
+          <tr><th>Level</th><th>What it means</th><th>Can “Always allow” remember it?</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Auto-approve</strong></td><td>Runs straight away, no interruption. Safe in-project actions live here.</td><td>— (never asks)</td></tr>
+          <tr><td><strong>Ask</strong></td><td>Prompts; choosing “Always allow this session” stops asking for that tool for the rest of the session.</td><td>✅ yes</td></tr>
+          <tr><td><strong>Always ask</strong></td><td>Prompts <em>every</em> time, even after you pressed “Always” — reserved for destructive / high-risk actions.</td><td>❌ no</td></tr>
+          <tr><td><strong>Scoped ask</strong></td><td>Prompts; “Always allow” remembers only <strong>this one resource</strong> (e.g. a single file). A different one still asks.</td><td>same resource only</td></tr>
+        </tbody>
+      </table>
+      <p>Keep these four in mind — everything below is just "which level does this action land in, and why."</p>
+
+      <h2 id="triggers">Which actions hit which level</h2>
+      <p>Rule of thumb: working inside the current project directory flows freely (<strong>Auto-approve</strong>); reaching outside it, touching secrets, or running something destructive escalates to a level that needs your confirmation.</p>
+      <table>
+        <thead>
+          <tr><th>Action</th><th>Triggered when…</th><th>Level</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Shell (<code>bash</code>) destructive command</td><td><code>rm -rf</code>, <code>dd</code>, <code>git push --force</code>, <code>chmod</code>, <code>mkfs</code>…</td><td><strong>Always ask</strong></td></tr>
+          <tr><td>Shell reads/writes outside the project</td><td>The command touches a path outside the project dir</td><td>read = <strong>Ask</strong> / write = <strong>Always ask</strong></td></tr>
+          <tr><td>Edit / create / replace file</td><td>The target is a sensitive file or outside the project</td><td><strong>Always ask</strong> (sensitive / outside)</td></tr>
+          <tr><td>Read file / list symbols / diagnostics</td><td>Reading a sensitive file outside the project (e.g. <code>~/.ssh/id_rsa</code>)</td><td>sensitive = <strong>Scoped ask</strong> / plain outside = <strong>Ask</strong></td></tr>
+          <tr><td><code>web_fetch</code></td><td>URL points at a private / loopback address (public sites auto-approve)</td><td><strong>Ask</strong></td></tr>
+          <tr><td>MCP tool call</td><td>Every call — unless the tool or its server is trusted</td><td><strong>Ask</strong></td></tr>
+        </tbody>
+      </table>
+      <p><strong>Always auto-approved:</strong> reading, searching, globbing and editing <em>inside</em> the project, plus <code>cd</code>, <code>list_dir</code>, <code>grep</code>, <code>web_search</code>, and the todo list.</p>
+
+      <h2 id="choices">Your choices on a prompt</h2>
+      <p>When a tool lands in Ask / Always-ask / Scoped-ask, you get these options:</p>
+      <ul>
+        <li><strong>Deny</strong> — reject this call; the agent continues without it.</li>
+        <li><strong>Approve</strong> — allow just this one call.</li>
+        <li><strong>Always allow this session</strong> — remember for the rest of the session (in memory only; gone when you quit). Has no effect on the <em>Always ask</em> level; on <em>Scoped ask</em> it remembers only the current resource.</li>
+        <li><strong>Always allow this tool</strong> — <em>MCP tools only.</em> Permanently auto-approve this one tool by writing it to <code>mcp.json</code> (see <a href="#mcp">two-tier consent</a>).</li>
+      </ul>
+      <p>In the terminal: <code>y</code> / <kbd>Enter</kbd> approve, <code>a</code> always-this-session, <code>n</code> / <kbd>Esc</kbd> deny, <kbd>Ctrl+C</kbd> cancel the whole turn. In the web UI these are buttons on the approval card.</p>
+
+      <h2 id="mcp">Two-tier consent for MCP tools</h2>
+      <p>MCP tools call <strong>external code</strong>, so they default to the <em>Ask</em> level. If you trust a tool or a server you can lift it to <em>Auto-approve</em> — across three levels, from least to most durable, and only the first two are reachable from a button:</p>
+      <ol>
+        <li><strong>Always allow this session</strong> (the <code>[A]</code> key / button) — in memory, this session, <em>this tool only</em>.</li>
+        <li><strong>Always allow this tool</strong> (button, MCP only) — persistent, <em>this tool only</em>. Appends the bare tool name to that server's <code>autoApprove</code> list in <code>mcp.json</code>:
+<pre><code>{
+  "mcpServers": {
+    "my-docs": { "command": "my-docs-server", "autoApprove": ["query", "search"] }
+  }
+}</code></pre></li>
+        <li><strong>Trust the whole server</strong> — <em>hand-edit only.</em> No runtime button ever sets this:
+<pre><code>{
+  "mcpServers": {
+    "my-docs": { "command": "my-docs-server", "trust": true }
+  }
+}</code></pre></li>
+      </ol>
+      <div class="callout callout-warn">
+        <strong>Why a single click can't trust a whole server</strong>
+        <p>MCP tools run with <strong>their own permissions</strong> and bypass AtomCode's own path/command guards — a server can write files, hit the network, or spend money. The approval prompt is your gate. <code>trust: true</code> auto-approves <em>every</em> tool on that server, including write/destructive ones you've never seen, so it's deliberately something only <strong>you</strong> can set by editing the file — a stray click (or a prompt-injection trick) can never escalate one approval into permanent, whole-server trust. Reserve <code>trust: true</code> for servers you fully control (ideally local and read-only).</p>
+      </div>
+
+      <h2 id="sensitive">Sensitive paths</h2>
+      <p>“Sensitive” is what pushes an outside-the-project path into <em>Always ask</em> (writes) or <em>Scoped ask</em> (reads). These count as sensitive:</p>
+      <ul>
+        <li><strong>System directories</strong> — <code>/etc</code>, <code>/usr</code>, <code>/System</code>, <code>/Windows</code>, <code>/Program Files</code>…</li>
+        <li><strong>Secret directories</strong> — <code>~/.ssh</code>, <code>~/.aws</code>, <code>~/.gnupg</code></li>
+        <li><strong>Secret files</strong> — <code>.env</code>, <code>credentials</code>, <code>id_rsa</code>, <code>*.pem</code>, <code>*.key</code>, <code>*.p12</code>…</li>
+      </ul>
+      <p>Ordinary application config (<code>~/.config/&lt;app&gt;/…</code>) is <strong>not</strong> treated as a secret. Two details that echo the levels above: <strong>reading</strong> a sensitive file is <em>Scoped ask</em> — “Always allow” remembers only that one file (so re-reading it in chunks stops re-prompting), while a different file still asks; <strong>writing</strong> outside the project and destructive commands are <em>Always ask</em> — they prompt every time and can't be silenced with “Always.”</p>
+
+      <h2 id="web">Web fetching</h2>
+      <p><code>web_fetch</code> auto-approves <strong>public</strong> sites; it only drops to the <em>Ask</em> level for <strong>loopback / private-network / link-local</strong> literals (<code>127.0.0.1</code>, <code>192.168.x</code>, <code>localhost</code>, <code>*.local</code>). Either way, fetching always enforces <strong>SSRF protection at execution time</strong>: it re-resolves the host and refuses loopback, private and cloud-metadata addresses and any non-<code>http(s)</code> scheme — so relaxing the prompt never weakens the actual safety check.</p>
+
+      <h2 id="modes">Two special modes</h2>
+      <p><strong>Plan mode:</strong> the agent is restricted to <strong>read-only</strong> tools — it can't edit, write, or run shell — so no change-approval prompts appear at all. This is a tool restriction, not a blanket permission grant.</p>
+      <div class="callout callout-warn">
+        <strong>--dangerously-skip-permissions (dangerous)</strong>
+        <p>Launching with this flag <strong>short-circuits all four levels to auto-approve</strong> — including <code>rm -rf</code>, <code>git push --force</code>, and writes outside the project — with no prompts at all. Only use it in throwaway or sandboxed environments you don't mind losing.</p>
+      </div>
+
+      <h2 id="config">Config reference</h2>
+      <p>MCP trust lives in <code>mcp.json</code> — project-level <code>.mcp.json</code> or user-level <code>~/.atomcode/mcp.json</code> — per server:</p>
+      <table>
+        <thead>
+          <tr><th>Field</th><th>Effect</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>trust: true</code></td><td>Lift <strong>all</strong> of the server's tools to <em>Auto-approve</em>. Hand-set only.</td></tr>
+          <tr><td><code>autoApprove: ["toolA", …]</code></td><td>Lift <strong>specific</strong> tools to <em>Auto-approve</em>. The “Always allow this tool” button appends here.</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Next</h2>
+      <ul>
+        <li><a href="./tools.html">Built-in Tools</a> — what each tool does and what it can touch</li>
+        <li><a href="./mcp.html">MCP Integration</a> — adding servers, and where <code>trust</code> / <code>autoApprove</code> live</li>
+        <li><a href="./configuration.html">Configuration</a> — config files and precedence</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

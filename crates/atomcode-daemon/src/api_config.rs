@@ -40,7 +40,8 @@ fn empty_config() -> Config {
         vision_preprocessor_provider: None,
         language: None,
         ui: Default::default(),
-            plugin: Default::default(),
+        plugin: Default::default(),
+        web_search: Default::default(),
     }
 }
 
@@ -79,6 +80,7 @@ pub(crate) fn provider_info(
         thinking_type: p.thinking_type.clone(),
         thinking_keep: p.thinking_keep.clone(),
         reasoning_history: p.reasoning_history.clone(),
+        reasoning_effort: p.reasoning_effort.clone(),
         skip_tls_verify: p.skip_tls_verify,
         ephemeral: p.ephemeral,
     }

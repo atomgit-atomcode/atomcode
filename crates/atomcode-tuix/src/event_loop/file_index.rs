@@ -5,9 +5,30 @@
 // See spec: docs/superpowers/specs/2026-05-06-at-mention-design.md
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
+
+/// How long a completed full-tree index stays "fresh" before the next
+/// `filter()` call kicks a background re-walk. This is what lets files
+/// created mid-session (`touch new.rs`, then `@new`) show up without a
+/// `/cd` or restart. The stale index keeps serving until the re-walk
+/// lands, so the popup never blocks or flickers. Kept short enough to
+/// feel live, long enough that rapid typing doesn't thrash the walker
+/// (at most one re-walk per interval — `built_at` only advances when a
+/// walk completes).
+const STALE_TTL: Duration = Duration::from_secs(3);
+
+/// Hard cap on how many entries a single index walk collects. The `@`-mention
+/// popup only ever shows 30 rows and substring-searches the cache, so any real
+/// project is served fine well below this. Its purpose is a CPU/memory
+/// backstop: the gitignore-aware walk is otherwise unbounded, so launching
+/// atomcode in a giant tree (an accidental `~` / `/`, or a repo with a huge
+/// non-ignored generated dir) used to peg a core at 100% for minutes walking
+/// millions of files (macOS `~/Library` alone). Stopping at this many entries
+/// keeps the worst case sub-second.
+const MAX_INDEX_ENTRIES: usize = 50_000;
 
 // ---------------------------------------------------------------------------
 // Token detection
@@ -100,10 +121,21 @@ pub fn split_token(token: &str) -> (String, String) {
 // ---------------------------------------------------------------------------
 
 /// Lazy project file/directory index, gitignore-filtered, cached for the
-/// session. Built on first `filter()` call.
+/// session. Built on first `filter()` call in a background thread so the
+/// event loop is never blocked by a synchronous file-system walk.
 pub struct FileIndex {
-    root: PathBuf,
+    root: std::cell::RefCell<PathBuf>,
     entries: RefCell<Option<Vec<Entry>>>,
+    /// When `Some`, a background build is in progress. The receiver
+    /// returns the completed entries once the walk finishes.
+    pending: RefCell<Option<std::sync::mpsc::Receiver<Vec<Entry>>>>,
+    /// True once the initial background build has been kicked off, so we
+    /// don't spawn a second thread while the first is still running.
+    building: RefCell<bool>,
+    /// When the currently-cached *full* index finished walking. `None`
+    /// until the first full walk completes (the shallow warm-up doesn't
+    /// count). Drives the TTL-based background refresh in `maybe_refresh`.
+    built_at: RefCell<Option<Instant>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,22 +150,74 @@ pub struct Entry {
 impl FileIndex {
     pub fn new(root: PathBuf) -> Self {
         Self {
-            root,
+            root: std::cell::RefCell::new(root),
             entries: RefCell::new(None),
+            pending: RefCell::new(None),
+            building: RefCell::new(false),
+            built_at: RefCell::new(None),
         }
+    }
+
+    /// Kick off a background build if none is running and no cached
+    /// entries exist. Returns `true` when a background thread was
+    /// spawned (first-ever call), `false` otherwise.
+    ///
+    /// **Staged warm-up**: before spawning the full-tree walk, the
+    /// root's direct children are collected synchronously via a shallow
+    /// (depth-1) gitignore-aware scan and stored immediately. This lets `filter()` return
+    /// results on the very first `@` keystroke (showing top-level
+    /// files/dirs) without waiting for the full walk to finish.
+    /// The background thread replaces the cache with the complete
+    /// index when it completes.
+    pub fn build_async(&self) -> bool {
+        if self.entries.borrow().is_some() {
+            return false; // already cached (shallow or full)
+        }
+        if *self.building.borrow() {
+            return false; // already building
+        }
+        *self.building.borrow_mut() = true;
+
+        // Stage 1: quick synchronous depth-1 scan of root's direct children.
+        // Bounded to one directory level (gitignore-aware) — effectively instant.
+        *self.entries.borrow_mut() = Some(Self::scan_shallow(&self.root.borrow()));
+
+        // Stage 2: spawn background thread for the full walk.
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.pending.borrow_mut() = Some(rx);
+        let root = self.root.borrow().clone();
+        std::thread::spawn(move || {
+            let walked = Self::walk_inner(root);
+            let _ = tx.send(walked);
+        });
+        true
     }
 
     /// Returns matching entries under `scope_dir` filtered by substring
     /// `filter` (case-insensitive). Sorted by direct-child priority,
     /// dir-first, alphabetical. Capped at 30.
+    ///
+    /// If the index has not been built yet, attempts a non-blocking
+    /// drain of the background walk. Returns whatever is available —
+    /// empty `Vec` when the thread is still working is fine; the
+    /// caller will re-invoke `filter` on the next keystroke and get
+    /// the fresh results then.
     pub fn filter(&self, scope_dir: &str, filter: &str) -> Vec<Entry> {
-        // Lazy build on first call.
-        if self.entries.borrow().is_none() {
-            let walked = self.walk();
-            *self.entries.borrow_mut() = Some(walked);
-        }
+        // Kick off background build on first call if not already building/cached.
+        self.build_async();
+        // Pick up a completed walk (initial or TTL refresh) if one landed.
+        self.drain_pending();
+        // If the cache has aged past STALE_TTL, kick a background re-walk so
+        // mid-session file creations become discoverable. Serves stale
+        // entries until the fresh walk lands (drained on a later keystroke).
+        self.maybe_refresh();
+
+        // entries is guaranteed to be Some (shallow at minimum), but be defensive.
         let entries = self.entries.borrow();
-        let entries = entries.as_ref().expect("just initialised above");
+        let entries = match entries.as_ref() {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
 
         let filter_lower = filter.to_lowercase();
         let scope_depth = if scope_dir.is_empty() {
@@ -175,28 +259,121 @@ impl FileIndex {
         matched
     }
 
-    fn walk(&self) -> Vec<Entry> {
+    /// Non-blocking drain of the background walk receiver. When a walk has
+    /// completed, swap its result into the cache, stamp `built_at`, and clear
+    /// the in-flight markers. Shared by the initial build and TTL refreshes.
+    fn drain_pending(&self) {
+        if self.pending.borrow().is_none() {
+            return;
+        }
+        let mut pending = self.pending.borrow_mut();
+        let Some(rx) = pending.as_mut() else { return };
+        match rx.try_recv() {
+            Ok(walked) => {
+                *self.entries.borrow_mut() = Some(walked);
+                *self.built_at.borrow_mut() = Some(Instant::now());
+                *self.building.borrow_mut() = false;
+                *pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Background walk still in progress — keep serving the cache.
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Thread panicked or dropped — fall back to a synchronous walk.
+                let walked = Self::walk_inner(self.root.borrow().clone());
+                *self.entries.borrow_mut() = Some(walked);
+                *self.built_at.borrow_mut() = Some(Instant::now());
+                *self.building.borrow_mut() = false;
+                *pending = None;
+            }
+        }
+    }
+
+    /// Spawn a background re-walk when the cached full index has aged past
+    /// `STALE_TTL` and nothing is already building. The stale cache keeps
+    /// serving until `drain_pending` swaps in the fresh result, so the popup
+    /// never blocks. `built_at == None` means the initial full walk hasn't
+    /// finished yet — `build_async` owns that, so there's nothing to refresh.
+    fn maybe_refresh(&self) {
+        if *self.building.borrow() {
+            return; // a build/refresh is already in flight
+        }
+        let stale = matches!(*self.built_at.borrow(), Some(t) if t.elapsed() >= STALE_TTL);
+        if !stale {
+            return;
+        }
+        *self.building.borrow_mut() = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.pending.borrow_mut() = Some(rx);
+        let root = self.root.borrow().clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::walk_inner(root));
+        });
+    }
+
+    fn walk_inner(root: PathBuf) -> Vec<Entry> {
+        // A full recursive index of an entire home directory or filesystem
+        // root is never a useful `@`-mention scope, and traverses millions of
+        // files (macOS `~/Library`, caches, every node_modules outside a repo)
+        // — pegging a core at 100% CPU for minutes. Serve only the top level
+        // there; `MAX_INDEX_ENTRIES` still backstops any other huge tree.
+        if Self::is_home_or_filesystem_root(&root) {
+            return Self::walk_with_depth(root, Some(1), MAX_INDEX_ENTRIES);
+        }
+        Self::walk_with_depth(root, None, MAX_INDEX_ENTRIES)
+    }
+
+    /// True when `root` is a filesystem root (`/`, `C:\`, …) or the user's
+    /// home directory — the two cases where a full recursive walk is both
+    /// pathologically expensive and useless for `@`-mentions.
+    fn is_home_or_filesystem_root(root: &Path) -> bool {
+        // Filesystem roots have no parent component.
+        if root.parent().is_none() {
+            return true;
+        }
+        if let Some(home) = crate::platform::home_dir() {
+            // Prefer canonical comparison (resolves symlinks / trailing
+            // slashes); fall back to a literal match if either path can't be
+            // canonicalised.
+            return match (std::fs::canonicalize(root), std::fs::canonicalize(&home)) {
+                (Ok(rc), Ok(hc)) => rc == hc,
+                _ => root == home,
+            };
+        }
+        false
+    }
+
+    /// Gitignore-respecting walk shared by the full index (`max_depth = None`)
+    /// and the staged warm-up (`max_depth = Some(1)` → the root's direct
+    /// children only). Routing both through one function guarantees the
+    /// shallow and full views apply identical filtering (gitignore, `.git/`,
+    /// whitespace), so warm-up results never include entries the full index
+    /// later hides.
+    fn walk_with_depth(root: PathBuf, max_depth: Option<usize>, max_entries: usize) -> Vec<Entry> {
         let mut out = Vec::new();
-        let walker = WalkBuilder::new(&self.root)
-            .hidden(false) // keep dotfiles
+        let mut builder = WalkBuilder::new(&root);
+        builder
+            .hidden(false)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
             .ignore(true)
             .parents(true)
-            .require_git(false) // apply .gitignore even without `.git/`
-            .max_filesize(None)
-            .build();
+            .require_git(false)
+            .max_filesize(None);
+        // None = unbounded (full subtree); Some(1) = root + its direct children.
+        builder.max_depth(max_depth);
+        let walker = builder.build();
 
         for result in walker {
             let Ok(dent) = result else { continue };
-            let Ok(rel) = dent.path().strip_prefix(&self.root) else {
+            let Ok(rel) = dent.path().strip_prefix(&root) else {
                 continue;
             };
             if rel.as_os_str().is_empty() {
                 continue; // skip the root itself
             }
-            let is_dir = dent.file_type().map_or(false, |t| t.is_dir());
+            let is_dir = dent.file_type().is_some_and(|t| t.is_dir());
             let mut s = rel_path_to_forward_slash(rel);
 
             // v1 limitation: skip paths containing whitespace (would break
@@ -222,17 +399,62 @@ impl FileIndex {
                 is_dir,
                 depth,
             });
+
+            // CPU/memory backstop: stop the (otherwise unbounded) walk once
+            // we've collected enough. Dropping the `walker` iterator here stops
+            // further filesystem traversal, so a giant tree can't peg a core.
+            if out.len() >= max_entries {
+                break;
+            }
         }
         out
+    }
+
+    /// Shallow warm-up scan of the root's direct children, used to show
+    /// immediate results on the first `@` before the full-tree walk finishes.
+    ///
+    /// Delegates to `walk_with_depth(.., Some(1))` so it applies the **exact
+    /// same** filtering as the full index — crucially gitignore — rather than
+    /// a raw `read_dir`. This prevents gitignored top-level dirs
+    /// (`node_modules/`, `target/`, …) from flashing in the popup and then
+    /// vanishing once the full walk replaces the cache. Still bounded to one
+    /// directory level, so it stays effectively instant.
+    fn scan_shallow(root: &Path) -> Vec<Entry> {
+        Self::walk_with_depth(root.to_path_buf(), Some(1), MAX_INDEX_ENTRIES)
+    }
+
+    /// Re-point the index to a new root directory and clear all cached
+    /// entries / in-flight background work. The next `filter()` call will
+    /// lazily trigger a fresh shallow scan + background rebuild for the
+    /// new root. Called by `apply_cd` when the user switches directories.
+    pub fn reset(&self, new_root: PathBuf) {
+        // Cancel any in-flight background build by taking the receiver
+        // and dropping it — the spawned thread's send will fail silently.
+        let _ = self.pending.borrow_mut().take();
+        *self.root.borrow_mut() = new_root;
+        *self.entries.borrow_mut() = None;
+        *self.building.borrow_mut() = false;
+        *self.built_at.borrow_mut() = None;
     }
 
     /// Test-only: construct an index with hand-built entries, bypassing walk.
     #[cfg(test)]
     pub fn from_entries(root: PathBuf, entries: Vec<Entry>) -> Self {
         Self {
-            root,
+            root: std::cell::RefCell::new(root),
             entries: RefCell::new(Some(entries)),
+            pending: RefCell::new(None),
+            building: RefCell::new(false),
+            built_at: RefCell::new(None),
         }
+    }
+
+    /// Test-only: backdate the cache so the next `filter()` treats it as stale
+    /// and triggers a TTL refresh — without sleeping for the real TTL.
+    #[cfg(test)]
+    fn mark_stale(&self) {
+        *self.built_at.borrow_mut() =
+            Instant::now().checked_sub(STALE_TTL + Duration::from_secs(1));
     }
 }
 
@@ -449,6 +671,24 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
     }
 
+    /// Busy-wait helper for tests: keeps calling `filter()` until the
+    /// background walk completes and returns the full-tree entries.
+    /// Times out after 5 seconds so a stuck test fails fast.
+    fn filter_walk(idx: &FileIndex, scope_dir: &str, filter: &str) -> Vec<Entry> {
+        for _ in 0..500 {
+            let result = idx.filter(scope_dir, filter);
+            // Background thread is done when `pending` is consumed (set to None).
+            if idx.pending.borrow().is_none() {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!(
+            "filter_walk timed out after 5s (scope_dir={:?}, filter={:?})",
+            scope_dir, filter
+        );
+    }
+
     #[test]
     fn walk_includes_top_level_files_and_dirs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -456,7 +696,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("crates")).unwrap();
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
-        let result = idx.filter("", "");
+        let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
 
         assert!(names.contains(&"Cargo.toml"), "got: {:?}", names);
@@ -469,7 +709,7 @@ mod tests {
         write_file(&tmp.path().join(".env"), "KEY=val");
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
-        let result = idx.filter("", "");
+        let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         assert!(names.contains(&".env"), "got: {:?}", names);
     }
@@ -482,12 +722,37 @@ mod tests {
         write_file(&tmp.path().join("kept.txt"), "y");
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
-        let result = idx.filter("", "");
+        let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         assert!(names.contains(&"kept.txt"));
         assert!(
             !names.contains(&"ignored.txt"),
             "gitignored file should be skipped: {:?}",
+            names
+        );
+    }
+
+    // Regression: the staged warm-up's shallow scan must apply the SAME
+    // gitignore filtering as the full walk. Otherwise a gitignored top-level
+    // dir would flash in the popup during warm-up and then vanish once the
+    // full walk replaces the cache.
+    #[test]
+    fn scan_shallow_respects_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join(".gitignore"), "ignored/\n");
+        write_file(&tmp.path().join("ignored/").join("secret.txt"), "x");
+        write_file(&tmp.path().join("visible.txt"), "v");
+
+        let shallow = FileIndex::scan_shallow(tmp.path());
+        let names: Vec<&str> = shallow.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(
+            names.contains(&"visible.txt"),
+            "shallow scan should list non-ignored direct children: {:?}",
+            names
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("ignored")),
+            "shallow scan must honour .gitignore (no `ignored/`): {:?}",
             names
         );
     }
@@ -500,7 +765,7 @@ mod tests {
         write_file(&tmp.path().join("Cargo.toml"), "[package]");
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
-        let result = idx.filter("", "");
+        let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         assert!(names.contains(&"Cargo.toml"));
         assert!(
@@ -517,13 +782,243 @@ mod tests {
         write_file(&tmp.path().join("with space.txt"), "y");
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
-        let result = idx.filter("", "");
+        let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         assert!(names.contains(&"normal.txt"));
         assert!(
             !names.iter().any(|n| n.contains(' ')),
             "paths with spaces should be skipped: {:?}",
             names
+        );
+    }
+
+    #[test]
+    fn build_async_only_spawns_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("a.txt"), "x");
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+
+        // First call spawns the thread.
+        assert!(idx.build_async());
+        // Second call should be a no-op.
+        assert!(!idx.build_async());
+        // Third call still no-op.
+        assert!(!idx.build_async());
+
+        // Walking is still in progress (or may have finished on a fast FS).
+        // Either way, entries are available after the background thread
+        // completes.
+        let result = filter_walk(&idx, "", "");
+        assert!(!result.is_empty());
+    }
+
+    // Regression: a file created mid-session must become discoverable via the
+    // TTL refresh, without a `/cd` or restart (the v1 "built once per session"
+    // limitation). The cache serves stale until the staleness window elapses,
+    // then a background re-walk picks up the new file.
+    #[test]
+    fn stale_cache_refresh_picks_up_new_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("first.txt"), "x");
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+
+        // Initial full walk sees first.txt only.
+        let r1 = filter_walk(&idx, "", "");
+        let n1: Vec<&str> = r1.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(n1.contains(&"first.txt"), "got: {:?}", n1);
+        assert!(!n1.contains(&"second.txt"), "got: {:?}", n1);
+
+        // Create a file after the index was built.
+        write_file(&tmp.path().join("second.txt"), "y");
+
+        // While the cache is still fresh, the new file stays hidden.
+        let r2 = idx.filter("", "");
+        assert!(
+            !r2.iter().any(|e| e.rel_path == "second.txt"),
+            "fresh cache should not yet show the new file: {:?}",
+            r2.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>()
+        );
+
+        // Once stale, the next filter() kicks a background re-walk that
+        // surfaces the new file.
+        idx.mark_stale();
+        let r3 = filter_walk(&idx, "", "");
+        let n3: Vec<&str> = r3.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(n3.contains(&"second.txt"), "TTL refresh should surface new file: {:?}", n3);
+        assert!(n3.contains(&"first.txt"), "got: {:?}", n3);
+    }
+
+    #[test]
+    fn filter_returns_results_immediately_via_shallow_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("hello.txt"), "x");
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+
+        // First call triggers staged warm-up: shallow scan (read_dir)
+        // returns direct children instantly, background thread fills in
+        // the full tree for substring search.
+        let first = idx.filter("", "");
+        assert!(
+            !first.is_empty(),
+            "shallow scan should return immediate results on first call"
+        );
+        assert_eq!(first[0].rel_path, "hello.txt");
+
+        // Second call after full walk completes should still have results.
+        let second = filter_walk(&idx, "", "");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].rel_path, "hello.txt");
+    }
+
+    // ---- FileIndex.reset ----
+
+    #[test]
+    fn reset_returns_files_from_new_root() {
+        let dir_a = tempfile::tempdir().unwrap();
+        write_file(&dir_a.path().join("alpha.txt"), "a");
+        let dir_b = tempfile::tempdir().unwrap();
+        write_file(&dir_b.path().join("beta.txt"), "b");
+
+        let idx = FileIndex::new(dir_a.path().to_path_buf());
+        // Wait for full walk of dir_a.
+        let result_a = filter_walk(&idx, "", "");
+        let names_a: Vec<&str> = result_a.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names_a.contains(&"alpha.txt"), "got: {:?}", names_a);
+
+        // Reset to dir_b — next filter should see dir_b's files.
+        idx.reset(dir_b.path().to_path_buf());
+        let result_b = filter_walk(&idx, "", "");
+        let names_b: Vec<&str> = result_b.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(
+            names_b.contains(&"beta.txt"),
+            "after reset should see dir_b files, got: {:?}",
+            names_b
+        );
+        assert!(
+            !names_b.contains(&"alpha.txt"),
+            "after reset should NOT see dir_a files, got: {:?}",
+            names_b
+        );
+    }
+
+    #[test]
+    fn reset_then_filter_triggers_fresh_background_build() {
+        let dir_a = tempfile::tempdir().unwrap();
+        write_file(&dir_a.path().join("only_a.txt"), "a");
+        let dir_b = tempfile::tempdir().unwrap();
+        write_file(&dir_b.path().join("only_b.txt"), "b");
+        write_file(&dir_b.path().join("sub/").join("nested.txt"), "nested");
+
+        let idx = FileIndex::new(dir_a.path().to_path_buf());
+        // Let the background build for dir_a complete.
+        let _ = filter_walk(&idx, "", "");
+
+        // Reset to dir_b and immediately check — shallow scan gives us
+        // direct children without waiting for the full walk.
+        idx.reset(dir_b.path().to_path_buf());
+        let shallow = idx.filter("", "");
+        let shallow_names: Vec<&str> = shallow.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(
+            shallow_names.contains(&"only_b.txt"),
+            "shallow after reset should see dir_b direct children, got: {:?}",
+            shallow_names
+        );
+
+        // Wait for background walk to finish and confirm deeper files appear.
+        let full = filter_walk(&idx, "", "");
+        let full_names: Vec<&str> = full.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(
+            full_names.contains(&"sub/"),
+            "full walk after reset should find sub/, got: {:?}",
+            full_names
+        );
+        assert!(
+            full_names.contains(&"only_b.txt"),
+            "full walk after reset should still have only_b.txt, got: {:?}",
+            full_names
+        );
+    }
+
+    #[test]
+    fn reset_cancels_in_flight_build() {
+        let dir_a = tempfile::tempdir().unwrap();
+        write_file(&dir_a.path().join("a.txt"), "a");
+        let dir_b = tempfile::tempdir().unwrap();
+        write_file(&dir_b.path().join("b.txt"), "b");
+
+        let idx = FileIndex::new(dir_a.path().to_path_buf());
+
+        // Start the background build but do NOT wait for it to complete.
+        assert!(idx.build_async(), "first build_async should spawn");
+        // building is true, pending is Some.
+
+        // Mid-flight reset to dir_b.
+        idx.reset(dir_b.path().to_path_buf());
+        // After reset: building=false, pending=None, entries=None.
+        // filter() will trigger a fresh build for dir_b.
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(
+            names.contains(&"b.txt"),
+            "after reset mid-flight should see dir_b files, got: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"a.txt"),
+            "after reset mid-flight should NOT see dir_a files, got: {:?}",
+            names
+        );
+    }
+
+    // Regression: the gitignore-aware walk is otherwise unbounded, so a giant
+    // tree (an accidental run in `~` / `/`, a repo with a huge generated dir)
+    // pegged a core at 100% CPU walking millions of files. The walk must stop
+    // once it has collected `max_entries`.
+    #[test]
+    fn walk_with_depth_caps_entry_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            write_file(&tmp.path().join(format!("f{i}.txt")), "x");
+        }
+        let capped = FileIndex::walk_with_depth(tmp.path().to_path_buf(), None, 3);
+        assert!(
+            capped.len() <= 3,
+            "walk must stop at the cap, got {} entries",
+            capped.len()
+        );
+    }
+
+    // The home directory and filesystem roots must be detected so `walk_inner`
+    // serves only the shallow view instead of a full (pathological) recursive
+    // walk. A normal project dir must NOT be flagged.
+    #[test]
+    fn detects_filesystem_root_but_not_a_project_dir() {
+        assert!(
+            FileIndex::is_home_or_filesystem_root(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            "filesystem root must be flagged"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            !FileIndex::is_home_or_filesystem_root(tmp.path()),
+            "a normal project dir must not be flagged"
+        );
+    }
+
+    #[test]
+    fn reset_works_on_fresh_unbuilt_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("fresh.txt"), "fresh");
+
+        // Create index pointing to a non-existent dir, then reset.
+        let idx = FileIndex::new(PathBuf::from("/nonexistent/path"));
+        idx.reset(dir.path().to_path_buf());
+
+        // filter() should lazily build for the new root.
+        let result = filter_walk(&idx, "", "");
+        assert!(
+            result.iter().any(|e| e.rel_path == "fresh.txt"),
+            "after reset on fresh index should see files: {:?}",
+            result
         );
     }
 }

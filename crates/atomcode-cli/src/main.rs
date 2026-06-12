@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod telemetry_cmd;
@@ -500,7 +500,11 @@ struct Cli {
     /// --dangerously-skip-permissions. The TUI shows a red ⚠ BYPASS
     /// badge while active. Use in CI/CD, eval harnesses, or when you
     /// trust the agent's built-in safety constraints.
-    #[arg(short = 'y', long = "dangerously-skip-permissions", default_value_t = false)]
+    #[arg(
+        short = 'y',
+        long = "dangerously-skip-permissions",
+        default_value_t = false
+    )]
     pub dangerously_skip_permissions: bool,
 }
 
@@ -544,6 +548,10 @@ enum Commands {
         /// Client identifier for telemetry (e.g. "vscode", "atomcode-air")
         #[arg(long)]
         client: Option<String>,
+        /// Idle-shutdown timeout in seconds; 0 disables. Env
+        /// ATOMCODE_DAEMON_IDLE_TIMEOUT overrides. Default 1800 (30 min).
+        #[arg(long)]
+        idle_timeout: Option<u64>,
     },
     /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
     Webui {
@@ -729,17 +737,66 @@ const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
 /// parent can be Ctrl+C'd without cancelling the download.
 const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Run the entire program on a thread with a large, explicit stack.
+    // Rust gives the *main* OS thread the platform-default stack — on
+    // Windows that's only ~1 MB (vs 8 MB on Linux/macOS). The TUI event
+    // loop, the synchronous codingplan/OAuth work, and the rustls TLS
+    // handshakes all run on it via `block_on`, and a deep call chain there
+    // can overflow 1 MB. A stack overflow on Windows kills the process via
+    // an OS exception (STATUS_STACK_OVERFLOW) WITHOUT a Rust panic — so it
+    // never reaches the crash-log hook and looks like a silent exit. A
+    // 16 MB stack removes that platform asymmetry. (See the Windows
+    // post-scan onboarding crash investigation.)
+    let child = std::thread::Builder::new()
+        .name("atomcode-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("failed to spawn atomcode main thread");
+    // Under `panic = "abort"` a panic in the child already aborts the whole
+    // process, so `join` only returns an error on an abnormal thread exit;
+    // mirror Rust's conventional panic exit code in that case.
+    if child.join().is_err() {
+        std::process::exit(101);
+    }
+}
+
+fn real_main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        // Worker threads (for `tokio::spawn`ed tasks) get a generous stack
+        // too — same rationale as the main thread above.
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("failed to build tokio runtime");
+    rt.block_on(async_main());
+}
+
+async fn async_main() {
     // Set Windows console to UTF-8 so CJK and other multi-byte characters
     // render correctly instead of showing garbled output (mojibake).
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::Globalization::CP_UTF8;
-        use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+        use windows_sys::Win32::System::Console::{
+            GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
+        };
         unsafe {
             SetConsoleOutputCP(CP_UTF8);
             SetConsoleCP(CP_UTF8);
+
+            // Also check output code page, same best-effort as input.
+            let actual_cp = GetConsoleCP();
+            let actual_out_cp = GetConsoleOutputCP();
+            if actual_cp != CP_UTF8 || actual_out_cp != CP_UTF8 {
+                let _ = eprintln!(
+                    "\n⚠  Console code pages — input: {} (expected 65001/UTF-8), output: {}.\n\
+                       Chinese/Japanese/Korean IME input/output may show garbled text.\n\
+                       → Use Windows Terminal for native UTF-8 support.\n\
+                       → Or enable Beta: Use Unicode UTF-8 in Region settings.\n",
+                    actual_cp, actual_out_cp,
+                );
+            }
         }
     }
 
@@ -847,6 +904,8 @@ async fn main() {
 async fn run() -> Result<i32> {
     let cli = Cli::parse();
 
+    let is_admin = atomcode_core::process_utils::is_running_as_admin();
+
     // ── Telemetry init ────────────────────────────────────────────────────────
     // Load config early (before subcommand dispatch) so we can read the
     // [telemetry] section. Failure to load config is non-fatal; telemetry
@@ -900,6 +959,7 @@ async fn run() -> Result<i32> {
     // `fixissue` is an interactive-feeling structured workflow (the user
     // is watching progress, not piping output). Force verbose so they see
     // tool calls / edits instead of long silences while the agent works.
+
     let mut force_verbose = false;
     if let Some(cmd) = cli.command {
         match cmd {
@@ -962,46 +1022,68 @@ async fn run() -> Result<i32> {
                     }
                     Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
                         eprintln!("{}", reason);
+                        // Flush telemetry before exiting, otherwise events are lost.
+                        telemetry
+                            .shutdown(std::time::Duration::from_millis(500))
+                            .await;
                         return Ok(0);
                     }
                     Err(e) => {
                         eprintln!("fixissue failed: {:#}", e);
+                        telemetry
+                            .shutdown(std::time::Duration::from_millis(500))
+                            .await;
                         return Ok(1);
                     }
                 }
             }
-            Commands::Daemon { port, client } => {
+            Commands::Daemon {
+                port,
+                client,
+                idle_timeout,
+            } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 eprintln!("Starting AtomCode daemon on port {}...", port);
                 eprintln!("Press Ctrl+C to stop.");
-                // Re-exec into the atomcode-daemon binary with matching port.
-                // This keeps the daemon as a separate compilation unit while
-                // providing a user-friendly `atomcode daemon` subcommand.
-                let daemon_bin = std::env::current_exe().ok().and_then(|p| {
-                    let dir = p.parent()?;
-                    let daemon = dir.join("atomcode-daemon");
-                    if daemon.exists() {
-                        Some(daemon)
-                    } else {
-                        None
-                    }
-                });
-                match daemon_bin {
-                    Some(bin) => {
-                        let mut cmd = std::process::Command::new(bin);
-                        cmd.arg("--port").arg(port.to_string());
-                        if let Some(ref c) = client {
-                            cmd.arg("--client").arg(c);
-                        }
-                        let status = cmd.status().context("Failed to start atomcode-daemon")?;
-                        return Ok(if status.success() { 0 } else { 1 });
-                    }
-                    None => {
-                        eprintln!("Error: atomcode-daemon binary not found next to atomcode.");
-                        eprintln!("Make sure both binaries are installed together.");
-                        return Ok(1);
-                    }
+                // Run the bundled server IN-PROCESS (same `run_server` the webui uses),
+                // instead of re-exec'ing into a separate `atomcode-daemon` binary that
+                // may not be installed. `webui_tokens: None` ⇒ enforce_token=false
+                // (headless), so loopback channel clients get interactive approval.
+                let idle = idle_timeout
+                    .or_else(|| {
+                        std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                    })
+                    .unwrap_or(30 * 60);
+                let startup_mode = match client.as_deref() {
+                    Some("vscode") => atomcode_telemetry::SessionMode::Vscode,
+                    Some("webui") => atomcode_telemetry::SessionMode::Webui,
+                    Some("atomcode-air") => atomcode_telemetry::SessionMode::AtomcodeAir,
+                    _ => atomcode_telemetry::SessionMode::Ide,
+                };
+                let res = atomcode_daemon::run_server(atomcode_daemon::ServerOpts {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    cli_override: CliOverride {
+                        disabled: cli.no_telemetry,
+                    },
+                    idle_timeout_secs: idle,
+                    startup_mode,
+                    webui_tokens: None,
+                    quiet: false,
+                    working_dir_override: None,
+                    prebound_listener: None,
+                })
+                .await;
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                if let Err(e) = res {
+                    eprintln!("Fatal: daemon server error: {e:#}");
+                    return Ok(1);
                 }
+                return Ok(0);
             }
             Commands::Webui { port, host } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -1009,6 +1091,10 @@ async fn run() -> Result<i32> {
                 eprintln!("{msg}");
                 // server 是后台 task；保持进程存活直到用户 Ctrl+C
                 let _ = tokio::signal::ctrl_c().await;
+                // Shutdown telemetry after Ctrl+C.
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
                 return Ok(0);
             }
             Commands::Telemetry { action } => {
@@ -1027,6 +1113,10 @@ async fn run() -> Result<i32> {
                     }
                     TelemetryAction::Clear => telemetry_cmd::clear(&atomcode_dir)?,
                 }
+                // Flush telemetry before exiting.
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
                 return Ok(0);
             }
             Commands::Setup { force } => {
@@ -1072,6 +1162,7 @@ async fn run() -> Result<i32> {
                 language: None,
                 ui: Default::default(),
                 plugin: Default::default(),
+                web_search: Default::default(),
             }
         })
     } else {
@@ -1091,6 +1182,7 @@ async fn run() -> Result<i32> {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         }
     };
 
@@ -1135,6 +1227,7 @@ async fn run() -> Result<i32> {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -1284,7 +1377,7 @@ async fn run() -> Result<i32> {
         tool_registry.register_sync(Box::new(ListDirTool));
     }
     if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool));
+        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
     }
     if enabled("web_fetch") {
         tool_registry.register_sync(Box::new(WebFetchTool));
@@ -1426,6 +1519,10 @@ async fn run() -> Result<i32> {
     } else {
         SessionMode::Tui
     };
+    // Launch-level fallback: any telemetry emitted outside a mode-bearing
+    // CurrentContext scope (e.g. an un-scoped spawned task) attributes to this
+    // process mode instead of `null`. Per-scope mode still overrides it.
+    telemetry.set_default_mode(Some(session_mode));
     // Bind telemetry to the continued session's id (if any). A fresh run needs
     // nothing here: the agent bootstraps telemetry + header + datalog from its
     // own session id. The TUI manages its own binding via
@@ -1465,7 +1562,11 @@ async fn run() -> Result<i32> {
             // Capture the assistant's streamed text only when we need to post
             // it back to AtomGit (fixissue). Plain `-p` stays zero-alloc.
             let capture = fixissue_ref.is_some();
-            let (ec, captured) = run_headless(
+            // Don't `?`-propagate here: an error must still fall through to the
+            // telemetry.shutdown() below, otherwise this session's un-drained
+            // mpsc events are lost. Capture the Result and let it bubble up only
+            // *after* the flush.
+            match run_headless(
                 agent_loop,
                 agent_handle,
                 prompt,
@@ -1474,39 +1575,53 @@ async fn run() -> Result<i32> {
                 capture,
                 working_dir.clone(),
                 cli.dangerously_skip_permissions,
+                is_admin,
             )
-            .await?;
-
-            // Post-run side effects for fixissue: only on clean completion
-            // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
-            // On non-zero we leave the issue alone — the user can retry.
-            if let Some(issue_ref) = fixissue_ref {
-                if ec == 0 {
-                    if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
-                        match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
-                            Ok(()) => eprintln!(
-                                "[fixissue] ✓ posted summary + applied 'fixed' label to issue #{}",
-                                issue_ref.number
-                            ),
-                            Err(e) => eprintln!(
-                                "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
-                                e
-                            ),
+            .await
+            {
+                Err(e) => Err(e),
+                Ok((ec, captured)) => {
+                    // Post-run side effects for fixissue: only on clean completion
+                    // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
+                    // On non-zero we leave the issue alone — the user can retry.
+                    if let Some(issue_ref) = fixissue_ref {
+                        let mut final_exit = ec;
+                        if ec == 0 {
+                            if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
+                                match atomcode_core::atomgit::fixissue::post_completion(
+                                    &issue_ref, &summary,
+                                ) {
+                                    Ok(()) => eprintln!(
+                                        "[fixissue] ✓ posted summary + applied 'fixed' label to issue #{}",
+                                        issue_ref.number
+                                    ),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
+                                            e
+                                        );
+                                        // Signal partial failure so CI/scripts can detect it.
+                                        final_exit = 3;
+                                    }
+                                }
+                            } else {
+                                eprintln!(
+                                    "[fixissue] agent produced no text; skipping comment + label on issue #{}",
+                                    issue_ref.number
+                                );
+                            }
+                        } else {
+                            eprintln!(
+                                "[fixissue] agent exited non-zero ({}); skipping comment + label on issue #{}",
+                                ec, issue_ref.number
+                            );
                         }
+                        Ok::<i32, anyhow::Error>(final_exit)
                     } else {
-                        eprintln!(
-                            "[fixissue] agent produced no text; skipping comment + label on issue #{}",
-                            issue_ref.number
-                        );
+                        Ok::<i32, anyhow::Error>(ec)
                     }
-                } else {
-                    eprintln!(
-                        "[fixissue] agent exited non-zero ({}); skipping comment + label on issue #{}",
-                        ec, issue_ref.number
-                    );
                 }
             }
-            Ok::<i32, anyhow::Error>(ec)
         } else {
             // Fire-and-forget: spawn a setsid'd subprocess to stage the next
             // release if one is out. Detached so a Ctrl+C in this parent doesn't
@@ -1541,10 +1656,20 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions).await?;
-            Ok(0)
+            // Same as the headless arm: don't `?` — a TUI run that ends in an
+            // error must still reach the shutdown/flush below. Ok(()) → exit 0;
+            // the error propagates only after telemetry is drained.
+            match atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
+                Ok(()) => Ok(0),
+                Err(e) => Err(e.into()),
+            }
         };
 
+        // Flush telemetry on EVERY exit path — Ok and Err alike. Both session
+        // arms above return their Result into `exit_code` instead of using `?`,
+        // so an errored TUI/headless run still drains the in-memory mpsc queue
+        // here before the error bubbles up to async_main's exit(1). Without this
+        // the tail of any session that ended in an error was silently dropped.
         telemetry.shutdown(std::time::Duration::from_millis(500)).await;
         exit_code
     })
@@ -1638,6 +1763,7 @@ async fn run_headless(
     capture: bool,
     working_dir: PathBuf,
     skip_permissions: bool,
+    is_admin: bool,
 ) -> Result<(i32, Option<String>)> {
     // Tell the panic hook / error path to skip TUI cleanup — raw mode was
     // never enabled here, so `disable_raw_mode` would be a wasted ioctl
@@ -1653,6 +1779,12 @@ async fn run_headless(
         eprintln!(
             "{}",
             atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless)
+        );
+    }
+    if is_admin {
+        eprintln!(
+            "{}",
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::AdminWarningHeadless)
         );
     }
 
@@ -1815,7 +1947,7 @@ async fn run_headless(
                 turn_count,
                 tool_call_count,
                 stop_reason,
-                messages: _,
+                ..
             } => {
                 close_thinking_line(&mut thinking_line_open);
                 atomcode_core::notify::notify_turn_finished(
@@ -1864,7 +1996,7 @@ async fn run_headless(
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
-            AgentEvent::Error { error, messages: _ } => {
+            AgentEvent::Error { error, .. } => {
                 close_thinking_line(&mut thinking_line_open);
                 // Always shown — errors are not noise.
                 eprintln!("[error] {}", error);
@@ -1990,7 +2122,8 @@ async fn run_headless(
             }
             AgentEvent::UserEcho(_)
             | AgentEvent::PeerBusy(_)
-            | AgentEvent::ProviderChanged(_) => {
+            | AgentEvent::ProviderChanged(_)
+            | AgentEvent::ProjectSwitched(_) => {
                 // Live-sync only — not applicable in headless CLI.
             }
         }
@@ -2489,9 +2622,7 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
                 if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
                     println!(
                         "\n{}",
-                        atomcode_core::i18n::t(
-                            atomcode_core::i18n::Msg::UpgradePackageManaged
-                        )
+                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
                     );
                 } else {
                     eprintln!("\nupgrade failed: {}", msg);
@@ -2581,6 +2712,7 @@ fn run_codingplan_core(
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         },
     };
 
@@ -2676,7 +2808,10 @@ fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
         .map(|s| s.to_string())
         .or_else(|| info.payload().downcast_ref::<String>().cloned())
         .unwrap_or_default();
-    let thread = std::thread::current().name().unwrap_or("unknown").to_string();
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or("unknown")
+        .to_string();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

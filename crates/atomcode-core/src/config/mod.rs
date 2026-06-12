@@ -150,6 +150,39 @@ pub struct Config {
     /// plugins track the binary.
     #[serde(default)]
     pub plugin: PluginConfig,
+    /// Web search backend. Missing from older configs → defaults to the
+    /// `exa` provider (reachable without a VPN, returns LLM-ready result
+    /// text). Set `provider = "duckduckgo"` to restore the legacy
+    /// HTML-scraping backend.
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
+}
+
+/// Web search backend configuration. Persisted as the `[web_search]` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchConfig {
+    /// Search backend: `"exa"` (default — MCP API at mcp.exa.ai, reachable
+    /// without a VPN and returns LLM-ready result text) or `"duckduckgo"`
+    /// (legacy HTML scraping of html.duckduckgo.com, blocked in some regions).
+    #[serde(default = "default_search_provider")]
+    pub provider: String,
+    /// Optional Exa API key. Also read from the `EXA_API_KEY` env var, which
+    /// takes precedence. When unset, Exa runs in its keyless tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+fn default_search_provider() -> String {
+    "exa".to_string()
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_search_provider(),
+            api_key: None,
+        }
+    }
 }
 
 /// Plugin / marketplace bootstrap configuration. Persisted as the
@@ -254,6 +287,7 @@ impl Default for Config {
             language: None,
             ui: UiConfig::default(),
             plugin: PluginConfig::default(),
+            web_search: WebSearchConfig::default(),
         }
     }
 }
@@ -753,6 +787,7 @@ mod tests {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         }
     }
 
@@ -917,6 +952,7 @@ mod tests {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -932,6 +968,7 @@ mod tests {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -1130,6 +1167,7 @@ mod tests {
             language: Some(crate::locale::Locale::ZhCn),
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1145,6 +1183,7 @@ mod tests {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -1210,6 +1249,7 @@ mod tests {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -1231,6 +1271,7 @@ mod tests {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         }
     }
 
@@ -1281,6 +1322,7 @@ mod tests {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,

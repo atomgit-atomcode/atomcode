@@ -36,7 +36,7 @@
 
 use std::io::Write as _;
 
-use super::cell::{diff_cell_frames, serialize_patches, Cell};
+use super::cell::{diff_cell_frames, serialize_frames_tight, serialize_patches, Cell};
 
 /// Retained W×H cell grid + current/prev frames.
 ///
@@ -64,6 +64,23 @@ pub struct Screen {
     /// no patch is emitted and the stale physical glyph survives —
     /// the "right-edge ghost row tail" symptom.
     physical_dirty: bool,
+    /// Last-emitted cursor position (for diff suppression).
+    /// `None` means "no CUP emitted yet — always emit on the first
+    /// frame that sets a cursor". Tracks the **1-indexed** position
+    /// that `render_diff` actually wrote to `out`.
+    last_cursor: Option<(u16, u16)>,
+    /// Last-emitted cursor visibility (`?25h` / `?25l`).
+    /// `None` means "no visibility sequence emitted yet".
+    last_cursor_visible: Option<bool>,
+    /// JediTerm (IntelliJ-platform terminal) repaint mode. When set,
+    /// `render_diff` serialises changed rows via
+    /// [`serialize_frames_tight`] — one CUP+EL per changed row, then a
+    /// contiguous run — instead of the per-cell-CUP [`serialize_patches`]
+    /// stream. Defeats the per-`─`-CUP rule fragmentation and stale-tail
+    /// ghosting JediTerm's no-font-fallback paint layer produces. Off by
+    /// default; set via [`Screen::with_jediterm`] from `caps.jediterm`.
+    /// Does NOT change the per-ideograph gap (that's a font artifact).
+    jediterm: bool,
 }
 
 impl Screen {
@@ -78,7 +95,17 @@ impl Screen {
             cursor: None,
             cursor_visible: true,
             physical_dirty: false,
+            last_cursor: None,
+            last_cursor_visible: None,
+            jediterm: false,
         }
+    }
+
+    /// Enable the JediTerm per-row tight-repaint path (see the `jediterm`
+    /// field). Chainable so call sites read `Screen::new(w, h).with_jediterm(caps.jediterm)`.
+    pub fn with_jediterm(mut self, on: bool) -> Self {
+        self.jediterm = on;
+        self
     }
 
     pub fn width(&self) -> u16 {
@@ -206,8 +233,16 @@ impl Screen {
             body.extend_from_slice(b"\x1b[H");
             self.physical_dirty = false;
         }
-        let patches = diff_cell_frames(&self.prev_cells, &self.cells);
-        let patch_bytes = serialize_patches(&patches);
+        // JediTerm: per-row tight repaint (one CUP+EL + contiguous run per
+        // changed row) instead of the per-cell-CUP patch stream. Defeats the
+        // rule fragmentation + stale-tail ghosting its no-font-fallback paint
+        // layer produces. Every other terminal keeps the minimal patch path.
+        let patch_bytes = if self.jediterm {
+            serialize_frames_tight(&self.prev_cells, &self.cells)
+        } else {
+            let patches = diff_cell_frames(&self.prev_cells, &self.cells);
+            serialize_patches(&patches)
+        };
         body.extend_from_slice(&patch_bytes);
         // Anti-flicker wrap around any frame that moves the caret.
         // `serialize_patches` walks the cursor across every changed
@@ -222,18 +257,50 @@ impl Screen {
         // patch lands, hiding intermediate state entirely. Older
         // terminals ignore unknown DEC private modes per spec.
         let has_visible_work = cold_start || !patch_bytes.is_empty();
+        // Compute stale_vis before the first use (line 237's `?25l`).
+        let stale_vis = cold_start || Some(self.cursor_visible) != self.last_cursor_visible;
+        let stale_cursor = cold_start || self.cursor != self.last_cursor;
         let mut out = Vec::with_capacity(body.len() + 32);
         if has_visible_work {
-            out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+            out.extend_from_slice(b"\x1b[?2026h");
+            // Hide the cursor for the patch walk. `serialize_patches`
+            // walks the caret across every changed cell, so any frame
+            // with patches WILL move it — hide unconditionally here and
+            // pair with the `has_visible_work`-guarded restore below.
+            // (Gating the hide on `stale_vis` was a bug: on frame 2+
+            // with unchanged visibility the caret bounced visibly across
+            // the patched cells on non-DECSET-2026 terminals.)
+            out.extend_from_slice(b"\x1b[?25l");
         }
         out.extend_from_slice(&body);
-        if let Some((r, c)) = self.cursor {
-            let _ = write!(&mut out, "\x1b[{};{}H", r, c);
+        // Park the caret. MANDATORY whenever `has_visible_work`: the
+        // patch walk above left the physical cursor on the last changed
+        // cell, so it must be jumped back to `self.cursor` regardless of
+        // whether the *logical* position changed since the last frame.
+        // (Gating solely on `stale_cursor` stranded the caret on the
+        // last patched row during streaming/idle repaints — the input
+        // position is stable frame-to-frame, so `stale_cursor` was false
+        // even though the patches had just moved the physical cursor.)
+        // On no-work frames the jump is only emitted when the position
+        // actually moved, so a genuinely empty, same-cursor frame still
+        // emits nothing — that's the real anti-flicker win.
+        if stale_cursor || has_visible_work {
+            if let Some((r, c)) = self.cursor {
+                let _ = write!(&mut out, "\x1b[{};{}H", r, c);
+            }
+            self.last_cursor = self.cursor;
         }
-        if self.cursor_visible {
-            out.extend_from_slice(b"\x1b[?25h");
-        } else {
-            out.extend_from_slice(b"\x1b[?25l");
+        // Restore visibility. Fires on `has_visible_work` frames to pair
+        // with the unconditional hide above; on no-work frames only when
+        // the visibility state actually transitions, so an idle toggle
+        // still lands without a redundant re-send every frame.
+        if stale_vis || has_visible_work {
+            if self.cursor_visible {
+                out.extend_from_slice(b"\x1b[?25h");
+            } else {
+                out.extend_from_slice(b"\x1b[?25l");
+            }
+            self.last_cursor_visible = Some(self.cursor_visible);
         }
         if has_visible_work {
             out.extend_from_slice(b"\x1b[?2026l");
@@ -269,6 +336,11 @@ impl Screen {
         // for the failure mode this guards against (right-edge ghost
         // tail after invalidate + shrink).
         self.physical_dirty = true;
+        // Physical state is now unknown — force cursor re-emit on the
+        // next render_diff (cold-start already guarantees full repaint,
+        // but we still need CUP+vis after the patches land).
+        self.last_cursor = None;
+        self.last_cursor_visible = None;
     }
 
     /// Blank `prev_cells` for rows `[start_row, height)`. Used by callers
@@ -368,6 +440,44 @@ mod tests {
         let out = String::from_utf8(bytes).unwrap();
         // Expect exactly the cursor-show sequence, nothing else.
         assert_eq!(out, "\x1b[?25h", "unexpected bytes: {:?}", out);
+    }
+
+    /// JediTerm mode renders a box-drawing rule as one contiguous run
+    /// (single CUP for the row) — the per-`─`-CUP fragmentation the
+    /// default path produces is what visually shatters the rule on
+    /// JediTerm's paint layer.
+    #[test]
+    fn jediterm_renders_rule_as_contiguous_run() {
+        let mut s = Screen::new(6, 2).with_jediterm(true);
+        let mut rule = Vec::new();
+        push_str_cells(&mut rule, "──────", &CellStyle::default());
+        s.draw_row(0, 0, &rule);
+        let out = String::from_utf8(s.render_diff()).unwrap();
+        assert!(out.contains("──────"), "rule must be one contiguous run: {:?}", out);
+        assert_eq!(
+            out.matches("\x1b[1;1H").count(),
+            1,
+            "exactly one CUP for the rule row (no per-dash CUP): {:?}",
+            out
+        );
+    }
+
+    /// Default Screen (no `with_jediterm`) keeps the per-cell-CUP path:
+    /// a rule of non-ASCII dashes emits one CUP per dash. Guards that the
+    /// JediTerm branch is opt-in and the legacy path is byte-unchanged.
+    #[test]
+    fn default_screen_keeps_per_cell_cup_for_rule() {
+        let mut s = Screen::new(5, 1);
+        let mut rule = Vec::new();
+        push_str_cells(&mut rule, "───", &CellStyle::default());
+        s.draw_row(0, 0, &rule);
+        let out = String::from_utf8(s.render_diff()).unwrap();
+        // serialize_patches forces a CUP before every non-ASCII cell → 3.
+        assert!(
+            out.matches('H').count() >= 3,
+            "default path per-dash CUPs, got: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -649,5 +759,91 @@ mod tests {
         let out = String::from_utf8_lossy(&bytes);
         assert!(out.starts_with("\x1b[?2026h\x1b[?25l"), "cold-start frame must open with BSU+hide: {:?}", out);
         assert!(out.ends_with("\x1b[?25h\x1b[?2026l"), "cold-start frame must close with show+ESU: {:?}", out);
+    }
+
+    /// REGRESSION: a later frame that emits cell patches but whose logical
+    /// cursor position is UNCHANGED from the previous frame must still emit
+    /// the parking CUP. `serialize_patches` walks the physical cursor
+    /// across the changed cells, so gating the park on `!stale_cursor`
+    /// alone strands the caret on the last patched row. The park is
+    /// mandatory whenever `has_visible_work` (patches moved the cursor).
+    #[test]
+    fn cursor_reparked_after_patches_even_when_position_unchanged() {
+        let mut s = Screen::new(10, 3);
+        // Frame 1: draw row 0, park caret at (2,5).
+        let mut c1 = Vec::new();
+        push_str_cells(&mut c1, "x", &CellStyle::default());
+        s.draw_row(0, 0, &c1);
+        s.set_cursor(2, 5);
+        let _ = s.render_diff(); // last_cursor becomes (2,5)
+
+        // Frame 2: patch a DIFFERENT row, caret stays at (2,5).
+        let mut c2 = Vec::new();
+        push_str_cells(&mut c2, "y", &CellStyle::default());
+        s.draw_row(1, 0, &c2);
+        s.set_cursor(2, 5);
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(
+            out.contains("\x1b[2;5H"),
+            "caret must be re-parked at (2,5) after patches, got {:?}",
+            out
+        );
+    }
+
+    /// A patched frame must hide the cursor for the patch walk and restore
+    /// it afterwards EVEN when visibility is unchanged frame-to-frame —
+    /// otherwise on non-DECSET-2026 terminals the visible caret bounces
+    /// across the changed cells. Hide/restore stay paired.
+    #[test]
+    fn patched_frame_hides_and_restores_cursor_even_when_visibility_unchanged() {
+        let mut s = Screen::new(10, 3);
+        // Frame 1: establishes last_cursor_visible = Some(true).
+        let mut c1 = Vec::new();
+        push_str_cells(&mut c1, "x", &CellStyle::default());
+        s.draw_row(0, 0, &c1);
+        s.set_cursor(1, 1);
+        let _ = s.render_diff();
+
+        // Frame 2: patches present, visibility still true.
+        let mut c2 = Vec::new();
+        push_str_cells(&mut c2, "y", &CellStyle::default());
+        s.draw_row(1, 0, &c2);
+        s.set_cursor(1, 1);
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(
+            out.starts_with("\x1b[?2026h\x1b[?25l"),
+            "patched frame must open with BSU+hide: {:?}",
+            out
+        );
+        assert!(
+            out.ends_with("\x1b[?25h\x1b[?2026l"),
+            "patched frame must close with show+ESU: {:?}",
+            out
+        );
+    }
+
+    /// The legitimate optimization must survive: a genuinely empty frame
+    /// (no patches, same cursor, same visibility) emits zero bytes — no
+    /// redundant CUP / visibility re-send / sync wrap.
+    #[test]
+    fn truly_empty_frame_after_park_emits_nothing() {
+        let mut s = Screen::new(10, 3);
+        let mut c1 = Vec::new();
+        push_str_cells(&mut c1, "x", &CellStyle::default());
+        s.draw_row(0, 0, &c1);
+        s.set_cursor(2, 5);
+        let _ = s.render_diff();
+
+        // Second frame: redraw the SAME content + SAME cursor → no delta.
+        s.draw_row(0, 0, &c1);
+        s.set_cursor(2, 5);
+        let bytes = s.render_diff();
+        assert!(
+            bytes.is_empty(),
+            "no-op frame must emit nothing, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
 }

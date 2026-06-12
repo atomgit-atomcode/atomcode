@@ -92,13 +92,15 @@ export function App() {
 
   // Seed cwd from /project on mount（恢复会话时以会话目录为准，故只在仍为空时填充）
   useEffect(() => {
+    let cancelled = false;
     getProject()
       .then((p) => {
-        if (p.working_dir) setCwd((c) => c || p.working_dir);
+        if (!cancelled && p.working_dir) setCwd((c) => c || p.working_dir);
       })
       .catch(() => {
         // Ignore; cwd stays empty
       });
+    return () => { cancelled = true; };
   }, []);
 
   // 把当前 session id（取前 8 位）同步进 URL，刷新后可恢复。

@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>权限与审批 · AtomCode 文档</title>
+<meta name="description" content="AtomCode 审批的整体模型:四个审批等级、哪些操作触发哪一级、弹窗里的选择、MCP 两档授权、敏感路径与联网抓取，以及如何在不牺牲安全的前提下少弹审批。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="approvals">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.25.1</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>权限与审批</h1>
+      <p class="lede">AtomCode 会替你执行工具——改文件、跑 shell、联网抓取、调用 MCP 服务。它的安全模型可以一句话概括:<strong>每一次工具调用都会被归到四个「审批等级」之一</strong>,等级决定它是直接执行、还是先弹窗征求你确认、以及你选「总是允许」时能不能被记住。本页先讲这套<strong>整体模型</strong>,再逐一展开:哪些操作落到哪一级、弹窗里你的选择、以及如何在不丢掉安全闸的前提下少问几次。</p>
+
+      <h2 id="model">核心:四个审批等级</h2>
+      <p>这是理解整页的主线。任何工具在执行前都会落到下面四级之一:</p>
+      <table>
+        <thead>
+          <tr><th>审批等级</th><th>含义</th><th>「总是允许」能记住吗</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>自动放行</strong></td><td>直接执行,不打扰你。项目内的安全操作都在这一级。</td><td>—(本就不问)</td></tr>
+          <tr><td><strong>询问</strong></td><td>弹窗确认;选「本会话总是允许」后,该工具本会话内不再问。</td><td>✅ 能</td></tr>
+          <tr><td><strong>始终询问</strong></td><td>每次都问,<em>即使</em>之前按过「总是允许」也不放过——留给破坏性 / 高危操作。</td><td>❌ 不能</td></tr>
+          <tr><td><strong>按资源询问</strong></td><td>弹窗确认;「总是允许」只记住<strong>这一个具体资源</strong>(比如某个文件),换一个仍会问。</td><td>仅同一资源</td></tr>
+        </tbody>
+      </table>
+      <p>记住这四级,后面所有内容都是在说"某个操作落到哪一级、为什么"。</p>
+
+      <h2 id="triggers">哪些操作触发哪一级</h2>
+      <p>大原则:在当前项目目录里干活畅通无阻(<strong>自动放行</strong>);一旦伸到项目外、碰到机密、或执行破坏性操作,就升级到需要确认的等级。</p>
+      <table>
+        <thead>
+          <tr><th>操作</th><th>触发条件</th><th>审批等级</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Shell(<code>bash</code>)破坏性命令</td><td><code>rm -rf</code>、<code>dd</code>、<code>git push --force</code>、<code>chmod</code>、<code>mkfs</code>…</td><td><strong>始终询问</strong></td></tr>
+          <tr><td>Shell 读/写项目外路径</td><td>命令访问当前项目目录之外</td><td>读=<strong>询问</strong> / 写=<strong>始终询问</strong></td></tr>
+          <tr><td>编辑 / 新建 / 替换文件</td><td>目标是敏感文件或在项目外</td><td><strong>始终询问</strong>(敏感/区外)</td></tr>
+          <tr><td>读文件 / 列符号 / 诊断</td><td>读取项目外的敏感文件(如 <code>~/.ssh/id_rsa</code>)</td><td>敏感=<strong>按资源询问</strong> / 普通区外=<strong>询问</strong></td></tr>
+          <tr><td><code>web_fetch</code></td><td>URL 指向私网 / 本地回环地址(公网自动放行)</td><td><strong>询问</strong></td></tr>
+          <tr><td>MCP 工具调用</td><td>每一次——除非该工具或其 server 已被信任</td><td><strong>询问</strong></td></tr>
+        </tbody>
+      </table>
+      <p><strong>始终自动放行</strong>的:项目<em>内</em>的读取、搜索、glob、编辑,以及 <code>cd</code>、<code>list_dir</code>、<code>grep</code>、<code>web_search</code>、待办清单。</p>
+
+      <h2 id="choices">弹窗里你的选择</h2>
+      <p>当一个工具落到"询问 / 始终询问 / 按资源询问"任一级时,你会看到这几个选项:</p>
+      <ul>
+        <li><strong>拒绝</strong> — 否决本次调用,agent 不带它继续。</li>
+        <li><strong>批准</strong> — 仅允许这一次。</li>
+        <li><strong>本会话总是允许</strong> — 本会话内记住(只在内存里,退出即失效)。对「始终询问」级无效;对「按资源询问」级只记住当前资源。</li>
+        <li><strong>永久允许此工具</strong> — <em>仅 MCP 工具</em>。把这一个工具写进 <code>mcp.json</code> 永久自动放行(见<a href="#mcp">两档授权</a>)。</li>
+      </ul>
+      <p>终端里:<code>y</code> / <kbd>Enter</kbd> 批准,<code>a</code> 本会话总是允许,<code>n</code> / <kbd>Esc</kbd> 拒绝,<kbd>Ctrl+C</kbd> 取消整轮。WebUI 里这些选择是审批卡片上的按钮。</p>
+
+      <h2 id="mcp">MCP 工具的两档授权</h2>
+      <p>MCP 工具调用的是<strong>外部代码</strong>,所以默认落在「询问」级。如果你信任某个工具或 server,可以把它升到「自动放行」——分三级,从最弱到最持久,而且关键在于<strong>只有前两级能从按钮触达</strong>:</p>
+      <ol>
+        <li><strong>本会话总是允许</strong>(<code>[A]</code> 键 / 按钮)——内存级,仅本会话,<em>仅该工具</em>。</li>
+        <li><strong>永久允许此工具</strong>(按钮,仅 MCP)——持久,<em>仅该工具</em>。把工具裸名追加进该 server 在 <code>mcp.json</code> 里的 <code>autoApprove</code> 列表:
+<pre><code>{
+  "mcpServers": {
+    "my-docs": { "command": "my-docs-server", "autoApprove": ["query", "search"] }
+  }
+}</code></pre></li>
+        <li><strong>信任整个 server</strong> — <em>只能手改配置</em>,任何运行时按钮都不会设置它:
+<pre><code>{
+  "mcpServers": {
+    "my-docs": { "command": "my-docs-server", "trust": true }
+  }
+}</code></pre></li>
+      </ol>
+      <div class="callout callout-warn">
+        <strong>为什么一次点击不能信任整个 server</strong>
+        <p>MCP 工具以<strong>它自己的权限</strong>运行,绕过 AtomCode 自身的路径 / 命令防护——一个 server 能写文件、能联网、能花钱。审批弹窗就是你的闸门。<code>trust: true</code> 会自动放行该 server 上的<em>每一个</em>工具,包括你从没见过的写入 / 破坏性工具,所以它被刻意设计成<strong>只有你</strong>能手改配置文件来开启——一次误点(或一次 prompt 注入)永远没法把单次批准升级成对整个 server 的永久信任。<code>trust: true</code> 只留给你完全掌控的 server(最好是本地、只读)。</p>
+      </div>
+
+      <h2 id="sensitive">敏感路径</h2>
+      <p>"敏感"决定一个项目外路径落到「始终询问」(写)还是「按资源询问」(读)。判定为敏感的有:</p>
+      <ul>
+        <li><strong>系统目录</strong> — <code>/etc</code>、<code>/usr</code>、<code>/System</code>、<code>/Windows</code>、<code>/Program Files</code>…</li>
+        <li><strong>机密目录</strong> — <code>~/.ssh</code>、<code>~/.aws</code>、<code>~/.gnupg</code></li>
+        <li><strong>机密文件</strong> — <code>.env</code>、<code>credentials</code>、<code>id_rsa</code>、<code>*.pem</code>、<code>*.key</code>、<code>*.p12</code>…</li>
+      </ul>
+      <p>普通应用配置(<code>~/.config/&lt;应用&gt;/…</code>)<strong>不</strong>当作机密。两个细节呼应上面的等级:<strong>读</strong>敏感文件是「按资源询问」——选「总是允许」只记住这一个文件(分段重读不再问),换文件仍问;<strong>写</strong>项目外和破坏性命令是「始终询问」——每次都问,无法用「总是允许」消掉。</p>
+
+      <h2 id="web">联网抓取</h2>
+      <p><code>web_fetch</code> 对<strong>公网</strong>站点自动放行;只在 URL 是<strong>本地回环 / 私网 / 链路本地</strong>字面量(<code>127.0.0.1</code>、<code>192.168.x</code>、<code>localhost</code>、<code>*.local</code>)时落到「询问」级。无论是否放行,抓取<strong>在执行时始终强制 SSRF 防护</strong>:重新解析主机,拒绝回环、私网、云元数据地址以及任何非 <code>http(s)</code> 协议——所以放宽审批从不削弱真正的安全校验。</p>
+
+      <h2 id="modes">两种特殊模式</h2>
+      <p><strong>计划模式</strong>:agent 被限制为<strong>只读</strong>工具——不能编辑、写入或跑 shell——因此根本不会出现修改类审批弹窗。这是工具层面的限制,不是一次性权限放行。</p>
+      <div class="callout callout-warn">
+        <strong>--dangerously-skip-permissions(危险)</strong>
+        <p>用这个参数启动会把上面四级<strong>全部短路成自动放行</strong>——包括 <code>rm -rf</code>、<code>git push --force</code>、写项目外——完全不弹窗。只在你不介意丢失的一次性 / 沙箱环境里用。</p>
+      </div>
+
+      <h2 id="config">配置参考</h2>
+      <p>MCP 信任写在 <code>mcp.json</code> 里——项目级 <code>.mcp.json</code> 或用户级 <code>~/.atomcode/mcp.json</code>——按 server 配置:</p>
+      <table>
+        <thead>
+          <tr><th>字段</th><th>效果</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>trust: true</code></td><td>把该 server 的<strong>所有</strong>工具升到「自动放行」。仅手改。</td></tr>
+          <tr><td><code>autoApprove: ["toolA", …]</code></td><td>把<strong>指定</strong>工具升到「自动放行」。「永久允许此工具」按钮追加到这里。</td></tr>
+        </tbody>
+      </table>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./tools.html">内置工具</a> — 每个工具做什么、能碰到什么</li>
+        <li><a href="./mcp.html">MCP 集成</a> — 添加 server,以及 <code>trust</code> / <code>autoApprove</code> 写在哪</li>
+        <li><a href="./configuration.html">配置文件</a> — 配置文件与优先级</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

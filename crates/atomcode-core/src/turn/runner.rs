@@ -123,6 +123,11 @@ impl TurnRunner {
         // the actually-sent messages diverge from what we logged.
         let context_window = self.ctx.ctx_window();
 
+        // Commit-collapse old tool results (idempotent, monotonic) so the
+        // sent prefix stays byte-stable across turns and the provider
+        // prompt-cache holds. Replaces the removed ephemeral microcompact.
+        crate::ctx::render::collapse_committed(conversation, context_window);
+
         let (messages, ctx_stats) =
             self.ctx
                 .build_messages(conversation, system_prompt, turn_reminder);
@@ -261,6 +266,14 @@ impl TurnRunner {
         // pattern</arg_key>...</tool_call>` mid-prose, polluting A/B
         // analysis.
         let mut visible_text_buf = String::new();
+        // Runaway-stream guard: if a degenerate model gets stuck in an
+        // autoregressive loop emitting the same character forever, we
+        // abort the turn rather than burning the user's quota waiting
+        // for the upstream max_tokens cap (#225). The detector keeps
+        // running across all visible Delta text in this turn — tool
+        // call boundaries reset stream_filter but not this; a real
+        // runaway will still trip on the per-segment text alone.
+        let mut runaway_detector = crate::stream::RunawayDetector::with_default_threshold();
         // Reasoning-model thinking content collected separately — not emitted
         // to scrollback by default (users don't want to read the thinking).
         // If `text_buf` ends up empty at `Done` but this is non-empty, we
@@ -439,6 +452,23 @@ impl TurnRunner {
                                             // blocks (Qwen/GLM XML leak suppression).
                                             let visible = stream_filter.feed(&text);
                                             if !visible.is_empty() {
+                                                // Runaway guard runs on the visible stream
+                                                // only — XML scaffolding inside <tool_call>
+                                                // blocks legitimately runs long, and we
+                                                // don't want to false-positive on it (#225).
+                                                if let Some(reason) =
+                                                    runaway_detector.feed(&visible)
+                                                {
+                                                    conversation.push_delta(&visible);
+                                                    visible_text_buf.push_str(&visible);
+                                                    let _ = event_tx
+                                                        .send(TurnEvent::TextDelta(visible));
+                                                    conversation.finalize_stream();
+                                                    tel_return!(
+                                                        TurnResult::Failed(reason),
+                                                        0u32
+                                                    );
+                                                }
                                                 conversation.push_delta(&visible);
                                                 visible_text_buf.push_str(&visible);
                                                 let _ = event_tx.send(TurnEvent::TextDelta(visible));
@@ -686,12 +716,12 @@ impl TurnRunner {
                                         // tool call message". The send-side ReasoningPolicy
                                         // (per-provider) decides whether the field actually
                                         // reaches the wire.
+                                        let reasoning = if reasoning_buf.trim().is_empty() {
+                                            None
+                                        } else {
+                                            Some(reasoning_buf.as_str())
+                                        };
                                         if !tool_calls_buf.is_empty() {
-                                            let reasoning = if reasoning_buf.trim().is_empty() {
-                                                None
-                                            } else {
-                                                Some(reasoning_buf.as_str())
-                                            };
                                             conversation
                                                 .finalize_stream_with_tool_calls_and_thinking(
                                                     &tool_calls_buf,
@@ -699,7 +729,17 @@ impl TurnRunner {
                                                     std::mem::take(&mut thinking_blocks),
                                                 );
                                         } else {
-                                            conversation.finalize_stream();
+                                            // No tool calls — still preserve the
+                                            // final-answer reasoning so the next
+                                            // request echoes the REAL reasoning_content
+                                            // (thinking-mode contract) instead of a
+                                            // "(no reasoning recorded)" placeholder that
+                                            // thinking models mimic back. See
+                                            // `finalize_stream_with_reasoning`.
+                                            conversation.finalize_stream_with_reasoning(
+                                                reasoning,
+                                                std::mem::take(&mut thinking_blocks),
+                                            );
                                         }
                                         was_truncated = is_truncated;
                                         break;
@@ -773,26 +813,11 @@ impl TurnRunner {
         //    Use the FILTERED accumulator so downstream consumers
         //    (datalog `log_text`, ATLAS plan extraction, telemetry)
         //    see clean prose, not raw text_buf with leaked XML
-        //    tool_call blocks.
-        if tool_calls_buf.is_empty() {
-            // Trigger post-turn hooks for Responded
-            self.trigger_post_turn_hooks("Responded").await;
-            
-            return TurnResult::Responded {
-                text: visible_text_buf,
-                tokens: total_tokens,
-                truncated: was_truncated,
-            };
-        }
-
-        // 5. If no tool calls, we're done — LLM produced text only.
-        //    Use the FILTERED accumulator so downstream consumers
-        //    (datalog `log_text`, ATLAS plan extraction, telemetry)
-        //    see clean prose, not raw text_buf with leaked XML
         //    tool_call blocks. Earlier bug: 5-7 atomgr datalog
         //    20-14-23 Turn 5 logged `### 3. 传输层安全<tool_call>grep
         //    <arg_key>...` because Responded.text was raw.
         if tool_calls_buf.is_empty() {
+            self.trigger_post_turn_hooks("Responded").await;
             tel_return!(
                 TurnResult::Responded {
                     text: visible_text_buf,
@@ -975,7 +1000,9 @@ impl TurnRunner {
             // Dup-in-batch was already short-circuited above (before the
             // ToolCallStarted emit), so by the time we reach here this is
             // a real, non-duplicate call to execute.
-            let result = self.execute_single_tool(call, event_tx, &cancel, &conversation.messages).await;
+            let result = self
+                .execute_single_tool(call, event_tx, &cancel, &conversation)
+                .await;
             if active_batch_id.is_some() && result.success {
                 batch_ok_count += 1;
             }
@@ -1062,7 +1089,9 @@ impl TurnRunner {
             "".to_string(),
             "".to_string(),
             working_dir.to_string_lossy().to_string(),
-        );
+        )
+        .with_session(self.provider.session_id())
+        .with_turn(self.current_turn_number);
         self.hook_engine.trigger_post_turn(&hook_ctx, turn_result).await;
     }
 
@@ -1129,7 +1158,7 @@ impl TurnRunner {
         call: &ToolCall,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
         cancel: &CancellationToken,
-        conversation_messages: &[crate::conversation::message::Message],
+        conversation: &crate::conversation::Conversation,
     ) -> ToolResult {
         // Auto-fix common tool name aliases (models trained on other agents use different names)
         // Case-insensitive matching: models may output "Run", "Bash", "Edit_File", etc.
@@ -1275,7 +1304,8 @@ impl TurnRunner {
         // the decider which handles interactive prompts or automatic policy.
         let approval = tool.approval_with_context(&call.arguments, &self.context);
         if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
-        | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
+        | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason)
+        | crate::tool::ApprovalRequirement::RequireApprovalScoped { ref reason, .. } = approval
         {
             // Only emit the ApprovalRequested event (which triggers the
             // TUI approval prompt) when the decider actually needs user
@@ -1289,13 +1319,16 @@ impl TurnRunner {
             let needs_prompt = !self.permission.will_auto_approve(call, &approval);
             if needs_prompt {
                 // Emit an informational event carrying a snapshot of
-                // conversation.messages so the TUI can persist mid-turn
-                // session state (e.g. for `/bg`).
+                // conversation state so the TUI can persist mid-turn
+                // session state (e.g. for `/bg`). Only clone here
+                // (lazily, when approval is actually needed) instead
+                // of per-tool-call — avoids O(N) full message-list
+                // clones for batch turns with many tools.
                 let _ = event_tx.send(TurnEvent::ApprovalRequested {
                     tool_name: call.name.clone(),
                     reason: reason.clone(),
                     call: call.clone(),
-                    messages: conversation_messages.to_vec(),
+                    snapshot: conversation.snapshot(),
                 });
             }
 

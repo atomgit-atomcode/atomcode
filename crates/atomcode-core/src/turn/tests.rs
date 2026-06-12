@@ -282,6 +282,7 @@ fn test_config() -> Config {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -304,6 +305,7 @@ fn test_config() -> Config {
         language: None,
         ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
     }
 }
 
@@ -330,6 +332,7 @@ fn make_runner(
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        reasoning_effort: None,
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -1482,6 +1485,7 @@ mod telemetry_tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,

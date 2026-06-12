@@ -107,6 +107,11 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false },
     Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
+    // Gateway entry: opens a second-level palette (high / max / off).
+    // needs_args=true so Enter rewrites the buffer to `/effort ` and the
+    // sub-mode menu renders the three choices. Selecting one commits as
+    // `/effort <choice>` → dispatched by the `effort` arm.
+    Command { name: "effort",  desc: "DeepSeek reasoning effort control (high / max / off)", needs_args: true },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true },
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
@@ -119,7 +124,11 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // skill list. Selecting a skill commits as `/skills <name>` →
     // dispatched by the `skills` arm in execute_slash_command.
     Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
-    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: true },
+    // needs_args=false so selecting `/plugin` opens the manager modal on the
+    // first Enter (like /model, /provider, /session). Subcommands
+    // (`/plugin install x@mp`, `uninstall`, `marketplace`, `list`) still work
+    // by typing the full line — needs_args only changes the menu-Enter behavior.
+    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: false },
     // Windows fallback for Ctrl+V: Windows Terminal / conhost
     // intercept Ctrl+V as their own `paste` action (which forwards
     // only `CF_UNICODETEXT`) before the keystroke reaches atomcode,
@@ -128,6 +137,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // `attach_image_to_input` pipeline directly so the user has a
     // terminal-agnostic way to attach an image. Works on every OS.
     Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false },
+    Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true },
 ];
 
 /// Look up the i18n translation for a built-in command description.
@@ -169,6 +179,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "plan" => Msg::CmdDescPlan,
         "build" => Msg::CmdDescBuild,
         "think" => Msg::CmdDescThink,
+        "effort" => Msg::CmdDescEffort,
         "help" => Msg::CmdDescHelp,
         "guide" => Msg::CmdDescGuide,
         "keys" => Msg::CmdDescKeys,
@@ -178,6 +189,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "skills" => Msg::CmdDescSkills,
         "plugin" => Msg::CmdDescPlugin,
         "paste" => Msg::CmdDescPaste,
+        "view" => Msg::CmdDescView,
         _ => return None,
     };
     Some(t(msg))
@@ -259,9 +271,41 @@ pub fn parse_slash_line(s: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Detect a `!cmd` bash-mode line. Returns the trimmed command when the
+/// line begins (strictly at column 0) with `!` and has a non-empty body.
+/// `!` alone, whitespace-only, or a non-leading `!` returns None.
+pub fn parse_bash_command(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('!')?;
+    let cmd = rest.trim();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_prefix_extracts_command() {
+        assert_eq!(parse_bash_command("!ls"), Some("ls"));
+        assert_eq!(parse_bash_command("!  echo hi"), Some("echo hi"));
+        assert_eq!(parse_bash_command("!git status"), Some("git status"));
+    }
+
+    #[test]
+    fn bare_bang_is_none() {
+        assert_eq!(parse_bash_command("!"), None);
+        assert_eq!(parse_bash_command("!   "), None);
+    }
+
+    #[test]
+    fn leading_space_not_bash() {
+        assert_eq!(parse_bash_command(" !ls"), None);
+        assert_eq!(parse_bash_command("echo !x"), None);
+    }
 
     #[test]
     fn registry_lookup_by_name() {

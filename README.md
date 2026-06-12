@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.24.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -84,7 +84,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 |----------|:---:|---|
 | Claude (Anthropic) | Yes | Claude Sonnet 4.5/4.6, Opus 4.6 |
 | OpenAI | Yes | GPT-4o, GPT-4.1 |
-| DeepSeek | Yes | DeepSeek V3, DeepSeek R1 |
+| DeepSeek | Yes | DeepSeek V3, DeepSeek R1, DeepSeek V4 |
 | Zhipu (GLM) | Yes | GLM-4, GLM-5 |
 | Qwen (Alibaba) | Yes | Qwen-Plus, Qwen-Max |
 | SiliconFlow | Yes | Various open models |
@@ -328,6 +328,7 @@ Then just type what you want:
 | `/login` | Login with AtomGit OAuth |
 | `/cd` | Change working directory |
 | `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
+| `/view &lt;filepath&gt;` | View file content in an overlay modal |
 | `/undo` | Undo last turn's edits |
 | `/diff` | Show git diff of current changes |
 | `/cost` | Show token usage for this session |
@@ -337,6 +338,8 @@ Then just type what you want:
 | `/config` | Edit config file |
 | `/status` | Show login status and model info |
 | `/logout` | Logout from AtomGit |
+| `/think` | Control extended thinking (on/off/budget N) |
+| `/effort` | DeepSeek reasoning effort control (high / max / off) |
 | `/help` | Show commands & shortcuts |
 | `/quit` | Exit (or Ctrl+C ×2) |
 

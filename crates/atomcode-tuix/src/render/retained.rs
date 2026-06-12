@@ -410,6 +410,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// no-op since the group rows are no longer at the bottom and may
     /// have scrolled out of the visible body strip).
     live_group: Option<LiveGroup>,
+    /// Modal overlay state: a floating window drawn on top of body+footer.
+    /// When Some, `paint_frame` paints the overlay cells after the normal
+    /// body+footer, so the diff sees the combined frame.
+    modal_overlay: Option<ModalOverlayState>,
     /// Windows only: the STD_INPUT_HANDLE console mode value saved by
     /// `enable_conhost_mouse_capture`. Currently always `None` — mouse
     /// capture is intentionally disabled (see `with_writer` comment),
@@ -420,6 +424,14 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// only on one side of the lifecycle).
     #[cfg(windows)]
     prior_console_in_mode: Option<u32>,
+}
+
+/// Pre-computed overlay cell grid + screen position for a modal window.
+#[derive(Debug, Clone)]
+struct ModalOverlayState {
+    cells: Vec<Vec<Cell>>,
+    x: u16,
+    y: u16,
 }
 
 /// Tracking state for an active multi-row live group. Populated by
@@ -509,7 +521,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self {
             out,
             caps,
-            screen: Screen::new(w, h),
+            screen: Screen::new(w, h).with_jediterm(caps.jediterm),
             input_buf: String::new(),
             input_cursor_byte: 0,
             menu: None,
@@ -530,6 +542,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_tool: None,
             inflight_tool_rows: 0,
             live_group: None,
+            modal_overlay: None,
             #[cfg(windows)]
             prior_console_in_mode,
         }
@@ -627,35 +640,39 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // it doesn't accumulate across ticks.
         let safe_name = scrub_controls(name);
         let safe_detail = scrub_controls(detail);
-        let body_str = if safe_detail.is_empty() {
-            safe_name
-        } else {
-            format!("{}({})", safe_name, safe_detail)
-        };
-        // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
-        // commands) from producing hundreds of terminal lines.
-        // This is a rendering safeguard only — the actual command
-        // execution uses the original, untruncated arguments.
-        let body_str = truncate_body_str(&body_str, 500);
-        // Append the spinner meta suffix (e.g. ` · 12s` or
-        // ` · 12s · 2 queued`) so the user has a time anchor while a
-        // long-running tool (cargo install, big test suite, etc.)
-        // executes. Without it the inflight row only shows
-        // `<spinner> Bash(cmd)` — no elapsed indicator — and looks
-        // indistinguishable from "stuck" once the user has been
-        // waiting >30s. `meta` carries its own leading ` · ` separator
-        // (or is empty); same single body style as the rest of the
-        // row, matching `build_spinner_body_row`'s convention where
-        // the suffix shares the label colour.
-        let body_str = if meta.is_empty() {
-            body_str
-        } else {
-            format!("{}{}", body_str, meta)
-        };
+
         let prefix = format!("{} ", icon);
         let prefix_style = self.style_for(Role::Muted);
-        let body_style = self.style_bold(Role::ToolName);
-        let new_rows = self.build_prefixed_rows(&prefix, &prefix_style, &body_str, &body_style);
+        let name_style = self.style_bold(Role::ToolName);
+        let detail_style = self.style_for(Role::Secondary);
+        let meta_style = self.style_bold(Role::ToolName);
+
+        let new_rows = if safe_detail.is_empty() {
+            // No detail: simple path — name + meta, all bold
+            self.build_mixed_style_rows(
+                &prefix, &prefix_style,
+                &safe_name, &name_style,
+                "", &detail_style,
+                meta, &meta_style,
+                &safe_name,
+            )
+        } else {
+            // Note: full_body intentionally excludes `meta` —
+            // build_mixed_style_rows appends meta separately in
+            // meta_style. Including meta in full_body would cause
+            // it to appear twice (once in the wrapped chunk, once
+            // as a separate append).
+            let full_body = format!("{}({})", safe_name, safe_detail);
+            let full_body = truncate_body_str(&full_body, 500);
+            let detail_display = format!("({})", safe_detail);
+            self.build_mixed_style_rows(
+                &prefix, &prefix_style,
+                &safe_name, &name_style,
+                &detail_display, &detail_style,
+                meta, &meta_style,
+                &full_body,
+            )
+        };
 
         let prev_rows = self.inflight_tool_rows;
         let n = new_rows.len();
@@ -750,6 +767,134 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         }
         self.inflight_tool_rows = n;
+    }
+
+    /// Build prefixed rows where the first-row body has mixed styling:
+    /// `name` in `name_style`, `detail` in `detail_style`. Continuation
+    /// rows use `detail_style`. Falls back to `build_prefixed_rows` with
+    /// `name_style` when detail is empty.
+    fn build_mixed_style_rows(
+        &self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        name: &str,
+        name_style: &CellStyle,
+        detail: &str,
+        detail_style: &CellStyle,
+        meta: &str,
+        meta_style: &CellStyle,
+        full_body: &str,
+    ) -> Vec<Vec<Cell>> {
+        if detail.is_empty() {
+            // No detail: append meta (if any) to name, all in name_style.
+            let body = if meta.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}{}", name, meta)
+            };
+            return self.build_prefixed_rows(prefix, prefix_style, &body, name_style);
+        }
+        let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
+        if w == 0 {
+            return Vec::new();
+        }
+        let prefix_w = crate::width::display_width(prefix);
+        let first_budget = w.saturating_sub(prefix_w);
+        let cont_pad: String = " ".repeat(prefix_w);
+        let name_dw = crate::width::display_width(name);
+        let detail_dw = crate::width::display_width(detail);
+        let meta_dw = crate::width::display_width(meta);
+        let mut rows = Vec::new();
+        if name_dw + detail_dw + meta_dw <= first_budget {
+            // Single-line: bold name + secondary detail + bold meta.
+            let mut row = Vec::new();
+            push_str_cells(&mut row, prefix, prefix_style);
+            push_str_cells(&mut row, name, name_style);
+            push_str_cells(&mut row, detail, detail_style);
+            if !meta.is_empty() {
+                push_str_cells(&mut row, meta, meta_style);
+            }
+            rows.push(row);
+        } else {
+            // Wrapping: first chunk splits at the name boundary; continuation
+            // chunks are padded under the name. `full_body` excludes `meta`
+            // (the ` · 12s` time anchor) — it's appended AFTER the wrapped body
+            // below, matching the single-line order (name → detail → meta).
+            let chunks: Vec<String> =
+                crate::width::wrap_line_to_width(full_body, first_budget.max(1))
+                    .into_iter()
+                    .map(|c| c.to_string())
+                    .collect();
+            for (i, chunk) in chunks.iter().enumerate() {
+                let mut row = Vec::new();
+                let pad = CellStyle::default();
+                if i == 0 {
+                    push_str_cells(&mut row, prefix, prefix_style);
+                    let chunk_dw = crate::width::display_width(chunk);
+                    if chunk_dw <= name_dw {
+                        push_str_cells(&mut row, chunk, name_style);
+                    } else {
+                        let name_part = crate::width::truncate_to_width(chunk, name_dw);
+                        push_str_cells(&mut row, &name_part, name_style);
+                        let rest = &chunk[name_part.len()..];
+                        if !rest.is_empty() {
+                            push_str_cells(&mut row, rest, detail_style);
+                        }
+                    }
+                } else {
+                    push_str_cells(&mut row, &cont_pad, &pad);
+                    // Continuation chunks: track cumulative width so we know
+                    // whether we're still within the tool name or past it.
+                    let chunk_dw = crate::width::display_width(chunk);
+                    let consumed_dw: usize = chunks[..i]
+                        .iter()
+                        .map(|c| crate::width::display_width(c))
+                        .sum();
+                    if consumed_dw + chunk_dw <= name_dw {
+                        // Entire chunk is still within the tool name
+                        push_str_cells(&mut row, chunk, name_style);
+                    } else if consumed_dw < name_dw {
+                        // Chunk straddles name/detail boundary
+                        let name_remain = name_dw - consumed_dw;
+                        let name_part = crate::width::truncate_to_width(chunk, name_remain);
+                        push_str_cells(&mut row, &name_part, name_style);
+                        let rest = &chunk[name_part.len()..];
+                        if !rest.is_empty() {
+                            push_str_cells(&mut row, rest, detail_style);
+                        }
+                    } else {
+                        // Chunk is entirely past the tool name
+                        push_str_cells(&mut row, chunk, detail_style);
+                    }
+                }
+                rows.push(row);
+            }
+            // Append `meta` after the wrapped body. Appending it to the FIRST
+            // row (as the old code did) overflowed the screen by meta's width —
+            // the first chunk already fills `first_budget`, so `prefix + chunk +
+            // meta` exceeds `w` and the terminal clips or re-wraps it, dropping
+            // the `· 93.7s` time anchor on narrow windows. Put it on the last
+            // row when it fits, otherwise on its own continuation row.
+            if !meta.is_empty() {
+                let last_w: usize = rows
+                    .last()
+                    .map(|r| r.iter().map(|c| c.width as usize).sum())
+                    .unwrap_or(0);
+                if last_w + meta_dw <= w {
+                    if let Some(last) = rows.last_mut() {
+                        push_str_cells(last, meta, meta_style);
+                    }
+                } else {
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, &cont_pad, &CellStyle::default());
+                    // meta is typically " · 12s"; drop the leading space so it
+                    // lines up under the body on its own row.
+                    push_str_cells(&mut row, meta.trim_start(), meta_style);
+                    rows.push(row);
+                }
+            }
+        }
+        rows
     }
 
     /// Pad a partially-built row with blank default-style cells until it
@@ -926,6 +1071,42 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("  {}  {}", padded, desc)
                 }
             }
+            super::MenuKind::TwoColumn { row_prefix, selected_marker } => {
+                // Name left-aligned, desc right-aligned. Rows fill the
+                // full screen width so pad_row_to_width adds no trailing
+                // spaces.  Optional selected_marker (show marker + space
+                // on selected row, same-width space pad on others) and
+                // row_prefix (prepended before name).
+                let full_w = rule_width + PAD_COL * 2;
+                let marker_w = unicode_width::UnicodeWidthStr::width(selected_marker);
+                let indicator = if selected {
+                    format!("{} ", selected_marker)
+                } else {
+                    " ".repeat(marker_w + 1) // marker + trailing space
+                };
+                let name = format!("{}{}", row_prefix, name);
+                let indicator_w = marker_w + 1;
+                let name_w = unicode_width::UnicodeWidthStr::width(name.as_str());
+                if desc.is_empty() {
+                    let rest = full_w.saturating_sub(indicator_w + name_w);
+                    format!("{}{}{}", indicator, name, " ".repeat(rest))
+                } else {
+                    let sep: usize = 2;
+                    // indicator_w + name + sep + desc must fit in full_w
+                    let desc_w = unicode_width::UnicodeWidthStr::width(desc);
+                    let avail = full_w.saturating_sub(indicator_w + sep);
+                    if name_w + desc_w <= avail {
+                        let pad = avail.saturating_sub(name_w + desc_w);
+                        format!("{}{}{}{}", indicator, name, " ".repeat(pad + sep), desc)
+                    } else {
+                        let max_name = avail.saturating_sub(desc_w);
+                        let truncated = crate::width::truncate_to_width(&name, max_name);
+                        let truncated_w = unicode_width::UnicodeWidthStr::width(truncated.as_str());
+                        let rest = full_w.saturating_sub(indicator_w + truncated_w + sep + desc_w);
+                        format!("{}{}{}{}{}", indicator, truncated, " ".repeat(sep), desc, " ".repeat(rest))
+                    }
+                }
+            }
         };
 
         let style = if selected {
@@ -1014,7 +1195,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // would eat the entire row, `truncate_path` replaces leading
         // segments with ".../" and keeps only the last segment.
         let model_str = if !status.model.is_empty() {
-            scrub_controls(&status.model)
+            let mut s = scrub_controls(&status.model);
+            if let Some(ref effort) = status.reasoning_effort {
+                use std::fmt::Write;
+                let _ = write!(s, " [{}]", effort);
+            }
+            s
         } else {
             String::new()
         };
@@ -1116,7 +1302,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ///   row 1: top rule
     ///   rows 2..2+N: middle input lines (N = wrap_with_cursor line count)
     ///   row 2+N: bottom rule
-    ///   rows 3+N..3+N+M: menu items (M = 0..4)
+    ///   rows 3+N..3+N+M: menu items (M = up to half screen height)
     ///   row 3+N+M: status line (if any chrome)
     ///
     /// Total rows = 1 + 1 + N + 1 + M + status_rows (where status is
@@ -1150,22 +1336,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let middle_rows = lines.len();
 
-        // Paginate menu to 4 items in view around `selected`.
+        // Paginate menu using the kind-specific cap.
+        let max_menu = self
+            .menu
+            .as_ref()
+            .map(|m| m.kind.max_visible_rows(h, m.items.len()))
+            .unwrap_or(4);
         let (menu_items, selected_in_view) = if let Some(m) = self.menu.as_ref() {
             let len = m.items.len();
             if len == 0 {
                 (Vec::<(String, String)>::new(), None)
             } else {
-                let offset = if len <= 4 {
+                let offset = if len <= max_menu {
                     0
-                } else if m.selected < 4 {
+                } else if m.selected < max_menu {
                     0
                 } else {
                     (m.selected + 1)
-                        .saturating_sub(4)
-                        .min(len.saturating_sub(4))
+                        .saturating_sub(max_menu)
+                        .min(len.saturating_sub(max_menu))
                 };
-                let end = (offset + 4).min(len);
+                let end = (offset + max_menu).min(len);
                 let items: Vec<(String, String)> = m.items[offset..end].to_vec();
                 let sel = if m.selected >= offset && m.selected < end {
                     Some(m.selected - offset)
@@ -1181,7 +1372,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Spinner moved to body as a live paragraph row — footer no
         // longer reserves a spinner slot. Footer layout:
         //   top_rule / middle... / bot_rule / menu... / status
-        let menu_rows = menu_items.len().min(4);
+        let menu_rows = menu_items.len().min(max_menu);
         // Attachment-preview rows: one `└ [Image #N]` per kept marker,
         // sitting between bot_rule and the menu. The list arrives
         // pre-filtered by `compute_input_attachments` (only markers
@@ -1328,10 +1519,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .len()
                 .max(1)
         };
+        let h = self.screen.height() as usize;
         let menu_rows = self
             .menu
             .as_ref()
-            .map(|m| m.items.len().min(4))
+            .map(|m| m.kind.max_visible_rows(h, m.items.len()))
             .unwrap_or(0);
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
@@ -1354,6 +1546,168 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn paint_frame(&mut self) {
         self.paint_body_into_cells();
         self.paint_footer();
+        // Overlay modal drawn on top of body+footer so the diff sees
+        // the combined frame. When modal_overlay is None this is a no-op.
+        if let Some(ref overlay) = self.modal_overlay {
+            for (dy, row) in overlay.cells.iter().enumerate() {
+                self.screen.draw_row(overlay.y as usize + dy, overlay.x as usize, row);
+            }
+        }
+    }
+
+    /// Build a modal overlay cell grid from the given title + content lines.
+    /// The window is centred on the current screen and bounded to fit.
+    fn build_modal_overlay(
+        &self,
+        title: &str,
+        lines: &[String],
+        scroll: usize,
+        total: usize,
+        win_width: u16,
+        win_height: u16,
+    ) -> ModalOverlayState {
+        let screen_w = self.screen.width();
+        let screen_h = self.screen.height();
+
+        // Clamp to screen bounds with a small margin.
+        let win_w = win_width.min(screen_w.saturating_sub(4)).max(20);
+        let win_h = win_height.min(screen_h.saturating_sub(4)).max(6);
+        let x = (screen_w.saturating_sub(win_w)) / 2;
+        let y = (screen_h.saturating_sub(win_h)) / 2;
+
+        let mut cells: Vec<Vec<Cell>> = Vec::with_capacity(win_h as usize);
+        let border_style = self.style_for(Role::Muted);
+        let title_style = self.style_bold(Role::Brand);
+        let text_style = CellStyle::default();
+        let hint_style = self.style_for(Role::Muted);
+
+        // Helper to build a full-width row padded with spaces.
+        let build_row = |content: Vec<Cell>| -> Vec<Cell> {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '│', style: border_style.clone(), width: 1 });
+            row.extend(content);
+            let filled: usize = row.iter().map(|c| c.width as usize).sum();
+            let pad = (win_w as usize).saturating_sub(filled).saturating_sub(1); // -1 for right border
+            for _ in 0..pad {
+                row.push(Cell::blank());
+            }
+            row.push(Cell { ch: '│', style: border_style.clone(), width: 1 });
+            row
+        };
+
+        // Inner text width: window minus the 2 borders and the 1-col left
+        // pad every row carries. ALL variable-text rows (title, content,
+        // hint) clip to this so none can overflow the frame and shove the
+        // right border out of alignment.
+        let max_inner = (win_w as usize).saturating_sub(3);
+        let clip_cells = |text: &str, style: &CellStyle| -> Vec<Cell> {
+            let mut out = Vec::new();
+            let mut used = 0usize;
+            for ch in text.chars() {
+                if used >= max_inner {
+                    break;
+                }
+                // Normalise control chars exactly like `push_str_cells`
+                // so the cell model stays column-aligned with the
+                // terminal: drop CR/LF, expand TAB to spaces (a raw TAB
+                // would jump the terminal to its hardware tab stop and
+                // shove the right border out of alignment), skip
+                // zero-width combining marks.
+                match ch {
+                    '\n' | '\r' => continue,
+                    '\t' => {
+                        let n = crate::render::cell::SOFT_TAB_WIDTH.min(max_inner - used);
+                        for _ in 0..n {
+                            out.push(Cell { ch: ' ', style: style.clone(), width: 1 });
+                        }
+                        used += n;
+                    }
+                    _ => {
+                        let w = crate::width::cell_char_width(ch).unwrap_or(1);
+                        if w == 0 {
+                            continue;
+                        }
+                        if used + w > max_inner {
+                            break;
+                        }
+                        out.push(Cell { ch, style: style.clone(), width: w as u8 });
+                        used += w;
+                        for _ in 1..w {
+                            out.push(Cell::continuation());
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        // Top border: ┌─────┐
+        {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '┌', style: border_style.clone(), width: 1 });
+            for _ in 0..(win_w as usize).saturating_sub(2) {
+                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+            }
+            row.push(Cell { ch: '┐', style: border_style.clone(), width: 1 });
+            cells.push(row);
+        }
+
+        // Title row (clipped so a long filename can't overflow the frame).
+        {
+            let safe_title = crate::sanitize::scrub_controls(title);
+            let mut content = Vec::new();
+            content.push(Cell::blank());
+            content.extend(clip_cells(&format!(" {}", safe_title), &title_style));
+            cells.push(build_row(content));
+        }
+
+        // Separator line
+        {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '├', style: border_style.clone(), width: 1 });
+            for _ in 0..(win_w as usize).saturating_sub(2) {
+                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+            }
+            row.push(Cell { ch: '┤', style: border_style.clone(), width: 1 });
+            cells.push(row);
+        }
+
+        // Content rows
+        let content_height = (win_h as usize).saturating_sub(5); // top + title + sep + hint + bottom
+        for line in lines.iter().take(content_height) {
+            let safe = crate::sanitize::scrub_controls(line);
+            let mut content = Vec::new();
+            content.push(Cell::blank());
+            content.extend(clip_cells(&safe, &text_style));
+            cells.push(build_row(content));
+        }
+
+        // Pad remaining content rows with blank lines
+        for _ in lines.len()..content_height {
+            cells.push(build_row(vec![Cell::blank()]));
+        }
+
+        // Bottom hint row: "Line X/Y · Esc/q to close" (clipped to width).
+        {
+            let hint = format!("Line {}/{} · Esc/q to close", scroll + 1, total);
+            let mut content = Vec::new();
+            content.push(Cell::blank());
+            content.extend(clip_cells(&hint, &hint_style));
+            cells.push(build_row(content));
+        }
+
+        // Bottom border: └─────┘
+        {
+            let mut row = Vec::with_capacity(win_w as usize);
+            row.push(Cell { ch: '└', style: border_style.clone(), width: 1 });
+            for _ in 0..(win_w as usize).saturating_sub(2) {
+                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+            }
+            row.push(Cell { ch: '┘', style: border_style.clone(), width: 1 });
+            cells.push(row);
+        }
+
+        ModalOverlayState { cells, x, y }
     }
 
     /// Append-only model: copy the body_lines tail into screen.cells
@@ -1391,6 +1745,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         for (i, row) in rows.iter().enumerate() {
             let clipped = clip_cells_to_width(row, body_width);
             self.screen.draw_row(i, 0, &clipped);
+        }
+        // Clear any rows between the last painted body row and the body
+        // area boundary (body_height). When the footer shrinks (e.g. slash
+        // menu closes), body_height grows, but the number of body_lines
+        // may not fill the newly available space. Rows that were
+        // previously occupied by the taller footer (which contained CJK
+        // text from skill descriptions in the sub-mode menu) would retain
+        // stale content in `self.cells` — the next `render_diff` would
+        // compare that stale content against `prev_cells` (which has the
+        // same stale content from the older frame) and find no diff,
+        // leaving ghost CJK characters on screen.
+        let painted = rows.len();
+        if painted < body_height {
+            let blank_row = vec![Cell::blank(); w.min(body_width)];
+            for r in painted..body_height {
+                self.screen.draw_row(r, 0, &blank_row);
+            }
         }
     }
 
@@ -1785,14 +2156,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if let Some((_id, name, detail)) = self.inflight_tool.take() {
             let safe_name = scrub_controls(&name);
             let safe_detail = scrub_controls(&detail);
-            let body_str = if safe_detail.is_empty() {
-                safe_name
-            } else {
-                format!("{}({})", safe_name, safe_detail)
-            };
-            // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
-            // commands) from producing hundreds of terminal lines.
-            let body_str = truncate_body_str(&body_str, 500);
             // Clear any previously rendered inflight tool rows so
             // push_body_prefixed appends fresh committed lines.
             self.live_spinner_active = false;
@@ -1842,17 +2205,32 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // double-gap in screenshots). Use `remove` (not just 1)
             // so multi-row inflight spinners are fully covered.
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(remove as u16);
-            self.push_body_prefixed(
-                // Frozen icon matches the static ToolCall arm — see its
-                // comment for the Windows-font rationale that picked ●
-                // (U+25CF, Geometric Shapes block) over ▸ (U+25B8,
-                // missing from Consolas/NSimSun and rendered as `□`
-                // tofu in screenshots).
-                "\u{25cf} ",
-                &self.style_for(Role::Muted),
-                &body_str,
-                &self.style_bold(Role::ToolName),
-            );
+            if safe_detail.is_empty() {
+                self.push_body_prefixed(
+                    "\u{25cf} ",
+                    &self.style_for(Role::Muted),
+                    &safe_name,
+                    &self.style_bold(Role::ToolName),
+                );
+            } else {
+                // Mixed styling: bold name + secondary detail
+                let body_str = format!("{}({})", safe_name, safe_detail);
+                let body_str = truncate_body_str(&body_str, 500);
+                let detail_str = format!("({})", safe_detail);
+                let prefix_style = self.style_for(Role::Muted);
+                let name_style = self.style_bold(Role::ToolName);
+                let detail_style = self.style_for(Role::Secondary);
+                let rows = self.build_mixed_style_rows(
+                    "\u{25cf} ", &prefix_style,
+                    &safe_name, &name_style,
+                    &detail_str, &detail_style,
+                    "", &name_style,
+                    &body_str,
+                );
+                for row in rows {
+                    self.push_body_row(row);
+                }
+            }
         }
     }
 
@@ -3019,24 +3397,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             UiLine::ApprovalPrompt { tool, detail } => {
                 let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
+                // Truecolor so the chips read as vivid green / blue / red on
+                // EVERY terminal theme. The 16-colour bright variants the rest
+                // of the UI uses (Color::Green/Cyan/Red) render muddy and
+                // near-indistinguishable on some dark palettes — user report:
+                // allow+always both looked grey, deny orange. These chips are
+                // safety-critical (allow vs deny must be unmistakable), so pin
+                // exact RGB. Same approach markdown highlighting already takes;
+                // `caps.colors` still gates all colour output.
+                let approve_green = Color::Rgb { r: 0x30, g: 0xD1, b: 0x58 };
+                let always_blue = Color::Rgb { r: 0x2B, g: 0xB8, b: 0xE0 };
+                let deny_red = Color::Rgb { r: 0xFF, g: 0x45, b: 0x3A };
                 let chip = |c: Color| CellStyle {
                     fg: Some(c),
                     bold: true,
                     reverse: true,
                     faint: false,
                 };
-                let chip_y = chip(Color::Green);
-                let chip_a = chip(Color::Cyan);
-                let chip_n = chip(Color::Red);
-
-                // Build tool label so user knows which specific action
-                // they're approving (issue #439: parallel batch approvals
-                // showed identical prompts with no way to tell which file).
-                let tool_label = if detail.is_empty() {
-                    format!("{}: ", tool)
-                } else {
-                    format!("{}({}): ", tool, detail)
-                };
+                let chip_y = chip(approve_green);
+                let chip_a = chip(always_blue);
+                let chip_n = chip(deny_red);
 
                 let waiting = t(Msg::ApprovalWaitingLabel);
                 let prefix_w = crate::width::display_width(&waiting);
@@ -3047,9 +3427,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let deny = t(Msg::ApprovalDeny);
 
                 // Build the Y/A/N chips cells once — reused whether
-                // we place them inline or on a separate line.
+                // we place them inline or on a separate line. The `↵` marker
+                // after the Y chip flags Allow(once) as the DEFAULT: pressing
+                // Enter triggers it (see `handle_approval_key`), so the user
+                // doesn't have to reach for an explicit key/chord. ASCII
+                // terminals (no `unicode_symbols`) fall back to "Enter".
+                let enter_marker = if self.caps.unicode_symbols { " ↵" } else { " Enter" };
+                let enter_style = CellStyle {
+                    fg: Some(approve_green), // match the Allow chip
+                    bold: true,
+                    reverse: false,
+                    faint: false,
+                };
                 let mut chips_cells: Vec<Cell> = Vec::new();
                 push_str_cells(&mut chips_cells, " Y ", &chip_y);
+                push_str_cells(&mut chips_cells, enter_marker, &enter_style);
                 push_str_cells(&mut chips_cells, &allow, &plain);
                 push_str_cells(&mut chips_cells, " A ", &chip_a);
                 push_str_cells(&mut chips_cells, &always, &plain);
@@ -3061,8 +3453,28 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // row + chips fit within the screen width, append chips
                 // inline (issue #454). Otherwise, emit chips on a
                 // separate line so they remain visible.
-                let safe_tool_label = crate::sanitize::scrub_controls(&tool_label);
-                let mut prefixed_rows = self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
+                // "Waiting for approval:" prefix stays yellow (Warning bold);
+                // tool name is bold ToolName; (detail): uses default fg.
+                let safe_tool = crate::sanitize::scrub_controls(&tool);
+                let safe_detail = crate::sanitize::scrub_controls(&detail);
+                let tool_name_style = self.style_bold(Role::ToolName);
+                let detail_style = self.style_for(Role::Secondary);
+                let mut prefixed_rows = if detail.is_empty() {
+                    // No detail: "▶ Waiting for approval: tool:"
+                    let body = format!("{}: ", safe_tool);
+                    self.build_prefixed_rows(&waiting, &warn, &body, &tool_name_style)
+                } else {
+                    // Build rows with mixed styling: yellow prefix, bold tool, fg detail
+                    let detail_suffix = format!("({}): ", safe_detail);
+                    let full_body = format!("{}{}", safe_tool, detail_suffix);
+                    self.build_mixed_style_rows(
+                        &waiting, &warn,
+                        &safe_tool, &tool_name_style,
+                        &detail_suffix, &detail_style,
+                        "", &detail_style,
+                        &full_body,
+                    )
+                };
                 let screen_w = self.screen.width() as usize;
                 let last_row_w: usize = prefixed_rows
                     .last()
@@ -3184,6 +3596,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let prefix = format!("{msg}  ");
                 self.push_body_prefixed(&prefix, &default_style, &model, &muted_style);
                 self.push_body_row(Vec::new());
+            }
+            UiLine::ModalOverlay {
+                title,
+                lines,
+                scroll,
+                total,
+                win_width,
+                win_height,
+            } => {
+                self.modal_overlay = Some(self.build_modal_overlay(
+                    &title,
+                    &lines,
+                    scroll,
+                    total,
+                    win_width,
+                    win_height,
+                ));
+            }
+            UiLine::ModalOverlayClear => {
+                self.modal_overlay = None;
             }
         }
         // Phase 5: widget state updated → mark frame dirty. No
@@ -3445,7 +3877,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         seq.push_str("\x1b[H");
         let _ = self.out.write_all(seq.as_bytes());
-        self.screen = Screen::new(self.screen.width(), self.screen.height());
+        self.screen =
+            Screen::new(self.screen.width(), self.screen.height()).with_jediterm(self.caps.jediterm);
         self.body_lines.clear();
         self.scrolled_off = 0;
         self.welcome_line_count = 0;
@@ -3629,18 +4062,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             let has_status = !self.status.model.is_empty()
                 || !self.status.cwd.is_empty()
                 || self.status.hint.is_some();
+            let h = self.screen.height() as usize;
+            let menu_rows = self
+                .menu
+                .as_ref()
+                .map(|m| m.kind.max_visible_rows(h, m.items.len()))
+                .unwrap_or(0);
             let middle_rows = footer_rows.saturating_sub(
                 1 /* spinner */
                 + 1 /* top rule */
                 + 1 /* bot rule */
-                + self.menu.as_ref().map(|m| m.items.len().min(4)).unwrap_or(0)
+                + menu_rows
                 + if has_status { 1 } else { 0 },
             );
-            let menu_rows = self
-                .menu
-                .as_ref()
-                .map(|m| m.items.len().min(4))
-                .unwrap_or(0);
             let buf_display_w = crate::width::display_width(&self.input_buf);
             self.paint_frame();
             let mut bytes = self.screen.render_diff();
@@ -3814,6 +4248,20 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         crate::tuix_trace!("RSZ", "wipe written");
         self.screen.resize(cols, rows);
+        // Mark physical state unknown so the upcoming paint_frame's
+        // render_diff cold-starts with a per-row CUP+EL preamble — exactly
+        // like reset() (:~3627) and resume_from_external() (:~3732), which
+        // rebuild the Screen the same way. Without this, `screen.resize`
+        // leaves `physical_dirty = false` + blank `prev_cells`, so the diff
+        // emits only cell patches and never clears the OLD footer rows. The
+        // per-row CUP+EL wipe above masks that on Unix / Windows Terminal,
+        // but legacy conhost is forced down to a single ED2 (to dodge the
+        // 0xc0000409 fastfail), and ED2 doesn't reliably clear the final
+        // geometry mid-drag — so the stale footer survives and the new
+        // footer stacks on top of it (the Windows resize footer-duplication
+        // bug). invalidate() must run AFTER resize so its sentinel rows are
+        // sized to the new width.
+        self.screen.invalidate();
         // Rebuild the semantic welcome banner against the new width so
         // its right-aligned version/license pair stays adaptive after
         // terminal resize instead of replaying stale gap cells.
@@ -3950,14 +4398,29 @@ fn truncate_body_str(body_str: &str, max_cols: usize) -> String {
     format!("{}{}", head, suffix)
 }
 
-/// Pluck the metadata suffix (` · 12s` and/or ` · N queued`) out of a
-/// spinner label built by `format_spinner_label`. Labels have the
-/// shape `{base}{ellipsis}[ · {elapsed}][ · {n} queued]`, so the first
-/// ` · ` marks where the base ends and the metadata begins. Returns
-/// the slice **including** its leading ` · ` separator so callers can
-/// concatenate it directly, or `""` if the label has no metadata yet
-/// (no phase clock has ticked).
+/// Pluck the time/queue metadata suffix (` · N queued` and/or ` · 12s`) out
+/// of a spinner label built by `format_spinner_label`, to forward onto an
+/// in-flight tool row. Labels have the shape
+/// `{base}{ellipsis}[ · thinking with {effort} effort][ · {n} queued][ · {elapsed}]`
+/// — the effort hint comes FIRST among the metadata (and must NOT ride onto a
+/// tool row, which isn't "thinking"). Returns the slice **including** its
+/// leading ` · ` separator so callers can concatenate it directly, or `""` if
+/// there's no time/queue metadata yet.
 fn spinner_meta_suffix(label: &str) -> &str {
+    const EFFORT_MARK: &str = " · thinking with ";
+    if let Some(start) = label.find(EFFORT_MARK) {
+        // Effort is the first metadata segment; it runs until the next ` · `
+        // (the queue/elapsed run) or end-of-string. Everything from that next
+        // separator on is the time/queue metadata to forward. Scanning from
+        // past the fixed marker lands inside the ASCII effort value, so the
+        // next ` · ` is unambiguously the following segment.
+        let scan_from = start + EFFORT_MARK.len();
+        return label[scan_from..]
+            .find(" · ")
+            .map(|rel| &label[scan_from + rel..])
+            .unwrap_or("");
+    }
+    // No effort hint: metadata begins at the first ` · ` after the base.
     label.find(" · ").map(|i| &label[i..]).unwrap_or("")
 }
 
@@ -4124,6 +4587,7 @@ mod tests {
             mode_indicator: None,
             bypass_indicator: None,
             session_name: None,
+            reasoning_effort: None,
         }
     }
 
@@ -4147,6 +4611,7 @@ mod tests {
             mode_indicator: Some("PLAN".into()),
             bypass_indicator: None,
             session_name: None,
+            reasoning_effort: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -4199,6 +4664,7 @@ mod tests {
             mode_indicator: Some("PLAN".into()),
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
+            reasoning_effort: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -4243,6 +4709,7 @@ mod tests {
             mode_indicator: None,
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
+            reasoning_effort: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -4666,11 +5133,110 @@ mod tests {
         );
     }
 
+    /// Regression: after a `/skills` menu containing CJK skill names/descs
+    /// closes, no glyph fragments may linger on screen. The user saw stray
+    /// `式` / `致` characters at column 0 below the input box after browsing
+    /// the installed-skills list and then clearing the buffer.
+    #[test]
+    fn closing_cjk_skill_menu_leaves_no_residual_glyphs() {
+        // Small screen so body + the menu-grown footer compete for rows and
+        // the body must scroll when the menu opens (and back when it closes).
+        let (mut r, buf) = new_capturing(80, 12);
+        let status = status_basic();
+
+        // Some ASCII body content (welcome-banner stand-in).
+        for i in 0..6 {
+            r.render(UiLine::User(format!("line-{i}")));
+        }
+
+        // A skills menu with CJK content, larger than the visible window so
+        // it paginates (mirrors "scroll down through installed skills").
+        let items: Vec<(String, String)> = (0..12)
+            .map(|i| (format!("技能{i}"), "代码格式化导致的问题".to_string()))
+            .collect();
+        r.render(UiLine::InputPrompt {
+            buf: "/skills ".into(),
+            cursor_byte: "/skills ".len(),
+            menu: Some(MenuPayload {
+                items: items.clone(),
+                selected: 8, // scrolled down past the first page
+                kind: crate::render::MenuKind::Skill,
+            }),
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Close the menu (user cleared the buffer).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 12);
+        drain_into_vterm(&buf, &mut vterm);
+
+        for row in 0..12 {
+            let text = vterm.row_text(row);
+            assert!(
+                !text.contains('式')
+                    && !text.contains('致')
+                    && !text.contains('技')
+                    && !text.contains('能'),
+                "residual menu glyph lingered on row {}: {:?}",
+                row,
+                text
+            );
+        }
+    }
+
     /// Regression: user showed a 5-column CJK table with long cells
     /// overflowing past the terminal's right edge — `flush_aligned_table`
     /// was ignoring terminal width. This test verifies the full pipeline
     /// (streamed assistant text → `render_line_with_width` → body_lines)
     /// keeps every rendered body row within screen width.
+    // Regression for the `/sync` blank-assistant-reply bug: a streamed
+    // assistant reply with NO trailing newline (e.g. "在的！") only reaches
+    // scrollback once an AssistantLineBreak flushes the partial buffer.
+    // `flush_assistant_lines` commits only `\n`-terminated lines, so without
+    // the line break the reply stays parked in `assistant_line_buf` forever.
+    // In sync mode the PeerBusy(false) handler now emits that line break on
+    // the peer's turn completion (the forwarder never sends TurnComplete).
+    #[test]
+    fn assistant_partial_line_commits_only_after_line_break() {
+        let (mut r, _c) = new_counting(80, 24);
+        r.render(UiLine::User("123".into()));
+        r.render(UiLine::AssistantText("在的！".into())); // no trailing '\n'
+
+        // Wide CJK glyphs occupy 2 cells, so cell-by-cell extraction inserts a
+        // padding space after each — strip spaces before substring-matching.
+        let body = |r: &RetainedRenderer<CountingSink>| -> String {
+            r.body_lines
+                .iter()
+                .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace(' ', "")
+        };
+        // Buffered, not yet in scrollback (the exact state the bug got stuck in).
+        assert!(
+            !body(&r).contains("在的！"),
+            "partial line must stay buffered until a line break; body:\n{}",
+            body(&r)
+        );
+        // Turn completion (AssistantLineBreak) flushes it to scrollback.
+        r.render(UiLine::AssistantLineBreak);
+        assert!(
+            body(&r).contains("在的！"),
+            "assistant reply must be committed after AssistantLineBreak; body:\n{}",
+            body(&r)
+        );
+    }
+
     #[test]
     fn retained_wide_table_truncated_to_screen_width() {
         let term_w: u16 = 100;
@@ -5027,13 +5593,29 @@ mod tests {
     #[test]
     fn spinner_meta_suffix_extracts_after_first_separator() {
         assert_eq!(spinner_meta_suffix("Running Bash… · 12s"), " · 12s");
+        // Effort now leads the metadata run and elapsed trails it; queue (when
+        // present) sits between. The effort hint must NOT ride onto a tool row.
         assert_eq!(
-            spinner_meta_suffix("Running Bash… · 12s · 2 queued"),
-            " · 12s · 2 queued"
+            spinner_meta_suffix("Running Bash… · 2 queued · 12s"),
+            " · 2 queued · 12s"
         );
         // No metadata yet (no phase clock tick) → empty suffix.
         assert_eq!(spinner_meta_suffix("Pondering…"), "");
         assert_eq!(spinner_meta_suffix(""), "");
+        // Effort first, elapsed last → only the trailing elapsed forwards.
+        assert_eq!(
+            spinner_meta_suffix("Running Bash… · thinking with high effort · 12s"),
+            " · 12s"
+        );
+        assert_eq!(
+            spinner_meta_suffix("Running Bash… · thinking with max effort · 2 queued · 12s"),
+            " · 2 queued · 12s"
+        );
+        // Effort with no time/queue after it → nothing forwards.
+        assert_eq!(
+            spinner_meta_suffix("Running Bash… · thinking with high effort"),
+            ""
+        );
     }
 
     /// Regression (screenshot 42.png): user reported a stray blinking
@@ -6385,7 +6967,7 @@ mod tests {
         let (mut r, _buf) = new_capturing(80, 24);
         let before = r.body_lines.len();
         r.render(UiLine::CommandOutput(
-            "  ○ Press Ctrl+O to show real-time output\n".into(),
+            "  ○ Press Ctrl+o to show real-time output\n".into(),
         ));
         let pushed = r.body_lines.len() - before;
         assert_eq!(
@@ -6491,6 +7073,38 @@ mod tests {
         assert_eq!(
             before2, after2,
             "pop_approval_prompt must not drop non-approval rows"
+        );
+    }
+
+    /// The Allow/Always/Deny chips must be unmistakable green/blue/red on EVERY
+    /// theme. The 16-colour bright variants (Color::Green/Cyan/Red) render muddy
+    /// / near-identical on some dark palettes (user report), so the chips pin
+    /// exact truecolor RGB. Inspect the cell model so a regression back to
+    /// 16-colour is caught.
+    #[test]
+    fn approval_chips_use_vivid_truecolor() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        let fgs: Vec<Color> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter_map(|c| c.style.fg)
+            .collect();
+        assert!(
+            fgs.contains(&Color::Rgb { r: 0x30, g: 0xD1, b: 0x58 }),
+            "Allow chip must be truecolor green, got fgs: {fgs:?}",
+        );
+        assert!(
+            fgs.contains(&Color::Rgb { r: 0x2B, g: 0xB8, b: 0xE0 }),
+            "Always chip must be truecolor blue, got fgs: {fgs:?}",
+        );
+        assert!(
+            fgs.contains(&Color::Rgb { r: 0xFF, g: 0x45, b: 0x3A }),
+            "Deny chip must be truecolor red, got fgs: {fgs:?}",
         );
     }
 
@@ -8387,6 +9001,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn modal_overlay_expands_tabs_no_raw_tab_cells() {
+        // A file line with a leading tab (Go / Makefiles / tab-indented C)
+        // must render as spaces in the overlay cell grid. A raw '\t' cell
+        // would make the terminal jump to its hardware tab stop while the
+        // cell model only advances 1 col, shoving the right border (and
+        // everything after the tab) out of alignment.
+        let (r, _buf) = new_capturing(80, 24);
+        let lines = vec!["\tfn main() {}".to_string()];
+        let overlay = r.build_modal_overlay("t.rs", &lines, 0, 1, 60, 20);
+
+        // No cell anywhere in the overlay may carry a raw tab.
+        for row in &overlay.cells {
+            assert!(
+                row.iter().all(|c| c.ch != '\t'),
+                "overlay cell grid must not contain a raw '\\t'"
+            );
+        }
+
+        // cells: [0]=top border, [1]=title, [2]=separator, [3]=first
+        // content row = │ + leading pad blank + clip_cells(line) + … + │.
+        let content = &overlay.cells[3];
+        let tab_w = crate::render::cell::SOFT_TAB_WIDTH;
+        let tab_region: String = content[2..2 + tab_w].iter().map(|c| c.ch).collect();
+        assert_eq!(
+            tab_region,
+            " ".repeat(tab_w),
+            "leading tab should expand to {tab_w} spaces"
+        );
+        // The first real glyph follows the expanded tab.
+        assert_eq!(content[2 + tab_w].ch, 'f');
+    }
+
     // --- width-aware truncation tests (Bug B) ---
     //
     // ToolGroup rows are forced to single terminal lines so child indices map
@@ -8407,6 +9054,35 @@ mod tests {
             total_cols <= 38,
             "row width {} cols exceeds avail 38 (screen=40, PAD_COL=2)",
             total_cols
+        );
+    }
+
+    #[test]
+    fn inflight_tool_meta_survives_wrapping_without_overflow() {
+        // Regression (narrow window): an in-flight tool row with a long detail
+        // wrapped, and the ` · 93.7s` duration was appended to the FIRST
+        // already-full-width row, overflowing the screen — the terminal then
+        // clipped/re-wrapped it and the time anchor vanished. The meta must
+        // survive, and NO row may exceed the available width.
+        let (r, _sink) = new_capturing(40, 24);
+        let plain = CellStyle::default();
+        let detail = "(mod.rs, publish_service.rs, publish_service.rs, PublishSkill.tsx, skill.ts)";
+        let rows = r.build_mixed_style_rows(
+            "◑ ", &plain,
+            "ParallelEditFiles", &plain,
+            detail, &plain,
+            " · 93.7s", &plain,
+            &format!("ParallelEditFiles{detail}"),
+        );
+        let avail = 40usize - PAD_COL;
+        for row in &rows {
+            let w: usize = row.iter().map(|c| c.width as usize).sum();
+            assert!(w <= avail, "row width {w} exceeds avail {avail}: {row:?}");
+        }
+        let all: String = rows.iter().flat_map(|row| row.iter().map(|c| c.ch)).collect();
+        assert!(
+            all.contains("93.7s"),
+            "duration must survive wrapping, got: {all:?}",
         );
     }
 
@@ -10094,6 +10770,69 @@ mod tests {
                  ghosts them into visible body as duplicated tail).\nbytes: {:?}",
                 row,
                 post_paint_str
+            );
+        }
+    }
+
+    /// Windows resize footer-duplication regression: `on_resize` must call
+    /// `screen.invalidate()` after rebuilding the Screen so the repaint
+    /// cold-starts with a per-row CUP+EL preamble — like `reset()` and
+    /// `resume_from_external()` already do.
+    ///
+    /// On legacy conhost the resize wipe is forced down to a single ED2 (to
+    /// dodge the 0xc0000409 fastfail), so it emits NO per-row CUP+EL. The
+    /// body re-emit only covers body rows. That leaves the cold-start as the
+    /// ONLY thing that clears the FOOTER rows. Without `invalidate()`,
+    /// `physical_dirty` stays false, `render_diff` skips the cold-start, the
+    /// old footer rows are never cleared, and the new footer stacks on top
+    /// of them (the user-reported Windows resize corruption).
+    ///
+    /// We exercise the conhost path on purpose: on other terminals the
+    /// per-row CUP+EL wipe clears every row regardless, masking a missing
+    /// invalidate() — which is exactly why the bug is conhost-only and why a
+    /// default-path test wouldn't distinguish fixed from broken.
+    #[test]
+    fn on_resize_cold_starts_in_legacy_conhost() {
+        let w: u16 = 40;
+        let h: u16 = 12;
+        let (mut r, buf) = new_capturing(w, h);
+        r.caps.legacy_conhost = true;
+
+        // Warm: paint footer + a body line so prev_cells is populated, like a
+        // live session right before the user drags the window.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::AssistantText("pre-resize content\n".into()));
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // Shrink height → footer moves up; the old footer rows must be
+        // cleared. on_resize repaints internally (paint_frame → render_diff),
+        // so the cold-start (if any) lands in `buf` during this call.
+        let new_h: u16 = h - 3;
+        r.on_resize(w, new_h);
+
+        let out_bytes = buf.lock().unwrap().clone();
+        let out = String::from_utf8_lossy(&out_bytes);
+        // ED2 emits no per-row CUP+EL and the body re-emit only covers body
+        // rows, so per-row CUP+EL for EVERY row 1..=new_h can only come from
+        // the render_diff cold-start — which fires only if on_resize
+        // invalidated the screen.
+        for row in 1..=(new_h as usize) {
+            let needle = format!("\x1b[{};1H\x1b[K", row);
+            assert!(
+                out.contains(&needle),
+                "on_resize must cold-start (per-row CUP+EL) for row {} on legacy \
+                 conhost; without screen.invalidate() the footer rows are never \
+                 cleared and the old footer ghosts under the new one (Windows \
+                 resize footer-stacking bug).\nbytes: {:?}",
+                row,
+                out
             );
         }
     }

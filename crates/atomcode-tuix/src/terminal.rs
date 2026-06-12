@@ -36,6 +36,26 @@ pub struct EnvView {
     /// Any value here means the user is on a modern emulator that
     /// almost certainly ships a Unicode-capable default font.
     pub term_program: Option<String>,
+    /// `TERMINAL_EMULATOR` — set by IntelliJ-platform IDEs (IDEA, Android
+    /// Studio, DevEco Studio, …) to `JetBrains-JediTerm`. The JediTerm
+    /// Swing terminal grids CJK at 2 cells (same as us) but its paint
+    /// layer has no font fallback, so a fallback CJK glyph with a ~1-cell
+    /// advance is drawn CENTERED in the 2-cell box — leaving the 2nd
+    /// column visually blank. That turns our per-cell-CUP positioning into
+    /// a visible "每个汉字后空一格" gap, and the per-`─`-CUP rule into a
+    /// fragmented line. Captured here so the render layer can switch to a
+    /// per-row tight repaint that streams each changed row as one
+    /// contiguous run (one CUP, terminal-advance positioning) instead of
+    /// one CUP per non-ASCII cell. Read in exactly one other place
+    /// (`event_loop/commands.rs`, for QR aspect tolerance).
+    pub terminal_emulator: Option<String>,
+    /// `ATOMCODE_JEDITERM` manual override for the JediTerm render quirk:
+    /// `1`/`true` forces the JediTerm tight-repaint path on, anything else
+    /// (`0`/`false`) forces it off, unset = auto-detect via
+    /// `terminal_emulator`. Escape hatch for two cases: (a) DevEco/IDE
+    /// launchers that don't propagate `TERMINAL_EMULATOR` into our process
+    /// (so auto-detect misses), and (b) A/B testing the path on-device.
+    pub force_jediterm: Option<bool>,
 }
 
 impl EnvView {
@@ -52,6 +72,10 @@ impl EnvView {
             is_windows: cfg!(target_os = "windows"),
             wt_session: std::env::var("WT_SESSION").ok(),
             term_program: std::env::var("TERM_PROGRAM").ok(),
+            terminal_emulator: std::env::var("TERMINAL_EMULATOR").ok(),
+            force_jediterm: std::env::var("ATOMCODE_JEDITERM")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         }
     }
 }
@@ -95,6 +119,16 @@ pub struct TerminalCaps {
     /// clear on resize instead of the row-by-row burst (see
     /// `RetainedRenderer::on_resize`). Always `false` off Windows.
     pub legacy_conhost: bool,
+    /// JediTerm (IntelliJ-platform terminal: DevEco Studio, Android
+    /// Studio, IDEA). Detected via `TERMINAL_EMULATOR == "JetBrains-JediTerm"`
+    /// or forced by `ATOMCODE_JEDITERM`. **Deliberately inert w.r.t. every
+    /// other capability** — it does NOT feed `unicode_symbols`/`legacy_conhost`
+    /// (so it can't change the chevron, ASCII fallback, or resize path). Its
+    /// only consumer is `Screen`'s per-row tight-repaint path, which streams
+    /// each changed row as one contiguous run to avoid the per-cell-CUP gap +
+    /// per-`─`-CUP rule fragmentation that JediTerm's no-fallback paint layer
+    /// produces. See `EnvView::terminal_emulator` for the full mechanism.
+    pub jediterm: bool,
 }
 
 impl TerminalCaps {
@@ -131,6 +165,14 @@ impl TerminalCaps {
             !env.force_ascii && !is_dumb && !ascii_locale && !windows_legacy_console
         };
 
+        // JediTerm: manual override wins, else auto-detect via the exact
+        // `TERMINAL_EMULATOR` string IntelliJ-platform terminals export.
+        // INTENTIONALLY computed AFTER (and independent of) unicode_symbols /
+        // legacy_conhost above — it must not perturb any existing decision.
+        let jediterm = env.force_jediterm.unwrap_or_else(|| {
+            env.terminal_emulator.as_deref() == Some("JetBrains-JediTerm")
+        });
+
         Self {
             tty,
             colors: tty && !env.no_color && !is_dumb,
@@ -140,6 +182,7 @@ impl TerminalCaps {
             scroll_region: tty && !is_dumb,
             unicode_symbols,
             legacy_conhost: windows_legacy_console,
+            jediterm,
         }
     }
 
@@ -181,6 +224,8 @@ mod tests {
             is_windows: false,
             wt_session: None,
             term_program: None,
+            terminal_emulator: None,
+            force_jediterm: None,
         }
     }
 
@@ -345,6 +390,72 @@ mod tests {
             ..env()
         });
         assert!(caps.unicode_symbols);
+    }
+
+    // ── JediTerm detection (DevEco Studio / IntelliJ-platform terminals) ──
+
+    #[test]
+    fn jediterm_detected_from_terminal_emulator() {
+        let caps = TerminalCaps::from_env(EnvView {
+            terminal_emulator: Some("JetBrains-JediTerm".to_string()),
+            ..env()
+        });
+        assert!(caps.jediterm, "exact TERMINAL_EMULATOR string → jediterm");
+    }
+
+    #[test]
+    fn jediterm_false_for_other_or_absent_emulator() {
+        let other = TerminalCaps::from_env(EnvView {
+            terminal_emulator: Some("xterm".to_string()),
+            ..env()
+        });
+        assert!(!other.jediterm);
+        assert!(!TerminalCaps::from_env(env()).jediterm, "absent → false");
+    }
+
+    #[test]
+    fn atomcode_jediterm_env_overrides_autodetect() {
+        // Forced ON without TERMINAL_EMULATOR (DevEco launcher dropped it).
+        let on = TerminalCaps::from_env(EnvView {
+            force_jediterm: Some(true),
+            ..env()
+        });
+        assert!(on.jediterm);
+        // Forced OFF wins even when the emulator string is present.
+        let off = TerminalCaps::from_env(EnvView {
+            terminal_emulator: Some("JetBrains-JediTerm".to_string()),
+            force_jediterm: Some(false),
+            ..env()
+        });
+        assert!(!off.jediterm);
+    }
+
+    /// The jediterm flag MUST NOT perturb any pre-existing capability —
+    /// it's a pure additive signal for the render layer. Same env, with
+    /// vs without the JediTerm marker, must agree on unicode_symbols,
+    /// legacy_conhost, colors, and the chevron.
+    #[test]
+    fn jediterm_flag_is_inert_for_other_caps() {
+        let base = TerminalCaps::from_env(env());
+        let jt = TerminalCaps::from_env(EnvView {
+            terminal_emulator: Some("JetBrains-JediTerm".to_string()),
+            ..env()
+        });
+        assert_eq!(base.unicode_symbols, jt.unicode_symbols);
+        assert_eq!(base.legacy_conhost, jt.legacy_conhost);
+        assert_eq!(base.colors, jt.colors);
+        assert_eq!(base.prompt_chevron(), jt.prompt_chevron());
+        // And on bare Windows the JediTerm marker still leaves the
+        // legacy-console ASCII fallback exactly as it was.
+        let win = TerminalCaps::from_env(EnvView { is_windows: true, ..env() });
+        let win_jt = TerminalCaps::from_env(EnvView {
+            is_windows: true,
+            terminal_emulator: Some("JetBrains-JediTerm".to_string()),
+            ..env()
+        });
+        assert_eq!(win.unicode_symbols, win_jt.unicode_symbols);
+        assert_eq!(win.legacy_conhost, win_jt.legacy_conhost);
+        assert!(win_jt.jediterm);
     }
 
     #[test]

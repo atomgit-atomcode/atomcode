@@ -59,6 +59,9 @@
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   color: var(--app-primary-foreground);
 }
 
@@ -223,6 +226,22 @@
   text-overflow: ellipsis;
 }
 
+.user-message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.user-message-image {
+  width: min(180px, 100%);
+  max-height: 180px;
+  object-fit: contain;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-primary-background);
+}
+
 /* === Assistant Message === */
 .assistant-message-content {
   font-size: 13px;
@@ -273,15 +292,20 @@
 /* === Markdown Root === */
 .markdown-root {
   text-wrap: auto;
-  overflow-x: hidden;
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
+  white-space: normal;
+  overflow-wrap: break-word;
 }
 
-.markdown-root p { white-space: pre-wrap; margin-top: 0.1em; margin-bottom: 0.2em; }
+.markdown-root p { white-space: pre-wrap; margin-top: 0.1em; margin-bottom: 0.2em; overflow-wrap: anywhere; }
 .markdown-root ul, .markdown-root ol { padding-inline-start: 2em; margin-bottom: 0.4em; }
-.markdown-root li { margin-bottom: 2px; }
+.markdown-root li { margin-bottom: 2px; overflow-wrap: anywhere; }
 .markdown-root h1, .markdown-root h2, .markdown-root h3, .markdown-root h4 { margin-top: 0.8em; margin-bottom: 0.3em; font-weight: 600; }
 .markdown-root > :first-child { margin-top: 0; }
+.markdown-root > :last-child { margin-bottom: 0; }
 .markdown-root h1 { font-size: 1.3em; }
 .markdown-root h2 { font-size: 1.15em; }
 .markdown-root h3 { font-size: 1.05em; }
@@ -309,6 +333,53 @@
 }
 
 .markdown-root pre code { padding: 0; }
+
+.markdown-root .ansi-fg-black { color: var(--vscode-terminal-ansiBlack, #000000); }
+.markdown-root .ansi-fg-red { color: var(--vscode-terminal-ansiRed, #cd3131); }
+.markdown-root .ansi-fg-green { color: var(--vscode-terminal-ansiGreen, #00bc00); }
+.markdown-root .ansi-fg-yellow { color: var(--vscode-terminal-ansiYellow, #949800); }
+.markdown-root .ansi-fg-blue { color: var(--vscode-terminal-ansiBlue, #0451a5); }
+.markdown-root .ansi-fg-magenta { color: var(--vscode-terminal-ansiMagenta, #bc05bc); }
+.markdown-root .ansi-fg-cyan { color: var(--vscode-terminal-ansiCyan, #0598bc); }
+.markdown-root .ansi-fg-white { color: var(--vscode-terminal-ansiWhite, #555555); }
+.markdown-root .ansi-fg-bright-black { color: var(--vscode-terminal-ansiBrightBlack, #666666); }
+.markdown-root .ansi-fg-bright-red { color: var(--vscode-terminal-ansiBrightRed, #cd3131); }
+.markdown-root .ansi-fg-bright-green { color: var(--vscode-terminal-ansiBrightGreen, #14ce14); }
+.markdown-root .ansi-fg-bright-yellow { color: var(--vscode-terminal-ansiBrightYellow, #b5ba00); }
+.markdown-root .ansi-fg-bright-blue { color: var(--vscode-terminal-ansiBrightBlue, #0451a5); }
+.markdown-root .ansi-fg-bright-magenta { color: var(--vscode-terminal-ansiBrightMagenta, #bc05bc); }
+.markdown-root .ansi-fg-bright-cyan { color: var(--vscode-terminal-ansiBrightCyan, #0598bc); }
+.markdown-root .ansi-fg-bright-white { color: var(--vscode-terminal-ansiBrightWhite, #a5a5a5); }
+
+/* GFM tables are often wider than the VS Code sidebar. Keep the message in
+   bounds and make the table itself horizontally scrollable. */
+.markdown-root table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  font-size: 0.95em;
+}
+
+.markdown-root th,
+.markdown-root td {
+  border: 1px solid var(--app-primary-border-color);
+  padding: 5px 10px;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.markdown-root th {
+  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
+  font-weight: 600;
+}
+
+.markdown-root tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--app-secondary-background), transparent 55%);
+}
 
 /* === Code Block === */
 .code-block-wrapper { position: relative; margin: 10px 0; }

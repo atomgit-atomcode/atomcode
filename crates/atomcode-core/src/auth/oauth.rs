@@ -61,19 +61,24 @@ pub fn user_url() -> String { format!("{}/api/v5/user", platform_base_url()) }
 /// OAuth-side request must carry the token or AtomGit's gate rejects it.
 /// Centralized so a future UA format change (e.g. append install-id)
 /// happens in one spot rather than at each `Client::new()` site.
-fn blocking_client() -> reqwest::blocking::Client {
+fn blocking_client() -> Result<reqwest::blocking::Client> {
     // Hard timeouts here too — the `get_valid_token` path calls
     // `refresh_access_token` synchronously whenever a stored token
     // looks expired, and that runs on the main TUI thread (via
     // `Client::from_stored_auth` → `/status`, drift monitor, etc.).
     // Without a cap, a slow or unreachable OAuth server would hang
     // the UI indefinitely. Same budget as the coding-plan client.
+    //
+    // Return `Result` rather than falling back to `Client::new()`: that
+    // helper *panics* on TLS/resolver init failure, and with `panic =
+    // "abort"` that takes down the whole process. `build()` reports the
+    // same failure as a catchable `Err` — propagate it.
     reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .user_agent(crate::ATOMCODE_USER_AGENT)
         .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        .context("failed to build OAuth HTTP client")
 }
 
 fn pending_invite_for_login() -> (Option<String>, Option<uuid::Uuid>) {
@@ -366,10 +371,16 @@ impl LoginSession {
             .json()
             .context("Failed to parse /auth/token response")?;
 
+        // `duration_since(UNIX_EPOCH)` only fails when the wall clock
+        // is before 1970 — a misconfigured VM clock at boot is the
+        // realistic trigger. Treat that as `created_at = 0`: the
+        // expiry check downstream will see the token as immediately
+        // stale and force a refresh / re-login rather than panicking
+        // out of the OAuth callback (#45).
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
 
         let auth_info = AuthInfo {
             access_token: token_resp.access_token,
@@ -394,10 +405,17 @@ impl LoginSession {
             // (e.g. before scope is entered, or from spawned tasks) inherit it.
             t.set_account_id(Some(auth_info.user.id.to_string()));
             let (invite_code, install_uuid) = pending_invite_for_login();
-            t.track(Event::LoginSuccess {
+            let event = Event::LoginSuccess {
                 invite_code,
                 install_uuid,
-            });
+            };
+            if let Err(e) = t.track_durable_sync(event.clone()) {
+                tracing::warn!(
+                    ?e,
+                    "login_success durable enqueue failed; falling back to async telemetry"
+                );
+                t.track(event);
+            }
         }
 
         Ok(auth_info)
@@ -409,7 +427,13 @@ impl LoginSession {
 /// user action — separated from polling so callers can render the URL
 /// before yielding control to the wait loop.
 pub fn start_login() -> Result<LoginSession> {
-    let client = reqwest::blocking::Client::new();
+    // `Client::new()` panics on TLS/resolver init failure; with `panic =
+    // "abort"` that aborts the process before the QR can even render.
+    // Build fallibly and surface a recoverable error instead.
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(crate::ATOMCODE_USER_AGENT)
+        .build()
+        .context("failed to build OAuth login HTTP client")?;
     let resp: PlatformLoginResponse = client
         .get(platform_login_url())
         .query(&[("provider", "atomgit")])
@@ -502,10 +526,13 @@ fn pasted_state(url: &str) -> Option<String> {
 #[allow(dead_code)]
 fn generate_state() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // Pre-1970 wall clock falls back to 0 instead of panicking. The
+    // value is folded into a CSRF state string so a deterministic
+    // 0-derived value is fine for the dead-code path (#45 audit).
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     format!("atomcode_{}", timestamp)
 }
 
@@ -529,6 +556,8 @@ pub fn open_browser(url: &str) -> Result<()> {
 pub fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("xdg-open")
         .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .context("Failed to open browser")?;
     Ok(())
@@ -858,7 +887,7 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         .as_deref()
         .context("No refresh_token available — please /login again")?;
 
-    let client = blocking_client();
+    let client = blocking_client()?;
 
     // Call Platform Broker API for refresh
     let response = client
@@ -888,10 +917,13 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
 
     let broker_resp: BrokerResponse = response.json().context("Failed to parse broker response")?;
 
+    // Pre-1970 wall clock would otherwise panic on `unwrap` and lose
+    // the refresh result. Falling back to 0 forces the next token
+    // check to refresh again — safer than crashing the broker path.
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
 
     let new_auth = AuthInfo {
         access_token: broker_resp.access_token,
@@ -926,10 +958,14 @@ pub fn get_valid_token() -> Result<String> {
 
     // Check if token is expired (with 5-minute safety margin)
     if let Some(expires_in) = auth.expires_in {
+        // A pre-1970 wall clock would otherwise panic here — and
+        // get_valid_token runs on EVERY authenticated API call (atomgit /
+        // coding_plan clients), not just /login. Treat that as expired
+        // (now = i64::MAX) so it force-refreshes instead of crashing (#45).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX);
         let expires_at = auth.created_at + expires_in;
 
         if now >= expires_at - 300 {

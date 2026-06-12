@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 use base64::Engine;
 use atomcode_core::conversation::message::ImagePart;
 
-use crate::commands::{parse_slash_line, CommandRegistry};
+use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
 use crate::input::history::History;
 use crate::input::key_action::{classify, Action};
 use crate::input::InputEvent;
@@ -817,7 +817,7 @@ pub struct LoopCtx {
     pub caps: crate::terminal::TerminalCaps,
     /// Session loaded by the CLI auto-continue path (`atomcode -c` /
     /// `--continue`). Replayed into scrollback AND restored into the
-    /// agent's model context via `AgentCommand::SetMessages` on first
+    /// agent's model context via `AgentCommand::SetConversation` on first
     /// `run_loop` entry, then dropped — matching `/resume` behaviour.
     pub replay_on_start: Option<atomcode_core::session::Session>,
     /// Lazy file/dir index for `@`-mention popup. Built on first `@`
@@ -844,10 +844,25 @@ pub struct LoopCtx {
     /// Shown as a red "⚠ BYPASS" badge in the status line so the
     /// user is always aware that all tool calls are auto-approved.
     pub dangerously_skip_permissions: bool,
+    /// When true, AtomCode is running with administrator/root privileges.
+    /// A warning banner is shown in scrollback on startup.
+    pub is_admin: bool,
     /// When `/guide <topic>` triggers auto-install of the "ask" skill,
     /// the topic is stashed here so `handle_plugin_job_event` can
     /// auto-invoke the skill once installation completes.
     pub pending_guide_topic: Option<String>,
+    /// Current reasoning_effort for the active provider's model.
+    /// None = not set (API uses its own default). Cycled via Ctrl+T.
+    pub reasoning_effort: Option<String>,
+    /// Transient status-line hint with auto-dismiss.
+    pub transient_hint: std::sync::Arc<std::sync::Mutex<Option<TransientHint>>>,
+}
+
+/// A transient hint shown on the status line, with auto-dismiss deadline.
+#[derive(Debug, Clone)]
+pub struct TransientHint {
+    pub text: String,
+    pub deadline: std::time::Instant,
 }
 
 /// Memoised result of the most recent clipboard probe. The hash is a
@@ -1732,6 +1747,41 @@ mod menu_tests {
     }
 
     #[test]
+    fn effort_top_level_is_gateway_only() {
+        // `/effort` at the top level surfaces the gateway entry, not the
+        // individual high/max/off choices (those live behind `/effort `).
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let items = build_menu_items("/effort", 0, &reg, &custom, None, None)
+            .expect("/effort gateway must appear");
+        assert!(items.iter().any(|(n, _)| n == "effort"));
+        assert!(!items.iter().any(|(n, _)| n == "high" || n == "max" || n == "off"));
+    }
+
+    #[test]
+    fn effort_sub_mode_lists_and_filters_choices() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        // `/effort ` (trailing space) → all three choices.
+        let all = build_menu_items("/effort ", 0, &reg, &custom, None, None)
+            .expect("/effort sub-mode must list choices");
+        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"high") && names.contains(&"max") && names.contains(&"off"),
+            "got: {names:?}"
+        );
+        // Prefix narrows.
+        let hi = build_menu_items("/effort hi", 0, &reg, &custom, None, None)
+            .expect("`hi` must match high");
+        assert_eq!(hi.len(), 1);
+        assert_eq!(hi[0].0, "high");
+        // No match → no menu.
+        assert!(build_menu_items("/effort zz", 0, &reg, &custom, None, None).is_none());
+        // A chosen value followed by a space (typing past) hides the menu.
+        assert!(build_menu_items("/effort high ", 0, &reg, &custom, None, None).is_none());
+    }
+
+    #[test]
     fn no_skill_registry_is_no_op() {
         // Ensures the legacy call path (None) keeps working.
         let reg = CommandRegistry::builtin();
@@ -2276,6 +2326,32 @@ mod tool_format_tests {
         assert_eq!(display_tool_name("_x"), "X");
     }
 
+    /// MCP tool names arrive on the wire as `mcp__<server>__<tool>` —
+    /// the double underscores carry meaning. Naive PascalCase folds the
+    /// three parts into one blob (`McpZouwuQueryRequirements`), which
+    /// the issue reporter (#299) couldn't visually parse. Render with
+    /// middle-dot separators instead.
+    #[test]
+    fn display_tool_name_splits_mcp_server_and_tool() {
+        assert_eq!(
+            display_tool_name("mcp__zouwu__query"),
+            "mcp · zouwu · query"
+        );
+        assert_eq!(
+            display_tool_name("mcp__zouwu-mcp-server__query_requirements"),
+            "mcp · zouwu-mcp-server · query_requirements"
+        );
+    }
+
+    /// Defensive: an `mcp__`-prefixed name that's missing the second
+    /// `__` boundary (e.g. partial / malformed wire name) falls back
+    /// to the generic PascalCase path rather than panicking on a
+    /// missing split.
+    #[test]
+    fn display_tool_name_mcp_missing_second_separator_falls_back() {
+        assert_eq!(display_tool_name("mcp__lonely"), "McpLonely");
+    }
+
     /// Short form strips the redundant noun suffix so batch UI shows
     /// `Read(mod.rs)` instead of `ReadFile(mod.rs)` — matches CC's
     /// function-call-style tool labels. Strip list is generic
@@ -2296,6 +2372,22 @@ mod tool_format_tests {
         assert_eq!(display_tool_name_short("search_replace"), "SearchReplace");
         assert_eq!(display_tool_name_short("web_fetch"), "WebFetch");
         assert_eq!(display_tool_name_short("blast_radius"), "BlastRadius");
+    }
+
+    /// The short form must NOT strip `_file`/`_files`/`_directory` from an
+    /// MCP tool name — that suffix is part of the real tool, not a redundant
+    /// noun. `mcp__fs__read_file` stays `mcp · fs · read_file`, not
+    /// `mcp · fs · read`.
+    #[test]
+    fn display_tool_name_short_keeps_mcp_suffix() {
+        assert_eq!(
+            display_tool_name_short("mcp__fs__read_file"),
+            "mcp · fs · read_file"
+        );
+        assert_eq!(
+            display_tool_name_short("mcp__playwright-mcp-server__browser_snapshot"),
+            "mcp · playwright-mcp-server · browser_snapshot"
+        );
     }
 
     #[test]
@@ -2549,71 +2641,69 @@ mod tool_format_tests {
 
     #[test]
     fn summarise_single_line_returned_as_is() {
-        assert_eq!(summarise("ok", true), "ok");
+        assert_eq!(summarise("ok"), "ok");
     }
 
     #[test]
     fn summarise_multi_line_adds_line_count() {
-        let out = summarise("first line\nsecond line\nthird line", true);
+        let out = summarise("first line\nsecond line\nthird line");
         assert!(out.starts_with("first line"));
         assert!(out.contains("(3 lines)"));
     }
 
     #[test]
     fn summarise_empty_string_has_fallback() {
-        let out = summarise("", true);
+        let out = summarise("");
         // Empty input: `lines()` yields nothing, so first falls back
         // to "(no output)" and n==0 means no " (N lines)" suffix.
         assert!(out.contains("(no output)"), "got: {}", out);
     }
 
-    /// Reproduces the bug: a long error message ending in a deep WSL
-    /// path used to silently truncate to 80 cols, leaving `f_stor`
-    /// instead of `f_store` with no `…` to indicate the cut. Failures
-    /// now get a 200-col budget so the path stays intact, and any
-    /// truncation that does happen is visibly marked with `…`.
+    /// A long diagnostic line (e.g. a deep WSL path) must survive intact —
+    /// no pre-truncation. The old code capped at 80/200 cols here; now the
+    /// renderer fits the line to the live screen width, so summarise hands
+    /// back the full text.
     #[test]
-    fn summarise_failure_keeps_long_path_intact() {
+    fn summarise_keeps_long_path_intact() {
         let err = "Error: old_string not found in \
             /mnt/d/docs/work/cangjie/projects/fountain/f_store.";
-        let out = summarise(err, false);
-        assert!(
-            out.contains("/mnt/d/docs/work/cangjie/projects/fountain/f_store"),
-            "the full path must survive the summary. got: {}",
-            out
-        );
-        assert!(
-            !out.contains("f_stor "),
-            "must not produce mid-token truncation like `f_stor ` (note the \
-            trailing space — that's where (N lines) would attach). got: {}",
-            out
-        );
+        let out = summarise(err);
+        assert_eq!(out, err, "the full line must survive un-truncated");
+        assert!(!out.contains('…'));
     }
 
-    /// Sanity check: success summaries still respect the tighter
-    /// 80-col cap (we don't want to flood the body with full status
-    /// output on every successful tool call). When that cap *does*
-    /// truncate, the ellipsis must appear — that was the second leg
-    /// of the fix beyond just enlarging the budget.
+    /// The actual bug fix: a 200-col first line must NOT be pre-truncated
+    /// (the old 80-col success cap chopped it and wasted wide screens).
+    /// The renderer now fits it to the live width, so summarise returns it
+    /// whole.
     #[test]
-    fn summarise_success_truncates_with_ellipsis_at_80() {
-        let long: String = "x".repeat(200);
-        let out = summarise(&long, true);
-        // 80 col cap means at most 80 chars of x, plus the ellipsis.
+    fn summarise_does_not_pretruncate_wide_line() {
+        let line: String = "x".repeat(200);
+        let out = summarise(&line);
+        assert_eq!(out, line, "200-col line must survive un-truncated");
+        assert!(!out.contains('…'));
+    }
+
+    /// The remaining 512-col cap is a pure safety bound, not a display
+    /// decision — it only trips for a pathological multi-KB single line,
+    /// and when it does the cut is marked with `…` and stays bounded.
+    #[test]
+    fn summarise_caps_pathological_line_with_ellipsis() {
+        let long: String = "x".repeat(600);
+        let out = summarise(&long);
         assert!(
             out.ends_with('…'),
-            "ellipsis is the visible-truncation marker. got: {}",
-            out
+            "safety cap must mark the cut. got len {}",
+            out.chars().count()
         );
-        assert!(out.chars().count() <= 80);
+        assert!(out.chars().count() <= 512);
     }
 
-    /// Failure summaries keep the line-count suffix when the original
-    /// was multi-line — the budget bump shouldn't change that behaviour.
+    /// Multi-line output keeps the line-count suffix.
     #[test]
-    fn summarise_failure_multi_line_still_appends_count() {
+    fn summarise_multi_line_still_appends_count() {
         let err = "Error: foo\nbar\nbaz";
-        let out = summarise(err, false);
+        let out = summarise(err);
         assert!(out.starts_with("Error: foo"));
         assert!(out.contains("(3 lines)"));
     }
@@ -2781,6 +2871,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             crate::i18n::t(crate::i18n::Msg::BypassWarningBanner).into_owned(),
         ));
     }
+    // Warn when running with admin/root privileges so the user is aware
+    // the model can access system files beyond the project directory.
+    if ctx.is_admin {
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::AdminWarningBanner).into_owned(),
+        ));
+    }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
     // printing to stdout, so the user sees the ✓/✗ lines in the chat
@@ -2853,14 +2950,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // working dir (via `atomcode -c` / `--continue`), replay its messages
     // into scrollback AND restore the agent's model context so follow-up
     // questions can reference prior conversation. This mirrors the `/resume`
-    // slash command's behaviour: visual replay + AgentCommand::SetMessages.
+    // slash command's behaviour: visual replay + AgentCommand::SetConversation.
     if let Some(session) = ctx.replay_on_start.take() {
         if !session.messages.is_empty() {
             crate::modals::session_picker::replay_session(renderer, &session, false);
             // Sync messages into the agent loop so the LLM has full context.
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SetMessages(session.messages.clone()))
+                .send(AgentCommand::SetConversation(
+                    session.to_conversation_snapshot(),
+                ))
                 .ok();
             // Continue accumulating into the same session file — future
             // TurnComplete saves overwrite it instead of creating a new one.
@@ -3046,6 +3145,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     #[cfg(windows)]
     let mut win_ctrl_c = tokio::signal::windows::ctrl_c()?;
 
+    sync_reasoning_effort_from_provider(&mut ctx);
+
     loop {
         #[cfg(unix)]
         tokio::select! {
@@ -3081,8 +3182,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // Fires once when the detached startup check resolves with a
             // positive result. Idle-only: in Streaming the spinner tick
             // redraws frequently enough that the hint picks up naturally.
+            // Preserve an active `/` command menu — don't blindly call
+            // `redraw_idle_plain(menu: None)` which would erase it.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
-                redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                let items = menu_for_display(&app.buf, &ctx);
+                if let Some(items) = items {
+                    redraw_with_menu(
+                        &app.buf,
+                        &items,
+                        app.menu.selected,
+                        &app.state,
+                        &ctx,
+                        renderer,
+                    );
+                } else {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                }
             }
 
             // ── OAuth poll thread results ──
@@ -3464,8 +3579,23 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Version-check wake ──
+            // Must check for an active `/` command menu before calling
+            // `redraw_idle_plain` — otherwise the menu gets erased when
+            // this fires a second or two after the user types `/`.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
-                redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                let items = menu_for_display(&app.buf, &ctx);
+                if let Some(items) = items {
+                    redraw_with_menu(
+                        &app.buf,
+                        &items,
+                        app.menu.selected,
+                        &app.state,
+                        &ctx,
+                        renderer,
+                    );
+                } else {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                }
             }
 
             // ── OAuth poll thread results ──
@@ -4058,6 +4188,13 @@ fn handle_input(
                 }
             }
             renderer.on_resize(cols, rows);
+            // A resize invalidates any open modal's cached overlay
+            // geometry (it was built for the old size). Rebuild it now so
+            // the window re-centres at the new dimensions instead of
+            // lingering stale / mispositioned until the next keypress.
+            if let Some(m) = app.active_modal.as_ref() {
+                m.draw(&app.buf, &app.state, ctx, renderer);
+            }
             for ev in deferred {
                 handle_input(app, ctx, renderer, ev)?;
             }
@@ -4559,6 +4696,26 @@ fn build_menu_items(
         return if items.is_empty() { None } else { Some(items) };
     }
 
+    // Two-level palette for `/effort` (same gateway pattern as `/skills`).
+    // Once `/effort ` (trailing space) is in the buffer, list the three
+    // reasoning-effort choices; submission commits `/effort <choice>`.
+    if let Some(after) = buf.strip_prefix("/effort ") {
+        if after.contains(char::is_whitespace) {
+            return None;
+        }
+        let prefix = after.to_ascii_lowercase();
+        let items: Vec<(String, String)> = [
+            ("high", "Deeper reasoning (DeepSeek V4)"),
+            ("max", "Maximum reasoning depth (DeepSeek V4)"),
+            ("off", "Use the API default"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| n.starts_with(prefix.as_str()))
+        .map(|(n, d)| (n.to_string(), d.to_string()))
+        .collect();
+        return if items.is_empty() { None } else { Some(items) };
+    }
+
     let rest = &buf[1..];
     // Once a space appears (user is typing args), stop showing menu.
     if rest.contains(char::is_whitespace) {
@@ -4806,6 +4963,23 @@ fn handle_idle_key(
                         ));
                     }
 
+                    // `/effort` gateway: render the high/max/off sub-menu
+                    // immediately so it doesn't blink out and reappear.
+                    if name == "effort" {
+                        if let Some(items) = build_menu_items(
+                            &app.buf.text,
+                            app.buf.cursor,
+                            &ctx.commands,
+                            &ctx.custom_commands,
+                            Some(&ctx.skill_registry),
+                            Some(&ctx.file_index),
+                        ) {
+                            app.menu.selected = 0;
+                            redraw_with_menu(&app.buf, &items, 0, &app.state, ctx, renderer);
+                            return Ok(());
+                        }
+                    }
+
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     return Ok(());
                 }
@@ -4821,6 +4995,52 @@ fn handle_idle_key(
                 // skills always fired without args, and there was no
                 // way to pass `argument` into the skill from the
                 // picker.
+                // Sub-mode submit for `/effort`: the selected item is one of
+                // high|max|off. Tab completes to `/effort <choice> ` (parked,
+                // consistent with the top-level Tab≠Enter rule); Enter commits
+                // `/effort <choice>` and executes via the regular dispatch path.
+                let in_effort_sub_mode = app.buf.text.starts_with("/effort ");
+                if in_effort_sub_mode {
+                    if code == KeyCode::Tab {
+                        app.buf.text = format!("/effort {} ", name);
+                        app.buf.cursor = app.buf.text.len();
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        return Ok(());
+                    }
+                    let committed = format!("/effort {}", name);
+                    renderer.render(UiLine::ClearTransient);
+                    renderer.render(UiLine::User(committed.clone()));
+                    app.buf.text.clear();
+                    app.buf.cursor = 0;
+                    ctx.history.push(crate::input::history::HistoryEntry {
+                        text: committed.clone(),
+                        images: Vec::new(),
+                    });
+                    if let Some((cmd, arg)) = parse_slash_line(&committed) {
+                        execute_slash_command(
+                            cmd,
+                            arg,
+                            &mut app.state,
+                            ctx,
+                            renderer,
+                            &mut app.active_modal,
+                            &mut app.fixissue_pending,
+                            &mut app.fixissue_buffer,
+                            &mut app.setup_pending,
+                        )?;
+                        if matches!(app.state.phase, UiPhase::Idle) {
+                            redraw_after_slash(
+                                &app.buf,
+                                &app.state,
+                                ctx,
+                                &app.active_modal,
+                                renderer,
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+
                 let in_skills_sub_mode = app.buf.text.starts_with("/skills ");
                 if in_skills_sub_mode {
                     app.buf.text = format!("/skills {} ", name);
@@ -4961,6 +5181,29 @@ fn handle_idle_key(
         // (the `v` char will be inserted as a regular character via classify).
     }
 
+    // Ctrl+T cycles reasoning_effort
+    if code == KeyCode::Char('t') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        if !reasoning_effort_applicable_on_provider(ctx) {
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::ReasoningEffortNoEffect).into_owned(),
+            ));
+            renderer.flush();
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            return Ok(());
+        }
+        let new_val = app.state.cycle_reasoning_effort();
+        ctx.reasoning_effort = new_val.map(|s| s.to_string());
+        persist_reasoning_effort(ctx);
+        let msg = match new_val {
+            Some(v) => format!("  reasoning_effort → {}\n", v),
+            None => "  reasoning_effort cleared (API default)\n".into(),
+        };
+        renderer.render(UiLine::CommandOutput(msg));
+        renderer.flush();
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
     // Multi-line cursor nav (idle path). Mirror of the streaming-mode
     // handler: in a buffer with embedded newlines, plain Up/Down walks
     // through the lines first; only when the cursor is already on the
@@ -5091,7 +5334,12 @@ fn handle_idle_key(
             // "Unknown command: /foo" dead-end.
             let as_slash = parse_slash_line(&line).filter(|(cmd, _)| {
                 ctx.commands.find(cmd).is_some()
-                    || ctx.custom_commands.get(&cmd.to_ascii_lowercase()).is_some()
+                    // Use `resolve()` (not exact-key `get()`) so a plugin
+                    // command keyed `plugin:name` is recognised when typed as
+                    // the bare `/name` — matching how dispatch renders it.
+                    // Otherwise `/wechat` (keyed `weixin:wechat`) fails the
+                    // gate and falls through to the agent as plain text.
+                    || ctx.custom_commands.resolve(cmd).is_some()
                     || ctx
                         .skill_registry
                         .read()
@@ -5099,7 +5347,20 @@ fn handle_idle_key(
                         .and_then(|r| r.get(cmd).map(|s| s.user_invocable))
                         .unwrap_or(false)
             });
-            if let Some((cmd, arg)) = as_slash {
+            if let Some(bash_cmd) = parse_bash_command(&line) {
+                // `!cmd` — user-invoked bash mode. Echo the line, hand off
+                // to the agent loop (executes + records context, no turn).
+                renderer.render(UiLine::User(line.clone()));
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::LocalShell { cmd: bash_cmd.to_string() })
+                    .ok();
+                // `!` lines carry no pastes/images; submit consumes the buffer.
+                app.buf.clear_pastes();
+                if matches!(app.state.phase, UiPhase::Idle) {
+                    redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                }
+            } else if let Some((cmd, arg)) = as_slash {
                 // Slash commands carry no image markers — echo the
                 // user line as-typed, before dispatch.
                 renderer.render(UiLine::User(line.clone()));
@@ -5556,12 +5817,20 @@ fn handle_streaming_key(
     if code == KeyCode::Char('o') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         app.state.toggle_tool_output();
         // Show feedback to the user about the current state
-        let status = if app.state.show_tool_output {
-            "  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+O to hide)\n"
+        // Use muted style matching ToolResult's summary_style:
+        // light theme → SGR 90 (DarkGrey), dark theme → SGR 2 (faint)
+        let reset = "\x1b[0m";
+        let mute = if crate::highlight::theme::is_light_for_render() {
+            "\x1b[90m"
         } else {
-            "  ○ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
+            "\x1b[2m"
         };
-        renderer.render(UiLine::CommandOutput(status.to_string()));
+        let status = if app.state.show_tool_output {
+            format!("{mute}  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+o to hide){reset}\n")
+        } else {
+            format!("{mute}  ○ Verbose mode disabled (Ctrl+o to show tool output + reasoning){reset}\n")
+        };
+        renderer.render(UiLine::CommandOutput(status));
         renderer.flush();
         draw_spinner_now(
             &mut app.state,
@@ -5852,15 +6121,17 @@ fn handle_streaming_key(
 /// (`current_live_session().approve`), exactly like the webui's
 /// `/live/permission`. Sending it to the TUI agent (which isn't running this
 /// turn) leaves the tool blocked forever: the "Running … 141s, and the webui
-/// approval card never closes" bug. `ApproveToolAlways` degrades to `Allow`
-/// here — the live approver has no persistent "always" slot, matching the
-/// webui path. In normal (non-sync) mode the decision goes to the TUI agent
+/// approval card never closes" bug. `ApproveToolAlways` sends `AllowAlways` so
+/// the LiveSession's decider persists a session grant (grant_session /
+/// grant_session_scope), exactly like the webui's "always allow this session"
+/// path. In normal (non-sync) mode the decision goes to the TUI agent
 /// as before.
 fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
     if ctx.sync_forwarder.is_some() {
         let decision = match cmd {
-            AgentCommand::ApproveTool | AgentCommand::ApproveToolAlways => {
-                atomcode_core::tool::PermissionDecision::Allow
+            AgentCommand::ApproveTool => atomcode_core::tool::PermissionDecision::Allow,
+            AgentCommand::ApproveToolAlways => {
+                atomcode_core::tool::PermissionDecision::AllowAlways
             }
             _ => atomcode_core::tool::PermissionDecision::Deny,
         };
@@ -6257,10 +6528,12 @@ fn handle_agent_event(
             pending_tools.insert(id, (display.clone(), detail, true));
             state.on_tool_call_started(&display);
         }
-        AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
-            // Display real-time tool output (e.g., bash stdout/stderr)
-            // Only show when the user has enabled it via Ctrl+O
-            if state.show_tool_output {
+        AgentEvent::ToolOutputChunk { call_id, chunk } => {
+            // Display real-time tool output (e.g., bash stdout/stderr).
+            // Normally gated behind Ctrl+O verbose mode, but user-invoked
+            // `!` shell commands always stream in full — the user ran them
+            // precisely to see the output.
+            if state.show_tool_output || call_id.starts_with("local-shell-") {
                 // Append to the scrollback as command output
                 renderer.render(UiLine::CommandOutput(chunk));
                 renderer.flush();
@@ -6377,7 +6650,7 @@ fn handle_agent_event(
                 });
             }
             if !suppress_body_echo {
-                let summary = summarise(&output, success);
+                let summary = summarise(&output);
                 renderer.render(UiLine::ToolResult { success, summary });
             }
             // Collect diff lines into a single batch — N individual
@@ -6434,21 +6707,32 @@ fn handle_agent_event(
             // The previous over-correction (screenshot 44 → 47) showed
             // that "looks like 2 blank lines" is just font line-height
             // padding — the actual row count is 1, which is correct.
-            if name == "bash" && !state.show_tool_output {
-                renderer.render(UiLine::CommandOutput(
-                    "  ○ Press Ctrl+O to show real-time output\n".to_string(),
-                ));
+            if name == "bash"
+                && !state.show_tool_output
+                && !call_id.starts_with("local-shell-")
+            {
+                // Use muted style matching ToolResult's summary_style:
+                // light theme → SGR 90 (DarkGrey), dark theme → SGR 2 (faint)
+                let reset = "\x1b[0m";
+                let mute = if crate::highlight::theme::is_light_for_render() {
+                    "\x1b[90m"
+                } else {
+                    "\x1b[2m"
+                };
+                renderer.render(UiLine::CommandOutput(format!(
+                    "{mute}  ○ Press Ctrl+o to show real-time output{reset}\n",
+                )));
             }
             renderer.flush();
             let _ = name;
         }
         AgentEvent::ApprovalNeeded {
-            tool_name, call, messages, ..
+            tool_name, call, snapshot, ..
         } => {
             // Persist mid-turn messages to session so /bg can recover
             // the conversation even when the turn hasn't finished yet.
-            if !messages.is_empty() {
-                apply_session_messages(&mut ctx.current_session, messages);
+            if !snapshot.messages.is_empty() {
+                apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone());
             }
@@ -6537,7 +6821,7 @@ fn handle_agent_event(
             turn_count,
             tool_call_count,
             stop_reason,
-            messages,
+            snapshot,
         } => {
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
@@ -6599,7 +6883,7 @@ fn handle_agent_event(
             // sessions persist only `messages`, so without this the per-turn
             // token/duration numbers are lost on reload and turns butt together.
             ctx.current_session.turn_stats.push(atomcode_core::session::TurnStat {
-                after_message: messages.len(),
+                after_message: snapshot.messages.len(),
                 turn_count,
                 tool_call_count,
                 duration_ms: duration.as_millis() as u64,
@@ -6608,7 +6892,7 @@ fn handle_agent_event(
             });
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
-            persist_current_session(ctx, messages, renderer);
+            persist_current_session(ctx, snapshot, renderer);
 
             // CodingPlan usage refresh — fire after each completed turn
             // (with cooldown) so the right-aligned hint reflects the
@@ -6671,7 +6955,7 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
-        AgentEvent::TurnCancelled { messages } => {
+        AgentEvent::TurnCancelled { snapshot } => {
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
                 atomcode_core::notify::NotificationEvent::TurnFinished(
@@ -6718,19 +7002,19 @@ fn handle_agent_event(
             think.reset();
             // Save what we did have — a user who Ctrl+C'd mid-stream
             // should still be able to /resume the cleaned conversation.
-            persist_current_session(ctx, messages, renderer);
+            persist_current_session(ctx, snapshot, renderer);
         }
         AgentEvent::ConversationTruncated {
-            messages,
+            snapshot,
             restored_prompt,
             target_n,
             prompts_before,
         } => {
-            let new_len = messages.len();
+            let new_len = snapshot.messages.len();
             // Persist the truncated conversation: messages + prune stale
             // per-turn dividers (anchored by message-count) so /resume won't
             // replay dividers for removed turns.
-            ctx.current_session.messages = messages.clone();
+            ctx.current_session.update_from_conversation_snapshot(snapshot);
             ctx.current_session
                 .turn_stats
                 .retain(|s| s.after_message <= new_len);
@@ -6774,7 +7058,7 @@ fn handle_agent_event(
             renderer.render(UiLine::CommandOutput(line));
             renderer.flush();
         }
-        AgentEvent::Error { error, messages } => {
+        AgentEvent::Error { error, snapshot } => {
             renderer.render(UiLine::Error(error));
             renderer.flush();
             fixissue_pending.take();
@@ -6791,7 +7075,7 @@ fn handle_agent_event(
             // nothing for that conversation. Empty `messages` from
             // the streaming-error forwarder is treated as a no-op
             // by persist_current_session.
-            persist_current_session(ctx, messages, renderer);
+            persist_current_session(ctx, snapshot, renderer);
         }
         AgentEvent::Warning(w) => {
             // Non-fatal — flush a yellow advisory line and let the turn
@@ -6867,6 +7151,19 @@ fn handle_agent_event(
                 ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
                 ctx.runtime_factory.set_working_dir(new_dir.clone());
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
+            }
+        }
+        AgentEvent::ProjectSwitched(new_dir) => {
+            // A webui /cd switched the project directory (delivered via the
+            // live-sync forwarder in sync mode). Follow it: change cwd like
+            // `/cd` (updates runtime_factory + @-file index + recent dirs +
+            // tells the running agent), THEN open a fresh session in the new
+            // dir like `/session`. Distinct from WorkingDirChanged (agent's own
+            // `cd`, conversation preserved). No-op when already there to avoid
+            // resetting on a redundant broadcast.
+            if ctx.working_dir != new_dir {
+                commands::apply_cd(ctx, new_dir);
+                commands::reset_to_new_session(ctx, state, renderer);
             }
         }
         AgentEvent::ContextStats {
@@ -7158,12 +7455,12 @@ fn handle_agent_event(
             }
             renderer.flush();
         }
-        AgentEvent::MessagesSync { messages } => {
+        AgentEvent::MessagesSync { snapshot } => {
             // Response to AgentCommand::SyncMessages. Persist the
             // snapshot to the current session so /bg can recover
             // the conversation state.
-            if !messages.is_empty() {
-                apply_session_messages(&mut ctx.current_session, messages);
+            if !snapshot.messages.is_empty() {
+                apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone());
             }
@@ -7179,6 +7476,19 @@ fn handle_agent_event(
             if running {
                 state.on_submit();
             } else {
+                // Peer's turn finished. In sync mode this is the ONLY
+                // turn-completion signal we get (the forwarder never sends
+                // AgentEvent::TurnComplete), so do the stream finalization
+                // TurnComplete normally performs:
+                //  1. Flush the buffered assistant line. A short reply with no
+                //     trailing newline (e.g. "在的！") otherwise stays parked in
+                //     the renderer's assistant_line_buf and never reaches
+                //     scrollback — the blank-assistant-bubble bug in sync mode.
+                //  2. Reset the <think> stripper between turns so a model that
+                //     left it inside=true can't swallow the next turn's text.
+                renderer.render(UiLine::AssistantLineBreak);
+                renderer.flush();
+                think.reset();
                 state.on_turn_complete();
             }
         }
@@ -7221,13 +7531,13 @@ fn handle_agent_event(
 /// conversation is empty (don't save a blank session).
 fn persist_current_session(
     ctx: &mut LoopCtx,
-    messages: Vec<atomcode_core::conversation::message::Message>,
+    snapshot: atomcode_core::conversation::ConversationSnapshot,
     renderer: &mut dyn Renderer,
 ) {
-    if messages.is_empty() {
+    if snapshot.messages.is_empty() {
         return;
     }
-    apply_session_messages(&mut ctx.current_session, messages);
+    apply_session_snapshot(&mut ctx.current_session, snapshot);
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
     // Surface save failures instead of silently swallowing them.
@@ -7244,14 +7554,14 @@ fn persist_current_session(
     }
 }
 
-pub(crate) fn apply_session_messages(
+pub(crate) fn apply_session_snapshot(
     session: &mut atomcode_core::session::Session,
-    messages: Vec<atomcode_core::conversation::message::Message>,
+    snapshot: atomcode_core::conversation::ConversationSnapshot,
 ) {
-    if messages.is_empty() {
+    if snapshot.messages.is_empty() {
         return;
     }
-    session.messages = messages;
+    session.update_from_conversation_snapshot(snapshot);
     session.touch();
     // Triggers for renaming:
     //   * `default` / `session-<ts>` — never renamed yet
@@ -7299,10 +7609,10 @@ fn is_synthetic_user_text(text: &str) -> bool {
 
 #[cfg(test)]
 mod session_naming_tests {
-    use super::{apply_session_messages, is_synthetic_user_text};
+    use super::{apply_session_snapshot, is_synthetic_user_text};
 
     #[test]
-    fn apply_session_messages_renames_from_first_real_user() {
+    fn apply_session_snapshot_renames_from_first_real_user() {
         use atomcode_core::conversation::message::{Message, Role};
         let mut session = atomcode_core::session::Session::default_session(
             std::path::PathBuf::from("/tmp/project"),
@@ -7312,23 +7622,56 @@ mod session_naming_tests {
             Message::new(Role::User, "implement background sessions\nwith tests"),
         ];
 
-        apply_session_messages(&mut session, messages);
+        apply_session_snapshot(
+            &mut session,
+            atomcode_core::conversation::ConversationSnapshot {
+                messages,
+                cold_summaries: Vec::new(),
+            },
+        );
 
         assert_eq!(session.name, "implement background sessions");
         assert_eq!(session.messages.len(), 2);
     }
 
     #[test]
-    fn apply_session_messages_preserves_custom_name() {
+    fn apply_session_snapshot_preserves_custom_name() {
         use atomcode_core::conversation::message::{Message, Role};
         let mut session = atomcode_core::session::Session::default_session(
             std::path::PathBuf::from("/tmp/project"),
         );
         session.name = "manual name".to_string();
 
-        apply_session_messages(&mut session, vec![Message::new(Role::User, "new task")]);
+        apply_session_snapshot(
+            &mut session,
+            atomcode_core::conversation::ConversationSnapshot {
+                messages: vec![Message::new(Role::User, "new task")],
+                cold_summaries: Vec::new(),
+            },
+        );
 
         assert_eq!(session.name, "manual name");
+    }
+
+    #[test]
+    fn apply_session_snapshot_preserves_cold_summaries() {
+        use atomcode_core::conversation::{
+            message::{Message, Role},
+            ConversationSnapshot,
+        };
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+
+        apply_session_snapshot(
+            &mut session,
+            ConversationSnapshot {
+                messages: vec![Message::new(Role::User, "new task")],
+                cold_summaries: vec!["compressed context".to_string()],
+            },
+        );
+
+        assert_eq!(session.cold_summaries, vec!["compressed context"]);
     }
 
     #[test]
@@ -7540,6 +7883,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         hint,
         mode_indicator,
         bypass_indicator,
+        reasoning_effort: if reasoning_effort_applicable_on_provider(ctx) {
+            ctx.reasoning_effort.clone()
+        } else {
+            None
+        },
         session_name,
     }
 }
@@ -7560,7 +7908,16 @@ fn draw_spinner_now(
     menu_selected: usize,
 ) {
     let frame = state.tick_spinner();
-    let label = format_spinner_label(state, queue_len);
+    // Same source + applicability gate as the status bar's `[high]`, so the
+    // spinner's effort hint and the status line never disagree. (Reading
+    // `state.reasoning_effort` here showed nothing when effort came from the
+    // provider config / webui rather than a Ctrl+T cycle.)
+    let effort = if reasoning_effort_applicable_on_provider(ctx) {
+        ctx.reasoning_effort.as_deref()
+    } else {
+        None
+    };
+    let label = format_spinner_label(state, queue_len, effort);
     let status = build_status(state, ctx);
     let menu = menu_for_display(buf, ctx).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
@@ -7591,18 +7948,34 @@ fn draw_spinner_now(
 /// word (e.g. `Pondering`, `Running ReadFile`); ellipsis + elapsed +
 /// queued suffixes are appended here so format is consistent across
 /// every call site.
-fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
+fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Option<&str>) -> String {
     let base = &state.spinner_label;
     let mut out = format!("{}{}", base, state.ellipsis());
-    // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
-    // `Running ReadFile… 4s`. CC behaviour: timer resets on every
-    // phase transition so the user reads "this thing has been
-    // running for N seconds", not "the whole turn so far is 1301s".
-    if let Some(d) = state.phase_elapsed() {
-        out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
+    // Order matters. The phase clock (`· 372ms`) ticks every frame, and any
+    // segment AFTER a rapidly-changing field shifts on every redraw — which
+    // read as flicker when the elapsed sat in the middle (user report:
+    // `Cogitating… · 372ms · thinking with high effort` jittered the effort
+    // text). So: static segments first, the ticking elapsed dead last.
+    //
+    // Reasoning-effort hint (deepseek-v4 high/max), mirroring CC's
+    // `… · thinking with high effort`. The value comes from the caller (the
+    // ctx-sourced, applicability-gated effort — the SAME source as the status
+    // bar's `[high]`, so the two never disagree). Placed FIRST among the
+    // metadata so `spinner_meta_suffix` can splice it out (a tool isn't
+    // "thinking") while still forwarding the trailing time/queue anchors.
+    if let Some(effort) = reasoning_effort {
+        out.push_str(&format!(" · thinking with {} effort", effort));
     }
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
+    }
+    // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
+    // `Running ReadFile… 4s`. CC behaviour: timer resets on every phase
+    // transition so the user reads "this thing has been running for N
+    // seconds", not "the whole turn so far is 1301s". LAST, so its per-frame
+    // width changes never shift anything after it.
+    if let Some(d) = state.phase_elapsed() {
+        out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
     }
     out
 }
@@ -7611,7 +7984,22 @@ fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
 /// protocol uses `read_file`, `edit_file`, `web_fetch` etc.; the UI shows
 /// `ReadFile`, `EditFile`, `WebFetch` — a CC-style convention that reads
 /// more cleanly at a glance.
+///
+/// MCP tools arrive on the wire as `mcp__<server>__<tool>`. Naive
+/// PascalCase collapses the three parts into `McpZouwuQueryRequirements`
+/// where the server / tool boundary disappears. Render them with a
+/// middle-dot separator so users can tell at a glance which part is the
+/// server and which is the tool (#299).
 pub fn display_tool_name(snake: &str) -> String {
+    if let Some(rest) = snake.strip_prefix("mcp__") {
+        if let Some((server, tool)) = rest.split_once("__") {
+            return format!("mcp · {} · {}", server, tool);
+        }
+    }
+    pascal_case(snake)
+}
+
+fn pascal_case(snake: &str) -> String {
     let mut out = String::with_capacity(snake.len());
     for word in snake.split('_') {
         let mut chars = word.chars();
@@ -7638,6 +8026,13 @@ pub fn display_tool_name(snake: &str) -> String {
 /// - `search_replace` → `SearchReplace` (suffix `_replace` not in
 ///    strip list, kept verbatim → preserves disambiguation)
 pub fn display_tool_name_short(snake: &str) -> String {
+    // MCP wire names (`mcp__server__tool`) carry their suffix as part of the
+    // real tool name — stripping `_file`/`_files`/`_directory` here would turn
+    // `mcp__fs__read_file` into `mcp · fs · read`. Hand the full name to
+    // display_tool_name so the `mcp · server · tool` split stays verbatim.
+    if snake.starts_with("mcp__") {
+        return display_tool_name(snake);
+    }
     const STRIP_SUFFIXES: &[&str] = &["_files", "_file", "_directory"];
     let trimmed = STRIP_SUFFIXES
         .iter()
@@ -7752,6 +8147,37 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
         }
         "use_skill" => get_str("name").unwrap_or_default(),
         _ => {
+            // For MCP tools (name starts with mcp__), render the
+            // arguments as key=value pairs so users can see what
+            // parameters are being passed to the external server.
+            if name.starts_with("mcp__") {
+                if let Some(obj) = v.as_object() {
+                    let pairs: Vec<String> = obj
+                        .iter()
+                        .filter_map(|(k, val)| {
+                            let s = match val {
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Number(n) => n.to_string(),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                serde_json::Value::Array(a) => {
+                                    serde_json::to_string(a).unwrap_or_default()
+                                }
+                                serde_json::Value::Object(o) => {
+                                    serde_json::to_string(o).unwrap_or_default()
+                                }
+                                _ => return None,
+                            };
+                            if s.is_empty() {
+                                return None;
+                            }
+                            Some(format!("{}: \"{}\"", k, s.replace('"', "\\\"")))
+                        })
+                        .collect();
+                    if !pairs.is_empty() {
+                        return crate::width::truncate_with_ellipsis(&pairs.join(", "), 200);
+                    }
+                }
+            }
             // Fallback: try common single-key args that make sense as detail.
             for key in [
                 "file_path",
@@ -7928,21 +8354,25 @@ pub(crate) fn fmt_elapsed(ms: u64) -> String {
     }
 }
 
-pub(crate) fn summarise(output: &str, success: bool) -> String {
+/// Build the one-line preview shown under a tool call (`└ …`): the
+/// output's first line, plus a ` (N lines)` suffix when it spans more.
+///
+/// No display-width budget here on purpose. The retained renderer wraps
+/// this to the LIVE terminal width (`wrap_line_to_width(_, screen.width()
+/// − …)` in the `UiLine::ToolResult` arm), so the preview fills whatever
+/// width the screen has and re-fits on resize — and the ` (N lines)`
+/// suffix is never lost because wrapping carries it to a continuation row.
+/// We used to hard-cap at 80 cols (success) / 200 (failure), which baked a
+/// `…` into the string and wasted the right half of wide screens. The
+/// 512-col cap that remains is a pure safety bound: it only trips for a
+/// pathological multi-KB single line (e.g. a minified file) so it can't
+/// wrap into dozens of rows. Real first lines are far shorter.
+pub(crate) fn summarise(output: &str) -> String {
     let first = output.lines().next().unwrap_or("(no output)");
     let n = output.lines().count();
-    // Failures get a larger budget because the first line is usually
-    // diagnostic ("Error: old_string not found in /mnt/d/.../f_store.")
-    // and the path is the load-bearing piece of info — silently
-    // chopping it at 80 cols turned `f_store` into `f_stor` and made
-    // the agent loop on the wrong file. 200 cols comfortably fits a
-    // typical WSL-style absolute path; anything beyond that probably
-    // is too long to read inline anyway.
-    let budget = if success { 80 } else { 200 };
-    // `truncate_with_ellipsis` (instead of bare `truncate_to_width`)
-    // so that whenever the budget IS exceeded, the user / agent sees
-    // a `…` marker — silent mid-token chops were the actual UX bug.
-    let trimmed = crate::width::truncate_with_ellipsis(first, budget);
+    // `truncate_with_ellipsis` (not bare `truncate_to_width`) so that if
+    // the safety bound ever does bite, the cut is visibly marked.
+    let trimmed = crate::width::truncate_with_ellipsis(first, 512);
     if n > 1 {
         format!("{} ({} lines)", trimmed, n)
     } else {
@@ -7952,3 +8382,43 @@ pub(crate) fn summarise(output: &str, success: bool) -> String {
 
 // SessionPicker tests moved alongside the struct in
 // `crate::modals::session_picker::tests`.
+
+/// Sync ctx.reasoning_effort from the current default provider's config.
+fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
+    let applicable = reasoning_effort_applicable_on_provider(ctx);
+    ctx.reasoning_effort = if applicable {
+        ctx.config
+            .providers
+            .get(&ctx.config.default_provider)
+            .and_then(|p| p.reasoning_effort.clone())
+    } else {
+        None
+    };
+}
+
+/// Persist the current reasoning_effort to config.toml
+fn persist_reasoning_effort(ctx: &mut LoopCtx) {
+    let path = Config::default_path();
+    let default_provider = ctx.config.default_provider.clone();
+    if let Some(p) = ctx.config.providers.get_mut(&default_provider) {
+        p.reasoning_effort = ctx.reasoning_effort.clone();
+    }
+    if let Err(e) = ctx.config.save(&path) {
+        eprintln!("[reasoning_effort] failed to save config: {e}");
+    }
+}
+
+pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
+    let ptype = ctx
+        .config
+        .providers
+        .get(&ctx.config.default_provider)
+        .map(|p| p.provider_type.as_str())
+        .unwrap_or("");
+    // Model-name check delegates to the provider so the UI "applicable" hint
+    // and the actual request-body gate (OpenAiProvider) can never diverge.
+    (ptype == "deepseek" || ptype == "openai")
+        && atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
+            &ctx.model_name,
+        )
+}

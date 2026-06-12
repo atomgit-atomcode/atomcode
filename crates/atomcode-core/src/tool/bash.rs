@@ -718,35 +718,47 @@ async fn bash_execute_background(
     })
 }
 
-async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-    let parsed: BashArgs = serde_json::from_str(args)?;
-    // Command runs verbatim — no stripping of trailing tail/head/etc.
-    // Aligns with Claude Code: model decides how to shape its own
-    // output. Previous strip-and-notice path mis-fired on `ssh "...
-    // | tail -30"` (inner pipe inside SSH quotes) and similar nested
-    // forms.
+/// Result of running a shell command, decoupled from tool-result framing.
+/// `bash_execute` (model-invoked Bash tool) and `handle_local_shell`
+/// (user-invoked `!` mode) both build on this.
+pub(crate) struct ShellOutcome {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit: ShellExit,
+    pub elapsed_secs: f64,
+}
 
-    // Cap timeout: model may request absurdly large values. Max 5 min.
-    let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
+/// How the child process ended. Mirrors the three branches the old
+/// `bash_execute` match handled: clean exit, idle-kill, hard-timeout-kill.
+pub(crate) enum ShellExit {
+    /// Process exited on its own. `success` is `status.success()`,
+    /// `code` is the numeric exit code (None = terminated by signal).
+    Exited { success: bool, code: Option<i32> },
+    /// Readers hit EOF/idle but the child never reaped — killed as stuck.
+    KilledIdle,
+    /// Hard wall-clock timeout — killed.
+    KilledTimeout,
+}
+
+/// Spawn `command` in `wd`, stream output via `chunk_cb`, return raw outcome.
+/// No ToolResult framing, no git snapshot, no error-signature tracking —
+/// those stay in the tool layer. `chunk_cb` receives stdout chunks verbatim
+/// and stderr chunks prefixed with `[stderr] `.
+pub(crate) async fn run_shell(
+    command: &str,
+    wd: &std::path::Path,
+    timeout_secs: u64,
+    chunk_cb: impl Fn(&str),
+) -> ShellOutcome {
     let start_instant = Instant::now();
-
-    let wd = ctx.working_dir.read().await.clone();
-
-    // Background mode: detach into a new session, redirect output to a log
-    // file, and return immediately. Deliberately bypasses the foreground
-    // wait/idle/timeout machinery AND the PgroupChild killpg cleanup below, so
-    // the process outlives this call (the whole point — dev servers, watchers).
-    if parsed.run_in_background {
-        return bash_execute_background(&parsed.command, &wd, start_instant).await;
-    }
 
     // Platform-aware shell: cmd.exe on Windows, bash on Unix
     #[cfg(target_os = "windows")]
     let mut child = {
         let mut cmd = Command::new("cmd.exe");
         cmd.arg("/C");
-        cmd.as_std_mut().raw_arg(&parsed.command);
-        cmd.current_dir(&wd)
+        cmd.as_std_mut().raw_arg(command);
+        cmd.current_dir(wd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -755,7 +767,17 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             // grandchildren — that's #3's Job Object work.
             .kill_on_drop(true);
         crate::process_utils::suppress_console_window(&mut cmd);
-        cmd.spawn()?
+        match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return ShellOutcome {
+                    stdout: String::new(),
+                    stderr: format!("failed to spawn: {e}"),
+                    exit: ShellExit::Exited { success: false, code: None },
+                    elapsed_secs: start_instant.elapsed().as_secs_f64(),
+                };
+            }
+        }
     };
 
     #[cfg(not(target_os = "windows"))]
@@ -764,12 +786,10 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut cmd = Command::new("bash");
         #[cfg(target_env = "ohos")]
         let mut cmd = Command::new("sh");
-        // bash does not exist on ohos
-        // use sh (mksh)
 
         cmd.arg("-c")
-            .arg(&parsed.command)
-            .current_dir(&wd)
+            .arg(command)
+            .current_dir(wd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -792,12 +812,7 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     fn close(fd: i32) -> i32;
                     fn ioctl(fd: i32, request: u64, ...) -> i32;
                 }
-                // Create a new session — detaches from the controlling
-                // terminal so /dev/tty opens fail.
                 setsid();
-                // Belt-and-suspenders: also try to explicitly detach using
-                // TIOCNOTTY, which works even when setsid alone doesn't
-                // fully sever the connection on some macOS versions.
                 const O_RDWR: i32 = 2;
                 #[cfg(target_os = "macos")]
                 const TIOCNOTTY: u64 = 0x20007471;
@@ -813,39 +828,29 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         }
         // Wrap the spawned child so pgroup cleanup runs on Drop (cancel)
         // and via the explicit terminate() calls below (timeout/idle).
-        PgroupChild::new(cmd.spawn()?)
+        match cmd.spawn() {
+            Ok(c) => PgroupChild::new(c),
+            Err(e) => {
+                return ShellOutcome {
+                    stdout: String::new(),
+                    stderr: format!("failed to spawn: {e}"),
+                    exit: ShellExit::Exited { success: false, code: None },
+                    elapsed_secs: start_instant.elapsed().as_secs_f64(),
+                };
+            }
+        }
     };
 
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
 
-    // Wait for process to finish or timeout. Read stdout/stderr concurrently.
-    // Idle detection: if output stops for SILENT_KILL_SECS after having produced
-    // some output, assume the command is truly stuck. This threshold needs to
-    // tolerate legitimate silent phases common across many tools/languages
-    // (build cache scan, dep lock waits, dep downloads, large file I/O, linking,
-    // compiler type-check pass, etc.) — none of which emit progress to stdout.
     let idle_timeout = Duration::from_secs(SILENT_KILL_SECS);
     let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let has_out_1 = has_any_output.clone();
     let has_out_2 = has_any_output.clone();
-
-    // Clone event sender for streaming output (if available)
-    let event_tx = ctx.event_tx.clone();
-    let call_id = ctx.current_call_id.clone();
-
-    // Helper to send output chunk event
-    let send_chunk = |chunk: &str| {
-        if let (Some(tx), Some(id)) = (&event_tx, &call_id) {
-            let _ = tx.send(crate::turn::event::TurnEvent::ToolOutputChunk {
-                call_id: id.clone(),
-                chunk: chunk.to_string(),
-            });
-        }
-    };
+    let chunk_cb = &chunk_cb;
 
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         let (_, _) = tokio::join!(
@@ -859,12 +864,10 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                                 crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stdout_buf.extend_from_slice(&buf[..n]);
                             has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
-                            // Send real-time output chunk
-                            send_chunk(&chunk);
+                            chunk_cb(&chunk);
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
-                            // No new stdout for 3s — if we have ANY output, break
                             if has_out_1.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
@@ -882,8 +885,7 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                                 crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stderr_buf.extend_from_slice(&buf[..n]);
                             has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
-                            // Send real-time output chunk (stderr marked with prefix)
-                            send_chunk(&format!("[stderr] {}", chunk));
+                            chunk_cb(&format!("[stderr] {}", chunk));
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
@@ -896,22 +898,6 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             }
         );
 
-        // Capture both the success flag AND the numeric exit code.
-        // Previously only `.success()` was read, which meant a failed
-        // command with empty stdout/stderr came back as bare
-        // "[elapsed: 0.0s]" — agent had zero signal on whether the
-        // command ran, was denied by the shell, or exited for a
-        // specific reason (e.g. grep's exit 1 = no match, exit 2 =
-        // real error; agent cannot tell these apart without the code).
-        //
-        // Two-stage wait to close a kernel-level race: for fast
-        // commands (true, echo, grep with no match) stdout/stderr hit
-        // EOF before SIGCHLD is observed, so a bare try_wait() sees
-        // `None` and the result gets misclassified as "idle kill".
-        // After the pipes close, we know the child is essentially
-        // done — give the reaper a tiny window to catch up before
-        // declaring it stuck. 100ms is well under human-perceptible
-        // latency and sufficient for any real reap on modern kernels.
         match child.try_wait() {
             Ok(Some(status)) => Some((status.success(), status.code())),
             _ => match tokio::time::timeout(Duration::from_millis(100), child.wait()).await {
@@ -924,30 +910,77 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
 
     let stdout_str = crate::process_utils::decode_subprocess_output(&stdout_buf);
     let stderr_str = crate::process_utils::decode_subprocess_output(&stderr_buf);
+    let elapsed_secs = start_instant.elapsed().as_secs_f64();
 
-    // Commands with & (backgrounded processes) may return non-zero even on success.
-    // pkill returns 1 when no process matched. These shouldn't be marked as failures.
+    let exit = match result {
+        Ok(Some((success, code))) => ShellExit::Exited { success, code },
+        Ok(None) => {
+            // Readers hit idle/EOF but the child never reaped — kill it.
+            // terminate() on Unix walks the pgroup (SIGTERM → 200ms → SIGKILL);
+            // Windows keeps the direct-child kill (process-tree cleanup is #3).
+            #[cfg(not(target_os = "windows"))]
+            child.terminate().await;
+            #[cfg(target_os = "windows")]
+            {
+                let _ = child.kill().await;
+            }
+            ShellExit::KilledIdle
+        }
+        Err(_) => {
+            // Hard wall-clock timeout — same pgroup-aware path as idle.
+            #[cfg(not(target_os = "windows"))]
+            child.terminate().await;
+            #[cfg(target_os = "windows")]
+            {
+                let _ = child.kill().await;
+            }
+            ShellExit::KilledTimeout
+        }
+    };
+
+    ShellOutcome { stdout: stdout_str, stderr: stderr_str, exit, elapsed_secs }
+}
+
+async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
+    let parsed: BashArgs = serde_json::from_str(args)?;
+    let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
+
+    let wd = ctx.working_dir.read().await.clone();
+
+    // `&`-detached / long-running launch: hand off to the background path
+    // (own session, log file, returns immediately) instead of the foreground
+    // run_shell. Restored on the pr_224 merge — its run_shell refactor predated
+    // the background-execution feature and dropped this branch.
+    if parsed.run_in_background {
+        return bash_execute_background(&parsed.command, &wd, Instant::now()).await;
+    }
+
+    let event_tx = ctx.event_tx.clone();
+    let call_id = ctx.current_call_id.clone();
+
+    let outcome = run_shell(&parsed.command, &wd, timeout_secs, |chunk| {
+        if let (Some(tx), Some(id)) = (&event_tx, &call_id) {
+            let _ = tx.send(crate::turn::event::TurnEvent::ToolOutputChunk {
+                call_id: id.clone(),
+                chunk: chunk.to_string(),
+            });
+        }
+    })
+    .await;
+
+    let stdout_str = outcome.stdout;
+    let stderr_str = outcome.stderr;
+    let elapsed_secs = outcome.elapsed_secs;
+
     let has_background = has_background_ampersand(&parsed.command);
     let has_pkill = parsed.command.contains("pkill");
 
-    // Total elapsed wall-clock — appended to every result so the agent can
-    // judge "slow but succeeded" vs "stalled/hung" without any per-tool
-    // pattern matching. Purely numeric, tech-neutral.
-    let elapsed_secs = start_instant.elapsed().as_secs_f64();
-
-    match result {
-        Ok(Some((success, code))) => {
+    match outcome.exit {
+        ShellExit::Exited { success, code } => {
             let mut combined = format_output(&stdout_str, &stderr_str);
-            // For background/pkill commands: non-empty output = success
             let effective_success =
                 success || has_background || (has_pkill && !combined.is_empty());
-
             if !effective_success {
-                // Even when stdout+stderr are empty, the agent needs to know
-                // the command actually failed and with what code. The old
-                // behavior dropped both pieces of info here, leaving the
-                // agent to retry the same command blindly. Now every failure
-                // carries exit code AND an explicit "nothing to read" note.
                 let suffix = if combined.is_empty() {
                     "[no stdout or stderr — use the exit code above to diagnose; \
                          common causes: missing file/path, permission denied, wrong shell, \
@@ -959,77 +992,41 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 combined.push_str(suffix);
             }
             let elapsed_marker = format_exit_marker(elapsed_secs, code);
-            // Prepend elapsed so it's visible even when output is truncated later
             let output = if combined.is_empty() {
                 elapsed_marker
             } else {
                 format!("{}\n{}", elapsed_marker, combined)
             };
-            Ok(ToolResult {
-                call_id: String::new(),
-                output,
-                success: effective_success,
-            })
+            Ok(ToolResult { call_id: String::new(), output, success: effective_success })
         }
-        Ok(None) => {
-            // Readers exited (idle timeout or EOF) but the child
-            // did not exit within the 1 s grace — process is stuck.
-            // Kill it. The elapsed marker already tells the model
-            // how long we waited; don't invent a hardcoded "90s"
-            // here (SILENT_KILL_SECS is a cap, not what actually
-            // happened — it lies when readers left via EOF and the
-            // grace wait is what fired).
-            //
-            // terminate() on Unix walks the pgroup with SIGTERM →
-            // 200ms grace → SIGKILL; Windows keeps the previous
-            // direct-child kill (process-tree cleanup is #3).
-            #[cfg(not(target_os = "windows"))]
-            child.terminate().await;
-            #[cfg(target_os = "windows")]
-            { let _ = child.kill().await; }
+        ShellExit::KilledIdle => {
             let combined = format_output(&stdout_str, &stderr_str);
             let elapsed_marker = format!("[elapsed: {:.1}s, killed: idle]", elapsed_secs);
             let output = if combined.is_empty() {
                 format!(
-                        "{} [killed: process did not exit; no output produced — treat as stuck, don't retry the same command]",
-                        elapsed_marker
-                    )
-            } else {
-                format!(
-                        "{}\n{}\n\n[killed: process did not exit cleanly — output above may be partial]",
-                        elapsed_marker, combined
-                    )
-            };
-            Ok(ToolResult {
-                call_id: String::new(),
-                output,
-                success: false,
-            })
-        }
-        Err(_) => {
-            // Hard timeout — kill it. Same pgroup-aware path as idle.
-            #[cfg(not(target_os = "windows"))]
-            child.terminate().await;
-            #[cfg(target_os = "windows")]
-            { let _ = child.kill().await; }
-            let combined = format_output(&stdout_str, &stderr_str);
-            let elapsed_marker = format!("[elapsed: {:.1}s, killed: timeout]", elapsed_secs);
-            let output = if combined.is_empty() {
-                format!(
-                    "{} [timed out after {}s with no output]",
-                    elapsed_marker, timeout_secs
+                    "{} [killed: process did not exit; no output produced — treat as stuck, don't retry the same command]",
+                    elapsed_marker
                 )
             } else {
                 format!(
-                        "{}\n{}\n\n[timed out after {}s — consider passing a larger `timeout` if this command legitimately takes longer]",
-                        elapsed_marker, combined, timeout_secs
-                    )
+                    "{}\n{}\n\n[killed: process did not exit cleanly — output above may be partial]",
+                    elapsed_marker, combined
+                )
             };
-            Ok(ToolResult {
-                call_id: String::new(),
-                output,
-                success: false,
-            })
+            Ok(ToolResult { call_id: String::new(), output, success: false })
+        }
+        ShellExit::KilledTimeout => {
+            let combined = format_output(&stdout_str, &stderr_str);
+            let elapsed_marker = format!("[elapsed: {:.1}s, killed: timeout]", elapsed_secs);
+            let output = if combined.is_empty() {
+                format!("{} [timed out after {}s with no output]", elapsed_marker, timeout_secs)
+            } else {
+                format!(
+                    "{}\n{}\n\n[timed out after {}s — consider passing a larger `timeout` if this command legitimately takes longer]",
+                    elapsed_marker, combined, timeout_secs
+                )
+            };
+            Ok(ToolResult { call_id: String::new(), output, success: false })
         }
     }
 }
@@ -2569,6 +2566,42 @@ error: could not compile `hermes-tauri` (bin \"hermes-tauri\") due to 1 previous
             r.output
         );
     }
+
+    #[tokio::test]
+    async fn run_shell_captures_stdout_and_exit_zero() {
+        let dir = TempDir::new().unwrap();
+        let outcome = run_shell("echo hello", dir.path(), 30, |_| {}).await;
+        assert!(matches!(outcome.exit, ShellExit::Exited { success: true, code: Some(0) }));
+        assert!(outcome.stdout.contains("hello"), "stdout was: {:?}", outcome.stdout);
+    }
+
+    #[tokio::test]
+    async fn run_shell_captures_stderr_and_nonzero_exit() {
+        let dir = TempDir::new().unwrap();
+        let outcome = run_shell("echo boom >&2; exit 2", dir.path(), 30, |_| {}).await;
+        match outcome.exit {
+            ShellExit::Exited { success, code } => {
+                assert!(!success);
+                assert_eq!(code, Some(2));
+            }
+            _ => panic!("expected Exited, got other variant"),
+        }
+        assert!(outcome.stderr.contains("boom"), "stderr was: {:?}", outcome.stderr);
+    }
+
+    #[tokio::test]
+    async fn run_shell_streams_chunks() {
+        use std::sync::{Arc, Mutex};
+        let dir = TempDir::new().unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        let outcome = run_shell("echo streamed", dir.path(), 30, move |c| {
+            seen2.lock().unwrap().push_str(c);
+        })
+        .await;
+        assert!(matches!(outcome.exit, ShellExit::Exited { success: true, .. }));
+        assert!(seen.lock().unwrap().contains("streamed"));
+    }
 }
 
 #[cfg(test)]
@@ -3388,7 +3421,16 @@ fn approval_for_command_paths(
             (Some(ApprovalRequirement::RequireApprovalAlways(reason)), _) => {
                 Some(ApprovalRequirement::RequireApprovalAlways(reason))
             }
+            // bash never path-scopes: a sensitive read embedded in an arbitrary
+            // command stays always-ask, so a per-file [A] grant (meant for the
+            // read_file tool) can't disarm the bash path guard.
+            (Some(ApprovalRequirement::RequireApprovalScoped { reason, .. }), _) => {
+                Some(ApprovalRequirement::RequireApprovalAlways(reason))
+            }
             (_, ApprovalRequirement::RequireApprovalAlways(reason)) => {
+                Some(ApprovalRequirement::RequireApprovalAlways(reason))
+            }
+            (_, ApprovalRequirement::RequireApprovalScoped { reason, .. }) => {
                 Some(ApprovalRequirement::RequireApprovalAlways(reason))
             }
             (Some(ApprovalRequirement::RequireApproval(reason)), _) => {

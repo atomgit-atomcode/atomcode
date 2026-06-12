@@ -20,6 +20,9 @@ import {
   SessionDetail,
   CreateSessionResponse,
   ChangeDirResponse,
+  SkillInfo,
+  AppendSessionMessagesRequest,
+  AppendSessionMessagesResponse,
 } from './types';
 
 const REST_TIMEOUT = 30000;
@@ -170,6 +173,19 @@ export class DaemonClient {
     return this.get<ModelInfo[]>('/models');
   }
 
+  setReasoningEffort(provider: string, effort: string | null): Promise<{ ok: boolean }> {
+    return this.post<{ ok: boolean }>('/live/reasoning_effort', {
+      provider,
+      reasoning_effort: effort,
+    });
+  }
+
+  // ── Skills ───────────────────────────────────────────────────
+
+  listSkills(): Promise<SkillInfo[]> {
+    return this.get<SkillInfo[]>('/skills');
+  }
+
   // ── Config / Providers ───────────────────────────────────────
 
   getConfig(): Promise<ConfigResponse> {
@@ -245,6 +261,16 @@ export class DaemonClient {
       title: name,
       working_dir: workingDir,
     });
+  }
+
+  appendSessionMessages(
+    sessionId: string,
+    req: AppendSessionMessagesRequest,
+  ): Promise<AppendSessionMessagesResponse> {
+    return this.post<AppendSessionMessagesResponse>(
+      `/sessions/${encodeURIComponent(sessionId)}/messages`,
+      req,
+    );
   }
 
   renameSession(projectHash: string, id: string, name: string): Promise<string> {
@@ -340,8 +366,13 @@ export class DaemonClient {
             if (restarted) {
               // Retry the stream by calling streamChat again
               const retryController = this.streamChat(req, callbacks);
-              // Forward abort from original controller to retry
-              controller.signal.addEventListener('abort', () => retryController.abort());
+              // Forward abort from original controller to retry.
+              // Check if already aborted (event already fired) to avoid missing the signal.
+              if (controller.signal.aborted) {
+                retryController.abort();
+              } else {
+                controller.signal.addEventListener('abort', () => retryController.abort());
+              }
             } else {
               callbacks.onError('Daemon not running');
             }

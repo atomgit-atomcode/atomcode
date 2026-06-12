@@ -46,6 +46,10 @@ pub enum LiveEvent {
     /// 任一视图（webui 下拉框 / TUI /model）切换了模型。其余视图据此同步显示与选中项。
     /// 仅作显示/状态广播——实际下一轮用哪个 provider 由进程级选择（daemon 侧 LIVE_PROVIDER）决定。
     ProviderChanged(String),
+    /// 任一视图（webui /cd）切换了工作目录/项目。其余视图据此跟随：同进程 TUI
+    /// 会切到新目录并开一个全新 session（见 event_loop/live_sync 转发）。仅广播
+    /// 路径，不触碰 turn 状态。
+    WorkingDirChanged(std::path::PathBuf),
 }
 
 /// turn 执行策略。实现者负责对 `conv` 跑一次完整 turn（含工具循环），并把过程
@@ -87,10 +91,16 @@ pub struct LiveSession {
 impl LiveSession {
     /// 用注入的执行器与初始消息建会话，并 spawn 协调器任务。返回 `Arc` 以便多视图共享。
     pub fn new(executor: Arc<dyn TurnExecutor>, initial: Vec<Message>) -> Arc<Self> {
+        Self::new_with_cold_summaries(executor, initial, Vec::new())
+    }
+
+    pub fn new_with_cold_summaries(
+        executor: Arc<dyn TurnExecutor>,
+        initial: Vec<Message>,
+        cold_summaries: Vec<String>,
+    ) -> Arc<Self> {
         let conversation = Arc::new(Mutex::new({
-            let mut c = Conversation::new();
-            c.messages = initial.clone();
-            c
+            Conversation::from_messages_and_cold_summaries(initial.clone(), cold_summaries)
         }));
         let snapshot = Arc::new(Mutex::new(initial));
         let (events, _rx) = broadcast::channel(BROADCAST_CAPACITY);
@@ -158,6 +168,12 @@ impl LiveSession {
     /// 让另一端的下拉框 / 头部显示实时跟随。返回 false 表示当前无订阅者（无妨）。
     pub fn notify_provider_changed(&self, provider: String) -> bool {
         self.events.send(LiveEvent::ProviderChanged(provider)).is_ok()
+    }
+
+    /// 广播一次工作目录切换给所有视图（不触碰 turn 状态）。webui /cd 时调用，
+    /// 让同进程 TUI 跟随切目录并开一个全新会话。返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_working_dir_changed(&self, dir: std::path::PathBuf) -> bool {
+        self.events.send(LiveEvent::WorkingDirChanged(dir)).is_ok()
     }
 
     /// 任一视图批准/拒绝，投递决定到执行器持有的审批通道。
