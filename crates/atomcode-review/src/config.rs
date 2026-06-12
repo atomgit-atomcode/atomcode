@@ -25,6 +25,11 @@ pub struct ReviewAgentConfig {
     /// built-in reviewer instructions are NOT appended. The caller is then responsible for
     /// telling the model about the read-only toolset + `report_finding`.
     pub persona: Option<String>,
+    /// Extra system-prompt section APPENDED after the persona (built-in or overridden):
+    /// the normal customization channel for domain rules, ignore lists, repo style guides,
+    /// PR metadata — without copying or replacing the built-in reviewer instructions.
+    /// Composes with `persona`: final prompt = (override or built-in) + "\n\n" + append.
+    pub persona_append: Option<String>,
 }
 
 impl ReviewAgentConfig {
@@ -44,12 +49,19 @@ impl ReviewAgentConfig {
             stream_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(300),
             persona: None,
+            persona_append: None,
         }
     }
 
     /// Set a FULL system-prompt override (replaces the built-in reviewer persona).
     pub fn with_persona(mut self, persona: impl Into<String>) -> Self {
         self.persona = Some(persona.into());
+        self
+    }
+
+    /// Append an extra section after the persona (built-in or overridden).
+    pub fn with_persona_append(mut self, append: impl Into<String>) -> Self {
+        self.persona_append = Some(append.into());
         self
     }
 }

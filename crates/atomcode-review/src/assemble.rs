@@ -45,8 +45,7 @@ pub fn build_review_agent_with(
     // One shared findings sink: the registered tool and the returned handle share state.
     let report = ReportFindingTool::new();
     let tools = mount_review_tools(&report);
-    // Full override wins; else the built-in reviewer persona.
-    let persona = cfg.persona.clone().unwrap_or_else(|| review_persona(&cfg.model));
+    let persona = compose_persona(cfg);
     let agent = Agent::builder()
         .provider(provider)
         .tools(tools)
@@ -69,6 +68,18 @@ fn mount_review_tools(report: &ReportFindingTool) -> MountedTools {
     reg.register(Arc::new(WebSearchTool::new()));
     reg.register(Arc::new(report.clone())); // shares state with the returned handle
     reg.mount(&review_tool_names())
+}
+
+/// Final system prompt: full override wins (else the built-in reviewer persona), then the
+/// append section (the normal customization channel: domain rules / ignore lists / repo
+/// style guides / PR metadata) composes on top of either base.
+fn compose_persona(cfg: &ReviewAgentConfig) -> String {
+    let mut persona = cfg.persona.clone().unwrap_or_else(|| review_persona(&cfg.model));
+    if let Some(append) = cfg.persona_append.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        persona.push_str("\n\n");
+        persona.push_str(append);
+    }
+    persona
 }
 
 #[cfg(test)]
@@ -141,5 +152,39 @@ mod tests {
         for forbidden in ["write_file", "edit_file", "bash", "change_dir", "search_replace", "parallel_edit_files"] {
             assert!(!names.contains(&forbidden), "reviewer must not mount `{forbidden}`");
         }
+    }
+}
+
+#[cfg(test)]
+mod persona_compose_tests {
+    use super::*;
+
+    fn cfg() -> ReviewAgentConfig {
+        ReviewAgentConfig::new("k", "https://x.test", "m1", std::env::temp_dir())
+    }
+
+    #[test]
+    fn default_is_builtin() {
+        assert_eq!(compose_persona(&cfg()), review_persona("m1"));
+    }
+
+    #[test]
+    fn append_composes_on_builtin() {
+        let c = cfg().with_persona_append("## Domain Rules\n- no fmt nits");
+        let p = compose_persona(&c);
+        assert!(p.starts_with("You are AtomCode Reviewer"), "built-in stays as the base");
+        assert!(p.ends_with("## Domain Rules\n- no fmt nits"), "append goes last");
+    }
+
+    #[test]
+    fn override_replaces_builtin_and_append_still_composes() {
+        let c = cfg().with_persona("CUSTOM").with_persona_append("EXTRA");
+        assert_eq!(compose_persona(&c), "CUSTOM\n\nEXTRA");
+    }
+
+    #[test]
+    fn blank_append_leaves_no_residue() {
+        let c = cfg().with_persona_append("   \n  ");
+        assert_eq!(compose_persona(&c), review_persona("m1"));
     }
 }

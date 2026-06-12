@@ -82,6 +82,15 @@ struct ReviewArgs {
     /// Like --system-prompt, but read the full prompt from a file (`-` for stdin).
     #[arg(long, conflicts_with = "system_prompt")]
     system_prompt_file: Option<String>,
+    /// APPEND an extra section after the system prompt (built-in persona or the
+    /// --system-prompt override). The normal customization channel: domain rules,
+    /// ignore lists, repo style guides, PR metadata — keeps the built-in reviewer
+    /// instructions intact.
+    #[arg(long)]
+    append_system_prompt: Option<String>,
+    /// Like --append-system-prompt, but read the section from a file (`-` for stdin).
+    #[arg(long, conflicts_with = "append_system_prompt")]
+    append_system_prompt_file: Option<String>,
     /// Run a CUSTOM task instead of diff review (for chat / explain / summary). Replaces the
     /// built-in "review this diff" task with this text and SKIPS diff computation — the caller
     /// puts everything the model needs (question, target code, any diff context) into the text.
@@ -111,12 +120,17 @@ async fn main() -> Result<()> {
 }
 
 async fn review(args: ReviewArgs) -> Result<()> {
-    // `-` means stdin; the persona and the diff/task can't both read it.
-    if args.diff_file.as_deref() == Some("-") && args.system_prompt_file.as_deref() == Some("-") {
-        bail!("--diff-file - and --system-prompt-file - both read stdin; give one of them a file path");
-    }
-    if args.task_file.as_deref() == Some("-") && args.system_prompt_file.as_deref() == Some("-") {
-        bail!("--task-file - and --system-prompt-file - both read stdin; give one of them a file path");
+    // `-` means stdin; only ONE of diff/task/persona/append may read it.
+    let stdin_users = [
+        ("--diff-file", args.diff_file.as_deref()),
+        ("--task-file", args.task_file.as_deref()),
+        ("--system-prompt-file", args.system_prompt_file.as_deref()),
+        ("--append-system-prompt-file", args.append_system_prompt_file.as_deref()),
+    ];
+    let on_stdin: Vec<&str> =
+        stdin_users.iter().filter(|(_, v)| *v == Some("-")).map(|(n, _)| *n).collect();
+    if on_stdin.len() > 1 {
+        bail!("{} all read stdin; give all but one of them a file path", on_stdin.join(" and "));
     }
     let repo = args.repo.canonicalize().with_context(|| format!("repo not found: {}", args.repo.display()))?;
 
@@ -185,6 +199,9 @@ async fn review(args: ReviewArgs) -> Result<()> {
     cfg.stream_timeout = std::time::Duration::from_secs(args.stream_timeout);
     // Full system-prompt override (flag text > file/stdin). None ⇒ built-in reviewer persona.
     cfg.persona = resolve_system_prompt(args.system_prompt.clone(), args.system_prompt_file.clone())?;
+    // Appended section (domain rules / ignore lists / PR metadata) — composes on top.
+    cfg.persona_append =
+        resolve_system_prompt(args.append_system_prompt.clone(), args.append_system_prompt_file.clone())?;
     let model_label = cfg.model.clone();
     let (agent, report) = build_review_agent(cfg).map_err(|e| anyhow::anyhow!(e))?;
 
