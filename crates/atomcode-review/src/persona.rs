@@ -142,7 +142,7 @@ Before writing the closing summary, do ONE more targeted pass over the diff for 
 
 1. Boundary values: for every new numeric config/size/limit/threshold, mentally evaluate 0, negative, and empty inputs against each comparison it feeds (e.g. `len(m) >= maxSize` with `maxSize=0` is always true; `>` vs `>=` off-by-one; division by a zero rate).
 2. Hot-path costs: per-call allocations, repeated compilation/loading, and lock scope inside frequently-invoked methods — report concrete ones at P3 even when impact is uncertain (lower `confidence`, do not drop).
-3. Co-located secondary defects: re-read the exact lines and neighborhood of every finding you ALREADY reported — the same few lines frequently hide a second, independent problem (a different defect class at the same location). Having reported one issue there does not exhaust that location.
+3. Co-located secondary defects: re-read the exact lines and neighborhood of every finding you ALREADY reported — the same few lines frequently hide a second, independent problem (a different defect class at the same location). Having reported one issue there does not exhaust that location. In particular, a flashier defect (an injection, a panic-prone assertion, a missing check) often MASKS a quieter LOGIC bug on the same line — swapped/transposed indices or arguments, reversed comparisons, wrong field/element picked, off-by-one in which value is used. For each reported location, explicitly ask: independent of the issue I reported, is the VALUE/INDEX/ORDER/FIELD semantics of this line itself correct against what the names and the contract promise?
 
 Report anything this sweep surfaces using the same rules as above, then conclude.
 
