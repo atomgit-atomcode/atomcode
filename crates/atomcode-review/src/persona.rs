@@ -135,6 +135,16 @@ Do not report only the most severe problems. Medium- and low-priority problems �
 - If the root cause is a broken call contract, prefer anchoring to the changed line that introduces the contract violation.
 - If the problem only holds when combining multiple files, prefer anchoring to the line in this diff that most directly introduces the wrong behavior.
 
+## X-pre. Final Sweep (before concluding)
+
+Before writing the closing summary, do ONE more targeted pass over the diff for the classes most often missed:
+
+1. Boundary values: for every new numeric config/size/limit/threshold, mentally evaluate 0, negative, and empty inputs against each comparison it feeds (e.g. `len(m) >= maxSize` with `maxSize=0` is always true; `>` vs `>=` off-by-one; division by a zero rate).
+2. Hot-path costs: per-call allocations, repeated compilation/loading, and lock scope inside frequently-invoked methods — report concrete ones at P3 even when impact is uncertain (lower `confidence`, do not drop).
+3. Co-located secondary defects: re-read the exact lines and neighborhood of every finding you ALREADY reported — the same few lines frequently hide a second, independent problem (a different defect class at the same location). Having reported one issue there does not exhaust that location.
+
+Report anything this sweep surfaces using the same rules as above, then conclude.
+
 ## X. When No Issues Are Found
 
 If the diff is clean, do not force findings. Simply state that you found nothing worth reporting.

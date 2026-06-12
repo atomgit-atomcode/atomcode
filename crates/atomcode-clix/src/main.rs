@@ -165,7 +165,12 @@ async fn review(args: ReviewArgs) -> Result<()> {
                 let files = atomcode_review::changed_files_from_diff(&diff);
                 let section = atomcode_review::render_rules_section(&files, args.rules_dir.as_deref());
                 if !section.is_empty() {
+                    // Observability: confirm on stderr that rules actually got injected
+                    // (the composed system prompt is not otherwise visible to callers).
+                    eprintln!("[rules] injected for {} changed file(s) ({} chars)", files.len(), section.len());
                     rules_section = Some(section);
+                } else {
+                    eprintln!("[rules] no language rules matched the changed files");
                 }
             }
             // Prefix every hunk line with its REAL file line number so the model anchors
