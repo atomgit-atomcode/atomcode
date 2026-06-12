@@ -4,7 +4,7 @@
 use serde_json::json;
 
 use super::client::AtomgitClient;
-use super::models::Repo;
+use super::models::{Repo, Tag};
 
 impl AtomgitClient {
     /// `GET /user/repos` — the caller's repos. `limit` truncates client-side
@@ -59,6 +59,21 @@ impl AtomgitClient {
             body.insert("private".into(), json!(p));
         }
         self.post_json(&format!("/repos/{owner}/{repo}/forks"), &json!(body)).await
+    }
+
+    /// `POST /repos/{owner}/{repo}/tags` — create a tag. `refs` is the start point
+    /// (branch/commit/tag, AtomGit defaults to `main`), `tag_name` is the new tag, and
+    /// `message` is the optional tag description.
+    pub async fn repo_create_tag(
+        &self,
+        owner: &str,
+        repo: &str,
+        tag_name: &str,
+        refs: &str,
+        message: &str,
+    ) -> Result<Tag, String> {
+        let body = json!({ "refs": refs, "tag_name": tag_name, "tag_message": message });
+        self.post_json(&format!("/repos/{owner}/{repo}/tags"), &body).await
     }
 }
 
@@ -129,6 +144,20 @@ mod tests {
             .mount(&server)
             .await;
         client(&server).repo_delete("o", "r").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_tag_posts_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v5/repos/o/r/tags"))
+            .and(body_json(serde_json::json!({"refs":"main","tag_name":"v1.0.0","tag_message":"release"})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"tag_name":"v1.0.0","tag_message":"release"})))
+            .mount(&server)
+            .await;
+        let t = client(&server).repo_create_tag("o", "r", "v1.0.0", "main", "release").await.unwrap();
+        assert_eq!(t.tag_name, "v1.0.0");
+        assert_eq!(t.message, "release");
     }
 
     #[tokio::test]

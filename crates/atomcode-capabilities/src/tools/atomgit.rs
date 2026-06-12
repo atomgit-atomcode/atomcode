@@ -13,7 +13,7 @@ use serde_json::json;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult, ToolRegistry};
 
 use super::{err, ok};
-use crate::atomgit::models::{Comment, CreatedComment, Issue, PullRequest, Repo};
+use crate::atomgit::models::{Comment, CreatedComment, Issue, PullRequest, Repo, Tag};
 use crate::atomgit::AtomgitClient;
 
 /// Pull `action` out of the raw args without failing the whole parse — used by
@@ -43,6 +43,12 @@ struct RepoArgs {
     branch: Option<String>,
     #[serde(default)]
     dir: Option<String>,
+    #[serde(default)]
+    tag_name: Option<String>,
+    #[serde(default)]
+    refs: Option<String>,
+    #[serde(default)]
+    tag_message: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
 }
@@ -71,6 +77,16 @@ fn render_repo(r: &Repo) -> String {
     )
 }
 
+/// Render a created tag, falling back to the requested name when the response omits it.
+fn render_tag(t: &Tag, requested: &str) -> String {
+    let name = if t.tag_name.is_empty() { requested } else { &t.tag_name };
+    if t.message.is_empty() {
+        format!("Created tag {name}")
+    } else {
+        format!("Created tag {name}: {}", t.message)
+    }
+}
+
 #[async_trait]
 impl Tool for AtomgitRepoTool {
     fn name(&self) -> &str {
@@ -80,13 +96,15 @@ impl Tool for AtomgitRepoTool {
         "Operate on AtomGit repositories. action: \"list\" (your repos), \"view\" \
          (owner+repo), \"create\" (name; optional owner=org, description, private), \
          \"delete\" (owner+repo), \"fork\" (owner+repo; optional name, private), \
-         \"clone\" (owner+repo; optional branch, dir — runs local `git clone`)."
+         \"clone\" (owner+repo; optional branch, dir — runs local `git clone`), \
+         \"create_tag\" (owner+repo+tag_name; optional refs=start point (default main), \
+         tag_message)."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["list","view","create","delete","fork","clone"] },
+                "action": { "type": "string", "enum": ["list","view","create","delete","fork","clone","create_tag"] },
                 "owner": { "type": "string", "description": "Repo owner (org for create). Omit on create for a personal repo." },
                 "repo": { "type": "string", "description": "Repo name for view/delete/fork/clone." },
                 "name": { "type": "string", "description": "New repo name (create) or fork target name." },
@@ -94,6 +112,9 @@ impl Tool for AtomgitRepoTool {
                 "private": { "type": "boolean" },
                 "branch": { "type": "string", "description": "Branch to clone." },
                 "dir": { "type": "string", "description": "Target dir for clone (relative to working dir)." },
+                "tag_name": { "type": "string", "description": "New tag name (create_tag)." },
+                "refs": { "type": "string", "description": "Start point for create_tag — branch/commit/tag (default main)." },
+                "tag_message": { "type": "string", "description": "Tag description (create_tag, optional)." },
                 "limit": { "type": "integer", "description": "Max repos for list (default 30)." }
             },
             "required": ["action"]
@@ -153,6 +174,17 @@ impl Tool for AtomgitRepoTool {
             "clone" => match (a.owner, a.repo) {
                 (Some(o), Some(r)) => clone_repo(&o, &r, a.branch.as_deref(), a.dir.as_deref(), ctx).await,
                 _ => err("atomgit_repo clone: owner and repo are required".to_string()),
+            },
+            "create_tag" => match (a.owner, a.repo, a.tag_name) {
+                (Some(o), Some(r), Some(tn)) => {
+                    let refs = a.refs.as_deref().unwrap_or("main");
+                    let msg = a.tag_message.as_deref().unwrap_or("");
+                    match self.client.repo_create_tag(&o, &r, &tn, refs, msg).await {
+                        Ok(tag) => ok(render_tag(&tag, &tn)),
+                        Err(e) => err(e),
+                    }
+                }
+                _ => err("atomgit_repo create_tag: owner, repo and tag_name are required".to_string()),
             },
             other => err(format!("atomgit_repo: unknown action {other:?}")),
         }
@@ -616,8 +648,34 @@ mod tests {
         assert_eq!(t.risk(r#"{"action":"delete"}"#), RiskLevel::Risky);
         assert_eq!(t.risk(r#"{"action":"fork"}"#), RiskLevel::Risky);
         assert_eq!(t.risk(r#"{"action":"clone"}"#), RiskLevel::Risky);
+        assert_eq!(t.risk(r#"{"action":"create_tag"}"#), RiskLevel::Risky);
         // malformed → fail safe to Risky
         assert_eq!(t.risk("not json"), RiskLevel::Risky);
+    }
+
+    #[tokio::test]
+    async fn execute_create_tag_renders() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v5/repos/o/r/tags"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"tag_name":"v1.0.0"})))
+            .mount(&server)
+            .await;
+        let r = tool(&server)
+            .execute(r#"{"action":"create_tag","owner":"o","repo":"r","tag_name":"v1.0.0"}"#, &ctx())
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("Created tag v1.0.0"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn execute_create_tag_requires_tag_name() {
+        let server = MockServer::start().await;
+        let r = tool(&server)
+            .execute(r#"{"action":"create_tag","owner":"o","repo":"r"}"#, &ctx())
+            .await;
+        assert!(r.is_error);
+        assert!(r.content.contains("tag_name are required"), "{}", r.content);
     }
 
     #[tokio::test]

@@ -99,6 +99,17 @@ pub struct Comment {
     pub html_url: String,
 }
 
+/// `POST .../tags` (create-tag) response. AtomGit's shape is loose, so every field
+/// is optional; `name` is accepted as an alias for `tag_name`. The tool falls back to
+/// the requested name when the response omits it.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct Tag {
+    #[serde(default, alias = "name")]
+    pub tag_name: String,
+    #[serde(default, alias = "tag_message")]
+    pub message: String,
+}
+
 /// `POST .../comments` returns an `id` that AtomGit sends as a string.
 #[derive(Debug, Deserialize, Clone)]
 pub struct CreatedComment {
