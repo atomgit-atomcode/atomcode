@@ -177,6 +177,25 @@ async fn review(args: ReviewArgs) -> Result<()> {
                     eprintln!("[rules] no language rules matched the changed files");
                 }
             }
+            // Explicit changed-file checklist: the agent decides what to read, and on
+            // large diffs it sometimes skips an entire file (the single biggest source of
+            // run-to-run recall variance). Force a one-by-one sweep with a confirmation in
+            // the summary so a missed file becomes visible instead of silently dropped.
+            let file_checklist = if changed_files.is_empty() {
+                String::new()
+            } else {
+                let list =
+                    changed_files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
+                format!(
+                    "\n\nYou MUST review EVERY one of the {} changed file(s) listed below, one \
+                     at a time — investigate each file's changes and surrounding code before \
+                     moving to the next; do NOT skip a file because it looks minor or \
+                     non-core. In your closing summary, list each changed file and confirm you \
+                     reviewed it (write \"no issues\" for the clean ones), so a missed file is \
+                     visible.\n\nChanged files to review:\n{list}",
+                    changed_files.len()
+                )
+            };
             // Prefix every hunk line with its REAL file line number so the model anchors
             // findings precisely instead of counting lines itself.
             let diff = atomcode_review::annotate_diff_line_numbers(&diff);
@@ -185,7 +204,7 @@ async fn review(args: ReviewArgs) -> Result<()> {
                  line number (`N: `) — use these numbers for `line_start`/`line_end`. \
                  Investigate the surrounding code with your read-only tools, then report \
                  each issue via `report_finding`. Report only real issues, each anchored \
-                 to a concrete file and line.\n\n```diff\n{diff}\n```"
+                 to a concrete file and line.{file_checklist}\n\n```diff\n{diff}\n```"
             );
             (t, label)
         }
