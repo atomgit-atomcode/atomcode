@@ -339,6 +339,51 @@ impl Conversation {
         }
     }
 
+    /// Finalize a no-tool-call assistant turn, PRESERVING any thinking-model
+    /// reasoning. A plain `Text` message can't carry `reasoning_content`, so a
+    /// turn that captured reasoning is stored as `AssistantWithToolCalls` with
+    /// an empty `tool_calls` list — the one representation that holds reasoning
+    /// while behaving like a text turn everywhere else (empty tool_calls expect
+    /// zero ToolResults, so `sanitize_messages` never drops it; `format_messages`
+    /// serialises it as plain assistant text + reasoning_content).
+    ///
+    /// This is what lets the next request echo the REAL reasoning of the final
+    /// answer back — DeepSeek V4's thinking-mode contract requires it (400
+    /// otherwise) — instead of falling back to the "(no reasoning recorded)"
+    /// placeholder, which thinking models (DeepSeek V4 Flash) otherwise mimic
+    /// into their replies and which stalls the turn. Turns with no captured
+    /// reasoning fall back to a plain `Text` message (non-thinking models are
+    /// unaffected).
+    pub fn finalize_stream_with_reasoning(
+        &mut self,
+        reasoning: Option<&str>,
+        thinking_blocks: Vec<crate::conversation::message::ThinkingBlock>,
+    ) {
+        let Some(raw) = self.stream_buffer.take() else {
+            return;
+        };
+        let Some(content) = clean_assistant_text(&raw) else {
+            return;
+        };
+        let has_reasoning = reasoning.map(|r| !r.trim().is_empty()).unwrap_or(false);
+        let idx = self.messages.len();
+        if has_reasoning || !thinking_blocks.is_empty() {
+            self.messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: Some(content),
+                    tool_calls: Vec::new(),
+                    reasoning_content: reasoning.map(|s| s.to_string()),
+                    thinking_blocks,
+                },
+                synthetic: false,
+            });
+        } else {
+            self.messages.push(Message::new(Role::Assistant, content));
+        }
+        self.turn_tracker.on_message_added(idx);
+    }
+
     pub fn add_assistant_tool_calls(
         &mut self,
         text: Option<&str>,
@@ -960,6 +1005,46 @@ mod tests {
         let conv = Conversation::new();
         assert!(conv.messages.is_empty());
         assert!(conv.stream_buffer.is_none());
+    }
+
+    #[test]
+    fn finalize_stream_with_reasoning_preserves_reasoning_as_empty_tool_calls() {
+        // A no-tool-call final answer that captured reasoning must keep it,
+        // stored as AssistantWithToolCalls{tool_calls: []} so format_messages can
+        // echo the REAL reasoning instead of the "(no reasoning recorded)"
+        // placeholder. (DeepSeek V4 Flash bug.)
+        let mut c = Conversation::new();
+        c.push_delta("the answer");
+        c.finalize_stream_with_reasoning(Some("my thinking"), Vec::new());
+        assert_eq!(c.messages.len(), 1);
+        match &c.messages[0].content {
+            MessageContent::AssistantWithToolCalls {
+                text,
+                tool_calls,
+                reasoning_content,
+                ..
+            } => {
+                assert!(tool_calls.is_empty(), "no tool calls on a final answer");
+                assert_eq!(text.as_deref(), Some("the answer"));
+                assert_eq!(reasoning_content.as_deref(), Some("my thinking"));
+            }
+            other => panic!("expected AssistantWithToolCalls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_stream_with_reasoning_falls_back_to_text_without_reasoning() {
+        // Non-thinking models capture no reasoning — keep the plain Text shape
+        // so nothing else changes for them.
+        let mut c = Conversation::new();
+        c.push_delta("plain answer");
+        c.finalize_stream_with_reasoning(None, Vec::new());
+        assert_eq!(c.messages.len(), 1);
+        assert!(
+            matches!(&c.messages[0].content, MessageContent::Text(t) if t == "plain answer"),
+            "no reasoning → plain Text, got {:?}",
+            c.messages[0].content
+        );
     }
 
     #[test]

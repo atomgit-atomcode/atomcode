@@ -716,12 +716,12 @@ impl TurnRunner {
                                         // tool call message". The send-side ReasoningPolicy
                                         // (per-provider) decides whether the field actually
                                         // reaches the wire.
+                                        let reasoning = if reasoning_buf.trim().is_empty() {
+                                            None
+                                        } else {
+                                            Some(reasoning_buf.as_str())
+                                        };
                                         if !tool_calls_buf.is_empty() {
-                                            let reasoning = if reasoning_buf.trim().is_empty() {
-                                                None
-                                            } else {
-                                                Some(reasoning_buf.as_str())
-                                            };
                                             conversation
                                                 .finalize_stream_with_tool_calls_and_thinking(
                                                     &tool_calls_buf,
@@ -729,7 +729,17 @@ impl TurnRunner {
                                                     std::mem::take(&mut thinking_blocks),
                                                 );
                                         } else {
-                                            conversation.finalize_stream();
+                                            // No tool calls — still preserve the
+                                            // final-answer reasoning so the next
+                                            // request echoes the REAL reasoning_content
+                                            // (thinking-mode contract) instead of a
+                                            // "(no reasoning recorded)" placeholder that
+                                            // thinking models mimic back. See
+                                            // `finalize_stream_with_reasoning`.
+                                            conversation.finalize_stream_with_reasoning(
+                                                reasoning,
+                                                std::mem::take(&mut thinking_blocks),
+                                            );
                                         }
                                         was_truncated = is_truncated;
                                         break;

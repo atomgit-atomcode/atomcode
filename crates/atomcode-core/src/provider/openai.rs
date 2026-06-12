@@ -1968,6 +1968,34 @@ mod tests {
     }
 
     #[test]
+    fn format_messages_no_tool_call_turn_echoes_real_reasoning_not_placeholder() {
+        // The fix for the DeepSeek V4 Flash "(no reasoning recorded)" bug: a
+        // final-answer (no tool_calls) turn that captured real reasoning is
+        // stored as AssistantWithToolCalls with an empty tool_calls list, so
+        // format_messages echoes the REAL reasoning back (satisfying the
+        // thinking-mode contract) instead of the placeholder that flash mimics.
+        use super::{OpenAiProvider, ReasoningPolicy};
+        use crate::conversation::message::{Message, MessageContent, Role};
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: Some("当前系统时间是 …".into()),
+                tool_calls: Vec::new(), // no tool calls — final answer
+                reasoning_content: Some("用户问时间，直接回答".into()),
+                thinking_blocks: Vec::new(),
+            },
+            synthetic: false,
+        }];
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
+        assert_eq!(out.len(), 1, "must not be dropped");
+        assert!(out[0].get("tool_calls").is_none(), "empty tool_calls omitted");
+        assert_eq!(
+            out[0]["reasoning_content"], "用户问时间，直接回答",
+            "must echo the REAL reasoning, not the placeholder",
+        );
+    }
+
+    #[test]
     fn placeholder_send_side_matches_shared_constant() {
         // `TurnRunner::Done` skips reasoning→text promotion when the
         // accumulated reasoning_buf equals exactly this placeholder.
