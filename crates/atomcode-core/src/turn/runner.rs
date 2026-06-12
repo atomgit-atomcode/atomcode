@@ -426,12 +426,18 @@ impl TurnRunner {
                             biased;
 
             _ = cancel.cancelled() => {
-                                conversation.finalize_stream();
+                                conversation.finalize_stream_with_reasoning(
+                                    reasoning_opt(&reasoning_buf),
+                                    std::mem::take(&mut thinking_blocks),
+                                );
                                 tel_return!(TurnResult::Cancelled, 0u32);
                             }
 
                             _ = tokio::time::sleep(timeout) => {
-                                conversation.finalize_stream();
+                                conversation.finalize_stream_with_reasoning(
+                                    reasoning_opt(&reasoning_buf),
+                                    std::mem::take(&mut thinking_blocks),
+                                );
                                 tel_return!(TurnResult::Failed(format!(
                                     "Stream timeout: no event for {:?}",
                                     timeout
@@ -463,7 +469,10 @@ impl TurnRunner {
                                                     visible_text_buf.push_str(&visible);
                                                     let _ = event_tx
                                                         .send(TurnEvent::TextDelta(visible));
-                                                    conversation.finalize_stream();
+                                                    conversation.finalize_stream_with_reasoning(
+                                                        reasoning_opt(&reasoning_buf),
+                                                        std::mem::take(&mut thinking_blocks),
+                                                    );
                                                     tel_return!(
                                                         TurnResult::Failed(reason),
                                                         0u32
@@ -669,7 +678,15 @@ impl TurnRunner {
                                             // 3-retry-with-backoff path takes over and
                                             // surfaces the issue to the user instead of
                                             // burying it as success.
-                                            let promoted = std::mem::take(&mut reasoning_buf);
+                                            // is_only_placeholder_filler already routed
+                                            // PURE-placeholder buffers to the empty-response
+                                            // path above, so we only reach here with REAL
+                                            // content — but a mimicking thinking model can
+                                            // splice placeholder copies INTO that content
+                                            // (mixed case). Strip them so the sentinel never
+                                            // surfaces in the user-visible answer.
+                                            let promoted = std::mem::take(&mut reasoning_buf)
+                                                .replace(crate::provider::REASONING_PLACEHOLDER, "");
                                             conversation.push_delta(&promoted);
                                             text_buf.push_str(&promoted);
                                             // Reasoning channel doesn't carry tool_call XML
@@ -746,7 +763,10 @@ impl TurnRunner {
                                     }
 
                                     Some(Ok(StreamEvent::Error(e))) => {
-                                        conversation.finalize_stream();
+                                        conversation.finalize_stream_with_reasoning(
+                                            reasoning_opt(&reasoning_buf),
+                                            std::mem::take(&mut thinking_blocks),
+                                        );
                                         tel_return!(TurnResult::Failed(e), 0u32);
                                     }
 
@@ -760,13 +780,20 @@ impl TurnRunner {
                                     }
 
                                     Some(Err(e)) => {
-                                        conversation.finalize_stream();
+                                        conversation.finalize_stream_with_reasoning(
+                                            reasoning_opt(&reasoning_buf),
+                                            std::mem::take(&mut thinking_blocks),
+                                        );
                                         tel_return!(TurnResult::Failed(e.to_string()), 0u32);
                                     }
 
                                     None => {
-                                        // Stream ended without Done event
-                                        conversation.finalize_stream();
+                                        // Stream ended without Done event — preserve any
+                                        // captured reasoning, mirroring the Done branch.
+                                        conversation.finalize_stream_with_reasoning(
+                                            reasoning_opt(&reasoning_buf),
+                                            std::mem::take(&mut thinking_blocks),
+                                        );
                                         break;
                                     }
                                 }
@@ -1599,6 +1626,22 @@ fn is_only_placeholder_filler(reasoning: &str) -> bool {
         .is_empty()
 }
 
+/// `None` for an empty/whitespace reasoning buffer, else `Some(buf)`.
+///
+/// Used at every stream-termination site (Done, error, abort, stream-end) so
+/// any captured thinking-model reasoning is preserved into history rather than
+/// dropped — `finalize_stream_with_reasoning(None, _)` is identical to the old
+/// `finalize_stream()`, so non-thinking models are unaffected. Preserving real
+/// reasoning means the next request echoes it instead of falling back to the
+/// `REASONING_PLACEHOLDER` filler.
+fn reasoning_opt(buf: &str) -> Option<&str> {
+    if buf.trim().is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
+}
+
 fn normalize_tool_args(args: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| args.to_string()),
@@ -2165,6 +2208,17 @@ mod is_only_placeholder_filler_tests {
         // the real reasoning we'd want to keep.
         let mixed = format!("{} but actually I see now that...", REASONING_PLACEHOLDER);
         assert!(!is_only_placeholder_filler(&mixed));
+    }
+
+    #[test]
+    fn reasoning_opt_maps_empty_to_none_and_content_to_some_verbatim() {
+        use super::reasoning_opt;
+        assert_eq!(reasoning_opt(""), None);
+        assert_eq!(reasoning_opt("   \n\t "), None);
+        assert_eq!(reasoning_opt("real thinking"), Some("real thinking"));
+        // Emptiness is judged after trim, but the value is returned verbatim
+        // (never trimmed) so we never mutate captured reasoning.
+        assert_eq!(reasoning_opt("  pad  "), Some("  pad  "));
     }
 }
 
