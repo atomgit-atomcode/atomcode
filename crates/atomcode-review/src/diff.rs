@@ -89,9 +89,9 @@ pub fn annotate_diff_line_numbers(diff: &str) -> String {
 
     // split('\n') yields a trailing empty segment for a trailing newline — drop the
     // extra newline we appended for it so the output matches the input's ending.
-    if !diff.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    } else if diff.ends_with('\n') && out.ends_with("\n\n") {
+    if (!diff.ends_with('\n') && out.ends_with('\n'))
+        || (diff.ends_with('\n') && out.ends_with("\n\n"))
+    {
         out.pop();
     }
     out

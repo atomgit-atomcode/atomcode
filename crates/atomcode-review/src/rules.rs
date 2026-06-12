@@ -27,6 +27,14 @@ const MATCHERS: &[(&str, &str)] = &[
     ("readme*.md", "markdown"),
     ("*.md", "markdown"),
     ("*.markdown", "markdown"),
+    ("dockerfile", "dockerfile"),
+    ("dockerfile.*", "dockerfile"),
+    ("*.dockerfile", "dockerfile"),
+    ("makefile", "makefile"),
+    ("gnumakefile", "makefile"),
+    ("*.mk", "makefile"),
+    ("cmakelists.txt", "cmake"),
+    ("*.cmake", "cmake"),
     // MyBatis mapper / dao xml (narrower than a generic *.xml).
     ("*mapper*.xml", "mapper_dao_xml"),
     ("*dao*.xml", "mapper_dao_xml"),
@@ -55,12 +63,45 @@ const MATCHERS: &[(&str, &str)] = &[
     ("*.rs", "rust"),
     ("*.rb", "ruby"),
     ("*.php", "php"),
+    ("*.cs", "csharp"),
+    ("*.swift", "swift"),
+    ("*.m", "objc"),
+    ("*.mm", "objc"),
+    ("*.dart", "dart"),
+    ("*.scala", "scala"),
+    ("*.groovy", "groovy"),
+    ("*.lua", "lua"),
+    ("*.pl", "perl"),
+    ("*.pm", "perl"),
+    ("*.r", "r"),
+    ("*.ex", "elixir"),
+    ("*.exs", "elixir"),
+    ("*.erl", "erlang"),
+    ("*.hrl", "erlang"),
+    ("*.hs", "haskell"),
+    ("*.clj", "clojure"),
+    ("*.cljs", "clojure"),
+    ("*.cljc", "clojure"),
+    ("*.sol", "solidity"),
+    ("*.tf", "terraform"),
+    ("*.tfvars", "terraform"),
+    ("*.proto", "protobuf"),
+    ("*.graphql", "graphql"),
+    ("*.gql", "graphql"),
+    ("*.html", "html"),
+    ("*.htm", "html"),
+    ("*.css", "css"),
+    ("*.scss", "css"),
+    ("*.sass", "css"),
+    ("*.less", "css"),
     // Generic config types (after the specific file names).
     ("*.properties", "properties"),
     ("*.yaml", "yaml"),
     ("*.yml", "yaml"),
     ("*.json", "json"),
     ("*.json5", "json"),
+    ("*.xml", "xml"),
+    ("*.toml", "toml"),
 ];
 
 /// Built-in rule documents, compiled in. `--rules-dir` overrides by name at runtime.
@@ -68,24 +109,48 @@ const RULE_DOCS: &[(&str, &str)] = &[
     ("arkts", include_str!("../rules/arkts.md")),
     ("build_gradle", include_str!("../rules/build_gradle.md")),
     ("c", include_str!("../rules/c.md")),
+    ("clojure", include_str!("../rules/clojure.md")),
+    ("cmake", include_str!("../rules/cmake.md")),
     ("cpp", include_str!("../rules/cpp.md")),
+    ("csharp", include_str!("../rules/csharp.md")),
+    ("css", include_str!("../rules/css.md")),
+    ("dart", include_str!("../rules/dart.md")),
+    ("dockerfile", include_str!("../rules/dockerfile.md")),
+    ("elixir", include_str!("../rules/elixir.md")),
+    ("erlang", include_str!("../rules/erlang.md")),
     ("go", include_str!("../rules/go.md")),
+    ("graphql", include_str!("../rules/graphql.md")),
+    ("groovy", include_str!("../rules/groovy.md")),
+    ("haskell", include_str!("../rules/haskell.md")),
+    ("html", include_str!("../rules/html.md")),
     ("java", include_str!("../rules/java.md")),
     ("json", include_str!("../rules/json.md")),
     ("kotlin", include_str!("../rules/kotlin.md")),
+    ("lua", include_str!("../rules/lua.md")),
+    ("makefile", include_str!("../rules/makefile.md")),
     ("mapper_dao_xml", include_str!("../rules/mapper_dao_xml.md")),
     ("markdown", include_str!("../rules/markdown.md")),
+    ("objc", include_str!("../rules/objc.md")),
     ("package_json", include_str!("../rules/package_json.md")),
+    ("perl", include_str!("../rules/perl.md")),
     ("php", include_str!("../rules/php.md")),
     ("pom_xml", include_str!("../rules/pom_xml.md")),
     ("properties", include_str!("../rules/properties.md")),
+    ("protobuf", include_str!("../rules/protobuf.md")),
     ("python", include_str!("../rules/python.md")),
     ("python_deps", include_str!("../rules/python_deps.md")),
+    ("r", include_str!("../rules/r.md")),
     ("ruby", include_str!("../rules/ruby.md")),
     ("rust", include_str!("../rules/rust.md")),
+    ("scala", include_str!("../rules/scala.md")),
     ("shell", include_str!("../rules/shell.md")),
+    ("solidity", include_str!("../rules/solidity.md")),
     ("sql", include_str!("../rules/sql.md")),
+    ("swift", include_str!("../rules/swift.md")),
+    ("terraform", include_str!("../rules/terraform.md")),
+    ("toml", include_str!("../rules/toml.md")),
     ("ts", include_str!("../rules/ts.md")),
+    ("xml", include_str!("../rules/xml.md")),
     ("yaml", include_str!("../rules/yaml.md")),
 ];
 
@@ -240,5 +305,15 @@ mod tests {
         let s2 = render_rules_section(&["x.sql".to_string()], Some(&dir));
         assert!(s2.contains("[SQL]"), "missing override falls back to built-in");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_matcher_rule_has_a_builtin_doc() {
+        for (pat, name) in MATCHERS {
+            assert!(
+                RULE_DOCS.iter().any(|(n, _)| n == name),
+                "matcher {pat:?} -> {name:?} has no entry in RULE_DOCS (forgot to register the rule doc?)"
+            );
+        }
     }
 }
