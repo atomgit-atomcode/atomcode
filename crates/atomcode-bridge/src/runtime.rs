@@ -101,6 +101,9 @@ struct Bridge {
     /// A plan-mode toggle note to prepend to the next user message (v1 parity:
     /// communicated via history, NOT the system prompt, to keep the prefix cache).
     pending_plan_note: Option<String>,
+    /// `/undo` in flight: the requested prompt index (None = the last turn). Awaits a
+    /// Snapshot to truncate against.
+    pending_undo: Option<Option<usize>>,
 }
 
 impl Bridge {
@@ -174,6 +177,7 @@ impl Bridge {
             pending_finish: None,
             pending_sync: false,
             pending_plan_note: None,
+            pending_undo: None,
         };
 
         loop {
@@ -419,9 +423,11 @@ impl Bridge {
                 let _ = self.handle.commands.send(KCmd::Snapshot);
             }
             CoreCmd::ReloadHooks => { /* plugin hooks are a legacy-engine feature */ }
-            CoreCmd::UndoToPrompt { .. } => {
-                // /undo is engine backlog (B6) on the new stack.
-                self.emit(CoreEv::UndoFailed { requested: 1, available: 0 });
+            CoreCmd::UndoToPrompt { nth } => {
+                // Need the current conversation to truncate against — fetch it; the
+                // Snapshot reply runs `do_undo`.
+                self.pending_undo = Some(nth);
+                let _ = self.handle.commands.send(KCmd::Snapshot);
             }
             CoreCmd::LocalShell { .. } => {
                 self.emit(CoreEv::Warning(
@@ -528,6 +534,36 @@ impl Bridge {
             }
         }
         self.emit(CoreEv::PhaseChange(AgentPhase::Idle));
+    }
+
+    /// `/undo`: truncate the conversation to BEFORE the `nth` user prompt (None = the
+    /// last turn), persist + respawn from it, and report the restored prompt — mirrors
+    /// v1's `Conversation::undo_to_prompt`. Runs on the kernel snapshot fetched by the
+    /// `UndoToPrompt` handler.
+    async fn do_undo(&mut self, messages: Vec<atomcode_kernel::message::Message>, nth: Option<usize>) {
+        match compute_undo(&messages, nth) {
+            Err((requested, available)) => {
+                self.emit(CoreEv::UndoFailed { requested, available })
+            }
+            Ok(undo) => {
+                let core_msgs: Vec<_> =
+                    undo.truncated.iter().map(convert::message_to_core).collect();
+                // Persist the truncated history, then respawn so the engine continues
+                // from exactly it (monotonic ids; approval + plan mode kept).
+                if let Some(b) = self.parts.session.as_ref() {
+                    let _ = b
+                        .manager
+                        .save_snapshot(&self.bridge_session, &SessionSnapshot::new(undo.truncated));
+                }
+                self.respawn(SessionMode::Resume(self.bridge_session.clone())).await;
+                self.emit(CoreEv::ConversationTruncated {
+                    messages: core_msgs,
+                    restored_prompt: undo.restored_prompt,
+                    target_n: undo.target_n,
+                    prompts_before: undo.prompts_before,
+                });
+            }
+        }
     }
 
     fn emit_context_stats(&self) {
@@ -650,14 +686,14 @@ impl Bridge {
                 self.emit_context_stats();
             }
             KEv::Snapshot { snapshot } => {
-                let messages: Vec<_> =
-                    snapshot.messages.iter().map(convert::message_to_core).collect();
                 if let Some(reason) = self.pending_finish.take() {
+                    let messages = snapshot.messages.iter().map(convert::message_to_core).collect();
                     self.finish_turn(reason, messages);
-                } else if self.pending_sync {
-                    self.pending_sync = false;
-                    self.emit(CoreEv::MessagesSync { messages });
+                } else if let Some(nth) = self.pending_undo.take() {
+                    self.do_undo(snapshot.messages, nth).await;
                 } else {
+                    self.pending_sync = false;
+                    let messages = snapshot.messages.iter().map(convert::message_to_core).collect();
                     self.emit(CoreEv::MessagesSync { messages });
                 }
             }
@@ -681,6 +717,42 @@ impl Bridge {
             }
             _ => {}
         }
+    }
+}
+
+/// Result of a successful `/undo` truncation.
+struct UndoPlan {
+    truncated: Vec<atomcode_kernel::message::Message>,
+    restored_prompt: String,
+    target_n: usize,
+    prompts_before: usize,
+}
+
+/// Pure truncation for `/undo`: cut the conversation to BEFORE the `nth` REAL
+/// (non-synthetic) user prompt (None = the last one), returning the truncated
+/// history + that prompt's text. `Err((requested, available))` when out of range —
+/// mirrors v1's `Conversation::undo_to_prompt`.
+fn compute_undo(
+    messages: &[atomcode_kernel::message::Message],
+    nth: Option<usize>,
+) -> Result<UndoPlan, (usize, usize)> {
+    use atomcode_kernel::message::Role as KRole;
+    let prompt_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == KRole::User && !m.synthetic)
+        .map(|(i, _)| i)
+        .collect();
+    let available = prompt_indices.len();
+    let target = nth.unwrap_or(available);
+    match target.checked_sub(1).and_then(|i| prompt_indices.get(i)) {
+        Some(&idx) => Ok(UndoPlan {
+            truncated: messages[..idx].to_vec(),
+            restored_prompt: messages[idx].text.clone(),
+            target_n: target,
+            prompts_before: available,
+        }),
+        None => Err((target, available)),
     }
 }
 
@@ -718,5 +790,60 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let head: String = s.chars().take(max).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::compute_undo;
+    use atomcode_kernel::message::Message;
+
+    fn convo() -> Vec<Message> {
+        // system, user1, asst1, user2, asst2 — two real prompts.
+        vec![
+            Message::system("persona"),
+            Message::user("first question"),
+            Message::assistant("first answer", vec![]),
+            Message::user("second question"),
+            Message::assistant("second answer", vec![]),
+        ]
+    }
+
+    #[test]
+    fn bare_undo_drops_the_last_turn() {
+        let p = compute_undo(&convo(), None).unwrap();
+        assert_eq!(p.target_n, 2);
+        assert_eq!(p.prompts_before, 2);
+        assert_eq!(p.restored_prompt, "second question");
+        // truncated to before user2 → system, user1, asst1.
+        assert_eq!(p.truncated.len(), 3);
+        assert_eq!(p.truncated.last().unwrap().text, "first answer");
+    }
+
+    #[test]
+    fn undo_to_first_prompt_keeps_only_the_system_head() {
+        let p = compute_undo(&convo(), Some(1)).unwrap();
+        assert_eq!(p.restored_prompt, "first question");
+        assert_eq!(p.truncated.len(), 1);
+        assert_eq!(p.truncated[0].role, atomcode_kernel::message::Role::System);
+    }
+
+    #[test]
+    fn out_of_range_and_zero_fail_with_counts() {
+        assert_eq!(compute_undo(&convo(), Some(3)).err(), Some((3, 2)));
+        assert_eq!(compute_undo(&convo(), Some(0)).err(), Some((0, 2)));
+        assert_eq!(compute_undo(&[], None).err(), Some((0, 0)));
+    }
+
+    #[test]
+    fn synthetic_user_messages_are_not_prompts() {
+        let mut msgs = convo();
+        let mut note = Message::user("[PLAN MODE ACTIVATED] ...");
+        note.synthetic = true;
+        msgs.insert(3, note); // a synthetic note between the two real prompts
+        let p = compute_undo(&msgs, None).unwrap();
+        // Still 2 real prompts; the synthetic note must not shift the count/target.
+        assert_eq!(p.prompts_before, 2);
+        assert_eq!(p.restored_prompt, "second question");
     }
 }
