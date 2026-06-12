@@ -816,8 +816,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
             rows.push(row);
         } else {
-            // Wrapping: first chunk splits at name boundary;
-            // meta is short, append to first row in meta_style.
+            // Wrapping: first chunk splits at the name boundary; continuation
+            // chunks are padded under the name. `full_body` excludes `meta`
+            // (the ` · 12s` time anchor) — it's appended AFTER the wrapped body
+            // below, matching the single-line order (name → detail → meta).
             let chunks: Vec<String> =
                 crate::width::wrap_line_to_width(full_body, first_budget.max(1))
                     .into_iter()
@@ -839,14 +841,35 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             push_str_cells(&mut row, rest, detail_style);
                         }
                     }
-                    if !meta.is_empty() {
-                        push_str_cells(&mut row, meta, meta_style);
-                    }
                 } else {
                     push_str_cells(&mut row, &cont_pad, &pad);
                     push_str_cells(&mut row, chunk, detail_style);
                 }
                 rows.push(row);
+            }
+            // Append `meta` after the wrapped body. Appending it to the FIRST
+            // row (as the old code did) overflowed the screen by meta's width —
+            // the first chunk already fills `first_budget`, so `prefix + chunk +
+            // meta` exceeds `w` and the terminal clips or re-wraps it, dropping
+            // the `· 93.7s` time anchor on narrow windows. Put it on the last
+            // row when it fits, otherwise on its own continuation row.
+            if !meta.is_empty() {
+                let last_w: usize = rows
+                    .last()
+                    .map(|r| r.iter().map(|c| c.width as usize).sum())
+                    .unwrap_or(0);
+                if last_w + meta_dw <= w {
+                    if let Some(last) = rows.last_mut() {
+                        push_str_cells(last, meta, meta_style);
+                    }
+                } else {
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, &cont_pad, &CellStyle::default());
+                    // meta is typically " · 12s"; drop the leading space so it
+                    // lines up under the body on its own row.
+                    push_str_cells(&mut row, meta.trim_start(), meta_style);
+                    rows.push(row);
+                }
             }
         }
         rows
@@ -8954,6 +8977,35 @@ mod tests {
             total_cols <= 38,
             "row width {} cols exceeds avail 38 (screen=40, PAD_COL=2)",
             total_cols
+        );
+    }
+
+    #[test]
+    fn inflight_tool_meta_survives_wrapping_without_overflow() {
+        // Regression (narrow window): an in-flight tool row with a long detail
+        // wrapped, and the ` · 93.7s` duration was appended to the FIRST
+        // already-full-width row, overflowing the screen — the terminal then
+        // clipped/re-wrapped it and the time anchor vanished. The meta must
+        // survive, and NO row may exceed the available width.
+        let (r, _sink) = new_capturing(40, 24);
+        let plain = CellStyle::default();
+        let detail = "(mod.rs, publish_service.rs, publish_service.rs, PublishSkill.tsx, skill.ts)";
+        let rows = r.build_mixed_style_rows(
+            "◑ ", &plain,
+            "ParallelEditFiles", &plain,
+            detail, &plain,
+            " · 93.7s", &plain,
+            &format!("ParallelEditFiles{detail}"),
+        );
+        let avail = 40usize - PAD_COL;
+        for row in &rows {
+            let w: usize = row.iter().map(|c| c.width as usize).sum();
+            assert!(w <= avail, "row width {w} exceeds avail {avail}: {row:?}");
+        }
+        let all: String = rows.iter().flat_map(|row| row.iter().map(|c| c.ch)).collect();
+        assert!(
+            all.contains("93.7s"),
+            "duration must survive wrapping, got: {all:?}",
         );
     }
 
