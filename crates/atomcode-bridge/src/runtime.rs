@@ -98,6 +98,9 @@ struct Bridge {
     pending_finish: Option<StopReason>,
     /// Driver asked for SyncMessages: the next Snapshot answers it.
     pending_sync: bool,
+    /// A plan-mode toggle note to prepend to the next user message (v1 parity:
+    /// communicated via history, NOT the system prompt, to keep the prefix cache).
+    pending_plan_note: Option<String>,
 }
 
 impl Bridge {
@@ -170,6 +173,7 @@ impl Bridge {
             turn_running: false,
             pending_finish: None,
             pending_sync: false,
+            pending_plan_note: None,
         };
 
         loop {
@@ -223,6 +227,13 @@ impl Bridge {
                 // The bridge never drives sync sessions, so emitting it here just
                 // double-renders the user's line (the "两条 input" duplicate).
                 self.start_turn_stats();
+                // A just-toggled plan mode rides in on the next message as a one-time
+                // note (kept out of the system prompt, like v1, so toggling it never
+                // zeroes the prefix cache).
+                let text = match self.pending_plan_note.take() {
+                    Some(note) => format!("{note}\n\n{text}"),
+                    None => text,
+                };
                 let images = images.iter().map(convert::image_to_kernel).collect();
                 let _ = self.handle.commands.send(KCmd::SendMessage { text, images });
             }
@@ -367,11 +378,25 @@ impl Bridge {
                 }
             }
             CoreCmd::SetPlanMode(on) => {
-                if on {
-                    self.emit(CoreEv::Warning(
-                        "plan mode is not yet supported by engine v2 (falls back to build mode)"
-                            .into(),
-                    ));
+                let was = self
+                    .parts
+                    .plan_mode
+                    .swap(on, std::sync::atomic::Ordering::Relaxed);
+                // Only note an ACTUAL toggle (idempotent SetPlanMode is a no-op). The
+                // note is delivered with the next user message (see SendMessage); the
+                // PlanModeGate enforces the read-only constraint every turn regardless.
+                if was != on {
+                    self.pending_plan_note = Some(
+                        if on {
+                            "[PLAN MODE ACTIVATED] You are now in plan mode: only read-only tools \
+                             are available — do NOT edit, create, or delete anything. Explore and \
+                             present a detailed plan for the user to approve before making changes."
+                        } else {
+                            "[PLAN MODE ENDED] Plan mode is off. You may now edit files and carry \
+                             out the plan."
+                        }
+                        .to_string(),
+                    );
                 }
             }
             CoreCmd::Background { .. } => {
@@ -439,6 +464,8 @@ impl Bridge {
             Ok(mut parts) => {
                 // Approval grants survive engine respawns (same contract as C1).
                 parts.approval = self.parts.approval.clone();
+                // Plan mode survives a respawn (/resume, /clear, model swap).
+                parts.plan_mode = self.parts.plan_mode.clone();
                 match build_provider(&self.coding_cfg)
                     .and_then(|p| assemble(&mut parts, &self.coding_cfg, p).map_err(Into::into))
                 {

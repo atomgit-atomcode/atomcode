@@ -108,6 +108,10 @@ pub struct CodingParts {
     /// next call. Session/memory/recall stay anchored to the PREPARE-time project
     /// root by design (the per-project stores don't follow a mid-session cd).
     pub shared_cwd: std::sync::Arc<std::sync::RwLock<std::path::PathBuf>>,
+    /// Plan-mode toggle (read-only exploration). The driver flips it (the bridge maps
+    /// `SetPlanMode`); the [`PlanModeGate`](crate::PlanModeGate) middleware reads it to
+    /// block mutating tools. Shared (not rebuilt) so a respawn preserves the mode.
+    pub plan_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Phase 1 — gather + connect everything the agent needs (async: MCP connect,
@@ -216,6 +220,7 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
 
     Ok(CodingParts {
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
+        plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         registry,
         tool_names: names,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
@@ -291,6 +296,10 @@ pub fn assemble(
         )));
     }
     let mut builder = builder
+        // Plan-mode gate BEFORE approval: while active it blocks mutating (Risky)
+        // tools outright, so there's no point prompting the user to approve a write
+        // plan mode forbids. Read-only when inactive — zero cost off the plan path.
+        .middleware(Arc::new(crate::plan_mode::PlanModeGate::new(parts.plan_mode.clone())))
         // Approval BEFORE any arg-rewriting middleware — the user approves the exact
         // bytes that run.
         .middleware(parts.approval.clone())

@@ -32,6 +32,7 @@ pub mod config;
 pub mod discipline;
 pub mod parts;
 pub mod persona;
+pub mod plan_mode;
 pub mod telemetry;
 
 mod assemble;
@@ -39,6 +40,7 @@ mod assemble;
 pub use assemble::{build_coding_agent, build_coding_agent_with};
 pub use config::CodingAgentConfig;
 pub use discipline::VerifyCadenceHook;
+pub use plan_mode::PlanModeGate;
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use parts::{assemble, prepare, CodingParts, PrepareOptions, SessionBinding, SessionMode};
 pub use persona::coding_persona;
