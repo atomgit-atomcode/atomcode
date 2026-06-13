@@ -142,7 +142,18 @@ impl RecallTool {
             limit,
         };
         let hits = self.index.search(&records, &q);
-        format_hits(&hits)
+        let mut out = format_hits(&hits);
+        // Self-documenting fallback: point the model at the raw ground truth (prints the
+        // REAL dir, so it never goes stale) and restate the freshness boundary right where
+        // a confused "why is nothing here?" lands. Reading those `<id>.jsonl` files gives
+        // the exact, full turn (incl. tool I/O) when the keyword digest above isn't enough.
+        out.push_str(&format!(
+            "\n(Raw per-turn transcripts: {} — one `<session_id>.jsonl` per session, full \
+             text incl. tool I/O. The current in-progress turn is appended there only once \
+             it finishes.)",
+            sessions_dir.display()
+        ));
+        out
     }
 }
 
@@ -153,11 +164,14 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search this project's past conversation turns — across ALL sessions, including \
-         earlier ones — by topic and/or time. Use it to remember something discussed \
-         before (e.g. a decision, a bug, an approach), even from another session. \
-         Resolve relative dates yourself (e.g. 'yesterday') into the `after`/`before` \
-         fields using the current date. Read-only."
+        "Search this project's COMPLETED conversation turns — across all sessions, \
+         including earlier turns of the CURRENT session — by topic and/or time. A turn is \
+         indexed only AFTER it finishes, so the in-progress turn (what is happening right \
+         now) is NOT here yet; for that, rely on your own context. Use it to recall a past \
+         decision, bug, or approach, even from another session. Resolve relative dates \
+         yourself (e.g. 'yesterday') into the `after`/`before` fields using the current \
+         date. Read-only — the result footer shows where the raw per-turn transcripts live \
+         if you need the exact, full text."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -372,6 +386,23 @@ mod tests {
         write_jsonl(dir.path(), "a.jsonl", &[rec("s", 1, "hello", "world")]);
         let out = RecallTool::new().search_dir(dir.path(), "nonexistent", None, None, 8);
         assert!(out.contains("No matching turns"));
+    }
+
+    #[test]
+    fn output_footer_points_at_raw_transcripts_and_states_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        write_jsonl(dir.path(), "a.jsonl", &[rec("s", 1, "hello", "world")]);
+        let want_dir = dir.path().display().to_string();
+
+        // On a hit: footer shows the REAL dir + restates the freshness boundary.
+        let hit = RecallTool::new().search_dir(dir.path(), "hello", None, None, 8);
+        assert!(hit.contains(&want_dir), "footer shows the real dir: {hit}");
+        assert!(hit.contains("in-progress turn"), "footer restates freshness: {hit}");
+
+        // On a no-match (where the "why is nothing here?" confusion lands): footer too.
+        let miss = RecallTool::new().search_dir(dir.path(), "nonexistent", None, None, 8);
+        assert!(miss.contains("No matching turns"));
+        assert!(miss.contains(&want_dir), "footer shows dir even on no-match: {miss}");
     }
 
     #[test]
