@@ -6461,6 +6461,42 @@ pub(super) fn handle_upgrade_event(
 /// `↻ goal round N` / `✓ done · N rounds` prefix and shows just the stats —
 /// the verdict banner already told the user what happened, the line below
 /// only needs the cost & duration. No-op when no separator is pending.
+/// Normal (non-goal) turn-end separator label — i18n, and Error-aware
+/// (✗ "stopped" on an errored turn vs the celebratory ✓ "done" otherwise).
+/// Shared by the immediate-render path (no active goal) and the deferred
+/// `flush_pending_separator` path so both stay localized and consistent.
+fn turn_summary_label(
+    state: &mut UiState,
+    errored: bool,
+    turn_count: usize,
+    tool_call_count: usize,
+    total_tokens: usize,
+    dur: &str,
+) -> String {
+    if errored {
+        // An errored turn already rendered a red Error line just above; a
+        // celebratory "✓ Nailed it" under it is contradictory, and we don't
+        // burn a DONE_LABELS rotation slot on a failure.
+        crate::i18n::t(crate::i18n::Msg::TurnSummaryError {
+            turn_count,
+            tool_call_count,
+            duration: dur,
+            total_tokens,
+        })
+        .into_owned()
+    } else {
+        let done = state.next_done_label();
+        crate::i18n::t(crate::i18n::Msg::TurnSummary {
+            done,
+            turn_count,
+            tool_call_count,
+            duration: dur,
+            total_tokens,
+        })
+        .into_owned()
+    }
+}
+
 fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_goal_end: bool) {
     let Some(ps) = state.pending_separator.take() else { return };
     let dur = crate::render::fmt_dur(ps.duration);
@@ -6477,28 +6513,17 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
             dur,
             ps.total_tokens
         )
-    } else if ps.errored {
-        // An errored turn already rendered a red Error line just above;
-        // showing a celebratory "✓ Nailed it" separator under it is
-        // contradictory. Use the ✗ "stopped" summary instead, and don't
-        // burn a DONE_LABELS rotation slot on a failure.
-        crate::i18n::t(crate::i18n::Msg::TurnSummaryError {
-            turn_count: ps.turn_count,
-            tool_call_count: ps.tool_call_count,
-            duration: &dur,
-            total_tokens: ps.total_tokens,
-        })
-        .into_owned()
     } else {
-        let done = state.next_done_label();
-        crate::i18n::t(crate::i18n::Msg::TurnSummary {
-            done,
-            turn_count: ps.turn_count,
-            tool_call_count: ps.tool_call_count,
-            duration: &dur,
-            total_tokens: ps.total_tokens,
-        })
-        .into_owned()
+        // Reached only if a non-goal turn was ever buffered (today they
+        // render immediately). Kept as a correct fallback either way.
+        turn_summary_label(
+            state,
+            ps.errored,
+            ps.turn_count,
+            ps.tool_call_count,
+            ps.total_tokens,
+            &dur,
+        )
     };
     renderer.render(UiLine::TurnSeparator { label });
     renderer.flush();
@@ -6926,23 +6951,31 @@ fn handle_agent_event(
             );
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
-            // Buffer the separator stats instead of rendering immediately.
-            // The next event decides the rendering (see flush_pending_separator):
-            //   - GoalUpdate(active=false) → the goal just ended, so we want
-            //     `✓ Goal met: ...` ABOVE a stats-only separator
-            //   - any other event → the normal turn summary (i18n + Error-aware,
-            //     preserved from before the /goal merge) or, mid-goal, the
-            //     `↻ goal round N` banner — so per-turn UX is unchanged.
-            // `errored` is carried so the flush can keep rendering the ✗
-            // "stopped" summary instead of a celebratory ✓ under a red Error.
-            state.pending_separator = Some(crate::state::PendingSeparator {
-                duration,
-                turn_count,
-                tool_call_count,
-                total_tokens,
-                was_goal_round: state.goal_condition.is_some(),
-                errored: matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error),
-            });
+            let errored = matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error);
+            if state.goal_condition.is_some() {
+                // A /goal is active: DEFER the separator so the next event can
+                // choose its form — a `✓ Goal met` banner ABOVE a stats-only
+                // line when the goal ends (GoalUpdate active=false), or the
+                // `↻ goal round N` banner mid-goal (flushed by should_flush_now).
+                // `errored` rides along as a defensive fallback.
+                state.pending_separator = Some(crate::state::PendingSeparator {
+                    duration,
+                    turn_count,
+                    tool_call_count,
+                    total_tokens,
+                    was_goal_round: true,
+                    errored,
+                });
+            } else {
+                // No active goal: render the turn summary immediately, exactly
+                // as before the /goal merge — the line lands at the bottom of
+                // the turn that just finished instead of waiting for the next
+                // event. Same i18n + Error-aware label as the deferred path.
+                let dur = crate::render::fmt_dur(duration);
+                let label =
+                    turn_summary_label(state, errored, turn_count, tool_call_count, total_tokens, &dur);
+                renderer.render(UiLine::TurnSeparator { label });
+            }
             renderer.flush();
             state.on_turn_complete();
 
