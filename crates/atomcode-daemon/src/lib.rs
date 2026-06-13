@@ -2203,7 +2203,7 @@ async fn process_chat_request(
     let mut tool_context = ToolContext::with_telemetry(
         working_dir.clone(),
         req.session_id.as_deref().unwrap_or("default"),
-        telemetry,
+        telemetry.clone(),
     );
     let mut tool_registry = ToolRegistry::new();
     // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
@@ -2445,47 +2445,71 @@ async fn process_chat_request(
     // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id
     let tel_ctx = CurrentContext::current();
 
-    // Run turn(s) in background task - may need multiple turns if tools are used
-    tokio::spawn(async move {
-        // Keep the ApprovalRequest receiver alive for the entire turn. The
-        // InteractivePermissionDecider (inside turn_runner) sends on the paired
-        // sender; if this receiver were dropped, every `send` would fail and the
-        // decider would auto-deny EVERY tool. We never read from it — the browser
-        // notification comes from the forwarded `TurnEvent::ApprovalRequested`.
-        // In standalone (BypassAll) mode there is no channel — this is `None`.
-        let _keep_perm_req_rx = perm_req_rx;
-        CurrentContext::scope(tel_ctx, || async move {
-            let mut conv = conversation_clone.lock().await;
+    // Run turn(s) in a background task. Engine v2 ($ATOMCODE_ENGINE=v2) drives the new
+    // stack via atomcode-bridge instead of the v1 TurnRunner; the downstream
+    // turn_rx → ChatEvent consumer + persistence are SHARED (they only read turn_rx).
+    if live_api::live_engine_v2() {
+        let bridge_cfg =
+            live_api::chat_bridge_config(&config, &provider_name, &working_dir, telemetry.clone());
+        // Interactive approval: route /chat/permission decisions to the v2 producer
+        // (this re-registration supersedes the v1 decider's, which never runs here).
+        let perm_rx = if webui_mode {
+            let (tx, rx) = mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
+            pending_permissions.register(perm_session_key.clone(), tx);
+            Some(rx)
+        } else {
+            None
+        };
+        let conv = conversation.clone();
+        let cancel = cancel_token.clone();
+        tokio::spawn(async move {
+            CurrentContext::scope(tel_ctx, || async move {
+                live_api::run_chat_turn_v2(conv, turn_tx, cancel, bridge_cfg, perm_rx).await;
+            })
+            .await;
+        });
+    } else {
+        tokio::spawn(async move {
+            // Keep the ApprovalRequest receiver alive for the entire turn. The
+            // InteractivePermissionDecider (inside turn_runner) sends on the paired
+            // sender; if this receiver were dropped, every `send` would fail and the
+            // decider would auto-deny EVERY tool. We never read from it — the browser
+            // notification comes from the forwarded `TurnEvent::ApprovalRequested`.
+            // In standalone (BypassAll) mode there is no channel — this is `None`.
+            let _keep_perm_req_rx = perm_req_rx;
+            CurrentContext::scope(tel_ctx, || async move {
+                let mut conv = conversation_clone.lock().await;
 
-            // Loop until LLM produces text without tool calls
-            loop {
-                let result = turn_runner
-                    .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
-                    .await;
+                // Loop until LLM produces text without tool calls
+                loop {
+                    let result = turn_runner
+                        .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
+                        .await;
 
-                match result {
-                    TurnResult::Responded { .. } => {
-                        // LLM produced text, turn is complete
-                        break;
-                    }
-                    TurnResult::UsedTools { .. } => {
-                        // Truncation of tool outputs is handled inside
-                        // TurnRunner::run_with_filter now. Nothing to do
-                        // here — just loop back for the next LLM call.
-                        continue;
-                    }
-                    TurnResult::Failed(e) => {
-                        let _ = turn_tx.send(TurnEvent::Error(e));
-                        break;
-                    }
-                    TurnResult::Cancelled => {
-                        break;
+                    match result {
+                        TurnResult::Responded { .. } => {
+                            // LLM produced text, turn is complete
+                            break;
+                        }
+                        TurnResult::UsedTools { .. } => {
+                            // Truncation of tool outputs is handled inside
+                            // TurnRunner::run_with_filter now. Nothing to do
+                            // here — just loop back for the next LLM call.
+                            continue;
+                        }
+                        TurnResult::Failed(e) => {
+                            let _ = turn_tx.send(TurnEvent::Error(e));
+                            break;
+                        }
+                        TurnResult::Cancelled => {
+                            break;
+                        }
                     }
                 }
-            }
-        })
-        .await;
-    });
+            })
+            .await;
+        });
+    }
 
     // Forward turn events to chat events
     let mut total_tokens = 0usize;

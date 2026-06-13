@@ -831,6 +831,157 @@ impl TurnExecutor for KernelTurnExecutor {
     }
 }
 
+/// Simple 1:1 `AgentEvent` → `TurnEvent` translations (the streaming surface both
+/// the `/live` executor and the `/chat` v2 producer forward). Returns `None` for
+/// events the caller handles specially (approval, turn terminals) or ignores.
+pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
+    Some(match ev {
+        AgentEvent::TextDelta(t) => TurnEvent::TextDelta(t),
+        AgentEvent::ReasoningDelta(t) => TurnEvent::ReasoningDelta(t),
+        AgentEvent::ToolCallStreaming { name, hint } => {
+            TurnEvent::ToolCallStreaming { name, hint }
+        }
+        AgentEvent::ToolCallStarted { id, name, arguments } => {
+            TurnEvent::ToolCallStarted { id, name, arguments }
+        }
+        AgentEvent::ToolOutputChunk { call_id, chunk } => {
+            TurnEvent::ToolOutputChunk { call_id, chunk }
+        }
+        AgentEvent::ToolCallResult { call_id, name, output, success, duration } => {
+            TurnEvent::ToolCallResult { call_id, name, output, success, duration }
+        }
+        AgentEvent::TokenUsage(u) => TurnEvent::TokenUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.prompt_tokens + u.completion_tokens,
+            cached_tokens: u.cached_tokens,
+        },
+        AgentEvent::ContextStats {
+            system_tokens,
+            sent_tokens,
+            dropped_tokens,
+            working_set_tokens,
+            total_messages,
+            ..
+        } => TurnEvent::ContextStats {
+            system_tokens,
+            sent_tokens,
+            dropped_tokens,
+            working_set_tokens,
+            total_messages,
+        },
+        AgentEvent::WorkingDirChanged(p) => TurnEvent::WorkingDirChanged(p),
+        AgentEvent::Warning(w) => TurnEvent::Warning(w),
+        _ => return None,
+    })
+}
+
+/// Derive the bridge config for a `/chat` request from the resolved provider.
+pub(crate) fn chat_bridge_config(
+    config: &Config,
+    provider_name: &str,
+    working_dir: &Path,
+    telemetry: Arc<Telemetry>,
+) -> atomcode_bridge::BridgeConfig {
+    let p = config.providers.get(provider_name);
+    atomcode_bridge::BridgeConfig {
+        api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
+        base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+        model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        working_dir: working_dir.to_path_buf(),
+        context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
+        mcp: true,
+        telemetry: Some(telemetry),
+    }
+}
+
+/// The engine-v2 producer for `/chat`: drive a bridged agent over `conv` and forward
+/// its events as `TurnEvent`s on `turn_tx` (which the shared `/chat` consumer turns
+/// into SSE). `perm_rx` carries interactive approval decisions from `/chat/permission`
+/// (`None` = auto-approve / standalone). The kernel snapshot is written back to `conv`
+/// so the caller persists the completed turn. Mirrors the `/live` KernelTurnExecutor.
+pub(crate) async fn run_chat_turn_v2(
+    conv: Arc<Mutex<Conversation>>,
+    turn_tx: mpsc::UnboundedSender<TurnEvent>,
+    cancel: CancellationToken,
+    bridge_cfg: atomcode_bridge::BridgeConfig,
+    mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
+) {
+    let (client, mut events) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
+
+    // Seed the bridge from conv (which already has the just-sent user message), then
+    // send that message to actually run the turn.
+    let (prefix, user_text, user_images) = {
+        let c = conv.lock().await;
+        let mut msgs = c.messages.clone();
+        let last = msgs.pop();
+        let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
+        (msgs, text, images)
+    };
+    let _ = client.cmd_tx.send(AgentCommand::SetMessages(prefix));
+    let _ = client.cmd_tx.send(AgentCommand::SendMessage {
+        text: user_text,
+        images: user_images,
+        image_markers: Vec::new(),
+    });
+
+    let mut cancelled = false;
+    let final_messages = loop {
+        let ev = tokio::select! {
+            _ = cancel.cancelled(), if !cancelled => {
+                cancelled = true;
+                let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                continue;
+            }
+            ev = events.recv() => ev,
+        };
+        let Some(ev) = ev else { break None };
+        match ev {
+            AgentEvent::ApprovalNeeded { tool_name, reason, call, messages } => {
+                let _ = turn_tx.send(TurnEvent::ApprovalRequested {
+                    tool_name,
+                    reason,
+                    call,
+                    messages,
+                });
+                let decision = match &mut perm_rx {
+                    None => PermissionDecision::Allow,
+                    Some(rx) => tokio::select! {
+                        _ = cancel.cancelled(), if !cancelled => {
+                            cancelled = true;
+                            let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                            PermissionDecision::Deny
+                        }
+                        d = rx.recv() => d.unwrap_or(PermissionDecision::Deny),
+                    },
+                };
+                let cmd = match decision {
+                    PermissionDecision::Allow => AgentCommand::ApproveTool,
+                    _ => AgentCommand::DenyTool,
+                };
+                let _ = client.cmd_tx.send(cmd);
+            }
+            AgentEvent::Error { error, .. } => {
+                // Non-terminal: forward, keep draining to the real terminal.
+                let _ = turn_tx.send(TurnEvent::Error(error));
+            }
+            AgentEvent::TurnCancelled { messages } => break Some(messages),
+            AgentEvent::TurnComplete { messages, .. } => break Some(messages),
+            other => {
+                if let Some(te) = agent_to_turn(other) {
+                    let _ = turn_tx.send(te);
+                }
+            }
+        }
+    };
+    if let Some(msgs) = final_messages {
+        let mut c = conv.lock().await;
+        c.messages = msgs;
+    }
+    // Dropping turn_tx here closes the consumer loop (its `turn_rx.recv()` returns
+    // None), which then persists conv and sends Done.
+}
+
 use crate::AppState;
 use axum::{
     extract::State,
