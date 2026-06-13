@@ -292,6 +292,7 @@ mod tests {
         }
         Config {
             default_provider: default.to_string(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: map,
             datalog: Default::default(),

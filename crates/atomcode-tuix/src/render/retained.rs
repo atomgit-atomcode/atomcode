@@ -4631,6 +4631,7 @@ mod tests {
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
+            goal_indicator: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -4684,6 +4685,7 @@ mod tests {
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
             reasoning_effort: None,
+            goal_indicator: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -4729,6 +4731,7 @@ mod tests {
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
             reasoning_effort: None,
+            goal_indicator: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
