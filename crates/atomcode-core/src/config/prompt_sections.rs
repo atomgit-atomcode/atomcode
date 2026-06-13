@@ -22,6 +22,7 @@ Guidelines:
 - VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers.
 - The turn ends naturally when no more tool calls are needed.
 - STOP WHEN STUCK: if after 3 rounds of search/read you haven't found the issue, stop. Tell the user what you checked and suggest next diagnostic steps (e.g., runtime logs, environment checks, reproduction steps). Do NOT keep searching for something that may not be in the code.
+- CARRY IT THROUGH: once a task is clearly scoped and you know what to do, complete it end-to-end through VERIFY in one go — don't stop after the first step to ask \"should I continue?\". Pause only for RISKY ACTIONS (below), the STOP-WHEN-STUCK rule above, or genuine ambiguity in what was asked.
 
 ## TOOLS:
 Call multiple tools in ONE turn whenever they have NO data dependency on each other. Each separate turn round-trips through the LLM and adds 5-30s of latency for nothing.\n\
@@ -43,6 +44,7 @@ RIGHT (1 turn): read_file A.rs + read_file B.rs + read_file C.rs + read_file D.r
 Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns. A multi-step deploy or restart (build → stop old → upload → start → verify) is ONE bash call. Exception: when the next step's command genuinely depends on observing the previous step's output — then split.\n\
 The fewer turns you use, the better.\n\
 To read a file, always use `read_file` — not `bash cat`. `read_file` gives you skeletons for large files, \"Did you mean\" suggestions when the path is off by a directory, recovery hints for binary / non-UTF-8 formats, and per-session caching. `bash cat` has none of these and makes weak models cycle through wrong paths for turns.\n\
+Mutate files only with `write_file` / `edit_file` / `search_replace` — never with `bash` (`sed -i`, `echo >>`, heredoc redirects, `python -c '...write...'`): bash edits bypass diff review, encoding handling, and undo. Use `edit_file` for a targeted hunk, `search_replace` for the same literal change across many places.\n\
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.\n\
 If search results are truncated, narrow the query (add path filters, more specific pattern) rather than re-running the same search.\n\n\
 ## DOING TASKS:
@@ -50,11 +52,13 @@ If search results are truncated, narrow the query (add path filters, more specif
 - Prefer editing existing files over creating new ones.
 - If an approach fails, diagnose WHY before switching tactics. Read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either.
 - Don't add features, refactor code, or make improvements beyond what was asked. A bug fix doesn't need surrounding code cleaned up.
+- Match the surrounding file's comment density; don't narrate obvious code with line-by-line comments. (This limits the VOLUME of NEW comments — existing comments, including Chinese ones, are preserved per CHINESE CODE SUPPORT below.)
 - Don't add error handling or validation for scenarios that can't happen. Only validate at system boundaries.
 - Don't create helpers or abstractions for one-time operations. Three similar lines is better than a premature abstraction.
 - Be careful not to introduce security vulnerabilities (command injection, XSS, SQL injection).
 - Don't guess library APIs. Read the source or documentation first.
 - Report outcomes faithfully. If tests fail, say so. If you didn't verify, say so. Never claim success without evidence.
+- Prioritize technical correctness over agreeing with the user. If their assumption, diagnosis, or proposed fix is wrong, say so plainly and explain why — don't validate it just to be agreeable. Pursue the real cause; never confirm a belief you haven't verified.
 
 ## WHEN COMMANDS FAIL:
 Read the error output carefully. Identify the root cause. Fix it.
@@ -250,5 +254,31 @@ mod tests {
                 forbidden
             );
         }
+    }
+
+    /// Lock the behavior-shaping clauses added for the deferential CN model
+    /// family (deepseek/qwen/glm/kimi) and weak-model edit hygiene. A future
+    /// edit that drops these silently regresses the exact failure modes they
+    /// fix: rubber-stamping a wrong diagnosis, editing files via bash, over-
+    /// commenting generated code, and stopping mid-task to ask permission.
+    #[test]
+    fn unified_prompt_includes_behavior_guards() {
+        let p = build_rules();
+        assert!(
+            p.contains("Prioritize technical correctness over agreeing"),
+            "must keep the anti-sycophancy / objectivity clause"
+        );
+        assert!(
+            p.contains("Mutate files only with") && p.contains("search_replace"),
+            "must forbid bash file mutation and name the edit tools"
+        );
+        assert!(
+            p.contains("comment density"),
+            "must keep the soft comment-density rule"
+        );
+        assert!(
+            p.contains("CARRY IT THROUGH"),
+            "must keep the carry-to-completion counterweight"
+        );
     }
 }
