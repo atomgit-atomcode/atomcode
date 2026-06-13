@@ -354,6 +354,61 @@ impl McpClient for HttpClient {
     }
 }
 
+impl Drop for HttpClient {
+    /// Best-effort Streamable-HTTP session teardown. When a stateful server
+    /// handed us a `Mcp-Session-Id`, the MCP spec says the client SHOULD send
+    /// an HTTP `DELETE` carrying that id so the server can release the session
+    /// instead of leaking it until its own timeout. Fire-and-forget: detach the
+    /// request onto the current runtime and ignore the outcome.
+    fn drop(&mut self) {
+        // Only meaningful once a session was actually captured (stateless and
+        // STDIO servers never set one, so this is a no-op for them).
+        let Ok(guard) = self.session_id.try_lock() else {
+            return;
+        };
+        let Some(session) = guard.clone() else {
+            return;
+        };
+        drop(guard);
+
+        // The DELETE is async; it needs a Tokio runtime to run on. If the client
+        // is dropped outside one (e.g. during a non-async shutdown path), skip —
+        // session cleanup is only advisory.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let headers = self.headers.clone();
+        handle.spawn(async move {
+            delete_http_session(client, url, headers, session).await;
+        });
+    }
+}
+
+/// Send the MCP session-termination `DELETE`. Mirrors `send_request`'s header
+/// handling: user-supplied headers (including a pinned `Mcp-Session-Id` or auth)
+/// are applied, and the captured session id is only added when the user didn't
+/// already provide one. Errors are intentionally ignored — this is best-effort.
+async fn delete_http_session(
+    client: reqwest::Client,
+    url: String,
+    headers: BTreeMap<String, String>,
+    session: String,
+) {
+    let user_has_session = headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+    let mut req = client.delete(&url);
+    for (key, value) in &headers {
+        req = req.header(key, value);
+    }
+    if !user_has_session {
+        req = req.header("Mcp-Session-Id", session);
+    }
+    let _ = req.send().await;
+}
+
 /// Parse a single JSON-RPC response out of an SSE-framed body.
 ///
 /// MCP "Streamable HTTP" allows the server to reply as either a single
@@ -585,23 +640,70 @@ mod session_tests {
         out
     }
 
+    /// Reads complete HTTP requests off a socket, one at a time, buffering any
+    /// extra bytes for the next call. Necessary because headers and body (or
+    /// successive keep-alive requests) can arrive split across reads — e.g. when
+    /// an HTTP proxy sits between the client and this mock — which a naive
+    /// one-read-per-request loop mis-parses.
+    struct ReqReader {
+        sock: tokio::net::TcpStream,
+        buf: Vec<u8>,
+    }
+
+    impl ReqReader {
+        fn new(sock: tokio::net::TcpStream) -> Self {
+            Self {
+                sock,
+                buf: Vec::new(),
+            }
+        }
+
+        /// Return one complete request (headers + `Content-Length` body) as text,
+        /// draining it from the buffer. `None` on clean EOF.
+        async fn next_request(&mut self) -> Option<String> {
+            use tokio::io::AsyncReadExt;
+            loop {
+                if let Some(total) = complete_request_len(&self.buf) {
+                    let req: Vec<u8> = self.buf.drain(..total).collect();
+                    return Some(String::from_utf8_lossy(&req).into_owned());
+                }
+                let mut tmp = [0u8; 4096];
+                match self.sock.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+        }
+    }
+
+    /// If `buf` holds at least one complete HTTP request, return its total byte
+    /// length (headers + blank line + `Content-Length` body); otherwise `None`.
+    fn complete_request_len(buf: &[u8]) -> Option<usize> {
+        let sep = b"\r\n\r\n";
+        let header_end = buf.windows(sep.len()).position(|w| w == sep)? + sep.len();
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+        let content_length = headers
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let total = header_end + content_length;
+        (buf.len() >= total).then_some(total)
+    }
+
     /// Minimal stateful Streamable-HTTP MCP server: hands out a session id on
     /// `initialize` and rejects `tools/list` (HTTP 400) unless the client echoes
     /// it back via `Mcp-Session-Id` — exactly how Figma's Dev Mode server behaves.
     async fn run_mock(listener: tokio::net::TcpListener) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
+            let Ok((sock, _)) = listener.accept().await else {
                 return;
             };
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 16 * 1024];
-                loop {
-                    let n = match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => n,
-                    };
-                    let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let mut reader = ReqReader::new(sock);
+                while let Some(raw) = reader.next_request().await {
+                    let req = raw.to_ascii_lowercase();
                     let has_session = req
                         .lines()
                         .any(|l| l.starts_with("mcp-session-id:") && l.contains(MOCK_SESSION));
@@ -632,7 +734,7 @@ mod session_tests {
                         http_response(400, None, "{}")
                     };
 
-                    if sock.write_all(response.as_bytes()).await.is_err() {
+                    if reader.sock.write_all(response.as_bytes()).await.is_err() {
                         return;
                     }
                 }
@@ -657,5 +759,75 @@ mod session_tests {
             .expect("tools/list should succeed once the session id is echoed");
         assert_eq!(tools.tools.len(), 1);
         assert_eq!(tools.tools[0].name, "ping");
+    }
+
+    /// Accept one connection, return the raw request text it received (after
+    /// replying 200 so the client's fire-and-forget send completes cleanly).
+    async fn capture_one_request(listener: tokio::net::TcpListener) -> Option<String> {
+        use tokio::io::AsyncWriteExt;
+        let (sock, _) = listener.accept().await.ok()?;
+        let mut reader = ReqReader::new(sock);
+        let raw = reader.next_request().await?;
+        let _ = reader
+            .sock
+            .write_all(http_response(200, None, "").as_bytes())
+            .await;
+        Some(raw)
+    }
+
+    #[tokio::test]
+    async fn drop_sends_session_delete_when_session_present() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(capture_one_request(listener).await);
+        });
+
+        {
+            let client = HttpClient::new("mock".into(), url, BTreeMap::new(), None, Some(5_000));
+            let mut headers = HeaderMap::new();
+            headers.insert("mcp-session-id", MOCK_SESSION.parse().unwrap());
+            client.capture_session_id(&headers).await;
+            assert_eq!(client.session_id().await.as_deref(), Some(MOCK_SESSION));
+        } // <- drop here must fire the DELETE
+
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("DELETE was not sent within 2s of drop")
+            .expect("server task panicked")
+            .expect("server captured no request");
+        let request_line = raw.lines().next().unwrap_or("");
+        assert!(
+            request_line.starts_with("DELETE "),
+            "expected a DELETE request on drop, got: {request_line}"
+        );
+        assert!(
+            raw.to_ascii_lowercase()
+                .contains(&format!("mcp-session-id: {MOCK_SESSION}")),
+            "DELETE must echo the captured session id; got:\n{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_without_session_sends_nothing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(capture_one_request(listener).await);
+        });
+
+        {
+            // No session was ever captured (stateless server) — drop must be a
+            // no-op and never open a connection.
+            let _client = HttpClient::new("mock".into(), url, BTreeMap::new(), None, Some(5_000));
+        }
+
+        let got = tokio::time::timeout(std::time::Duration::from_millis(300), rx).await;
+        assert!(
+            got.is_err(),
+            "no request expected on drop when there is no session, but server received one"
+        );
     }
 }
