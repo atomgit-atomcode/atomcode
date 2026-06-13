@@ -3937,6 +3937,36 @@ mod agent_handle_tests {
         );
     }
 
+    /// Regression for the user-reported web_search "wrong year" bug: with no
+    /// current-date anchor the model fell back to its training-era year and
+    /// built "2025 latest news" queries in 2026. The current date (day-granular,
+    /// frozen per session — see `system_prompt_is_frozen_across_model_cwd_change`)
+    /// must be present in the system prompt's env metadata.
+    #[tokio::test]
+    async fn system_prompt_includes_current_date() {
+        let wd = std::path::PathBuf::from(format!("/tmp/atomcode_date_{}", std::process::id()));
+        let tool_context = crate::tool::ToolContext::new(wd);
+        let (mut loop_, _handle) = super::AgentLoop::new_with_shared_parts(
+            crate::config::Config::default(),
+            crate::provider::unavailable_provider("test"),
+            std::sync::Arc::new(crate::tool::ToolRegistry::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+            Some("test".to_string()),
+            tool_context,
+            crate::conversation::Conversation::new(),
+        );
+        let sys = loop_.build_system_prompt();
+        assert!(
+            sys.contains("Today's date:"),
+            "system prompt must carry a current-date anchor for time-sensitive queries"
+        );
+        let year = chrono::Local::now().format("%Y").to_string();
+        assert!(
+            sys.contains(&year),
+            "system prompt must contain the current year ({year}) so the model stops using a training-era year for web_search"
+        );
+    }
+
     /// Regression: in plan mode the read-only tool gate blocks file writes, but
     /// not the model writing the implementation into its reply. A per-turn
     /// reminder must carry the "plan only, don't implement, STOP" constraint so
