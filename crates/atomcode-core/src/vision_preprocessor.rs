@@ -192,6 +192,7 @@ mod tests {
         // helpers. If new mandatory fields are added to Config, update both.
         Config {
             default_provider: String::new(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
             datalog: Default::default(),

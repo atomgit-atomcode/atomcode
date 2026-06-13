@@ -447,6 +447,45 @@ impl DatalogWriter {
         self.flush();
     }
 
+    /// Log one /goal evaluator round. Independent of `active` turn state
+    /// because evaluator calls happen *between* main turns (not inside one),
+    /// so they don't have a natural `begin_turn`/`end_turn` pair. Writes to
+    /// `<log_dir>/goal-evaluator.md` (append-only) so the user can audit
+    /// (a) what the evaluator was asked, (b) what it said, and (c) how many
+    /// tokens it cost — currently invisible everywhere else.
+    pub fn log_evaluator_round(
+        &self,
+        round: u32,
+        verdict: &str,
+        reason: &str,
+        prompt_tokens: Option<usize>,
+        completion_tokens: Option<usize>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let dir = Self::resolve_log_dir(&self.base_dir, self.configured_dir.as_deref());
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = dir.join("goal-evaluator.md");
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let tokens = match (prompt_tokens, completion_tokens) {
+            (Some(p), Some(c)) => format!(" · prompt={p} completion={c}"),
+            (Some(p), None) => format!(" · prompt={p}"),
+            (None, Some(c)) => format!(" · completion={c}"),
+            (None, None) => String::new(),
+        };
+        let line = format!(
+            "[{timestamp}] round={round} verdict={verdict}{tokens}\n    reason: {reason}\n"
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
+
     /// End the turn: write duration and final flush.
     pub fn end_turn(&mut self, total_tokens: usize, tool_call_count: usize) {
         if !self.active {

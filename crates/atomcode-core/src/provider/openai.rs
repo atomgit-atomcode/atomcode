@@ -224,6 +224,10 @@ impl OpenAiProvider {
     ///   message, or the API returns 400 "The `reasoning_content` in the
     ///   thinking mode must be passed back to the API". See
     ///   <https://api-docs.deepseek.com/zh-cn/guides/thinking_mode>.
+    /// - `mimo-*` / base_url contains `xiaomimimo` → Include. MiMo (小米开源)
+    ///   v2.5 / v2.5-pro reuses DeepSeek V4 thinking-mode protocol — gateway
+    ///   returns the identical "The reasoning_content in the thinking mode
+    ///   must be passed back to the API" 400 when the field is stripped.
     /// - Other OpenAI-compatible endpoints → Exclude (safe default; normal
     ///   OpenAI models don't emit reasoning_content, so there's nothing to
     ///   strip, and non-thinking models typically ignore the field).
@@ -243,6 +247,9 @@ impl OpenAiProvider {
             || u.contains("xiaomimimo")
             || u.contains("mimo")
         {
+            return ReasoningPolicy::Include;
+        }
+        if m.starts_with("mimo-") || u.contains("xiaomimimo") {
             return ReasoningPolicy::Include;
         }
         ReasoningPolicy::Exclude
@@ -1801,6 +1808,28 @@ mod tests {
         );
         assert_eq!(
             OpenAiProvider::derive_reasoning_policy("deepseek-v4", "https://api.deepseek.com"),
+            ReasoningPolicy::Include,
+        );
+    }
+
+    #[test]
+    fn reasoning_policy_mimo_routes_to_include() {
+        use super::{OpenAiProvider, ReasoningPolicy};
+        // MiMo gateway reuses DeepSeek V4 thinking-mode protocol: returns the
+        // identical 400 "reasoning_content in the thinking mode must be passed
+        // back" when the field is stripped from historical tool_call messages.
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy(
+                "mimo-v2.5-pro",
+                "https://token-plan-cn.xiaomimimo.com/v1"
+            ),
+            ReasoningPolicy::Include,
+        );
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy(
+                "mimo-v2.5",
+                "https://token-plan-cn.xiaomimimo.com/v1"
+            ),
             ReasoningPolicy::Include,
         );
     }

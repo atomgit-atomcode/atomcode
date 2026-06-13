@@ -112,6 +112,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // sub-mode menu renders the three choices. Selecting one commits as
     // `/effort <choice>` → dispatched by the `effort` arm.
     Command { name: "effort",  desc: "DeepSeek reasoning effort control (high / max / off)", needs_args: true },
+    Command { name: "goal",    desc: "Set a completion goal (autonomous loop until met)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true },
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },

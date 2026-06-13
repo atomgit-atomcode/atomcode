@@ -433,6 +433,10 @@ pub struct StatusLine {
     /// Current reasoning_effort for the active provider's model.
     /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
+    /// When an autonomous `/goal` loop is active, this carries a compact
+    /// progress label like `"◎ /goal (round 3, 1m 42s)"`. Rendered in
+    /// the status row between the left info and the right-aligned hint.
+    pub goal_indicator: Option<String>,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

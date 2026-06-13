@@ -1227,7 +1227,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .saturating_sub(crate::width::display_width(&ctx_str))
             .saturating_sub(sep_w);
 
-        let mut parts: Vec<String> = Vec::with_capacity(3);
+        let mut parts: Vec<String> = Vec::with_capacity(4);
         if !model_str.is_empty() {
             parts.push(model_str);
         }
@@ -1244,6 +1244,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         if !ctx_str.is_empty() {
             parts.push(ctx_str);
+        }
+        if let Some(ref gi) = status.goal_indicator {
+            parts.push(scrub_controls(gi));
         }
         let left = parts.join(" · ");
 
@@ -4603,6 +4606,7 @@ mod tests {
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
+            goal_indicator: None,
         }
     }
 

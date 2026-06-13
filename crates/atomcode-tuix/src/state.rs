@@ -258,6 +258,19 @@ pub struct UiState {
     pub call_id_to_batch: std::collections::HashMap<String, String>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
+    /// Active goal condition string, if a `/goal` is running.
+    pub goal_condition: Option<String>,
+    /// Current round number of the running goal loop.
+    pub goal_round: u32,
+    /// When the goal was started, for elapsed-time display.
+    pub goal_started_at: Option<std::time::Instant>,
+    /// Per-turn stats buffered from the most recent `TurnComplete`. The
+    /// separator line is NOT rendered immediately so that — if the next
+    /// event happens to be `GoalUpdate(active=false)` (the goal just
+    /// ended) — we can render the goal verdict banner ABOVE the line.
+    /// Any other event flushes this buffer with the usual `↻ goal round N`
+    /// or `✓ done` label.
+    pub pending_separator: Option<PendingSeparator>,
 }
 
 /// Per-batch state for an active `ToolBatchStarted`. Tracks how many
@@ -266,6 +279,23 @@ pub struct UiState {
 #[derive(Debug, Clone)]
 pub struct ActiveToolBatch {
     pub call_ids: Vec<String>,
+}
+
+/// Stats captured at `TurnComplete` and held until the next event decides
+/// how to render the turn-boundary separator.
+#[derive(Debug, Clone)]
+pub struct PendingSeparator {
+    pub duration: std::time::Duration,
+    pub turn_count: usize,
+    pub tool_call_count: usize,
+    pub total_tokens: usize,
+    /// Whether the turn ran inside an active `/goal` (decides `↻` vs `✓`
+    /// when flushed without a goal-end event).
+    pub was_goal_round: bool,
+    /// Whether the turn ended with `TurnStopReason::Error`. Lets the deferred
+    /// flush render the ✗ "stopped" summary instead of a celebratory ✓ under
+    /// the red Error line (preserves the pre-/goal-merge behaviour).
+    pub errored: bool,
 }
 
 impl Default for UiState {
@@ -316,6 +346,10 @@ impl UiState {
             active_tool_batches: std::collections::HashMap::new(),
             call_id_to_batch: std::collections::HashMap::new(),
             reasoning_effort: None,
+            goal_condition: None,
+            goal_round: 0,
+            goal_started_at: None,
+            pending_separator: None,
         }
     }
 
