@@ -313,6 +313,19 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                 let _ = ack.send(());
             }
         }
+
+        // Trailing-edge footer repair: if the command just processed scrolled
+        // the whole viewport (an overflow LF lifts the footer up one row),
+        // repaint the footer NOW rather than waiting for the event loop's next
+        // ~5ms FlushDeferred — which lags, and starves under streaming load,
+        // and is exposed on hosts that don't vsync-coalesce (native Win10
+        // conhost / pwsh7). Only fires on a real body scroll: InputPrompt / IME
+        // bursts never scroll, so their coalescing on the deferred tick is
+        // unaffected. A multi-row render sets the flag once → ONE flush here,
+        // not one per row. flush_deferred is a no-op when nothing is dirty.
+        if inner.take_pending_scroll_flush() {
+            inner.flush_deferred();
+        }
     }
     // Sender dropped without explicit Shutdown — still run shutdown so
     // the terminal isn't left in raw mode on abrupt exit paths.

@@ -385,6 +385,11 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// the row (flag flips to false) so the last animation frame
     /// stays frozen as a historical paragraph header.
     live_spinner_active: bool,
+    /// Set by `emit_body_line_inner` when an overflow LF scrolled the whole
+    /// viewport (footer included) up one row; consumed (cleared) by
+    /// `take_pending_scroll_flush` so the render worker repaints the footer
+    /// the same tick instead of waiting ~5ms for the deferred FlushDeferred.
+    pending_scroll_flush: bool,
     /// When `Some`, the live row at body_bottom is the animated
     /// in-flight tool-call line (`<frame> Bash(cmd)`), not the generic
     /// spinner. The Spinner / StreamingBox tick handlers consult this:
@@ -539,6 +544,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             welcome_banner: None,
             welcome_line_count: 0,
             live_spinner_active: false,
+            pending_scroll_flush: false,
             inflight_tool: None,
             inflight_tool_rows: 0,
             live_group: None,
@@ -1905,6 +1911,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // pushes don't treat it as visible — and don't re-promote
             // it on the next overflow LF after an intervening tail pop.
             self.scrolled_off = self.scrolled_off.saturating_add(1);
+            // The whole-viewport scroll just lifted the footer up one row;
+            // flag it so the render worker repaints the footer this tick
+            // (see `take_pending_scroll_flush`) instead of waiting ~5ms for
+            // the event loop's deferred FlushDeferred.
+            self.pending_scroll_flush = true;
             visible_len -= 1;
         }
         // 1-indexed row where the NEW body line should land on the
@@ -4035,6 +4046,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
     }
 
+    fn take_pending_scroll_flush(&mut self) -> bool {
+        std::mem::take(&mut self.pending_scroll_flush)
+    }
+
     fn flush_deferred(&mut self) {
         // The coalesce point. Called every 5ms by the event loop
         // tick. If widget state has changed since the last tick,
@@ -5130,6 +5145,69 @@ mod tests {
              (baseline before resize: {})",
             vterm_after.scrollback_len(),
             baseline_scrollback
+        );
+    }
+
+    /// Footer-jitter fix invariant: a body overflow scrolls the whole
+    /// viewport (footer included) up one row, so it must flag a pending
+    /// scroll-flush — that's the signal the render worker uses to repaint the
+    /// footer the same tick instead of waiting ~5ms for the deferred tick.
+    /// `take_pending_scroll_flush` returns it once, then clears.
+    #[test]
+    fn body_overflow_flags_pending_scroll_flush_and_take_clears() {
+        // Short viewport so a handful of body rows overflow the visible cap.
+        let (mut r, _c) = new_counting(80, 10);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        assert!(
+            !r.take_pending_scroll_flush(),
+            "no body scroll has happened yet"
+        );
+
+        // Push well past the visible cap so the overflow LF fires.
+        for i in 0..20 {
+            r.render(UiLine::User(format!("line-{i}")));
+        }
+        assert!(
+            r.take_pending_scroll_flush(),
+            "overflow must flag a pending scroll-flush for the worker"
+        );
+        assert!(
+            !r.take_pending_scroll_flush(),
+            "take must clear the flag (one repaint per drained burst)"
+        );
+    }
+
+    /// Coalescing guard: InputPrompt / IME bursts never push body rows, so
+    /// they must NEVER set the scroll-flush flag — otherwise the worker would
+    /// eager-paint per keystroke and defeat the deferred-tick coalescing that
+    /// `retained_coalesce_many_renders_one_emit` pins.
+    #[test]
+    fn input_prompt_burst_never_flags_scroll_flush() {
+        let (mut r, _c) = new_counting(80, 24);
+        let status = status_basic();
+        r.flush_deferred();
+        let mut buf = String::new();
+        for ch in "你是谁你是谁你是谁你是谁你是谁你是谁你是谁".chars() {
+            buf.push(ch);
+            r.render(UiLine::InputPrompt {
+                buf: buf.clone(),
+                cursor_byte: buf.len(),
+                menu: None,
+                status: status.clone(),
+                attachments: Vec::new(),
+            });
+        }
+        assert!(
+            !r.take_pending_scroll_flush(),
+            "InputPrompt never scrolls the body, so it must not trigger the eager scroll-flush"
         );
     }
 

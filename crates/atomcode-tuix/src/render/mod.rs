@@ -262,6 +262,18 @@ pub trait Renderer: Send {
     /// treat this as a flush.
     fn flush_deferred(&mut self);
 
+    /// Returns (and clears) whether a body overflow scrolled the whole
+    /// viewport — footer included — up one row since the last call. The
+    /// render worker calls this after each command and, when true, repaints
+    /// the footer immediately via `flush_deferred` instead of waiting for the
+    /// event loop's next ~5ms deferred tick, so the footer doesn't visibly lag
+    /// the scroll on hosts that don't vsync-coalesce (native Win10 conhost /
+    /// pwsh7). Default `false`: only the retained renderer scrolls a viewport;
+    /// plain/pipe and the cross-thread proxy renderer never do.
+    fn take_pending_scroll_flush(&mut self) -> bool {
+        false
+    }
+
     /// Remove the most recent `ApprovalPrompt` body row, if the tail
     /// row is one. Called by the event loop after the user responds
     /// Y/A/N so the prompt stops sitting in the body above the footer.
