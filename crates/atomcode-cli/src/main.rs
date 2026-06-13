@@ -425,10 +425,10 @@ const VERSION: &str = concat!(
 #[derive(Parser)]
 #[command(name = "atomcode", version = VERSION, about = "AI coding assistant in your terminal")]
 struct Cli {
-    /// Engine selection: "v1" (legacy, default) or "v2" (new kernel stack via
-    /// atomcode-bridge). Also settable via $ATOMCODE_ENGINE. v2 runs the same
-    /// drivers (headless + TUI) over the new engine; /session and /resume inside
-    /// the TUI still spawn v1 runtimes in this build.
+    /// Engine selection: "v2" (new kernel stack via atomcode-bridge) is the
+    /// DEFAULT. Opt out to the legacy engine with "v1" (or "legacy"/"old").
+    /// Also settable via $ATOMCODE_ENGINE. v2 runs the same drivers (headless +
+    /// TUI, incl. in-TUI /session and /resume) over the new engine.
     #[arg(long)]
     engine: Option<String>,
 
@@ -1428,13 +1428,19 @@ async fn run() -> Result<i32> {
     let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
 
     // ── Engine selection (the strangler switch) ──────────────────────────────
-    // v2 = the NEW stack behind the legacy channel protocol (atomcode-bridge).
+    // v2 = the NEW stack behind the legacy channel protocol (atomcode-bridge) and
+    // is now the DEFAULT. The legacy engine stays reachable as the rollback escape
+    // hatch (--engine v1 / $ATOMCODE_ENGINE=v1) until it is removed in a later phase.
     // The drivers below (headless loop / tuix) are untouched either way.
     let engine_choice = cli
         .engine
         .clone()
         .or_else(|| std::env::var("ATOMCODE_ENGINE").ok());
-    let engine_v2 = matches!(engine_choice.as_deref(), Some("v2" | "2" | "new"));
+    let engine_v1 = matches!(engine_choice.as_deref(), Some("v1" | "1" | "legacy" | "old"));
+    let engine_v2 = !engine_v1;
+    if engine_v1 {
+        eprintln!("[engine v1] legacy stack active (opt-out via --engine v1)");
+    }
     let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if engine_v2 {
         let bridge_cfg =
             bridge_config_from(&config, &working_dir, cli.provider.as_deref(), Some(telemetry.clone()));

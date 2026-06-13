@@ -539,12 +539,13 @@ impl TurnExecutor for DaemonTurnExecutor {
 // ============================================================================
 
 /// True when the daemon should run live turns on the NEW stack (kernel +
-/// capabilities + coding) via atomcode-bridge. Selected by `$ATOMCODE_ENGINE`
-/// (same switch the cli uses); off by default → the legacy `DaemonTurnExecutor`.
+/// capabilities + coding) via atomcode-bridge. The new stack is the DEFAULT now
+/// (same strangler flip as the cli); opt OUT to the legacy `DaemonTurnExecutor`
+/// with `$ATOMCODE_ENGINE=v1` (or `legacy`/`old`).
 pub(crate) fn live_engine_v2() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ATOMCODE_ENGINE").ok().as_deref(),
-        Some("v2" | "2" | "new")
+        Some("v1" | "1" | "legacy" | "old")
     )
 }
 
