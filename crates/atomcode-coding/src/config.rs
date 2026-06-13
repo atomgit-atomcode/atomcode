@@ -35,6 +35,13 @@ pub struct CodingAgentConfig {
     ///
     /// [`TelemetryHook`]: crate::TelemetryHook
     pub telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
+    /// Provider `reasoning_history` override (`"include"` | `"exclude"`), passed
+    /// through verbatim to the provider builder. `None`/empty (default) ⇒ the
+    /// adapter's per-model auto-detect ([`ReasoningPolicy::derive`]). This is the
+    /// config knob, not a code default — the heuristic only applies when it's unset.
+    ///
+    /// [`ReasoningPolicy::derive`]: atomcode_capabilities::provider::ReasoningPolicy::derive
+    pub reasoning_history: Option<String>,
 }
 
 impl CodingAgentConfig {
@@ -56,6 +63,7 @@ impl CodingAgentConfig {
             max_continuations: 50,
             chat_options: Default::default(),
             telemetry: None,
+            reasoning_history: None,
         }
     }
 }

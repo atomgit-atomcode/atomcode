@@ -610,6 +610,7 @@ impl KernelTurnExecutor {
             context_window: p.context_window as u32,
             mcp: true,
             telemetry: Some(self.telemetry.clone()),
+            reasoning_history: p.reasoning_history.clone(),
         })
     }
 }
@@ -892,6 +893,7 @@ pub(crate) fn chat_bridge_config(
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
         mcp: true,
         telemetry: Some(telemetry),
+        reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
     }
 }
 

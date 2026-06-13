@@ -33,6 +33,10 @@ pub struct BridgeConfig {
     /// Telemetry sink forwarded to the coding assembly (→ a `LlmChat`-emitting
     /// hook). `None` ⇒ no telemetry. The driver supplies its own `Telemetry`.
     pub telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
+    /// Provider `reasoning_history` override (`"include"` | `"exclude"`) from the
+    /// driver's provider config. `None` ⇒ the adapter auto-detects by model. Threaded
+    /// so v2 honors the same per-provider knob the legacy engine reads.
+    pub reasoning_history: Option<String>,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -128,6 +132,7 @@ impl Bridge {
         );
         coding_cfg.context_window = cfg.context_window;
         coding_cfg.telemetry = cfg.telemetry.clone();
+        coding_cfg.reasoning_history = cfg.reasoning_history.clone();
 
         let opts_template = PrepareOptions {
             session: SessionMode::Fresh,
@@ -1007,10 +1012,14 @@ fn compute_undo(
 fn build_provider(
     cfg: &CodingAgentConfig,
 ) -> anyhow::Result<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
-    use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
+    use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider, ReasoningPolicy};
     use atomcode_core::coding_plan::crypto;
     let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
     pc.context_window = cfg.context_window;
+    // Honor the provider's `reasoning_history` override; unset ⇒ leave `None` so the
+    // adapter auto-detects by model. A typo fails fast (parity with the legacy engine).
+    pc.reasoning_policy = ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // AtomGit gateways need per-request auth instead of a static api_key, handled by
     // the closed `atomcode-codingplan-crypto` (gated by core's `codingplan-crypto`
@@ -1043,8 +1052,31 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod undo_tests {
-    use super::compute_undo;
+    use super::{build_provider, compute_undo};
+    use atomcode_coding::CodingAgentConfig;
     use atomcode_kernel::message::Message;
+
+    fn coding_cfg(reasoning_history: Option<&str>) -> CodingAgentConfig {
+        // A plain (non-AtomGit) OpenAI-compatible endpoint so build_provider takes the
+        // no-signer path and constructs offline (no network).
+        let mut c = CodingAgentConfig::new("sk-x", "https://api.example.com/v1", "some-model", "/tmp");
+        c.reasoning_history = reasoning_history.map(str::to_string);
+        c
+    }
+
+    #[test]
+    fn build_provider_honors_reasoning_history_and_rejects_typos() {
+        // Valid override → provider builds.
+        assert!(build_provider(&coding_cfg(Some("exclude"))).is_ok());
+        assert!(build_provider(&coding_cfg(Some("include"))).is_ok());
+        // Unset → adapter auto-detects; still builds.
+        assert!(build_provider(&coding_cfg(None)).is_ok());
+        // Typo → fail fast (parity with the legacy engine's load-time validation).
+        let res = build_provider(&coding_cfg(Some("sometimes")));
+        assert!(res.is_err(), "a reasoning_history typo must fail provider construction");
+        let err = res.err().unwrap().to_string();
+        assert!(err.contains("reasoning_history"), "expected a reasoning_history error, got: {err}");
+    }
 
     fn convo() -> Vec<Message> {
         // system, user1, asst1, user2, asst2 — two real prompts.

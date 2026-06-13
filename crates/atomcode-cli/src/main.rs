@@ -1436,7 +1436,8 @@ async fn run() -> Result<i32> {
         .or_else(|| std::env::var("ATOMCODE_ENGINE").ok());
     let engine_v2 = matches!(engine_choice.as_deref(), Some("v2" | "2" | "new"));
     let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if engine_v2 {
-        let bridge_cfg = bridge_config_from(&config, &working_dir, Some(telemetry.clone()));
+        let bridge_cfg =
+            bridge_config_from(&config, &working_dir, cli.provider.as_deref(), Some(telemetry.clone()));
         eprintln!("[engine v2] new stack active (model {})", bridge_cfg.model);
         let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
         Some(atomcode_core::agent::AgentHandle { client, event_rx })
@@ -1450,9 +1451,14 @@ async fn run() -> Result<i32> {
         let tel = telemetry.clone();
         Some(std::sync::Arc::new(
             move |config: &atomcode_core::config::Config, working_dir: &std::path::Path| {
+                // In-TUI re-spawns (/session, /bg, disk /resume) follow the
+                // config's CURRENT default_provider (None) so a /provider switch
+                // inside the session takes effect — the launch-time --provider
+                // override only seeds the initial handle above.
                 atomcode_bridge::spawn_bridged_runtime(bridge_config_from(
                     config,
                     working_dir,
+                    None,
                     Some(tel.clone()),
                 ))
             },
@@ -1716,12 +1722,19 @@ fn redirect_stderr_to_log_file() {
 /// Derive the engine-v2 bridge config from the current config + working dir.
 /// Shared by the initial bridge handle and the in-TUI runtime-spawn override so
 /// both resolve the provider identically.
+///
+/// `provider_override` is the `--provider` flag: it must flow through the SAME
+/// `active_provider` resolution the legacy engine uses (honor the override, fall
+/// back when the default points to a deleted section). Reading
+/// `default_provider` directly silently ignored `--provider`, so a headless
+/// `--engine v2 --provider X` run picked the config default instead of X.
 fn bridge_config_from(
     config: &atomcode_core::config::Config,
     working_dir: &std::path::Path,
+    provider_override: Option<&str>,
     telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
 ) -> atomcode_bridge::BridgeConfig {
-    let p = config.providers.get(&config.default_provider);
+    let p = config.active_provider(provider_override).ok();
     atomcode_bridge::BridgeConfig {
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
@@ -1730,6 +1743,7 @@ fn bridge_config_from(
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
         mcp: true,
         telemetry,
+        reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
     }
 }
 
@@ -2916,10 +2930,50 @@ fn is_auth_gap_error(msg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        close_thinking_chunk, format_thinking_chunk, is_auth_gap_error, resolve_working_dir,
-        truncate_log_line,
+        bridge_config_from, close_thinking_chunk, format_thinking_chunk, is_auth_gap_error,
+        resolve_working_dir, truncate_log_line,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn bridge_config_honors_provider_override() {
+        // Regression: engine-v2 headless `--provider X` was silently ignored —
+        // bridge_config_from read `default_provider` directly instead of routing
+        // through `active_provider`, so the bridge picked the config default
+        // (e.g. an AtomGit gateway needing a signer this build lacks) and a
+        // `--provider deepseek` run hit the wrong endpoint and failed.
+        let toml_str = r#"
+            default_provider = "gateway"
+
+            [providers.gateway]
+            type = "openai"
+            model = "gw-model"
+            base_url = "https://llm-api.atomgit.com/v1"
+
+            [providers.direct]
+            type = "openai"
+            api_key = "sk-direct"
+            model = "direct-model"
+            base_url = "https://api.deepseek.com"
+            reasoning_history = "exclude"
+        "#;
+        let config: atomcode_core::config::Config = toml::from_str(toml_str).unwrap();
+        let wd = PathBuf::from("/tmp/x");
+
+        // No override → the config default (gateway), no reasoning_history set.
+        let def = bridge_config_from(&config, &wd, None, None);
+        assert_eq!(def.base_url, "https://llm-api.atomgit.com/v1");
+        assert_eq!(def.model, "gw-model");
+        assert_eq!(def.reasoning_history, None);
+
+        // `--provider direct` → that provider's endpoint/model/key + its per-provider
+        // reasoning_history override, NOT the default.
+        let ov = bridge_config_from(&config, &wd, Some("direct"), None);
+        assert_eq!(ov.base_url, "https://api.deepseek.com");
+        assert_eq!(ov.model, "direct-model");
+        assert_eq!(ov.api_key, "sk-direct");
+        assert_eq!(ov.reasoning_history.as_deref(), Some("exclude"));
+    }
 
     #[test]
     fn ascii_short_unchanged() {

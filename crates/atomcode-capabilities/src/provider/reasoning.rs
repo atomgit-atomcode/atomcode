@@ -36,6 +36,26 @@ pub enum ReasoningPolicy {
 }
 
 impl ReasoningPolicy {
+    /// Parse the user-facing `reasoning_history` config value into an explicit
+    /// override. `None`/empty ⇒ `Ok(None)` (caller falls back to [`derive`]);
+    /// `"include"`/`"exclude"` (case/space-insensitive) ⇒ the matching policy; any
+    /// other value is a typo and fails fast — mirrors `atomcode-core`'s load-time
+    /// validation so a bad config errors the same way on either engine.
+    ///
+    /// [`derive`]: ReasoningPolicy::derive
+    pub fn from_config(value: Option<&str>) -> Result<Option<Self>, String> {
+        match value.map(|s| s.trim().to_ascii_lowercase()) {
+            None => Ok(None),
+            Some(s) if s.is_empty() => Ok(None),
+            Some(s) if s == "include" => Ok(Some(ReasoningPolicy::Include)),
+            Some(s) if s == "exclude" => Ok(Some(ReasoningPolicy::Exclude)),
+            Some(other) => Err(format!(
+                "invalid `reasoning_history` value {other:?} — expected \"include\" or \
+                 \"exclude\" (unset = auto-detect)"
+            )),
+        }
+    }
+
     /// Derive the default policy from the model name + base URL (some vendors are only
     /// identifiable by host, e.g. Moonshot/MiMo gateways). An explicit
     /// [`OpenAiCompatConfig::reasoning_policy`](super::OpenAiCompatConfig) override takes
@@ -99,6 +119,16 @@ mod tests {
             ReasoningPolicy::derive("some-model", "https://api-inference.xiaomimimo.com/v1"),
             ReasoningPolicy::Include
         );
+    }
+
+    #[test]
+    fn from_config_parses_override_or_errors() {
+        assert_eq!(ReasoningPolicy::from_config(None), Ok(None));
+        assert_eq!(ReasoningPolicy::from_config(Some("")), Ok(None));
+        assert_eq!(ReasoningPolicy::from_config(Some("  ")), Ok(None));
+        assert_eq!(ReasoningPolicy::from_config(Some("include")), Ok(Some(ReasoningPolicy::Include)));
+        assert_eq!(ReasoningPolicy::from_config(Some(" Exclude ")), Ok(Some(ReasoningPolicy::Exclude)));
+        assert!(ReasoningPolicy::from_config(Some("sometimes")).is_err());
     }
 
     #[test]
