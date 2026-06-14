@@ -19,11 +19,13 @@
 //! sessions stay full-fidelity and purely append-only (perfect cache).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_kernel::message::{
-    CompactionPlan, CompactionStrategy, CompactionView, Message, Role,
+    CompactTrigger, CompactionPlan, CompactionStrategy, CompactionView, Message, Role,
 };
+use atomcode_kernel::provider::LlmProvider;
 
 /// Tool results at or below this byte size are left alone. A produced stub is far under
 /// this, which is what makes the rewrite MONOTONIC: re-running never re-stubs a stub.
@@ -89,6 +91,123 @@ impl CompactionStrategy for StubCompaction {
         }
         // Pure in-place stubbing: no drain, no summary, no resume note.
         CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites, resume_note: None }
+    }
+}
+
+/// Tool results below this size are left alone under OVERFLOW (smaller than the normal
+/// `MIN_COLLAPSE_SIZE` — overflow is more aggressive). A produced stub is well under this,
+/// so re-running never re-stubs a stub (monotonic / idempotent).
+const AGGRESSIVE_STUB_MIN: usize = 160;
+
+/// Marker appended to a hard-truncated message body. Presence of this substring makes
+/// truncation idempotent (a re-run skips an already-truncated message).
+const TRUNCATE_MARKER: &str = "\n[truncated: showing ";
+
+/// Wraps [`StubCompaction`] with a hard-OVERFLOW escalation ladder. `Auto`/`Manual`
+/// delegate to the inner gentle policy verbatim (normal path unchanged). `Overflow`
+/// escalates by `attempt`: 0 = aggressive stub, 1 = hard-truncate oversized messages,
+/// 2 = drain old turns into one LLM summary (plain drain when `summary_provider` is None).
+///
+/// Off the normal path: only the kernel's overflow-retry loop constructs
+/// [`CompactTrigger::Overflow`], and only after a real provider rejection — pressure never
+/// reaches these tiers.
+pub struct OverflowCompaction {
+    inner: StubCompaction,
+    /// Provider used ONLY by tier 2 to summarize the drained span. `None` ⇒ tier 2 plain-drains.
+    summary_provider: Option<Arc<dyn LlmProvider>>,
+}
+
+impl OverflowCompaction {
+    pub fn new(inner: StubCompaction, summary_provider: Option<Arc<dyn LlmProvider>>) -> Self {
+        Self { inner, summary_provider }
+    }
+
+    /// Aggressive stub of every tool result in `[from, to)` over `AGGRESSIVE_STUB_MIN`
+    /// (no read_file exemption). Monotonic: an already-stubbed result is left alone.
+    fn aggressive_stub_rewrites(msgs: &[Message], from: usize, to: usize) -> Vec<(usize, String)> {
+        let id_to_tool = call_id_to_tool(msgs);
+        let mut out = Vec::new();
+        for (i, m) in msgs.iter().enumerate().take(to).skip(from) {
+            if m.role != Role::Tool || m.text.len() <= AGGRESSIVE_STUB_MIN {
+                continue;
+            }
+            let tool = m
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| id_to_tool.get(id))
+                .map(String::as_str)
+                .unwrap_or("tool");
+            out.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
+        }
+        out
+    }
+
+    /// Hard-truncate any single message in `[from, len)` whose text exceeds `budget_chars`.
+    /// Idempotent via `TRUNCATE_MARKER`. Char-based (CJK-safe).
+    fn truncate_rewrites(msgs: &[Message], from: usize, budget_chars: usize) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for (i, m) in msgs.iter().enumerate().skip(from) {
+            if m.text.contains(TRUNCATE_MARKER) {
+                continue; // already truncated
+            }
+            let total = m.text.chars().count();
+            if total <= budget_chars {
+                continue;
+            }
+            let head: String = m.text.chars().take(budget_chars).collect();
+            out.push((i, format!("{head}{TRUNCATE_MARKER}{budget_chars} of {total} chars]")));
+        }
+        out
+    }
+
+    async fn overflow_plan(&self, view: &CompactionView<'_>, attempt: u8) -> CompactionPlan {
+        let msgs = view.messages;
+        let floor = view.sacred_floor;
+        match attempt {
+            0 => {
+                let rewrites = Self::aggressive_stub_rewrites(msgs, floor, msgs.len());
+                if rewrites.is_empty() {
+                    return CompactionPlan::noop();
+                }
+                CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites, resume_note: None }
+            }
+            1 => {
+                // ~2 chars/token lower bound; min floor so tiny windows don't over-truncate.
+                let budget = (view.ctx_window as usize).saturating_mul(2).max(8_000);
+                let rewrites = Self::truncate_rewrites(msgs, floor, budget);
+                if rewrites.is_empty() {
+                    return CompactionPlan::noop();
+                }
+                CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites, resume_note: None }
+            }
+            _ => {
+                // Tier 2: drain old turns; summarize (LLM) if a provider is available.
+                let drain_to = active_turn_start(msgs, 1).max(floor);
+                if drain_to <= floor {
+                    return CompactionPlan::noop(); // nothing older than the active turn
+                }
+                let summary = self.summarize(&msgs[floor..drain_to]).await;
+                let rewrites = Self::aggressive_stub_rewrites(msgs, drain_to, msgs.len());
+                CompactionPlan { drain_from: floor, drain_to, summary, rewrites, resume_note: None }
+            }
+        }
+    }
+
+    /// Tier 2 summary. `None` here ⇒ caller plain-drains. Implemented in a follow-up step;
+    /// stubbed to `None` so the mechanical tiers land and test independently.
+    async fn summarize(&self, _span: &[Message]) -> Option<String> {
+        let _ = &self.summary_provider;
+        None
+    }
+}
+
+#[async_trait]
+impl CompactionStrategy for OverflowCompaction {
+    async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
+        match view.trigger {
+            CompactTrigger::Overflow { attempt } => self.overflow_plan(view, attempt).await,
+            _ => self.inner.plan(view).await,
+        }
     }
 }
 
@@ -167,6 +286,17 @@ mod tests {
             used_tokens: 800,
             utilization: 0.8,
             sacred_floor,
+        }
+    }
+
+    fn overflow_view<'a>(msgs: &'a [Message], floor: usize, attempt: u8, ctx_window: u32) -> CompactionView<'a> {
+        CompactionView {
+            messages: msgs,
+            trigger: CompactTrigger::Overflow { attempt },
+            ctx_window,
+            used_tokens: ctx_window,
+            utilization: 1.0,
+            sacred_floor: floor,
         }
     }
 
@@ -251,6 +381,94 @@ mod tests {
         let floor = conv.sacred_floor();
         let plan = StubCompaction::default().plan(&view(&conv.messages, floor)).await;
         assert!(plan.is_noop(), "a single-turn history has nothing older than the active turn");
+    }
+
+    #[tokio::test]
+    async fn overflow_tier0_stubs_all_tool_results_even_read_file() {
+        // Aggressive: read_file is NOT exempt under overflow, and active-turn results stub too.
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("u1"),
+            asst_call("r1", "read_file"),
+            Message::tool_result("r1", &big("file body"), false),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let plan = OverflowCompaction::new(StubCompaction::default(), None)
+            .plan(&overflow_view(&conv.messages, floor, 0, 8000))
+            .await;
+        let report = conv.apply_plan(plan, floor);
+        assert!(report.committed, "tier 0 must stub the read_file result under overflow");
+        assert!(
+            conv.messages[3].text.starts_with("[read_file "),
+            "read_file stubbed: {:?}",
+            conv.messages[3].text
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_tier1_truncates_oversized_message() {
+        let huge = "x".repeat(50_000);
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("u1"),
+            Message::assistant("a1", vec![]),
+            Message::user(huge.as_str()), // an oversized later message (e.g. a giant paste)
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let plan = OverflowCompaction::new(StubCompaction::default(), None)
+            .plan(&overflow_view(&conv.messages, floor, 1, 1000))
+            .await;
+        let report = conv.apply_plan(plan, floor);
+        assert!(report.committed, "tier 1 must truncate the oversized message");
+        assert!(
+            conv.messages.last().unwrap().text.contains("[truncated: showing "),
+            "marker present"
+        );
+        assert!(conv.messages.last().unwrap().text.len() < huge.len(), "shrunk");
+    }
+
+    #[tokio::test]
+    async fn overflow_tier1_is_noop_when_nothing_oversized() {
+        let msgs = vec![
+            Message::system("p"),
+            Message::user("small"),
+            Message::assistant("tiny", vec![]),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let plan = OverflowCompaction::new(StubCompaction::default(), None)
+            .plan(&overflow_view(&conv.messages, floor, 1, 1_000_000))
+            .await;
+        assert!(plan.is_noop(), "no message exceeds budget → noop");
+    }
+
+    #[tokio::test]
+    async fn overflow_delegates_normal_triggers_to_inner() {
+        // Auto/Manual must behave EXACTLY like StubCompaction (normal path unchanged).
+        let msgs = vec![
+            Message::system("p"),
+            Message::user("u1"),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", &big("out"), false),
+            Message::user("u2"),
+            asst_call("g1", "grep"),
+            Message::tool_result("g1", &big("o2"), false),
+        ];
+        let mut a = Conversation::new();
+        a.messages = msgs.clone();
+        let mut b = Conversation::new();
+        b.messages = msgs;
+        let floor = a.sacred_floor();
+        let pa = OverflowCompaction::new(StubCompaction::default(), None)
+            .plan(&view(&a.messages, floor))
+            .await;
+        let pb = StubCompaction::default().plan(&view(&b.messages, floor)).await;
+        assert_eq!(pa.rewrites, pb.rewrites, "Auto trigger must match inner StubCompaction byte-for-byte");
     }
 }
 
