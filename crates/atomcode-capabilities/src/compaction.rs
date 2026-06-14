@@ -25,7 +25,9 @@ use async_trait::async_trait;
 use atomcode_kernel::message::{
     CompactTrigger, CompactionPlan, CompactionStrategy, CompactionView, Message, Role,
 };
-use atomcode_kernel::provider::LlmProvider;
+use atomcode_kernel::provider::{ChatOptions, LlmProvider};
+use atomcode_kernel::stream::StreamEvent;
+use futures::StreamExt;
 
 /// Tool results at or below this byte size are left alone. A produced stub is far under
 /// this, which is what makes the rewrite MONOTONIC: re-running never re-stubs a stub.
@@ -102,6 +104,11 @@ const AGGRESSIVE_STUB_MIN: usize = 160;
 /// Marker appended to a hard-truncated message body. Presence of this substring makes
 /// truncation idempotent (a re-run skips an already-truncated message).
 const TRUNCATE_MARKER: &str = "\n[truncated: showing ";
+
+/// System prompt for the tier-2 overflow summary LLM call.
+const SUMMARY_SYSTEM_PROMPT: &str =
+    "You compress conversation history. Produce a faithful, compact summary that another \
+     instance can resume from. No preamble, no meta-commentary — just the summary.";
 
 /// Wraps [`StubCompaction`] with a hard-OVERFLOW escalation ladder. `Auto`/`Manual`
 /// delegate to the inner gentle policy verbatim (normal path unchanged). `Overflow`
@@ -193,12 +200,51 @@ impl OverflowCompaction {
         }
     }
 
-    /// Tier 2 summary. `None` here ⇒ caller plain-drains. Implemented in a follow-up step;
-    /// stubbed to `None` so the mechanical tiers land and test independently.
-    async fn summarize(&self, _span: &[Message]) -> Option<String> {
-        let _ = &self.summary_provider;
-        None
+    /// Summarize a drained span into one paragraph via the configured provider. `None` if
+    /// no provider, the call errors, or the result is empty (caller then plain-drains).
+    /// One-shot, no tools; operates on the already-stubbed span so its input is small.
+    async fn summarize(&self, span: &[Message]) -> Option<String> {
+        let provider = self.summary_provider.as_ref()?;
+        let transcript = render_transcript(span);
+        let prompt = vec![
+            Message::system(SUMMARY_SYSTEM_PROMPT),
+            Message::user(format!(
+                "Summarize the following conversation span. Preserve decisions made, file \
+                 paths touched, and any unresolved threads. Be concise.\n\n{transcript}"
+            )),
+        ];
+        let mut stream = provider.chat_stream(&prompt, &[], &ChatOptions::default()).await.ok()?;
+        let mut out = String::new();
+        while let Some(ev) = stream.next().await {
+            if let StreamEvent::TextDelta(t) = ev {
+                out.push_str(&t);
+            }
+        }
+        let out = out.trim().to_string();
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
+}
+
+/// Render a message span as a compact role-tagged transcript for the summarizer.
+fn render_transcript(span: &[Message]) -> String {
+    let mut s = String::new();
+    for m in span {
+        let role = match m.role {
+            Role::System => "SYSTEM",
+            Role::User => "USER",
+            Role::Assistant => "ASSISTANT",
+            Role::Tool => "TOOL",
+        };
+        s.push_str(role);
+        s.push_str(": ");
+        s.push_str(&m.text);
+        s.push('\n');
+    }
+    s
 }
 
 #[async_trait]
@@ -469,6 +515,69 @@ mod tests {
             .await;
         let pb = StubCompaction::default().plan(&view(&b.messages, floor)).await;
         assert_eq!(pa.rewrites, pb.rewrites, "Auto trigger must match inner StubCompaction byte-for-byte");
+    }
+
+    struct CannedSummaryProvider;
+    #[async_trait]
+    impl LlmProvider for CannedSummaryProvider {
+        fn model_name(&self) -> &str {
+            "canned"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &ChatOptions,
+        ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, atomcode_kernel::stream::ProviderError>
+        {
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta("PRIOR CONTEXT SUMMARY".into()),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_tier2_drains_old_turns_into_llm_summary() {
+        // The drained span must be BIGGER than the summary, or apply_plan's net-loss guard
+        // (correctly) refuses — so the old turns carry bulk, as in a real overflow.
+        let msgs = vec![
+            Message::system("p"),
+            Message::user("u1"),
+            Message::assistant(big("a1"), vec![]),
+            Message::user(big("u2")),
+            Message::assistant(big("a2"), vec![]),
+            Message::user("u3-active"),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let strat = OverflowCompaction::new(StubCompaction::default(), Some(Arc::new(CannedSummaryProvider)));
+        let plan = strat.plan(&overflow_view(&conv.messages, floor, 2, 8000)).await;
+        assert_eq!(plan.summary.as_deref(), Some("PRIOR CONTEXT SUMMARY"), "tier 2 attaches the LLM summary");
+        assert!(plan.drain_from == floor && plan.drain_to > floor, "drains the old span");
+        let report = conv.apply_plan(plan, floor);
+        assert!(report.committed);
+        // The drained span is replaced by ONE synthetic_user summary message.
+        assert!(conv.messages.iter().any(|m| m.text == "PRIOR CONTEXT SUMMARY" && m.synthetic));
+    }
+
+    #[tokio::test]
+    async fn overflow_tier2_plain_drains_without_provider() {
+        let msgs = vec![
+            Message::system("p"),
+            Message::user("u1"),
+            Message::assistant("a1", vec![]),
+            Message::user("u2-active"),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let plan = OverflowCompaction::new(StubCompaction::default(), None)
+            .plan(&overflow_view(&conv.messages, floor, 2, 8000))
+            .await;
+        assert!(plan.summary.is_none(), "no provider → plain drain");
+        assert!(plan.drain_to > floor);
     }
 }
 
