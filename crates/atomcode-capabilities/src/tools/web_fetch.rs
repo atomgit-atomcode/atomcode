@@ -151,16 +151,7 @@ impl Tool for WebFetchTool {
         let is_html = ct_is_html || (ct_header.is_none() && body.trim_start().starts_with('<'));
         let text = if is_html { html_to_text(&body) } else { body };
 
-        let output = match max {
-            Some(m) if text.len() > m => {
-                let mut end = m;
-                while end > 0 && !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                format!("{}\n\n[Truncated at {m} chars, {} total]", &text[..end], text.len())
-            }
-            _ => text, // no cap (or under it) → full content
-        };
+        let output = apply_char_cap(text, max);
         if output.trim().is_empty() {
             return err(format!("web_fetch: page fetched but no readable text at {final_url}"));
         }
@@ -170,6 +161,20 @@ impl Tool for WebFetchTool {
             String::new()
         };
         ok(format!("Content from {final_url}:\n\n{output}{cap_note}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+/// Truncate `text` to at most `max` CHARACTERS (not bytes), appending a `[Truncated …]`
+/// note. `None` → full text unchanged. Char-based so a multibyte (CJK/emoji) page isn't
+/// cut short and mis-counted (the byte-vs-char bug fixed in core 4c2ad525).
+fn apply_char_cap(text: String, max: Option<usize>) -> String {
+    match max {
+        Some(m) if text.chars().count() > m => {
+            let truncated: String = text.chars().take(m).collect();
+            format!("{}\n\n[Truncated at {m} chars, {} total]", truncated, text.chars().count())
+        }
+        _ => text,
     }
 }
 
@@ -437,6 +442,17 @@ fn replace_tag_with(html: &str, tag: &str, replacement: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn char_cap_counts_chars_not_bytes() {
+        // 5 CJK chars = 15 bytes. Cap at 3 CHARS must keep 3 chars (not 3 bytes = 1 char).
+        let out = apply_char_cap("你好世界啊".to_string(), Some(3));
+        assert!(out.starts_with("你好世"), "char-based slice: {out}");
+        assert!(out.contains("Truncated at 3 chars, 5 total"), "char counts: {out}");
+        // Under the cap and no-cap leave text untouched.
+        assert_eq!(apply_char_cap("abc".to_string(), Some(10)), "abc");
+        assert_eq!(apply_char_cap("abc".to_string(), None), "abc");
+    }
 
     #[test]
     fn ssrf_blocks_loopback_private_and_metadata() {
