@@ -27,7 +27,9 @@ use atomcode_capabilities::session::{
     CurrentDateHook, RecallTool, SessionManager, SnapshotHook, TranscriptHook,
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
-use atomcode_capabilities::tools::{register_coding_tools, ApprovalMiddleware, WebFetchTool, WebSearchTool};
+use atomcode_capabilities::tools::{
+    register_coding_tools, ApprovalMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool,
+};
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::SessionSnapshot;
@@ -304,6 +306,10 @@ pub fn assemble(
         // blocks mutating TOOLS, this keeps the model PLANNING instead of writing the
         // implementation inline. Shares the same plan_mode flag; cache-safe (tail only).
         .hook(Arc::new(crate::plan_mode::PlanModeReminderHook::new(parts.plan_mode.clone())))
+        // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
+        // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
+        // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
+        .middleware(Arc::new(SensitivePathGate::new()))
         // Approval BEFORE any arg-rewriting middleware — the user approves the exact
         // bytes that run.
         .middleware(parts.approval.clone())

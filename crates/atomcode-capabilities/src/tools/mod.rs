@@ -41,6 +41,7 @@ pub mod parallel_edit;
 pub mod read;
 pub mod report_finding;
 pub mod search_replace;
+pub mod sensitive_path;
 pub mod todo;
 pub mod write;
 /// Network tools (`web_fetch` / `web_search`). Opt-in `web` feature (HTTP stack).
@@ -68,6 +69,7 @@ pub use parallel_edit::ParallelEditTool;
 pub use read::ReadFileTool;
 pub use report_finding::{Finding, ReportFindingTool};
 pub use search_replace::SearchReplaceTool;
+pub use sensitive_path::{references_sensitive_path, SensitivePathGate};
 pub use todo::TodoTool;
 pub use write::WriteFileTool;
 #[cfg(feature = "web")]
