@@ -45,6 +45,39 @@ pub struct ProviderError {
     pub code: Option<String>,
 }
 
+impl ProviderError {
+    /// True iff this is a hard CONTEXT-WINDOW OVERFLOW — the assembled prompt exceeded the
+    /// model's window and the provider rejected the WHOLE request (a request-open 400,
+    /// surfaced as `Err` from `chat_stream`). Centralizes per-provider signatures so a
+    /// consumer can branch without string-matching at the call site. Distinct from a
+    /// retryable 429/5xx and from a plain bad-request 400 (auth, unknown model, bad args).
+    pub fn is_context_overflow(&self) -> bool {
+        // 1. Structured code (most reliable) — OpenAI + compatibles.
+        if let Some(code) = &self.code {
+            let c = code.to_ascii_lowercase();
+            if c == "context_length_exceeded" || c == "string_above_max_length" {
+                return true;
+            }
+        }
+        // 2. HTTP 400 + message signature (Anthropic "prompt is too long", others).
+        if self.http_status == Some(400) {
+            let m = self.message.to_ascii_lowercase();
+            const NEEDLES: [&str; 6] = [
+                "context length",
+                "context window",
+                "maximum context",
+                "prompt is too long",
+                "reduce the length",
+                "too many tokens",
+            ];
+            if NEEDLES.iter().any(|n| m.contains(n)) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Minimal provider stream surface. Fallible: a real streaming LLM can fail
 /// mid-stream, truncate on `finish_reason=length`, or emit reasoning content —
 /// each is first-class here so it never degrades into an empty SUCCESSFUL turn.
@@ -124,5 +157,36 @@ mod tests {
         let mut o = TokenUsage::default();
         o.merge_max(TokenUsage { prompt: 200, completion: 30, cached: 5 });
         assert_eq!(o, TokenUsage { prompt: 200, completion: 30, cached: 5 });
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::ProviderError;
+
+    fn err(http: Option<u16>, code: Option<&str>, msg: &str) -> ProviderError {
+        ProviderError { retryable: false, message: msg.into(), http_status: http, code: code.map(Into::into) }
+    }
+
+    #[test]
+    fn openai_code_is_overflow() {
+        assert!(err(Some(400), Some("context_length_exceeded"), "...").is_context_overflow());
+    }
+    #[test]
+    fn anthropic_message_is_overflow() {
+        assert!(err(Some(400), None, "prompt is too long: 250000 tokens > 200000").is_context_overflow());
+    }
+    #[test]
+    fn generic_400_context_message_is_overflow() {
+        assert!(err(Some(400), None, "This model's maximum context length is 8192 tokens").is_context_overflow());
+    }
+    #[test]
+    fn auth_and_model_errors_are_not_overflow() {
+        assert!(!err(Some(401), Some("invalid_api_key"), "bad key").is_context_overflow());
+        assert!(!err(Some(400), Some("model_not_found"), "no such model").is_context_overflow());
+    }
+    #[test]
+    fn retryable_429_is_not_overflow() {
+        assert!(!err(Some(429), None, "rate limited").is_context_overflow());
     }
 }
