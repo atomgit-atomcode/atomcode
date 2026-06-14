@@ -27,6 +27,11 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 /// bounded.
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 
+/// Bounded overflow-recovery retries per round (covers ladder tiers 0..=2). After this
+/// many failed compact-and-retry attempts the kernel surfaces the overflow error rather
+/// than spinning — a genuinely-unrecoverable history (sacred floor alone over the window).
+const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
+
 /// Enforce the kernel's tool-result size cap on `result.content`, IN PLACE.
 ///
 /// Contract:
@@ -671,6 +676,9 @@ impl RunningAgent {
         // `max_rounds` is None — the model never regains agency to stop. Bounded by
         // `max_continuations` (default Some(50)).
         let mut continuations: u32 = 0;
+        // OVERFLOW recovery counter for the CURRENT round: incremented each time a hard
+        // context-overflow triggers a compact-and-retry; reset to 0 on a successful open.
+        let mut overflow_attempt: u8 = 0;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -727,7 +735,26 @@ impl RunningAgent {
             // neutral SLOT) ride along as a sideband request param — NOT part of
             // `messages`, so they never perturb the append-only wire prefix.
             let mut stream = match self.provider.chat_stream(&messages, &defs, &self.chat_options).await {
-                Ok(s) => s,
+                Ok(s) => {
+                    overflow_attempt = 0; // a successful open resets the per-round counter
+                    s
+                }
+                // HARD OVERFLOW recovery (OFF the normal path): the prompt exceeded the
+                // window and was rejected wholesale. That prompt was never cached, so the
+                // cache is already lost here — compact MORE aggressively and retry the SAME
+                // round. Bounded by MAX_OVERFLOW_ATTEMPTS so a genuinely-unrecoverable
+                // history (sacred floor alone over the window) still terminates by surfacing
+                // the error. This is the ONLY place compaction runs mid-turn, and only after
+                // a real provider rejection — pressure never triggers it.
+                Err(e) if e.is_context_overflow() && overflow_attempt < MAX_OVERFLOW_ATTEMPTS => {
+                    self.rt.emit(AgentEvent::Warning(format!(
+                        "context overflow on round {round} (attempt {overflow_attempt}); compacting and retrying"
+                    )));
+                    self.run_compaction(convo, CompactTrigger::Overflow { attempt: overflow_attempt }).await;
+                    overflow_attempt += 1;
+                    round -= 1; // a RETRY of the same logical round, not a new one
+                    continue;
+                }
                 Err(e) => {
                     self.hooks.on_error(&e.message).await;
                     self.rt.emit(AgentEvent::Error { message: e.message, http_status: e.http_status, code: e.code });
