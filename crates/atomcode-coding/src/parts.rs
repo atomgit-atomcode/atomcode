@@ -300,6 +300,10 @@ pub fn assemble(
         // tools outright, so there's no point prompting the user to approve a write
         // plan mode forbids. Read-only when inactive — zero cost off the plan path.
         .middleware(Arc::new(crate::plan_mode::PlanModeGate::new(parts.plan_mode.clone())))
+        // Plan-mode reminder (ephemeral request tail) — pairs with the gate: the gate
+        // blocks mutating TOOLS, this keeps the model PLANNING instead of writing the
+        // implementation inline. Shares the same plan_mode flag; cache-safe (tail only).
+        .hook(Arc::new(crate::plan_mode::PlanModeReminderHook::new(parts.plan_mode.clone())))
         // Approval BEFORE any arg-rewriting middleware — the user approves the exact
         // bytes that run.
         .middleware(parts.approval.clone())
