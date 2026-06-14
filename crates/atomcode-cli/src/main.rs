@@ -1955,10 +1955,28 @@ async fn run_headless(
             AgentEvent::TokenUsage(usage) => {
                 if verbose {
                     close_thinking_line(&mut thinking_line_open);
-                    eprintln!(
-                        "[tokens] prompt={} completion={}",
-                        usage.prompt_tokens, usage.completion_tokens
-                    );
+                    // `cached` = provider prompt-cache HIT tokens (e.g. DeepSeek's
+                    // `prompt_cache_hit_tokens`): how much of the prompt was served from
+                    // the prefix cache instead of recomputed. Shown only when > 0 so the
+                    // line stays clean on providers that don't report it.
+                    if usage.cached_tokens > 0 {
+                        eprintln!(
+                            "[tokens] prompt={} completion={} cached={} ({:.0}% hit)",
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            usage.cached_tokens,
+                            if usage.prompt_tokens > 0 {
+                                usage.cached_tokens as f64 / usage.prompt_tokens as f64 * 100.0
+                            } else {
+                                0.0
+                            }
+                        );
+                    } else {
+                        eprintln!(
+                            "[tokens] prompt={} completion={}",
+                            usage.prompt_tokens, usage.completion_tokens
+                        );
+                    }
                 }
             }
             AgentEvent::PhaseChange(_) => {
