@@ -28,11 +28,11 @@ pub struct WebFetchTool;
 #[derive(Deserialize)]
 struct Args {
     url: String,
-    #[serde(default = "default_max_chars")]
-    max_chars: usize,
-}
-fn default_max_chars() -> usize {
-    20_000
+    /// Optional character cap on the returned text. Omitted → return the FULL content
+    /// (bounded only by the 2 MiB byte buffer). When set, truncate to this many chars
+    /// (≤ `MAX_CHARS_CAP`) with a note. No default truncation — a large page comes whole.
+    #[serde(default)]
+    max_chars: Option<usize>,
 }
 
 #[async_trait]
@@ -44,15 +44,15 @@ impl Tool for WebFetchTool {
         "Fetch a web page over http(s) and return its content as clean text (HTML is \
          converted to readable text). Use after `web_search` to read a specific page \
          (docs, README, API reference). Only http/https URLs are allowed; requests to \
-         localhost / private / cloud-metadata addresses are blocked. `max_chars` caps \
-         the returned text (default 20000)."
+         localhost / private / cloud-metadata addresses are blocked. Returns the full page \
+         by default; pass `max_chars` to cap the returned text."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
                 "url": { "type": "string", "description": "The http(s) URL to fetch" },
-                "max_chars": { "type": "integer", "description": "Max characters of text to return (default 20000)" }
+                "max_chars": { "type": "integer", "description": "Optional max characters to return. Omit to get the full page (recommended for code/docs)." }
             },
             "required": ["url"]
         })
@@ -63,7 +63,7 @@ impl Tool for WebFetchTool {
             Ok(a) => a,
             Err(e) => return err(format!("web_fetch: invalid arguments: {e}. Expected {{\"url\":\"https://...\"}}.")),
         };
-        let max = a.max_chars.min(MAX_CHARS_CAP);
+        let max = a.max_chars.map(|m| m.min(MAX_CHARS_CAP));
 
         let mut url = match Url::parse(&a.url) {
             Ok(u) => u,
@@ -151,14 +151,15 @@ impl Tool for WebFetchTool {
         let is_html = ct_is_html || (ct_header.is_none() && body.trim_start().starts_with('<'));
         let text = if is_html { html_to_text(&body) } else { body };
 
-        let output = if text.len() > max {
-            let mut end = max;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
+        let output = match max {
+            Some(m) if text.len() > m => {
+                let mut end = m;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}\n\n[Truncated at {m} chars, {} total]", &text[..end], text.len())
             }
-            format!("{}\n\n[Truncated at {max} chars, {} total]", &text[..end], text.len())
-        } else {
-            text
+            _ => text, // no cap (or under it) → full content
         };
         if output.trim().is_empty() {
             return err(format!("web_fetch: page fetched but no readable text at {final_url}"));
@@ -291,7 +292,8 @@ fn build_client(host: &str, pinned: &[SocketAddr]) -> Result<reqwest::Client, St
         .redirect(Policy::none())
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .user_agent("Mozilla/5.0 (compatible; atomcode/web_fetch)");
+        // A real browser UA — many sites (docs hosts, forges) 403 a generic/bot UA.
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36");
     if !pinned.is_empty() {
         builder = builder.resolve_to_addrs(host, pinned);
     }
