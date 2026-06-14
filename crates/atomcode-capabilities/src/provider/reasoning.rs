@@ -24,7 +24,12 @@
 /// assistant message but none was captured (resumed/compacted history, or a turn
 /// produced by a non-thinking model). DeepSeek-V4 rejects an *empty* `reasoning_content`
 /// on tool-call messages, so a non-empty placeholder is mandatory under [`ReasoningPolicy::Include`].
-pub const REASONING_PLACEHOLDER: &str = "(no reasoning recorded)";
+///
+/// It is a single NON-PROSE sentinel (`·`), not an English sentence: at high context a
+/// history full of an English placeholder *sentence* led DeepSeek-V4-Flash to MIMIC it and
+/// emit it as its only assistant text, stalling the turn. A bare middle-dot satisfies the
+/// non-empty requirement without giving the model prose to echo (ported from core 54c9e4bb).
+pub const REASONING_PLACEHOLDER: &str = "·";
 
 /// Whether a model echoes prior-turn `reasoning_content` back on the next request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +76,7 @@ impl ReasoningPolicy {
             ReasoningPolicy::Include
         } else if m.starts_with("kimi-")
             || m.starts_with("moonshot")
+            || m.starts_with("mimo-")
             || u.contains("moonshot")
             || u.contains("kimi")
             || u.contains("xiaomimimo")
@@ -110,6 +116,12 @@ mod tests {
     fn moonshot_kimi_mimo_include() {
         assert_eq!(ReasoningPolicy::derive("kimi-k2", ""), ReasoningPolicy::Include);
         assert_eq!(ReasoningPolicy::derive("moonshot-v1-8k", ""), ReasoningPolicy::Include);
+        // MiMo by MODEL NAME (reuses DeepSeek-V4 thinking protocol) — even on a generic
+        // gateway URL that doesn't contain "mimo".
+        assert_eq!(
+            ReasoningPolicy::derive("mimo-v2.5-pro", "https://generic-gateway.example/v1"),
+            ReasoningPolicy::Include
+        );
         // identifiable only by host:
         assert_eq!(
             ReasoningPolicy::derive("some-model", "https://api.moonshot.cn/v1"),
