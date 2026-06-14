@@ -1694,10 +1694,12 @@ mod menu_tests {
 
         let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("/skills (with space) must list skills");
-        assert!(items.iter().any(|(n, _)| n == "skills:brainstorming"));
-        assert!(items.iter().any(|(n, _)| n == "skills:web-access"));
+        // Sub-mode lists BARE names (the dispatcher re-qualifies to `skills:<name>` on
+        // submit) — matches build_skill_menu_items_lists_unique_bare_names + the documented design.
+        assert!(items.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "web-access"));
         for (n, _) in &items {
-            assert!(n.contains(':'), "sub-mode names must be qualified: {}", n);
+            assert!(!n.contains(':'), "sub-mode names are bare: {}", n);
         }
     }
 
@@ -1715,12 +1717,12 @@ mod menu_tests {
         let bra = build_menu_items("/skills bra", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(bra.len(), 1);
-        assert_eq!(bra[0].0, "skills:brainstorming");
+        assert_eq!(bra[0].0, "brainstorming");
 
         let web = build_menu_items("/skills web", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(web.len(), 1);
-        assert_eq!(web[0].0, "skills:web-access");
+        assert_eq!(web[0].0, "web-access");
 
         assert!(build_menu_items("/skills zz", 0, &reg, &custom, Some(&lock), None).is_none());
     }
@@ -1751,9 +1753,9 @@ mod menu_tests {
 
         let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("at least one visible skill should produce a menu");
-        assert!(items.iter().any(|(n, _)| n == "skills:visible"));
+        assert!(items.iter().any(|(n, _)| n == "visible"));
         assert!(
-            !items.iter().any(|(n, _)| n == "skills:hidden"),
+            !items.iter().any(|(n, _)| n == "hidden"),
             "user_invocable=false skill leaked into sub-menu"
         );
     }
