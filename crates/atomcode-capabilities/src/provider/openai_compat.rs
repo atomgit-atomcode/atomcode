@@ -409,6 +409,7 @@ fn effort_str(e: ReasoningEffort) -> &'static str {
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
+        ReasoningEffort::Max => "max",
     }
 }
 
@@ -923,6 +924,18 @@ mod tests {
         assert_eq!(body["max_tokens"].as_u64(), Some(100)); // cfg fallback
         assert_eq!(body["reasoning_effort"], "high"); // v4 applicable
         assert_eq!(body["tools"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn reasoning_effort_max_reaches_wire() {
+        // DeepSeek V4 accepts "max" beyond low/medium/high — the `/effort max` path.
+        let cfg = OpenAiCompatConfig::new("k", "https://x", "deepseek-v4-flash");
+        let opts = ChatOptions {
+            reasoning_effort: Some(ReasoningEffort::Max),
+            ..Default::default()
+        };
+        let body = build_request_body("deepseek-v4-flash", &[Message::user("hi")], &[], &opts, &cfg, ReasoningPolicy::Include);
+        assert_eq!(body["reasoning_effort"], "max");
     }
 
     #[test]

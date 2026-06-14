@@ -612,6 +612,7 @@ impl KernelTurnExecutor {
             mcp: true,
             telemetry: Some(self.telemetry.clone()),
             reasoning_history: p.reasoning_history.clone(),
+            reasoning_effort: p.reasoning_effort.clone(),
         })
     }
 }
@@ -895,6 +896,7 @@ pub(crate) fn chat_bridge_config(
         mcp: true,
         telemetry: Some(telemetry),
         reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
+        reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
     }
 }
 

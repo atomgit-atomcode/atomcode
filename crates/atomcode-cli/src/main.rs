@@ -1750,6 +1750,7 @@ fn bridge_config_from(
         mcp: true,
         telemetry,
         reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
+        reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
     }
 }
 

@@ -37,6 +37,12 @@ pub struct BridgeConfig {
     /// driver's provider config. `None` ⇒ the adapter auto-detects by model. Threaded
     /// so v2 honors the same per-provider knob the legacy engine reads.
     pub reasoning_history: Option<String>,
+    /// Provider `reasoning_effort` override (`"low"|"medium"|"high"|"max"`) from the
+    /// driver's provider config (the `/effort` control writes it). `None`/`"off"` ⇒ no
+    /// opinion. Threaded into `ChatOptions.reasoning_effort` so v2 honors `/effort` — the
+    /// legacy engine reads the same per-provider knob, but the bridge previously dropped
+    /// it (the `reasoning_history`-style footgun).
+    pub reasoning_effort: Option<String>,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -133,6 +139,11 @@ impl Bridge {
         coding_cfg.context_window = cfg.context_window;
         coding_cfg.telemetry = cfg.telemetry.clone();
         coding_cfg.reasoning_history = cfg.reasoning_history.clone();
+        // `/effort`: thread the per-provider reasoning_effort into the per-call ChatOptions
+        // so v2 actually emits it (openai_compat → `reasoning_effort` body field). Without
+        // this the knob was silently dropped at the bridge.
+        coding_cfg.chat_options.reasoning_effort =
+            atomcode_kernel::provider::ReasoningEffort::from_config(cfg.reasoning_effort.as_deref());
 
         let opts_template = PrepareOptions {
             session: SessionMode::Fresh,
@@ -376,6 +387,12 @@ impl Bridge {
                     if let Some(k) = &p.api_key {
                         self.coding_cfg.api_key = k.clone();
                     }
+                    // `/effort` / `/think` write the provider config then ReloadConfig: pick
+                    // up the (possibly changed) reasoning_effort so the respawned agent's
+                    // ChatOptions reflect it. (`reasoning_history` is a model-property, set
+                    // once at construction; effort is the knob users flip mid-session.)
+                    self.coding_cfg.chat_options.reasoning_effort =
+                        atomcode_kernel::provider::ReasoningEffort::from_config(p.reasoning_effort.as_deref());
                     match build_provider(&self.coding_cfg) {
                         Ok(provider) => {
                             let _ = self.handle.commands.send(KCmd::Shutdown);

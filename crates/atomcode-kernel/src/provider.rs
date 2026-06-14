@@ -49,6 +49,26 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    /// Maximum effort — DeepSeek V4 accepts `reasoning_effort: "max"` beyond the
+    /// OpenAI low/medium/high ladder.
+    Max,
+}
+
+impl ReasoningEffort {
+    /// Parse a config string (`"low"|"medium"|"high"|"max"`, case-insensitive) into an
+    /// effort level. `None`/empty/`"off"` ⇒ `None` (no opinion); an UNKNOWN value also ⇒
+    /// `None` (effort is a non-critical optimization — unlike `reasoning_history`, a typo
+    /// degrades to the adapter default rather than failing the turn). Lets a driver plumb
+    /// a per-provider `reasoning_effort` config knob into [`ChatOptions::reasoning_effort`].
+    pub fn from_config(s: Option<&str>) -> Option<ReasoningEffort> {
+        match s.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+            "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            "max" => Some(ReasoningEffort::Max),
+            _ => None,
+        }
+    }
 }
 
 /// NEUTRAL tool-use directive for one call. The provider adapter maps it onto the
@@ -94,6 +114,19 @@ pub trait LlmProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_from_config_maps_levels() {
+        assert_eq!(ReasoningEffort::from_config(Some("low")), Some(ReasoningEffort::Low));
+        assert_eq!(ReasoningEffort::from_config(Some("medium")), Some(ReasoningEffort::Medium));
+        assert_eq!(ReasoningEffort::from_config(Some("high")), Some(ReasoningEffort::High));
+        assert_eq!(ReasoningEffort::from_config(Some("MAX")), Some(ReasoningEffort::Max), "case-insensitive");
+        // off / empty / unset / unknown → no opinion (None), never a panic.
+        assert_eq!(ReasoningEffort::from_config(Some("off")), None);
+        assert_eq!(ReasoningEffort::from_config(Some("")), None);
+        assert_eq!(ReasoningEffort::from_config(None), None);
+        assert_eq!(ReasoningEffort::from_config(Some("bogus")), None);
+    }
 
     #[test]
     fn chat_options_default_is_neutral() {
