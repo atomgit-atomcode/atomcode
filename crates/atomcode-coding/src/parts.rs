@@ -279,6 +279,7 @@ pub fn assemble(
         }
     }
 
+    let summary_provider = provider.clone(); // tier-2 overflow summary uses the same provider
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
@@ -316,9 +317,13 @@ pub fn assemble(
         // LIVE cwd handle (not the immutable pin): /cd mutates parts.shared_cwd.
         .working_dir_shared(parts.shared_cwd.clone())
         .chat_options(cfg.chat_options.clone())
-        // Cache-friendly history compaction: stub old tool results at the task boundary
-        // once real utilization crosses the threshold. Kept full below it (pure append).
-        .compaction(Arc::new(atomcode_capabilities::compaction::StubCompaction::default()))
+        // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
+        // →drain+LLM-summary). Stubs old tool results once utilization crosses the threshold
+        // (kept full below it); the overflow tiers fire only on a typed overflow error.
+        .compaction(Arc::new(atomcode_capabilities::compaction::OverflowCompaction::new(
+            atomcode_capabilities::compaction::StubCompaction::default(),
+            Some(summary_provider),
+        )))
         .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout)

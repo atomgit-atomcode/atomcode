@@ -28,3 +28,7 @@ atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] 
 # atomcode-kernel::testkit (MockProvider, scripted StreamEvents) is ungated — no extra dep.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
+async-trait = "0.1"
+# Construct a mock provider stream in the overflow-recovery e2e (the testkit providers
+# can't model error-once-then-succeed).
+futures = "0.3"

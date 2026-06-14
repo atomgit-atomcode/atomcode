@@ -37,6 +37,7 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
 /// (a mock for tests, or any custom [`LlmProvider`]). Use this when you construct the
 /// provider yourself; otherwise prefer [`build_coding_agent`].
 pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmProvider>) -> Agent {
+    let summary_provider = provider.clone(); // tier-2 overflow summary uses the same provider
     Agent::builder()
         .provider(provider)
         .tools(mount_coding_tools())
@@ -45,8 +46,12 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
         .middleware(Arc::new(ApprovalMiddleware::in_memory()))
         .hook(Arc::new(VerifyCadenceHook::new()))
         .working_dir(cfg.working_dir.clone())
-        // Cache-friendly history compaction (stub old tool results at the task boundary).
-        .compaction(Arc::new(atomcode_capabilities::compaction::StubCompaction::default()))
+        // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
+        // →drain+LLM-summary). The overflow path is off the normal path (typed error only).
+        .compaction(Arc::new(atomcode_capabilities::compaction::OverflowCompaction::new(
+            atomcode_capabilities::compaction::StubCompaction::default(),
+            Some(summary_provider),
+        )))
         .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout)
