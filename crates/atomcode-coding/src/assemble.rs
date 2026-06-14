@@ -5,6 +5,7 @@ use crate::discipline::VerifyCadenceHook;
 use crate::persona::coding_persona;
 use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
 use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
+use atomcode_capabilities::session::SessionContextHook;
 use atomcode_capabilities::tools::{coding_tool_names, register_coding_tools, ApprovalMiddleware};
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::provider::LlmProvider;
@@ -44,6 +45,8 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
         .persona(coding_persona(&cfg.model))
         // Approval runs BEFORE any (future) arg-rewriting middleware — load-bearing order.
         .middleware(Arc::new(ApprovalMiddleware::in_memory()))
+        // Env / project-instructions / git context at session start (after persona).
+        .hook(Arc::new(SessionContextHook::new(cfg.working_dir.clone())))
         .hook(Arc::new(VerifyCadenceHook::new()))
         .working_dir(cfg.working_dir.clone())
         // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate

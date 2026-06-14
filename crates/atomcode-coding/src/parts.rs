@@ -24,7 +24,7 @@ use atomcode_capabilities::codeintel::register_codeintel_tools;
 use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::session::{
-    CurrentDateHook, RecallTool, SessionManager, SnapshotHook, TranscriptHook,
+    CurrentDateHook, RecallTool, SessionContextHook, SessionManager, SnapshotHook, TranscriptHook,
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
@@ -183,16 +183,21 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
     }
 
     // Hooks in the CANONICAL ORDER (registration order = HookChain execution order):
-    // 1. MemoryHook    — the ONLY hook that rewrites the leading-system run at
-    //    session_start (fresh inject after persona / resume reconcile) → must run
-    //    before anything else observes the conversation.
-    // 2. SnapshotHook  — turn_complete: persist .snapshot + .meta.
-    // 3. TranscriptHook— turn_complete: append the .jsonl record. (No coupling with
-    //    2 — the order is fixed purely for determinism.)
-    // 4. CurrentDateHook — pre_request tail-append (cache red-line: tail only).
-    // 5. VerifyCadenceHook — offer_continuation; FIRST `Some` wins in the chain, so
+    // 1. SessionContextHook — session_start: inject env + project-instructions + git
+    //    snapshot after persona. Rewrites the leading-system run (like MemoryHook); runs
+    //    FIRST so the order is persona → context → memory.
+    // 2. MemoryHook    — session_start: inject memory.md after the leading-system run
+    //    (fresh inject / resume reconcile). Both 1 and 2 reconcile by their own header
+    //    prefix, so they compose (the insert position is computed live each time).
+    // 3. SnapshotHook  — turn_complete: persist .snapshot + .meta.
+    // 4. TranscriptHook— turn_complete: append the .jsonl record. (No coupling with
+    //    3 — the order is fixed purely for determinism.)
+    // 5. CurrentDateHook — pre_request tail-append (cache red-line: tail only).
+    // 6. VerifyCadenceHook — offer_continuation; FIRST `Some` wins in the chain, so
     //    keep it last: any earlier hook's continuation outranks the cadence nudge.
     let mut hooks: Vec<Arc<dyn LifecycleHooks>> = Vec::new();
+    // Env / project-instructions / git context — unconditional (v1 parity: always present).
+    hooks.push(Arc::new(SessionContextHook::new(&cfg.working_dir)));
     if opts.memory {
         hooks.push(Arc::new(MemoryHook::for_project(&cfg.working_dir)));
     }

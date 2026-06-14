@@ -100,17 +100,23 @@ async fn full_assembly_lifecycle() {
         }
     }
 
-    // Memory injected: persona first, the MEMORY block right after, BEFORE the user.
+    // Leading-system run order: persona → SESSION CONTEXT → MEMORY, all BEFORE the user.
     {
         let calls = calls1.lock().unwrap();
         let first = &calls[0].0;
+        let shape = || first.iter().map(|m| (&m.role, m.text[..m.text.len().min(30)].to_string())).collect::<Vec<_>>();
         assert_eq!(first[0].role, Role::System, "persona leads");
         assert!(
-            first[1].role == Role::System && first[1].text.starts_with("=== MEMORY ==="),
-            "memory block injected after persona: {:?}",
-            first.iter().map(|m| (&m.role, &m.text[..m.text.len().min(30)])).collect::<Vec<_>>()
+            first[1].role == Role::System && first[1].text.starts_with("=== SESSION CONTEXT ==="),
+            "session-context block injected after persona: {:?}",
+            shape()
         );
-        assert!(first[1].text.contains("prefers tabs"));
+        assert!(
+            first[2].role == Role::System && first[2].text.starts_with("=== MEMORY ==="),
+            "memory block injected after the context block: {:?}",
+            shape()
+        );
+        assert!(first[2].text.contains("prefers tabs"));
         // CurrentDateHook tail-append rides the request.
         assert!(first.last().unwrap().text.starts_with("Current date:"));
     }
@@ -160,7 +166,10 @@ async fn full_assembly_lifecycle() {
         assert!(first.iter().any(|m| m.text == "the swap task"), "incl. the respawned turn");
         assert!(first.iter().any(|m| m.text == "the second task"));
         let system_count = first.iter().filter(|m| m.role == Role::System).count();
-        assert_eq!(system_count, 2, "persona + memory exactly once (no resume double-inject)");
+        assert_eq!(
+            system_count, 3,
+            "persona + session-context + memory exactly once each (resume reconciles in place, no double-inject)"
+        );
     }
 
     // Transcript turn_ids are MONOTONIC across the resume (the 8c06a9e2 seeding,
