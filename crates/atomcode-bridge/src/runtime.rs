@@ -299,10 +299,15 @@ impl Bridge {
                 };
                 match target.canonicalize() {
                     Ok(d) if d.is_dir() => {
-                        if let Ok(mut w) = self.parts.shared_cwd.write() {
-                            *w = d.clone();
-                        }
+                        // `/cd` = a NEW SESSION in the new project: re-prepare the engine
+                        // rooted at the new dir so persona/context/instructions/MCP/skills
+                        // all rebind. An in-place `shared_cwd` write would only move the
+                        // tools' cwd, leaving the frozen session context pointing at the old
+                        // project. `respawn(Fresh)` re-runs `prepare` against the new
+                        // `working_dir` and starts a fresh conversation there.
+                        self.coding_cfg.working_dir = d.clone();
                         self.emit(CoreEv::WorkingDirChanged(d));
+                        self.respawn(SessionMode::Fresh).await;
                     }
                     _ => self.emit(CoreEv::Warning(format!("no such directory: {dir}"))),
                 }
@@ -478,7 +483,14 @@ impl Bridge {
                 self.pending_sync = true;
                 let _ = self.handle.commands.send(KCmd::Snapshot);
             }
-            CoreCmd::ReloadHooks => { /* plugin hooks are a legacy-engine feature */ }
+            CoreCmd::ReloadHooks => {
+                // "Reload everything except the provider" — re-prepare so the engine picks
+                // up mid-session changes to plugin skills / hooks / MCP servers (all bound
+                // at prepare time). Resume keeps the conversation + cwd; only the mounted
+                // capabilities rebind. Drives `/plugin install`, `/mcp reload` (the driver
+                // sends ReloadHooks after rebuilding its own registry), and plugin hooks.
+                self.respawn(SessionMode::Resume(self.bridge_session.clone())).await;
+            }
             CoreCmd::UndoToPrompt { nth } => {
                 // Need the current conversation to truncate against — fetch it; the
                 // Snapshot reply runs `do_undo`.

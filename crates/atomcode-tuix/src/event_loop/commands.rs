@@ -1586,6 +1586,12 @@ pub(super) fn execute_slash_command(
                 ctx.mcp_registry = Some(std::sync::Arc::new(registry));
                 ctx.mcp_connect_rx = Some(rx);
 
+                // The driver registry above feeds the palette; the ENGINE binds its own MCP
+                // at prepare time. Ask it to re-prepare so the reloaded servers reach the
+                // model too. (Legacy engine: a no-op hook reload; engine v2: a Resume
+                // respawn that re-mounts MCP/skills/hooks.)
+                ctx.agent.cmd_tx.send(AgentCommand::ReloadHooks).ok();
+
                 renderer.render(UiLine::CommandOutput(
                     t(Msg::McpClearedReconnecting { removed }).into_owned(),
                 ));
