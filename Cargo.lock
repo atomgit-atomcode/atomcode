@@ -295,6 +295,7 @@ dependencies = [
  "atomcode-kernel",
  "atomcode-telemetry",
  "dirs 6.0.0",
+ "futures",
  "serde_json",
  "tempfile",
  "tokio",

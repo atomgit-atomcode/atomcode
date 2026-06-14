@@ -535,7 +535,7 @@ pub struct CompactReport {
 }
 
 /// Why a compaction is being attempted.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CompactTrigger {
     /// Context-pressure driven: `utilization` of the window has been crossed.
     Auto { utilization: f32 },

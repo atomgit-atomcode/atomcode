@@ -130,6 +130,10 @@ pub enum AgentEvent {
     /// Emitted on BOTH the auto task-boundary trigger and the manual `Compact`
     /// command. Serializable for web/daemon drivers.
     Compacted {
+        /// WHY this compaction ran — `Auto` (task-boundary pressure), `Manual` (`/compact`),
+        /// or `Overflow { attempt }` (hard context-overflow recovery). Lets a telemetry sink
+        /// distinguish normal-path compaction from emergency overflow recovery.
+        trigger: crate::message::CompactTrigger,
         epoch: u64,
         removed: usize,
         bytes_before: usize,

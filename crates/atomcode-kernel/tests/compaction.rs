@@ -74,7 +74,7 @@ fn compacted_events(events: &[AgentEvent]) -> Vec<(u64, usize, usize, usize, boo
     events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::Compacted { epoch, removed, bytes_before, bytes_after, committed } => {
+            AgentEvent::Compacted { epoch, removed, bytes_before, bytes_after, committed, .. } => {
                 Some((*epoch, *removed, *bytes_before, *bytes_after, *committed))
             }
             _ => None,

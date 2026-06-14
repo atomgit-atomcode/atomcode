@@ -385,6 +385,7 @@ impl RunningAgent {
     /// call — so the strategy may await without holding a borrow across the mutable
     /// apply.
     async fn run_compaction(&self, convo: &mut Conversation, trigger: CompactTrigger) {
+        let trigger_for_event = trigger.clone(); // `trigger` is moved into the view below
         let floor = convo.sacred_floor();
         // Pull the small pressure facts from the most recent assistant meta (default
         // 0 if none recorded yet).
@@ -411,6 +412,7 @@ impl RunningAgent {
         };
         let report = convo.apply_plan(plan, floor);
         self.rt.emit(AgentEvent::Compacted {
+            trigger: trigger_for_event,
             epoch: report.epoch_after,
             removed: report.removed,
             bytes_before: report.bytes_before,
