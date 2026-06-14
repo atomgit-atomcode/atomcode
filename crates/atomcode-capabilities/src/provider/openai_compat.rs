@@ -249,7 +249,9 @@ fn format_messages(messages: &[Message], policy: ReasoningPolicy) -> Vec<Value> 
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m.role {
-            Role::System => out.push(json!({ "role": "system", "content": m.text })),
+            // Coalesce consecutive system messages into ONE wire entry — many
+            // OpenAI-compatible models accept only a single system message.
+            Role::System => super::push_system_coalesced(&mut out, &m.text),
             Role::User => {
                 if m.images.is_empty() {
                     // Text-only: `content` stays a STRING — byte-identical to the prior
@@ -768,6 +770,26 @@ mod tests {
         assert_eq!(out[2]["content"], "ans");
         assert!(out[2].get("reasoning_content").is_none());
         assert_eq!(out[3], json!({"role":"tool","tool_call_id":"call_1","content":"result text"}));
+    }
+
+    #[test]
+    fn coalesces_consecutive_system_messages_into_one() {
+        // The kernel's neutral history can carry persona + memory.md as TWO leading
+        // System messages; many OpenAI-compatible models / chat templates accept only a
+        // SINGLE system message (extra ones error or silently honor just the first,
+        // dropping memory). They must merge into ONE system wire entry (blank-line
+        // joined), never two.
+        let msgs = vec![
+            Message::system("persona"),
+            Message::system("MEMORY\n- fact"),
+            Message::user("hi"),
+        ];
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude);
+        let systems = out.iter().filter(|v| v["role"] == "system").count();
+        assert_eq!(systems, 1, "consecutive system messages must coalesce to one: {out:?}");
+        assert_eq!(out[0], json!({"role":"system","content":"persona\n\nMEMORY\n- fact"}));
+        assert_eq!(out[1], json!({"role":"user","content":"hi"}));
+        assert_eq!(out.len(), 2, "exactly one system + one user");
     }
 
     #[test]

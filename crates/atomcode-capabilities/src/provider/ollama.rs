@@ -212,7 +212,9 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m.role {
-            Role::System => out.push(json!({ "role": "system", "content": m.text })),
+            // Coalesce consecutive system messages into ONE wire entry — many chat
+            // templates accept only a single system message.
+            Role::System => super::push_system_coalesced(&mut out, &m.text),
             Role::User => {
                 let mut obj = Map::new();
                 obj.insert("role".into(), json!("user"));
@@ -476,6 +478,21 @@ mod tests {
         assert_eq!(out[2], json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"read","arguments":{"p":"a"}}}]}));
         // tool result → role tool (no tool_call_id on the wire; matched by order).
         assert_eq!(out[3], json!({"role":"tool","content":"body"}));
+    }
+
+    #[test]
+    fn coalesces_consecutive_system_messages_into_one() {
+        // persona + memory.md as two leading System messages must merge into ONE wire
+        // system entry — many chat templates accept only a single system message.
+        let msgs = vec![
+            Message::system("persona"),
+            Message::system("MEMORY\n- fact"),
+            Message::user("hi"),
+        ];
+        let out = format_messages(&msgs);
+        assert_eq!(out.iter().filter(|v| v["role"] == "system").count(), 1, "{out:?}");
+        assert_eq!(out[0], json!({"role":"system","content":"persona\n\nMEMORY\n- fact"}));
+        assert_eq!(out[1], json!({"role":"user","content":"hi"}));
     }
 
     #[test]
