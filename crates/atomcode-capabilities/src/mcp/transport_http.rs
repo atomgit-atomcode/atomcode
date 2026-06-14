@@ -32,6 +32,10 @@ pub struct HttpClient {
     status: Arc<Mutex<ServerStatus>>,
     next_id: AtomicU64,
     client: reqwest::Client,
+    /// Streamable-HTTP session id. Stateful servers (e.g. Figma Dev Mode) return
+    /// `Mcp-Session-Id` on the `initialize` response and REJECT later requests that
+    /// don't echo it; we capture it from every response and replay it on every request.
+    session_id: Arc<Mutex<Option<String>>>,
 }
 
 impl HttpClient {
@@ -59,6 +63,22 @@ impl HttpClient {
             status: Arc::new(Mutex::new(ServerStatus::Disconnected)),
             next_id: AtomicU64::new(1),
             client,
+            session_id: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Current Streamable-HTTP session id, if the server handed one out.
+    async fn session_id(&self) -> Option<String> {
+        self.session_id.lock().await.clone()
+    }
+
+    /// Capture the `Mcp-Session-Id` response header (case-insensitive) so it can be
+    /// echoed on later requests. A missing or empty value leaves the prior id intact.
+    async fn capture_session_id(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(value) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+            if !value.is_empty() {
+                *self.session_id.lock().await = Some(value.to_string());
+            }
         }
     }
 
@@ -114,6 +134,15 @@ impl HttpClient {
             }
         }
 
+        // Echo the captured Streamable-HTTP session id (unless the user pinned one) so a
+        // stateful server accepts this request as part of the established session.
+        let user_has_session = self.headers.keys().any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+        if !user_has_session {
+            if let Some(sid) = self.session_id().await {
+                req = req.header("Mcp-Session-Id", sid);
+            }
+        }
+
         let timeout_duration = Duration::from_millis(self.timeout_ms);
         let response = timeout(timeout_duration, req.send())
             .await
@@ -124,6 +153,9 @@ impl HttpClient {
                 )
             })?
             .with_context(|| format!("HTTP request to MCP server {} failed", self.server_name))?;
+
+        // Capture the session id the server may have handed out (e.g. on initialize).
+        self.capture_session_id(response.headers()).await;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -239,10 +271,66 @@ impl HttpClient {
             }
         }
 
+        let user_has_session = self.headers.keys().any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+        if !user_has_session {
+            if let Some(sid) = self.session_id().await {
+                req = req.header("Mcp-Session-Id", sid);
+            }
+        }
+
         // Fire and forget — ignore response
         let _ = req.send().await;
         Ok(())
     }
+}
+
+impl Drop for HttpClient {
+    /// Best-effort Streamable-HTTP session teardown. When a stateful server handed us a
+    /// `Mcp-Session-Id`, the MCP spec says the client SHOULD send an HTTP `DELETE` carrying
+    /// that id so the server releases the session instead of leaking it until its own
+    /// timeout. Fire-and-forget: detach onto the current runtime and ignore the outcome.
+    fn drop(&mut self) {
+        // Only meaningful once a session was captured (stateless / STDIO never set one).
+        let Ok(guard) = self.session_id.try_lock() else {
+            return;
+        };
+        let Some(session) = guard.clone() else {
+            return;
+        };
+        drop(guard);
+        // The DELETE is async; it needs a Tokio runtime. If dropped outside one (a
+        // non-async shutdown path), skip — session cleanup is only advisory.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let headers = self.headers.clone();
+        handle.spawn(async move {
+            delete_http_session(client, url, headers, session).await;
+        });
+    }
+}
+
+/// Send the MCP session-termination `DELETE`. Mirrors `send_request`'s header handling:
+/// user-supplied headers (incl. a pinned `Mcp-Session-Id` or auth) are applied, and the
+/// captured session id is added only when the user didn't already provide one. Best-effort
+/// — errors are intentionally ignored.
+async fn delete_http_session(
+    client: reqwest::Client,
+    url: String,
+    headers: BTreeMap<String, String>,
+    session: String,
+) {
+    let user_has_session = headers.keys().any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+    let mut req = client.delete(&url);
+    for (key, value) in &headers {
+        req = req.header(key, value);
+    }
+    if !user_has_session {
+        req = req.header("Mcp-Session-Id", session);
+    }
+    let _ = req.send().await;
 }
 
 #[async_trait]
@@ -465,5 +553,36 @@ mod sse_tests {
                     data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}\n\n";
         let resp = parse_sse_jsonrpc(body, 5).expect("parse");
         assert_eq!(resp.id, 5);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use reqwest::header::HeaderMap;
+
+    fn client() -> HttpClient {
+        HttpClient::new("t".into(), "http://localhost/mcp".into(), BTreeMap::new(), None, Some(1000))
+    }
+
+    #[tokio::test]
+    async fn captures_session_id_from_response_headers() {
+        let c = client();
+        assert!(c.session_id().await.is_none(), "no session before any response");
+        let mut h = HeaderMap::new();
+        h.insert("mcp-session-id", "abc-123".parse().unwrap());
+        c.capture_session_id(&h).await;
+        assert_eq!(c.session_id().await.as_deref(), Some("abc-123"), "captured + replayable");
+    }
+
+    #[tokio::test]
+    async fn ignores_missing_or_empty_session_id() {
+        let c = client();
+        c.capture_session_id(&HeaderMap::new()).await; // header absent
+        assert!(c.session_id().await.is_none());
+        let mut h = HeaderMap::new();
+        h.insert("mcp-session-id", "".parse().unwrap());
+        c.capture_session_id(&h).await; // header present but empty
+        assert!(c.session_id().await.is_none(), "empty value must not overwrite");
     }
 }
