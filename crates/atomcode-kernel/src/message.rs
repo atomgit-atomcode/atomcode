@@ -534,13 +534,18 @@ pub struct CompactReport {
     pub committed: bool,
 }
 
-/// Why a compaction is being attempted. (Overflow is deferred — no caller yet.)
+/// Why a compaction is being attempted.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CompactTrigger {
     /// Context-pressure driven: `utilization` of the window has been crossed.
     Auto { utilization: f32 },
     /// User-requested (e.g. `/compact`), optionally focused on a topic.
     Manual { focus: Option<String> },
+    /// Hard context-window OVERFLOW recovery (OFF the normal path): the provider rejected
+    /// the request as too long. `attempt` (0-based) drives the strategy's escalation
+    /// ladder; the kernel increments it per retry. NEVER fired by pressure — only by a
+    /// typed overflow error from `chat_stream`.
+    Overflow { attempt: u8 },
 }
 
 /// READ-ONLY view handed to a [`CompactionStrategy`]: a borrow of the current
