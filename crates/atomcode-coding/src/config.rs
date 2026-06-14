@@ -19,7 +19,10 @@ pub struct CodingAgentConfig {
     pub working_dir: PathBuf,
     /// Model context window in tokens (forwarded to the provider). Default 128k.
     pub context_window: u32,
-    /// Liveness: max wait for the next stream event (first-token + inter-token). Default 120s.
+    /// Liveness: max byte-idle wait for the next stream event (first-token + inter-token).
+    /// Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`. Thinking models go quiet
+    /// for a long stretch after a large (~200K) prompt before the first reasoning byte; the
+    /// old 120s cut them off mid-think and surfaced as a spurious "stream timeout".
     pub stream_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny. Default 300s.
     pub request_timeout: Duration,
@@ -51,6 +54,17 @@ pub struct CodingAgentConfig {
     pub compact_threshold: f32,
 }
 
+/// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
+/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
+fn default_stream_timeout() -> Duration {
+    std::env::var("ATOMCODE_STREAM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(300))
+}
+
 impl CodingAgentConfig {
     /// Construct with the required fields and sane defaults for the rest.
     pub fn new(
@@ -65,7 +79,7 @@ impl CodingAgentConfig {
             model: model.into(),
             working_dir: working_dir.into(),
             context_window: 128_000,
-            stream_timeout: Duration::from_secs(120),
+            stream_timeout: default_stream_timeout(),
             request_timeout: Duration::from_secs(300),
             max_continuations: 50,
             chat_options: Default::default(),
