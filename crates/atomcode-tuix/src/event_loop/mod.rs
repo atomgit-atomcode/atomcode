@@ -969,6 +969,20 @@ impl Buffer {
         self.menu_suppressed = true;
     }
 
+    /// Restore a cancelled prompt for edit-and-resend, PRESERVING any draft the
+    /// user typed while the turn was running. When the buffer already holds a
+    /// non-blank draft, the cancelled prompt is prepended on its own line
+    /// instead of clobbering it; an empty/whitespace buffer just gets the
+    /// prompt (same as `set_restored_text`). Cursor lands at the end.
+    pub fn restore_cancelled_text(&mut self, prompt: String) {
+        let merged = if self.text.trim().is_empty() {
+            prompt
+        } else {
+            format!("{}\n{}", prompt, self.text)
+        };
+        self.set_restored_text(merged);
+    }
+
     /// True while the user is scrolling input history (Up/Down on an
     /// empty / non-empty buffer). The slash-command menu suppresses
     /// itself in this state so that recalling a previous `/session foo`
@@ -1504,6 +1518,39 @@ mod buffer_tests {
         assert_eq!(b.text, "/provider");
         assert_eq!(b.cursor, "/provider".len(), "cursor at end for edit-and-resend");
         assert!(b.menu_suppressed(), "restored /command must not pop the menu");
+    }
+
+    #[test]
+    fn restore_cancelled_text_prepends_before_existing_draft() {
+        let mut b = Buffer::new();
+        // User started typing a new message while the previous turn ran.
+        b.text = "my new draft".to_string();
+        b.cursor = b.text.len();
+        // Then cancelled the previous request → its prompt comes back, but
+        // the draft must be preserved (prompt prepended on its own line).
+        b.restore_cancelled_text("original prompt".to_string());
+        assert_eq!(b.text, "original prompt\nmy new draft");
+        assert_eq!(b.cursor, b.text.len(), "cursor at end for edit-and-resend");
+        assert!(b.menu_suppressed(), "restored /command must not pop the menu");
+    }
+
+    #[test]
+    fn restore_cancelled_text_replaces_when_draft_empty() {
+        let mut b = Buffer::new();
+        // No draft typed → behaves exactly like the old restore (just the prompt).
+        b.restore_cancelled_text("original prompt".to_string());
+        assert_eq!(b.text, "original prompt");
+        assert_eq!(b.cursor, "original prompt".len());
+    }
+
+    #[test]
+    fn restore_cancelled_text_ignores_whitespace_only_draft() {
+        let mut b = Buffer::new();
+        b.text = "   \n".to_string();
+        b.cursor = b.text.len();
+        // A draft that's only whitespace isn't worth preserving — treat as empty.
+        b.restore_cancelled_text("original prompt".to_string());
+        assert_eq!(b.text, "original prompt");
     }
 
     #[test]
@@ -5790,7 +5837,9 @@ fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, 
     if let Some(msg) = app.state.last_submitted_message.take() {
         // Cursor at the end (edit-and-resend), but suppress the slash menu
         // for one frame so a restored `/command` doesn't re-pop the list.
-        app.buf.set_restored_text(msg);
+        // Preserve any draft the user typed while the turn was running —
+        // prepend the cancelled prompt instead of clobbering the draft.
+        app.buf.restore_cancelled_text(msg);
         app.menu.selected = 0;
         // Force an immediate StreamingBox repaint so the restored
         // text shows in the input box on this frame, not the next
