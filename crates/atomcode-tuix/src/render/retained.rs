@@ -44,7 +44,7 @@ pub const MAX_SCROLLBACK_ROWS: usize = 5000;
 /// internally. Bounds the footer so a long paste / typed text can't grow it
 /// past the screen height (the overflow bug). This caps DISPLAY only — the
 /// full text always lives in `input_buf` and is sent verbatim on submit.
-const MAX_INPUT_ROWS: usize = 10;
+const MAX_INPUT_ROWS: usize = 6;
 
 /// Render context usage as `12.3k/131k tok` when both used and window
 /// are known, or `12.3k tok` when only the used count is known (provider
