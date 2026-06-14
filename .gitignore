@@ -89,6 +89,7 @@ docs/c1-assembly-spec.md
 docs/mcp-capability-spec.md
 docs/overflow-compaction-spec.md
 docs/session-persistence-recall-spec.md
+docs/system-prompt-parity-spec.md
 docs/v2-port-backlog.md
 
 # Superpowers plugin state
