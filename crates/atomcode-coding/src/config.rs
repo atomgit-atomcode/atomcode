@@ -45,6 +45,19 @@ pub struct CodingAgentConfig {
     ///
     /// [`ReasoningPolicy::derive`]: atomcode_capabilities::provider::ReasoningPolicy::derive
     pub reasoning_history: Option<String>,
+    /// Provider adapter kind: `"openai"` (default, OpenAI-compatible), `"claude"`
+    /// (Anthropic Messages API), or `"ollama"`. Selects which v2 provider adapter the
+    /// builder constructs — mirrors v1's `provider_type` dispatch. Empty/unknown ⇒ openai.
+    pub provider_type: String,
+    /// Extended-thinking toggle for the Anthropic adapter (`/think on|off`). `Some(true)`
+    /// ⇒ `thinking: {type:"adaptive"}` on the wire. `None`/`Some(false)` ⇒ off. (v2 uses
+    /// adaptive thinking, so v1's `thinking_budget` has no direct mapping and is dropped.)
+    pub thinking_enabled: Option<bool>,
+    /// Kimi-family thinking control for the OpenAI-compatible adapter: `thinking.type`
+    /// (`"enabled"`/`"disabled"`). `None` ⇒ omit.
+    pub thinking_type: Option<String>,
+    /// Kimi K2.6 preserved thinking: `thinking.keep`. `None` ⇒ omit.
+    pub thinking_keep: Option<String>,
     /// Auto-compaction trigger as a fraction of the context window (real utilization
     /// from the provider's reported prompt tokens). At/above this, the task-boundary
     /// trigger runs [`StubCompaction`] to stub old tool results. Default `0.7` (the
@@ -85,6 +98,10 @@ impl CodingAgentConfig {
             chat_options: Default::default(),
             telemetry: None,
             reasoning_history: None,
+            provider_type: "openai".into(),
+            thinking_enabled: None,
+            thinking_type: None,
+            thinking_keep: None,
             compact_threshold: 0.7,
         }
     }

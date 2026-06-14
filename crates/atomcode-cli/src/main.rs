@@ -1751,6 +1751,10 @@ fn bridge_config_from(
         telemetry,
         reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
         reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
+        provider_type: p.map(|p| p.provider_type.clone()).unwrap_or_else(|| "openai".into()),
+        thinking_enabled: p.and_then(|p| p.thinking_enabled),
+        thinking_type: p.and_then(|p| p.thinking_type.clone()),
+        thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
     }
 }
 

@@ -613,6 +613,10 @@ impl KernelTurnExecutor {
             telemetry: Some(self.telemetry.clone()),
             reasoning_history: p.reasoning_history.clone(),
             reasoning_effort: p.reasoning_effort.clone(),
+            provider_type: p.provider_type.clone(),
+            thinking_enabled: p.thinking_enabled,
+            thinking_type: p.thinking_type.clone(),
+            thinking_keep: p.thinking_keep.clone(),
         })
     }
 }
@@ -897,6 +901,10 @@ pub(crate) fn chat_bridge_config(
         telemetry: Some(telemetry),
         reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
         reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
+        provider_type: p.map(|p| p.provider_type.clone()).unwrap_or_else(|| "openai".into()),
+        thinking_enabled: p.and_then(|p| p.thinking_enabled),
+        thinking_type: p.and_then(|p| p.thinking_type.clone()),
+        thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
     }
 }
 

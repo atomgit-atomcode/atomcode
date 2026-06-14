@@ -43,6 +43,16 @@ pub struct BridgeConfig {
     /// legacy engine reads the same per-provider knob, but the bridge previously dropped
     /// it (the `reasoning_history`-style footgun).
     pub reasoning_effort: Option<String>,
+    /// Provider adapter kind (`"openai"` | `"claude"` | `"ollama"`). Selects the v2 adapter
+    /// the engine builds — previously the bridge always built OpenAI-compat, breaking
+    /// Claude-/Ollama-native providers under v2.
+    pub provider_type: String,
+    /// `/think on|off` → Anthropic (adaptive) / Ollama thinking toggle.
+    pub thinking_enabled: Option<bool>,
+    /// Kimi-family `thinking.type` for OpenAI-compatible models.
+    pub thinking_type: Option<String>,
+    /// Kimi K2.6 `thinking.keep`.
+    pub thinking_keep: Option<String>,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -144,6 +154,11 @@ impl Bridge {
         // this the knob was silently dropped at the bridge.
         coding_cfg.chat_options.reasoning_effort =
             atomcode_kernel::provider::ReasoningEffort::from_config(cfg.reasoning_effort.as_deref());
+        // Adapter selection + thinking controls (so Claude-/Ollama-native + /think work in v2).
+        coding_cfg.provider_type = cfg.provider_type.clone();
+        coding_cfg.thinking_enabled = cfg.thinking_enabled;
+        coding_cfg.thinking_type = cfg.thinking_type.clone();
+        coding_cfg.thinking_keep = cfg.thinking_keep.clone();
 
         let opts_template = PrepareOptions {
             session: SessionMode::Fresh,
@@ -398,6 +413,13 @@ impl Bridge {
                     // once at construction; effort is the knob users flip mid-session.)
                     self.coding_cfg.chat_options.reasoning_effort =
                         atomcode_kernel::provider::ReasoningEffort::from_config(p.reasoning_effort.as_deref());
+                    // A /model swap can change the adapter kind + per-provider knobs entirely
+                    // — refresh them all so the rebuilt provider matches the new config.
+                    self.coding_cfg.provider_type = p.provider_type.clone();
+                    self.coding_cfg.reasoning_history = p.reasoning_history.clone();
+                    self.coding_cfg.thinking_enabled = p.thinking_enabled;
+                    self.coding_cfg.thinking_type = p.thinking_type.clone();
+                    self.coding_cfg.thinking_keep = p.thinking_keep.clone();
                     match build_provider(&self.coding_cfg) {
                         Ok(provider) => {
                             let _ = self.handle.commands.send(KCmd::Shutdown);
@@ -1041,33 +1063,66 @@ fn compute_undo(
 fn build_provider(
     cfg: &CodingAgentConfig,
 ) -> anyhow::Result<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
-    use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider, ReasoningPolicy};
+    use atomcode_capabilities::provider::{
+        AnthropicConfig, AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig,
+        OpenAiCompatProvider, ReasoningPolicy,
+    };
     use atomcode_core::coding_plan::crypto;
-    let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
-    pc.context_window = cfg.context_window;
-    // Honor the provider's `reasoning_history` override; unset ⇒ leave `None` so the
-    // adapter auto-detects by model. A typo fails fast (parity with the legacy engine).
-    pc.reasoning_policy = ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
-        .map_err(|e| anyhow::anyhow!(e))?;
 
-    // AtomGit gateways need per-request auth instead of a static api_key, handled by
-    // the closed `atomcode-codingplan-crypto` (gated by core's `codingplan-crypto`
-    // feature). Open-source builds have none → fail fast with an actionable message.
-    if crypto::is_atomgit_gateway(&cfg.base_url) {
-        if !crypto::signer_available() {
-            anyhow::bail!(
-                "provider base_url '{}' is an AtomGit gateway this build can't \
-                 authenticate against. Use the official binary, or point the provider \
-                 at a plain OpenAI-compatible endpoint with an api_key.",
-                cfg.base_url
-            );
+    // Dispatch by provider_type — the v2 engine has native adapters for each, and using the
+    // wrong one (e.g. OpenAI-format to the Anthropic API) fails. Mirrors v1 `create_provider`.
+    match cfg.provider_type.as_str() {
+        "claude" | "anthropic" => {
+            let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
+            ac.context_window = cfg.context_window;
+            // `/think on` → adaptive extended thinking. (v2 uses adaptive, so v1's
+            // thinking_budget has no direct mapping — intentionally dropped.)
+            ac.thinking = cfg.thinking_enabled.unwrap_or(false);
+            Ok(Arc::new(
+                AnthropicProvider::new(ac).map_err(|e| anyhow::anyhow!(e.message))?,
+            ))
         }
-        pc.request_signer = Some(crate::sign::atomgit_signer(&cfg.base_url)?);
-    }
+        "ollama" => {
+            let mut oc = OllamaConfig::new(&cfg.base_url, &cfg.model);
+            oc.api_key = cfg.api_key.clone();
+            oc.context_window = cfg.context_window;
+            oc.think = cfg.thinking_enabled.unwrap_or(false);
+            Ok(Arc::new(
+                OllamaProvider::new(oc).map_err(|e| anyhow::anyhow!(e.message))?,
+            ))
+        }
+        // "openai" (default) + any unknown → OpenAI-compatible.
+        _ => {
+            let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
+            pc.context_window = cfg.context_window;
+            // Honor the provider's `reasoning_history` override; unset ⇒ leave `None` so the
+            // adapter auto-detects by model. A typo fails fast (parity with the legacy engine).
+            pc.reasoning_policy = ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            // Kimi-family thinking (`thinking.{type,keep}`); omitted unless configured.
+            pc.thinking_type = cfg.thinking_type.clone();
+            pc.thinking_keep = cfg.thinking_keep.clone();
 
-    Ok(Arc::new(
-        OpenAiCompatProvider::new(pc).map_err(|e| anyhow::anyhow!(e.message))?,
-    ))
+            // AtomGit gateways need per-request auth instead of a static api_key, handled by
+            // the closed `atomcode-codingplan-crypto` (gated by core's `codingplan-crypto`
+            // feature). Open-source builds have none → fail fast with an actionable message.
+            if crypto::is_atomgit_gateway(&cfg.base_url) {
+                if !crypto::signer_available() {
+                    anyhow::bail!(
+                        "provider base_url '{}' is an AtomGit gateway this build can't \
+                         authenticate against. Use the official binary, or point the provider \
+                         at a plain OpenAI-compatible endpoint with an api_key.",
+                        cfg.base_url
+                    );
+                }
+                pc.request_signer = Some(crate::sign::atomgit_signer(&cfg.base_url)?);
+            }
+
+            Ok(Arc::new(
+                OpenAiCompatProvider::new(pc).map_err(|e| anyhow::anyhow!(e.message))?,
+            ))
+        }
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

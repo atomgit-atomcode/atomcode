@@ -45,6 +45,12 @@ pub struct OpenAiCompatConfig {
     pub max_tokens: Option<u32>,
     /// Explicit reasoning round-trip policy; `None` ⇒ derived from the model name.
     pub reasoning_policy: Option<ReasoningPolicy>,
+    /// Kimi-family thinking control: `thinking.type` in the request body
+    /// (`"enabled"`/`"disabled"`). `None` ⇒ omit the whole `thinking` object (safer for
+    /// non-Kimi gateways that 400 on an unknown top-level `thinking`). Mirrors v1.
+    pub thinking_type: Option<String>,
+    /// Kimi K2.6 preserved thinking: `thinking.keep` in the request body.
+    pub thinking_keep: Option<String>,
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
     pub idle_timeout: Duration,
     pub connect_timeout: Duration,
@@ -68,6 +74,8 @@ impl OpenAiCompatConfig {
             context_window: 128_000,
             max_tokens: None,
             reasoning_policy: None,
+            thinking_type: None,
+            thinking_keep: None,
             idle_timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
@@ -380,6 +388,11 @@ fn build_request_body(
             body.insert("reasoning_effort".into(), json!(effort_str(effort)));
         }
     }
+    // Kimi-family `thinking` object — only when configured (omitted otherwise so non-Kimi
+    // gateways don't 400 on an unknown top-level key). Port of v1's `thinking_body_value`.
+    if let Some(thinking) = thinking_body_value(cfg.thinking_type.as_deref(), cfg.thinking_keep.as_deref()) {
+        body.insert("thinking".into(), thinking);
+    }
     if !tools.is_empty() {
         let t: Vec<Value> = tools
             .iter()
@@ -402,6 +415,23 @@ fn build_request_body(
 fn reason_effort_applicable(model: &str) -> bool {
     // Only DeepSeek-V4 takes a top-level `reasoning_effort`; others reject/ignore it.
     model.to_ascii_lowercase().contains("deepseek-v4")
+}
+
+/// Build Kimi's `thinking` request-body object from the two flat config fields. `None`
+/// when both are unset, so the caller omits the whole key. Byte-for-byte port of v1's
+/// `thinking_body_value`.
+fn thinking_body_value(thinking_type: Option<&str>, thinking_keep: Option<&str>) -> Option<Value> {
+    if thinking_type.is_none() && thinking_keep.is_none() {
+        return None;
+    }
+    let mut obj = Map::new();
+    if let Some(t) = thinking_type {
+        obj.insert("type".into(), json!(t));
+    }
+    if let Some(k) = thinking_keep {
+        obj.insert("keep".into(), json!(k));
+    }
+    Some(Value::Object(obj))
 }
 
 fn effort_str(e: ReasoningEffort) -> &'static str {
@@ -947,6 +977,22 @@ mod tests {
         };
         let body = build_request_body("glm-5.1", &[Message::user("hi")], &[], &opts, &cfg, ReasoningPolicy::Exclude);
         assert!(body.get("reasoning_effort").is_none(), "non-v4 omits reasoning_effort");
+    }
+
+    #[test]
+    fn kimi_thinking_object_emitted_when_configured() {
+        let mut cfg = OpenAiCompatConfig::new("k", "https://x", "kimi-k2");
+        cfg.thinking_type = Some("enabled".into());
+        cfg.thinking_keep = Some("all".into());
+        let body = build_request_body("kimi-k2", &[Message::user("hi")], &[], &ChatOptions::default(), &cfg, ReasoningPolicy::Exclude);
+        assert_eq!(body["thinking"], json!({"type":"enabled","keep":"all"}));
+    }
+
+    #[test]
+    fn no_thinking_object_when_unconfigured() {
+        let cfg = OpenAiCompatConfig::new("k", "https://x", "kimi-k2");
+        let body = build_request_body("kimi-k2", &[Message::user("hi")], &[], &ChatOptions::default(), &cfg, ReasoningPolicy::Exclude);
+        assert!(body.get("thinking").is_none(), "omit thinking when unset (non-Kimi-safe)");
     }
 
     #[test]
