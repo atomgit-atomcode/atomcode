@@ -40,6 +40,12 @@ const PAD_COL: usize = 2;
 /// Bounded so memory doesn't grow without limit on long sessions.
 pub const MAX_SCROLLBACK_ROWS: usize = 5000;
 
+/// Hard cap on how many rows the input box may DISPLAY before it scrolls
+/// internally. Bounds the footer so a long paste / typed text can't grow it
+/// past the screen height (the overflow bug). This caps DISPLAY only — the
+/// full text always lives in `input_buf` and is sent verbatim on submit.
+const MAX_INPUT_ROWS: usize = 10;
+
 /// Render context usage as `12.3k/131k tok` when both used and window
 /// are known, or `12.3k tok` when only the used count is known (provider
 /// hasn't reported its window yet, e.g. pre-config or fallback).
@@ -1343,7 +1349,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if lines.is_empty() {
             lines.push(String::new());
         }
-        let middle_rows = lines.len();
 
         // Paginate menu using the kind-specific cap.
         let max_menu = self
@@ -1392,6 +1397,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
+        // Cap the input-box height so a long paste / typed text can't grow the
+        // footer past the screen (overflow). The full text stays in input_buf;
+        // we render a scrolling window that keeps the cursor row visible. The
+        // `[Pasted #N]` folding (insert_paste) already shrinks most big pastes;
+        // this is the backstop for the rest (unfolded single-line pastes,
+        // sub-threshold pastes, typed text).
+        let max_input_rows = Self::max_input_rows(h, attachment_rows, menu_rows, status_rows);
+        let input_view_start = if lines.len() > max_input_rows {
+            cursor_row_in_middle
+                .saturating_sub(max_input_rows.saturating_sub(1))
+                .min(lines.len() - max_input_rows)
+        } else {
+            0
+        };
+        let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
+        let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
         let total_rows = 1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows;
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
@@ -1410,12 +1431,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
             input_rule_width,
             self.status.session_name.as_deref(),
         );
-        let middle_cells: Vec<Vec<Cell>> = lines
+        let middle_cells: Vec<Vec<Cell>> = lines[input_view_start..input_view_start + middle_rows]
             .iter()
             .enumerate()
-            .map(|(i, line)| self.build_middle_row(line, i == 0))
+            .map(|(i, line)| self.build_middle_row(line, input_view_start + i == 0))
             .collect();
-        let bot_rule = self.build_rule_row(input_rule_width);
+        // When the input is scrolled (windowed), show "+N more lines" on the
+        // bottom rule so it's visible that content is hidden, not lost.
+        let hidden_rows = lines.len() - middle_rows;
+        let bot_rule = self.build_input_bot_rule(input_rule_width, hidden_rows);
         let status_clone = self.status.clone();
         let status_cells = if has_status {
             Some(self.build_status_row(&status_clone, rule_width))
@@ -1539,10 +1563,46 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
         let attachment_rows = self.input_attachments.len();
+        // Cap the input height (mirrors paint_footer) so a long paste / typed
+        // input can't make the footer exceed the screen.
+        let capped_middle =
+            middle_rows.min(Self::max_input_rows(h, attachment_rows, menu_rows, status_rows));
         // 1 top rule + middle + 1 bot rule + attachments + menu + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows
+        1 + capped_middle + 1 + attachment_rows + menu_rows + status_rows
+    }
+
+    /// Max rows the input box may DISPLAY before scrolling internally. Bounds
+    /// the footer to leave the rule rows, any attachment/menu/status chrome,
+    /// and at least one body row — so the footer never exceeds the screen no
+    /// matter how long the input is. Also capped to `MAX_INPUT_ROWS` so a huge
+    /// paste can't take the whole screen on tall terminals.
+    fn max_input_rows(h: usize, attachment_rows: usize, menu_rows: usize, status_rows: usize) -> usize {
+        // top rule + bot rule + chrome, plus one reserved body row.
+        let reserved = 2 + attachment_rows + menu_rows + status_rows + 1;
+        h.saturating_sub(reserved).min(MAX_INPUT_ROWS).max(1)
+    }
+
+    /// Bottom rule of the input box. When `hidden_rows > 0` (the input is
+    /// scrolled), embed a muted `+N more lines` hint at the right so the user
+    /// sees the content is hidden (still in `input_buf`), not lost.
+    fn build_input_bot_rule(&self, rule_width: usize, hidden_rows: usize) -> Vec<Cell> {
+        let mut row = self.build_rule_row(rule_width);
+        if hidden_rows == 0 {
+            return row;
+        }
+        let hint = format!(" +{hidden_rows} more lines ");
+        let hint_chars: Vec<char> = hint.chars().collect();
+        if hint_chars.len() >= rule_width {
+            return row;
+        }
+        let muted = self.style_for(Role::Muted);
+        let start = rule_width - hint_chars.len();
+        for (i, ch) in hint_chars.into_iter().enumerate() {
+            row[start + i] = Cell { ch, style: muted.clone(), width: 1 };
+        }
+        row
     }
 
     /// Single-entry-point for painting a full frame. Append-only
@@ -5216,6 +5276,32 @@ mod tests {
             !r.take_pending_scroll_flush(),
             "InputPrompt never scrolls the body, so it must not trigger the eager scroll-flush"
         );
+    }
+
+    /// Overflow fix: a long paste / typed text used to grow the input box (and
+    /// the footer) past the screen height. The footer must now stay within the
+    /// screen, with the input box capped to a scrolling window (full text still
+    /// lives in input_buf — display-only cap).
+    #[test]
+    fn long_input_does_not_overflow_footer() {
+        let (mut r, _c) = new_counting(80, 24);
+        let big = (0..60).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        r.input_buf = big.clone();
+        r.input_cursor_byte = big.len();
+        let footer = r.current_footer_rows();
+        assert!(
+            footer < 24,
+            "footer ({footer}) must not exceed screen height for a 60-line input"
+        );
+        // top rule + <=MAX_INPUT_ROWS input rows + bot rule (no menu/status here).
+        assert!(
+            footer <= 1 + MAX_INPUT_ROWS + 1,
+            "input box must be capped near MAX_INPUT_ROWS, got footer={footer}"
+        );
+        // A short input is unaffected.
+        r.input_buf = "hi".into();
+        r.input_cursor_byte = 2;
+        assert!(r.current_footer_rows() < footer, "short input should be smaller");
     }
 
     /// Regression: after a `/skills` menu containing CJK skill names/descs
