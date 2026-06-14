@@ -1,11 +1,15 @@
 //! The coding persona (system prompt). Ported + trimmed from production
 //! `atomcode-core/src/config/prompt_sections.rs` (`UNIFIED_PROMPT`).
 //!
-//! Differences from production (deliberate for the L2 MVP):
+//! Differences from production (deliberate):
 //! - The model name is a parameter (production injects it separately in `prompt.rs`).
-//! - The `## CONTEXT:` section (which promises automatic history compaction) is DROPPED:
-//!   the MVP has no `CompactionStrategy`, so claiming "your conversation is not limited
-//!   by the context window" would be a lie. Re-add it when compaction lands (followon).
+//! - Production's `## CONTEXT:` section promised "your conversation is not limited by the
+//!   context window" — we still DROP that claim. Compaction HAS landed
+//!   ([`StubCompaction`](atomcode_capabilities::compaction::StubCompaction): old tool
+//!   results are stubbed at the task boundary), but it is stub-only — no summarize /
+//!   emergency tier yet — so the unconditional "unlimited context" promise would still
+//!   overstate it. The model-facing implication is already covered honestly under
+//!   `## TOOLS:` ("Tool results may be truncated or condensed … re-read … for detail").
 
 /// Build the coding system prompt for `model`. The identity line carries the model name
 /// so the agent self-identifies correctly; the rest is the language-agnostic coding

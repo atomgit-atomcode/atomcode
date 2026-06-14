@@ -42,6 +42,13 @@ pub struct CodingAgentConfig {
     ///
     /// [`ReasoningPolicy::derive`]: atomcode_capabilities::provider::ReasoningPolicy::derive
     pub reasoning_history: Option<String>,
+    /// Auto-compaction trigger as a fraction of the context window (real utilization
+    /// from the provider's reported prompt tokens). At/above this, the task-boundary
+    /// trigger runs [`StubCompaction`] to stub old tool results. Default `0.7` (the
+    /// normal-path threshold ported from core). Set `>= 1.0` to effectively disable.
+    ///
+    /// [`StubCompaction`]: atomcode_capabilities::compaction::StubCompaction
+    pub compact_threshold: f32,
 }
 
 impl CodingAgentConfig {
@@ -64,6 +71,7 @@ impl CodingAgentConfig {
             chat_options: Default::default(),
             telemetry: None,
             reasoning_history: None,
+            compact_threshold: 0.7,
         }
     }
 }

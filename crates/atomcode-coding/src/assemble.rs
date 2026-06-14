@@ -45,6 +45,9 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
         .middleware(Arc::new(ApprovalMiddleware::in_memory()))
         .hook(Arc::new(VerifyCadenceHook::new()))
         .working_dir(cfg.working_dir.clone())
+        // Cache-friendly history compaction (stub old tool results at the task boundary).
+        .compaction(Arc::new(atomcode_capabilities::compaction::StubCompaction::default()))
+        .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout)
         .max_continuations(cfg.max_continuations)

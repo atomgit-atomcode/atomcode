@@ -306,6 +306,10 @@ pub fn assemble(
         // LIVE cwd handle (not the immutable pin): /cd mutates parts.shared_cwd.
         .working_dir_shared(parts.shared_cwd.clone())
         .chat_options(cfg.chat_options.clone())
+        // Cache-friendly history compaction: stub old tool results at the task boundary
+        // once real utilization crosses the threshold. Kept full below it (pure append).
+        .compaction(Arc::new(atomcode_capabilities::compaction::StubCompaction::default()))
+        .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout)
         .max_continuations(cfg.max_continuations);

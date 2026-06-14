@@ -23,6 +23,11 @@
 /// is always available regardless of which capability features are enabled.
 pub mod hooks;
 
+/// Cache-friendly history compaction strategy ([`compaction::StubCompaction`]) — a
+/// [`atomcode_kernel::message::CompactionStrategy`] that stubs old tool results in place.
+/// Kernel-only deps, so it is always available regardless of capability features.
+pub mod compaction;
+
 /// Shared `$ATOMCODE_HOME` path resolution for the persisting capabilities — one
 /// home for the rule (and for documenting its single known `sudo` divergence from
 /// production). Internal; compiled only when a feature that persists needs it.
