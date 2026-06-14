@@ -32,15 +32,31 @@ impl SkillRegistry {
 
     /// Load one directory, optionally namespacing the skill names (`{ns}:{name}`).
     pub fn load_dir(&mut self, dir: &Path, namespace: Option<&str>) {
+        self.scan_skill_dir(dir, namespace, 0);
+    }
+
+    /// Scan `dir` for skills, recursing into grouping subdirectories. A subdir holding a
+    /// `SKILL.md` is a skill (NOT descended into — its own files are skill resources); a
+    /// subdir without one is a grouping directory whose nested skills are discovered
+    /// recursively, so `skills/GROUP/SUB/SKILL.md` is still found. Flat `*.md`
+    /// slash-commands are TOP-LEVEL only (depth 0) — a skill's own `*.md` are resources,
+    /// not separate commands. `depth` is bounded to guard against symlink cycles.
+    fn scan_skill_dir(&mut self, dir: &Path, namespace: Option<&str>, depth: usize) {
+        const MAX_DEPTH: usize = 8;
+        if depth > MAX_DEPTH {
+            return;
+        }
         let Ok(rd) = std::fs::read_dir(dir) else {
             return;
         };
         let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
         entries.sort();
         for p in entries {
-            if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Ok(s) = parse_skill_file(&p, namespace) {
-                    self.skills.insert(s.name.clone(), Arc::new(s));
+            if p.is_file() {
+                if depth == 0 && p.extension().and_then(|e| e.to_str()) == Some("md") {
+                    if let Ok(s) = parse_skill_file(&p, namespace) {
+                        self.skills.insert(s.name.clone(), Arc::new(s));
+                    }
                 }
             } else if p.is_dir() {
                 let skill_md = p.join("SKILL.md");
@@ -48,6 +64,8 @@ impl SkillRegistry {
                     if let Ok(s) = parse_skill_dir(&p, &skill_md, namespace) {
                         self.skills.insert(s.name.clone(), Arc::new(s));
                     }
+                } else {
+                    self.scan_skill_dir(&p, namespace, depth + 1);
                 }
             }
         }
@@ -128,5 +146,27 @@ mod tests {
     fn missing_dir_is_skipped() {
         let reg = SkillRegistry::load(&[PathBuf::from("/no/such/skills/dir")]);
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn discovers_nested_skills_under_grouping_dirs() {
+        let d = tempfile::tempdir().unwrap();
+        // A grouping dir (no SKILL.md of its own) holding a nested skill two levels deep.
+        std::fs::create_dir_all(d.path().join("GROUP/sub")).unwrap();
+        std::fs::write(
+            d.path().join("GROUP/sub/SKILL.md"),
+            "---\ndescription: nested skill\n---\nDo the nested thing.\n",
+        )
+        .unwrap();
+        // A skill dir's OWN nested *.md must NOT be mis-loaded as a separate skill.
+        std::fs::create_dir_all(d.path().join("top")).unwrap();
+        std::fs::write(d.path().join("top/SKILL.md"), "---\ndescription: top\n---\nTop.\n").unwrap();
+        std::fs::write(d.path().join("top/resource.md"), "internal resource, not a command\n").unwrap();
+
+        let reg = SkillRegistry::load(&[d.path().to_path_buf()]);
+        assert!(reg.get("sub").is_some(), "nested GROUP/sub/SKILL.md must be discovered");
+        assert_eq!(reg.get("sub").unwrap().description, "nested skill");
+        assert!(reg.get("top").is_some(), "top-level skill dir loaded");
+        assert!(reg.get("resource").is_none(), "a skill's own resource .md is not a command");
     }
 }
