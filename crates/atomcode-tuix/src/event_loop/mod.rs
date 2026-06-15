@@ -2659,6 +2659,26 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn plan_mode_block_reason_detects_gate_blocks() {
+        // A PlanModeGate block → calm hint (reason without the `blocked: ` prefix).
+        assert_eq!(
+            plan_mode_block_reason(
+                "blocked: plan mode is active — `write_file` would modify the workspace",
+                false
+            ),
+            Some("plan mode is active — `write_file` would modify the workspace")
+        );
+        // Successes, non-block failures, and OTHER middleware blocks (e.g. approval
+        // deny) are NOT plan-mode hints → normal ✗ result render.
+        assert_eq!(plan_mode_block_reason("ok", true), None);
+        assert_eq!(plan_mode_block_reason("Error: file not found", false), None);
+        assert_eq!(
+            plan_mode_block_reason("blocked: denied by approval policy: bash", false),
+            None
+        );
+    }
+
+    #[test]
     fn summarise_multi_line_adds_line_count() {
         let out = summarise("first line\nsecond line\nthird line", true);
         assert!(out.starts_with("first line"));
@@ -6635,8 +6655,15 @@ fn handle_agent_event(
                 });
             }
             if !suppress_body_echo {
-                let summary = summarise(&output, success);
-                renderer.render(UiLine::ToolResult { success, summary });
+                // A plan-mode interception isn't a failure — render it as a calm `○`
+                // hint (with the gate's reason) instead of a ✗ error, so the user
+                // sees WHY the tool didn't run and that they should review the plan.
+                if let Some(reason) = plan_mode_block_reason(&output, success) {
+                    renderer.render(UiLine::CommandOutput(format!("  ○ {reason}\n")));
+                } else {
+                    let summary = summarise(&output, success);
+                    renderer.render(UiLine::ToolResult { success, summary });
+                }
             }
             // Collect diff lines into a single batch — N individual
             // DiffLine renders each trigger a full footer redraw and
@@ -8280,6 +8307,22 @@ pub(crate) fn summarise(output: &str, success: bool) -> String {
     } else {
         trimmed
     }
+}
+
+/// A plan-mode interception surfaces as a failed tool result whose body is
+/// `blocked: plan mode …` — the kernel prefixes every middleware block with `blocked: `,
+/// and `PlanModeGate`'s reason starts with `plan mode is active`. Returns the human reason
+/// (sans the `blocked: ` prefix) when the result is such a block, so the UI can render a
+/// calm `○` hint instead of a ✗ error — plan-mode enforcement is EXPECTED, not a failure.
+/// The model still receives the full `blocked: …` ToolResult via the conversation. The link
+/// to the gate's wording is by string; if it ever drifts this returns `None` and the normal
+/// ✗ result render is used (a harmless fallback, never a panic).
+pub(crate) fn plan_mode_block_reason(output: &str, success: bool) -> Option<&str> {
+    if success {
+        return None;
+    }
+    let reason = output.strip_prefix("blocked: ")?;
+    reason.starts_with("plan mode").then_some(reason)
 }
 
 // SessionPicker tests moved alongside the struct in
