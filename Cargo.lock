@@ -199,6 +199,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serial_test",
+ "sysinfo",
  "tempfile",
  "tokio",
  "toml 0.8.23",
@@ -207,6 +209,7 @@ dependencies = [
  "uuid",
  "which",
  "windows-sys 0.61.2",
+ "winreg",
  "winresource",
 ]
 
@@ -462,8 +465,10 @@ dependencies = [
  "objc2-foundation",
  "png 0.17.16",
  "qrcode",
+ "reqwest",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
  "tokio",
  "toml 0.8.23",
