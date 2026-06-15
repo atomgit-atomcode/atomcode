@@ -7,6 +7,9 @@ pub mod actions;
 pub mod paths;
 pub mod scan;
 
+mod frontend;
+pub use frontend::{run, Args};
+
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

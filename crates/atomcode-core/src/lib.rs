@@ -31,7 +31,6 @@ pub mod telemetry_bootstrap;
 pub mod tool;
 pub mod trace;
 pub mod turn;
-pub mod uninstall;
 pub mod version_check;
 pub mod vision_preprocessor;
 

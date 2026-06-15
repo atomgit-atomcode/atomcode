@@ -8,6 +8,14 @@ default-run = "atomcode"
 name = "atomcode"
 path = "src/main.rs"
 
+# Thin lib target so integration tests (and the bin) can reach testable
+# modules like `uninstall` (moved here from atomcode-core). A bin-only crate
+# exposes no API to `tests/`, which is why the uninstall manifest used to
+# live in core just to be reachable from script_parity.rs.
+[lib]
+name = "atomcode"
+path = "src/lib.rs"
+
 [features]
 default = []
 distro-pm = ["atomcode-core/distro-pm", "atomcode-tuix/distro-pm"]
@@ -32,6 +40,8 @@ serde_json = "1"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 is-terminal = "0.4"
+# Process scan for the uninstall flow (detect running atomcode instances).
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 # setsid() for the detached upgrade-prep subprocess. Unix-only — Windows
 # uses CREATE_NO_WINDOW creation flags instead (see main.rs).
@@ -43,7 +53,9 @@ libc = "0.2"
 # cost enough to make typing feel smooth again on Windows Terminal / ConHost.
 [target.'cfg(target_os = "windows")'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
-windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Globalization"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Globalization", "Win32_UI_WindowsAndMessaging"] }
+# Registry User PATH cleanup during uninstall.
+winreg = "0.55"
 
 # Build-dep for embedding the app icon into atomcode.exe resource section.
 # Gated at runtime in build.rs via CARGO_CFG_TARGET_OS so it only fires
@@ -56,6 +68,8 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 which = "7"
+# Serialize env-var-mutating uninstall tests (moved from atomcode-core).
+serial_test = "3"
 
 [build-dependencies]
 winresource = "0.1"

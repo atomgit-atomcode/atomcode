@@ -300,7 +300,7 @@ impl SelfDeleteStrategy for PlatformSelfDelete {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
         // Rename live exe to .atomcode.rolling so the install dir can be deleted.
-        let rolling = crate::self_update::rolling_path(exe);
+        let rolling = atomcode_core::self_update::rolling_path(exe);
         if exe.file_name() != rolling.file_name() {
             let _ = std::fs::rename(exe, &rolling);
         }

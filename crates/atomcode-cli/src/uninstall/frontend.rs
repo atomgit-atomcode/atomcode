@@ -4,7 +4,7 @@
 //! Plan: docs/superpowers/plans/2026-05-08-uninstall-feature.md
 
 use atomcode_core::self_update::current_exe_path;
-use atomcode_core::uninstall::{
+use super::{
     actions::{PlatformSelfDelete, SelfDeleteStrategy},
     paths::atomcode_dir,
     scan::scan,
@@ -80,7 +80,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let strategy: Box<dyn SelfDeleteStrategy> = Box::new(PlatformSelfDelete);
     let outcome =
-        atomcode_core::uninstall::execute(&plan, final_decisions, strategy.as_ref(), Some(ctx))?;
+        super::execute(&plan, final_decisions, strategy.as_ref(), Some(ctx))?;
     print_summary(&outcome);
 
     if !outcome.failed.is_empty() {
@@ -115,7 +115,7 @@ fn decision_mode(args: &Args, tty: bool) -> DecisionMode {
 }
 
 fn confirm_and_kill_running_processes() -> anyhow::Result<bool> {
-    use atomcode_core::uninstall::actions::{kill_process, list_atomcode_processes};
+    use super::actions::{kill_process, list_atomcode_processes};
     use std::io::{BufRead, Write};
 
     let procs = list_atomcode_processes();
@@ -155,7 +155,7 @@ fn confirm_and_kill_running_processes() -> anyhow::Result<bool> {
 
 // ----- Task 9 implementations -----
 
-fn print_plan(plan: &atomcode_core::uninstall::scan::Plan, decisions: Decisions) {
+fn print_plan(plan: &super::scan::Plan, decisions: Decisions) {
     println!("DRY RUN — no changes will be made.\n");
 
     print_group(
@@ -179,7 +179,7 @@ fn print_plan(plan: &atomcode_core::uninstall::scan::Plan, decisions: Decisions)
 }
 
 fn print_group(
-    plan: &atomcode_core::uninstall::scan::Plan,
+    plan: &super::scan::Plan,
     g: Group,
     label: &str,
     will_remove: bool,
@@ -219,7 +219,7 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-fn prompt_user(plan: &atomcode_core::uninstall::scan::Plan) -> anyhow::Result<Option<Decisions>> {
+fn prompt_user(plan: &super::scan::Plan) -> anyhow::Result<Option<Decisions>> {
     use std::io::{BufRead, Write};
 
     println!("This will uninstall AtomCode from your system.\n");
@@ -267,7 +267,7 @@ fn prompt_user(plan: &atomcode_core::uninstall::scan::Plan) -> anyhow::Result<Op
 }
 
 fn ask_group(
-    plan: &atomcode_core::uninstall::scan::Plan,
+    plan: &super::scan::Plan,
     g: Group,
     prompt: &str,
     default_yes: bool,
@@ -301,7 +301,7 @@ fn ask_group(
     })
 }
 
-fn summarize_decision(plan: &atomcode_core::uninstall::scan::Plan, g: Group, will_remove: bool) {
+fn summarize_decision(plan: &super::scan::Plan, g: Group, will_remove: bool) {
     let count = plan.items.iter().filter(|i| i.group == g).count();
     if count == 0 {
         return;
@@ -343,7 +343,7 @@ fn print_summary(outcome: &Outcome) {
     }
 }
 
-fn build_context(plan: &atomcode_core::uninstall::scan::Plan) -> anyhow::Result<ExecuteContext> {
+fn build_context(plan: &super::scan::Plan) -> anyhow::Result<ExecuteContext> {
     // `mut` is only used by the `#[cfg(unix)]` branch below — Windows
     // builds compile this as a never-mutated `Vec`. Suppress the lint
     // there rather than duplicate the let with cfg gates.
@@ -356,7 +356,7 @@ fn build_context(plan: &atomcode_core::uninstall::scan::Plan) -> anyhow::Result<
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let rc = atomcode_core::uninstall::paths::unix_rc_paths();
+        let rc = super::paths::unix_rc_paths();
         for path in [rc.zshrc, rc.bashrc] {
             if path.exists() {
                 rc_files.push((path, prefix.clone()));
