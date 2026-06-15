@@ -193,24 +193,49 @@ impl OverflowCompaction {
                 if drain_to <= floor {
                     return CompactionPlan::noop(); // nothing older than the active turn
                 }
-                let summary = self.summarize(&msgs[floor..drain_to]).await;
+                let summary = self.summarize(&msgs[floor..drain_to], None).await;
                 let rewrites = Self::aggressive_stub_rewrites(msgs, drain_to, msgs.len());
                 CompactionPlan { drain_from: floor, drain_to, summary, rewrites, resume_note: None }
             }
         }
     }
 
+    /// `/compact <focus>` — a USER-requested FOCUSED compaction (off both the normal stub
+    /// path and the overflow ladder). Drains everything older than the active turn into ONE
+    /// focus-directed LLM summary, keeping the active turn intact. Plain `/compact` (no
+    /// focus) is NOT routed here — it keeps the cache-friendly inner stub policy; only a
+    /// non-empty focus opts into this drain+summary. No provider ⇒ plain-drain (the
+    /// net-loss guard refuses it if it wouldn't shrink). `rewrites` is empty: the old span
+    /// is replaced by the summary, the kept span is left untouched (less aggressive than
+    /// overflow, which also stubs the kept span).
+    async fn manual_focus_plan(&self, view: &CompactionView<'_>, focus: &str) -> CompactionPlan {
+        let msgs = view.messages;
+        let floor = view.sacred_floor;
+        let drain_to = active_turn_start(msgs, 1).max(floor);
+        if drain_to <= floor {
+            // Nothing older than the active turn — fall back to the gentle stub policy.
+            return self.inner.plan(view).await;
+        }
+        let summary = self.summarize(&msgs[floor..drain_to], Some(focus)).await;
+        CompactionPlan { drain_from: floor, drain_to, summary, rewrites: Vec::new(), resume_note: None }
+    }
+
     /// Summarize a drained span into one paragraph via the configured provider. `None` if
     /// no provider, the call errors, or the result is empty (caller then plain-drains).
     /// One-shot, no tools; operates on the already-stubbed span so its input is small.
-    async fn summarize(&self, span: &[Message]) -> Option<String> {
+    /// `focus` (from `/compact <focus>`) steers the summary toward a topic when present.
+    async fn summarize(&self, span: &[Message], focus: Option<&str>) -> Option<String> {
         let provider = self.summary_provider.as_ref()?;
         let transcript = render_transcript(span);
+        let focus_line = match focus.map(str::trim).filter(|f| !f.is_empty()) {
+            Some(f) => format!(" Pay special attention to anything related to: {f}."),
+            None => String::new(),
+        };
         let prompt = vec![
             Message::system(SUMMARY_SYSTEM_PROMPT),
             Message::user(format!(
                 "Summarize the following conversation span. Preserve decisions made, file \
-                 paths touched, and any unresolved threads. Be concise.\n\n{transcript}"
+                 paths touched, and any unresolved threads.{focus_line} Be concise.\n\n{transcript}"
             )),
         ];
         let mut stream = provider.chat_stream(&prompt, &[], &ChatOptions::default()).await.ok()?;
@@ -250,8 +275,13 @@ fn render_transcript(span: &[Message]) -> String {
 #[async_trait]
 impl CompactionStrategy for OverflowCompaction {
     async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
-        match view.trigger {
-            CompactTrigger::Overflow { attempt } => self.overflow_plan(view, attempt).await,
+        match &view.trigger {
+            CompactTrigger::Overflow { attempt } => self.overflow_plan(view, *attempt).await,
+            // `/compact <focus>`: a non-empty focus opts into a focused drain+summary. Plain
+            // `/compact` (None / blank) and `Auto` fall through to the cache-friendly stub.
+            CompactTrigger::Manual { focus: Some(f) } if !f.trim().is_empty() => {
+                self.manual_focus_plan(view, f).await
+            }
             _ => self.inner.plan(view).await,
         }
     }
@@ -342,6 +372,17 @@ mod tests {
             ctx_window,
             used_tokens: ctx_window,
             utilization: 1.0,
+            sacred_floor: floor,
+        }
+    }
+
+    fn manual_view<'a>(msgs: &'a [Message], floor: usize, focus: Option<&str>) -> CompactionView<'a> {
+        CompactionView {
+            messages: msgs,
+            trigger: CompactTrigger::Manual { focus: focus.map(str::to_string) },
+            ctx_window: 8000,
+            used_tokens: 100,
+            utilization: 0.0125,
             sacred_floor: floor,
         }
     }
@@ -560,6 +601,60 @@ mod tests {
         assert!(report.committed);
         // The drained span is replaced by ONE synthetic_user summary message.
         assert!(conv.messages.iter().any(|m| m.text == "PRIOR CONTEXT SUMMARY" && m.synthetic));
+    }
+
+    #[tokio::test]
+    async fn manual_focus_drains_old_into_focused_summary() {
+        // `/compact <focus>`: old turns (carrying bulk) drain into ONE focused LLM summary;
+        // the active turn stays intact. Span must out-weigh the summary or the net-loss
+        // guard refuses — so the old turns are big(), as in real usage.
+        let msgs = vec![
+            Message::system("p"),
+            Message::user("u1"),
+            Message::assistant(big("a1"), vec![]),
+            Message::user(big("u2")),
+            Message::assistant(big("a2"), vec![]),
+            Message::user("u3-active"),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let strat =
+            OverflowCompaction::new(StubCompaction::default(), Some(Arc::new(CannedSummaryProvider)));
+        let plan = strat.plan(&manual_view(&conv.messages, floor, Some("the auth refactor"))).await;
+        assert_eq!(plan.summary.as_deref(), Some("PRIOR CONTEXT SUMMARY"), "focused manual compaction summarizes");
+        assert!(plan.drain_from == floor && plan.drain_to > floor, "drains the old span");
+        assert!(plan.rewrites.is_empty(), "manual focus keeps the active span untouched");
+        let report = conv.apply_plan(plan, floor);
+        assert!(report.committed);
+        assert!(conv.messages.iter().any(|m| m.synthetic && m.text == "PRIOR CONTEXT SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn manual_plain_and_blank_focus_delegate_to_stub() {
+        // Plain `/compact` (None) and a blank focus ("   ") keep the cache-friendly inner
+        // stub policy — NO drain, NO summary (StubCompaction ignores the trigger entirely).
+        let msgs = vec![
+            Message::system("p"),
+            Message::user("u1"),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", &big("out"), false),
+            Message::user("u2"),
+            asst_call("g1", "grep"),
+            Message::tool_result("g1", &big("o2"), false),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let strat =
+            OverflowCompaction::new(StubCompaction::default(), Some(Arc::new(CannedSummaryProvider)));
+        let stub = StubCompaction::default().plan(&view(&conv.messages, floor)).await;
+        let none = strat.plan(&manual_view(&conv.messages, floor, None)).await;
+        let blank = strat.plan(&manual_view(&conv.messages, floor, Some("   "))).await;
+        assert_eq!(none.rewrites, stub.rewrites, "plain /compact == inner stub byte-for-byte");
+        assert_eq!(blank.rewrites, stub.rewrites, "blank focus == inner stub");
+        assert!(none.summary.is_none() && blank.summary.is_none(), "no drain/summary on plain manual");
+        assert!(none.drain_to == 0 && blank.drain_to == 0, "no drain on plain manual");
     }
 
     #[tokio::test]
