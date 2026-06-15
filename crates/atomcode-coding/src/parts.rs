@@ -24,7 +24,8 @@ use atomcode_capabilities::codeintel::register_codeintel_tools;
 use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::session::{
-    CurrentDateHook, RecallTool, SessionContextHook, SessionManager, SnapshotHook, TranscriptHook,
+    RecallTool, SessionContextHook, SessionManager, SnapshotHook, StatusReminderHook,
+    TranscriptHook,
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
@@ -241,7 +242,8 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
     // 3. SnapshotHook  — turn_complete: persist .snapshot + .meta.
     // 4. TranscriptHook— turn_complete: append the .jsonl record. (No coupling with
     //    3 — the order is fixed purely for determinism.)
-    // 5. CurrentDateHook — pre_request tail-append (cache red-line: tail only).
+    // 5. StatusReminderHook — pre_request tail-append (cache red-line: tail only, and
+    //    SKIPPED on a turn's round 1 so it never pairs with the user message).
     // 6. VerifyCadenceHook — offer_continuation; FIRST `Some` wins in the chain, so
     //    keep it last: any earlier hook's continuation outranks the cadence nudge.
     let mut hooks: Vec<Arc<dyn LifecycleHooks>> = Vec::new();
@@ -255,19 +257,23 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
         hooks.push(Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd)));
         hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
     }
-    // Date awareness is UNCONDITIONAL (production parity): it serves recall's
-    // relative-date resolution when sessions are on, but the model should know the
-    // date in a Disabled-session CI run too.
-    hooks.push(Arc::new(CurrentDateHook::new()));
+    // Status awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder>
+    // with date + context-window usage + round budget. Serves recall's relative-date
+    // resolution and lets the model pace itself. Injected from round 2 of each turn (round 1
+    // is skipped — see StatusReminderHook — to avoid a user-after-user wire pair).
+    hooks.push(Arc::new(StatusReminderHook::new()));
     hooks.push(Arc::new(VerifyCadenceHook::new()));
     // 6. TelemetryHook — observation-only (on_request + on_model_response): emits
     //    LlmChat per round. Last in the chain; it mutates nothing, so order is moot.
     //    Only when the driver supplied a telemetry sink (kernel stays zero-telemetry
-    //    otherwise). The new stack always speaks OpenAI-compat → vendor "openai".
+    //    otherwise). Vendor = the configured `provider_type` (`openai`/`claude`/`ollama`,
+    //    the exact vocabulary telemetry's `resolve_provider_host` keys on) — NOT a fixed
+    //    "openai": since the provider_type dispatch landed, claude/ollama no longer speak
+    //    OpenAI-compat, so a hardcoded vendor would misattribute their telemetry.
     if let Some(tel) = &cfg.telemetry {
         hooks.push(Arc::new(crate::telemetry::TelemetryHook::new(
             tel.clone(),
-            "openai",
+            cfg.provider_type.as_str(),
             &cfg.base_url,
             &cfg.model,
             session.as_ref().map(|b| b.id.as_str()),
@@ -350,7 +356,7 @@ pub fn assemble(
         Some(tel) => Arc::new(crate::telemetry::CompactionTelemetryProvider::new(
             provider.clone(),
             tel.clone(),
-            "openai",
+            cfg.provider_type.as_str(),
             &cfg.base_url,
             &cfg.model,
             parts.session.as_ref().map(|b| b.id.as_str()),
@@ -369,7 +375,7 @@ pub fn assemble(
     if let Some(tel) = &cfg.telemetry {
         builder = builder.middleware(Arc::new(crate::telemetry::ToolTelemetryMiddleware::new(
             tel.clone(),
-            "openai",
+            cfg.provider_type.as_str(),
             &cfg.base_url,
             &cfg.model,
             parts.session.as_ref().map(|b| b.id.as_str()),

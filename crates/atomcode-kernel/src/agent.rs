@@ -689,6 +689,8 @@ impl RunningAgent {
             // minted request_id is simply unused; the counter stays monotonic and
             // deterministic, so reproducible-eval stitching is unaffected.)
             let request_id = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            // Live context pressure from the last response (0s before any response).
+            let (ctx_window, used_tokens, _util) = convo.last_pressure();
             let turn_ctx = TurnCtx {
                 session_id: self.session_id.clone(),
                 turn_id,
@@ -696,6 +698,8 @@ impl RunningAgent {
                 round,
                 max_rounds: self.max_rounds,
                 cache_epoch: convo.cache_epoch,
+                context_window: ctx_window,
+                used_tokens,
             };
             // Hard cap (safety fuse): stop before exceeding max_rounds.
             if let Some(max) = self.max_rounds {

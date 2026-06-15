@@ -36,6 +36,14 @@ pub struct TurnCtx {
     /// only re-render an expensive view when the epoch changed). A committed
     /// compaction bumps it; an append-only round does not.
     pub cache_epoch: u64,
+    /// Model context window in tokens, from the LAST response's usage report (provider's
+    /// `meta.ctx_window`). `0` before any response is recorded (e.g. round 1) or when the
+    /// provider reports none. Lets a `pre_request` hook project live context pressure
+    /// (`used_tokens` / `context_window`) to the model.
+    pub context_window: u32,
+    /// Prompt tokens the LAST request actually used (provider's `meta.used_tokens`). `0`
+    /// before any response is recorded. Pairs with `context_window` for a utilization view.
+    pub used_tokens: u32,
 }
 
 /// TURN-level lifecycle seam (session / turn / request / response / error). The

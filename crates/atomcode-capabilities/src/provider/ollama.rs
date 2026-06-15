@@ -110,6 +110,7 @@ impl LlmProvider for OllamaProvider {
         options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg);
+        super::wire_dump_request(&self.cfg.model, &body); // byte-level dump (ATOMCODE_WIRE_DUMP=1)
 
         let policy = &self.cfg.retry;
         let mut attempt = 1u32;

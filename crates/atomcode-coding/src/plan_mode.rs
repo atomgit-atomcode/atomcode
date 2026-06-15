@@ -51,19 +51,21 @@ impl ToolMiddleware for PlanModeGate {
     }
 }
 
-/// The standing plan-mode reminder. Kept OUT of the system prompt (so toggling plan mode
-/// never perturbs the cached prefix) and carried instead as an EPHEMERAL per-request tail
-/// by [`PlanModeReminderHook`]. The [`PlanModeGate`] blocks mutating TOOLS, but nothing
-/// stops the model from writing the implementation straight into its reply — this keeps it
-/// planning. (Ported from core's `plan_mode_turn_reminder`.)
-pub const PLAN_MODE_REMINDER: &str = "<system-reminder>\n\
+/// The standing plan-mode reminder BODY. Kept OUT of the system prompt (so toggling plan
+/// mode never perturbs the cached prefix) and carried instead as an EPHEMERAL per-request
+/// tail by [`PlanModeReminderHook`], which wraps it via the shared
+/// [`system_reminder`](atomcode_capabilities::reminder::system_reminder) constructor so the
+/// `<system-reminder>` convention lives in ONE place. The [`PlanModeGate`] blocks mutating
+/// TOOLS, but nothing stops the model from writing the implementation straight into its
+/// reply — this keeps it planning. (Ported from core's `plan_mode_turn_reminder`.)
+const PLAN_MODE_REMINDER_BODY: &str = "\
 PLAN MODE is active. Do NOT create, edit, or delete files, and do NOT write out the \
 implementation — not even as code blocks in your reply. Investigate with read-only tools, \
 then present a concise implementation plan and STOP, waiting for the user to review and \
-switch to build mode. Writing the full solution now defeats the purpose of plan mode.\n\
-</system-reminder>";
+switch to build mode. Writing the full solution now defeats the purpose of plan mode.";
 
-/// Injects [`PLAN_MODE_REMINDER`] as an ephemeral request tail while plan mode is active.
+/// Injects the wrapped [`PLAN_MODE_REMINDER_BODY`] as an ephemeral request tail while plan
+/// mode is active.
 /// Shares the same `Arc<AtomicBool>` as the [`PlanModeGate`] so they toggle together.
 /// Cache-safe: the tail is appended in `pre_request` (not stored), so the cached prefix is
 /// untouched and an OFF↔ON toggle only changes ephemeral bytes past the prefix.
@@ -81,7 +83,9 @@ impl PlanModeReminderHook {
 impl LifecycleHooks for PlanModeReminderHook {
     async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
         if self.active.load(Ordering::Relaxed) {
-            messages.push(Message::user(PLAN_MODE_REMINDER.to_string()));
+            messages.push(Message::user(atomcode_capabilities::reminder::system_reminder(
+                PLAN_MODE_REMINDER_BODY,
+            )));
         }
     }
 }

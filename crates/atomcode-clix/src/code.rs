@@ -540,7 +540,7 @@ fn split_global_flag(rest: &str) -> (bool, &str) {
 }
 
 /// epoch ms → `YYYY-MM-DD HH:MM UTC` (dependency-free; UTC — labeled as such, while
-/// the engine's CurrentDateHook shows the MODEL local time; negative ms clamp to epoch).
+/// the engine's StatusReminderHook shows the MODEL local time; negative ms clamp to epoch).
 fn fmt_ts(ms: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let Some(t) = UNIX_EPOCH.checked_add(Duration::from_millis(ms.max(0) as u64)) else {

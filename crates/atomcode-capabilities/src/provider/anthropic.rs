@@ -130,6 +130,7 @@ impl LlmProvider for AnthropicProvider {
         options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg);
+        super::wire_dump_request(&self.cfg.model, &body); // byte-level dump (ATOMCODE_WIRE_DUMP=1)
 
         let policy = &self.cfg.retry;
         let mut attempt = 1u32;
@@ -342,7 +343,62 @@ fn format_messages(messages: &[Message], echo_thinking: bool) -> (Option<String>
         }
         i += 1;
     }
+    // Anthropic requires STRICTLY ALTERNATING user/assistant roles. Several kernel shapes
+    // produce adjacent user messages on the wire: a tool-result run folds into a user
+    // message that an injected `<system-reminder>` tail then follows; a post-compaction
+    // history places a synthetic-summary user beside the real user; multiple tail hooks
+    // stack. Merge every consecutive `role:"user"` run into one (others — OpenAI/Ollama —
+    // tolerate adjacency, so they don't need this).
+    let out = merge_consecutive_user(out);
     (system, out)
+}
+
+/// Merge consecutive `role:"user"` wire entries into ONE. Text-only neighbors join into a
+/// STRING (prefix-cache parity with the no-block path); any block/array content promotes the
+/// merged entry to a single blocks array.
+fn merge_consecutive_user(messages: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let is_user = m.get("role").and_then(Value::as_str) == Some("user");
+        let prev_user =
+            out.last().and_then(|p| p.get("role").and_then(Value::as_str)) == Some("user");
+        if is_user && prev_user {
+            let last = out.last_mut().unwrap();
+            let merged = merge_user_content(
+                last.get("content").cloned().unwrap_or(Value::Null),
+                m.get("content").cloned().unwrap_or(Value::Null),
+            );
+            last["content"] = merged;
+        } else {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// Combine two user `content` values. Both strings → joined string (blank-line separated,
+/// keeping the cache-friendly string form). Otherwise → ONE array of blocks (a non-empty
+/// string becomes a `{type:"text"}` block; existing arrays are concatenated).
+fn merge_user_content(a: Value, b: Value) -> Value {
+    if let (Some(sa), Some(sb)) = (a.as_str(), b.as_str()) {
+        let joined = if sa.is_empty() || sb.is_empty() {
+            format!("{sa}{sb}")
+        } else {
+            format!("{sa}\n\n{sb}")
+        };
+        return Value::String(joined);
+    }
+    let mut blocks = content_to_blocks(a);
+    blocks.extend(content_to_blocks(b));
+    Value::Array(blocks)
+}
+
+fn content_to_blocks(content: Value) -> Vec<Value> {
+    match content {
+        Value::Array(arr) => arr,
+        Value::String(s) if !s.is_empty() => vec![json!({ "type": "text", "text": s })],
+        _ => vec![],
+    }
 }
 
 /// A `user` message. Text-only → `content` is a STRING (prefix-cache parity with the
@@ -721,6 +777,50 @@ mod tests {
 
     fn cfg() -> AnthropicConfig {
         AnthropicConfig::new("k", "https://api.anthropic.test", "claude-opus-4-8")
+    }
+
+    fn roles(out: &[Value]) -> Vec<String> {
+        out.iter()
+            .filter_map(|m| m.get("role").and_then(|r| r.as_str()).map(str::to_string))
+            .collect()
+    }
+    fn has_consecutive_user(out: &[Value]) -> bool {
+        roles(out).windows(2).any(|w| w[0] == "user" && w[1] == "user")
+    }
+
+    #[test]
+    fn no_consecutive_user_after_tool_fold_then_reminder() {
+        use atomcode_kernel::message::Message;
+        use atomcode_kernel::tool::ToolCall;
+        // tool result folds into a user message; the injected reminder is another user
+        // message right after — Anthropic would 400 without merging them.
+        let msgs = vec![
+            Message::user("do X"),
+            Message::assistant(
+                "",
+                vec![ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() }],
+            ),
+            Message::tool_result("c1", "result text", false),
+            Message::user("<system-reminder>\nstatus\n</system-reminder>"),
+        ];
+        let (_system, out) = format_messages(&msgs, false);
+        assert!(!has_consecutive_user(&out), "no consecutive user on the wire: {:?}", roles(&out));
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(wire.contains("system-reminder"), "reminder preserved (merged): {wire}");
+        assert!(wire.contains("result text"), "tool result preserved: {wire}");
+    }
+
+    #[test]
+    fn no_consecutive_user_post_compaction_summary_beside_user() {
+        use atomcode_kernel::message::Message;
+        // After compaction: synthetic-summary (user) sits beside the real user turn.
+        let mut summary = Message::user("summary of prior work");
+        summary.synthetic = true;
+        let msgs = vec![Message::user("prompt1"), summary, Message::user("follow up")];
+        let (_system, out) = format_messages(&msgs, false);
+        assert!(!has_consecutive_user(&out), "merged into one user: {:?}", roles(&out));
+        assert_eq!(out.len(), 1, "three consecutive users → one");
+        assert_eq!(out[0]["content"], json!("prompt1\n\nsummary of prior work\n\nfollow up"));
     }
 
     fn line(event: &str, v: Value) -> String {

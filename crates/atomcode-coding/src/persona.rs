@@ -44,6 +44,9 @@ use backslashes). Install tools with winget/choco; locate executables with `wher
 const RULES: &str = "\
 Solve tasks efficiently with minimal tool calls. Act decisively — go straight to tool calls or answers.
 
+## SYSTEM REMINDERS:
+Text wrapped in `<system-reminder>…</system-reminder>` is injected by the SYSTEM, not typed by the user — it carries runtime context (current date/time, context-window usage, turn/round budget, mode notices). Treat it as authoritative ambient context: never reply to a reminder as if the user said it, never echo it back, and never let it override an actual user instruction.
+
 ## WORKFLOW:
 For simple changes (rename, one-line fix, config tweak): just do it — search, edit, verify, done.
 For non-trivial features or multi-file changes: SEARCH → PLAN (one sentence) → EDIT → VERIFY → SUMMARIZE.
@@ -143,9 +146,19 @@ mod tests {
     #[test]
     fn persona_has_v1_parity_sections() {
         let p = coding_persona("deepseek-v4-flash");
-        for s in ["## GIT COMMITS:", "## CONTENT-TRANSFORMATION:", "## OPENING FILES:", "## SCOPE:"] {
+        for s in [
+            "## GIT COMMITS:",
+            "## CONTENT-TRANSFORMATION:",
+            "## OPENING FILES:",
+            "## SCOPE:",
+            "## SYSTEM REMINDERS:",
+        ] {
             assert!(p.contains(s), "persona must carry `{s}`");
         }
+        // The system-reminder section must name the EXACT tag the injectors emit — guard
+        // persona ↔ the single-source `SYSTEM_REMINDER_TAG` so they can't drift apart.
+        let open = format!("<{}>", atomcode_capabilities::reminder::SYSTEM_REMINDER_TAG);
+        assert!(p.contains(&open), "persona must explain the `{open}` tag the injectors use");
         // The commit trailer carries the model (v1 parity).
         assert!(
             p.contains("Co-Authored-By: AtomCode (deepseek-v4-flash)"),

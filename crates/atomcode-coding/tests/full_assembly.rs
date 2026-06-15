@@ -119,8 +119,19 @@ async fn full_assembly_lifecycle() {
             shape()
         );
         assert!(first[2].text.contains("prefers tabs"));
-        // CurrentDateHook tail-append rides the request.
-        assert!(first.last().unwrap().text.starts_with("Current date:"));
+        // StatusReminderHook is SKIPPED on a turn's round 1 (this is a single-round text
+        // turn), so NO status tail rides this request — the last message is the user turn,
+        // not a "<system-reminder>". (The reminder appears from round 2 onward; covered by
+        // the hook's own unit tests.)
+        assert_eq!(first.last().unwrap().role, Role::User, "round 1 ends at the user turn");
+        // Scope to USER messages: the reminder is a user-role tail. (The persona — a System
+        // message — legitimately *mentions* the `<system-reminder>` tag to explain it, so a
+        // blanket text search would false-positive on the persona.)
+        assert!(
+            !first.iter().any(|m| m.role == Role::User && m.text.contains("<system-reminder>")),
+            "no status reminder (user tail) on a turn's round 1: {:?}",
+            shape()
+        );
     }
 
     // The turn persisted all three session files.

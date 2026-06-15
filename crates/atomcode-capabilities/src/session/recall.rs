@@ -6,7 +6,7 @@
 //! tool needs no session wiring. Matching is keyword/full-text v1 behind a swappable
 //! [`RecallIndex`] so a semantic/embedding backend can drop in later without touching the
 //! tool. Read-only ⇒ `risk = Safe`. The model resolves relative dates ("yesterday") into
-//! concrete `after`/`before` using the current date the `CurrentDateHook` injects.
+//! concrete `after`/`before` using the current date the `StatusReminderHook` injects.
 
 use std::path::Path;
 use std::sync::Arc;

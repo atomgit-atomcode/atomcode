@@ -144,6 +144,7 @@ mod tests {
             round: 2,
             max_rounds: Some(5),
             cache_epoch: 7,
+            ..Default::default()
         };
         hooks.on_request(&msgs, &tools, &ChatOptions::default(), &ctx).await;
 
@@ -182,6 +183,7 @@ mod tests {
                 round: 1,
                 max_rounds: None,
                 cache_epoch: 0,
+                ..Default::default()
             };
             hooks
                 .on_request(&[Message::user("file-test-msg")], &[], &ChatOptions::default(), &ctx)

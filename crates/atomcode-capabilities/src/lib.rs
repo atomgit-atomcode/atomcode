@@ -23,6 +23,11 @@
 /// is always available regardless of which capability features are enabled.
 pub mod hooks;
 
+/// The `<system-reminder>` convention — one constructor ([`reminder::system_reminder`]) so
+/// every runtime-context injector wraps consistently and the wrapper can't be forgotten.
+/// Dependency-free, so it is always available regardless of capability features.
+pub mod reminder;
+
 /// Cache-friendly history compaction strategy ([`compaction::StubCompaction`]) — a
 /// [`atomcode_kernel::message::CompactionStrategy`] that stubs old tool results in place.
 /// Kernel-only deps, so it is always available regardless of capability features.
@@ -31,7 +36,8 @@ pub mod compaction;
 /// Shared `$ATOMCODE_HOME` path resolution for the persisting capabilities — one
 /// home for the rule (and for documenting its single known `sudo` divergence from
 /// production). Internal; compiled only when a feature that persists needs it.
-#[cfg(any(feature = "mcp", feature = "session", feature = "memory"))]
+/// `provider` also needs it: the byte-level wire dump lands under `config_dir()/wire-dump`.
+#[cfg(any(feature = "mcp", feature = "session", feature = "memory", feature = "provider"))]
 pub(crate) mod paths;
 
 #[cfg(feature = "provider")]

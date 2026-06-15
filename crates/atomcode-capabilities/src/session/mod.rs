@@ -24,14 +24,14 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod context;
-pub mod current_date;
 pub mod instructions;
 pub mod manager;
 pub mod recall;
 pub mod snapshot;
+pub mod status_reminder;
 pub mod transcript;
 pub use context::SessionContextHook;
-pub use current_date::CurrentDateHook;
+pub use status_reminder::StatusReminderHook;
 pub use manager::{SessionManager, SessionMeta, TurnStat};
 pub use recall::{KeywordIndex, RecallIndex, RecallTool};
 pub use snapshot::SnapshotHook;

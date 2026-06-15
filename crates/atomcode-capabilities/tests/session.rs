@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use atomcode_capabilities::session::{
-    CurrentDateHook, RecallTool, SessionManager, SnapshotHook, TranscriptHook,
+    RecallTool, SessionManager, SnapshotHook, StatusReminderHook, TranscriptHook,
 };
 use atomcode_kernel::conformance;
 use atomcode_kernel::hook::LifecycleHooks;
@@ -43,7 +43,7 @@ async fn snapshot_hook_passes_lifecycle_conformance() {
 }
 
 #[tokio::test]
-async fn current_date_hook_passes_lifecycle_conformance() {
-    let h: Arc<dyn LifecycleHooks> = Arc::new(CurrentDateHook::new());
+async fn status_reminder_hook_passes_lifecycle_conformance() {
+    let h: Arc<dyn LifecycleHooks> = Arc::new(StatusReminderHook::new());
     conformance::hooks::check(h).await.assert_conformant();
 }

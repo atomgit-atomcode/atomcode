@@ -359,6 +359,21 @@ impl Conversation {
         }
     }
 
+    /// `(context_window, used_tokens, utilization)` from the MOST RECENT assistant
+    /// message's recorded `meta` — the provider's last usage report. `(0, 0, 0.0)` when no
+    /// assistant turn has been recorded yet (e.g. the first request). The same source the
+    /// compaction trigger reads; exposed so a `pre_request` hook can project live context
+    /// pressure to the model (e.g. a status reminder) via [`TurnCtx`](crate::hook::TurnCtx).
+    pub fn last_pressure(&self) -> (u32, u32, f32) {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .and_then(|m| m.meta.as_ref())
+            .map(|meta| (meta.ctx_window, meta.used_tokens, meta.utilization))
+            .unwrap_or((0, 0, 0.0))
+    }
+
     /// Apply a compaction [`CompactionPlan`] as the SOLE non-append history writer
     /// (besides `backfill_cancelled_tool_results`). The kernel — not the strategy —
     /// owns and enforces every invariant here, so a buggy strategy cannot corrupt
@@ -711,6 +726,22 @@ impl SessionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_pressure_reads_latest_assistant_meta() {
+        let mut c = Conversation::new();
+        c.push(Message::user("hi"));
+        assert_eq!(c.last_pressure(), (0, 0, 0.0), "no assistant meta yet → zeros");
+        let mut a = Message::assistant("ans", vec![]);
+        a.meta = Some(MessageMeta {
+            ctx_window: 128_000,
+            used_tokens: 40_000,
+            utilization: 0.3125,
+            ..Default::default()
+        });
+        c.push(a);
+        assert_eq!(c.last_pressure(), (128_000, 40_000, 0.3125));
+    }
 
     #[test]
     fn conversation_records_messages_in_order() {

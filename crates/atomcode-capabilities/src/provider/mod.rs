@@ -30,6 +30,50 @@ pub use retry::RetryPolicy;
 pub use sign::{RequestSigner, SignedAuth};
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-local sequence so dumps sort in call order even when two land in the same
+/// nanosecond (the timestamp alone isn't a tiebreaker under concurrency).
+static WIRE_DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// BYTE-LEVEL outbound-request dump for wire diagnosis. No-op unless `ATOMCODE_WIRE_DUMP=1`.
+/// Writes the EXACT JSON body an adapter built (post-projection, pre-send) to
+/// `<config_dir>/wire-dump/<seq>-<ts>-<model>.req.json`. Best-effort: any failure (env unset,
+/// unwritable dir) is silently ignored so diagnostics never break a real request.
+///
+/// This is the ADAPTER-level, provider-SPECIFIC counterpart to the neutral
+/// [`WireLogHooks`](crate::hooks::WireLogHooks) (which logs the kernel `Message` view, not
+/// these bytes). The kernel has NO byte seam by design — byte framing is intrinsically the
+/// adapter's concern (each backend's JSON differs), so every adapter routes its built body
+/// through here. Ported from core's v1 `ATOMCODE_WIRE_DUMP` (same env + `wire-dump/` dir),
+/// but `config_dir()` honors `$ATOMCODE_HOME` (v1 used `$HOME`).
+pub(crate) fn wire_dump_request(model: &str, body: &Value) {
+    if std::env::var("ATOMCODE_WIRE_DUMP").ok().as_deref() != Some("1") {
+        return;
+    }
+    wire_dump_to(&crate::paths::config_dir().join("wire-dump"), model, body);
+}
+
+/// The pure writer behind [`wire_dump_request`] — `dir`-injected so it's testable without
+/// mutating the process-global `$ATOMCODE_HOME`/`$ATOMCODE_WIRE_DUMP`. Best-effort.
+fn wire_dump_to(dir: &std::path::Path, model: &str, body: &Value) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+        .unwrap_or_default();
+    let seq = WIRE_DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let safe_model: String = model
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("{seq:06}-{ts}-{safe_model}.req.json"));
+    if let Ok(s) = serde_json::to_string_pretty(body) {
+        let _ = std::fs::write(&path, s);
+    }
+}
 
 /// Push a `system` wire message, COALESCING it into the previous wire entry when that is
 /// also a `system` message (joined with a blank line).
@@ -85,5 +129,50 @@ mod coalesce_tests {
         push_system_coalesced(&mut out, "");
         push_system_coalesced(&mut out, "real");
         assert_eq!(out, vec![json!({"role":"system","content":"real"})]);
+    }
+}
+
+#[cfg(test)]
+mod wire_dump_tests {
+    use super::wire_dump_to;
+    use serde_json::json;
+
+    #[test]
+    fn writes_body_as_req_json_into_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = json!({"model": "deepseek-v4", "messages": [{"role": "user", "content": "hi"}]});
+        wire_dump_to(dir.path(), "deepseek-v4", &body);
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 1, "one dump file written: {files:?}");
+        let name = &files[0];
+        assert!(name.ends_with(".req.json"), "req.json suffix: {name}");
+        assert!(name.contains("deepseek-v4"), "model in filename: {name}");
+
+        // The dumped bytes round-trip to the exact body (byte-level content preserved).
+        let written = std::fs::read_to_string(dir.path().join(name)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(parsed, body, "dumped JSON equals the outbound body");
+    }
+
+    #[test]
+    fn model_name_is_filename_sanitized() {
+        let dir = tempfile::tempdir().unwrap();
+        // A slash / colon in a model id must not escape the dir or break the path.
+        wire_dump_to(dir.path(), "org/model:v1", &json!({}));
+        let name = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        assert!(!name.contains('/') && !name.contains(':'), "unsafe chars stripped: {name}");
+        assert!(name.contains("org_model_v1"), "sanitized model retained: {name}");
     }
 }
