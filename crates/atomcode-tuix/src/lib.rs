@@ -1,10 +1,15 @@
 // crates/atomcode-tuix/src/lib.rs
 
 pub mod commands;
+pub mod custom_commands;
 pub mod event_loop;
+pub mod git;
 pub mod highlight;
 pub mod i18n;
+pub mod init;
 pub mod input;
+pub mod pricing;
+pub mod version_check;
 pub mod markdown;
 pub mod modals;
 pub mod platform;
@@ -34,6 +39,7 @@ use tokio::sync::mpsc;
 
 use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
+pub use crate::event_loop::RuntimeSpawnOverride;
 use crate::input::history::History;
 use crate::input::reader;
 use crate::render::{
@@ -171,6 +177,7 @@ pub async fn run(
     model_name: String,
     agent_handle: AgentHandle,
     runtime_factory: AgentRuntimeFactory,
+    runtime_spawn_override: Option<RuntimeSpawnOverride>,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
@@ -417,7 +424,7 @@ pub async fn run(
         let wake = wake_tx.clone();
         tokio::spawn(async move {
             let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-            if let Some(latest) = atomcode_core::version_check::check_latest(&current).await {
+            if let Some(latest) = crate::version_check::check_latest(&current).await {
                 if let Ok(mut g) = slot.lock() {
                     *g = Some(latest);
                 }
@@ -462,7 +469,7 @@ pub async fn run(
         dirs
     };
 
-    let custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
+    let custom_commands = crate::custom_commands::CustomCommandRegistry::load(&working_dir);
     // Same Arc the agent loop holds — reload() calls there propagate
     // here automatically, so the slash menu reflects newly-installed
     // skills without re-plumbing.
@@ -532,6 +539,7 @@ pub async fn run(
         model_name,
         agent: agent_client,
         runtime_factory,
+        runtime_spawn_override,
         bg_manager,
         foreground_runtime_id,
         runtime_event_tx,

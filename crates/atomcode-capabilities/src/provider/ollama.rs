@@ -1,0 +1,645 @@
+//! Ollama native `/api/chat` `LlmProvider` adapter (local models via the Ollama daemon).
+//!
+//! Sibling of [`openai_compat`](super::openai_compat) and [`anthropic`](super::anthropic)
+//! — same seam, a third wire. Design notes (grounded in the kernel contract):
+//!   - Ollama's stream is NDJSON — one COMPLETE JSON object per line (no `data:` SSE
+//!     framing, no `[DONE]` sentinel) — so this has its own [`OllamaNdjsonDecoder`].
+//!   - `system` is a message ROLE (not a top-level field). Tool RESULTS are `role:"tool"`
+//!     messages. Assistant `tool_calls[].function.arguments` is a JSON OBJECT (not a
+//!     string), and Ollama tool calls carry NO id — the decoder SYNTHESIZES a stable id
+//!     so the kernel can pair the call with its result; the id stays internal (never sent
+//!     back, since a tool result is matched by ORDER on the wire).
+//!   - Tool calls arrive WHOLE in a single chunk (Ollama does not fragment them), so the
+//!     decoder emits [`StreamEvent::ToolCall`] directly (no buffering).
+//!   - THINKING (`message.thinking`, for thinking models) is PLAIN TEXT with no signature
+//!     — like the OpenAI `reasoning_content` path — so it maps to
+//!     [`StreamEvent::Reasoning`] only (never `ReasoningSignature`).
+//!   - Usage is on the final `done:true` line (`prompt_eval_count` / `eval_count`); auth
+//!     is typically NONE (local), with an OPTIONAL bearer for a fronting proxy.
+//!   - PREFIX BYTE-STABILITY: the body is built from a BTreeMap-backed `Map` with no
+//!     timestamps/uuids, so the same `(messages, tools)` serialize identically.
+
+use super::retry::{self, RetryPolicy};
+use async_trait::async_trait;
+use atomcode_kernel::message::{Message, Role};
+use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort, ToolChoice};
+use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
+use atomcode_kernel::tool::{ToolCall, ToolDef};
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Config + provider
+// ---------------------------------------------------------------------------
+
+/// Construction-time config for the Ollama native `/api/chat` adapter.
+#[derive(Clone)]
+pub struct OllamaConfig {
+    /// OPTIONAL bearer token — Ollama itself needs none (local), but a fronting proxy
+    /// might. Empty ⇒ no `Authorization` header.
+    pub api_key: String,
+    /// Daemon root (no path), e.g. `http://localhost:11434`. The adapter appends
+    /// `/api/chat`.
+    pub base_url: String,
+    pub model: String,
+    pub context_window: u32,
+    /// Output cap → `options.num_predict` when `ChatOptions::max_tokens` is `None`.
+    /// `None` ⇒ let Ollama decide.
+    pub max_tokens: Option<u32>,
+    /// Enable thinking (`think: true`) for thinking-capable models. A per-call
+    /// `reasoning_effort` overrides this with a level string (`think: "high"`).
+    pub think: bool,
+    pub idle_timeout: Duration,
+    pub connect_timeout: Duration,
+    pub retry: RetryPolicy,
+}
+
+impl OllamaConfig {
+    pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            api_key: String::new(),
+            base_url: base_url.into(),
+            model: model.into(),
+            context_window: 8_192,
+            max_tokens: None,
+            think: false,
+            idle_timeout: Duration::from_secs(120),
+            connect_timeout: Duration::from_secs(30),
+            retry: RetryPolicy::default(),
+        }
+    }
+}
+
+pub struct OllamaProvider {
+    cfg: OllamaConfig,
+    client: reqwest::Client,
+    url: String,
+}
+
+impl OllamaProvider {
+    pub fn new(cfg: OllamaConfig) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(cfg.connect_timeout)
+            .build()
+            .map_err(|e| ProviderError {
+                retryable: false,
+                message: format!("http client build failed: {e}"),
+                ..Default::default()
+            })?;
+        let url = format!("{}/api/chat", cfg.base_url.trim_end_matches('/'));
+        Ok(Self { cfg, client, url })
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OllamaProvider {
+    fn model_name(&self) -> &str {
+        &self.cfg.model
+    }
+
+    fn context_window(&self) -> u32 {
+        self.cfg.context_window
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg);
+        super::wire_dump_request(&self.cfg.model, &body); // byte-level dump (ATOMCODE_WIRE_DUMP=1)
+
+        let policy = &self.cfg.retry;
+        let mut attempt = 1u32;
+        let resp = loop {
+            let mut req = self.client.post(&self.url).json(&body);
+            if !self.cfg.api_key.is_empty() {
+                req = req.bearer_auth(&self.cfg.api_key);
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    let code = resp.status().as_u16();
+                    if !resp.status().is_success() {
+                        if retry::is_retryable_status(code) && attempt < policy.max_attempts {
+                            let wait = retry::parse_retry_after(resp.headers())
+                                .unwrap_or_else(|| retry::compute_backoff(attempt, policy));
+                            tokio::time::sleep(wait).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        let text = resp.text().await.unwrap_or_default();
+                        // Ollama errors are `{"error":"..."}` (a STRING).
+                        let detail = serde_json::from_str::<Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(truncate_msg))
+                            .unwrap_or_else(|| truncate_msg(&text));
+                        return Err(ProviderError {
+                            retryable: retry::is_retryable_status(code),
+                            message: format!("HTTP {code}: {detail}"),
+                            http_status: Some(code),
+                            code: None,
+                        });
+                    }
+                    break resp;
+                }
+                Err(e) => {
+                    if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
+                        let wait = retry::compute_backoff(attempt, policy);
+                        tokio::time::sleep(wait).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(open_error(e));
+                }
+            }
+        };
+
+        let idle = self.cfg.idle_timeout;
+        let byte_stream = resp.bytes_stream();
+
+        let s = async_stream::stream! {
+            let mut dec = OllamaNdjsonDecoder::new();
+            futures::pin_mut!(byte_stream);
+            loop {
+                match tokio::time::timeout(idle, byte_stream.next()).await {
+                    Err(_elapsed) => {
+                        yield StreamEvent::Error(ProviderError {
+                            retryable: false,
+                            message: "stream idle timeout".to_string(),
+                            ..Default::default()
+                        });
+                        return;
+                    }
+                    Ok(None) => {
+                        for ev in dec.finish() { yield ev; }
+                        return;
+                    }
+                    Ok(Some(Err(e))) => {
+                        yield StreamEvent::Error(ProviderError {
+                            retryable: false,
+                            message: format!("stream read error: {e}"),
+                            ..Default::default()
+                        });
+                        return;
+                    }
+                    Ok(Some(Ok(chunk))) => {
+                        let mut saw_done = false;
+                        for ev in dec.feed(chunk.as_ref()) {
+                            if matches!(ev, StreamEvent::Done { .. }) {
+                                saw_done = true;
+                            }
+                            yield ev;
+                        }
+                        if saw_done { return; }
+                    }
+                }
+            }
+        };
+
+        Ok(s.boxed())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request building (pure, deterministic)
+// ---------------------------------------------------------------------------
+
+/// Map kernel `Message`s onto Ollama `messages[]`. `system` is a ROLE here; tool results
+/// are `role:"tool"`; assistant `tool_calls[].function.arguments` is an OBJECT.
+fn format_messages(messages: &[Message]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(messages.len());
+    for m in messages {
+        match m.role {
+            // Coalesce consecutive system messages into ONE wire entry — many chat
+            // templates accept only a single system message.
+            Role::System => super::push_system_coalesced(&mut out, &m.text),
+            Role::User => {
+                let mut obj = Map::new();
+                obj.insert("role".into(), json!("user"));
+                obj.insert("content".into(), json!(m.text));
+                // Ollama images are BARE base64 strings (no data: URL prefix).
+                let imgs: Vec<Value> = m
+                    .images
+                    .iter()
+                    .filter(|i| !i.data.is_empty())
+                    .map(|i| json!(i.data))
+                    .collect();
+                if !imgs.is_empty() {
+                    obj.insert("images".into(), json!(imgs));
+                }
+                out.push(Value::Object(obj));
+            }
+            Role::Assistant => {
+                let mut obj = Map::new();
+                obj.insert("role".into(), json!("assistant"));
+                obj.insert("content".into(), json!(m.text));
+                if !m.tool_calls.is_empty() {
+                    let tcs: Vec<Value> = m
+                        .tool_calls
+                        .iter()
+                        .map(|tc| {
+                            // arguments → OBJECT (parse the raw-string args; fallback {}).
+                            let args: Value = serde_json::from_str(tc.arguments.trim())
+                                .ok()
+                                .filter(Value::is_object)
+                                .unwrap_or_else(|| json!({}));
+                            json!({ "function": { "name": tc.name, "arguments": args } })
+                        })
+                        .collect();
+                    obj.insert("tool_calls".into(), json!(tcs));
+                }
+                out.push(Value::Object(obj));
+            }
+            Role::Tool => {
+                // Tool RESULT. Ollama matches by ORDER (no tool_call_id on the wire).
+                out.push(json!({ "role": "tool", "content": m.text }));
+            }
+        }
+    }
+    out
+}
+
+/// Build the `/api/chat` request body. Deterministic (BTreeMap-backed `Map`).
+fn build_request_body(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    options: &ChatOptions,
+    cfg: &OllamaConfig,
+) -> Value {
+    let mut body = Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("messages".into(), json!(format_messages(messages)));
+    body.insert("stream".into(), json!(true));
+
+    // `options` sub-object — only inserted if it has at least one knob.
+    let mut opts = Map::new();
+    if let Some(t) = options.temperature {
+        opts.insert("temperature".into(), json!(t));
+    }
+    if let Some(mt) = options.max_tokens.or(cfg.max_tokens) {
+        opts.insert("num_predict".into(), json!(mt));
+    }
+    if !opts.is_empty() {
+        body.insert("options".into(), Value::Object(opts));
+    }
+
+    // Thinking: a per-call effort level wins (`think:"high"`), else the cfg flag
+    // (`think:true`). `tool_choice` has no Ollama equivalent — ignored.
+    let _ = ToolChoice::Auto;
+    if let Some(effort) = options.reasoning_effort {
+        body.insert("think".into(), json!(effort_str(effort)));
+    } else if cfg.think {
+        body.insert("think".into(), json!(true));
+    }
+
+    if !tools.is_empty() {
+        // OpenAI-style tool definitions.
+        let t: Vec<Value> = tools
+            .iter()
+            .map(|td| {
+                json!({
+                    "type": "function",
+                    "function": { "name": td.name, "description": td.description, "parameters": td.parameters }
+                })
+            })
+            .collect();
+        body.insert("tools".into(), json!(t));
+    }
+    Value::Object(body)
+}
+
+fn effort_str(e: ReasoningEffort) -> &'static str {
+    match e {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Max => "max",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+fn open_error(e: reqwest::Error) -> ProviderError {
+    ProviderError {
+        retryable: e.is_timeout() || e.is_connect(),
+        message: format!("open failed: {e}"),
+        ..Default::default()
+    }
+}
+
+fn truncate_msg(s: &str) -> String {
+    const CAP: usize = 2048;
+    if s.len() <= CAP {
+        return s.to_string();
+    }
+    let mut end = CAP;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+// ---------------------------------------------------------------------------
+// NDJSON decoding (unit-testable, no network)
+// ---------------------------------------------------------------------------
+
+/// Stateful NDJSON decoder. Feed raw byte chunks; get whole kernel `StreamEvent`s. Each
+/// complete line is one JSON object; tool calls arrive whole (no buffering needed).
+struct OllamaNdjsonDecoder {
+    buf: Vec<u8>,
+    tool_index: u32,
+    truncated: bool,
+    done: bool,
+}
+
+impl OllamaNdjsonDecoder {
+    fn new() -> Self {
+        Self { buf: Vec::new(), tool_index: 0, truncated: false, done: false }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = self.buf.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&raw);
+            let text = text.trim();
+            if !text.is_empty() {
+                self.process_line(text, &mut out);
+            }
+            if self.done {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Stream EOF: if a final `done:true` line was never seen, flush a `Done`.
+    fn finish(&mut self) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        if !self.done {
+            out.push(StreamEvent::Done { truncated: self.truncated });
+            self.done = true;
+        }
+        out
+    }
+
+    fn process_line(&mut self, line: &str, out: &mut Vec<StreamEvent>) {
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        // A streamed error line: `{"error":"..."}`.
+        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+            out.push(StreamEvent::Error(ProviderError {
+                retryable: false,
+                message: format!("provider error: {}", truncate_msg(err)),
+                http_status: None,
+                code: None,
+            }));
+            self.done = true;
+            return;
+        }
+        if let Some(msg) = v.get("message") {
+            if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
+                if !c.is_empty() {
+                    out.push(StreamEvent::TextDelta(c.to_string()));
+                }
+            }
+            // Thinking models: plain-text reasoning, no signature.
+            if let Some(t) = msg.get("thinking").and_then(|t| t.as_str()) {
+                if !t.is_empty() {
+                    out.push(StreamEvent::Reasoning(t.to_string()));
+                }
+            }
+            if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in tcs {
+                    let f = tc.get("function");
+                    let name = f.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    // arguments is an OBJECT → serialize to the kernel's raw-string form.
+                    let args = f
+                        .and_then(|f| f.get("arguments"))
+                        .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".into()))
+                        .unwrap_or_else(|| "{}".into());
+                    // Ollama tool calls carry NO id; synthesize a stable one so the kernel
+                    // can pair the call with its result (id stays internal).
+                    let id = format!("ollama_call_{}", self.tool_index);
+                    self.tool_index += 1;
+                    out.push(StreamEvent::ToolCall(ToolCall { id, name, arguments: args }));
+                }
+            }
+        }
+        if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+            if v.get("done_reason").and_then(|r| r.as_str()) == Some("length") {
+                self.truncated = true;
+            }
+            let prompt = v.get("prompt_eval_count").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+            let completion = v.get("eval_count").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+            if prompt > 0 || completion > 0 {
+                out.push(StreamEvent::Usage(TokenUsage { prompt, completion, cached: 0 }));
+            }
+            out.push(StreamEvent::Done { truncated: self.truncated });
+            self.done = true;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests (deterministic, no network)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomcode_kernel::message::ImageContent;
+
+    fn cfg() -> OllamaConfig {
+        OllamaConfig::new("http://localhost:11434", "qwen3")
+    }
+
+    // ---- request building ----
+
+    #[test]
+    fn roles_map_with_object_tool_args_and_tool_role() {
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("hi"),
+            Message::assistant("", vec![ToolCall { id: "x".into(), name: "read".into(), arguments: "{\"p\":\"a\"}".into() }]),
+            Message::tool_result("x", "body", false),
+        ];
+        let out = format_messages(&msgs);
+        assert_eq!(out[0], json!({"role":"system","content":"sys"}));
+        assert_eq!(out[1], json!({"role":"user","content":"hi"}));
+        // assistant tool_calls: arguments is an OBJECT, no id on the wire.
+        assert_eq!(out[2], json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"read","arguments":{"p":"a"}}}]}));
+        // tool result → role tool (no tool_call_id on the wire; matched by order).
+        assert_eq!(out[3], json!({"role":"tool","content":"body"}));
+    }
+
+    #[test]
+    fn coalesces_consecutive_system_messages_into_one() {
+        // persona + memory.md as two leading System messages must merge into ONE wire
+        // system entry — many chat templates accept only a single system message.
+        let msgs = vec![
+            Message::system("persona"),
+            Message::system("MEMORY\n- fact"),
+            Message::user("hi"),
+        ];
+        let out = format_messages(&msgs);
+        assert_eq!(out.iter().filter(|v| v["role"] == "system").count(), 1, "{out:?}");
+        assert_eq!(out[0], json!({"role":"system","content":"persona\n\nMEMORY\n- fact"}));
+        assert_eq!(out[1], json!({"role":"user","content":"hi"}));
+    }
+
+    #[test]
+    fn user_images_are_bare_base64_array() {
+        let m = Message::user_with_images("look", vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }]);
+        let out = format_messages(&[m]);
+        assert_eq!(out[0], json!({"role":"user","content":"look","images":["QUJD"]}));
+    }
+
+    #[test]
+    fn body_basics_options_tools_and_think() {
+        let mut c = cfg();
+        c.think = true;
+        let opts = ChatOptions { temperature: Some(0.5), max_tokens: Some(128), ..Default::default() };
+        let tools = vec![ToolDef { name: "read".into(), description: "d".into(), parameters: json!({"type":"object"}) }];
+        let body = build_request_body("qwen3", &[Message::user("hi")], &tools, &opts, &c);
+        assert_eq!(body["model"], "qwen3");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["options"]["temperature"], 0.5);
+        assert_eq!(body["options"]["num_predict"].as_u64(), Some(128));
+        assert_eq!(body["think"], true, "cfg.think → think:true");
+        // OpenAI-style tool definition.
+        assert_eq!(body["tools"][0], json!({"type":"function","function":{"name":"read","description":"d","parameters":{"type":"object"}}}));
+    }
+
+    #[test]
+    fn body_omits_empty_options_and_tools_and_think() {
+        let body = build_request_body("qwen3", &[Message::user("hi")], &[], &ChatOptions::default(), &cfg());
+        assert!(body.get("options").is_none(), "no options knobs → omit options");
+        assert!(body.get("tools").is_none(), "empty tools omitted");
+        assert!(body.get("think").is_none(), "think off by default");
+    }
+
+    #[test]
+    fn reasoning_effort_maps_to_think_level() {
+        let opts = ChatOptions { reasoning_effort: Some(ReasoningEffort::High), ..Default::default() };
+        let body = build_request_body("qwen3", &[Message::user("hi")], &[], &opts, &cfg());
+        assert_eq!(body["think"], "high", "per-call effort → think level string");
+    }
+
+    #[test]
+    fn body_serialization_is_deterministic() {
+        let opts = ChatOptions { temperature: Some(0.7), max_tokens: Some(64), ..Default::default() };
+        let tools = vec![
+            ToolDef { name: "b".into(), description: "db".into(), parameters: json!({"type":"object","properties":{"z":{"type":"string"},"a":{"type":"number"}}}) },
+            ToolDef { name: "a".into(), description: "da".into(), parameters: json!({"type":"object"}) },
+        ];
+        let msgs = vec![Message::system("s"), Message::user("u")];
+        let first = serde_json::to_string(&build_request_body("qwen3", &msgs, &tools, &opts, &cfg())).unwrap();
+        for _ in 0..100 {
+            let again = serde_json::to_string(&build_request_body("qwen3", &msgs, &tools, &opts, &cfg())).unwrap();
+            assert_eq!(first, again, "request body serialization must be deterministic");
+        }
+    }
+
+    // ---- NDJSON decoding ----
+
+    fn kinds(ev: &[StreamEvent]) -> Vec<&'static str> {
+        ev.iter()
+            .map(|e| match e {
+                StreamEvent::Reasoning(_) => "reason",
+                StreamEvent::ReasoningSignature { .. } => "reasonsig",
+                StreamEvent::TextDelta(_) => "text",
+                StreamEvent::ToolCall(_) => "tool",
+                StreamEvent::ToolCallDelta { .. } => "tooldelta",
+                StreamEvent::Usage(_) => "usage",
+                StreamEvent::ResponseId(_) => "response_id",
+                StreamEvent::Done { .. } => "done",
+                StreamEvent::Error(_) => "error",
+            })
+            .collect()
+    }
+
+    fn nd(v: Value) -> String {
+        format!("{v}\n")
+    }
+
+    #[test]
+    fn ndjson_content_then_thinking_then_usage_done() {
+        let mut d = OllamaNdjsonDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(nd(json!({"message":{"role":"assistant","thinking":"hmm"},"done":false})).as_bytes()));
+        ev.extend(d.feed(nd(json!({"message":{"role":"assistant","content":"Hel"},"done":false})).as_bytes()));
+        ev.extend(d.feed(nd(json!({"message":{"role":"assistant","content":"lo"},"done":false})).as_bytes()));
+        ev.extend(d.feed(nd(json!({"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":7,"eval_count":2})).as_bytes()));
+        assert_eq!(kinds(&ev), vec!["reason", "text", "text", "usage", "done"]);
+        let u = ev.iter().find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None }).unwrap();
+        assert_eq!(u.prompt, 7);
+        assert_eq!(u.completion, 2);
+        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+    }
+
+    #[test]
+    fn ndjson_tool_call_emitted_whole_with_synth_id_and_string_args() {
+        let mut d = OllamaNdjsonDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(nd(json!({"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"Paris"}}}]},"done":false})).as_bytes()));
+        ev.extend(d.feed(nd(json!({"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":3,"eval_count":1})).as_bytes()));
+        let tc = ev.iter().find_map(|e| if let StreamEvent::ToolCall(c) = e { Some(c.clone()) } else { None }).unwrap();
+        assert_eq!(tc.name, "get_weather");
+        assert_eq!(tc.id, "ollama_call_0", "synthesized stable id");
+        // arguments serialized back to a string for the kernel; valid JSON.
+        let parsed: Value = serde_json::from_str(&tc.arguments).unwrap();
+        assert_eq!(parsed, json!({"city":"Paris"}));
+    }
+
+    #[test]
+    fn ndjson_done_reason_length_sets_truncated() {
+        let mut d = OllamaNdjsonDecoder::new();
+        let ev = d.feed(nd(json!({"message":{"role":"assistant","content":"x"},"done":true,"done_reason":"length","eval_count":1})).as_bytes());
+        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: true }));
+    }
+
+    #[test]
+    fn ndjson_error_line_surfaces_and_terminates() {
+        let mut d = OllamaNdjsonDecoder::new();
+        let ev = d.feed(nd(json!({"error":"model 'nope' not found"})).as_bytes());
+        let e = ev.iter().find_map(|e| if let StreamEvent::Error(e) = e { Some(e.clone()) } else { None }).expect("error surfaced");
+        assert!(e.message.contains("not found"));
+        assert!(!e.retryable);
+    }
+
+    #[test]
+    fn ndjson_byte_split_robust_and_utf8_safe() {
+        let payload = format!(
+            "{}{}",
+            nd(json!({"message":{"role":"assistant","content":"héllo世界"},"done":false})),
+            nd(json!({"message":{"role":"assistant","content":""},"done":true,"eval_count":1})),
+        );
+        let mut d1 = OllamaNdjsonDecoder::new();
+        let whole = d1.feed(payload.as_bytes());
+        let mut d2 = OllamaNdjsonDecoder::new();
+        let mut split = Vec::new();
+        for b in payload.as_bytes() {
+            split.extend(d2.feed(&[*b]));
+        }
+        assert_eq!(format!("{whole:?}"), format!("{split:?}"));
+        assert!(matches!(&whole[0], StreamEvent::TextDelta(s) if s == "héllo世界"));
+    }
+
+    #[test]
+    fn ndjson_finish_without_done_flushes() {
+        let mut d = OllamaNdjsonDecoder::new();
+        let mut ev = d.feed(nd(json!({"message":{"role":"assistant","content":"x"},"done":false})).as_bytes());
+        ev.extend(d.finish());
+        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { .. }));
+    }
+}

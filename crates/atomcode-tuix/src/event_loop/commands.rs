@@ -114,7 +114,13 @@ fn spawn_runtime(
     Session,
 ) {
     let runtime_id = ctx.bg_manager.allocate_runtime_id();
-    let (client, event_rx) = ctx.runtime_factory.spawn_runtime(Conversation::new());
+    // Engine v2: spawn through the injected bridge so in-TUI session switches run
+    // on the new stack too. The override reads the CURRENT config/working_dir (the
+    // same values the v1 factory would), keeping /model /provider /cd honoured.
+    let (client, event_rx) = match &ctx.runtime_spawn_override {
+        Some(spawn) => spawn(&ctx.config, &ctx.working_dir),
+        None => ctx.runtime_factory.spawn_runtime(Conversation::new()),
+    };
     bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
     (runtime_id, client, session)
 }
@@ -511,6 +517,32 @@ pub(super) fn execute_slash_command(
             ));
             renderer.flush();
         }
+        "review" => {
+            // Trigger the v2 coding agent's `code_review` sub-agent tool. Map the optional
+            // arg to the tool's scope (default = working-tree changes; `staged`; or a base
+            // ref), then the model calls the tool and summarizes its findings. If the
+            // running engine lacks the tool (e.g. legacy v1), the model simply says so.
+            let scope = arg.trim();
+            let text = if scope.is_empty() {
+                "Review my current uncommitted changes: call the `code_review` tool with no \
+                 arguments, then give me a concise summary of its findings."
+                    .to_string()
+            } else if scope.eq_ignore_ascii_case("staged") {
+                "Review my staged changes: call the `code_review` tool with {\"staged\": true}, \
+                 then give me a concise summary of its findings."
+                    .to_string()
+            } else {
+                format!(
+                    "Review the changes since `{scope}`: call the `code_review` tool with \
+                     {{\"base\": \"{scope}\"}}, then give me a concise summary of its findings."
+                )
+            };
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SendMessage { text, images: vec![], image_markers: vec![] })
+                .ok();
+            state.on_submit();
+        }
         "config" => {
             // Head: current active provider + config path so users know
             // which provider is talking and where to edit.
@@ -789,13 +821,13 @@ pub(super) fn execute_slash_command(
             } else {
                 0
             };
-            let cost = atomcode_core::pricing::calculate_cost(
+            let cost = crate::pricing::calculate_cost(
                 &ctx.model_name,
                 state.prompt_tokens,
                 state.completion_tokens,
                 state.cached_tokens,
             );
-            let cost_str = atomcode_core::pricing::format_cost(cost);
+            let cost_str = crate::pricing::format_cost(cost);
             renderer.render(UiLine::CommandOutput(
                 t(Msg::CostReport {
                     prompt: state.prompt_tokens,
@@ -1360,7 +1392,7 @@ pub(super) fn execute_slash_command(
                 renderer.flush();
                 return Ok(());
             }
-            let content = atomcode_core::init::generate_project_instructions(&ctx.working_dir);
+            let content = crate::init::generate_project_instructions(&ctx.working_dir);
             match std::fs::write(&target, &content) {
                 Ok(()) => {
                     let path_str = target.display().to_string();
@@ -1568,6 +1600,12 @@ pub(super) fn execute_slash_command(
                 );
                 ctx.mcp_registry = Some(std::sync::Arc::new(registry));
                 ctx.mcp_connect_rx = Some(rx);
+
+                // The driver registry above feeds the palette; the ENGINE binds its own MCP
+                // at prepare time. Ask it to re-prepare so the reloaded servers reach the
+                // model too. (Legacy engine: a no-op hook reload; engine v2: a Resume
+                // respawn that re-mounts MCP/skills/hooks.)
+                ctx.agent.cmd_tx.send(AgentCommand::ReloadHooks).ok();
 
                 renderer.render(UiLine::CommandOutput(
                     t(Msg::McpClearedReconnecting { removed }).into_owned(),
@@ -2542,7 +2580,7 @@ fn parse_scope_arg(s: &str) -> atomcode_core::plugin::InstallScope {
 
 /// Handle `/worktree` subcommands: create, list, done, cleanup.
 fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> Result<()> {
-    use atomcode_core::git::worktree::WorktreeManager;
+    use crate::git::worktree::WorktreeManager;
 
     let parts: Vec<&str> = arg.split_whitespace().collect();
     let sub = parts.first().map(|s| s.to_ascii_lowercase());

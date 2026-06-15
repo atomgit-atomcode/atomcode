@@ -649,12 +649,27 @@ pub struct McpReloadProgress {
     pub started_at: std::time::Instant,
 }
 
+/// Optional override for spawning agent runtimes. `None` ⇒ use
+/// `runtime_factory.spawn_runtime` (the v1 engine). When set, in-TUI session
+/// switches (`/session`, `/bg`, disk `/resume`) spawn through it instead — the
+/// cli injects the engine-v2 bridge here. It receives the CURRENT config +
+/// working dir (so it tracks `/model` / `/provider` / `/cd`) and returns the same
+/// `(client, event_rx)` pair the factory does.
+pub type RuntimeSpawnOverride = std::sync::Arc<
+    dyn Fn(&Config, &std::path::Path) -> (AgentClient, mpsc::UnboundedReceiver<AgentEvent>)
+        + Send
+        + Sync,
+>;
+
 /// Bag of handles passed into the loop.
 pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
     pub agent: AgentClient,
     pub runtime_factory: AgentRuntimeFactory,
+    /// Optional engine-v2 spawner; `None` ⇒ the v1 `runtime_factory`. See
+    /// [`RuntimeSpawnOverride`].
+    pub runtime_spawn_override: Option<RuntimeSpawnOverride>,
     pub bg_manager: bg_runtime::BgRuntimeManager,
     pub foreground_runtime_id: bg_runtime::RuntimeId,
     pub runtime_event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
@@ -802,7 +817,7 @@ pub struct LoopCtx {
     /// `<project>/.atomcode/commands/`. Queried by the slash-command
     /// dispatcher as a fallback when the entered name doesn't match a
     /// built-in command.
-    pub custom_commands: atomcode_core::commands::CustomCommandRegistry,
+    pub custom_commands: crate::custom_commands::CustomCommandRegistry,
     /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). Same `Arc`
     /// the agent loop holds, so `reload(...)` there is visible here
     /// without extra plumbing. Used by the slash-command palette to
@@ -1613,7 +1628,7 @@ mod buffer_tests {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
-    use atomcode_core::commands::CustomCommandRegistry;
+    use crate::custom_commands::CustomCommandRegistry;
 
     #[test]
     fn non_slash_input_returns_no_menu() {
@@ -1729,10 +1744,12 @@ mod menu_tests {
 
         let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("/skills (with space) must list skills");
-        assert!(items.iter().any(|(n, _)| n == "skills:brainstorming"));
-        assert!(items.iter().any(|(n, _)| n == "skills:web-access"));
+        // Sub-mode lists BARE names (the dispatcher re-qualifies to `skills:<name>` on
+        // submit) — matches build_skill_menu_items_lists_unique_bare_names + the documented design.
+        assert!(items.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "web-access"));
         for (n, _) in &items {
-            assert!(n.contains(':'), "sub-mode names must be qualified: {}", n);
+            assert!(!n.contains(':'), "sub-mode names are bare: {}", n);
         }
     }
 
@@ -1750,12 +1767,12 @@ mod menu_tests {
         let bra = build_menu_items("/skills bra", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(bra.len(), 1);
-        assert_eq!(bra[0].0, "skills:brainstorming");
+        assert_eq!(bra[0].0, "brainstorming");
 
         let web = build_menu_items("/skills web", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(web.len(), 1);
-        assert_eq!(web[0].0, "skills:web-access");
+        assert_eq!(web[0].0, "web-access");
 
         assert!(build_menu_items("/skills zz", 0, &reg, &custom, Some(&lock), None).is_none());
     }
@@ -1786,9 +1803,9 @@ mod menu_tests {
 
         let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("at least one visible skill should produce a menu");
-        assert!(items.iter().any(|(n, _)| n == "skills:visible"));
+        assert!(items.iter().any(|(n, _)| n == "visible"));
         assert!(
-            !items.iter().any(|(n, _)| n == "skills:hidden"),
+            !items.iter().any(|(n, _)| n == "hidden"),
             "user_invocable=false skill leaked into sub-menu"
         );
     }
@@ -2689,6 +2706,26 @@ mod tool_format_tests {
     #[test]
     fn summarise_single_line_returned_as_is() {
         assert_eq!(summarise("ok"), "ok");
+    }
+
+    #[test]
+    fn plan_mode_block_reason_detects_gate_blocks() {
+        // A PlanModeGate block → calm hint (reason without the `blocked: ` prefix).
+        assert_eq!(
+            plan_mode_block_reason(
+                "blocked: plan mode is active — `write_file` would modify the workspace",
+                false
+            ),
+            Some("plan mode is active — `write_file` would modify the workspace")
+        );
+        // Successes, non-block failures, and OTHER middleware blocks (e.g. approval
+        // deny) are NOT plan-mode hints → normal ✗ result render.
+        assert_eq!(plan_mode_block_reason("ok", true), None);
+        assert_eq!(plan_mode_block_reason("Error: file not found", false), None);
+        assert_eq!(
+            plan_mode_block_reason("blocked: denied by approval policy: bash", false),
+            None
+        );
     }
 
     #[test]
@@ -4681,7 +4718,7 @@ fn build_menu_items(
     buf: &str,
     cursor: usize,
     commands: &CommandRegistry,
-    custom: &atomcode_core::commands::CustomCommandRegistry,
+    custom: &crate::custom_commands::CustomCommandRegistry,
     skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
     file_index: Option<&file_index::FileIndex>,
 ) -> Option<Vec<(String, String)>> {
@@ -5795,7 +5832,7 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
         warnings = guard.reload(&ctx.working_dir);
         loaded = guard.all().count();
     }
-    ctx.custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&ctx.working_dir);
+    ctx.custom_commands = crate::custom_commands::CustomCommandRegistry::load(&ctx.working_dir);
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal
     // so plugin-contributed hooks (especially UserPromptSubmit) fire on the
     // next user message rather than waiting for /cd or restart.
@@ -6812,8 +6849,15 @@ fn handle_agent_event(
                 });
             }
             if !suppress_body_echo {
-                let summary = summarise(&output);
-                renderer.render(UiLine::ToolResult { success, summary });
+                // A plan-mode interception isn't a failure — render it as a calm `○`
+                // hint (with the gate's reason) instead of a ✗ error, so the user
+                // sees WHY the tool didn't run and that they should review the plan.
+                if let Some(reason) = plan_mode_block_reason(&output, success) {
+                    renderer.render(UiLine::CommandOutput(format!("  ○ {reason}\n")));
+                } else {
+                    let summary = summarise(&output);
+                    renderer.render(UiLine::ToolResult { success, summary });
+                }
             }
             // Collect diff lines into a single batch — N individual
             // DiffLine renders each trigger a full footer redraw and
@@ -8595,6 +8639,22 @@ pub(crate) fn summarise(output: &str) -> String {
     } else {
         trimmed
     }
+}
+
+/// A plan-mode interception surfaces as a failed tool result whose body is
+/// `blocked: plan mode …` — the kernel prefixes every middleware block with `blocked: `,
+/// and `PlanModeGate`'s reason starts with `plan mode is active`. Returns the human reason
+/// (sans the `blocked: ` prefix) when the result is such a block, so the UI can render a
+/// calm `○` hint instead of a ✗ error — plan-mode enforcement is EXPECTED, not a failure.
+/// The model still receives the full `blocked: …` ToolResult via the conversation. The link
+/// to the gate's wording is by string; if it ever drifts this returns `None` and the normal
+/// ✗ result render is used (a harmless fallback, never a panic).
+pub(crate) fn plan_mode_block_reason(output: &str, success: bool) -> Option<&str> {
+    if success {
+        return None;
+    }
+    let reason = output.strip_prefix("blocked: ")?;
+    reason.starts_with("plan mode").then_some(reason)
 }
 
 // SessionPicker tests moved alongside the struct in

@@ -106,6 +106,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "issue",   desc: "Report a bug / request a feature for AtomCode itself (interactive wizard)", needs_args: false },
     Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false },
     Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
+    Command { name: "review",  desc: "Code review the current changes (/review · /review staged · /review <base>)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     // Gateway entry: opens a second-level palette (high / max / off).
     // needs_args=true so Enter rewrites the buffer to `/effort ` and the
@@ -486,11 +487,22 @@ mod tests {
 
     #[test]
     fn complete_custom_commands() {
-        let custom = vec![("review".to_string(), "Code review".to_string())];
-        let candidates = complete_commands("rev", &custom);
+        // Use a name with NO built-in collision ("review" is now a built-in, which would
+        // shadow a same-named custom command — see `builtin_takes_precedence`).
+        let custom = vec![("deploy".to_string(), "Deploy app".to_string())];
+        let candidates = complete_commands("dep", &custom);
         assert!(
-            candidates.iter().any(|c| c.name == "review" && c.is_custom),
-            "\"rev\" should match custom \"review\""
+            candidates.iter().any(|c| c.name == "deploy" && c.is_custom),
+            "\"dep\" should match custom \"deploy\""
+        );
+    }
+
+    #[test]
+    fn review_is_a_builtin_command() {
+        let candidates = complete_commands("rev", &[]);
+        assert!(
+            candidates.iter().any(|c| c.name == "review" && !c.is_custom),
+            "/review must be a built-in command"
         );
     }
 
