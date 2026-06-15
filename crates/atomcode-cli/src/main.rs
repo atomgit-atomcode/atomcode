@@ -194,6 +194,96 @@ fn is_running_as_backup() -> bool {
 ///
 /// Deliberately scans argv by hand — clap hasn't parsed yet at this point
 /// in main(), and we need to decide before any slower setup happens.
+
+/// Scan argv by hand to extract the value of --lang <VALUE> or --lang=VALUE.
+/// This runs BEFORE clap parses the arguments, so that the i18n locale
+/// can be set in time for clap to render localised --help text.
+fn scan_argv_for_lang() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1; // skip program name
+    while i < args.len() {
+        if args[i] == "--lang" && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+        if let Some(val) = args[i].strip_prefix("--lang=") {
+            return Some(val.to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+
+/// Scan the config file (default path only) for the `language` field.
+/// Returns `None` if the config file does not exist, cannot be parsed, or
+/// has no `language` key. This is a lightweight pre-parse -- the full config
+/// is loaded later in `run()` after clap has parsed CLI flags.
+fn scan_config_language() -> Option<atomcode_tuix::i18n::Locale> {
+    let path = atomcode_core::config::Config::default_path();
+    if !path.exists() {
+        return None;
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let cfg: atomcode_core::config::Config = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    cfg.language
+}
+
+
+/// Build the top-level clap Command with i18n-localised about and help text.
+/// This replaces the default Cli::parse() flow so that --help output
+/// respects the current locale (set by scan_argv_for_lang above).
+fn build_i18n_command() -> clap::Command {
+    use atomcode_tuix::i18n::{t, Msg};
+    use clap::CommandFactory;
+
+    let cmd = Cli::command();
+
+    // Mutate the top-level about
+    let cmd = cmd.about(t(Msg::CliAbout).into_owned());
+
+    // Mutate top-level argument help texts
+    let cmd = cmd
+        .mut_arg("continue_last", |a| a.help(t(Msg::CliHelpContinue).into_owned()))
+        .mut_arg("provider", |a| a.help(t(Msg::CliHelpProvider).into_owned()))
+        .mut_arg("model", |a| a.help(t(Msg::CliHelpModel).into_owned()))
+        .mut_arg("lang", |a| a.help(t(Msg::CliHelpLang).into_owned()))
+        .mut_arg("config", |a| a.help(t(Msg::CliHelpConfig).into_owned()))
+        .mut_arg("dir", |a| a.help(t(Msg::CliHelpDir).into_owned()))
+        .mut_arg("prompt", |a| a.help(t(Msg::CliHelpPrompt).into_owned()))
+        .mut_arg("prompt_file", |a| a.help(t(Msg::CliHelpPromptFile).into_owned()))
+        .mut_arg("verbose", |a| a.help(t(Msg::CliHelpVerbose).into_owned()))
+        .mut_arg("max_turns", |a| a.help(t(Msg::CliHelpMaxTurns).into_owned()))
+        .mut_arg("dev", |a| a.help(t(Msg::CliHelpDev).into_owned()))
+        .mut_arg("disable_tools", |a| a.help(t(Msg::CliHelpDisableTools).into_owned()))
+        .mut_arg("no_telemetry", |a| a.help(t(Msg::CliHelpNoTelemetry).into_owned()))
+        .mut_arg("dangerously_skip_permissions", |a| a.help(t(Msg::CliHelpDangerouslySkipPermissions).into_owned()));
+
+    // Mutate subcommand about texts
+    let cmd = cmd
+        .mut_subcommand("login", |s| s.about(t(Msg::CliAboutLogin).into_owned()))
+        .mut_subcommand("logout", |s| s.about(t(Msg::CliAboutLogout).into_owned()))
+        .mut_subcommand("status", |s| s.about(t(Msg::CliAboutStatus).into_owned()))
+        .mut_subcommand("upgrade", |s| s.about(t(Msg::CliAboutUpgrade).into_owned()))
+        .mut_subcommand("rollback", |s| s.about(t(Msg::CliAboutRollback).into_owned()))
+        .mut_subcommand("fixissue", |s| s.about(t(Msg::CliAboutFixissue).into_owned()))
+        .mut_subcommand("mcp", |s| s.about(t(Msg::CliAboutMcp).into_owned()))
+        .mut_subcommand("daemon", |s| s.about(t(Msg::CliAboutDaemon).into_owned()))
+        .mut_subcommand("webui", |s| s.about(t(Msg::CliAboutWebui).into_owned()))
+        .mut_subcommand("telemetry", |s| s.about(t(Msg::CliAboutTelemetry).into_owned()))
+        .mut_subcommand("plugin", |s| s.about(t(Msg::CliAboutPlugin).into_owned()))
+        .mut_subcommand("uninstall", |s| s.about(t(Msg::CliAboutUninstall).into_owned()))
+        .mut_subcommand("setup", |s| s.about(t(Msg::CliAboutSetup).into_owned()))
+        .mut_subcommand("hooks", |s| s.about(t(Msg::CliAboutHooks).into_owned()));
+
+    cmd
+}
+
 fn should_try_sync_upgrade() -> bool {
     if is_running_as_backup() {
         return false;
@@ -902,6 +992,27 @@ async fn async_main() {
 }
 
 async fn run() -> Result<i32> {
+    // -- Pre-parse --lang to set locale BEFORE clap renders --help --
+    // clap help text is generated during parse, so we must resolve
+    // the locale first (from --lang flag, env vars, or config) so that
+    // the i18n system is ready when clap calls our dynamic about/help closures.
+    let pre_lang = scan_argv_for_lang();
+    // Also read config language field so --help respects /language setting.
+    let pre_config_lang = scan_config_language();
+    let pre_locale = atomcode_tuix::i18n::resolve_initial_locale(pre_lang.as_deref(), pre_config_lang);
+    atomcode_tuix::i18n::set_locale(pre_locale);
+
+    // Build the clap Command with i18n-injected about/help text, then parse.
+    // Check if --help or -h was requested by scanning argv.
+    // If so, render the i18n-localised help via our custom Command and exit.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        let help_cmd = build_i18n_command();
+        help_cmd.try_get_matches_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
+        // Unreachable: e.exit() prints the localised help and exits.
+    }
+
+    // No --help was passed. Parse normally to get the Cli struct.
     let cli = Cli::parse();
 
     let is_admin = atomcode_core::process_utils::is_running_as_admin();
@@ -1189,8 +1300,13 @@ async fn run() -> Result<i32> {
     };
 
     // ── i18n locale ──
-    let locale = atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
-    atomcode_tuix::i18n::set_locale(locale);
+    // Locale was already pre-resolved above (before clap parse) so --help
+    // could be localised. Re-resolve with the full config (which may specify
+    // a language key) to honour config-over-env priority.
+    if config.language.is_some() {
+        let locale = atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
+        atomcode_tuix::i18n::set_locale(locale);
+    }
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
     //
