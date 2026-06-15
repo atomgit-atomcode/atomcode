@@ -806,13 +806,13 @@ pub(super) fn execute_slash_command(
             } else {
                 0
             };
-            let cost = atomcode_core::pricing::calculate_cost(
+            let cost = crate::pricing::calculate_cost(
                 &ctx.model_name,
                 state.prompt_tokens,
                 state.completion_tokens,
                 state.cached_tokens,
             );
-            let cost_str = atomcode_core::pricing::format_cost(cost);
+            let cost_str = crate::pricing::format_cost(cost);
             renderer.render(UiLine::CommandOutput(
                 t(Msg::CostReport {
                     prompt: state.prompt_tokens,
@@ -1377,7 +1377,7 @@ pub(super) fn execute_slash_command(
                 renderer.flush();
                 return Ok(());
             }
-            let content = atomcode_core::init::generate_project_instructions(&ctx.working_dir);
+            let content = crate::init::generate_project_instructions(&ctx.working_dir);
             match std::fs::write(&target, &content) {
                 Ok(()) => {
                     let path_str = target.display().to_string();
@@ -2477,7 +2477,7 @@ fn parse_scope_arg(s: &str) -> atomcode_core::plugin::InstallScope {
 
 /// Handle `/worktree` subcommands: create, list, done, cleanup.
 fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> Result<()> {
-    use atomcode_core::git::worktree::WorktreeManager;
+    use crate::git::worktree::WorktreeManager;
 
     let parts: Vec<&str> = arg.split_whitespace().collect();
     let sub = parts.first().map(|s| s.to_ascii_lowercase());

@@ -817,7 +817,7 @@ pub struct LoopCtx {
     /// `<project>/.atomcode/commands/`. Queried by the slash-command
     /// dispatcher as a fallback when the entered name doesn't match a
     /// built-in command.
-    pub custom_commands: atomcode_core::commands::CustomCommandRegistry,
+    pub custom_commands: crate::custom_commands::CustomCommandRegistry,
     /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). Same `Arc`
     /// the agent loop holds, so `reload(...)` there is visible here
     /// without extra plumbing. Used by the slash-command palette to
@@ -1578,7 +1578,7 @@ mod buffer_tests {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
-    use atomcode_core::commands::CustomCommandRegistry;
+    use crate::custom_commands::CustomCommandRegistry;
 
     #[test]
     fn non_slash_input_returns_no_menu() {
@@ -4654,7 +4654,7 @@ fn build_menu_items(
     buf: &str,
     cursor: usize,
     commands: &CommandRegistry,
-    custom: &atomcode_core::commands::CustomCommandRegistry,
+    custom: &crate::custom_commands::CustomCommandRegistry,
     skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
     file_index: Option<&file_index::FileIndex>,
 ) -> Option<Vec<(String, String)>> {
@@ -5763,7 +5763,7 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
         warnings = guard.reload(&ctx.working_dir);
         loaded = guard.all().count();
     }
-    ctx.custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&ctx.working_dir);
+    ctx.custom_commands = crate::custom_commands::CustomCommandRegistry::load(&ctx.working_dir);
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal
     // so plugin-contributed hooks (especially UserPromptSubmit) fire on the
     // next user message rather than waiting for /cd or restart.

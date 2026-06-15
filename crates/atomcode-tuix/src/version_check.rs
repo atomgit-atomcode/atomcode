@@ -6,7 +6,7 @@
 //! row. Any error (network, parse, non-matching format) silently returns
 //! `None` — this feature must never be noisy.
 
-use crate::self_update::{Manifest, MANIFEST_URL};
+use atomcode_core::self_update::{Manifest, MANIFEST_URL};
 
 /// Compare a `latest.json` body against the current compiled-in version.
 ///
@@ -52,7 +52,7 @@ fn format_version(v: (u64, u64, u64)) -> String {
 pub async fn check_latest(current: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
-        .user_agent(crate::ATOMCODE_USER_AGENT)
+        .user_agent(atomcode_core::ATOMCODE_USER_AGENT)
         .build()
         .ok()?;
     let resp = client.get(MANIFEST_URL).send().await.ok()?;

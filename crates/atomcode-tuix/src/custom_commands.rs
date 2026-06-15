@@ -58,13 +58,13 @@ impl CustomCommandRegistry {
     /// (`<project_root>/.atomcode/commands/`) directories, merging results.
     /// Project entries win on name collision.
     pub fn load(project_root: &Path) -> Self {
-        let config_dir = crate::config::Config::config_dir();
+        let config_dir = atomcode_core::config::Config::config_dir();
         let mut commands = HashMap::new();
         // Global first — project overrides on second pass.
         Self::load_from_dir(&config_dir.join("commands"), None, &mut commands);
         Self::load_from_dir(&project_root.join(".atomcode/commands"), None, &mut commands);
         // Plugin layer
-        for assets in crate::plugin::loader::iter_installed_plugin_assets() {
+        for assets in atomcode_core::plugin::loader::iter_installed_plugin_assets() {
             Self::load_from_dir(&assets.commands_dir(), Some(&assets.plugin), &mut commands);
         }
         Self { commands }
@@ -331,7 +331,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn list_returns_sorted_commands() {
+        // Isolate $ATOMCODE_HOME so the global commands dir and any installed
+        // plugin commands on the dev machine don't leak into the assertion.
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+
         let dir = tempfile::tempdir().unwrap();
         let cmd_dir = dir.path().join(".atomcode/commands");
         std::fs::create_dir_all(&cmd_dir).unwrap();
@@ -347,6 +353,8 @@ mod tests {
         .unwrap();
         let reg = CustomCommandRegistry::load(dir.path());
         let names: Vec<_> = reg.list().iter().map(|c| c.name.as_str()).collect();
+
+        std::env::remove_var("ATOMCODE_HOME");
         assert_eq!(names, vec!["alpha", "zebra"]);
     }
 

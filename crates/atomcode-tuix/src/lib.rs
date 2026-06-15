@@ -1,10 +1,15 @@
 // crates/atomcode-tuix/src/lib.rs
 
 pub mod commands;
+pub mod custom_commands;
 pub mod event_loop;
+pub mod git;
 pub mod highlight;
 pub mod i18n;
+pub mod init;
 pub mod input;
+pub mod pricing;
+pub mod version_check;
 pub mod markdown;
 pub mod modals;
 pub mod platform;
@@ -418,7 +423,7 @@ pub async fn run(
         let wake = wake_tx.clone();
         tokio::spawn(async move {
             let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-            if let Some(latest) = atomcode_core::version_check::check_latest(&current).await {
+            if let Some(latest) = crate::version_check::check_latest(&current).await {
                 if let Ok(mut g) = slot.lock() {
                     *g = Some(latest);
                 }
@@ -463,7 +468,7 @@ pub async fn run(
         dirs
     };
 
-    let custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
+    let custom_commands = crate::custom_commands::CustomCommandRegistry::load(&working_dir);
     // Same Arc the agent loop holds — reload() calls there propagate
     // here automatically, so the slash menu reflects newly-installed
     // skills without re-plumbing.

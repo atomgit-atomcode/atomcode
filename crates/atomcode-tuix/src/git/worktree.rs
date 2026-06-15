@@ -22,7 +22,7 @@ impl WorktreeManager {
         let mut cmd = Command::new("git");
         cmd.args(["rev-parse", "--show-toplevel"])
             .current_dir(&dir);
-        crate::process_utils::suppress_console_window_sync(&mut cmd);
+        atomcode_core::process_utils::suppress_console_window_sync(&mut cmd);
         let output = cmd.output()
             .context("Failed to resolve git repository root")?;
         if !output.status.success() {
@@ -55,7 +55,7 @@ impl WorktreeManager {
                 .arg(&worktree_path)
                 .arg(base)
                 .current_dir(&self.repo_root);
-            crate::process_utils::suppress_console_window_sync(&mut cmd);
+            atomcode_core::process_utils::suppress_console_window_sync(&mut cmd);
             cmd.output()
                 .context("Failed to run git worktree add")?
         };
@@ -77,7 +77,7 @@ impl WorktreeManager {
         let mut cmd = Command::new("git");
         cmd.args(["worktree", "list", "--porcelain"])
             .current_dir(&self.repo_root);
-        crate::process_utils::suppress_console_window_sync(&mut cmd);
+        atomcode_core::process_utils::suppress_console_window_sync(&mut cmd);
         let output = cmd.output()
             .context("Failed to run git worktree list")?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -119,7 +119,7 @@ impl WorktreeManager {
             cmd.args(&args)
                 .arg(&worktree_path)
                 .current_dir(&self.repo_root);
-            crate::process_utils::suppress_console_window_sync(&mut cmd);
+            atomcode_core::process_utils::suppress_console_window_sync(&mut cmd);
             cmd.output()
                 .context("Failed to run git worktree remove")?
         };
@@ -136,7 +136,7 @@ impl WorktreeManager {
         let mut cmd = Command::new("git");
         cmd.args(["status", "--porcelain"])
             .current_dir(worktree_path);
-        crate::process_utils::suppress_console_window_sync(&mut cmd);
+        atomcode_core::process_utils::suppress_console_window_sync(&mut cmd);
         cmd.output()
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false)
