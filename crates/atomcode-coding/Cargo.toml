@@ -14,6 +14,9 @@ atomcode-capabilities = { path = "../atomcode-capabilities", features = [
 ] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 async-trait = "0.1"
+# Stream proxying for the compaction-summary telemetry provider decorator (folds
+# StreamEvent::Usage, emits one LlmChat at stream end). Also used by tests.
+futures = "0.3"
 # Telemetry re-enters the neutral kernel via a LifecycleHooks adapter (the kernel's
 # designated `on_request`/`on_model_response` seam), wired here at assembly.
 atomcode-telemetry = { path = "../atomcode-telemetry" }
@@ -29,6 +32,3 @@ atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
 async-trait = "0.1"
-# Construct a mock provider stream in the overflow-recovery e2e (the testkit providers
-# can't model error-once-then-succeed).
-futures = "0.3"

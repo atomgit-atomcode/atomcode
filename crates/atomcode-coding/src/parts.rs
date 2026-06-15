@@ -134,7 +134,19 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
 
     if opts.web {
         registry.register(Arc::new(WebFetchTool));
-        registry.register(Arc::new(WebSearchTool::new()));
+        // web_search backend: explicit config wins; else the `ATOMCODE_WEB_SEARCH_PROVIDER`
+        // env knob (the zero-core path for legacy drivers, whose config types we can't
+        // extend); else Exa. `with_provider` maps unknown values to Exa, the safe default.
+        let provider = cfg
+            .web_search_provider
+            .clone()
+            .or_else(|| std::env::var("ATOMCODE_WEB_SEARCH_PROVIDER").ok())
+            .filter(|p| !p.trim().is_empty());
+        let web_search = match provider {
+            Some(p) => WebSearchTool::with_provider(&p),
+            None => WebSearchTool::new(),
+        };
+        registry.register(Arc::new(web_search));
         names.push("web_fetch".into());
         names.push("web_search".into());
     }
@@ -284,7 +296,20 @@ pub fn assemble(
         }
     }
 
-    let summary_provider = provider.clone(); // tier-2 overflow summary uses the same provider
+    // Tier-2 overflow summary uses the same provider. When telemetry is on, decorate it so
+    // the summary LLM call (which bypasses the turn-level TelemetryHook — it's an internal
+    // capability call, not an agent round) still records an LlmChat with its token spend.
+    let summary_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
+        Some(tel) => Arc::new(crate::telemetry::CompactionTelemetryProvider::new(
+            provider.clone(),
+            tel.clone(),
+            "openai",
+            &cfg.base_url,
+            &cfg.model,
+            parts.session.as_ref().map(|b| b.id.as_str()),
+        )),
+        None => provider.clone(),
+    };
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())

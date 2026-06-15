@@ -65,6 +65,11 @@ pub struct CodingAgentConfig {
     ///
     /// [`StubCompaction`]: atomcode_capabilities::compaction::StubCompaction
     pub compact_threshold: f32,
+    /// `web_search` backend: `"exa"` (default, globally reachable, keyless) or
+    /// `"duckduckgo"`/`"ddg"` (legacy HTML scraping, blocked in some regions). `None`/empty
+    /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
+    /// tool was hardwired to Exa with no way to opt into DDG.
+    pub web_search_provider: Option<String>,
 }
 
 /// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
@@ -103,6 +108,7 @@ impl CodingAgentConfig {
             thinking_type: None,
             thinking_keep: None,
             compact_threshold: 0.7,
+            web_search_provider: None,
         }
     }
 }

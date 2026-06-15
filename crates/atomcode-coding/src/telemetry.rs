@@ -27,10 +27,12 @@ use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message};
 use atomcode_kernel::middleware::ToolMiddleware;
-use atomcode_kernel::provider::ChatOptions;
+use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::request::RequestCtx;
+use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
 use atomcode_kernel::tool::{Tool, ToolCall, ToolDef, ToolResult};
 use atomcode_telemetry::{CurrentContext, Event, LlmErrorKind, Telemetry, ToolErrorKind};
+use futures::stream::{BoxStream, StreamExt};
 
 /// Estimate the tokens a single outgoing message contributes — the byte/4
 /// heuristic the legacy `Message::estimate_tokens` uses, adapted to the kernel's
@@ -428,11 +430,111 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
     }
 }
 
+/// An [`LlmProvider`] decorator that records one [`Event::LlmChat`] for each call made
+/// THROUGH it. Its job: count the [`OverflowCompaction`] tier-2 summary LLM call, which
+/// otherwise bypasses the turn-level [`TelemetryHook`] entirely — it is an INTERNAL
+/// capability call (history summarization), not an agent round, so `on_request` /
+/// `on_model_response` never fire for it and its token spend was invisible. This is the
+/// v2 port of core's `run_llm_summary` telemetry (`c58427a3`).
+///
+/// The emitted event is a plain `LlmChat` (the telemetry `Event` enum has no
+/// compaction-specific variant) carrying the call's REAL token usage (folded from the
+/// stream's [`StreamEvent::Usage`] events) and wall-clock duration. The per-zone
+/// breakdown is folded into the message zone (an internal summary call has no
+/// system/tool zones) so zones still sum to the prompt total. Wrapping is opt-in at
+/// assembly — only when a telemetry sink is configured — so a telemetry-free embedder
+/// keeps a zero-telemetry kernel AND an undecorated summary provider.
+///
+/// [`OverflowCompaction`]: atomcode_capabilities::compaction::OverflowCompaction
+pub struct CompactionTelemetryProvider {
+    inner: Arc<dyn LlmProvider>,
+    attr: Arc<Attribution>,
+}
+
+impl CompactionTelemetryProvider {
+    pub fn new(
+        inner: Arc<dyn LlmProvider>,
+        telemetry: Arc<Telemetry>,
+        vendor: impl Into<String>,
+        base_url: &str,
+        model: impl Into<String>,
+        session_id: Option<&str>,
+    ) -> Self {
+        Self { inner, attr: Arc::new(Attribution::new(telemetry, vendor, base_url, model, session_id)) }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for CompactionTelemetryProvider {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+    fn context_window(&self) -> u32 {
+        self.inner.context_window()
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let start = Instant::now();
+        let ctx_window = self.inner.context_window();
+        let messages_count = messages.len() as u32;
+        let inner_stream = self.inner.chat_stream(messages, tools, options).await?;
+        let attr = self.attr.clone();
+        // Proxy the inner stream verbatim, folding Usage events; when it ends, emit ONE
+        // LlmChat with the accumulated usage. `unfold`'s step closure is async, so the
+        // terminal emit can await — no extra task, the consumer's drain drives it.
+        let stream = futures::stream::unfold(
+            (inner_stream, TokenUsage::default(), false, Some((attr, start, messages_count, ctx_window))),
+            |(mut s, mut usage, had_error, mut pending)| async move {
+                match s.next().await {
+                    Some(ev) => {
+                        let had_error = match &ev {
+                            StreamEvent::Usage(u) => {
+                                usage.merge_max(*u);
+                                had_error
+                            }
+                            StreamEvent::Error(_) => true,
+                            _ => had_error,
+                        };
+                        Some((ev, (s, usage, had_error, pending)))
+                    }
+                    None => {
+                        if let Some((attr, start, messages_count, ctx_window)) = pending.take() {
+                            attr.emit(Event::LlmChat {
+                                duration_ms: start.elapsed().as_millis() as u32,
+                                tool_calls_count: 0,
+                                input_tokens: usage.prompt,
+                                output_tokens: usage.completion,
+                                cached_tokens: usage.cached,
+                                had_error,
+                                context_window: ctx_window,
+                                system_tokens: 0,
+                                tool_def_tokens: 0,
+                                tool_result_tokens: 0,
+                                // Whole prompt is the (summarizer) message zone; zones sum to total.
+                                message_tokens: usage.prompt,
+                                messages_count,
+                                error_kind: had_error.then_some(LlmErrorKind::Other),
+                                error_data: None,
+                            })
+                            .await;
+                        }
+                        None
+                    }
+                }
+            },
+        );
+        Ok(Box::pin(stream))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomcode_kernel::message::MessageMeta;
-    use atomcode_kernel::stream::TokenUsage;
 
     #[tokio::test]
     async fn emits_one_llm_chat_per_response_with_attribution() {
@@ -700,5 +802,103 @@ mod tests {
             other => panic!("expected ToolCall, got {other:?}"),
         }
         assert_eq!(records[0].envelope.model.as_deref(), Some("m"));
+    }
+
+    /// A canned summary provider: emits text, a usage report, then Done (or an Error when
+    /// `fail`), so the decorator has real usage to fold and a terminal to emit on.
+    struct CannedSummary {
+        fail: bool,
+    }
+    #[async_trait]
+    impl LlmProvider for CannedSummary {
+        fn model_name(&self) -> &str {
+            "summ"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolDef],
+            _: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            let mut evs = vec![
+                StreamEvent::TextDelta("summary text".into()),
+                StreamEvent::Usage(TokenUsage { prompt: 300, completion: 40, cached: 0 }),
+            ];
+            if self.fail {
+                evs.push(StreamEvent::Error(ProviderError {
+                    message: "boom".into(),
+                    ..Default::default()
+                }));
+            } else {
+                evs.push(StreamEvent::Done { truncated: false });
+            }
+            Ok(Box::pin(futures::stream::iter(evs)))
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_provider_records_summary_llm_chat() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        let dec = CompactionTelemetryProvider::new(
+            Arc::new(CannedSummary { fail: false }),
+            tel,
+            "openai",
+            "https://x/v1",
+            "deepseek-v4",
+            None,
+        );
+        let mut stream = dec
+            .chat_stream(&[Message::user("summarize this")], &[], &ChatOptions::default())
+            .await
+            .unwrap();
+        // Drain — the terminal LlmChat emit fires when the proxied stream ends.
+        let mut text = String::new();
+        while let Some(ev) = stream.next().await {
+            if let StreamEvent::TextDelta(t) = ev {
+                text.push_str(&t);
+            }
+        }
+        assert_eq!(text, "summary text", "stream proxied verbatim");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1, "exactly one LlmChat for the summary call");
+        match &records[0].event {
+            Event::LlmChat { input_tokens, output_tokens, had_error, message_tokens, .. } => {
+                assert_eq!(*input_tokens, 300, "folded from StreamEvent::Usage");
+                assert_eq!(*output_tokens, 40);
+                assert!(!*had_error);
+                assert_eq!(*message_tokens, 300, "prompt folded into the message zone");
+            }
+            other => panic!("expected LlmChat, got {other:?}"),
+        }
+        assert_eq!(records[0].envelope.model.as_deref(), Some("deepseek-v4"));
+    }
+
+    #[tokio::test]
+    async fn compaction_provider_marks_had_error_on_stream_error() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        let dec = CompactionTelemetryProvider::new(
+            Arc::new(CannedSummary { fail: true }),
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+        );
+        let mut stream =
+            dec.chat_stream(&[Message::user("x")], &[], &ChatOptions::default()).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        match &records[0].event {
+            Event::LlmChat { had_error, error_kind, .. } => {
+                assert!(*had_error, "stream Error → had_error");
+                assert!(error_kind.is_some());
+            }
+            other => panic!("expected LlmChat, got {other:?}"),
+        }
     }
 }
