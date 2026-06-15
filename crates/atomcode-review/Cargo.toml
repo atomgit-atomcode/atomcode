@@ -10,8 +10,14 @@ atomcode-kernel = { path = "../atomcode-kernel" }
 # code-intelligence (`codeintel`), and web_search (`web`). NO write/edit/bash mounted.
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "codeintel", "web"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# The `code_review` sub-agent tool: async Tool trait + JSON arg parsing.
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 async-trait = "0.1"
 futures = "0.3"
+# Temp git repos for the code_review tool's end-to-end test.
+tempfile = "3"

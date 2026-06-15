@@ -495,6 +495,32 @@ pub(super) fn execute_slash_command(
             ));
             renderer.flush();
         }
+        "review" => {
+            // Trigger the v2 coding agent's `code_review` sub-agent tool. Map the optional
+            // arg to the tool's scope (default = working-tree changes; `staged`; or a base
+            // ref), then the model calls the tool and summarizes its findings. If the
+            // running engine lacks the tool (e.g. legacy v1), the model simply says so.
+            let scope = arg.trim();
+            let text = if scope.is_empty() {
+                "Review my current uncommitted changes: call the `code_review` tool with no \
+                 arguments, then give me a concise summary of its findings."
+                    .to_string()
+            } else if scope.eq_ignore_ascii_case("staged") {
+                "Review my staged changes: call the `code_review` tool with {\"staged\": true}, \
+                 then give me a concise summary of its findings."
+                    .to_string()
+            } else {
+                format!(
+                    "Review the changes since `{scope}`: call the `code_review` tool with \
+                     {{\"base\": \"{scope}\"}}, then give me a concise summary of its findings."
+                )
+            };
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SendMessage { text, images: vec![], image_markers: vec![] })
+                .ok();
+            state.on_submit();
+        }
         "config" => {
             // Head: current active provider + config path so users know
             // which provider is talking and where to edit.

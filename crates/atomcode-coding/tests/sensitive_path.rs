@@ -27,6 +27,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         mcp: false,
         memory: false,
         web: false,
+        review: false,
     };
     let mut parts = prepare(&cfg, opts).await.unwrap();
 

@@ -91,11 +91,13 @@ async fn full_assembly_lifecycle() {
     h1.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = h1.task.await;
 
-    // The FULL toolset rode the wire: core + codeintel + web + skills + recall.
+    // The FULL toolset rode the wire: core + codeintel + web + skills + recall + review.
     {
         let calls = calls1.lock().unwrap();
         let defs: Vec<&str> = calls[0].1.iter().map(|d| d.name.as_str()).collect();
-        for expected in ["bash", "read_file", "list_symbols", "web_fetch", "use_skill", "recall"] {
+        for expected in
+            ["bash", "read_file", "list_symbols", "web_fetch", "use_skill", "recall", "code_review"]
+        {
             assert!(defs.contains(&expected), "missing tool {expected}: {defs:?}");
         }
     }

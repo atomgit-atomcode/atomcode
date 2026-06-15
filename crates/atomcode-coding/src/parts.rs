@@ -35,6 +35,7 @@ use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::SessionSnapshot;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, ToolRegistry};
+use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
 
 use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
@@ -72,11 +73,22 @@ pub struct PrepareOptions {
     pub memory: bool,
     /// Mount `web_fetch` / `web_search`.
     pub web: bool,
+    /// Mount the `code_review` sub-agent tool (lets the agent review the current changes
+    /// in-session via the review specialization). Reuses the host provider (set at
+    /// assemble), so it works on a signing gateway. `false` ⇒ not mounted.
+    pub review: bool,
 }
 
 impl Default for PrepareOptions {
     fn default() -> Self {
-        Self { session: SessionMode::Fresh, skill_dirs: None, mcp: true, memory: true, web: true }
+        Self {
+            session: SessionMode::Fresh,
+            skill_dirs: None,
+            mcp: true,
+            memory: true,
+            web: true,
+            review: true,
+        }
     }
 }
 
@@ -114,6 +126,10 @@ pub struct CodingParts {
     /// `SetPlanMode`); the [`PlanModeGate`](crate::PlanModeGate) middleware reads it to
     /// block mutating tools. Shared (not rebuilt) so a respawn preserves the mode.
     pub plan_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
+    /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
+    /// updates the reviewer's provider too. `None` when `opts.review` was false.
+    pub review_provider: Option<SharedReviewProvider>,
 }
 
 /// Phase 1 — gather + connect everything the agent needs (async: MCP connect,
@@ -150,6 +166,27 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
         names.push("web_fetch".into());
         names.push("web_search".into());
     }
+
+    // Review-as-capability: a `code_review` sub-agent tool. The provider is filled at
+    // assemble (the tool is built here, before the provider exists) via this shared slot,
+    // so the reviewer reuses the host's correctly-built — possibly signed — provider.
+    let review_provider: Option<SharedReviewProvider> = if opts.review {
+        let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
+        registry.register(Arc::new(ReviewTool::new(
+            slot.clone(),
+            ReviewToolConfig {
+                model: cfg.model.clone(),
+                context_window: cfg.context_window,
+                stream_timeout: cfg.stream_timeout,
+                request_timeout: cfg.request_timeout,
+                rules_dir: None,
+            },
+        )));
+        names.push("code_review".into());
+        Some(slot)
+    } else {
+        None
+    };
 
     // Skills: standard home+project precedence unless the caller supplied dirs.
     let skill_dirs = opts.skill_dirs.clone().unwrap_or_else(|| {
@@ -247,6 +284,7 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
         session,
         mcp_registry,
         mcp_events,
+        review_provider,
     })
 }
 
@@ -293,6 +331,15 @@ pub fn assemble(
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
+        }
+    }
+
+    // Fill the `code_review` tool's provider slot with the host provider (the tool was
+    // built in `prepare` before the provider existed). A model-swap respawn re-runs assemble
+    // and updates it, so the reviewer always uses the current provider.
+    if let Some(slot) = &parts.review_provider {
+        if let Ok(mut g) = slot.write() {
+            *g = Some(provider.clone());
         }
     }
 

@@ -166,6 +166,9 @@ impl Bridge {
             mcp: cfg.mcp,
             memory: true,
             web: true,
+            // The interactive coding agent gains a `code_review` capability (the /review
+            // command + model self-invocation). Reuses this agent's signed provider.
+            review: true,
         };
 
         let mut parts = match prepare(&coding_cfg, opts_template.clone()).await {
@@ -957,6 +960,8 @@ async fn run_background_task(
         mcp: false,
         memory: false,
         web: true,
+        // A background one-shot stays lean — no nested review sub-agent.
+        review: false,
     };
     let built = async {
         let mut parts = prepare(&coding_cfg, opts).await.map_err(|e| e.to_string())?;

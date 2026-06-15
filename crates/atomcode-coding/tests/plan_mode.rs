@@ -25,6 +25,7 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
         mcp: false,
         memory: false,
         web: false,
+        review: false,
     };
 
     let mut parts = prepare(&cfg, opts).await.unwrap();

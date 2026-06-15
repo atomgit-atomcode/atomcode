@@ -153,6 +153,9 @@ pub async fn code(args: CodeArgs) -> Result<()> {
         mcp: !args.no_mcp,
         memory: !args.no_memory,
         web: !args.no_web,
+        // The `code` agent can also review the current changes in-session (the dedicated
+        // `atomcodex review` subcommand still exists for headless/CI one-shots).
+        review: true,
     };
 
     eprintln!("preparing ({model}) …");
