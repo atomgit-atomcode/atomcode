@@ -113,6 +113,18 @@ struct ReviewArgs {
     /// against a stalled provider). Raise it for slow providers / very large contexts.
     #[arg(long, default_value_t = 180)]
     stream_timeout: u64,
+    /// Hard cap on LLM rounds (tool-call iterations) for this review — the round safety
+    /// fuse. Omit ⇒ UNLIMITED. On a large repo a small diff can otherwise send the model
+    /// grepping/reading for an unbounded number of rounds; engineering callers bound it
+    /// (e.g. `--max-rounds 35`). On the cap the run stops and reports findings gathered so far.
+    #[arg(long)]
+    max_rounds: Option<u32>,
+    /// Absolute wall-clock cap (seconds) on the whole review. Omit ⇒ UNLIMITED. The only
+    /// guard that also fires while a provider stalls mid-stream (keepalive bytes defeat
+    /// `--stream-timeout`'s idle timer, and `--max-rounds` only checks at round boundaries).
+    /// On the cap the run stops and reports findings gathered so far. E.g. `--max-duration 900`.
+    #[arg(long)]
+    max_duration: Option<u64>,
     /// Emit findings as JSON instead of a human-readable report.
     #[arg(long)]
     json: bool,
@@ -250,6 +262,8 @@ async fn review(args: ReviewArgs) -> Result<()> {
     let mut cfg = ReviewAgentConfig::new(api_key, base_url, model, &repo);
     cfg.context_window = context_window;
     cfg.stream_timeout = std::time::Duration::from_secs(args.stream_timeout);
+    cfg.max_rounds = args.max_rounds;
+    cfg.max_turn_duration = args.max_duration.map(std::time::Duration::from_secs);
     // Full system-prompt override (flag text > file/stdin). None ⇒ built-in reviewer persona.
     cfg.persona = resolve_system_prompt(args.system_prompt.clone(), args.system_prompt_file.clone())?;
     // Appended sections compose after the persona: engine-injected language rules first,

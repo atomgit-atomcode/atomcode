@@ -46,14 +46,31 @@ pub fn build_review_agent_with(
     let report = ReportFindingTool::new();
     let tools = mount_review_tools(&report);
     let persona = compose_persona(cfg);
-    let agent = Agent::builder()
+    let mut builder = Agent::builder()
         .provider(provider)
         .tools(tools)
         .persona(persona)
         .working_dir(cfg.working_dir.clone())
         .stream_timeout(cfg.stream_timeout)
-        .request_timeout(cfg.request_timeout)
-        .build();
+        .request_timeout(cfg.request_timeout);
+    // Round fuse is opt-in: only bound rounds when the caller asked for it (keeps a bare
+    // CLI run unbounded; engineering callers pass `--max-rounds`).
+    if let Some(n) = cfg.max_rounds {
+        builder = builder.max_rounds(n);
+    }
+    // Turn total-time cap via the kernel's cancel seam (no kernel change): inject a cancel
+    // token and fire it after the deadline. This trips run_turn's stream-select cancel arm
+    // even while a stalled provider keeps the stream alive — the gap `stream_timeout`/`max_rounds`
+    // leave open. On cancel the turn stops as `StopReason::Cancelled`, keeping findings so far.
+    if let Some(d) = cfg.max_turn_duration {
+        let token = tokio_util::sync::CancellationToken::new();
+        builder = builder.cancel_token(token.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(d).await;
+            token.cancel();
+        });
+    }
+    let agent = builder.build();
     (agent, report)
 }
 
@@ -142,6 +159,84 @@ mod tests {
         assert_eq!(findings[0].priority, "P1");
         assert_eq!(findings[0].file_path, "src/a.rs");
         assert!(findings[0].title.contains("unchecked unwrap"));
+    }
+
+    /// Never terminates on its own: every round emits another tool call. Only `max_rounds`
+    /// can stop it — guards that the review path actually wires the round fuse through.
+    struct LoopingProvider;
+    #[async_trait]
+    impl LlmProvider for LoopingProvider {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _t: &[ToolDef],
+            _o: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            let evs = vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("loop{}", messages.len()),
+                    name: "grep".into(),
+                    arguments: r#"{"pattern":"zzz"}"#.into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ];
+            Ok(stream::iter(evs).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn max_rounds_stops_runaway_review() {
+        let mut c = cfg();
+        c.max_rounds = Some(2);
+        let (agent, _report) = build_review_agent_with(&c, Arc::new(LoopingProvider));
+        let outcome = agent
+            .run_to_completion("Review this diff:\n+ x", AutoRespond::AllowAll)
+            .await;
+        assert_eq!(
+            outcome.stop,
+            atomcode_kernel::event::StopReason::MaxRounds,
+            "endless tool calls must be capped by max_rounds"
+        );
+    }
+
+    /// Never yields a stream event (a provider that holds the connection but makes no
+    /// progress — what `stream_timeout` can't catch if keepalive bytes arrive). Only the
+    /// turn-duration cancel can stop it.
+    struct StallProvider;
+    #[async_trait]
+    impl LlmProvider for StallProvider {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+        async fn chat_stream(
+            &self,
+            _m: &[Message],
+            _t: &[ToolDef],
+            _o: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            Ok(stream::pending::<StreamEvent>().boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn max_turn_duration_stops_stalled_review() {
+        let mut c = cfg();
+        c.max_turn_duration = Some(std::time::Duration::from_millis(150));
+        let (agent, _report) = build_review_agent_with(&c, Arc::new(StallProvider));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.run_to_completion("Review this diff:\n+ x", AutoRespond::AllowAll),
+        )
+        .await
+        .expect("turn-duration cancel must end the run, not hang");
+        assert_eq!(
+            outcome.stop,
+            atomcode_kernel::event::StopReason::Cancelled,
+            "a stalled stream must be cut by the turn-duration cancel"
+        );
     }
 
     #[test]
