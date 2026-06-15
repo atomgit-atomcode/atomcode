@@ -33,6 +33,29 @@ struct Args {
     /// (≤ `MAX_CHARS_CAP`) with a note. No default truncation — a large page comes whole.
     #[serde(default)]
     max_chars: Option<usize>,
+    /// How HTML is rendered: `"text"` (default) flattens to clean plain text; `"markdown"`
+    /// preserves structure (headings, links, lists, code fences). Ignored for non-HTML
+    /// responses (raw source / JSON / plain text always come through verbatim).
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// Output rendering for an HTML page. Non-HTML responses ignore this (returned raw).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Text,
+    Markdown,
+}
+
+impl OutputFormat {
+    /// Parse the `format` arg: `"markdown"`/`"md"` → Markdown; anything else (incl.
+    /// `"text"` / empty / unknown / omitted) → Text, the back-compatible default.
+    fn from_arg(s: Option<&str>) -> Self {
+        match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("markdown") | Some("md") => OutputFormat::Markdown,
+            _ => OutputFormat::Text,
+        }
+    }
 }
 
 #[async_trait]
@@ -41,18 +64,19 @@ impl Tool for WebFetchTool {
         "web_fetch"
     }
     fn description(&self) -> &str {
-        "Fetch a web page over http(s) and return its content as clean text (HTML is \
-         converted to readable text). Use after `web_search` to read a specific page \
-         (docs, README, API reference). Only http/https URLs are allowed; requests to \
-         localhost / private / cloud-metadata addresses are blocked. Returns the full page \
-         by default; pass `max_chars` to cap the returned text."
+        "Fetch a web page over http(s) and return its content (HTML is converted to clean \
+         text, or to Markdown with `format:\"markdown\"` to keep headings/links/code). Use \
+         after `web_search` to read a specific page (docs, README, API reference). Only \
+         http/https URLs are allowed; requests to localhost / private / cloud-metadata \
+         addresses are blocked. Returns the full page by default; pass `max_chars` to cap."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
                 "url": { "type": "string", "description": "The http(s) URL to fetch" },
-                "max_chars": { "type": "integer", "description": "Optional max characters to return. Omit to get the full page (recommended for code/docs)." }
+                "max_chars": { "type": "integer", "description": "Optional max characters to return. Omit to get the full page (recommended for code/docs)." },
+                "format": { "type": "string", "enum": ["text", "markdown"], "description": "HTML rendering: 'text' (default, plain) or 'markdown' (keeps headings/links/lists/code). Ignored for non-HTML." }
             },
             "required": ["url"]
         })
@@ -64,6 +88,7 @@ impl Tool for WebFetchTool {
             Err(e) => return err(format!("web_fetch: invalid arguments: {e}. Expected {{\"url\":\"https://...\"}}.")),
         };
         let max = a.max_chars.map(|m| m.min(MAX_CHARS_CAP));
+        let fmt = OutputFormat::from_arg(a.format.as_deref());
 
         let mut url = match Url::parse(&a.url) {
             Ok(u) => u,
@@ -149,7 +174,16 @@ impl Tool for WebFetchTool {
 
         // Shape-sniff only when no Content-Type was sent (don't misread JSON starting with '<').
         let is_html = ct_is_html || (ct_header.is_none() && body.trim_start().starts_with('<'));
-        let text = if is_html { html_to_text(&body) } else { body };
+        // Non-HTML (raw source, JSON, plain text) always comes through verbatim — `format`
+        // only chooses how an HTML page is flattened.
+        let text = if is_html {
+            match fmt {
+                OutputFormat::Markdown => html_to_markdown(&body),
+                OutputFormat::Text => html_to_text(&body),
+            }
+        } else {
+            body
+        };
 
         let output = apply_char_cap(text, max);
         if output.trim().is_empty() {
@@ -361,6 +395,235 @@ fn html_to_text(html: &str) -> String {
     lines.join("\n")
 }
 
+// ---------------------------------------------------------------------------
+// HTML → Markdown (pure, testable)
+// ---------------------------------------------------------------------------
+
+/// One lexed HTML token. Attributes are kept RAW (only `<a href>` is parsed, lazily).
+enum HtmlToken {
+    Open { name: String, attrs: String },
+    Close(String),
+    Text(String),
+}
+
+/// Lex HTML into a flat open/close/text token stream. Self-closing (`<br/>`) and void
+/// tags surface as a single `Open`; comments / doctype / processing-instructions are
+/// dropped. Deliberately permissive (browser-tolerant): an unterminated `<` runs to EOF.
+fn tokenize_html(html: &str) -> Vec<HtmlToken> {
+    let bytes = html.as_bytes();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    let mut text_start = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        // Flush pending text.
+        if i > text_start {
+            toks.push(HtmlToken::Text(html[text_start..i].to_string()));
+        }
+        // Comment / CDATA / doctype: skip to the matching terminator.
+        if html[i..].starts_with("<!--") {
+            match html[i..].find("-->") {
+                Some(end) => i += end + 3,
+                None => i = bytes.len(),
+            }
+            text_start = i;
+            continue;
+        }
+        let Some(rel_gt) = html[i..].find('>') else {
+            // Unterminated tag → treat the rest as text.
+            toks.push(HtmlToken::Text(html[i..].to_string()));
+            i = bytes.len();
+            text_start = i;
+            break;
+        };
+        let inner = &html[i + 1..i + rel_gt]; // between < and >
+        let inner_trim = inner.trim();
+        if inner_trim.starts_with('!') || inner_trim.starts_with('?') {
+            // doctype / PI — drop.
+            i += rel_gt + 1;
+            text_start = i;
+            continue;
+        }
+        if let Some(rest) = inner_trim.strip_prefix('/') {
+            let name = rest.trim().split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            if !name.is_empty() {
+                toks.push(HtmlToken::Close(name));
+            }
+        } else {
+            let mut parts = inner_trim.splitn(2, |c: char| c.is_whitespace());
+            let name = parts.next().unwrap_or("").trim_end_matches('/').to_ascii_lowercase();
+            let attrs = parts.next().unwrap_or("").to_string();
+            if !name.is_empty() {
+                toks.push(HtmlToken::Open { name, attrs });
+            }
+        }
+        i += rel_gt + 1;
+        text_start = i;
+    }
+    if text_start < bytes.len() {
+        toks.push(HtmlToken::Text(html[text_start..].to_string()));
+    }
+    toks
+}
+
+/// Extract the `href` value from a raw attribute string (`href="..."` or `href='...'`).
+fn extract_href(attrs: &str) -> Option<String> {
+    let lower = attrs.to_ascii_lowercase();
+    let key = lower.find("href")?;
+    let after = attrs[key + 4..].trim_start();
+    let after = after.strip_prefix('=')?.trim_start();
+    let (quote, body) = match after.chars().next()? {
+        q @ ('"' | '\'') => (Some(q), &after[1..]),
+        _ => (None, after),
+    };
+    let end = match quote {
+        Some(q) => body.find(q).unwrap_or(body.len()),
+        None => body.find(|c: char| c.is_whitespace()).unwrap_or(body.len()),
+    };
+    let href = body[..end].trim();
+    if href.is_empty() { None } else { Some(decode_entities(href)) }
+}
+
+/// Collapse internal whitespace runs (incl. newlines) to single spaces — for inline text
+/// OUTSIDE `<pre>` (inside `<pre>` whitespace is significant and kept verbatim).
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out
+}
+
+/// Convert HTML to Markdown, preserving the structure plain-text flattening drops:
+/// headings (`#`), links (`[text](url)`), list items (`- `), inline/blocks code
+/// (`` ` `` / fenced), and bold/italic. Same pre-clean as [`html_to_text`] (script /
+/// style / head / nav / footer removed). Best-effort and dependency-free — not a full
+/// CommonMark serializer, but it keeps the signal an LLM reader needs.
+fn html_to_markdown(html: &str) -> String {
+    let cleaned = remove_tag_content(html, "script");
+    let cleaned = remove_tag_content(&cleaned, "style");
+    let cleaned = remove_tag_content(&cleaned, "head");
+    let cleaned = remove_tag_content(&cleaned, "nav");
+    let cleaned = remove_tag_content(&cleaned, "footer");
+
+    let mut out = String::new();
+    let mut pre_depth: u32 = 0; // inside <pre>: keep whitespace, fence the block
+    let mut link_href: Vec<Option<String>> = Vec::new(); // open <a> stack
+
+    /// Ensure the output ends with at least one (`\n`) or a blank-line (`\n\n`) break.
+    fn ensure_break(out: &mut String, blank: bool) {
+        if out.is_empty() {
+            return;
+        }
+        let trailing = out.chars().rev().take_while(|&c| c == '\n').count();
+        let want = if blank { 2 } else { 1 };
+        for _ in trailing..want {
+            out.push('\n');
+        }
+    }
+
+    for tok in tokenize_html(&cleaned) {
+        match tok {
+            HtmlToken::Text(t) => {
+                if pre_depth > 0 {
+                    out.push_str(&decode_entities(&t));
+                } else {
+                    let decoded = decode_entities(&t);
+                    let collapsed = collapse_ws(&decoded);
+                    // Drop pure-whitespace text between block tags (avoids stray spaces).
+                    if collapsed != " " || out.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                        out.push_str(&collapsed);
+                    }
+                }
+            }
+            HtmlToken::Open { name, attrs } => match name.as_str() {
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                    ensure_break(&mut out, true);
+                    let level = name[1..].parse::<usize>().unwrap_or(1);
+                    out.push_str(&"#".repeat(level));
+                    out.push(' ');
+                }
+                "p" | "div" | "section" | "article" | "blockquote" | "tr" | "dd" | "dt" => {
+                    ensure_break(&mut out, true)
+                }
+                "br" => out.push('\n'),
+                "li" => {
+                    ensure_break(&mut out, false);
+                    out.push_str("- ");
+                }
+                "ul" | "ol" => ensure_break(&mut out, true),
+                "pre" => {
+                    ensure_break(&mut out, true);
+                    out.push_str("```\n");
+                    pre_depth += 1;
+                }
+                "code" if pre_depth == 0 => out.push('`'),
+                "strong" | "b" => out.push_str("**"),
+                "em" | "i" => out.push('*'),
+                "a" => {
+                    let href = extract_href(&attrs);
+                    if href.is_some() {
+                        out.push('[');
+                    }
+                    link_href.push(href);
+                }
+                _ => {}
+            },
+            HtmlToken::Close(name) => match name.as_str() {
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "div" | "section" | "article"
+                | "blockquote" | "ul" | "ol" => ensure_break(&mut out, true),
+                "pre" => {
+                    if pre_depth > 0 {
+                        pre_depth -= 1;
+                        ensure_break(&mut out, false);
+                        out.push_str("```");
+                        ensure_break(&mut out, true);
+                    }
+                }
+                "code" if pre_depth == 0 => out.push('`'),
+                "strong" | "b" => out.push_str("**"),
+                "em" | "i" => out.push('*'),
+                "a" => {
+                    if let Some(Some(href)) = link_href.pop() {
+                        out.push_str(&format!("]({href})"));
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    // Normalize: trim trailing space on each line, collapse 3+ blank lines to one blank.
+    let mut result = String::with_capacity(out.len());
+    let mut blank_run = 0;
+    for line in out.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 {
+                result.push('\n');
+            }
+        } else {
+            blank_run = 0;
+            result.push_str(trimmed);
+            result.push('\n');
+        }
+    }
+    result.trim().to_string()
+}
+
 fn decode_entities(s: &str) -> String {
     s.replace("&amp;", "&")
         .replace("&lt;", "<")
@@ -522,5 +785,65 @@ mod tests {
         let t = html_to_text("<p>a</p><p>b</p>");
         assert!(t.contains('a') && t.contains('b'));
         assert!(t.lines().count() >= 2, "block elements split onto lines: {t:?}");
+    }
+
+    #[test]
+    fn output_format_parsing() {
+        assert!(OutputFormat::from_arg(Some("markdown")) == OutputFormat::Markdown);
+        assert!(OutputFormat::from_arg(Some("MD")) == OutputFormat::Markdown);
+        assert!(OutputFormat::from_arg(Some(" Markdown ")) == OutputFormat::Markdown);
+        assert!(OutputFormat::from_arg(Some("text")) == OutputFormat::Text);
+        assert!(OutputFormat::from_arg(Some("")) == OutputFormat::Text);
+        assert!(OutputFormat::from_arg(None) == OutputFormat::Text, "omitted → text default");
+        assert!(OutputFormat::from_arg(Some("xml")) == OutputFormat::Text, "unknown → text");
+    }
+
+    #[test]
+    fn markdown_preserves_headings_and_links() {
+        let html = "<html><head><title>t</title></head><body>\
+            <h1>Title</h1><h2>Sub</h2>\
+            <p>See <a href=\"https://example.com/doc\">the docs</a> for more.</p>\
+            </body></html>";
+        let md = html_to_markdown(html);
+        assert!(md.contains("# Title"), "h1 → #: {md}");
+        assert!(md.contains("## Sub"), "h2 → ##: {md}");
+        assert!(md.contains("[the docs](https://example.com/doc)"), "link preserved: {md}");
+    }
+
+    #[test]
+    fn markdown_preserves_lists_and_code() {
+        let html = "<ul><li>first</li><li>second</li></ul>\
+            <pre><code>fn main() {\n    println!(\"hi\");\n}</code></pre>\
+            <p>inline <code>x = 1</code> here</p>";
+        let md = html_to_markdown(html);
+        assert!(md.contains("- first"), "list item: {md}");
+        assert!(md.contains("- second"), "list item: {md}");
+        assert!(md.contains("```"), "code fence present: {md}");
+        assert!(md.contains("println!(\"hi\");"), "code body kept verbatim: {md}");
+        assert!(md.contains("`x = 1`"), "inline code fenced: {md}");
+    }
+
+    #[test]
+    fn markdown_strips_scripts_and_bold_italic() {
+        let html = "<body><script>evil()</script><p><strong>bold</strong> and <em>it</em></p></body>";
+        let md = html_to_markdown(html);
+        assert!(!md.contains("evil()"), "script removed: {md}");
+        assert!(md.contains("**bold**"), "strong → **: {md}");
+        assert!(md.contains("*it*"), "em → *: {md}");
+    }
+
+    #[test]
+    fn markdown_anchor_without_href_keeps_text() {
+        // An <a> with no href must not emit empty `[]( )` brackets — just the text.
+        let md = html_to_markdown("<p>click <a>here</a> now</p>");
+        assert!(md.contains("here"), "anchor text kept: {md}");
+        assert!(!md.contains("["), "no stray bracket for hrefless anchor: {md}");
+    }
+
+    #[test]
+    fn markdown_decodes_entities_and_collapses_blanks() {
+        let md = html_to_markdown("<p>a &amp; b</p>\n\n\n<p>c</p>");
+        assert!(md.contains("a & b"), "entity decoded: {md}");
+        assert!(!md.contains("\n\n\n"), "no triple blank lines: {md:?}");
     }
 }
