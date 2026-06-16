@@ -78,6 +78,20 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     // those shapes from the clipboard ourselves.
     let mut clipboard = arboard::Clipboard::new().ok()?;
 
+    // Tier 0 (macOS only): file URL first. Finder Cmd+C puts both a
+    // low-res thumbnail (arboard sees it as RGBA pixels) and the real
+    // file path (public.file-url) on the pasteboard. Checking file-url
+    // first guarantees we read the original file instead of sending
+    // a tiny icon to the VL model.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(path) = read_macos_clipboard_file_url() {
+            if let Some(result) = try_attach_image_from_path(&path) {
+                return Some(result);
+            }
+        }
+    }
+
     // Tier 1: raw bytes (NSPasteboardTypePNG / TIFF / NSImage).
     //   Sources: Cmd+Shift+Ctrl+4 screenshot, Preview "Copy", browser
     //   "Copy image", any app's Edit-menu Copy on a bitmap. arboard's
@@ -108,19 +122,6 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
             if let Some(result) = try_attach_image_from_path(&decoded) {
                 return Some(result);
             }
-        }
-    }
-
-    // Tier 3 (macOS only): read NSPasteboard's `public.file-url` type
-    // directly. This is the case Finder `Cmd+C` on an image file
-    // produces — there are NO image bytes and the text type is
-    // typically NOT auto-populated. iTerm2's Cmd+V handles this by
-    // querying the file-URL type and writing the temp path to the
-    // PTY; we read the same type via AppKit so Ctrl+V matches.
-    #[cfg(target_os = "macos")]
-    if let Some(path) = read_macos_clipboard_file_url() {
-        if let Some(result) = try_attach_image_from_path(&path) {
-            return Some(result);
         }
     }
 
@@ -160,7 +161,48 @@ fn read_macos_clipboard_file_url() -> Option<String> {
     let raw = unsafe { pb.stringForType(NSPasteboardTypeFileURL) }?.to_string();
     let stripped = raw.strip_prefix("file://").unwrap_or(&raw);
     let decoded = urlencoding::decode(stripped).ok()?;
-    Some(decoded.into_owned())
+    let path = decoded.into_owned();
+    // macOS may return a file-reference URL (/.file/id=…) instead of a
+    // standard POSIX path. File-ref URLs can be read by the kernel but
+    // their extension is an opaque id — try_attach_image_from_path's
+    // whitelist rejects them. Resolve through NSURL to the real path.
+    if path.starts_with("/.file/id=") {
+        if let Some(resolved) = resolve_macos_file_ref_url(&path) {
+            return Some(resolved);
+        }
+        // canonicalize() may fail for various reasons (permissions, NAS
+        // paths, APFS snapshots). Don't discard the original path — let
+        // try_attach_image_from_path attempt to read it directly. The
+        // kernel can open /.file/id=… natively, and the magic-byte
+        // detector in try_attach_image_from_path will handle it.
+        // Fall through to return the raw path.
+    }
+    Some(path)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_file_ref_url(raw: &str) -> Option<String> {
+    // macOS kernel resolves /.file/id=… paths natively — canonicalize()
+    // turns them into the standard /Users/… or /Volumes/… POSIX path
+    // that passes is_absolute() and extension-whitelist checks.
+    std::fs::canonicalize(raw).ok()?.to_str().map(|s| s.to_owned())
+}
+
+/// Detect image type from file header magic bytes. Used when the
+/// file extension is unavailable or unreliable (e.g. macOS file-
+/// reference URLs whose extension is an opaque numeric id).
+fn detect_image_type_from_path(path: &std::path::Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 12];
+    f.read_exact(&mut header).ok()?;
+    if header.starts_with(b"\x89PNG\r\n\x1a\n") { return Some("image/png"); }
+    if header.starts_with(b"\xff\xd8\xff") { return Some("image/jpeg"); }
+    if header.starts_with(b"GIF8") { return Some("image/gif"); }
+    if header.starts_with(b"RIFF") && header.len() >= 12 && &header[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 /// Map an `ImagePart::media_type` to a cache filename extension.
@@ -385,17 +427,23 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
     if !path.is_absolute() {
         return None;
     }
-    let media_type = match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        _ => return None,
+    let media_type = if candidate.starts_with("/.file/id=") {
+        // macOS file-reference URL — the extension is an opaque id,
+        // not the real type. Read the file header to detect format.
+        detect_image_type_from_path(path)?
+    } else {
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            _ => return None,
+        }
     };
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_PATH_IMAGE_BYTES {

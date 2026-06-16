@@ -682,6 +682,8 @@ pub fn model_name_suggests_vision(name: &str) -> bool {
         || n.starts_with("pixtral")
         || n.contains("llava")
         || n.contains("qvq")
+        // Kimi K2 series (kimi-k2, kimi-k2.5, kimi-k2.6) — all multimodal.
+        || n.starts_with("kimi-k2")
 }
 
 #[cfg(test)]
