@@ -55,7 +55,7 @@ class StreamEventHandler(
 
     fun onToolResult(name: String, success: Boolean, durationMs: Long) {
         val status = if (success) "done (${durationMs}ms)" else "failed"
-        messageView.addToolCall(name, status)
+        messageView.updateToolCall(name, status)
     }
 
     fun onArtifactStart(title: String?) {

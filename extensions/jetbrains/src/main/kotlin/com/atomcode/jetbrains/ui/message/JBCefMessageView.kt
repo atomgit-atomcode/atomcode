@@ -76,6 +76,7 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     fun addAssistantMessage(text: String)       { sendJs("addAssistantMessage", text) }
     fun addCodeBlock(lang: String, code: String, file: String? = null) { sendJs("addCodeBlock", lang, code, file ?: "") }
     fun addToolCall(name: String, status: String, detail: String? = null) { sendJs("addToolCall", name, status, detail ?: "") }
+    fun updateToolCall(name: String, status: String, detail: String? = null) { sendJs("updateToolCall", name, status, detail ?: "") }
     fun addError(text: String)                  { sendJs("addError", text) }
     fun addQueuedMessage(text: String)          { sendJs("addQueuedMessage", text) }
     fun addThinkingIndicator()                  { sendJs("addThinkingIndicator") }
@@ -179,6 +180,7 @@ function buildAsst(t){var d=document.createElement('div');d.className='am';d.inn
 function updateLastAssistantMessage(t){if(last)last.querySelector('.b').textContent=t;else addAssistantMessage(t);sd()}
 function addCodeBlock(l,c,f){var d=document.createElement('div');d.className='cm';d.innerHTML='<div class="h">📄 '+h(f||l||'Code')+'</div><pre>'+h(c)+'</pre>';m.appendChild(d);last=null;sd()}
 function addToolCall(n,s,d){var e=document.createElement('div');e.className='tm';e.innerHTML='🔧 '+h(n)+' — '+h(s)+(d?'<br><small>'+h(d)+'</small>':'');m.appendChild(e);last=null;sd()}
+function updateToolCall(n,s,d){var e=m.querySelector('.tm:last-child');if(e&&e.textContent.startsWith(n)){e.innerHTML='🔧 '+h(n)+' — '+h(s)+(d?'<br><small>'+h(d)+'</small>':'');sd()}else addToolCall(n,s,d)}
 function addError(t){var d=document.createElement('div');d.className='em';d.innerHTML='⚠️ '+h(t);m.appendChild(d);last=null;sd()}
 function addQueuedMessage(t){var d=document.createElement('div');d.className='qm';d.innerHTML='<span class="b">📥 '+h(t)+'</span>';m.appendChild(d);last=null;sd()}
 function addThinkingIndicator(){ti=m.children.length;var d=document.createElement('div');d.className='th';d.innerHTML='<span style="color:$vfg;font-size:11px">🤖 AtomCode</span> <span>思考中<span class="dots"></span></span>';m.appendChild(d);last=null;sd()}

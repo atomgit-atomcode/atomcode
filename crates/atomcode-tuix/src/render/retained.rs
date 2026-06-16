@@ -10167,6 +10167,174 @@ mod tests {
         );
     }
 
+    /// Bug repro: single edit_file tool call (auto-approved) must render
+    /// exactly ONE ● EditFile row in body_lines. User report shows two
+    /// when ToolCallResult arrives and both ToolCallCommit → commit_inflight_tool
+    /// AND ToolResult's defense-in-depth commit_inflight_tool produce a row.
+    #[test]
+    fn retained_single_edit_file_does_not_double_editfile() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Simulate ToolCallStarted -> inflight spinner for edit_file
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-edit-1".into(),
+            name: "EditFile".into(),
+            detail: "numbers.txt ← \"5\"".into(),
+        });
+        r.flush_deferred();
+
+        // Count rows before result (should be 1: the spinner)
+        let before = r.body_lines.iter().filter(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("EditFile")
+        }).count();
+        eprintln!("EditFile rows before ToolCallResult: {}", before);
+        assert_eq!(before, 1, "spinner row must exist before result");
+
+        // Simulate ToolCallResult doing EXACTLY what the event loop does:
+        //   ToolCallCommit (line 6813) + ToolResult (line 6859)
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-edit-1".into()),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "Edited /path/numbers.txt (1 replacement)".into(),
+        });
+        r.flush_deferred();
+
+        // Count ● EditFile rows after result
+        let after = r.body_lines.iter().filter(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("EditFile") && text.contains("●")
+        }).count();
+
+        eprintln!("Body lines after ToolCallResult:");
+        for (i, row) in r.body_lines.iter().enumerate() {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if !text.is_empty() {
+                eprintln!("  [{}] {:?}", i, text);
+            }
+        }
+
+        assert_eq!(
+            after, 1,
+            "ToolCallResult must produce exactly ONE ● EditFile row, got {}. body_lines has {} total rows.\n{:?}",
+            after,
+            r.body_lines.len(),
+            r.body_lines.iter().map(|row| row.iter().map(|c| c.ch).collect::<String>()).collect::<Vec<_>>()
+        );
+
+        // Verify the └ result row is immediately after the ● row
+        let tool_idx = r.body_lines.iter().rposition(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("EditFile") && text.contains("●")
+        }).unwrap();
+        let result_idx = r.body_lines.iter().position(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("Edited") && text.contains("replacement")
+        }).unwrap();
+        assert_eq!(
+            result_idx, tool_idx + 1,
+            "result row must be immediately after tool row, gap of {} rows",
+            result_idx - tool_idx - 1
+        );
+    }
+
+    /// Bug repro: approval flow — ApprovalNeeded commits inflight to ●,
+    /// THEN ToolCallResult arrives later. Must not produce a second ●.
+    #[test]
+    fn retained_approval_flow_does_not_double_editfile() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Phase 1: ToolCallStarted → inflight spinner
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-edit-1".into(),
+            name: "EditFile".into(),
+            detail: "numbers.txt ← \"5\"".into(),
+        });
+        r.flush_deferred();
+
+        // Phase 2: ApprovalNeeded → ToolCallCommit (commit inflight) + ApprovalPrompt
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-edit-1".into()),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "EditFile".into(),
+            detail: "numbers.txt ← \"5\"".into(),
+        });
+        r.flush_deferred();
+
+        // Count ● rows AFTER approval commit (should be 1)
+        let mid = r.body_lines.iter().filter(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("EditFile") && text.contains("●")
+        }).count();
+        eprintln!("● EditFile rows after ApprovalNeeded: {}", mid);
+        assert_eq!(mid, 1, "ApprovalNeeded must produce exactly ONE ● EditFile row");
+
+        // Phase 3: User approves → pop_approval_prompt
+        r.pop_approval_prompt();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Phase 4: ToolCallResult arrives
+        // EXACT sequence from event loop: AssistantLineBreak + ToolCallCommit + ToolResult
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-edit-1".into()),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "Edited /path/numbers.txt (1 replacement)".into(),
+        });
+        r.flush_deferred();
+
+        eprintln!("Body lines after ToolCallResult:");
+        for (i, row) in r.body_lines.iter().enumerate() {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if !text.is_empty() {
+                eprintln!("  [{}] {:?}", i, text);
+            }
+        }
+
+        // Count ● EditFile rows after ToolCallResult (must still be 1)
+        let after = r.body_lines.iter().filter(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("EditFile") && text.contains("●")
+        }).count();
+
+        assert_eq!(
+            after, 1,
+            "Full approval flow must produce exactly ONE ● EditFile row, got {}.\n{:?}",
+            after,
+            r.body_lines.iter().map(|row| row.iter().map(|c| c.ch).collect::<String>()).collect::<Vec<_>>()
+        );
+    }
+
     /// Regression for the "missing top rule after /model switch" bug.
     ///
     /// Reproduction sequence (mirrors the real /model flow):
