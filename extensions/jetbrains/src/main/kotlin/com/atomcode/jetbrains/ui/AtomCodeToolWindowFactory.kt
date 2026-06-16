@@ -19,19 +19,6 @@ class AtomCodeToolWindowFactory : ToolWindowFactory {
                     e.project?.let { openAtomCodeChatTab(it, newTab = true) }
                 }
             },
-            object : AnAction("Close Tab", "Close current chat tab", AllIcons.Actions.Close) {
-                override fun getActionUpdateThread() = ActionUpdateThread.BGT
-                override fun update(e: AnActionEvent) {
-                    e.presentation.isEnabled = e.project?.let { p ->
-                        val tw = com.intellij.openapi.wm.ToolWindowManager.getInstance(p)
-                            .getToolWindow(ATOMCODE_TOOL_WINDOW_ID)
-                        (tw?.contentManager?.contentCount ?: 0) > 1
-                    } ?: false
-                }
-                override fun actionPerformed(e: AnActionEvent) {
-                    e.project?.let { closeCurrentChatTab(it) }
-                }
-            },
             object : AnAction("Settings", "Open AtomCode settings", AllIcons.General.GearPlain) {
                 override fun getActionUpdateThread() = ActionUpdateThread.BGT
                 override fun actionPerformed(e: AnActionEvent) {
