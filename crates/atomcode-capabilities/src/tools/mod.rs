@@ -82,7 +82,7 @@ pub use atomgit::{atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, 
 /// Names of the full neutral coding toolset — pass to
 /// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).
 pub fn coding_tool_names() -> &'static [&'static str] {
-    &["read_file", "write_file", "edit_file", "list_directory", "bash", "grep", "glob"]
+    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todo"]
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
@@ -92,9 +92,13 @@ pub fn register_coding_tools(reg: &mut ToolRegistry) {
     reg.register(Arc::new(WriteFileTool));
     reg.register(Arc::new(EditFileTool));
     reg.register(Arc::new(ListDirTool));
+    reg.register(Arc::new(OpenFileTool));
     reg.register(Arc::new(BashTool));
     reg.register(Arc::new(GrepTool));
     reg.register(Arc::new(GlobTool));
+    reg.register(Arc::new(SearchReplaceTool));
+    reg.register(Arc::new(AstGrepTool));
+    reg.register(Arc::new(TodoTool::new()));
 }
 
 /// Resolve a model-supplied path: absolute → as-is; relative → joined to
@@ -162,4 +166,99 @@ pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
 /// A failed tool result (`is_error: true`) — surfaced to the model so it can recover.
 pub(crate) fn err(content: impl Into<String>) -> ToolResult {
     ToolResult { call_id: String::new(), content: content.into(), is_error: true }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomcode_kernel::tool::ToolRegistry;
+
+    /// The canonical list of tool names `register_coding_tools` and
+    /// `coding_tool_names` must agree on — the single source of truth for these
+    /// tests. Adding/removing a tool updates only this list; the assertions below
+    /// fail if the code doesn't match.
+    const EXPECTED_TOOL_NAMES: &[&str] = &[
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_directory",
+        "open_file",
+        "bash",
+        "grep",
+        "glob",
+        "search_replace",
+        "ast_grep",
+        "todo",
+    ];
+
+    #[test]
+    fn coding_tool_names_matches_expected_list() {
+        let mut names = coding_tool_names().to_vec();
+        names.sort();
+        let mut expected = EXPECTED_TOOL_NAMES.to_vec();
+        expected.sort();
+        assert_eq!(names, expected, "coding_tool_names() must match EXPECTED_TOOL_NAMES");
+    }
+
+    #[test]
+    fn register_coding_tools_has_no_extra_or_missing_tools() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+
+        // Mount all names from the expected list.
+        let mounted = reg.mount(EXPECTED_TOOL_NAMES);
+        for name in EXPECTED_TOOL_NAMES {
+            assert!(
+                mounted.get(name).is_some(),
+                "registered tool '{name}' must be mountable by name"
+            );
+            // Each mounted tool's name() must match the key it was registered under.
+            let tool = mounted.get(name).unwrap();
+            assert_eq!(
+                tool.name(),
+                *name,
+                "tool.name() must match the registration key '{name}'"
+            );
+        }
+        // The mount must have resolved exactly the expected number of tools.
+        assert_eq!(
+            mounted.defs().len(),
+            EXPECTED_TOOL_NAMES.len(),
+            "mount must resolve all expected tools"
+        );
+    }
+
+    #[test]
+    fn register_coding_tools_all_tools_have_valid_defs() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(EXPECTED_TOOL_NAMES);
+
+        for def in mounted.defs() {
+            assert!(!def.name.is_empty(), "tool name must not be empty");
+            assert!(!def.description.is_empty(), "tool '{}' must have a description", def.name);
+            assert!(
+                def.parameters.get("type").and_then(|v| v.as_str()) == Some("object"),
+                "tool '{}' parameters must be a JSON object with type=object",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn unmounted_tools_are_not_resolvable() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+
+        // Mount only a subset; tools not in this list must not resolve.
+        let subset = &["read_file", "bash", "grep"];
+        let mounted = reg.mount(subset);
+        assert!(mounted.get("read_file").is_some());
+        assert!(mounted.get("bash").is_some());
+        assert!(mounted.get("grep").is_some());
+        // An unmounted tool must not be resolvable.
+        assert!(mounted.get("write_file").is_none(), "unmounted tool must not resolve");
+        assert!(mounted.get("edit_file").is_none(), "unmounted tool must not resolve");
+        assert!(mounted.get("open_file").is_none(), "unmounted tool must not resolve");
+    }
 }

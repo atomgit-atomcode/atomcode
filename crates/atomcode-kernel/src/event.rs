@@ -62,6 +62,15 @@ pub enum AgentCommand {
     Shutdown,
 }
 
+/// One call inside a `ToolBatchStarted` payload — everything the driver/UI
+/// needs to render a child row in the group block.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolBatchCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
 /// Agent → driver. Serializable for the same reason. The id-correlated
 /// Request/Respond pair replaces any in-process oneshot, so the round-trip
 /// works identically in-process and over the wire.
@@ -80,6 +89,23 @@ pub enum AgentEvent {
         id: Option<String>,
         name: Option<String>,
         arguments: String,
+    },
+    /// Multiple tool calls fan out from one assistant message. Fires BEFORE
+    /// the per-call `ToolStarted` events, only when ≥ 2 non-duplicate calls
+    /// are about to dispatch. Driver/UI uses this to render a single grouped
+    /// block rather than N independent rows. Per-call events still fire for
+    /// backward compat — driver dedupes via `batch_id` membership.
+    ToolBatchStarted {
+        batch_id: String,
+        calls: Vec<ToolBatchCall>,
+    },
+    /// Closes the batch opened by `ToolBatchStarted`. Driver/UI finalizes
+    /// the group header with `· N/M ok · Xs wall` summary.
+    ToolBatchCompleted {
+        batch_id: String,
+        ok: usize,
+        total: usize,
+        elapsed_ms: u64,
     },
     ToolStarted { call: ToolCall },
     /// Live progress from a long-running tool MID-execution (e.g. a sub-agent tool

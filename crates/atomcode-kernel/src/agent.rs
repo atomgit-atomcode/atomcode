@@ -1,4 +1,4 @@
-use crate::event::{AgentCommand, AgentEvent, StopReason};
+use crate::event::{AgentCommand, AgentEvent, StopReason, ToolBatchCall};
 use crate::hook::{HookChain, LifecycleHooks, TurnCtx};
 use crate::message::{
     CompactTrigger, CompactionStrategy, CompactionView, Conversation, ImageContent, Message,
@@ -13,6 +13,7 @@ use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Instant;
 use crate::clock::{Clock, SystemClock};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -978,6 +979,46 @@ impl RunningAgent {
                 self.finish_turn(convo, StopReason::Stopped, &turn_ctx).await;
                 return;
             }
+            // ── Batch detection (pre-scan) ──
+            // Count NON-DUPLICATE tool calls using the SAME dedup key as the
+            // execution loop below — `(name, raw_arguments)` — captured BEFORE
+            // any middleware rewrite, matching the loop's `dedup_key` (L1019).
+            // If ≥ 2 non-dup calls, emit ToolBatchStarted so the UI can render
+            // a single grouped block instead of N independent rows. The count
+            // (`total_non_dup`) reflects the REAL calls that will actually
+            // execute — mode-B stub kills (same name+args, new id) are not
+            // counted, matching v1's `non_dup_count` semantics.
+            let total_non_dup: usize = {
+                let mut dedup_set: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                let mut non_dup = 0usize;
+                for c in &pending_calls {
+                    let key = (c.name.clone(), c.arguments.clone());
+                    if dedup_set.insert(key) {
+                        non_dup += 1;
+                    }
+                }
+                non_dup
+            };
+            let batch_start: Option<(String, Instant)> = if total_non_dup >= 2 {
+                let batch_id = format!("batch_{}_{}", self.turn_counter.load(Ordering::Relaxed), round);
+                let batch_calls: Vec<ToolBatchCall> = pending_calls
+                    .iter()
+                    .map(|c| ToolBatchCall {
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                        arguments: c.arguments.clone(),
+                    })
+                    .collect();
+                self.rt.emit(AgentEvent::ToolBatchStarted {
+                    batch_id: batch_id.clone(),
+                    calls: batch_calls,
+                });
+                Some((batch_id, Instant::now()))
+            } else {
+                None
+            };
+            let mut batch_ok: usize = 0;
             // ── Per-batch dedup state (claim 21 / A1 gap ⑨) ──
             // `result_ids` = call_ids that have ALREADY produced a result THIS
             // batch (real, stub, or blocked). `seen_calls` = `(name, arguments)`
@@ -996,6 +1037,15 @@ impl RunningAgent {
                 // "(cancelled)" results by backfill on the cancel path below.
                 if cancel.is_cancelled() {
                     convo.backfill_cancelled_tool_results();
+                    // Close any active batch so the UI doesn't have a dangling group.
+                    if let Some((batch_id, started_at)) = &batch_start {
+                        self.rt.emit(AgentEvent::ToolBatchCompleted {
+                            batch_id: batch_id.clone(),
+                            ok: batch_ok,
+                            total: total_non_dup,
+                            elapsed_ms: started_at.elapsed().as_millis() as u64,
+                        });
+                    }
                     self.rt.emit(AgentEvent::Cancelled);
                     self.finish_turn(convo, StopReason::Cancelled, &turn_ctx).await;
                     return;
@@ -1141,6 +1191,8 @@ impl RunningAgent {
                 cap_tool_result(&mut result, self.max_tool_result_bytes);
                 if result.is_error {
                     self.hooks.on_error(&result.content).await;
+                } else if batch_start.is_some() {
+                    batch_ok += 1;
                 }
                 self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
                 convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
@@ -1159,6 +1211,15 @@ impl RunningAgent {
                 if executed {
                     seen_calls.insert(dedup_key);
                 }
+            }
+            // ── Close batch (if one was opened) ──
+            if let Some((batch_id, started_at)) = batch_start {
+                self.rt.emit(AgentEvent::ToolBatchCompleted {
+                    batch_id,
+                    ok: batch_ok,
+                    total: total_non_dup,
+                    elapsed_ms: started_at.elapsed().as_millis() as u64,
+                });
             }
         }
     }

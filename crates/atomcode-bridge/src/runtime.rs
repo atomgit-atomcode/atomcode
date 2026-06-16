@@ -764,6 +764,19 @@ impl Bridge {
                 });
                 self.emit(CoreEv::PhaseChange(AgentPhase::Thinking));
             }
+            KEv::ToolBatchStarted { batch_id, calls } => {
+                self.emit(CoreEv::ToolBatchStarted {
+                    batch_id,
+                    calls: calls.into_iter().map(|c| atomcode_core::turn::event::ToolBatchCall {
+                        id: c.id,
+                        name: c.name,
+                        arguments: c.arguments,
+                    }).collect(),
+                });
+            }
+            KEv::ToolBatchCompleted { batch_id, ok, total, elapsed_ms } => {
+                self.emit(CoreEv::ToolBatchCompleted { batch_id, ok, total, elapsed_ms });
+            }
             KEv::Request { id, kind, payload } if kind == APPROVAL_KIND => {
                 let req: ApprovalRequest = match serde_json::from_value(payload) {
                     Ok(r) => r,
