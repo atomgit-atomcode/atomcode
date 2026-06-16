@@ -170,7 +170,14 @@ async fn review(args: ReviewArgs) -> Result<()> {
         None => {
             let diff = obtain_diff(&repo, &args)?;
             if diff.trim().is_empty() {
-                println!("No changes to review.");
+                // Honor --json even on an empty diff: emit a valid EMPTY envelope, not prose.
+                // A bare "No changes" line makes downstream JSON parsers fail on `N...`; an
+                // empty diff is a clean outcome (nothing to review), not a failure.
+                if args.json {
+                    println!("{}", render_json(&[], "No changes to review.", None)?);
+                } else {
+                    println!("No changes to review.");
+                }
                 return Ok(());
             }
             let label = format!("{} changed line(s)", diff.lines().count());
