@@ -15,7 +15,7 @@ mod code;
 
 use anyhow::{bail, Context, Result};
 use atomcode_kernel::agent::Agent;
-use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_review::{build_review_agent, Finding, ReviewAgentConfig};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -322,13 +322,27 @@ async fn review(args: ReviewArgs) -> Result<()> {
     // delivered — a stall AFTER findings were collected still produced the review, so warn
     // but succeed; a failure with no findings (auth/connect/immediate stall) is a real
     // failure CI must detect.
-    if let Some(err) = run.error {
+    // Cut-short detection: an error OR a non-`Stopped` terminal (Cancelled via max-duration,
+    // Timeout, MaxRounds) means the run didn't finish on the model's own terms. If nothing was
+    // delivered, that's a real failure CI/callers must see — NEVER a clean "no issues" run
+    // (the max-duration cancel path emits Cancelled WITHOUT an error, so checking error alone
+    // would silently pass a cut-short review as clean). With findings already collected the
+    // review still produced value: warn but succeed.
+    if review_incomplete(run.stop, run.error.is_some()) {
+        let why = run.error.clone().unwrap_or_else(|| format!("{:?}", run.stop));
         if findings.is_empty() {
-            bail!("review run failed before producing findings: {err}");
+            bail!("review did not complete ({why}): no findings collected");
         }
-        eprintln!("warning: review ended early ({err}); {} finding(s) collected before it stopped", findings.len());
+        eprintln!("warning: review ended early ({why}); {} finding(s) collected before it stopped", findings.len());
     }
     Ok(())
+}
+
+/// Whether a review was CUT SHORT rather than finishing on the model's own terms: a
+/// non-`Stopped` terminal (Cancelled via max-duration / Timeout / MaxRounds) or a surfaced
+/// error. Combined with "no findings" this is a real failure — must not pass as a clean run.
+fn review_incomplete(stop: StopReason, has_error: bool) -> bool {
+    has_error || !matches!(stop, StopReason::Stopped)
 }
 
 /// Result of driving one review turn loop while live-tracing tool activity to stderr.
@@ -336,6 +350,10 @@ async fn review(args: ReviewArgs) -> Result<()> {
 struct ReviewRun {
     /// Accumulated assistant prose (the final summary).
     text: String,
+    /// How the turn ended. `Stopped` = the model finished on its own; anything else
+    /// (Cancelled via max-duration, Timeout, MaxRounds, ProviderError) means the review
+    /// was CUT SHORT — must NOT be reported as a clean "no issues" run. Default `Stopped`.
+    stop: StopReason,
     /// Last error surfaced, if any.
     error: Option<String>,
     /// Final token usage.
@@ -728,6 +746,20 @@ fn render_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cut_short_runs_are_incomplete() {
+        // 正常完成、无 error → 完整（可当 clean）。
+        assert!(!review_incomplete(StopReason::Stopped, false));
+        // 关键回归：max-duration 的 cancel 发 Cancelled 但 error=None——必须判为未完成，
+        // 否则 0 finding 时会被当成"审完无问题"假成功入库。
+        assert!(review_incomplete(StopReason::Cancelled, false));
+        // 其它切短终态同样未完成。
+        assert!(review_incomplete(StopReason::Timeout, false));
+        assert!(review_incomplete(StopReason::MaxRounds, false));
+        // 有 error 即使 Stopped 也算未完成。
+        assert!(review_incomplete(StopReason::Stopped, true));
+    }
 
     fn finding(priority: &str, confidence: f32, title: &str) -> Finding {
         Finding {
