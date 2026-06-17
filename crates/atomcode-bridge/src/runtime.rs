@@ -527,10 +527,6 @@ impl Bridge {
                             match assemble(&mut self.parts, &self.coding_cfg, provider) {
                                 Ok(a) => {
                                     self.handle = a.spawn();
-                                    self.emit(CoreEv::Warning(format!(
-                                        "engine v2: provider → {} ({})",
-                                        config.default_provider, self.coding_cfg.model
-                                    )));
                                 }
                                 Err(e) => self.emit(CoreEv::Error {
                                     error: format!("provider switch failed: {e}"),
