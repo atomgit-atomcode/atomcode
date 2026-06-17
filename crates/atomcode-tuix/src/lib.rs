@@ -101,7 +101,20 @@ impl TerminalGuard {
         // to pop. Terminals that support DISAMBIGUATE but not
         // REPORT_EVENT_TYPES ignore the extra bit silently — this never
         // makes things worse than before.
+        //
+        // WINDOWS EXCLUSION: never push on Windows. crossterm's Windows
+        // input backend reads Win32 console KEY_EVENT records (not an ANSI
+        // parser), so it already reports Shift+Enter modifiers and autorepeat
+        // (Press/Repeat/Release) natively — the two things this push buys on
+        // Unix — making the protocol pure downside here. Worse, it has no
+        // `CSI u` decoder at all, so once a terminal honours the push and
+        // starts encoding KEYPAD keys as functional codes (numpad 1 →
+        // `ESC[57400u`), ConPTY (VSCode integrated terminal, Windows Terminal)
+        // delivers the un-decoded bytes as the literal characters `[57400u`
+        // straight into the input box. Unix crossterm decodes 57400 → '1';
+        // Windows can't, so we simply don't ask the terminal to use it.
         let kbd_enhanced = caps.tty
+            && !cfg!(windows)
             && execute!(
                 io::stdout(),
                 PushKeyboardEnhancementFlags(

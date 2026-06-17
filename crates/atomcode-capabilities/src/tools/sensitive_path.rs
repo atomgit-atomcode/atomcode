@@ -106,6 +106,7 @@ impl ToolMiddleware for SensitivePathGate {
             return Ok(());
         }
         let payload = serde_json::to_value(ApprovalRequest {
+            call_id: call.id.clone(),
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
         })
