@@ -11,7 +11,10 @@ use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, Sess
 use atomcode_core::agent::{
     AgentClient, AgentCommand as CoreCmd, AgentEvent as CoreEv, AgentPhase, TurnStopReason,
 };
+use atomcode_core::agent::goal::{GoalResult, GoalState};
+use atomcode_core::agent::goal_evaluator::{EvalOutcome, GoalEvaluator};
 use atomcode_core::conversation::ConversationSnapshot;
+use tokio_util::sync::CancellationToken;
 use atomcode_kernel::event::{
     AgentCommand as KCmd, AgentEvent as KEv, RequestId, StopReason,
 };
@@ -148,6 +151,24 @@ struct Bridge {
     /// `--dangerously-skip-permissions`: auto-approve kernel approval round-trips
     /// instead of prompting the driver (see [`bypass_auto_approval`]).
     dangerously_skip_permissions: bool,
+    /// Active `/goal` state (loop-until-evaluator-met), or None. Reuses v1's
+    /// `GoalState`; the loop is driven from the turn-end Snapshot hook.
+    goal: Option<GoalState>,
+    /// Provider for the goal evaluator (reuses v1's `GoalEvaluator`), built lazily
+    /// on SetGoal from `evaluator_provider`/default provider. Cloned into each
+    /// spawned eval task.
+    goal_provider: Option<Arc<dyn atomcode_core::provider::LlmProvider>>,
+    /// Cancels an in-flight goal evaluation (fresh per goal). Triggered by
+    /// Cancel/ClearGoal/Shutdown so Esc interrupts the evaluator immediately
+    /// instead of waiting out its 30s/event timeout.
+    goal_cancel: CancellationToken,
+    /// Set while a goal evaluation runs OFF the select loop: holds the deferred
+    /// turn (reason + conversation) until the eval result comes back. `Some` ⇒
+    /// an eval is in flight and the driver-facing turn is held open.
+    pending_goal: Option<(StopReason, Vec<atomcode_core::conversation::message::Message>)>,
+    /// The spawned eval task reports its outcome here; drained by the main loop
+    /// as a third event source so commands (Cancel) stay responsive during eval.
+    goal_eval_tx: mpsc::UnboundedSender<EvalOutcome>,
 }
 
 impl Bridge {
@@ -226,6 +247,8 @@ impl Bridge {
             }
         };
 
+        let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
+
         let mut bridge = Bridge {
             coding_cfg,
             opts_template,
@@ -246,6 +269,11 @@ impl Bridge {
             pending_local_shell: Vec::new(),
             local_shell_seq: 0,
             dangerously_skip_permissions: cfg.dangerously_skip_permissions,
+            goal: None,
+            goal_provider: None,
+            goal_cancel: CancellationToken::new(),
+            pending_goal: None,
+            goal_eval_tx,
         };
 
         loop {
@@ -258,6 +286,11 @@ impl Bridge {
                     }
                     None => break, // driver gone
                 },
+                // Goal evaluations run on a spawned task and report here, so a
+                // Cancel arriving mid-eval is still processed (cmd_rx stays live).
+                Some(outcome) = goal_eval_rx.recv() => {
+                    bridge.on_goal_eval_result(outcome).await;
+                }
                 ev = bridge.handle.events.recv() => match ev {
                     Some(e) => bridge.on_kernel_event(e).await,
                     None => {
@@ -284,6 +317,118 @@ impl Bridge {
 
     fn emit(&self, ev: CoreEv) {
         let _ = self.ev_tx.send(ev);
+    }
+
+    /// Goal-mode turn-end hook: spawn the evaluator OFF the select loop and hold
+    /// the turn open (store `pending_goal`) until its result arrives on
+    /// `goal_eval_tx`. Keeping it off the loop means a Cancel during the (up to
+    /// 30s/event) evaluation is still processed — it cancels `goal_cancel`, which
+    /// aborts the spawned evaluate immediately.
+    fn spawn_goal_eval(
+        &mut self,
+        reason: StopReason,
+        messages: Vec<atomcode_core::conversation::message::Message>,
+    ) {
+        let (Some(provider), Some(condition)) = (
+            self.goal_provider.clone(),
+            self.goal.as_ref().filter(|g| g.active).map(|g| g.condition.clone()),
+        ) else {
+            self.finish_turn(reason, messages);
+            return;
+        };
+        let prev = self.goal.as_ref().and_then(|g| g.last_eval_reason.clone());
+        let summary = summarize_for_goal(&messages, prev.as_deref());
+        self.pending_goal = Some((reason, messages));
+        let cancel = self.goal_cancel.clone();
+        let tx = self.goal_eval_tx.clone();
+        tokio::spawn(async move {
+            let evaluator = GoalEvaluator::new(provider);
+            let outcome = evaluator.evaluate(&condition, &summary, &cancel).await;
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// Apply a goal evaluation result delivered from the spawned task. Met (or
+    /// evaluator-exhausted) clears the goal and finishes the held-open turn; NotMet
+    /// (or a recoverable evaluator error) injects a continuation and keeps the turn
+    /// open. A `None` `pending_goal` means the goal was cleared/cancelled while the
+    /// eval ran — ignore the stale outcome.
+    async fn on_goal_eval_result(&mut self, outcome: EvalOutcome) {
+        let Some((reason, messages)) = self.pending_goal.take() else {
+            return;
+        };
+        if let Some(u) = outcome.usage.as_ref() {
+            if let Some(g) = self.goal.as_mut() {
+                g.add_tokens((u.prompt_tokens + u.completion_tokens) as u64);
+            }
+        }
+        match outcome.result {
+            GoalResult::Met { reason: verdict } => {
+                if let Some(g) = self.goal.as_mut() {
+                    g.active = false;
+                    g.last_eval_reason = Some(verdict);
+                }
+                if let Some(g) = self.goal.take() {
+                    let ev = goal_update_ev(&g);
+                    self.emit(ev);
+                }
+                self.finish_turn(reason, messages);
+            }
+            GoalResult::NotMet { reason: verdict } => {
+                let cond = match self.goal.as_mut() {
+                    Some(g) => {
+                        g.round += 1;
+                        g.evaluator_consecutive_failures = 0;
+                        g.last_eval_reason = Some(verdict.clone());
+                        g.condition.clone()
+                    }
+                    None => {
+                        self.finish_turn(reason, messages);
+                        return;
+                    }
+                };
+                let ev = goal_update_ev(self.goal.as_ref().unwrap());
+                self.emit(ev);
+                let text = format!(
+                    "Goal not yet met: {verdict}\n\nContinue working toward this goal:\n```\n{cond}\n```"
+                );
+                self.start_turn_stats();
+                let _ = self.handle.commands.send(KCmd::SendMessage { text, images: vec![] });
+            }
+            GoalResult::Error(e) => {
+                let exhausted = match self.goal.as_mut() {
+                    Some(g) => {
+                        g.evaluator_consecutive_failures += 1;
+                        g.is_evaluator_exhausted()
+                    }
+                    None => {
+                        self.finish_turn(reason, messages);
+                        return;
+                    }
+                };
+                if exhausted {
+                    if let Some(g) = self.goal.as_mut() {
+                        g.active = false;
+                        g.last_eval_reason = Some(format!("evaluator failed: {e}"));
+                    }
+                    if let Some(g) = self.goal.take() {
+                        let ev = goal_update_ev(&g);
+                        self.emit(ev);
+                    }
+                    self.finish_turn(reason, messages);
+                } else {
+                    let cond = self.goal.as_ref().unwrap().condition.clone();
+                    if let Some(g) = self.goal.as_mut() {
+                        g.last_eval_reason = Some(format!("evaluator error, retrying: {e}"));
+                    }
+                    let ev = goal_update_ev(self.goal.as_ref().unwrap());
+                    self.emit(ev);
+                    let text = format!("Continue working toward this goal:\n```\n{cond}\n```");
+                    self.start_turn_stats();
+                    let _ = self.handle.commands.send(KCmd::SendMessage { text, images: vec![] });
+                }
+            }
+        }
     }
 
     // ---------------- legacy commands → kernel ----------------
@@ -413,7 +558,20 @@ impl Bridge {
                 let _ = self.handle.commands.send(KCmd::SendMessage { text, images });
             }
             CoreCmd::Cancel => {
+                // Esc/Ctrl+C stops an active goal (v1 parity) and interrupts an
+                // in-flight evaluation immediately via the cancel token.
+                self.goal_cancel.cancel();
+                if let Some(mut g) = self.goal.take() {
+                    g.clear();
+                    g.last_eval_reason = Some("cancelled".into());
+                    let ev = goal_update_ev(&g);
+                    self.emit(ev);
+                }
                 let _ = self.handle.commands.send(KCmd::Cancel);
+                // If an eval was holding a turn open, close it as cancelled.
+                if let Some((_, messages)) = self.pending_goal.take() {
+                    self.finish_turn(StopReason::Cancelled, messages);
+                }
             }
             CoreCmd::ApproveTool => self.answer_approval(ApprovalResponse::allow()),
             CoreCmd::ApproveToolAlways => {
@@ -669,15 +827,47 @@ impl Bridge {
                 // The model sees the output on the NEXT turn (no LLM turn now).
                 self.pending_local_shell.push(context);
             }
-            CoreCmd::SetGoal { .. } => {
-                // Goal mode (loop-until-evaluator-met) is a v1-engine feature the
-                // bridge doesn't model. Surface it instead of silently dropping it.
-                self.emit(CoreEv::Warning(
-                    "goal mode (/goal) is not supported under engine v2 — ignored".into(),
-                ));
+            CoreCmd::SetGoal { condition } => {
+                // Goal mode (loop-until-evaluator-met) on v2: reuse v1's GoalState +
+                // GoalEvaluator (atomcode-core is a bridge dep). `/goal <cond>` also
+                // sends the condition as a normal message, so the FIRST turn starts on
+                // its own; this just arms the loop, which is driven from the turn-end
+                // Snapshot hook (`maybe_continue_goal`).
+                if self.goal_provider.is_none() {
+                    self.goal_provider = build_goal_provider();
+                }
+                if self.goal_provider.is_none() {
+                    self.emit(CoreEv::Warning(
+                        "goal mode unavailable: could not build evaluator (check [providers] / \
+                         evaluator_provider in ~/.atomcode/config.toml)"
+                            .into(),
+                    ));
+                } else {
+                    // Fresh cancel token per goal so a prior goal's cancel can't kill this one.
+                    self.goal_cancel = CancellationToken::new();
+                    let state = GoalState::new(condition);
+                    let ev = goal_update_ev(&state);
+                    self.emit(ev);
+                    self.goal = Some(state);
+                }
             }
-            CoreCmd::ClearGoal => {}
-            CoreCmd::Shutdown => return true,
+            CoreCmd::ClearGoal => {
+                self.goal_cancel.cancel();
+                if let Some(mut g) = self.goal.take() {
+                    g.clear();
+                    g.last_eval_reason = Some("cleared by user".into());
+                    let ev = goal_update_ev(&g);
+                    self.emit(ev);
+                }
+                // An eval was holding a turn open — close it now.
+                if let Some((_, messages)) = self.pending_goal.take() {
+                    self.finish_turn(StopReason::Cancelled, messages);
+                }
+            }
+            CoreCmd::Shutdown => {
+                self.goal_cancel.cancel();
+                return true;
+            }
         }
         false
     }
@@ -1006,7 +1196,18 @@ impl Bridge {
             }
             KEv::Snapshot { snapshot } => {
                 if let Some(reason) = self.pending_finish.take() {
-                    let messages = snapshot.messages.iter().map(convert::message_to_core).collect();
+                    let messages: Vec<atomcode_core::conversation::message::Message> =
+                        snapshot.messages.iter().map(convert::message_to_core).collect();
+                    // Goal hook: a natural stop with an active goal isn't the end.
+                    // Spawn the evaluator OFF this loop (so Cancel stays responsive);
+                    // the turn is held open until `on_goal_eval_result` decides to
+                    // continue (inject) or finish.
+                    if matches!(reason, StopReason::Stopped)
+                        && self.goal.as_ref().map_or(false, |g| g.active)
+                    {
+                        self.spawn_goal_eval(reason, messages);
+                        return;
+                    }
                     self.finish_turn(reason, messages);
                 } else if let Some(nth) = self.pending_undo.take() {
                     self.do_undo(snapshot.messages, nth).await;
@@ -1049,6 +1250,81 @@ impl Bridge {
 /// path does.
 fn bypass_auto_approval(skip_permissions: bool) -> Option<ApprovalResponse> {
     skip_permissions.then(ApprovalResponse::allow)
+}
+
+/// Build the legacy `GoalUpdate` event from goal state (free fn so callers don't
+/// borrow `self.goal` and `self` simultaneously).
+fn goal_update_ev(g: &GoalState) -> CoreEv {
+    CoreEv::GoalUpdate {
+        active: g.active,
+        round: g.round,
+        elapsed_secs: g.elapsed_secs(),
+        condition: g.condition.clone(),
+        last_reason: g.last_eval_reason.clone(),
+    }
+}
+
+/// Build the goal evaluator provider (reused by v1's `GoalEvaluator`) from config:
+/// the `evaluator_provider` entry if set, else the default provider. `None` if the
+/// config can't load or the provider can't be constructed. Minimal port: no
+/// fallback to the active /chat model — set `evaluator_provider` to pin a fast
+/// judge, exactly as the `/goal` help documents.
+fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
+    let config =
+        atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
+    let key = config
+        .evaluator_provider
+        .as_ref()
+        .unwrap_or(&config.default_provider);
+    let pcfg = config.providers.get(key)?;
+    let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
+    Some(Arc::from(provider))
+}
+
+/// Compact the conversation into a plain-text summary for the evaluator, mirroring
+/// v1's `summarize_recent_turns_for_goal`: the previous round's verdict (so the
+/// judge sees what it asked for last time) plus the last 5 non-empty assistant
+/// replies (200 chars each, oldest → newest) — the agent's own account of what it
+/// did, which is the signal the evaluator rules on.
+fn summarize_for_goal(
+    messages: &[atomcode_core::conversation::message::Message],
+    prev_verdict: Option<&str>,
+) -> String {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    let mut sections: Vec<String> = Vec::new();
+    if let Some(v) = prev_verdict {
+        sections.push(format!("Previous round verdict: {v}"));
+    }
+    let mut recent: Vec<String> = Vec::new();
+    for msg in messages.iter().rev() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        let text = match &msg.content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::AssistantWithToolCalls { text, .. } => text.clone().unwrap_or_default(),
+            _ => continue,
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        recent.push(text.chars().take(200).collect());
+        if recent.len() >= 5 {
+            break;
+        }
+    }
+    recent.reverse();
+    if !recent.is_empty() {
+        sections.push(format!(
+            "Recent assistant replies (oldest → newest):\n{}",
+            recent.join("\n---\n")
+        ));
+    }
+    if sections.is_empty() {
+        "(no agent work yet)".to_owned()
+    } else {
+        sections.join("\n\n")
+    }
 }
 
 /// Escape `<`/`>`/`&` so command output can't forge the `<bash-*>` tags the model
@@ -1348,6 +1624,41 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let head: String = s.chars().take(max).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod goal_summary_tests {
+    use super::summarize_for_goal;
+    use atomcode_core::conversation::message::{Message, Role};
+
+    #[test]
+    fn summary_has_assistant_replies_and_prev_verdict_but_not_user_msgs() {
+        let msgs = vec![
+            Message::new(Role::User, "do the thing".to_string()),
+            Message::new(Role::Assistant, "".to_string()), // empty → skipped
+            Message::new(Role::Assistant, "did step one".to_string()),
+        ];
+        let s = summarize_for_goal(&msgs, Some("not done: missing tests"));
+        assert!(s.contains("Previous round verdict: not done: missing tests"));
+        assert!(s.contains("did step one"));
+        // only assistant replies feed the summary — user text is not echoed
+        assert!(!s.contains("do the thing"));
+    }
+
+    #[test]
+    fn summary_truncates_replies_to_200_chars() {
+        let long = "x".repeat(1000);
+        let msgs = vec![Message::new(Role::Assistant, long)];
+        let s = summarize_for_goal(&msgs, None);
+        assert!(s.contains("Recent assistant replies"));
+        assert!(s.matches('x').count() <= 200, "each reply capped at 200 chars");
+    }
+
+    #[test]
+    fn summary_empty_when_no_assistant_work() {
+        let msgs = vec![Message::new(Role::User, "go".to_string())];
+        assert_eq!(summarize_for_goal(&msgs, None), "(no agent work yet)");
     }
 }
 
