@@ -30,6 +30,8 @@ kotlin {
 }
 
 dependencies {
+    implementation("com.google.code.gson:gson:2.11.0")
+
     intellijPlatform {
         val localIdePath = providers.gradleProperty("platformLocalPath")
         if (localIdePath.isPresent) {

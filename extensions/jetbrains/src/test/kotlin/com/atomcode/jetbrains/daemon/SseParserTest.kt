@@ -46,6 +46,33 @@ class SseParserTest {
     }
 
     @Test
+    fun parsesLargeToolResultWithoutRecursiveRegexOverflow() {
+        val parser = SseParser()
+        val output = buildString {
+            repeat(80_000) {
+                append("line ")
+                append(it)
+                append(" \\\"quoted\\\" \\\\ path\\n")
+            }
+        }
+
+        val events = parser.feed(
+            """data: {"type":"tool_result","id":"call-1","name":"bash","output":"$output","success":true,"duration_ms":123}${"\n\n"}""",
+        )
+
+        assertEquals(
+            ChatEvent.ToolResult(
+                id = "call-1",
+                name = "bash",
+                output = output.replace("\\\"", "\"").replace("\\\\", "\\").replace("\\n", "\n"),
+                success = true,
+                durationMs = 123,
+            ),
+            events.single(),
+        )
+    }
+
+    @Test
     fun parsesJsonObjectArray() {
         val objects = """[{"id":"s1","name":"One"},{"id":"s2","name":"Two","nested":{"ok":true}}]""".jsonObjects()
 
