@@ -293,6 +293,98 @@ pub(super) fn auth_retry_args(url: &str) -> Option<[String; 2]> {
     Some(["-c".to_string(), extra_header_config(url, &header)])
 }
 
+/// Run `git clone …` built by `add_args`, anonymously first. If it fails with
+/// an auth error on a trusted-host repo while logged in, wipe the partial
+/// `target` and retry once with the per-URL auth header injected. `add_args`
+/// must append the full `clone … <url> <target>` arguments and is called fresh
+/// per attempt. `target` is passed so the failed-attempt dir can be removed
+/// before the authenticated retry (git refuses to clone into a non-empty dir).
+pub(super) fn clone_with_optional_auth(
+    git: &Path,
+    url: &str,
+    target: &Path,
+    add_args: impl Fn(&mut Command),
+) -> Result<()> {
+    let run = |extra: Option<&[String]>| -> Result<std::process::Output> {
+        let mut cmd = git_command(git);
+        if let Some(e) = extra {
+            cmd.args(e);
+        }
+        add_args(&mut cmd);
+        cmd.output().context("spawn git clone")
+    };
+
+    let out = run(None)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    if is_git_auth_failure(&stderr) {
+        if let Some(cargs) = auth_retry_args(url) {
+            if target.exists() {
+                std::fs::remove_dir_all(target).ok();
+            }
+            let out2 = run(Some(&cargs))?;
+            if out2.status.success() {
+                return Ok(());
+            }
+            bail!(
+                "克隆失败：使用已登录凭证仍无法访问该私有仓库（可能无权限或登录已过期，\
+                 可 /login 重新登录后重试）。\n原始错误：{}",
+                String::from_utf8_lossy(&out2.stderr).trim()
+            );
+        }
+        bail!(
+            "克隆失败：该仓库需要认证（私有仓库）。已登录时可自动使用凭证\
+             （仅 gitcode.com / atomgit.com）；否则请改用 SSH 地址（git@…）\
+             或先用 git 配置好凭证后重试。\n原始错误：{}",
+            stderr.trim()
+        );
+    }
+    bail!("git clone failed: {}", stderr);
+}
+
+/// `git pull --ff-only` in `repo`, anonymously first; on auth failure for a
+/// trusted-host `source_url` while logged in, retry once with the injected
+/// header. Symmetric with `clone_with_optional_auth` for the update path.
+pub(super) fn git_pull_ff(repo: &Path, source_url: &str) -> Result<()> {
+    let git = find_git()?;
+    let run = |extra: Option<&[String]>| -> Result<std::process::Output> {
+        let mut cmd = git_command(&git);
+        if let Some(e) = extra {
+            cmd.args(e);
+        }
+        cmd.args(["pull", "--ff-only"]).current_dir(repo);
+        cmd.output().context("spawn git pull")
+    };
+
+    let out = run(None)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if is_git_auth_failure(&stderr) {
+        if let Some(cargs) = auth_retry_args(source_url) {
+            let out2 = run(Some(&cargs))?;
+            if out2.status.success() {
+                return Ok(());
+            }
+            bail!(
+                "更新失败：使用已登录凭证仍无法访问（无权限或登录已过期，可 /login 重新登录）。\
+                 \n原始错误：{}",
+                String::from_utf8_lossy(&out2.stderr).trim()
+            );
+        }
+        bail!(
+            "更新失败：该 marketplace 仓库需要认证（私有仓库）。请改用 SSH 或配置 git 凭证后重试。\
+             \n原始错误：{}",
+            stderr.trim()
+        );
+    }
+    bail!("git pull failed: {}", stderr);
+}
+
 /// True when `git`'s stderr indicates it failed because it needed interactive
 /// credentials we deliberately suppressed (private repo, no helper/PAT).
 fn is_git_auth_failure(stderr: &str) -> bool {
@@ -304,25 +396,9 @@ fn is_git_auth_failure(stderr: &str) -> bool {
 
 pub(super) fn git_clone(url: &str, target: &Path) -> Result<()> {
     let git = find_git()?;
-    let out = git_command(&git)
-        .args(["clone", "--depth", "1", url])
-        .arg(target)
-        .output()
-        .context("spawn git")?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if is_git_auth_failure(&stderr) {
-            bail!(
-                "克隆失败：该 marketplace 仓库需要认证（私有仓库）。\
-                 AtomCode 不会在终端弹出账号/密码输入（那会卡住界面），\
-                 请改用 SSH 地址（git@…）或先用 git 配置好凭证（credential helper / PAT）后重试。\n\
-                 原始错误：{}",
-                stderr.trim()
-            );
-        }
-        bail!("git clone failed: {}", stderr);
-    }
-    Ok(())
+    clone_with_optional_auth(&git, url, target, |cmd| {
+        cmd.args(["clone", "--depth", "1", url]).arg(target);
+    })
 }
 
 fn git_rev_parse(repo: &Path) -> Result<String> {
