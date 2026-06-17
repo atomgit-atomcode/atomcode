@@ -299,6 +299,36 @@ pub(super) fn auth_retry_args(url: &str) -> Option<[String; 2]> {
 /// must append the full `clone … <url> <target>` arguments and is called fresh
 /// per attempt. `target` is passed so the failed-attempt dir can be removed
 /// before the authenticated retry (git refuses to clone into a non-empty dir).
+/// User-facing error when an auth failure could NOT be resolved automatically
+/// (no credential was injected). Tailors the hint to the cause so a logged-in
+/// user with a dead token isn't told "just log in" as if they hadn't:
+/// - untrusted host → SSH / configure git creds (the platform token is never
+///   sent to non-allowlisted hosts, so /login wouldn't help);
+/// - trusted host + a stored login present (token expired AND refresh failed) →
+///   re-login;
+/// - trusted host + not logged in → /login (auto-creds) or SSH.
+/// `verb` is 克隆 / 更新. Shared by clone + pull so the wording can't drift.
+fn auth_required_message(verb: &str, url: &str, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if !super::url::host_is_trusted(url) {
+        return format!(
+            "{verb}失败：该仓库需要认证（私有仓库）。请改用 SSH 地址（git@…）\
+             或先用 git 配置好凭证后重试。\n原始错误：{stderr}"
+        );
+    }
+    if crate::auth::get_stored_auth().is_some() {
+        format!(
+            "{verb}失败：登录已过期或凭证无效，请运行 /login 重新登录后重试。\n原始错误：{stderr}"
+        )
+    } else {
+        format!(
+            "{verb}失败：该私有仓库需要认证。请先 /login 登录\
+             （gitcode.com / atomgit.com 登录后可自动使用凭证），或改用 SSH 地址（git@…）。\
+             \n原始错误：{stderr}"
+        )
+    }
+}
+
 pub(super) fn clone_with_optional_auth(
     git: &Path,
     url: &str,
@@ -335,12 +365,7 @@ pub(super) fn clone_with_optional_auth(
                 String::from_utf8_lossy(&out2.stderr).trim()
             );
         }
-        bail!(
-            "克隆失败：该仓库需要认证（私有仓库）。已登录时可自动使用凭证\
-             （仅 gitcode.com / atomgit.com）；否则请改用 SSH 地址（git@…）\
-             或先用 git 配置好凭证后重试。\n原始错误：{}",
-            stderr.trim()
-        );
+        bail!("{}", auth_required_message("克隆", url, &stderr));
     }
     bail!("git clone failed: {}", stderr);
 }
@@ -376,11 +401,7 @@ pub(super) fn git_pull_ff(repo: &Path, source_url: &str) -> Result<()> {
                 String::from_utf8_lossy(&out2.stderr).trim()
             );
         }
-        bail!(
-            "更新失败：该 marketplace 仓库需要认证（私有仓库）。请改用 SSH 或配置 git 凭证后重试。\
-             \n原始错误：{}",
-            stderr.trim()
-        );
+        bail!("{}", auth_required_message("更新", source_url, &stderr));
     }
     bail!("git pull failed: {}", stderr);
 }
@@ -595,6 +616,46 @@ mod tests {
     fn auth_retry_args_none_when_not_logged_in() {
         let _home = isolated_home(); // 无 auth.toml
         assert!(auth_retry_args("https://gitcode.com/owner/repo").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_required_message_untrusted_host_suggests_ssh_not_login() {
+        // Platform token is never sent to non-allowlisted hosts, so /login
+        // wouldn't help — guide to SSH/creds instead.
+        let m = auth_required_message("克隆", "https://github.com/o/r", "fatal: auth");
+        assert!(m.contains("SSH"), "got: {m}");
+        assert!(!m.contains("/login"), "must not suggest /login for untrusted host: {m}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_required_message_trusted_not_logged_in_suggests_login() {
+        let _home = isolated_home(); // no auth.toml under the temp ATOMCODE_HOME
+        let m = auth_required_message("克隆", "https://gitcode.com/o/r", "fatal: auth");
+        assert!(m.contains("/login"), "trusted host + not logged in should guide to /login: {m}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_required_message_trusted_logged_in_says_session_expired() {
+        // Logged in (auth.toml present) but no usable token (expired + refresh
+        // failed) → must say the session expired, not "just log in" as if the
+        // user never had. ATOMCODE_HOME is isolated, so this writes to a
+        // tempdir, never the real ~/.atomcode/auth.toml.
+        let _home = isolated_home();
+        let dir = crate::config::Config::config_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.toml"),
+            "access_token = \"x\"\ntoken_type = \"Bearer\"\n[user]\nid = \"1\"\nusername = \"alice\"\n",
+        )
+        .unwrap();
+        let m = auth_required_message("更新", "https://atomgit.com/o/r", "fatal: auth");
+        assert!(
+            m.contains("登录已过期") || m.contains("重新登录"),
+            "logged-in-but-dead-token should indicate re-login: {m}"
+        );
     }
 
     #[test]
