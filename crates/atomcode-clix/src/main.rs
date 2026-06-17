@@ -355,7 +355,8 @@ fn review_incomplete(stop: StopReason, has_error: bool) -> bool {
 /// Result of driving one review turn loop while live-tracing tool activity to stderr.
 #[derive(Default)]
 struct ReviewRun {
-    /// Accumulated assistant prose (the final summary).
+    /// The closing summary: assistant prose emitted AFTER the last tool call.
+    /// Cleared on every `ToolStarted` so pre-call narration never leaks in.
     text: String,
     /// How the turn ended. `Stopped` = the model finished on its own; anything else
     /// (Cancelled via max-duration, Timeout, MaxRounds, ProviderError) means the review
@@ -371,6 +372,51 @@ struct ReviewRun {
     tool_calls: usize,
 }
 
+impl ReviewRun {
+    /// Fold ONE agent event into the run, mutating accumulators in place.
+    /// Returns `false` once the turn is terminal (the caller then stops reading).
+    /// `call_names` maps tool-call id → name for the live stderr trace.
+    fn apply(&mut self, ev: AgentEvent, call_names: &mut std::collections::HashMap<String, String>) -> bool {
+        match ev {
+            AgentEvent::ToolStarted { call } => {
+                self.tool_calls += 1;
+                *self.tool_counts.entry(call.name.clone()).or_default() += 1;
+                call_names.insert(call.id.clone(), call.name.clone());
+                // A tool call means whatever prose came before it was pre-call narration
+                // ("let me read X…"), NOT the persona's Closing Summary. Drop it — only
+                // text emitted AFTER the last tool call survives, which is exactly the
+                // closing summary (persona §XI). Without this, every turn's narration
+                // leaked into `text` and onto the PR comment.
+                self.text.clear();
+                eprintln!("  → {} {}", call.name, tool_hint(&call.name, &call.arguments));
+            }
+            AgentEvent::ToolResult { result } => {
+                let name = call_names.get(&result.call_id).map(String::as_str).unwrap_or("tool");
+                let mark = if result.is_error { "✗" } else { "✓" };
+                eprintln!("    {mark} {name} ({} chars)", result.content.chars().count());
+            }
+            AgentEvent::TextDelta(t) => self.text.push_str(&t),
+            // Each turn emits ONE per-turn usage figure; SUM across turns for the run total.
+            // (Last-wins kept only the final turn and silently under-reported the whole
+            // agentic run — e.g. a 40-turn review looked like one 50k-prompt call.)
+            AgentEvent::Usage(meta) => {
+                let u = self.usage.get_or_insert(Default::default());
+                u.prompt += meta.tokens.prompt;
+                u.completion += meta.tokens.completion;
+                u.cached += meta.tokens.cached;
+            }
+            AgentEvent::Error { message, .. } => {
+                eprintln!("    [error] {message}");
+                self.error = Some(message);
+            }
+            AgentEvent::Warning(w) => eprintln!("    [warn] {w}"),
+            AgentEvent::TurnComplete { .. } => return false,
+            _ => {}
+        }
+        true
+    }
+}
+
 /// Spawn the review agent, kick off the turn, and stream a live execution trace to stderr:
 /// each tool call (name + key args) and its result (ok/err + size), plus a final
 /// tool-usage + token profile. Returns the accumulated summary text + stats.
@@ -382,35 +428,8 @@ async fn run_review_streaming(agent: Agent, task: String) -> ReviewRun {
     let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     while let Some(ev) = handle.events.recv().await {
-        match ev {
-            AgentEvent::ToolStarted { call } => {
-                run.tool_calls += 1;
-                *run.tool_counts.entry(call.name.clone()).or_default() += 1;
-                call_names.insert(call.id.clone(), call.name.clone());
-                eprintln!("  → {} {}", call.name, tool_hint(&call.name, &call.arguments));
-            }
-            AgentEvent::ToolResult { result } => {
-                let name = call_names.get(&result.call_id).map(String::as_str).unwrap_or("tool");
-                let mark = if result.is_error { "✗" } else { "✓" };
-                eprintln!("    {mark} {name} ({} chars)", result.content.chars().count());
-            }
-            AgentEvent::TextDelta(t) => run.text.push_str(&t),
-            // Each turn emits ONE per-turn usage figure; SUM across turns for the run total.
-            // (Last-wins kept only the final turn and silently under-reported the whole
-            // agentic run — e.g. a 40-turn review looked like one 50k-prompt call.)
-            AgentEvent::Usage(meta) => {
-                let u = run.usage.get_or_insert(Default::default());
-                u.prompt += meta.tokens.prompt;
-                u.completion += meta.tokens.completion;
-                u.cached += meta.tokens.cached;
-            }
-            AgentEvent::Error { message, .. } => {
-                eprintln!("    [error] {message}");
-                run.error = Some(message);
-            }
-            AgentEvent::Warning(w) => eprintln!("    [warn] {w}"),
-            AgentEvent::TurnComplete { .. } => break,
-            _ => {}
+        if !run.apply(ev, &mut call_names) {
+            break;
         }
     }
     let _ = handle.commands.send(AgentCommand::Shutdown);
@@ -766,6 +785,34 @@ mod tests {
         assert!(review_incomplete(StopReason::MaxRounds, false));
         // 有 error 即使 Stopped 也算未完成。
         assert!(review_incomplete(StopReason::Stopped, true));
+    }
+
+    #[test]
+    fn closing_summary_survives_pre_call_narration_dropped() {
+        use atomcode_kernel::tool::ToolCall;
+        let tool = |id: &str, name: &str| AgentEvent::ToolStarted {
+            call: ToolCall { id: id.into(), name: name.into(), arguments: "{}".into() },
+        };
+        // 模型每轮调工具前都会叙述（"let me read X…"），那是过程噪声，不该进 text；
+        // 只有最后一次工具调用之后输出的 Closing Summary（persona §XI）才该保留。
+        let events = [
+            AgentEvent::TextDelta("Now let me read the kernel file…".into()),
+            tool("c1", "read_file"),
+            AgentEvent::TextDelta("Now let me check validation.go…".into()),
+            tool("c2", "report_finding"),
+            AgentEvent::TextDelta("## 审查总结\nP0: 1, P1: 2\n整体风险：HIGH".into()),
+            AgentEvent::TurnComplete { reason: StopReason::Stopped },
+        ];
+        let mut run = ReviewRun::default();
+        let mut names = std::collections::HashMap::new();
+        for ev in events {
+            run.apply(ev, &mut names);
+        }
+        assert_eq!(
+            run.text.trim(),
+            "## 审查总结\nP0: 1, P1: 2\n整体风险：HIGH",
+            "只保留末轮 Closing Summary，丢弃工具调用前的过程叙述",
+        );
     }
 
     fn finding(priority: &str, confidence: f32, title: &str) -> Finding {
