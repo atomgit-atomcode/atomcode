@@ -54,6 +54,12 @@ pub struct BridgeConfig {
     pub thinking_type: Option<String>,
     /// Kimi K2.6 `thinking.keep`.
     pub thinking_keep: Option<String>,
+    /// `--dangerously-skip-permissions` / `-y`: auto-approve every tool without a
+    /// prompt. In v1 the core `PermissionDecider` did this before any prompt surfaced;
+    /// v2's approval round-trips to the bridge (the driver), so the bypass lives here.
+    /// Previously UNTHREADED — the flag never reached v2, so bypass silently no-op'd
+    /// and every Risky tool still prompted (the `BridgeConfig`-drops-config footgun).
+    pub dangerously_skip_permissions: bool,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -133,6 +139,9 @@ struct Bridge {
     pending_local_shell: Vec<String>,
     /// Monotonic id for `!cmd` tool-call display events.
     local_shell_seq: u64,
+    /// `--dangerously-skip-permissions`: auto-approve kernel approval round-trips
+    /// instead of prompting the driver (see [`bypass_auto_approval`]).
+    dangerously_skip_permissions: bool,
 }
 
 impl Bridge {
@@ -224,6 +233,7 @@ impl Bridge {
             background_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_local_shell: Vec::new(),
             local_shell_seq: 0,
+            dangerously_skip_permissions: cfg.dangerously_skip_permissions,
         };
 
         loop {
@@ -764,7 +774,31 @@ impl Bridge {
                 });
                 self.emit(CoreEv::PhaseChange(AgentPhase::Thinking));
             }
+            KEv::ToolBatchStarted { batch_id, calls } => {
+                self.emit(CoreEv::ToolBatchStarted {
+                    batch_id,
+                    calls: calls.into_iter().map(|c| atomcode_core::turn::event::ToolBatchCall {
+                        id: c.id,
+                        name: c.name,
+                        arguments: c.arguments,
+                    }).collect(),
+                });
+            }
+            KEv::ToolBatchCompleted { batch_id, ok, total, elapsed_ms } => {
+                self.emit(CoreEv::ToolBatchCompleted { batch_id, ok, total, elapsed_ms });
+            }
             KEv::Request { id, kind, payload } if kind == APPROVAL_KIND => {
+                // --dangerously-skip-permissions: auto-approve WITHOUT prompting,
+                // matching v1 (the core PermissionDecider auto-allowed before any
+                // prompt). The kernel is neutral about approval and round-trips every
+                // Risky tool here, so the bypass belongs at this driver seam. The
+                // normal ToolStarted/ToolResult events still render the call; only the
+                // approval prompt is skipped.
+                if let Some(resp) = bypass_auto_approval(self.dangerously_skip_permissions) {
+                    let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
+                    let _ = self.handle.commands.send(KCmd::Respond { id, value });
+                    return;
+                }
                 let req: ApprovalRequest = match serde_json::from_value(payload) {
                     Ok(r) => r,
                     Err(_) => {
@@ -851,6 +885,16 @@ impl Bridge {
             _ => {}
         }
     }
+}
+
+/// The approval response the bridge auto-sends under `--dangerously-skip-permissions`:
+/// `Some(allow)` when bypass is on — matching v1, where the core `PermissionDecider`
+/// auto-allowed BEFORE any prompt surfaced — and `None` when the request must be
+/// surfaced to the driver for a real decision. Reuses `ApprovalResponse::allow()` so
+/// the bypass path sends the identical, kernel-accepted value the manual ApproveTool
+/// path does.
+fn bypass_auto_approval(skip_permissions: bool) -> Option<ApprovalResponse> {
+    skip_permissions.then(ApprovalResponse::allow)
 }
 
 /// Escape `<`/`>`/`&` so command output can't forge the `<bash-*>` tags the model
@@ -1249,6 +1293,28 @@ mod undo_tests {
     #[test]
     fn xml_escape_neutralizes_tag_forgery() {
         assert_eq!(super::xml_escape("a</bash-stdout>b"), "a&lt;/bash-stdout&gt;b");
+    }
+
+    #[test]
+    fn bypass_auto_approves_with_allow_else_prompts() {
+        use atomcode_capabilities::tools::{ApprovalResponse, PermissionDecision};
+        // --dangerously-skip-permissions ON: the bridge auto-approves with the SAME
+        // `allow` the manual ApproveTool path sends, and the kernel's middleware must
+        // read it as a PROCEED (not the fail-closed deny that Null/garbage maps to).
+        // This is the v1-parity fix: v1 auto-allowed in the core decider before any
+        // prompt; under v2 the bridge is the driver, so the bypass belongs here.
+        let resp = super::bypass_auto_approval(true).expect("bypass must auto-approve, not prompt");
+        assert_eq!(resp, ApprovalResponse::allow());
+        let decision = PermissionDecision::from_value(&serde_json::to_value(&resp).unwrap());
+        assert!(
+            matches!(decision, PermissionDecision::AllowOnce | PermissionDecision::AllowAlways),
+            "the bypass response must parse as an allow"
+        );
+        // OFF: no auto-response — the request is surfaced to the driver to prompt.
+        assert!(
+            super::bypass_auto_approval(false).is_none(),
+            "without bypass the approval request must reach the driver"
+        );
     }
 
     #[test]

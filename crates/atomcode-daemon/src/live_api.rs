@@ -682,6 +682,10 @@ impl KernelTurnExecutor {
             thinking_enabled: p.thinking_enabled,
             thinking_type: p.thinking_type.clone(),
             thinking_keep: p.thinking_keep.clone(),
+            // The daemon answers approvals at its OWN driver seam (the `/live`
+            // BypassAll decider / `/chat` interactive perm_rx), so the bridge must
+            // NOT auto-approve — keep the round-trip and the daemon decides.
+            dangerously_skip_permissions: false,
         })
     }
 }
@@ -974,6 +978,9 @@ pub(crate) fn chat_bridge_config(
         thinking_enabled: p.and_then(|p| p.thinking_enabled),
         thinking_type: p.and_then(|p| p.thinking_type.clone()),
         thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
+        // The daemon answers `/chat` approvals at its own seam (interactive perm_rx),
+        // so the bridge must keep the round-trip rather than auto-approving here.
+        dangerously_skip_permissions: false,
     }
 }
 

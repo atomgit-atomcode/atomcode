@@ -1618,8 +1618,13 @@ async fn run() -> Result<i32> {
         eprintln!("[engine v1] legacy stack active (opt-out via --engine v1)");
     }
     let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if engine_v2 {
-        let bridge_cfg =
-            bridge_config_from(&config, &working_dir, cli.provider.as_deref(), Some(telemetry.clone()));
+        let bridge_cfg = bridge_config_from(
+            &config,
+            &working_dir,
+            cli.provider.as_deref(),
+            Some(telemetry.clone()),
+            cli.dangerously_skip_permissions,
+        );
         eprintln!("[engine v2] new stack active (model {})", bridge_cfg.model);
         let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
         Some(atomcode_core::agent::AgentHandle { client, event_rx })
@@ -1631,6 +1636,9 @@ async fn run() -> Result<i32> {
     // not the v1 factory — backs those runtimes too. `None` in v1 keeps the factory.
     let runtime_spawn_override: Option<atomcode_tuix::RuntimeSpawnOverride> = if engine_v2 {
         let tel = telemetry.clone();
+        // Capture the bypass flag so in-TUI re-spawns (/session, /bg, disk /resume)
+        // also honor --dangerously-skip-permissions — not just the launch handle.
+        let skip_perms = cli.dangerously_skip_permissions;
         Some(std::sync::Arc::new(
             move |config: &atomcode_core::config::Config, working_dir: &std::path::Path| {
                 // In-TUI re-spawns (/session, /bg, disk /resume) follow the
@@ -1642,6 +1650,7 @@ async fn run() -> Result<i32> {
                     working_dir,
                     None,
                     Some(tel.clone()),
+                    skip_perms,
                 ))
             },
         ))
@@ -1944,6 +1953,7 @@ fn bridge_config_from(
     working_dir: &std::path::Path,
     provider_override: Option<&str>,
     telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
+    dangerously_skip_permissions: bool,
 ) -> atomcode_bridge::BridgeConfig {
     let p = config.active_provider(provider_override).ok();
     atomcode_bridge::BridgeConfig {
@@ -1960,6 +1970,7 @@ fn bridge_config_from(
         thinking_enabled: p.and_then(|p| p.thinking_enabled),
         thinking_type: p.and_then(|p| p.thinking_type.clone()),
         thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
+        dangerously_skip_permissions,
     }
 }
 

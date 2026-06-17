@@ -93,6 +93,12 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
     }
 
     fun ensureConnected(): CompletableFuture<ConnectionState> {
+        // 已连接则短路，避免多余 HTTP 往返
+        val current = connectionState
+        if (current is ConnectionState.Ready) {
+            return CompletableFuture.completedFuture(current)
+        }
+
         val existing = ensureConnectedInFlight.get()
         if (existing != null) return existing
 
@@ -102,20 +108,25 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         }
 
         return ensureConnectedImpl()
-            .whenComplete { result, _ ->
-                future.complete(result)
-                ensureConnectedInFlight.set(null)
+            .whenComplete { result, error ->
+                future.complete(if (error != null) connectionState else result)
+                // 无论正常/异常/取消都清空缓存（exception + cancel）
             }
             .thenCompose { future }
+            .whenComplete { _, _ -> ensureConnectedInFlight.set(null) }
     }
 
     private fun ensureConnectedImpl(): CompletableFuture<ConnectionState> {
         setConnectionState(ConnectionState.CheckingDaemon)
         val settings = settingsService.state.copy()
-        val client = AtomCodeDaemonClient(settings.host, settings.port, settings.requestTimeoutMs, auth)
         val daemonProcess = AtomCodeDaemonProcess(settings)
 
-        return client.health()
+        // 初始探测用短超时（3s），daemon 本地响应只需 <100ms
+        // 避免 daemon 未运行时等满 30s 才超时
+        val probeClient = AtomCodeDaemonClient(settings.host, settings.port, 3000, auth)
+        val client = AtomCodeDaemonClient(settings.host, settings.port, settings.requestTimeoutMs, auth)
+
+        return probeClient.health()
             .handle { health, healthError ->
                 if (healthError == null && health.service == "atomcode-daemon") {
                     setConnectionState(ConnectionState.Connecting)
@@ -460,27 +471,24 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         if (connectionState.isConnecting()) return
         if (!backgroundHealthInFlight.compareAndSet(false, true)) return
 
-        try {
-            val client = getOrCreateClient()
-            client.health()
-                .thenCompose { health ->
-                    if (health.service != "atomcode-daemon") {
-                        CompletableFuture.failedFuture(IllegalStateException("Unexpected service on AtomCode port."))
-                    } else if (connectionState is ConnectionState.Ready) {
-                        CompletableFuture.completedFuture(connectionState)
-                    } else {
-                        syncProjectDirectory(client, health.version)
-                    }
+        val client = getOrCreateClient()
+        client.health()
+            .thenCompose { health ->
+                if (health.service != "atomcode-daemon") {
+                    CompletableFuture.failedFuture(IllegalStateException("Unexpected service on AtomCode port."))
+                } else if (connectionState is ConnectionState.Ready) {
+                    CompletableFuture.completedFuture(connectionState)
+                } else {
+                    syncProjectDirectory(client, health.version)
                 }
-                .whenComplete { _, error ->
-                    if (error != null && !connectionState.isConnecting()) {
-                        activeClient = null
-                        setConnectionState(ConnectionState.SetupRequired("AtomCode daemon is not running."))
-                    }
+            }
+            .whenComplete { _, error ->
+                backgroundHealthInFlight.set(false)
+                if (error != null && !connectionState.isConnecting()) {
+                    activeClient = null
+                    setConnectionState(ConnectionState.SetupRequired("AtomCode daemon is not running."))
                 }
-        } finally {
-            backgroundHealthInFlight.set(false)
-        }
+            }
     }
 
     private fun pollLoginUntilAuthorized(
@@ -526,10 +534,13 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
 
         setConnectionState(ConnectionState.SyncingProject)
         return client.changeDir(basePath)
-            .thenApply {
+            .thenApply { response ->
+                if (!response.success) {
+                    throw IllegalStateException("AtomCode daemon rejected project directory: ${response.message}")
+                }
                 activeClient = client
                 setConnectionState(ConnectionState.CheckingProvider)
-                setConnectionState(ConnectionState.Ready(version, it.currentDir))
+                setConnectionState(ConnectionState.Ready(version, response.currentDir))
                 connectionState
             }
     }

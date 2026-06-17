@@ -26,7 +26,7 @@ fn full_toolset_registers_and_mounts() {
     for expected in coding_tool_names() {
         assert!(names.iter().any(|n| n == expected), "{expected} should be mounted; got {names:?}");
     }
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), coding_tool_names().len());
 }
 
 #[tokio::test]

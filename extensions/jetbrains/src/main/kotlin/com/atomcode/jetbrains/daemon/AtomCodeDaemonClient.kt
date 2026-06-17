@@ -290,41 +290,35 @@ class AtomCodeDaemonClient(
             .POST(HttpRequest.BodyPublishers.ofString(body))
             .build()
 
+        // 使用 ofInputStream 代替 fromLineSubscriber：
+        // fromLineSubscriber 基于 Java Reactive Streams Flow API，
+        // 其内部递归调用在 SSE 高频事件场景下会触发 java.lang.StackOverflowError。
+        // ofInputStream 直接读取字节流，逐行解析，无需 Flow API。
         val future = CompletableFuture<Void>()
-        val subscriber = object : java.util.concurrent.Flow.Subscriber<String> {
-            private var subscription: java.util.concurrent.Flow.Subscription? = null
-
-            override fun onSubscribe(sub: java.util.concurrent.Flow.Subscription) {
-                subscription = sub
-                sub.request(1) // Backpressure: request one line at a time
-            }
-
-            override fun onNext(item: String) {
+        client.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofInputStream())
+            .thenAcceptAsync({ response ->
                 try {
-                    parser.feed("$item\n").forEach(onEvent)
+                    response.body().bufferedReader().use { reader ->
+                        var line = reader.readLine()
+                        while (line != null) {
+                            try {
+                                parser.feed("$line\n").forEach(onEvent)
+                            } catch (e: Exception) {
+                                onEvent(ChatEvent.Error("Parse error: ${e.message}"))
+                            }
+                            line = reader.readLine()
+                        }
+                        parser.flush().forEach(onEvent)
+                    }
                 } catch (e: Exception) {
-                    onEvent(ChatEvent.Error("Parse error: ${e.message}"))
+                    onEvent(ChatEvent.Error("Stream read error: ${e.message}"))
                 }
-                subscription?.request(1) // Request next after processing
-            }
-
-            override fun onError(throwable: Throwable) {
-                onEvent(ChatEvent.Error(throwable.message ?: "Stream error"))
                 future.complete(null)
-            }
-
-            override fun onComplete() {
-                parser.flush().forEach(onEvent)
+            }, java.util.concurrent.CompletableFuture.delayedExecutor(0, java.util.concurrent.TimeUnit.MILLISECONDS))
+            .exceptionally { error ->
+                onEvent(ChatEvent.Error("Stream connection failed: ${error.cause?.message ?: error.message}"))
                 future.complete(null)
-            }
-        }
-
-        client.sendAsync(httpRequest, HttpResponse.BodyHandlers.fromLineSubscriber(subscriber))
-            .whenComplete { _, error ->
-                if (error != null) {
-                    onEvent(ChatEvent.Error("Stream connection failed: ${error.message}"))
-                    future.complete(null)
-                }
+                null
             }
 
         return future
