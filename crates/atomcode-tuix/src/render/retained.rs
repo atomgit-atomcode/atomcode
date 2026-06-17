@@ -242,6 +242,11 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
             Some(7) => style.reverse = true,
             Some(27) => style.reverse = false,
             Some(39) => style.fg = None,
+            // SGR 37 (regular white → soft light-gray on dark themes). Used
+            // by `theme::md_border_open()` for table borders in dark mode,
+            // where SGR 90 (DarkGrey) collapses to ~3:1 against the bg and
+            // the grid goes invisible. Maps to Color::Grey, NOT bright white.
+            Some(37) => style.fg = Some(Color::Grey),
             Some(90) => style.fg = Some(Color::DarkGrey),
             Some(91) => style.fg = Some(Color::Red),
             Some(92) => style.fg = Some(Color::Green),
@@ -9482,6 +9487,18 @@ mod tests {
         let mut style = CellStyle::default();
         apply_sgr("2", &mut style);
         assert!(style.faint, "SGR 2 must set faint");
+    }
+
+    #[test]
+    fn apply_sgr_37_is_grey_for_dark_table_borders() {
+        // SGR 37 is emitted by `theme::md_border_open()` for table borders
+        // on dark themes (DarkGrey/SGR 90 is swallowed by the bg there).
+        // The parser must map it to Color::Grey — a visible light-gray —
+        // not drop it (which would fall back to the default fg) and not
+        // bright white (Color::White / SGR 97).
+        let mut style = CellStyle::default();
+        apply_sgr("37", &mut style);
+        assert_eq!(style.fg, Some(Color::Grey), "SGR 37 must map to Color::Grey");
     }
 
     #[test]
