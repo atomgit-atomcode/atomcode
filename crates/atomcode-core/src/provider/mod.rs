@@ -682,8 +682,9 @@ pub fn model_name_suggests_vision(name: &str) -> bool {
         || n.starts_with("pixtral")
         || n.contains("llava")
         || n.contains("qvq")
-        // Kimi K2 series (kimi-k2, kimi-k2.5, kimi-k2.6) — all multimodal.
-        || n.starts_with("kimi-k2")
+        // Kimi K2 series — only 2.5 / 2.6 support vision.
+        || n.starts_with("kimi-k2.5")
+        || n.starts_with("kimi-k2.6")
 }
 
 #[cfg(test)]
@@ -832,6 +833,9 @@ mod tests {
         assert!(model_name_suggests_vision("pixtral-12b"));
         assert!(model_name_suggests_vision("llava-1.6"));
         assert!(model_name_suggests_vision("qvq-72b-preview"));
+        // Kimi K2 series — only 2.5 / 2.6 support vision.
+        assert!(model_name_suggests_vision("kimi-k2.5"));
+        assert!(model_name_suggests_vision("kimi-k2.6"));
     }
 
     /// Regression for the user's exact failure: pasting an image while
@@ -846,7 +850,7 @@ mod tests {
         assert!(!model_name_suggests_vision("deepseek-v4-flash"));
         assert!(!model_name_suggests_vision("Qwen/Qwen3.6-35B-A3B"));
         assert!(!model_name_suggests_vision("gpt-4-turbo")); // text-only base
-        assert!(!model_name_suggests_vision("kimi-k2-thinking"));
+        assert!(!model_name_suggests_vision("kimi-k2-thinking")); // K2 base / thinking not vision
         assert!(!model_name_suggests_vision("o1-preview")); // not a vision tag
         assert!(!model_name_suggests_vision(""));
     }

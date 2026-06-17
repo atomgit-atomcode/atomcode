@@ -182,7 +182,7 @@ pub struct UiState {
     pub pending_images: Vec<atomcode_core::conversation::message::ImagePart>,
     /// Parallel to `pending_images` — content fingerprint of each pasted
     /// image's raw RGBA bytes. Used by the right-aligned status hint to
-    /// suppress `Image in clipboard · ctrl+v to paste` once the clipboard
+    /// suppress `Image in clipboard · ctrl+v / ⌘V to paste` once the clipboard
     /// content matches an already-attached image (avoids dup paste prompts),
     /// while still surfacing the hint when the user copies a new image
     /// after pasting an earlier one. Cleared together with `pending_images`

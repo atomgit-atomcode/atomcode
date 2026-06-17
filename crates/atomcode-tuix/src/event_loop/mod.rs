@@ -86,9 +86,14 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     #[cfg(target_os = "macos")]
     {
         if let Some(path) = read_macos_clipboard_file_url() {
+            crate::tuix_trace!("IMG", "Tier0 file-url={}", path);
             if let Some(result) = try_attach_image_from_path(&path) {
+                crate::tuix_trace!("IMG", "Tier0 hit type={}", result.0.media_type);
                 return Some(result);
             }
+            crate::tuix_trace!("IMG", "Tier0 rejected, fallthrough");
+        } else {
+            crate::tuix_trace!("IMG", "Tier0 no file-url");
         }
     }
 
@@ -97,6 +102,7 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     //   "Copy image", any app's Edit-menu Copy on a bitmap. arboard's
     //   get_image decodes these into RGBA.
     if let Ok(img) = clipboard.get_image() {
+        crate::tuix_trace!("IMG", "Tier1 arboard {}x{} px", img.width, img.height);
         let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
         let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
@@ -186,6 +192,42 @@ fn resolve_macos_file_ref_url(raw: &str) -> Option<String> {
     // turns them into the standard /Users/… or /Volumes/… POSIX path
     // that passes is_absolute() and extension-whitelist checks.
     std::fs::canonicalize(raw).ok()?.to_str().map(|s| s.to_owned())
+}
+
+/// Unescape shell backslash escapes that iTerm2 emits when pasting
+/// file paths containing metacharacters (spaces, parens, brackets,
+/// `!`, `$`, `&`, `;`, `|`, etc.). On macOS only — Windows/Linux
+/// terminals don't apply shell escaping to paste payloads.
+///
+/// Any `\X` where X is non-alphanumeric becomes just X. Backslash
+/// before alphanumeric is kept verbatim — those are rare in real
+/// filenames and could be intentional (e.g. `\n` in a real file).
+#[cfg(target_os = "macos")]
+fn unescape_shell_escapes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                if !next.is_alphanumeric() {
+                    out.push(next);
+                    continue;
+                }
+                out.push('\\');
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unescape_shell_escapes(raw: &str) -> String {
+    // On other platforms, only unescape backslash-space — the only
+    // shell escape that drag-and-drop paths carry cross-platform.
+    raw.replace("\\ ", " ")
 }
 
 /// Detect image type from file header magic bytes. Used when the
@@ -417,11 +459,7 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
     } else {
         trimmed
     };
-    // Unescape shell-escaped spaces (iTerm2 / drag-and-drop emit
-    // `/path/with\ space.png`). Backslash before any other char is left
-    // alone — no other shell-escape forms occur in real-world drag
-    // pastes.
-    let unescaped = unquoted.replace("\\ ", " ");
+    let unescaped = unescape_shell_escapes(unquoted);
     let candidate = unescaped.trim();
     let path = std::path::Path::new(candidate);
     if !path.is_absolute() {
@@ -4200,11 +4238,33 @@ fn attach_typed_image_paths(
     // Snapshot tokens before mutating `text`. The `/` `\` pre-filter avoids a
     // filesystem stat on every word of a long message — an absolute path
     // always carries a separator.
-    let tokens: Vec<String> = text
-        .split_whitespace()
-        .filter(|t| t.contains('/') || t.contains('\\'))
-        .map(str::to_string)
-        .collect();
+    //
+    // Quote-aware: iTerm2 wraps paths containing spaces / parens / CJK in
+    // single quotes when it writes a file URL to the PTY. Plain split_whitespace
+    // shatters `'/path/to/default (18).jpeg'` into `/path/to/default` and
+    // `(18).jpeg'` — neither is a valid absolute path. Extract quoted segments
+    // whole, then fall back to whitespace splitting for the remainder.
+    let tokens: Vec<String> = {
+        let mut v: Vec<String> = Vec::new();
+        let mut remaining = text.as_str();
+        while let Some(start) = remaining.find(|c| c == '\'' || c == '"') {
+            let quote = remaining.as_bytes()[start];
+            let Some(end) = remaining[start + 1..].find(quote as char) else {
+                break;
+            };
+            let quoted = &remaining[start + 1..start + 1 + end];
+            if quoted.contains('/') || quoted.contains('\\') {
+                v.push(quoted.to_string());
+            }
+            remaining = &remaining[start + 2 + end..];
+        }
+        for t in remaining.split_whitespace() {
+            if t.contains('/') || t.contains('\\') {
+                v.push(t.to_string());
+            }
+        }
+        v
+    };
     for tok in tokens {
         let Some((img, _hash)) = try_attach_image_from_path(&tok) else {
             continue;
@@ -4370,6 +4430,7 @@ fn handle_input(
                 let image_paste: Option<(ImagePart, u64)> = if text.trim().is_empty() {
                     try_paste_clipboard_image()
                 } else {
+                    crate::tuix_trace!("IMG", "CmdV-paste-text len={} head={:?}", text.len(), &text[..text.len().min(120)]);
                     try_attach_image_from_path(&text)
                 };
                 if attach_image_to_input(app, ctx, renderer, image_paste)? {
@@ -8098,6 +8159,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         // the snappier keybind hint.
         let hint_msg = if cfg!(target_os = "windows") {
             crate::i18n::Msg::StatusClipboardImageHintSlash
+        } else if cfg!(target_os = "macos") {
+            crate::i18n::Msg::StatusClipboardImageHintMac
         } else {
             crate::i18n::Msg::StatusClipboardImageHint
         };
