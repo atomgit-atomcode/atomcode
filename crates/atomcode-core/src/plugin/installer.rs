@@ -139,7 +139,9 @@ fn git_subdir_clone(git: &Path, url: &str, path: &str, pin: &GitPin, target: &Pa
 
     // Partial clone (no blobs) + no checkout, so we can scope the working tree
     // to just `sub` before materialising any files.
-    let mut clone = Command::new(git);
+    // Hardened git (no interactive tty prompt) — a private remote must fail
+    // fast, not deadlock the TUI. See `marketplace::git_command`.
+    let mut clone = super::marketplace::git_command(git);
     clone.args(["clone", "--filter=blob:none", "--no-checkout", "--depth", "1"]);
     // git-subdir pins are branch names in practice (the schema's `ref`); a
     // commit `sha` would need full history, but the catalog carries none.
@@ -152,7 +154,7 @@ fn git_subdir_clone(git: &Path, url: &str, path: &str, pin: &GitPin, target: &Pa
     if !out.status.success() {
         // Fall back to a plain shallow clone for git versions without
         // partial-clone support; we still scope via sparse-checkout below.
-        let mut plain = Command::new(git);
+        let mut plain = super::marketplace::git_command(git);
         plain.args(["clone", "--no-checkout", "--depth", "1"]);
         if let Some(b) = branch {
             plain.args(["--branch", b]);
@@ -296,7 +298,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn git_clone_with_pin(git: &Path, url: &str, target: &Path, pin: &GitPin) -> Result<()> {
-    let mut cmd = Command::new(git);
+    let mut cmd = super::marketplace::git_command(git);
     cmd.arg("clone");
     let needs_full_history = pin.commit.is_some() || pin.tag.is_some() || pin.git_ref.is_some();
     if !needs_full_history {

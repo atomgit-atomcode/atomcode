@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use super::manifest::{load_marketplace_manifest, MarketplaceManifest, PluginSource};
 use super::paths;
@@ -230,15 +230,55 @@ pub(super) fn resolve_marketplace_identity(
     }
 }
 
+/// Build a `git` Command hardened for headless / TUI use: never prompt on the
+/// controlling terminal.
+///
+/// AtomCode runs marketplace `git clone`/`pull` from inside the TUI, which
+/// holds the terminal in raw mode. For a private HTTPS remote, git would
+/// otherwise open `/dev/tty` directly and block on `Username for 'https://…':`
+/// — the same tty the TUI is reading, so keystrokes never reach git and the
+/// whole UI deadlocks (even Ctrl-C barely works). `GIT_TERMINAL_PROMPT=0` makes
+/// git fail fast with a clear error instead; the GCM / SSH-BatchMode guards do
+/// the same for those transports, and stdin is closed as defense in depth.
+/// A real credential helper or stored PAT still authenticates non-interactively
+/// — only the blocking interactive fallback is disabled.
+pub(super) fn git_command(git: &Path) -> Command {
+    let mut cmd = Command::new(git);
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// True when `git`'s stderr indicates it failed because it needed interactive
+/// credentials we deliberately suppressed (private repo, no helper/PAT).
+fn is_git_auth_failure(stderr: &str) -> bool {
+    stderr.contains("terminal prompts disabled")
+        || stderr.contains("could not read Username")
+        || stderr.contains("could not read Password")
+        || stderr.contains("Authentication failed")
+}
+
 pub(super) fn git_clone(url: &str, target: &Path) -> Result<()> {
     let git = find_git()?;
-    let out = Command::new(&git)
+    let out = git_command(&git)
         .args(["clone", "--depth", "1", url])
         .arg(target)
         .output()
         .context("spawn git")?;
     if !out.status.success() {
-        bail!("git clone failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if is_git_auth_failure(&stderr) {
+            bail!(
+                "克隆失败：该 marketplace 仓库需要认证（私有仓库）。\
+                 AtomCode 不会在终端弹出账号/密码输入（那会卡住界面），\
+                 请改用 SSH 地址（git@…）或先用 git 配置好凭证（credential helper / PAT）后重试。\n\
+                 原始错误：{}",
+                stderr.trim()
+            );
+        }
+        bail!("git clone failed: {}", stderr);
     }
     Ok(())
 }
@@ -307,13 +347,21 @@ pub fn update_marketplace(name: &str) -> Result<MarketplaceInfo> {
             .with_context(|| format!("re-clone marketplace `{}`", name))?;
     } else {
         let git = find_git()?;
-        let out = Command::new(&git)
+        let out = git_command(&git)
             .args(["pull", "--ff-only"])
             .current_dir(&target)
             .output()
             .context("spawn git pull")?;
         if !out.status.success() {
-            bail!("git pull failed: {}", String::from_utf8_lossy(&out.stderr));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if is_git_auth_failure(&stderr) {
+                bail!(
+                    "更新失败：该 marketplace 仓库需要认证（私有仓库）。\
+                     请改用 SSH 地址或配置好 git 凭证后重试。\n原始错误：{}",
+                    stderr.trim()
+                );
+            }
+            bail!("git pull failed: {}", stderr);
         }
     }
     let commit = git_rev_parse(&target)?;
@@ -374,6 +422,42 @@ mod tests {
         Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
         Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
         repo
+    }
+
+    #[test]
+    fn git_command_runs_noninteractively() {
+        // The whole point of git_command: git must never open the tty for a
+        // credential prompt — that deadlocks the raw-mode TUI (the private-repo
+        // `/plugin marketplace add` freeze). Verify the guard env is present on
+        // every git invocation we build.
+        let cmd = git_command(Path::new("git"));
+        let prompt = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("GIT_TERMINAL_PROMPT"))
+            .map(|(_, v)| v);
+        assert_eq!(
+            prompt,
+            Some(Some(std::ffi::OsStr::new("0"))),
+            "GIT_TERMINAL_PROMPT must be 0 so a private remote fails fast \
+             instead of blocking on a tty prompt"
+        );
+    }
+
+    #[test]
+    fn git_auth_failure_is_detected() {
+        // The non-interactive error git emits when it needs credentials.
+        assert!(is_git_auth_failure(
+            "fatal: could not read Username for 'https://gitcode.com': terminal prompts disabled"
+        ));
+        assert!(is_git_auth_failure(
+            "remote: HTTP Basic: Access denied\nfatal: Authentication failed for 'https://x/y'"
+        ));
+        // Plain not-found / network errors are NOT auth failures — they must
+        // keep their original message, not the credentials hint.
+        assert!(!is_git_auth_failure("fatal: repository 'https://x/y' not found"));
+        assert!(!is_git_auth_failure(
+            "fatal: unable to access 'https://x/y': Could not resolve host"
+        ));
     }
 
     #[test]
