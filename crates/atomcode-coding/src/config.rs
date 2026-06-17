@@ -24,8 +24,14 @@ pub struct CodingAgentConfig {
     /// for a long stretch after a large (~200K) prompt before the first reasoning byte; the
     /// old 120s cut them off mid-think and surfaced as a spurious "stream timeout".
     pub stream_timeout: Duration,
-    /// Liveness: max wait for a driver approval response before it degrades to deny. Default 300s.
-    pub request_timeout: Duration,
+    /// Liveness: max wait for a driver approval response before it degrades to deny.
+    /// `Some(d)` ⇒ fail-closed after `d` — for HEADLESS / no-human drivers where a never-
+    /// answered approval must not park a turn forever. `None` ⇒ PARK: block until the driver
+    /// answers (or the turn is cancelled / the driver dies) — for INTERACTIVE drivers, so a
+    /// present human is never auto-denied for thinking too long. Default `Some(300s)`.
+    /// NOTE: approval is the only driver round-trip in this stack, so this is effectively the
+    /// approval timeout.
+    pub request_timeout: Option<Duration>,
     /// Safety fuse: max edit-then-verify continuations per turn (kernel default is 50).
     pub max_continuations: u32,
     /// Per-call provider options (reasoning effort / max_tokens / temperature).
@@ -98,7 +104,7 @@ impl CodingAgentConfig {
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
-            request_timeout: Duration::from_secs(300),
+            request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             chat_options: Default::default(),
             telemetry: None,

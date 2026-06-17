@@ -60,6 +60,12 @@ pub struct BridgeConfig {
     /// Previously UNTHREADED — the flag never reached v2, so bypass silently no-op'd
     /// and every Risky tool still prompted (the `BridgeConfig`-drops-config footgun).
     pub dangerously_skip_permissions: bool,
+    /// Is a human present to answer approval prompts? `true` (interactive TUI / live web)
+    /// ⇒ approvals PARK until answered, so a thinking user is never auto-denied. `false`
+    /// (headless `-p`, automated) ⇒ keep the fail-closed approval timeout so a never-
+    /// answered approval can't park a turn forever. Maps to the kernel agent's
+    /// `request_timeout` (None vs the configured bound) — approval is the only round-trip.
+    pub interactive: bool,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -169,6 +175,12 @@ impl Bridge {
         coding_cfg.thinking_enabled = cfg.thinking_enabled;
         coding_cfg.thinking_type = cfg.thinking_type.clone();
         coding_cfg.thinking_keep = cfg.thinking_keep.clone();
+        // Interactive drivers PARK approvals (a present human must not be auto-denied for
+        // thinking too long); headless keeps the configured fail-closed timeout. Liveness for
+        // a crashed interactive driver is handled by Cancel/Shutdown flushing pending requests.
+        if cfg.interactive {
+            coding_cfg.request_timeout = None;
+        }
 
         let opts_template = PrepareOptions {
             session: SessionMode::Fresh,

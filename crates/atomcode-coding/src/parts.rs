@@ -180,7 +180,9 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
                 model: cfg.model.clone(),
                 context_window: cfg.context_window,
                 stream_timeout: cfg.stream_timeout,
-                request_timeout: cfg.request_timeout,
+                // The review sub-agent isn't the interactive approval surface; keep a
+                // concrete fail-closed bound even when the main agent parks (None).
+                request_timeout: cfg.request_timeout.unwrap_or_else(|| std::time::Duration::from_secs(300)),
                 rules_dir: None,
             },
         )));
@@ -427,8 +429,13 @@ pub fn assemble(
         )))
         .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
-        .request_timeout(cfg.request_timeout)
         .max_continuations(cfg.max_continuations);
+    // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
+    // answered (interactive — a present human must not be auto-denied). The kernel defaults
+    // to unbounded when `.request_timeout` is never set, so None = park.
+    if let Some(d) = cfg.request_timeout {
+        builder = builder.request_timeout(d);
+    }
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
     }
