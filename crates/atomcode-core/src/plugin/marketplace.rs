@@ -251,6 +251,24 @@ pub(super) fn git_command(git: &Path) -> Command {
     cmd
 }
 
+/// Build the `Authorization: Basic` header value from credentials. Pure
+/// (creds passed in) so it's unit-testable without touching auth.toml.
+fn basic_auth_header(username: &str, token: &str) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD
+        .encode(format!("{}:{}", username, token));
+    format!("Authorization: Basic {}", b64)
+}
+
+/// `-c` value scoping the auth header to this repo's host only, so git won't
+/// send it on a cross-host redirect. git matches `http.<base-url>.*` by URL
+/// prefix; we scope to `scheme://host` (no path). Falls back to the full URL
+/// if it can't be parsed (caller only reaches here for trusted hosts).
+fn extra_header_config(url: &str, header: &str) -> String {
+    let base = super::url::scheme_host_prefix(url).unwrap_or_else(|| url.to_string());
+    format!("http.{}.extraHeader={}", base, header)
+}
+
 /// True when `git`'s stderr indicates it failed because it needed interactive
 /// credentials we deliberately suppressed (private repo, no helper/PAT).
 fn is_git_auth_failure(stderr: &str) -> bool {
@@ -458,6 +476,27 @@ mod tests {
         assert!(!is_git_auth_failure(
             "fatal: unable to access 'https://x/y': Could not resolve host"
         ));
+    }
+
+    #[test]
+    fn basic_auth_header_encodes_user_colon_token() {
+        // base64("alice:tok123") = "YWxpY2U6dG9rMTIz"
+        assert_eq!(
+            basic_auth_header("alice", "tok123"),
+            "Authorization: Basic YWxpY2U6dG9rMTIz"
+        );
+    }
+
+    #[test]
+    fn extra_header_config_is_scoped_to_host() {
+        let cfg = extra_header_config(
+            "https://gitcode.com/owner/repo.git",
+            "Authorization: Basic XYZ",
+        );
+        assert_eq!(
+            cfg,
+            "http.https://gitcode.com.extraHeader=Authorization: Basic XYZ"
+        );
     }
 
     #[test]
