@@ -14,6 +14,7 @@ use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
 #[folder = "../../webui/dist/"]
+#[allow_missing = true]
 pub struct WebuiAssets;
 
 /// 取静态资源；未命中时回退 index.html 的内容（SPA）。
