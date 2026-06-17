@@ -3,6 +3,7 @@ import java.nio.file.StandardCopyOption
 
 plugins {
     kotlin("jvm") version "2.2.21"
+    kotlin("plugin.serialization") version "2.2.21"
     id("org.jetbrains.intellij.platform") version "2.16.0"
 }
 
@@ -30,7 +31,11 @@ kotlin {
 }
 
 dependencies {
-    implementation("com.google.code.gson:gson:2.11.0")
+    implementation("com.google.code.gson:gson:2.11.0")  // 保留，逐步迁移后移除
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.3.8")
 
     intellijPlatform {
         val localIdePath = providers.gradleProperty("platformLocalPath")
