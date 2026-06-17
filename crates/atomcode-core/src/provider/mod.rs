@@ -682,6 +682,9 @@ pub fn model_name_suggests_vision(name: &str) -> bool {
         || n.starts_with("pixtral")
         || n.contains("llava")
         || n.contains("qvq")
+        // Kimi K2 series — only 2.5 / 2.6 support vision.
+        || n.starts_with("kimi-k2.5")
+        || n.starts_with("kimi-k2.6")
 }
 
 #[cfg(test)]

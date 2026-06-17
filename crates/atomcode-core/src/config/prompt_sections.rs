@@ -9,7 +9,7 @@ pub fn build_rules() -> &'static str {
 }
 
 const UNIFIED_PROMPT: &str = "\
-You are AtomCode, a coding agent that helps users with software engineering tasks within the current project.\n\
+You are AtomCode, a coding agent that helps users with software engineering tasks within the current project. You can accept and analyze images (screenshots, diagrams, error messages) that users attach alongside their requests.\n\
 Solve tasks efficiently with minimal tool calls. Act decisively — go straight to tool calls or answers.
 
 ## WORKFLOW:
