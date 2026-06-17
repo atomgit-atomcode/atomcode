@@ -13,7 +13,7 @@ sealed interface ChatEvent {
     data class Reasoning(val content: String) : ChatEvent
     data class ToolBatchStarted(val calls: List<ToolBatchCall>) : ChatEvent
     data class ToolCallStarted(val id: String, val name: String, val arguments: String) : ChatEvent
-    data class ToolOutputChunk(val chunk: String) : ChatEvent
+    data class ToolOutputChunk(val id: String, val chunk: String) : ChatEvent
     data class ToolCallResult(
         val id: String,
         val name: String,

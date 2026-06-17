@@ -73,7 +73,7 @@ class SseParserTest {
 
             data: {"type":"tool_start","id":"1","name":"read","arguments":"{}"}
 
-            data: {"type":"tool_output","chunk":"output"}
+            data: {"type":"tool_output","id":"1","chunk":"output"}
 
             data: {"type":"tool_result","id":"1","name":"read","output":"done","success":true,"duration_ms":100}
 

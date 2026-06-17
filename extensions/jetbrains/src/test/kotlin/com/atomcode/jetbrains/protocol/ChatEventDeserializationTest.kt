@@ -42,9 +42,10 @@ class ChatEventDeserializationTest {
 
     @Test
     fun `deserialize tool_output event`() {
-        val input = """{"type":"tool_output","chunk":"output line 1\n"}"""
+        val input = """{"type":"tool_output","id":"t1","chunk":"output line 1\n"}"""
         val event = deserializeChatEvent(input)
         assertTrue(event is ChatEvent.ToolOutputChunk)
+        assertEquals("t1", (event as ChatEvent.ToolOutputChunk).id)
         assertEquals("output line 1\n", (event as ChatEvent.ToolOutputChunk).chunk)
     }
 

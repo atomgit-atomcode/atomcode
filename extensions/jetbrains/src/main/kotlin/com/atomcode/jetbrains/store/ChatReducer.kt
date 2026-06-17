@@ -39,7 +39,7 @@ private fun ChatState.handleDaemonEvent(event: ChatEvent, ids: IdGenerator): Cha
         is ChatEvent.Reasoning -> appendReasoning(event.content)
         is ChatEvent.ToolBatchStarted -> addToolCalls(event.calls)
         is ChatEvent.ToolCallStarted -> markToolRunning(event.id)
-        is ChatEvent.ToolOutputChunk -> appendToolOutput(event.chunk)
+        is ChatEvent.ToolOutputChunk -> appendToolOutput(event)
         is ChatEvent.ToolCallResult -> finishTool(event)
         is ChatEvent.ArtifactStart -> startArtifact(event)
         is ChatEvent.ArtifactContent -> appendArtifactContent(event)
@@ -74,11 +74,11 @@ private fun ChatState.markToolRunning(callId: String): ChatState =
         }.toImmutableList()
     )}
 
-private fun ChatState.appendToolOutput(chunk: String): ChatState =
+private fun ChatState.appendToolOutput(event: ChatEvent.ToolOutputChunk): ChatState =
     updateLastAssistant { assistant ->
         val tools = assistant.toolCalls.toMutableList()
-        val runningIdx = tools.indexOfLast { it.status == ToolStatus.Running }
-        if (runningIdx >= 0) tools[runningIdx] = tools[runningIdx].copy(output = tools[runningIdx].output + chunk)
+        val idx = tools.indexOfLast { it.callId == event.id && it.status == ToolStatus.Running }
+        if (idx >= 0) tools[idx] = tools[idx].copy(output = tools[idx].output + event.chunk)
         assistant.copy(toolCalls = tools.toImmutableList())
     }
 
@@ -130,7 +130,7 @@ private fun ChatState.finishGeneration(event: ChatEvent.Done): ChatState =
     copy(
         sessionId = event.session_id ?: sessionId,
         generation = GenerationState.Idle,
-        tokens = TokenUsageState(event.tokens, 0, event.tokens),
+        tokens = (tokens ?: TokenUsageState(0, 0, 0)).copy(total = event.tokens),
     ).updateLastAssistant { it.copy(status = AssistantStatus.Complete) }
 
 private fun ChatState.handlePermissionDecision(action: ChatAction.PermissionDecision, ids: IdGenerator): ChatState =

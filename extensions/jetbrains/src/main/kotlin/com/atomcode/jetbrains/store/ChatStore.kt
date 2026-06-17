@@ -3,8 +3,11 @@ package com.atomcode.jetbrains.store
 import com.atomcode.jetbrains.client.DaemonClient
 import com.atomcode.jetbrains.protocol.*
 import kotlinx.collections.immutable.toImmutableList
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
 
 class ChatStore(
     val tabId: String,
@@ -13,6 +16,7 @@ class ChatStore(
 ) {
     private val _state = MutableStateFlow(ChatState(tabId = tabId))
     val state: StateFlow<ChatState> = _state.asStateFlow()
+    private var streamJob: Job? = null
 
     fun dispatch(action: ChatAction) {
         _state.update { reduce(it, action, defaultIds) }
@@ -35,7 +39,7 @@ class ChatStore(
         dispatch(ChatAction.SubmitPrompt(text, images, contextFiles))
         val sid = sessionId ?: current.sessionId
 
-        scope.launch {
+        streamJob = scope.launch {
             try {
                 val stream = client.streamChat(
                     ChatRequest(message = text,
@@ -48,7 +52,7 @@ class ChatStore(
                 }
                 afterStreamComplete()
             } catch (e: CancellationException) {
-                // user stopped
+                throw e
             } catch (e: Exception) {
                 dispatch(ChatAction.DaemonEvent(ChatEvent.Error(e.message ?: "Unknown error")))
             }
@@ -56,6 +60,7 @@ class ChatStore(
     }
 
     fun stop() {
+        streamJob?.cancel()
         dispatch(ChatAction.StopGeneration)
         scope.launch {
             _state.value.sessionId?.let { client.stopChat(it) }
