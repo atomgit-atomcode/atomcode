@@ -172,6 +172,7 @@ class AtomCodeChatPanel(
     fun stopCurrentGeneration() {
         queuedPrompts.clear()
         renderQueueState()
+        messageView.finishAssistantTurn()
         if (!generating) {
             service.stopGeneration(currentSession?.id)
             return
@@ -694,6 +695,7 @@ class AtomCodeChatPanel(
         runtime?.submitPrompt(prompt)
         renderQueueState()
         messageView.addUserMessage(prompt)
+        messageView.beginAssistantTurn()
         if (contextNames.isNotEmpty()) {
             addSystemMessage("[Context] ${contextNames.joinToString()}")
         }
@@ -778,7 +780,7 @@ class AtomCodeChatPanel(
     private fun finishPrompt() {
         if (!generating) return
         generating = false
-        messageView.hideStreamingCursor()
+        messageView.finishAssistantTurn()
         inputPanel.setGenerating(false)
         inputPanel.focusInput()
         renderQueueState()

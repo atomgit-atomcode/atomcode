@@ -95,12 +95,12 @@ class StreamEventHandler(
     }
 
     fun onStopped() {
-        messageView.hideStreamingCursor()
+        messageView.finishAssistantTurn()
         messageView.addAssistantEvent("[Stopped]")
     }
 
     fun onError(message: String) {
-        messageView.hideStreamingCursor()
+        messageView.finishAssistantTurn()
         messageView.addError(message)
     }
 
@@ -110,7 +110,7 @@ class StreamEventHandler(
 
     /** 流完成时收尾：如果没有输出，清理思考指示器 */
     fun onComplete() {
-        messageView.hideStreamingCursor()
+        messageView.finishAssistantTurn()
         if (!hasOutput) {
             messageView.replaceThinkingWithAssistant("(no output)")
         }

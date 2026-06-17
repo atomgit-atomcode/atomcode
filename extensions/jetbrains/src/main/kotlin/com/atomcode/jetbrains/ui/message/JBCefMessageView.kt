@@ -6,7 +6,7 @@ import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
 import javax.swing.JPanel
-import javax.swing.SwingUtilities
+import javax.swing.Timer
 
 /**
  * 基于 JBCefBrowser (Chromium) 的聊天消息视图。
@@ -36,7 +36,18 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         super.addNotify()
         if (!initialized) {
             initialized = true
-            initBrowser()
+            scheduleBrowserInit()
+        }
+    }
+
+    private fun scheduleBrowserInit() {
+        Timer(300) {
+            if (browser == null && isDisplayable) {
+                initBrowser()
+            }
+        }.apply {
+            isRepeats = false
+            start()
         }
     }
 
@@ -62,19 +73,22 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 
         b.loadHTML(buildChatHtml())
 
-        // 兜底：2 秒后如果 JS 仍未就绪，强制开始发送消息
-        SwingUtilities.invokeLater {
-            Thread.sleep(2000)
+        // 兜底：2 秒后如果 JS 仍未就绪，强制开始发送消息。
+        Timer(2000) {
             if (!jsReady && !forceReady) {
                 forceReady = true
                 flushPending()
             }
+        }.apply {
+            isRepeats = false
+            start()
         }
     }
 
     // ── Public API ──
 
     fun addUserMessage(text: String)            { sendJs("addUserMessage", text) }
+    fun beginAssistantTurn()                    { sendJs("beginAssistantTurn") }
     fun addAssistantMessage(text: String)       { sendJs("addAssistantMessage", text) }
     fun addCodeBlock(lang: String, code: String, file: String? = null) { sendJs("addCodeBlock", lang, code, file ?: "") }
     fun addToolCall(name: String, status: String, detail: String? = null) { sendJs("addToolCall", name, status, detail ?: "") }
@@ -90,6 +104,7 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     fun updateLastAssistantMessage(text: String) { sendJs("updateLastAssistantMessage", text) }
     fun showStreamingCursor()                   { sendJs("showStreamingCursor") }
     fun hideStreamingCursor()                   { sendJs("hideStreamingCursor") }
+    fun finishAssistantTurn()                   { sendJs("finishAssistantTurn") }
     fun clear()                                 { sendJs("clearMessages") }
     fun render(model: ChatRenderModel)          { sendRawJs("renderChatModel(${gson.toJson(model)})") }
 
@@ -191,34 +206,37 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 </style></head><body>
 <div id="m"></div>
 <script>
-	var m=document.getElementById('m'),last=null,ti=-1,nb=true,cv=false;
+		var m=document.getElementById('m'),last=null,active=null,ti=-1,nb=true,cv=false;
 document.body.addEventListener('scroll',function(){nb=document.body.scrollHeight-document.body.scrollTop-document.body.clientHeight<120});
 function sd(){if(nb)requestAnimationFrame(function(){document.body.scrollTop=document.body.scrollHeight})}
 function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 	function setTheme(d){}
-	function addUserMessage(t){var d=document.createElement('div');d.className='um';d.innerHTML='<span class="b">'+h(t)+'</span>';m.appendChild(d);last=null;sd()}
-	function ensureAssistant(){if(last&&last.className==='am')return last;last=buildAsst('');m.appendChild(last);return last}
+		function addUserMessage(t){var d=document.createElement('div');d.className='um';d.innerHTML='<span class="b">'+h(t)+'</span>';m.appendChild(d);last=null;sd()}
+		function beginAssistantTurn(){active=buildAsst('');last=active;m.appendChild(active);cv=false;sd()}
+		function currentAssistant(){return active&&active.parentNode?active:null}
+		function ensureAssistant(){var a=currentAssistant();if(a){last=a;return a}beginAssistantTurn();return active}
 	function parts(){var a=ensureAssistant();return a.querySelector('.parts')}
 	function addAssistantMessage(t){var p=parts();var b=p.querySelector('.b');if(!b){b=document.createElement('div');b.className='b';p.appendChild(b)}b.textContent=t;renderCursor();sd()}
 	function buildAsst(t){var d=document.createElement('div');d.className='am';d.innerHTML='<div class="av">🤖 AtomCode</div><div class="parts"><div class="b">'+h(t)+'</div></div>';return d}
 	function renderCursor(){if(!last)return;var b=last.querySelector('.b');if(!b)return;var old=b.querySelector('.streaming-cursor');if(old)old.remove();if(cv){var c=document.createElement('span');c.className='streaming-cursor';b.appendChild(c)}}
 	function updateLastAssistantMessage(t){if(last)last.querySelector('.b').textContent=t;else addAssistantMessage(t);renderCursor();sd()}
-	function showStreamingCursor(){cv=true;renderCursor();sd()}
-	function hideStreamingCursor(){cv=false;renderCursor();sd()}
+		function showStreamingCursor(){cv=true;renderCursor();sd()}
+		function hideStreamingCursor(){cv=false;renderCursor();sd()}
+		function finishAssistantTurn(){cv=false;hideStreamingCursor();removeThinkingIndicator()}
 	function addCodeBlock(l,c,f){var d=document.createElement('div');d.className='cm';d.innerHTML='<div class="h">📄 '+h(f||l||'Code')+'</div><pre>'+h(c)+'</pre>';parts().appendChild(d);sd()}
 	function toolHtml(n,s,d){var summary='🔧 '+h(n)+' — '+h(s);return d?'<details open><summary>'+summary+'</summary><pre>'+h(d)+'</pre></details>':summary}
 	function addToolCall(n,s,d){var e=document.createElement('div');e.className='tm';e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d);parts().appendChild(e);sd()}
-	function updateToolCall(n,s,d){var ps=parts();var e=Array.prototype.slice.call(ps.querySelectorAll('.tm')).reverse().find(function(x){return x.getAttribute('data-name')===n});if(e){e.innerHTML=toolHtml(n,s,d);sd()}else addToolCall(n,s,d)}
+		function updateToolCall(n,s,d){var ps=parts();var tools=Array.prototype.slice.call(ps.querySelectorAll('.tm')).reverse();var e=tools.find(function(x){return x.getAttribute('data-name')===n})||tools[0];if(e){e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d);sd()}else addToolCall(n,s,d)}
 function addError(t){var d=document.createElement('div');d.className='em';d.innerHTML='⚠️ '+h(t);m.appendChild(d);last=null;sd()}
 function addQueuedMessage(t){var d=document.createElement('div');d.className='qm';d.innerHTML='<span class="b">📥 '+h(t)+'</span>';m.appendChild(d);last=null;sd()}
 	function addThinkingIndicator(){var d=document.createElement('div');d.className='rm thp';d.innerHTML='💭 思考中<span class="dots"></span>';parts().appendChild(d);sd()}
 	function replaceThinkingWithAssistant(t){var a=ensureAssistant();var th=a.querySelector('.thp');if(th)th.remove();addAssistantMessage(t||'')}
-	function removeThinkingIndicator(){var a=last&&last.className==='am'?last:null;if(a){var th=a.querySelector('.thp');if(th)th.remove()}}
+		function removeThinkingIndicator(){var a=currentAssistant();if(a){var th=a.querySelector('.thp');if(th)th.remove()}}
 	function addSystemMessage(t){var d=document.createElement('div');d.className='sm';d.textContent=t;m.appendChild(d);last=null;sd()}
 	function addAssistantEvent(t){var d=document.createElement('div');d.className='sm';d.textContent=t;parts().appendChild(d);sd()}
 	function addReasoningBlock(t){var d=document.createElement('div');d.className='rm';var fl=t.split('\n')[0].substring(0,80);if(t.length>fl.length)fl+='...';d.innerHTML='💭 思考 — '+h(fl);var p=parts();p.insertBefore(d,p.firstChild);sd()}
 	function renderChatModel(model){clearMessages();(model.messages||[]).forEach(function(x){if(x.text!==undefined&&x.contextSummary!==undefined)addUserMessage(x.text);else if(x.markdown!==undefined)addAssistantMessage(x.markdown);else if(x.toolName!==undefined)addSystemMessage('[Permission] '+x.toolName+': '+(x.reason||''));else if(x.name!==undefined&&x.callId!==undefined)addToolCall(x.name,x.status||'',x.output||x.argumentsJson||'');else if(x.text!==undefined)addSystemMessage(x.text)});sd()}
-	function clearMessages(){m.innerHTML='';last=null;ti=-1;cv=false}
+		function clearMessages(){m.innerHTML='';last=null;active=null;ti=-1;cv=false}
 (function find(){for(var k in window){if(k.indexOf('JBCefQuery_')===0&&typeof window[k]==='function'){window[k]('js:ready');return}}setTimeout(find,50)})();
 </script></body></html>""".trimIndent()
     }
