@@ -8245,6 +8245,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         },
         session_name,
         goal_indicator,
+        vision: ctx.config.can_handle_attached_images(),
     }
 }
 

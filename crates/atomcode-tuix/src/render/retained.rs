@@ -1250,6 +1250,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // segments with ".../" and keeps only the last segment.
         let model_str = if !status.model.is_empty() {
             let mut s = scrub_controls(&status.model);
+            if status.vision {
+                let fallback = t(Msg::StatusVisionIndicator);
+                let glyph = if self.caps.unicode_symbols {
+                    "\u{f06e}"
+                } else {
+                    fallback.as_ref()
+                };
+                s = format!("{} · {} ", s, glyph);
+            }
             if let Some(ref effort) = status.reasoning_effort {
                 use std::fmt::Write;
                 let _ = write!(s, " [{}]", effort);

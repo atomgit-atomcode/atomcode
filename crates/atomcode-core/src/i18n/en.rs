@@ -137,6 +137,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Image in clipboard · ⌘+v to paste".into(),
         Msg::StatusWebuiHint =>
             "Tips: Use /webui to open AtomCode in your browser".into(),
+        Msg::StatusVisionIndicator =>
+            "[Vision]".into(),
 
         // ── /status command body ──
         Msg::StatusBody { model, dir, config, tokens } =>

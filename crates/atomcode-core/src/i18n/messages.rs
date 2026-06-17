@@ -141,6 +141,8 @@ pub enum Msg<'a> {
     /// `/webui` command (browser UI) when no higher-priority hint
     /// (warnings / usage / upgrade) is competing for the slot.
     StatusWebuiHint,
+    /// Status bar vision indicator for non-Nerd-Font terminals.
+    StatusVisionIndicator,
 
     // ── /status command body ──
     StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },
