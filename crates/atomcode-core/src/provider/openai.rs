@@ -203,7 +203,7 @@ impl OpenAiProvider {
             // with zero visible output. CC uses fixed 16-32K, not proportional.
             max_tokens: config
                 .max_tokens
-                .unwrap_or((config.context_window / 4).clamp(8_000, 131_072)),
+                .unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
@@ -1858,6 +1858,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+
 };
         let p = OpenAiProvider::new(&cfg).expect("provider builds");
         assert_eq!(p.reasoning_history_policy(), ReasoningPolicy::Exclude);
@@ -1897,6 +1898,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+
 };
         let err = match OpenAiProvider::new(&cfg) {
             Err(e) => e,

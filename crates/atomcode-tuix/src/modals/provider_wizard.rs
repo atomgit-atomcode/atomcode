@@ -125,7 +125,8 @@ impl DraftProvider {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        }
+
+}
     }
 }
 
@@ -1411,6 +1412,7 @@ chunks = query({
             provider_type: provider_type.to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
+            ..Default::default()
         }
     }
 

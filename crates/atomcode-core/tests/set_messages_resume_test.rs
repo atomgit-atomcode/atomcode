@@ -182,6 +182,7 @@ fn context_builds_with_turn_tracking_after_set_messages() {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
+
 };
     let ctx_builder = DefaultCtx::new(&provider_config);
 
@@ -257,6 +258,7 @@ fn context_uses_fallback_when_turn_tracker_is_empty() {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
+
 };
     let ctx_builder = DefaultCtx::new(&provider_config);
 
@@ -461,6 +463,7 @@ fn restored_context_contains_same_user_messages_as_original() {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
+
 };
     let ctx_builder = DefaultCtx::new(&provider_config);
     let system_prompt = "You are a helpful assistant.";
@@ -532,6 +535,7 @@ fn empty_turn_tracker_loses_windowing_precision() {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
+
     };
     let ctx_builder = DefaultCtx::new(&provider_config);
 
