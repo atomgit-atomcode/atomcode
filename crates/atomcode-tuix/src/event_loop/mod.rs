@@ -2461,6 +2461,12 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_edit_file_omits_old_string_preview() {
+        let args = r#"{"file_path":"/abs/path/to/test.txt","old_string":"4","new_string":"1888"}"#;
+        assert_eq!(format_tool_detail("edit_file", args), "test.txt");
+    }
+
+    #[test]
     fn format_tool_detail_read_symbol_combines_symbol_and_file() {
         let args = r#"{"symbol":"parse","file_path":"src/lexer.rs"}"#;
         assert_eq!(format_tool_detail("read_symbol", args), "parse in lexer.rs");
@@ -8322,31 +8328,13 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
     let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
 
     match name {
-        "read_file" | "write_file" | "create_file" | "list_symbols" => {
+        "read_file" | "edit_file" | "write_file" | "create_file" | "list_symbols" => {
             // Single-call path: basename only (compact). Batch disambiguation
             // is handled by `disambiguate_batch_details` which runs after
             // all child details are computed and can compare them.
             get_str("file_path")
                 .map(|p| basename(&p))
                 .unwrap_or_default()
-        }
-        "edit_file" => {
-            // Show file_path + old_string snippet so identical-looking
-            // edit_file calls (same file, different old/new) are
-            // distinguishable in the TUI scrollback and approval prompt.
-            let path = get_str("file_path")
-                .map(|p| basename(&p))
-                .unwrap_or_default();
-            let old = get_str("old_string")
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    let first_line = s.lines().next().unwrap_or(&s);
-                    crate::width::truncate_with_ellipsis(first_line, 50)
-                });
-            match (path, old) {
-                (p, Some(o)) if !p.is_empty() => format!("{} ← \"{}\"", p, o),
-                (p, _) => p,
-            }
         }
         "read_symbol" => {
             let sym = get_str("symbol").unwrap_or_default();
