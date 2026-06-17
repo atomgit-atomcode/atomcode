@@ -217,12 +217,23 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
         }),
         SessionMode::Resume(id) => {
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
-            let snap = manager.load_snapshot(id)?;
-            // A version-mismatched snapshot must FAIL here, not fall through to the
-            // kernel's empty-start seam — that would silently fresh-start under the
-            // SAME session id and corrupt the session's on-disk state.
-            check_snapshot_version(&snap)?;
-            Some(SessionBinding { id: id.clone(), manager, resume: Some(snap) })
+            match manager.load_snapshot(id) {
+                Ok(snap) => {
+                    // A version-mismatched snapshot must FAIL here, not fall through
+                    // to the kernel's empty-start seam — that would silently fresh-
+                    // start under the SAME session id and corrupt on-disk state.
+                    check_snapshot_version(&snap)?;
+                    Some(SessionBinding { id: id.clone(), manager, resume: Some(snap) })
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // Snapshot not found (possibly due to a previous save_snapshot
+                    // IO failure that was logged and skipped). Downgrade to Fresh:
+                    // start a new session under a new id rather than crashing.
+                    let fresh_id = uuid::Uuid::new_v4().to_string();
+                    Some(SessionBinding { id: fresh_id, manager, resume: None })
+                }
+                Err(e) => return Err(e),
+            }
         }
     };
 

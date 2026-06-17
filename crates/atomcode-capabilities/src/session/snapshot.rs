@@ -86,7 +86,9 @@ impl LifecycleHooks for SnapshotHook {
         // resume seeds past THIS turn even when it stored nothing.
         snap.turn_counter = snap.turn_counter.max(ctx.turn_id);
         snap.request_counter = snap.request_counter.max(ctx.request_id);
-        let _ = self.mgr.save_snapshot(&self.session_id, &snap);
+        if let Err(e) = self.mgr.save_snapshot(&self.session_id, &snap) {
+            eprintln!("[SnapshotHook] save_snapshot failed: {e}");
+        }
 
         let now = now_ms();
         let (duration_ms, tool_call_count, total_tokens) = {

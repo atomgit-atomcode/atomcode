@@ -682,35 +682,85 @@ impl Bridge {
         let _ = task.await;
         let mut opts = self.opts_template.clone();
         opts.session = session;
-        match prepare(&self.coding_cfg, opts).await {
-            Ok(mut parts) => {
-                // Approval grants survive engine respawns (same contract as C1).
-                parts.approval = self.parts.approval.clone();
-                // Plan mode survives a respawn (/resume, /clear, model swap).
-                parts.plan_mode = self.parts.plan_mode.clone();
-                match build_provider(&self.coding_cfg)
-                    .and_then(|p| assemble(&mut parts, &self.coding_cfg, p).map_err(Into::into))
-                {
-                    Ok(a) => {
-                        self.handle = a.spawn();
-                        self.bridge_session = parts
-                            .session
-                            .as_ref()
-                            .map(|b| b.id.clone())
-                            .unwrap_or_default();
-                        self.parts = parts;
-                        self.turn_running = false;
-                        self.pending_approval = None;
-                    }
-                    Err(e) => self.emit(CoreEv::Error {
+
+        // Try the requested session mode first; if that fails (e.g. Resume could
+        // not find the snapshot), fall back to Fresh before giving up entirely.
+        // This prevents a broken snapshot from crashing the whole bridge.
+        let mut parts = match prepare(&self.coding_cfg, opts.clone()).await {
+            Ok(p) => p,
+            Err(e) => {
+                // Don't retry Fresh if the caller already asked for Fresh — that
+                // would loop with the same prepare args and fail the same way.
+                if matches!(opts.session, SessionMode::Fresh) {
+                    self.emit(CoreEv::Error {
                         error: format!("engine v2 respawn failed: {e}"),
                         snapshot: ConversationSnapshot::default(),
-                    }),
+                    });
+                    self.handle = Self::noop_handle();
+                    return;
+                }
+                opts.session = SessionMode::Fresh;
+                match prepare(&self.coding_cfg, opts).await {
+                    Ok(p) => p,
+                    Err(e2) => {
+                        self.emit(CoreEv::Error {
+                            error: format!(
+                                "engine v2 respawn failed (fresh fallback also failed): {e2}"
+                            ),
+                            snapshot: ConversationSnapshot::default(),
+                        });
+                        self.handle = Self::noop_handle();
+                        return;
+                    }
                 }
             }
-            Err(e) => self.emit(CoreEv::Error {
-                error: format!("engine v2 respawn failed: {e}"),
-                snapshot: ConversationSnapshot::default(),
+        };
+
+        // Approval grants survive engine respawns (same contract as C1).
+        parts.approval = self.parts.approval.clone();
+        // Plan mode survives a respawn (/resume, /clear, model swap).
+        parts.plan_mode = self.parts.plan_mode.clone();
+
+        match build_provider(&self.coding_cfg)
+            .and_then(|p| assemble(&mut parts, &self.coding_cfg, p).map_err(Into::into))
+        {
+            Ok(a) => {
+                self.handle = a.spawn();
+                self.bridge_session = parts
+                    .session
+                    .as_ref()
+                    .map(|b| b.id.clone())
+                    .unwrap_or_default();
+                self.parts = parts;
+                self.turn_running = false;
+                self.pending_approval = None;
+            }
+            Err(e) => {
+                self.emit(CoreEv::Error {
+                    error: format!("engine v2 respawn failed: {e}"),
+                    snapshot: ConversationSnapshot::default(),
+                });
+                // Must install a live handle so the bridge event loop's
+                // recv() never returns None and kills the process.
+                self.handle = Self::noop_handle();
+            }
+        }
+    }
+
+    /// Replace `self.handle` with a no-op handle that keeps the bridge event loop
+    /// alive (its events channel never closes). Used as a safety net when respawn
+    /// fails — the bridge stays running and can still process driver commands even
+    /// though the agent kernel is gone.
+    fn noop_handle() -> atomcode_kernel::agent::AgentHandle {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        atomcode_kernel::agent::AgentHandle {
+            commands: cmd_tx,
+            events: ev_rx,
+            // Hold ev_tx in the task so the receiver side stays open forever.
+            task: tokio::spawn(async move {
+                let _keep_alive = ev_tx;
+                std::future::pending::<()>().await;
             }),
         }
     }
