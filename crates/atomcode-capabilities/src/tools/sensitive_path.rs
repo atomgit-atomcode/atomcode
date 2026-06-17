@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_kernel::middleware::ToolMiddleware;
+use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall};
 
@@ -90,20 +90,20 @@ impl ToolMiddleware for SensitivePathGate {
         call: &mut ToolCall,
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         // Only tools that would otherwise SKIP approval need this — a Risky tool already
         // round-trips through ApprovalMiddleware, so gating it here would double-prompt.
         if tool.risk(&call.arguments) != RiskLevel::Safe {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         if !references_sensitive_path(&call.arguments) {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         // Distinct key namespace so a "sensitive-read always" grant never silently widens
         // an ordinary approval grant (and vice versa).
         let key = format!("sensitive::{}::{}", call.name, call.arguments);
         if self.store.is_granted(&key) {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         let payload = serde_json::to_value(ApprovalRequest {
             call_id: call.id.clone(),
@@ -112,12 +112,12 @@ impl ToolMiddleware for SensitivePathGate {
         })
         .unwrap_or(serde_json::Value::Null);
         match PermissionDecision::from_value(&rt.request(&self.kind, payload).await) {
-            PermissionDecision::AllowOnce => Ok(()),
+            PermissionDecision::AllowOnce => BeforeOutcome::Proceed,
             PermissionDecision::AllowAlways => {
                 self.store.grant(&key);
-                Ok(())
+                BeforeOutcome::Proceed
             }
-            PermissionDecision::Deny => Err(format!(
+            PermissionDecision::Deny => BeforeOutcome::deny(format!(
                 "reading a sensitive path needs approval and was denied: {} {}",
                 tool.name(),
                 call.arguments
@@ -160,8 +160,8 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool);
         let mut call =
             ToolCall { id: "1".into(), name: "read_file".into(), arguments: r#"{"file_path":"src/main.rs"}"#.into() };
-        // Ordinary path → Ok WITHOUT awaiting the (silent) driver.
-        assert!(gate.before(&mut call, &tool, &silent_rt()).await.is_ok());
+        // Ordinary path → Proceed WITHOUT awaiting the (silent) driver.
+        assert!(!gate.before(&mut call, &tool, &silent_rt()).await.is_deny());
     }
 
     #[tokio::test]
@@ -175,7 +175,7 @@ mod tests {
             name: "write_file".into(),
             arguments: r#"{"file_path":"/home/u/.ssh/authorized_keys","content":"x"}"#.into(),
         };
-        assert!(gate.before(&mut call, &tool, &silent_rt()).await.is_ok());
+        assert!(!gate.before(&mut call, &tool, &silent_rt()).await.is_deny());
     }
 
     #[tokio::test]
@@ -188,7 +188,7 @@ mod tests {
             arguments: r#"{"file_path":"/home/u/.ssh/id_rsa"}"#.into(),
         };
         let res = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(res.is_err(), "a sensitive read with no approval must fail closed");
-        assert!(res.unwrap_err().contains("sensitive path"));
+        assert!(res.is_deny(), "a sensitive read with no approval must fail closed");
+        assert!(res.deny_reason().unwrap().contains("sensitive path"));
     }
 }

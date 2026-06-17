@@ -3220,14 +3220,14 @@ mod tests {
         let wd = PathBuf::from("/tmp/x");
 
         // No override → the config default (gateway), no reasoning_history set.
-        let def = bridge_config_from(&config, &wd, None, None);
+        let def = bridge_config_from(&config, &wd, None, None, false);
         assert_eq!(def.base_url, "https://llm-api.atomgit.com/v1");
         assert_eq!(def.model, "gw-model");
         assert_eq!(def.reasoning_history, None);
 
         // `--provider direct` → that provider's endpoint/model/key + its per-provider
         // reasoning_history override, NOT the default.
-        let ov = bridge_config_from(&config, &wd, Some("direct"), None);
+        let ov = bridge_config_from(&config, &wd, Some("direct"), None, false);
         assert_eq!(ov.base_url, "https://api.deepseek.com");
         assert_eq!(ov.model, "direct-model");
         assert_eq!(ov.api_key, "sk-direct");

@@ -4,7 +4,7 @@ use crate::message::{
     CompactTrigger, CompactionStrategy, CompactionView, Conversation, ImageContent, Message,
     MessageMeta, NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
 };
-use crate::middleware::ToolMiddleware;
+use crate::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use crate::provider::{ChatOptions, LlmProvider};
 use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
@@ -1104,14 +1104,27 @@ impl RunningAgent {
                     },
                     Some(tool) => {
                         // ToolMiddleware before-chain: may rewrite the call (&mut),
-                        // round-trip via rt (approval), or block via Err. Runs after
-                        // lookup; ToolStarted fires only for a tool that executes
-                        // (no ghost row for blocked tools).
+                        // round-trip via rt (approval), and returns a BeforeOutcome
+                        // GATE decision. Runs after lookup; ToolStarted fires only for
+                        // a tool that executes (no ghost row for blocked tools).
                         let mut blocked: Option<String> = None;
                         for mw in &self.middlewares {
-                            if let Err(reason) = mw.before(&mut call, &tool, &self.rt).await {
-                                blocked = Some(reason);
-                                break;
+                            match mw.before(&mut call, &tool, &self.rt).await {
+                                BeforeOutcome::Proceed => {}
+                                // `ask` has no kernel-independent prompt yet (the
+                                // approval gate — also a middleware in this chain —
+                                // owns the round-trip), so it defers to the normal
+                                // approval flow. Full force-ask lands with the CC
+                                // bridge producer (M2).
+                                BeforeOutcome::Ask { .. } => {}
+                                // `allow` force-approves: stop the remaining `before`
+                                // gates and execute (CC `permissionDecision: "allow"`
+                                // bypasses the permission system).
+                                BeforeOutcome::Allow { .. } => break,
+                                BeforeOutcome::Deny { reason } => {
+                                    blocked = Some(reason);
+                                    break;
+                                }
                             }
                         }
                         if let Some(reason) = blocked {
@@ -1176,10 +1189,14 @@ impl RunningAgent {
                         }
                     }
                 };
-                // ToolMiddleware after-chain: transform / observe the result.
-                // Middleware sees the RAW (uncapped) result.
+                // ToolMiddleware after-chain: transform / observe the result and
+                // collect any CONTINUATION decision. Middleware sees the RAW
+                // (uncapped) result. The first `Block` reason wins.
+                let mut post_block: Option<String> = None;
                 for mw in &self.middlewares {
-                    mw.after(&mut result).await;
+                    if let AfterOutcome::Block { reason } = mw.after(&mut result).await {
+                        post_block.get_or_insert(reason);
+                    }
                 }
                 // KERNEL TOOL-RESULT SIZE CAP — the kernel's only built-in safety
                 // at this altitude (it cannot sandbox). Applied AFTER the
@@ -1196,6 +1213,14 @@ impl RunningAgent {
                 }
                 self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
                 convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
+                // CC PostToolUse `decision: "block"`: feed the reason back to the
+                // model so it can course-correct. Hard turn-termination (stop before
+                // the next model call) needs a dedicated StopReason and lands with the
+                // CC-bridge producer (M2); no middleware emits `Block` yet, so this is
+                // currently inert.
+                if let Some(reason) = post_block {
+                    convo.push(Message::user(reason));
+                }
 
                 // (3) Record this id as "resulted" so a later SAME-id call (mode A)
                 // is skipped. Recorded for EVERY path that produces a result —
