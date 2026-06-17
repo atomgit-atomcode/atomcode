@@ -269,6 +269,30 @@ fn extra_header_config(url: &str, header: &str) -> String {
     format!("http.{}.extraHeader={}", base, header)
 }
 
+/// Fetch (username, fresh access token) from the stored login, refreshing the
+/// token if expired. None when not logged in or refresh fails.
+fn live_credentials() -> Option<(String, String)> {
+    let auth = crate::auth::get_stored_auth()?;
+    let token = crate::auth::get_valid_token().ok()?;
+    if token.is_empty() {
+        return None;
+    }
+    Some((auth.user.username, token))
+}
+
+/// If `url` is a trusted-host repo and we're logged in, return the
+/// `["-c", "http.<host>.extraHeader=Authorization: Basic ..."]` args to inject
+/// on an authenticated clone/pull retry. Centralizes host-gate + cred fetch +
+/// per-URL scoping. None → caller must NOT inject the token.
+pub(super) fn auth_retry_args(url: &str) -> Option<[String; 2]> {
+    if !super::url::host_is_trusted(url) {
+        return None;
+    }
+    let (username, token) = live_credentials()?;
+    let header = basic_auth_header(&username, &token);
+    Some(["-c".to_string(), extra_header_config(url, &header)])
+}
+
 /// True when `git`'s stderr indicates it failed because it needed interactive
 /// credentials we deliberately suppressed (private repo, no helper/PAT).
 fn is_git_auth_failure(stderr: &str) -> bool {
@@ -497,6 +521,20 @@ mod tests {
             cfg,
             "http.https://gitcode.com.extraHeader=Authorization: Basic XYZ"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_retry_args_none_when_untrusted_host() {
+        // github.com 非白名单 → 永不注入 token，即使已登录
+        assert!(auth_retry_args("https://github.com/owner/repo").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_retry_args_none_when_not_logged_in() {
+        let _home = isolated_home(); // 无 auth.toml
+        assert!(auth_retry_args("https://gitcode.com/owner/repo").is_none());
     }
 
     #[test]
