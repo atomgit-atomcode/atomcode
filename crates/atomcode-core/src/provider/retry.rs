@@ -48,8 +48,34 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 }
 
 /// Whether a reqwest error is a transient transport issue worth retrying.
+///
+/// `is_timeout() || is_connect()` is too narrow: a keep-alive connection the
+/// gateway LB silently closed on idle-timeout, then reused, surfaces as
+/// "error sending request" with `is_connect() == false`, wrapping an
+/// `io::Error(ConnectionReset)`. Walk the source chain so the open loop
+/// reconnects transparently instead of hard-failing.
 fn is_retryable_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
+    err.is_timeout() || err.is_connect() || chain_has_transient_io(err)
+}
+
+/// True if any error in the `source()` chain is an `io::Error` for a
+/// dropped/half-open connection (reset/aborted/broken-pipe/eof). Safe to retry
+/// only on the OPEN path (no response bytes consumed yet).
+fn chain_has_transient_io(err: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind::*;
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected
+            ) {
+                return true;
+            }
+        }
+        cur = e.source();
+    }
+    false
 }
 
 /// Parse `Retry-After` header as integer seconds. Returns `None` for absent,
@@ -372,6 +398,34 @@ mod tests {
         assert!(!is_retryable_status(reqwest::StatusCode::FORBIDDEN));
         assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
         assert!(!is_retryable_status(reqwest::StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn chain_has_transient_io_detects_buried_connection_drops() {
+        use std::io::{Error, ErrorKind};
+        // Mirrors a reqwest "error sending request" wrapping a hyper error
+        // wrapping the io error — the reset is buried, is_connect()==false.
+        #[derive(Debug)]
+        struct Wrap(Error);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error sending request")
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(chain_has_transient_io(&Wrap(Error::new(kind, "x"))), "{kind:?}");
+        }
+        assert!(!chain_has_transient_io(&Wrap(Error::new(ErrorKind::NotFound, "nf"))));
     }
 
     #[test]
