@@ -464,23 +464,7 @@ pub fn update_marketplace(name: &str) -> Result<MarketplaceInfo> {
         git_clone(&entry.source, &target)
             .with_context(|| format!("re-clone marketplace `{}`", name))?;
     } else {
-        let git = find_git()?;
-        let out = git_command(&git)
-            .args(["pull", "--ff-only"])
-            .current_dir(&target)
-            .output()
-            .context("spawn git pull")?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if is_git_auth_failure(&stderr) {
-                bail!(
-                    "更新失败：该 marketplace 仓库需要认证（私有仓库）。\
-                     请改用 SSH 地址或配置好 git 凭证后重试。\n原始错误：{}",
-                    stderr.trim()
-                );
-            }
-            bail!("git pull failed: {}", stderr);
-        }
+        git_pull_ff(&target, &entry.source)?;
     }
     let commit = git_rev_parse(&target)?;
     let manifest = load_marketplace_manifest(&target)?;
