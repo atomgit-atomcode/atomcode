@@ -580,7 +580,7 @@ impl Config {
     pub fn default_context_window(&self) -> usize {
         self.providers
             .get(&self.default_provider)
-            .map(|p| p.context_window)
+            .map(|p| p.context_window.min(provider::MAX_CONTEXT_WINDOW))
             .unwrap_or(128_000)
     }
 
@@ -980,7 +980,6 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
-
 },
         );
         cfg.save(&tmp).unwrap();
@@ -1196,6 +1195,7 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
+                ..Default::default()
             },
         );
         cfg.save(tmp.path()).unwrap();
@@ -1262,7 +1262,7 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
-            },
+},
         );
         Config {
             default_provider: "active".into(),
@@ -1336,6 +1336,7 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
+                ..Default::default()
             },
         );
         assert!(cfg.can_handle_attached_images());

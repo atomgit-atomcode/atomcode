@@ -83,6 +83,11 @@ impl ProviderConfig {
     }
 }
 
+/// Hard upper-bound for any context_window. Prevents users from accidentally
+/// configuring 10M/100M on a model that can't handle it. 4M is the ceiling
+/// (MiniMax-01 and future models).
+pub const MAX_CONTEXT_WINDOW: usize = 4_000_000;
+
 fn default_context_window() -> usize {
     128000
 }

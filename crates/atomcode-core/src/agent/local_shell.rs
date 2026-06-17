@@ -56,7 +56,7 @@ fn clamp_for_context(s: &str, char_limit: usize) -> String {
 /// Build the User-message text injected into the conversation. The model
 /// reads this on its next turn. XML tags mirror Claude Code's bash mode.
 /// `char_limit` bounds each captured stream — pass the same calibration as
-/// `ctx::truncate`: `(context_window / 8).min(32_000).max(8_000)`.
+/// `ctx::truncate`: `(context_window / 8).max(8_000).min(128_000)`.
 pub(crate) fn format_bash_context(cmd: &str, outcome: &ShellOutcome, char_limit: usize) -> String {
     let mut s = format!("<bash-input>{}</bash-input>", xml_escape(cmd));
     let stdout = clamp_for_context(&xml_escape(outcome.stdout.trim()), char_limit);

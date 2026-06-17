@@ -1216,7 +1216,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             String::new()
         };
-        let ctx_str = if status.ctx_used > 0 {
+        let ctx_str = if status.ctx_window > 0 {
             format_ctx_usage(status.ctx_used, status.ctx_window)
         } else {
             String::new()

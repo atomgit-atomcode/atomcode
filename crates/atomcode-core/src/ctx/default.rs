@@ -31,7 +31,7 @@ impl DefaultCtx {
     /// Construct a `DefaultCtx` from a provider config.
     pub fn new(provider: &ProviderConfig) -> Self {
         Self {
-            ctx_window: provider.context_window.max(8000),
+            ctx_window: provider.context_window.min(crate::config::provider::MAX_CONTEXT_WINDOW).max(8000),
             model_id: provider.model.to_lowercase(),
         }
     }
@@ -101,8 +101,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-
-}
+        }
     }
 
     #[test]

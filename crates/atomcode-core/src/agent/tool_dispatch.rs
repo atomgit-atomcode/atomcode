@@ -266,7 +266,7 @@ impl AgentLoop {
     /// Post-process tool results added by TurnRunner: CLI-specific
     /// semantic enrichment (pre-read files mentioned in failed-bash
     /// errors). The generic byte-level truncation (head/tail caps,
-    /// 300-line universal cap, 32K char cap, per-turn budget) moved
+    /// 300-line universal cap, 128K char cap, per-turn budget) moved
     /// into `TurnRunner::run_with_filter` so daemon + any other caller
     /// gets it for free — previously each caller had to remember.
     pub(crate) fn post_process_tool_results(&mut self, tool_count: usize) {
