@@ -97,6 +97,7 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     //   "Copy image", any app's Edit-menu Copy on a bitmap. arboard's
     //   get_image decodes these into RGBA.
     if let Ok(img) = clipboard.get_image() {
+        crate::tuix_trace!("IMG", "Tier1 arboard {}x{} px", img.width, img.height);
         let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
         let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
@@ -4401,6 +4402,7 @@ fn handle_input(
                 let image_paste: Option<(ImagePart, u64)> = if text.trim().is_empty() {
                     try_paste_clipboard_image()
                 } else {
+                    crate::tuix_trace!("IMG", "CmdV-paste-text len={} head={:?}", text.len(), &text[..text.len().min(120)]);
                     try_attach_image_from_path(&text)
                 };
                 if attach_image_to_input(app, ctx, renderer, image_paste)? {
@@ -8141,6 +8143,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         // the snappier keybind hint.
         let hint_msg = if cfg!(target_os = "windows") {
             crate::i18n::Msg::StatusClipboardImageHintSlash
+        } else if cfg!(target_os = "macos") {
+            crate::i18n::Msg::StatusClipboardImageHintMac
         } else {
             crate::i18n::Msg::StatusClipboardImageHint
         };
