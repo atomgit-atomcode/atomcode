@@ -6,7 +6,9 @@ use crate::persona::coding_persona;
 use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
 use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_capabilities::session::SessionContextHook;
-use atomcode_capabilities::tools::{coding_tool_names, register_coding_tools, ApprovalMiddleware};
+use atomcode_capabilities::tools::{
+    coding_tool_names, register_coding_tools, ApprovalMiddleware, OpenFileWorkspaceGate,
+};
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, ToolRegistry};
@@ -43,6 +45,10 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
         .provider(provider)
         .tools(mount_coding_tools())
         .persona(coding_persona(&cfg.model))
+        // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
+        // preview). This path pins an immutable working_dir, so the gate pins the same root.
+        // BEFORE approval so its `Allow` short-circuits the prompt.
+        .middleware(Arc::new(OpenFileWorkspaceGate::pinned(cfg.working_dir.clone())))
         // Approval runs BEFORE any (future) arg-rewriting middleware — load-bearing order.
         .middleware(Arc::new(ApprovalMiddleware::in_memory()))
         // Env / project-instructions / git context at session start (after persona).

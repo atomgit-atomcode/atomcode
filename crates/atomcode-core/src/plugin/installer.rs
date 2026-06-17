@@ -141,32 +141,32 @@ fn git_subdir_clone(git: &Path, url: &str, path: &str, pin: &GitPin, target: &Pa
     // to just `sub` before materialising any files.
     // Hardened git (no interactive tty prompt) — a private remote must fail
     // fast, not deadlock the TUI. See `marketplace::git_command`.
-    let mut clone = super::marketplace::git_command(git);
-    clone.args(["clone", "--filter=blob:none", "--no-checkout", "--depth", "1"]);
     // git-subdir pins are branch names in practice (the schema's `ref`); a
     // commit `sha` would need full history, but the catalog carries none.
-    let branch = pin.git_ref.as_deref().or(pin.branch.as_deref());
-    if let Some(b) = branch {
-        clone.args(["--branch", b]);
-    }
-    clone.arg(clone_url.as_str()).arg(target);
-    let out = clone.output().context("spawn git clone (git-subdir)")?;
-    if !out.status.success() {
-        // Fall back to a plain shallow clone for git versions without
-        // partial-clone support; we still scope via sparse-checkout below.
-        let mut plain = super::marketplace::git_command(git);
-        plain.args(["clone", "--no-checkout", "--depth", "1"]);
-        if let Some(b) = branch {
-            plain.args(["--branch", b]);
+    let branch = pin.git_ref.as_deref().or(pin.branch.as_deref()).map(String::from);
+    let build_partial = |cmd: &mut Command| {
+        cmd.args(["clone", "--filter=blob:none", "--no-checkout", "--depth", "1"]);
+        if let Some(b) = &branch {
+            cmd.args(["--branch", b]);
         }
-        plain.arg(clone_url.as_str()).arg(target);
-        let out2 = plain.output().context("spawn git clone (git-subdir fallback)")?;
-        if !out2.status.success() {
-            bail!(
-                "git clone failed: {}",
-                String::from_utf8_lossy(&out2.stderr)
-            );
+        cmd.arg(clone_url.as_str()).arg(target);
+    };
+    // Partial clone (no blobs). Old gits lack --filter; fall back to plain.
+    if super::marketplace::clone_with_optional_auth(git, clone_url.as_str(), target, build_partial)
+        .is_err()
+    {
+        if target.exists() {
+            std::fs::remove_dir_all(target).ok();
         }
+        let build_plain = |cmd: &mut Command| {
+            cmd.args(["clone", "--no-checkout", "--depth", "1"]);
+            if let Some(b) = &branch {
+                cmd.args(["--branch", b]);
+            }
+            cmd.arg(clone_url.as_str()).arg(target);
+        };
+        super::marketplace::clone_with_optional_auth(git, clone_url.as_str(), target, build_plain)
+            .context("git-subdir clone")?;
     }
 
     // Scope the working tree to the subdir, then check it out. `--no-cone` +
@@ -298,20 +298,19 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn git_clone_with_pin(git: &Path, url: &str, target: &Path, pin: &GitPin) -> Result<()> {
-    let mut cmd = super::marketplace::git_command(git);
-    cmd.arg("clone");
-    let needs_full_history = pin.commit.is_some() || pin.tag.is_some() || pin.git_ref.is_some();
-    if !needs_full_history {
-        cmd.args(["--depth", "1"]);
-    }
-    if let Some(branch) = &pin.branch {
-        cmd.args(["--branch", branch]);
-    }
-    cmd.arg(url).arg(target);
-    let out = cmd.output().context("spawn git clone")?;
-    if !out.status.success() {
-        bail!("git clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
+    let needs_full_history =
+        pin.commit.is_some() || pin.tag.is_some() || pin.git_ref.is_some();
+    let branch = pin.branch.clone();
+    super::marketplace::clone_with_optional_auth(git, url, target, |cmd| {
+        cmd.arg("clone");
+        if !needs_full_history {
+            cmd.args(["--depth", "1"]);
+        }
+        if let Some(b) = &branch {
+            cmd.args(["--branch", b]);
+        }
+        cmd.arg(url).arg(target);
+    })?;
 
     // Apply commit/tag/ref pin via post-clone checkout.
     let pin_ref = pin

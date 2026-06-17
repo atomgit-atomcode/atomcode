@@ -29,7 +29,8 @@ use atomcode_capabilities::session::{
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
-    register_coding_tools, ApprovalMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool,
+    register_coding_tools, ApprovalMiddleware, OpenFileWorkspaceGate, SensitivePathGate, WebFetchTool,
+    WebSearchTool,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::hook::LifecycleHooks;
@@ -405,6 +406,12 @@ pub fn assemble(
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
         // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
         .middleware(Arc::new(SensitivePathGate::new()))
+        // open_file is Risky (launches a GUI), so approval would prompt on EVERY preview.
+        // Restore the legacy engine's behavior: auto-approve when the target is inside the
+        // workspace (benign side effect on the user's own files). BEFORE approval so its
+        // `Allow` short-circuits the prompt; out-of-workspace paths fall through and still
+        // prompt. Reads the SAME live cwd handle below, so a /cd moves the boundary.
+        .middleware(Arc::new(OpenFileWorkspaceGate::new(parts.shared_cwd.clone())))
         // Approval BEFORE any arg-rewriting middleware — the user approves the exact
         // bytes that run.
         .middleware(parts.approval.clone())
