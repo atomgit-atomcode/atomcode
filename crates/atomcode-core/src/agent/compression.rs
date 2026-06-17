@@ -69,7 +69,7 @@ pub async fn compaction_keep_ceiling(
         })
         .sum();
     let cold_zone_tokens: usize = cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
-    let output_reserve = (window / 4).clamp(8_000, 16_384);
+    let output_reserve = (window / 4).clamp(8_000, 131_072);
     window
         .saturating_sub(system_tokens)
         .saturating_sub(tool_def_tokens)

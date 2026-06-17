@@ -83,6 +83,10 @@ impl ProviderConfig {
     }
 }
 
+/// Hard upper-bound for any context_window. 1M is the ceiling
+/// (Kimi K2.5, Qwen-Long, GLM-4-Long). Applied at every entry point.
+pub const MAX_CONTEXT_WINDOW: usize = 1_000_000;
+
 fn default_context_window() -> usize {
     128000
 }

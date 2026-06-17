@@ -75,7 +75,7 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
     // revert to restore verify.rs hit this as collateral damage).
     // Other tools (bash, grep, etc.) still get the char cap.
     // ────────────────────────────────────────────────────────────
-    let hard_char_limit = (context_window / 8).min(32_000).max(8_000);
+    let hard_char_limit = (context_window / 8).max(8_000).min(128_000);
     if tool_name == "read_file" {
         // read_file: no char cap. Managed by read.rs internally:
         // 1. auto_skeleton (file_tokens > budget/5)
@@ -179,8 +179,10 @@ pub fn post_process_tool_results(
     // Was capped at 16K chars, which at 128K ctx meant a single turn of
     // 3 file reads got "trimmed to fit turn budget" — the model saw
     // different fragments each re-read and couldn't correlate them.
-    // Now: ctx/4 with cap at 64K chars, floor 4K.
-    let turn_budget = (context_window / 4).min(64_000).max(4_000);
+    // Now: ctx/4 with cap at 256K chars, floor 4K. For models ≤128K
+    // the formula gives the same result as before — only models with
+    // >256K context windows benefit from the raised ceiling.
+    let turn_budget = (context_window / 4).max(4_000).min(256_000);
     let mut total_chars: usize = 0;
     for i in start..len {
         if let MessageContent::ToolResult(ref r) = messages[i].content {

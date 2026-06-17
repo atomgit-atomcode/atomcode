@@ -43,7 +43,7 @@ impl ClaudeProvider {
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
             max_tokens: config
                 .max_tokens
-                .unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
+                .unwrap_or((config.context_window / 4).clamp(8_000, 131_072)),
             thinking_enabled,
             thinking_budget,
         })

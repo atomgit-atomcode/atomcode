@@ -203,7 +203,7 @@ impl OpenAiProvider {
             // with zero visible output. CC uses fixed 16-32K, not proportional.
             max_tokens: config
                 .max_tokens
-                .unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
+                .unwrap_or((config.context_window / 4).clamp(8_000, 131_072)),
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
