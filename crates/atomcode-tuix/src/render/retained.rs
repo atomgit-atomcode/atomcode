@@ -425,16 +425,23 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// When Some, `paint_frame` paints the overlay cells after the normal
     /// body+footer, so the diff sees the combined frame.
     modal_overlay: Option<ModalOverlayState>,
-    /// Windows only: the STD_INPUT_HANDLE console mode value saved by
-    /// `enable_conhost_mouse_capture`. Currently always `None` — mouse
-    /// capture is intentionally disabled (see `with_writer` comment),
-    /// so there's nothing to restore. Field retained because the
-    /// suspend / shutdown paths still defensively call
-    /// `restore_conhost_console_in_mode` if it ever became `Some`
-    /// (belt-and-suspenders against a future re-enable being added
-    /// only on one side of the lifecycle).
+    /// Windows only: the STD_INPUT_HANDLE console mode saved before
+    /// `disable_conhost_quick_edit` cleared `ENABLE_QUICK_EDIT_MODE` at
+    /// startup (the conhost click-to-freeze fix). `Some(prev)` on a real
+    /// interactive console; `None` in unit tests and whenever stdin isn't a
+    /// console. The suspend / shutdown / Drop paths `take()` it and call
+    /// `restore_conhost_console_in_mode` to put the mode back byte-for-byte.
     #[cfg(windows)]
     prior_console_in_mode: Option<u32>,
+    /// Windows only: `true` once the real `new()` constructor has taken
+    /// ownership of the conhost QuickEdit bit on an interactive console.
+    /// Gates the re-clear in `resume_from_external` so that path's
+    /// `SetConsoleMode` syscall fires ONLY for a renderer built by `new()`
+    /// — never by the generic `with_writer` test path. `caps.tty` cannot be
+    /// the gate: it is `true` in unit tests too (see `caps_with_color`), so
+    /// gating resume on it would mutate the CI runner's console.
+    #[cfg(windows)]
+    quick_edit_managed: bool,
 }
 
 /// Pre-computed overlay cell grid + screen position for a modal window.
@@ -502,7 +509,30 @@ impl RetainedRenderer<StdoutTap> {
             inner: BufWriter::new(std::io::stdout()),
             mirror,
         };
-        Self::with_writer(tap, caps, w, h)
+        // Clear conhost's QuickEdit bit on a real interactive console so a
+        // click can't pause our stdout writes and freeze the render worker
+        // (see `conhost::disable_conhost_quick_edit`). This is the ONLY place
+        // the syscall fires: `new()` is monomorphic for the real stdout
+        // writer and is never reached by unit tests (they call `with_writer`
+        // with in-memory sinks), so the CI console is never mutated. Note
+        // `caps.tty` alone would NOT be a safe gate — test caps report
+        // tty=true too — the constructor boundary is the real protection.
+        #[cfg(windows)]
+        let manage_quick_edit = caps.tty;
+        #[cfg(windows)]
+        let prior = if manage_quick_edit {
+            crate::render::conhost::disable_conhost_quick_edit()
+        } else {
+            None
+        };
+        #[allow(unused_mut)]
+        let mut r = Self::with_writer(tap, caps, w, h);
+        #[cfg(windows)]
+        {
+            r.prior_console_in_mode = prior;
+            r.quick_edit_managed = manage_quick_edit;
+        }
+        r
     }
 }
 
@@ -525,9 +555,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // panicked before Drop) having left capture on.
         let _ = out.write_all(b"\x1b[3J");
         let _ = out.flush();
+        // `with_writer` never touches the console mode: it's generic over the
+        // writer and is the path unit tests use with in-memory sinks, so
+        // issuing a `SetConsoleMode` here would mutate the CI runner's real
+        // console. The conhost QuickEdit clear lives in `new()` (the real
+        // StdoutTap constructor, never reached by tests); this stays `None`
+        // and `new()` overwrites it after construction.
         #[cfg(windows)]
-        // Conhost mouse capture intentionally skipped — see comment
-        // above re: deferring to terminal-native selection/wheel/copy.
         let prior_console_in_mode: Option<u32> = None;
         Self {
             out,
@@ -557,6 +591,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             modal_overlay: None,
             #[cfg(windows)]
             prior_console_in_mode,
+            // Generic constructor (incl. all unit tests): never manages the
+            // console QuickEdit bit. Only the real `new()` flips this true.
+            #[cfg(windows)]
+            quick_edit_managed: false,
         }
     }
 
@@ -4053,7 +4091,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // coming as `Repeat`, Shift+Enter stops carrying SHIFT, and any
         // other logic that depended on CSI u event types silently
         // degrades. Same flag set as `TerminalGuard::activate`.
-        if self.caps.tty {
+        //
+        // Windows is excluded for the same reason as the initial push: the
+        // Win32 console backend can't decode `CSI u`, so re-arming the
+        // protocol after a resume would reintroduce the numpad-leak bug
+        // (`ESC[57400u` for keypad keys) on every OAuth/shell round-trip.
+        // See `TerminalGuard::activate` in lib.rs for the full rationale.
+        if self.caps.tty && !cfg!(windows) {
             let _ = execute!(
                 self.out,
                 PushKeyboardEnhancementFlags(
@@ -4113,10 +4157,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // an external subprocess. The matching disable in
         // suspend_for_external is still emitted so any subprocess that
         // somehow turned capture on during its run gets cleaned up here.
+        // Re-clear conhost QuickEdit after returning from an external
+        // subprocess. `suspend_for_external` restored the original mode
+        // (re-enabling QuickEdit so the child — OAuth browser, `/shell` —
+        // got a normal console) and took the saved value to `None`;
+        // crossterm's `enable_raw_mode` above does not touch QuickEdit. So
+        // without re-clearing here, the click-to-freeze bug would return
+        // after every external round-trip. Win32 console-mode change only —
+        // no ANSI bytes, no mouse capture re-enabled. Gated on
+        // `quick_edit_managed` (set only by the real `new()`), NOT on
+        // `caps.tty`, so the generic `with_writer` test path — which also
+        // reports tty=true and DOES call `resume_from_external` in tests —
+        // never issues a `SetConsoleMode` syscall against the CI console.
         #[cfg(windows)]
-        {
-            // Mirror the lib-level decision: leave conhost mode alone.
-            self.prior_console_in_mode = None;
+        if self.quick_edit_managed {
+            self.prior_console_in_mode = crate::render::conhost::disable_conhost_quick_edit();
         }
         let _ = self.out.flush();
     }
@@ -9515,6 +9570,30 @@ mod tests {
             after_drop.contains("\x1b[?1006l"),
             "Drop must emit mouse-mode disable (1006l) defensively: {:?}",
             after_drop
+        );
+    }
+
+    /// Lock the test-safety boundary for the conhost QuickEdit fix: the
+    /// generic `with_writer` constructor (the path every unit test uses)
+    /// must NEVER take ownership of the console mode — i.e. it must not call
+    /// `SetConsoleMode`. If a future change moves the QuickEdit clear out of
+    /// the real `new()` and into `with_writer` gated only on `caps.tty`
+    /// (which is `true` in tests), it would mutate the CI runner's console;
+    /// this assertion catches that. Windows-only because the fields are
+    /// `#[cfg(windows)]`.
+    #[cfg(windows)]
+    #[test]
+    fn retained_with_writer_never_manages_console_quick_edit() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        assert!(
+            r.prior_console_in_mode.is_none(),
+            "with_writer must not capture a console mode (no SetConsoleMode in the test path)"
+        );
+        assert!(
+            !r.quick_edit_managed,
+            "with_writer must not flag itself as managing QuickEdit — only real new() does"
         );
     }
 
