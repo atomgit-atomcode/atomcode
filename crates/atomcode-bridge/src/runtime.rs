@@ -826,7 +826,7 @@ impl Bridge {
                 self.emit(CoreEv::PhaseChange(AgentPhase::WaitingApproval));
                 self.emit(CoreEv::ApprovalNeeded {
                     tool_name: req.tool.clone(),
-                    reason: truncate(&req.args, 200),
+                    reason: "Requires approval".to_string(),
                     call: atomcode_core::tool::ToolCall {
                         id: req.call_id,
                         name: req.tool,
