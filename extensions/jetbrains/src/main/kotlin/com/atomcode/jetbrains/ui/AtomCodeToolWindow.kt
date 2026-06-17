@@ -1,11 +1,17 @@
 package com.atomcode.jetbrains.ui
 
+import com.atomcode.jetbrains.core.AtomCodeProjectController
+import com.atomcode.jetbrains.persistence.WorkspaceTabState
+import com.atomcode.jetbrains.session.ChatRuntime
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Key
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.ui.content.Content
 import com.intellij.ui.content.ContentFactory
+import com.intellij.ui.content.ContentManagerEvent
+import com.intellij.ui.content.ContentManagerListener
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.JMenuItem
@@ -15,13 +21,32 @@ import javax.swing.JTabbedPane
 import javax.swing.SwingUtilities
 
 const val ATOMCODE_TOOL_WINDOW_ID = "AtomCode"
+private val ATOMCODE_TAB_ID_KEY = Key.create<String>("atomcode.tabId")
 
 fun createAtomCodeChatContent(project: Project, toolWindow: ToolWindow, closeable: Boolean): AtomCodeChatPanel {
-    val panel = AtomCodeChatPanel(project)
     val name = nextChatTabName(toolWindow)
+    val runtime = AtomCodeProjectController.getInstance(project).createChatRuntime(name)
+    return createAtomCodeChatContent(project, toolWindow, closeable, runtime, name)
+}
+
+fun restoreAtomCodeChatContent(project: Project, toolWindow: ToolWindow, tab: WorkspaceTabState): AtomCodeChatPanel {
+    val name = tab.title.ifBlank { nextChatTabName(toolWindow) }
+    val runtime = AtomCodeProjectController.getInstance(project).createRestoredChatRuntime(tab)
+    return createAtomCodeChatContent(project, toolWindow, closeable = true, runtime, name)
+}
+
+private fun createAtomCodeChatContent(
+    project: Project,
+    toolWindow: ToolWindow,
+    closeable: Boolean,
+    runtime: ChatRuntime,
+    name: String,
+): AtomCodeChatPanel {
+    val panel = AtomCodeChatPanel(project, runtime)
     val content = ContentFactory.getInstance().createContent(panel, name, false).apply {
         isCloseable = closeable
         description = "AtomCode Chat"
+        putUserData(ATOMCODE_TAB_ID_KEY, runtime.tabId)
         setDisposer(panel)
     }
     toolWindow.contentManager.addContent(content)
@@ -29,6 +54,7 @@ fun createAtomCodeChatContent(project: Project, toolWindow: ToolWindow, closeabl
 
     // 给标签栏安装右键菜单
     installTabPopupMenu(toolWindow, project)
+    installContentSelectionListener(toolWindow, project)
 
     return panel
 }
@@ -67,9 +93,13 @@ fun closeCurrentChatTab(project: Project) {
             panel?.startNewConversation()
             return@invokeLater
         }
+        closeRuntimeForContent(project, selected)
         contentManager.removeContent(selected, true)
     }
 }
+
+fun contentTabId(content: Content): String? =
+    content.getUserData(ATOMCODE_TAB_ID_KEY)
 
 private fun nextChatTabName(toolWindow: ToolWindow): String {
     val count = toolWindow.contentManager.contentCount
@@ -106,6 +136,7 @@ private fun installTabPopupMenu(toolWindow: ToolWindow, project: Project) {
                             val panel = clickedContent.component as? AtomCodeChatPanel
                             panel?.startNewConversation()
                         } else {
+                            closeRuntimeForContent(project, clickedContent)
                             contentManager.removeContent(clickedContent, true)
                         }
                     }
@@ -114,7 +145,10 @@ private fun installTabPopupMenu(toolWindow: ToolWindow, project: Project) {
                     isEnabled = contentManager.contentCount > 1
                     addActionListener {
                         val others = contentManager.contents.filter { it != clickedContent }
-                        others.forEach { contentManager.removeContent(it, true) }
+                        others.forEach {
+                            closeRuntimeForContent(project, it)
+                            contentManager.removeContent(it, true)
+                        }
                     }
                 })
                 menu.add(JSeparator())
@@ -125,6 +159,20 @@ private fun installTabPopupMenu(toolWindow: ToolWindow, project: Project) {
             }
         })
     }
+}
+
+private fun closeRuntimeForContent(project: Project, content: Content) {
+    contentTabId(content)?.let { AtomCodeProjectController.getInstance(project).closeChatRuntime(it) }
+}
+
+private fun installContentSelectionListener(toolWindow: ToolWindow, project: Project) {
+    if (toolWindow.component.getClientProperty("atomcode-content-listener-installed") == true) return
+    toolWindow.component.putClientProperty("atomcode-content-listener-installed", true)
+    toolWindow.contentManager.addContentManagerListener(object : ContentManagerListener {
+        override fun selectionChanged(event: ContentManagerEvent) {
+            contentTabId(event.content)?.let { AtomCodeProjectController.getInstance(project).selectChatRuntime(it) }
+        }
+    })
 }
 
 /**

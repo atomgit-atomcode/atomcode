@@ -86,14 +86,9 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     #[cfg(target_os = "macos")]
     {
         if let Some(path) = read_macos_clipboard_file_url() {
-            crate::tuix_trace!("IMG", "Tier0 file-url={}", path);
             if let Some(result) = try_attach_image_from_path(&path) {
-                crate::tuix_trace!("IMG", "Tier0 hit type={}", result.0.media_type);
                 return Some(result);
             }
-            crate::tuix_trace!("IMG", "Tier0 rejected, fallthrough");
-        } else {
-            crate::tuix_trace!("IMG", "Tier0 no file-url");
         }
     }
 
@@ -169,19 +164,13 @@ fn read_macos_clipboard_file_url() -> Option<String> {
     let decoded = urlencoding::decode(stripped).ok()?;
     let path = decoded.into_owned();
     // macOS may return a file-reference URL (/.file/id=…) instead of a
-    // standard POSIX path. File-ref URLs can be read by the kernel but
-    // their extension is an opaque id — try_attach_image_from_path's
-    // whitelist rejects them. Resolve through NSURL to the real path.
+    // standard POSIX path. Resolve through canonicalize().
     if path.starts_with("/.file/id=") {
         if let Some(resolved) = resolve_macos_file_ref_url(&path) {
             return Some(resolved);
         }
-        // canonicalize() may fail for various reasons (permissions, NAS
-        // paths, APFS snapshots). Don't discard the original path — let
-        // try_attach_image_from_path attempt to read it directly. The
-        // kernel can open /.file/id=… natively, and the magic-byte
-        // detector in try_attach_image_from_path will handle it.
-        // Fall through to return the raw path.
+        // canonicalize() can fail (NAS, permissions). Fall through —
+        // try_attach_image_from_path has magic-byte detection.
     }
     Some(path)
 }
@@ -189,50 +178,34 @@ fn read_macos_clipboard_file_url() -> Option<String> {
 #[cfg(target_os = "macos")]
 fn resolve_macos_file_ref_url(raw: &str) -> Option<String> {
     // macOS kernel resolves /.file/id=… paths natively — canonicalize()
-    // turns them into the standard /Users/… or /Volumes/… POSIX path
-    // that passes is_absolute() and extension-whitelist checks.
+    // turns them into the standard /Users/… or /Volumes/… POSIX path.
     std::fs::canonicalize(raw).ok()?.to_str().map(|s| s.to_owned())
 }
 
-/// Unescape shell backslash escapes that iTerm2 emits when pasting
-/// file paths containing metacharacters (spaces, parens, brackets,
-/// `!`, `$`, `&`, `;`, `|`, etc.). On macOS only — Windows/Linux
-/// terminals don't apply shell escaping to paste payloads.
-///
-/// Any `\X` where X is non-alphanumeric becomes just X. Backslash
-/// before alphanumeric is kept verbatim — those are rare in real
-/// filenames and could be intentional (e.g. `\n` in a real file).
 #[cfg(target_os = "macos")]
 fn unescape_shell_escapes(raw: &str) -> String {
+    // iTerm2 emits backslash-escaped metacharacters ( \  \( \) \[ \] ) in
+    // pasted file paths. Any \X where X is non-alphanumeric → just X.
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
             if let Some(next) = chars.next() {
-                if !next.is_alphanumeric() {
-                    out.push(next);
-                    continue;
-                }
+                if !next.is_alphanumeric() { out.push(next); continue; }
                 out.push('\\');
                 out.push(next);
             }
-        } else {
-            out.push(c);
-        }
+        } else { out.push(c); }
     }
     out
 }
 
 #[cfg(not(target_os = "macos"))]
 fn unescape_shell_escapes(raw: &str) -> String {
-    // On other platforms, only unescape backslash-space — the only
-    // shell escape that drag-and-drop paths carry cross-platform.
     raw.replace("\\ ", " ")
 }
 
-/// Detect image type from file header magic bytes. Used when the
-/// file extension is unavailable or unreliable (e.g. macOS file-
-/// reference URLs whose extension is an opaque numeric id).
+/// Detect image type from file header magic bytes.
 fn detect_image_type_from_path(path: &std::path::Path) -> Option<&'static str> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
@@ -241,9 +214,7 @@ fn detect_image_type_from_path(path: &std::path::Path) -> Option<&'static str> {
     if header.starts_with(b"\x89PNG\r\n\x1a\n") { return Some("image/png"); }
     if header.starts_with(b"\xff\xd8\xff") { return Some("image/jpeg"); }
     if header.starts_with(b"GIF8") { return Some("image/gif"); }
-    if header.starts_with(b"RIFF") && header.len() >= 12 && &header[8..12] == b"WEBP" {
-        return Some("image/webp");
-    }
+    if header.starts_with(b"RIFF") && &header[8..12] == b"WEBP" { return Some("image/webp"); }
     None
 }
 
@@ -466,8 +437,6 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
         return None;
     }
     let media_type = if candidate.starts_with("/.file/id=") {
-        // macOS file-reference URL — the extension is an opaque id,
-        // not the real type. Read the file header to detect format.
         detect_image_type_from_path(path)?
     } else {
         match path
@@ -4235,19 +4204,21 @@ fn attach_typed_image_paths(
     if !ctx.config.can_handle_attached_images() {
         return;
     }
-    // Snapshot tokens before mutating `text`. The `/` `\` pre-filter avoids a
-    // filesystem stat on every word of a long message — an absolute path
-    // always carries a separator.
-    //
-    // Quote-aware: iTerm2 wraps paths containing spaces / parens / CJK in
-    // single quotes when it writes a file URL to the PTY. Plain split_whitespace
-    // shatters `'/path/to/default (18).jpeg'` into `/path/to/default` and
-    // `(18).jpeg'` — neither is a valid absolute path. Extract quoted segments
-    // whole, then fall back to whitespace splitting for the remainder.
+    // Quote-aware token extraction: iTerm2 wraps paths with spaces/parens/CJK
+    // in single quotes (`'/Volumes/Data/default (18).jpeg'`). Plain
+    // split_whitespace shatters them into two non-path tokens. Extract quoted
+    // segments whole, AND process the unquoted text between/around quotes
+    // so that bare paths like `/tmp/a.png` aren't discarded.
     let tokens: Vec<String> = {
         let mut v: Vec<String> = Vec::new();
         let mut remaining = text.as_str();
         while let Some(start) = remaining.find(|c| c == '\'' || c == '"') {
+            // Text BEFORE this quote — split normally for bare paths.
+            for t in remaining[..start].split_whitespace() {
+                if t.contains('/') || t.contains('\\') {
+                    v.push(t.to_string());
+                }
+            }
             let quote = remaining.as_bytes()[start];
             let Some(end) = remaining[start + 1..].find(quote as char) else {
                 break;
@@ -4258,6 +4229,7 @@ fn attach_typed_image_paths(
             }
             remaining = &remaining[start + 2 + end..];
         }
+        // Remainder after the last quote.
         for t in remaining.split_whitespace() {
             if t.contains('/') || t.contains('\\') {
                 v.push(t.to_string());

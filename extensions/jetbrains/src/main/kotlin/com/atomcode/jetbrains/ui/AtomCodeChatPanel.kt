@@ -18,10 +18,14 @@ import com.atomcode.jetbrains.security.PathSensitivity
 import com.atomcode.jetbrains.security.SensitivePathClassifier
 import com.atomcode.jetbrains.services.AtomCodeProjectService
 import com.atomcode.jetbrains.services.SessionRefView
+import com.atomcode.jetbrains.session.ChatRuntime
+import com.atomcode.jetbrains.session.ContextItemState
+import com.atomcode.jetbrains.session.SessionWorkspace
 import com.atomcode.jetbrains.settings.AtomCodeContextLevel
 import com.atomcode.jetbrains.settings.AtomCodeSettingsState
 import com.atomcode.jetbrains.ui.header.HeaderPanel
 import com.atomcode.jetbrains.ui.input.InputPanel
+import com.atomcode.jetbrains.ui.input.QueuedPromptView
 import com.atomcode.jetbrains.ui.message.JBCefMessageView
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
@@ -45,6 +49,7 @@ import java.awt.GridBagLayout
 import java.awt.Insets
 import java.awt.datatransfer.StringSelection
 import java.beans.PropertyChangeEvent
+import java.util.UUID
 import javax.swing.DefaultListModel
 import javax.swing.JButton
 import javax.swing.JCheckBox
@@ -64,12 +69,16 @@ import javax.swing.JSeparator
 import javax.swing.ListSelectionModel
 import javax.swing.JOptionPane
 import javax.swing.SwingUtilities
+import javax.swing.Timer
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
 private const val MAX_ATTACHED_FILE_CHARS = 120_000
 
-class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), Disposable {
+class AtomCodeChatPanel(
+    private val project: Project,
+    private val runtime: ChatRuntime? = null,
+) : JPanel(BorderLayout()), Disposable {
     private val service = AtomCodeProjectService.getInstance(project)
     private val settings = AtomCodeSettingsState.getInstance()
 
@@ -163,6 +172,7 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
     fun stopCurrentGeneration() {
         queuedPrompts.clear()
         renderQueueState()
+        messageView.finishAssistantTurn()
         if (!generating) {
             service.stopGeneration(currentSession?.id)
             return
@@ -184,6 +194,7 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
         }
         if (!duplicate) {
             pendingContext += item
+            runtime?.addContext(item.toContextItemState())
         }
         rebuildContext()
         focusInput()
@@ -421,6 +432,8 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
             SwingUtilities.invokeLater {
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to create session"); return@invokeLater }
                 currentSession = session
+                runtime?.updateSession(session)
+                persistRuntimeSession()
                 messageView.clear()
                 addSystemMessage("Started new session ${session.name.ifBlank { session.id.take(8) }}.")
                 refreshSessionList()
@@ -445,25 +458,42 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
         val list = JList(model).apply { selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION; visibleRowCount = 14 }
         val load = JButton("Load"); val rename = JButton("Rename"); val delete = JButton("Delete Selected")
         val refresh = JButton("Refresh"); val close = JButton("Close")
+        var searchGeneration = 0
 
         fun updateHistoryButtons() {
             val selectedCount = list.selectedValuesList.size
             load.isEnabled = selectedCount == 1; rename.isEnabled = selectedCount == 1; delete.isEnabled = selectedCount > 0
         }
-        fun refill() {
-            val query = search.text.trim().lowercase()
+        fun refill(items: List<SessionMeta> = sessions) {
             model.clear()
-            sessions.filter { query.isBlank() || it.displayName.lowercase().contains(query) || it.id.lowercase().contains(query) }
-                .forEach(model::addElement)
+            items.forEach(model::addElement)
             val hasItems = model.size() > 0
             if (hasItems && list.selectedIndex < 0) list.selectedIndex = 0
             updateHistoryButtons()
         }
+        fun runSearch() {
+            val query = search.text.trim()
+            val generation = ++searchGeneration
+            val future = if (query.isBlank()) service.refreshSessions() else service.searchSessions(query)
+            future.whenComplete { updated, error ->
+                SwingUtilities.invokeLater {
+                    if (generation != searchGeneration) return@invokeLater
+                    if (error != null) {
+                        addErrorMessage(error.cause?.message ?: error.message ?: "failed to search sessions")
+                        return@invokeLater
+                    }
+                    sessions = updated.sortedByDescending { it.updatedAt }
+                    replaceSessions(sessions, currentSession?.id)
+                    refill(sessions)
+                }
+            }
+        }
+        val searchTimer = Timer(300) { runSearch() }.apply { isRepeats = false }
         list.addListSelectionListener { if (!it.valueIsAdjusting) updateHistoryButtons() }
         search.document.addDocumentListener(object : DocumentListener {
-            override fun insertUpdate(e: DocumentEvent) = refill()
-            override fun removeUpdate(e: DocumentEvent) = refill()
-            override fun changedUpdate(e: DocumentEvent) = refill()
+            override fun insertUpdate(e: DocumentEvent) = searchTimer.restart()
+            override fun removeUpdate(e: DocumentEvent) = searchTimer.restart()
+            override fun changedUpdate(e: DocumentEvent) = searchTimer.restart()
         })
 
         val panel = JPanel(BorderLayout(8, 8)).apply {
@@ -484,7 +514,7 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
                 SwingUtilities.invokeLater {
                     rename.isEnabled = true
                     if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to rename session"); return@invokeLater }
-                    sessions = updated.sortedByDescending { it.updatedAt }; replaceSessions(sessions, selected.id); refill()
+                    sessions = updated.sortedByDescending { it.updatedAt }; replaceSessions(sessions, selected.id); refill(sessions)
                     addSystemMessage("Session renamed to $nextName.")
                 }
             }
@@ -503,7 +533,7 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
                     if (selected.any { it.id == currentSession?.id }) { currentSession = null }
                     replaceSessions(sessions, currentSession?.id)
                     if (currentSession == null) messageView.clear()
-                    refill(); addSystemMessage("Deleted ${selected.size} session(s).")
+                    refill(sessions); addSystemMessage("Deleted ${selected.size} session(s).")
                 }
             }
         }
@@ -513,12 +543,12 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
                 SwingUtilities.invokeLater {
                     refresh.isEnabled = true
                     if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to refresh sessions"); return@invokeLater }
-                    sessions = updated.sortedByDescending { it.updatedAt }; replaceSessions(sessions, currentSession?.id); refill()
+                    sessions = updated.sortedByDescending { it.updatedAt }; replaceSessions(sessions, currentSession?.id); refill(sessions)
                 }
             }
         }
         close.addActionListener { dialog.dispose() }
-        refill(); dialog.isVisible = true
+        refill(sessions); dialog.isVisible = true
     }
 
     private fun renameSelectedSession() {
@@ -615,6 +645,8 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
             SwingUtilities.invokeLater {
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to load session"); return@invokeLater }
                 currentSession = SessionRefView(detail.id, detail.name, detail.projectHash, detail.workingDir)
+                runtime?.loadSession(detail)
+                persistRuntimeSession()
                 replaceSelectedSession(detail.id); renderSession(detail); inputPanel.focusInput()
             }
         }
@@ -646,8 +678,9 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
         val contextNames = contextForSend.map { it.displayName }
 
         if (generating) {
-            queuedPrompts += QueuedPrompt(transformedPrompt, message, contextNames)
-            messageView.addQueuedMessage(transformedPrompt)
+            val queued = QueuedPrompt(UUID.randomUUID().toString(), transformedPrompt, message, contextNames)
+            queuedPrompts += queued
+            runtime?.queuePrompt(transformedPrompt, queued.id)
             if (pendingContextForSend.isNotEmpty()) clearPendingContext()
             inputPanel.clearInput()
             renderQueueState()
@@ -659,7 +692,10 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
 
     private fun startPrompt(prompt: String, message: String, contextNames: List<String>) {
         // Add user message + immediate thinking feedback
+        runtime?.submitPrompt(prompt)
+        renderQueueState()
         messageView.addUserMessage(prompt)
+        messageView.beginAssistantTurn()
         if (contextNames.isNotEmpty()) {
             addSystemMessage("[Context] ${contextNames.joinToString()}")
         }
@@ -686,24 +722,30 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
                 SwingUtilities.invokeLater { streamHandler.onError(message) }
             }
         }, onSessionReady = { session ->
-            SwingUtilities.invokeLater { currentSession = session; replaceSelectedSession(session.id) }
+            SwingUtilities.invokeLater {
+                currentSession = session
+                runtime?.updateSession(session)
+                replaceSelectedSession(session.id)
+                persistRuntimeSession()
+            }
         }).whenComplete { session, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
                     finishPromptAndContinue()
-                } else if (session != null) { currentSession = session; replaceSelectedSession(session.id) }
+                } else if (session != null) { currentSession = session; runtime?.updateSession(session); replaceSelectedSession(session.id); persistRuntimeSession() }
             }
         }
     }
 
     private fun renderChatEvent(event: ChatEvent) {
+        runtime?.applyDaemonEvent(event)
         when (event) {
             is ChatEvent.Text -> streamHandler.onText(event.content)
             is ChatEvent.Reasoning -> streamHandler.onReasoning(event.content)
             is ChatEvent.ToolBatch -> streamHandler.onToolBatch()
             is ChatEvent.ToolStart -> streamHandler.onToolStart(event.name)
-            is ChatEvent.ToolOutput -> { /* handled by ToolResult */ }
-            is ChatEvent.ToolResult -> streamHandler.onToolResult(event.name, event.success, event.durationMs)
+            is ChatEvent.ToolOutput -> streamHandler.onToolOutput(event.chunk)
+            is ChatEvent.ToolResult -> streamHandler.onToolResult(event.name, event.output, event.success, event.durationMs)
             is ChatEvent.ArtifactStart -> streamHandler.onArtifactStart(event.title)
             is ChatEvent.ArtifactContent -> streamHandler.onArtifactContent(event.content)
             is ChatEvent.ArtifactEnd -> streamHandler.onArtifactEnd(event.id)
@@ -729,6 +771,8 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
         }
         val next = if (queuedPrompts.isEmpty()) null else queuedPrompts.removeFirst()
         if (next == null) { renderQueueState(); return }
+        runtime?.removeQueuedPrompt(next.id)
+        renderQueueState()
         addSystemMessage("Sending queued message...")
         startPrompt(next.prompt, next.message, next.contextNames)
     }
@@ -736,6 +780,7 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
     private fun finishPrompt() {
         if (!generating) return
         generating = false
+        messageView.finishAssistantTurn()
         inputPanel.setGenerating(false)
         inputPanel.focusInput()
         renderQueueState()
@@ -769,7 +814,22 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
         addSystemMessage("Applied the last code block to the active editor.")
     }
 
-    private fun renderQueueState() { rebuildContext() }
+    private fun renderQueueState() {
+        inputPanel.setQueuedPrompts(
+            queuedPrompts.map { queued ->
+                QueuedPromptView(
+                    id = queued.id,
+                    text = queued.prompt,
+                    contextSummary = queued.contextNames,
+                )
+            },
+        ) { item ->
+            queuedPrompts.removeAll { it.id == item.id }
+            runtime?.removeQueuedPrompt(item.id)
+            renderQueueState()
+        }
+        rebuildContext()
+    }
 
     private fun requestPermissionDecision(event: ChatEvent.PermissionRequest) {
         // 非破坏性工具自动允许，避免模态对话框阻塞 EDT 导致 daemon 流中断
@@ -810,6 +870,11 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
         header.updateConnectionState(state)
     }
 
+    private fun persistRuntimeSession() {
+        val runtime = runtime ?: return
+        SessionWorkspace.getInstance(project).updateRuntimeSession(runtime)
+    }
+
     private fun installInputKeyBindings() {
         inputPanel.installKeyBindings(settings.state.sendWithCtrlEnter)
     }
@@ -833,6 +898,7 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
 
     private fun clearPendingContext() {
         pendingContext.clear()
+        runtime?.clearContext()
         rebuildContext()
     }
 
@@ -1000,12 +1066,22 @@ class AtomCodeChatPanel(private val project: Project) : JPanel(BorderLayout()), 
 }
 
 private data class SlashCommand(val name: String, val description: String)
-private data class QueuedPrompt(val prompt: String, val message: String, val contextNames: List<String>)
+private data class QueuedPrompt(val id: String, val prompt: String, val message: String, val contextNames: List<String>)
 
 data class ChatContextItem(
     val path: String, val displayName: String, val language: String,
     val content: String, val selection: String?, val startLine: Int?, val endLine: Int?,
 )
+
+private fun ChatContextItem.toContextItemState(): ContextItemState =
+    ContextItemState(
+        id = "$path:${startLine ?: 0}:${endLine ?: 0}:${selection?.hashCode() ?: 0}",
+        path = path,
+        displayName = displayName,
+        language = language,
+        selectionStartLine = startLine,
+        selectionEndLine = endLine,
+    )
 
 internal fun slashPromptTemplate(prompt: String): String? {
     val parts = prompt.split(Regex("\\s+"), limit = 2)
