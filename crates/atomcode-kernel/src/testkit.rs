@@ -8,7 +8,7 @@ use crate::tool::MountedTools;
 use crate::message::{
     CompactionPlan, CompactionStrategy, CompactionView, Conversation, Message,
 };
-use crate::middleware::ToolMiddleware;
+use crate::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use crate::provider::{ChatOptions, LlmProvider};
 use crate::request::RequestCtx;
 use crate::stream::{ProviderError, StreamEvent};
@@ -401,15 +401,15 @@ impl ToolMiddleware for ApprovalMiddleware {
         call: &mut ToolCall,
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         // Safe call (arg-aware) → no approval.
         if tool.risk(&call.arguments) == RiskLevel::Safe {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         // Session grant cache: an identical risky call already approved-always.
         let key = Self::grant_key(call);
         if self.granted.lock().unwrap().contains(&key) {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         // Round-trip to the driver for a decision.
         let decision = rt
@@ -419,13 +419,13 @@ impl ToolMiddleware for ApprovalMiddleware {
             )
             .await;
         if decision.get("decision").and_then(|d| d.as_str()) != Some("allow") {
-            return Err("denied".to_string());
+            return BeforeOutcome::deny("denied");
         }
         // "remember" → cache the grant so the same command is not asked again.
         if decision.get("remember").and_then(|r| r.as_bool()) == Some(true) {
             self.granted.lock().unwrap().insert(key);
         }
-        Ok(())
+        BeforeOutcome::Proceed
     }
 }
 
@@ -563,9 +563,9 @@ impl ToolMiddleware for ArgRewriteMiddleware {
         call: &mut ToolCall,
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         call.arguments = "{\"rewritten\":true}".to_string();
-        Ok(())
+        BeforeOutcome::Proceed
     }
 }
 
@@ -579,8 +579,8 @@ impl ToolMiddleware for BlockToolMiddleware {
         _call: &mut ToolCall,
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
-    ) -> Result<(), String> {
-        Err("blocked by policy".to_string())
+    ) -> BeforeOutcome {
+        BeforeOutcome::deny("blocked by policy")
     }
 }
 
@@ -599,8 +599,9 @@ pub struct TruncateMiddleware;
 
 #[async_trait]
 impl ToolMiddleware for TruncateMiddleware {
-    async fn after(&self, result: &mut ToolResult) {
+    async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
         result.content = format!("[truncated] {}", result.content);
+        AfterOutcome::Proceed
     }
 }
 

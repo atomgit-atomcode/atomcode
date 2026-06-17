@@ -437,6 +437,9 @@ pub struct StatusLine {
     /// progress label like `"◎ /goal (round 3, 1m 42s)"`. Rendered in
     /// the status row between the left info and the right-aligned hint.
     pub goal_indicator: Option<String>,
+    /// Whether the active model supports vision. When true the status
+    /// bar renders a  glyph before the model name.
+    pub vision: bool,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

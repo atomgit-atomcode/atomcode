@@ -59,7 +59,10 @@ impl Tool for EditFileTool {
             }
         };
         if a.old_string == a.new_string {
-            return err("edit_file: old_string and new_string are identical — nothing to change.".to_string());
+            return err(
+                "edit_file: old_string and new_string are identical — nothing to change."
+                    .to_string(),
+            );
         }
         let path = resolve_path(&a.file_path, &ctx.working_dir);
         let content = match tokio::fs::read_to_string(&path).await {
@@ -90,15 +93,49 @@ impl Tool for EditFileTool {
             content.replacen(&a.old_string, &a.new_string, 1)
         };
         if let Err(e) = tokio::fs::write(&path, &updated).await {
-            return err(format!("edit_file: failed to write {}: {e}", path.display()));
+            return err(format!(
+                "edit_file: failed to write {}: {e}",
+                path.display()
+            ));
         }
         let replaced = if a.replace_all { count } else { 1 };
+        let diff = build_compact_diff(&a.old_string, &a.new_string);
         ok(format!(
-            "Edited {} ({replaced} replacement{})",
+            "Edited {} ({replaced} replacement{})\n{}",
             path.display(),
-            if replaced == 1 { "" } else { "s" }
+            if replaced == 1 { "" } else { "s" },
+            diff,
         ))
     }
+}
+
+fn build_compact_diff(old: &str, new: &str) -> String {
+    let mut diff = String::new();
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let max_show = 4;
+
+    for (i, line) in old_lines.iter().take(max_show).enumerate() {
+        diff.push_str(&format!("- {}\n", line));
+        if i == max_show - 1 && old_lines.len() > max_show {
+            diff.push_str(&format!(
+                "  ... ({} more removed)\n",
+                old_lines.len() - max_show
+            ));
+        }
+    }
+
+    for (i, line) in new_lines.iter().take(max_show).enumerate() {
+        diff.push_str(&format!("+ {}\n", line));
+        if i == max_show - 1 && new_lines.len() > max_show {
+            diff.push_str(&format!(
+                "  ... ({} more added)\n",
+                new_lines.len() - max_show
+            ));
+        }
+    }
+
+    diff.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -108,7 +145,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+        }
     }
 
     #[tokio::test]
@@ -116,11 +157,27 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
         let r = EditFileTool
-            .execute(r#"{"file_path":"a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"file_path":"a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("- let x = 1;"), "{}", r.content);
+        assert!(r.content.contains("+ let x = 2;"), "{}", r.content);
         let on_disk = std::fs::read_to_string(d.path().join("a.rs")).unwrap();
         assert!(on_disk.contains("let x = 2;"), "{on_disk}");
+    }
+
+    #[test]
+    fn compact_diff_truncates_each_side() {
+        let old = "1\n2\n3\n4\n5";
+        let new = "a\nb\nc\nd\ne";
+        let diff = build_compact_diff(old, new);
+        assert!(diff.contains("- 1"), "{diff}");
+        assert!(diff.contains("... (1 more removed)"), "{diff}");
+        assert!(diff.contains("+ a"), "{diff}");
+        assert!(diff.contains("... (1 more added)"), "{diff}");
     }
 
     #[tokio::test]
@@ -128,12 +185,18 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "dup\ndup\n").unwrap();
         let r = EditFileTool
-            .execute(r#"{"file_path":"a.txt","old_string":"dup","new_string":"x"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"file_path":"a.txt","old_string":"dup","new_string":"x"}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("appears 2 times"), "{}", r.content);
         // file unchanged
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "dup\ndup\n");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "dup\ndup\n"
+        );
     }
 
     #[tokio::test]
@@ -148,7 +211,10 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("3 replacements"), "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "x\nx\nx\n");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "x\nx\nx\n"
+        );
     }
 
     #[tokio::test]
@@ -156,11 +222,17 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "hello\n").unwrap();
         let r = EditFileTool
-            .execute(r#"{"file_path":"a.txt","old_string":"absent","new_string":"x"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"file_path":"a.txt","old_string":"absent","new_string":"x"}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("not found"), "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "hello\n");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "hello\n"
+        );
     }
 
     #[tokio::test]

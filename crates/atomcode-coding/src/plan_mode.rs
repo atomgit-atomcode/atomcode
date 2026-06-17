@@ -15,7 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
-use atomcode_kernel::middleware::ToolMiddleware;
+use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall};
 
@@ -38,16 +38,16 @@ impl ToolMiddleware for PlanModeGate {
         call: &mut ToolCall,
         tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         if self.active.load(Ordering::Relaxed) && tool.risk(&call.arguments) == RiskLevel::Risky {
-            return Err(format!(
+            return BeforeOutcome::deny(format!(
                 "plan mode is active — `{}` would modify the workspace and is blocked. Only \
                  read-only tools are allowed: explore and present a plan for the user to approve \
                  before making changes.",
                 call.name
             ));
         }
-        Ok(())
+        BeforeOutcome::Proceed
     }
 }
 
@@ -110,13 +110,13 @@ mod tests {
             ToolCall { id: "c".into(), name: "risky_write".into(), arguments: "{}".into() };
 
         // Inactive: nothing blocked.
-        assert!(gate.before(&mut call, &risky, &rt()).await.is_ok());
+        assert!(!gate.before(&mut call, &risky, &rt()).await.is_deny());
 
         // Active: Risky blocked, Safe allowed.
         flag.store(true, Ordering::Relaxed);
-        assert!(gate.before(&mut call, &risky, &rt()).await.is_err());
+        assert!(gate.before(&mut call, &risky, &rt()).await.is_deny());
         let mut safe_call = ToolCall { id: "c".into(), name: "echo".into(), arguments: "{}".into() };
-        assert!(gate.before(&mut safe_call, &safe, &rt()).await.is_ok());
+        assert!(!gate.before(&mut safe_call, &safe, &rt()).await.is_deny());
     }
 
     #[tokio::test]

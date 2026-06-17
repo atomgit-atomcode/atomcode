@@ -257,11 +257,11 @@ impl atomcode_kernel::middleware::ToolMiddleware for GateMiddleware {
         call: &mut ToolCall,
         _tool: &Arc<dyn Tool>,
         rt: &atomcode_kernel::request::RequestCtx,
-    ) -> Result<(), String> {
+    ) -> atomcode_kernel::middleware::BeforeOutcome {
         let v = rt.request("approval", serde_json::json!({"tool": call.name})).await;
         match v.as_str() {
-            Some("allow") => Ok(()),
-            _ => Err("denied".into()),
+            Some("allow") => atomcode_kernel::middleware::BeforeOutcome::Proceed,
+            _ => atomcode_kernel::middleware::BeforeOutcome::deny("denied"),
         }
     }
 }

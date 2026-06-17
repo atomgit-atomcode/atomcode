@@ -13,7 +13,7 @@
 //! ordering contract).
 
 use async_trait::async_trait;
-use atomcode_kernel::middleware::ToolMiddleware;
+use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall};
 use serde::{Deserialize, Serialize};
@@ -158,15 +158,15 @@ impl ToolMiddleware for ApprovalMiddleware {
         call: &mut ToolCall,
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         // Arg-aware: a Safe call needs no approval.
         if tool.risk(&call.arguments) == RiskLevel::Safe {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         // Session grant cache: an identical risky call already approved-always.
         let key = Self::grant_key(call);
         if self.store.is_granted(&key) {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         // Round-trip the driver for a decision (the oneshot lives in the kernel's
         // RequestCtx, never in an event → events stay serializable). Built from the
@@ -178,13 +178,13 @@ impl ToolMiddleware for ApprovalMiddleware {
         })
         .unwrap_or(serde_json::Value::Null);
         match PermissionDecision::from_value(&rt.request(&self.kind, payload).await) {
-            PermissionDecision::AllowOnce => Ok(()),
+            PermissionDecision::AllowOnce => BeforeOutcome::Proceed,
             PermissionDecision::AllowAlways => {
                 self.store.grant(&key);
-                Ok(())
+                BeforeOutcome::Proceed
             }
             PermissionDecision::Deny => {
-                Err(format!("denied by approval policy: {} {}", tool.name(), call.arguments))
+                BeforeOutcome::deny(format!("denied by approval policy: {} {}", tool.name(), call.arguments))
             }
         }
     }
@@ -233,8 +233,8 @@ mod tests {
         let mw = ApprovalMiddleware::in_memory();
         let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool);
         let mut call = safe_call();
-        // Safe → Ok without ever awaiting the driver (which never responds here).
-        assert!(mw.before(&mut call, &tool, &rt).await.is_ok());
+        // Safe → Proceed without ever awaiting the driver (which never responds here).
+        assert!(!mw.before(&mut call, &tool, &rt).await.is_deny());
     }
 
     #[tokio::test]
@@ -247,7 +247,7 @@ mod tests {
         let mw = ApprovalMiddleware::new(store);
         let tool: Arc<dyn Tool> = Arc::new(WriteFileTool);
         let mut c = call;
-        assert!(mw.before(&mut c, &tool, &rt).await.is_ok());
+        assert!(!mw.before(&mut c, &tool, &rt).await.is_deny());
     }
 
     #[tokio::test]
@@ -260,8 +260,8 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(WriteFileTool);
         let mut call = risky_call();
         let res = mw.before(&mut call, &tool, &rt).await;
-        assert!(res.is_err(), "silent driver must fail closed");
-        assert!(res.unwrap_err().contains("denied"));
+        assert!(res.is_deny(), "silent driver must fail closed");
+        assert!(res.deny_reason().unwrap().contains("denied"));
     }
 
     /// The exported typed contract must stay byte-compatible with the wire shapes
