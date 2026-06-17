@@ -712,8 +712,16 @@ impl TurnExecutor for KernelTurnExecutor {
         }
         let live_provider = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
+        let original_text = input.text.clone();
         let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
-        UserInput { text, images: input.images }
+        // VL 预处理成功后（text 发生了变化），图片已被转成文字，清空 images
+        // 以免 kernel 的 provider adapter 把原图发给不支持视觉的模型（导致 400 错误）
+        let images = if text != original_text {
+            Vec::new()
+        } else {
+            input.images
+        };
+        UserInput { text, images }
     }
 
     async fn run_turn(
@@ -749,6 +757,14 @@ impl TurnExecutor for KernelTurnExecutor {
             let last = msgs.pop();
             let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
             (msgs, text, images)
+        };
+
+        // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
+        // （非视觉模型的 provider adapter 会因原图而报 400 错误）
+        let user_images = if user_text.contains("[图片内容（由") || user_text.contains("[图片识别失败]") {
+            Vec::new()
+        } else {
+            user_images
         };
 
         if !state.seeded {
@@ -1006,6 +1022,13 @@ pub(crate) async fn run_chat_turn_v2(
         let last = msgs.pop();
         let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
         (msgs, text, images)
+    };
+    // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
+    // （非视觉模型的 provider adapter 会因原图而报 400 错误）
+    let user_images = if user_text.contains("[图片内容（由") || user_text.contains("[图片识别失败]") {
+        Vec::new()
+    } else {
+        user_images
     };
     let _ = client.cmd_tx.send(AgentCommand::SetConversation(ConversationSnapshot {
         messages: prefix,

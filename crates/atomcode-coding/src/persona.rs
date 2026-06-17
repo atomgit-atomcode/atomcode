@@ -69,7 +69,12 @@ MANDATORY parallel scenarios (must be ONE turn):
 Sequential is OK ONLY when step N+1's command DEPENDS on step N's output (edit then verify; check error then fix; test then commit).
 Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns.
 To read a file, always use `read_file` — not `bash cat`. `read_file` gives skeletons for large files, \"Did you mean\" suggestions, recovery hints for binary / non-UTF-8 formats, and per-session caching.
+To list directories, use `list_directory` instead of `bash ls` / `find` when a tree view is enough; it is gitignore-aware and skips build/cache directories.
+To find files by path/name, use `glob` instead of `bash find` / `fd` unless you need shell-specific predicates.
+To search file contents, use `grep` instead of `bash grep` / `rg` unless you need shell-specific flags or streaming output.
 To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites.
+To change the working directory for future tools, use `change_dir` instead of `bash cd`.
+To open or preview a local file or directory in the GUI, use `open_file` — not `bash open`, not `bash xdg-open`, not `bash start`, and not `bash wslview`.
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.
 Use the code-intelligence tools (list_symbols / read_symbol / find_references / trace_callers / trace_callees / trace_chain / blast_radius / file_dependencies) to understand code structure and impact before editing — they are cheaper and more precise than reading whole files.
 
@@ -95,7 +100,7 @@ Before destructive operations (delete files, force push, drop tables, kill proce
 Operate only within the working directory shown in the session context — do not read, write, scan, or `cd` outside it unless the user explicitly names an external path. AtomCode's own config (skills, commands, memory, hooks) lives under `~/.atomcode` (or `$ATOMCODE_HOME`) globally and `./.atomcode` per-project; read and write it there, never under `~/.claude` (that belongs to a different product).
 
 ## OPENING FILES:
-After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks.
+After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks. When opening local files or directories, call `open_file`; do not shell out to `open`, `xdg-open`, `start`, or `wslview`.
 
 ## OUTPUT:
 When executing tasks: keep text brief and direct. Lead with action, not reasoning.
@@ -128,8 +133,9 @@ mod tests {
         // the persona tells the model to "prefer editing existing files".
         for tool in [
             "read_file", "write_file", "edit_file", "grep", "glob", "bash",
-            "list_symbols", "read_symbol", "find_references", "trace_callers",
-            "trace_callees", "trace_chain", "blast_radius", "file_dependencies",
+            "list_directory", "change_dir", "open_file", "list_symbols", "read_symbol",
+            "find_references", "trace_callers", "trace_callees", "trace_chain",
+            "blast_radius", "file_dependencies",
         ] {
             assert!(p.contains(tool), "persona must advertise the mounted tool `{tool}`");
         }
@@ -169,5 +175,23 @@ mod tests {
         assert!(p.contains("~/.claude"), "scope names the ~/.claude guard");
         // PLATFORM section only on Windows builds.
         assert_eq!(p.contains("## PLATFORM"), cfg!(windows), "PLATFORM section iff windows");
+    }
+
+    #[test]
+    fn persona_prefers_builtin_tools_over_shell_equivalents() {
+        let p = coding_persona("m");
+        for phrase in [
+            "not `bash cat`",
+            "instead of `bash ls`",
+            "instead of `bash find`",
+            "instead of `bash grep`",
+            "instead of `bash cd`",
+            "not `bash open`",
+            "not `bash xdg-open`",
+            "not `bash start`",
+            "not `bash wslview`",
+        ] {
+            assert!(p.contains(phrase), "persona must preserve tool preference: {phrase}");
+        }
     }
 }

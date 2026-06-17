@@ -125,19 +125,20 @@ impl Tool for OpenFileTool {
         "open_file"
     }
     fn description(&self) -> &str {
-        "Open a local file (HTML / PDF / image / SVG / …) in the user's default GUI \
-         application — a browser for HTML, an image viewer for PNG/JPG, a PDF reader for \
-         PDF. USE ONLY when the user asks to preview/open/view a file, or when previewing \
-         is the obvious next step AND you have asked first — do NOT auto-open after every \
-         write_file/edit_file. Cross-platform (macOS `open`, Linux `xdg-open`, Windows \
-         `start`, WSL `wslview`); headless / SSH / CI sessions refuse with a clear reason \
-         so you can give the user the path instead of pretending a window opened."
+        "Open a local file or directory in the user's default GUI application — a browser \
+         for HTML, an image viewer for PNG/JPG, a PDF reader for PDF, or the OS file \
+         manager for directories. USE ONLY when the user asks to preview/open/view a file \
+         or directory, or when previewing is the obvious next step AND you have asked \
+         first — do NOT auto-open after every write_file/edit_file. Prefer this tool over \
+         shelling out to `open`, `xdg-open`, `start`, or `wslview`. Cross-platform \
+         dispatch is built in; headless / SSH / CI sessions refuse with a clear reason so \
+         you can give the user the path instead of pretending a window opened."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "file_path": { "type": "string", "description": "File path to open. Absolute, or relative to the working directory. Must exist." }
+                "file_path": { "type": "string", "description": "File or directory path to open. Absolute, or relative to the working directory. Must exist." }
             },
             "required": ["file_path"]
         })

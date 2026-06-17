@@ -279,7 +279,7 @@ impl Bridge {
     /// Returns `true` to shut the bridge down.
     async fn on_command(&mut self, cmd: CoreCmd) -> bool {
         match cmd {
-            CoreCmd::SendMessage { text, images, .. } => {
+            CoreCmd::SendMessage { text, images, image_markers } => {
                 // NO UserEcho here: in non-sync mode every driver echoes the typed
                 // message LOCALLY (tuix renders `UiLine::User` on submit; headless -p
                 // doesn't echo at all). `UserEcho` is a LIVE-SYNC-only event the peer
@@ -300,8 +300,89 @@ impl Bridge {
                     prefix.push_str(&sh);
                     prefix.push_str("\n\n");
                 }
-                let text = if prefix.is_empty() { text } else { format!("{prefix}{text}") };
-                let images = images.iter().map(convert::image_to_kernel).collect();
+                let mut text = if prefix.is_empty() { text } else { format!("{prefix}{text}") };
+
+                // Vision preprocessing: when the active provider can't accept images
+                // and the user pasted some, run them through the configured VL model
+                // first and turn the result into plain text. This mirrors the v1
+                // AgentLoop::handle_send_message logic that the bridge previously
+                // bypassed — causing non-vision models (like DeepSeek) to receive raw
+                // image data they cannot process (400 error from the upstream API).
+                let images = if !images.is_empty() {
+                    use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+                    let core_images: Vec<atomcode_core::conversation::message::ImagePart> = images.clone();
+                    let config = atomcode_core::config::Config::load(
+                        &atomcode_core::config::Config::default_path(),
+                    );
+                    match config {
+                        Err(_) => {
+                            // Config load failed — fall through with original images;
+                            // a vision-capable model can still handle them natively.
+                            images.iter().map(convert::image_to_kernel).collect()
+                        }
+                        Ok(config) => {
+                            // Build a provider instance for the active model to check vision support.
+                            let provider_name = config.default_provider.clone();
+                            let active_provider = config
+                                .providers
+                                .get(&provider_name)
+                                .and_then(|p| atomcode_core::provider::create_provider(p).ok());
+                            match active_provider {
+                                Some(ref provider) => {
+                                    match maybe_preprocess(&config, provider.as_ref(), &text, &core_images).await {
+                                        PreprocessOutcome::Skipped => {
+                                            // Model supports vision natively — forward images as-is.
+                                            images.iter().map(convert::image_to_kernel).collect()
+                                        }
+                                        PreprocessOutcome::Replaced { text: vl_text, vl_key } => {
+                                            let merged = if text.is_empty() {
+                                                format!("[图片内容（由 {vl_key} 识别）]\n{vl_text}")
+                                            } else {
+                                                format!("{text}\n\n[图片内容（由 {vl_key} 识别）]\n{vl_text}")
+                                            };
+                                            text = merged;
+                                            // VL succeeded — images converted to text, clear them
+                                            // so the kernel's provider adapter doesn't send raw
+                                            // image data to a non-vision model.
+                                            let _ = self.emit(CoreEv::VisionPreprocessSuccess {
+                                                vl_key,
+                                                char_count: vl_text.chars().count(),
+                                            });
+                                            Vec::new()
+                                        }
+                                        PreprocessOutcome::Failed { reason } => {
+                                            let merged = if text.is_empty() {
+                                                "[图片识别失败]".to_string()
+                                            } else {
+                                                format!("{text}\n\n[图片识别失败]")
+                                            };
+                                            text = merged;
+                                            // VL failed — return images to the TUI so the user
+                                            // can retry without re-pasting from clipboard.
+                                            let _ = self.emit(CoreEv::RestorePendingImages {
+                                                images: core_images,
+                                                markers: image_markers,
+                                            });
+                                            // Surface the failure reason as a warning, matching
+                                            // v1's AgentLoop::handle_send_message behavior.
+                                            let _ = self.emit(CoreEv::Warning(
+                                                format!("VL 预处理失败：{reason} · 图片已自动保留，可直接重试"),
+                                            ));
+                                            Vec::new()
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // Provider not found — forward images as-is (best effort).
+                                    images.iter().map(convert::image_to_kernel).collect()
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+
                 let _ = self.handle.commands.send(KCmd::SendMessage { text, images });
             }
             CoreCmd::Cancel => {
@@ -826,9 +907,9 @@ impl Bridge {
                 self.emit(CoreEv::PhaseChange(AgentPhase::WaitingApproval));
                 self.emit(CoreEv::ApprovalNeeded {
                     tool_name: req.tool.clone(),
-                    reason: truncate(&req.args, 200),
+                    reason: "Requires approval".to_string(),
                     call: atomcode_core::tool::ToolCall {
-                        id: String::new(),
+                        id: req.call_id,
                         name: req.tool,
                         arguments: req.args,
                     },

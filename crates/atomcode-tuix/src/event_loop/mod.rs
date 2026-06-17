@@ -6822,6 +6822,18 @@ fn handle_agent_event(
                 return;
             }
 
+            // The v2 kernel asks for approval from middleware BEFORE it emits
+            // ToolStarted. ApprovalNeeded may therefore have already rendered the
+            // static `● Tool(detail)` row for this same call id. In that case the
+            // started event is only a state transition: rendering a fresh
+            // ToolCallInFlight row would duplicate the tool line.
+            if let Some((stored_display, stored_detail, true)) = pending_tools.get_mut(&id) {
+                *stored_display = display.clone();
+                *stored_detail = detail.clone();
+                state.on_tool_call_started(&display);
+                return;
+            }
+
             // Emit the ▸ line immediately so users can see what command
             // is running, especially for long-running bash commands.
             renderer.render(UiLine::AssistantLineBreak);
