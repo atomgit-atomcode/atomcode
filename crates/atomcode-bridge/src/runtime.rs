@@ -321,12 +321,27 @@ impl Bridge {
                             images.iter().map(convert::image_to_kernel).collect()
                         }
                         Ok(config) => {
-                            // Build a provider instance for the active model to check vision support.
-                            let provider_name = config.default_provider.clone();
+                            // Build a provider instance for the ACTIVE model to check vision support.
+                            // Use the bridge's actual model (self.coding_cfg.model), NOT
+                            // config.default_provider — they can differ when the user selects
+                            // a different provider via /chat or /live UI. A vision-capable
+                            // default would incorrectly skip VL preprocessing for a non-vision
+                            // active model, forwarding raw image data that causes a 400 error
+                            // ("… is not a multimodal model") from the upstream gateway.
+                            let active_model = self.coding_cfg.model.clone();
                             let active_provider = config
                                 .providers
-                                .get(&provider_name)
-                                .and_then(|p| atomcode_core::provider::create_provider(p).ok());
+                                .values()
+                                .find(|p| p.model == active_model)
+                                .and_then(|p| atomcode_core::provider::create_provider(p).ok())
+                                .or_else(|| {
+                                    // Fallback: model name not found in any provider config —
+                                    // try default_provider as a best-effort backward compat.
+                                    config
+                                        .providers
+                                        .get(&config.default_provider)
+                                        .and_then(|p| atomcode_core::provider::create_provider(p).ok())
+                                });
                             match active_provider {
                                 Some(ref provider) => {
                                     match maybe_preprocess(&config, provider.as_ref(), &text, &core_images).await {
