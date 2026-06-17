@@ -7,7 +7,6 @@ use super::paths;
 use super::state::{load_marketplaces_file, save_marketplaces_file, MarketplaceEntry};
 use super::url::{infer_marketplace_name_from_url, validate_git_url};
 
-/// Sanitize a name into a path-safe segment (CC convention).
 /// Locate the `git` executable on the system.
 ///
 /// Tries the default PATH resolution first, then falls back to a set of
@@ -96,6 +95,7 @@ fn which_git(name: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(name))
 }
 
+/// Sanitize a name into a path-safe segment (CC convention).
 pub fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
@@ -595,6 +595,40 @@ mod tests {
     fn auth_retry_args_none_when_not_logged_in() {
         let _home = isolated_home(); // 无 auth.toml
         assert!(auth_retry_args("https://gitcode.com/owner/repo").is_none());
+    }
+
+    #[test]
+    fn injected_auth_header_is_not_persisted_to_git_config() {
+        // Security invariant lock: we inject the credential via a TOP-LEVEL
+        // `git -c <cfg> clone …` (one-shot, NOT written to the new repo), never
+        // the clone-option form `git clone -c <cfg> …` (which git PERSISTS into
+        // the cloned `.git/config` — a plaintext-token-on-disk leak). Verified
+        // empirically 2026-06-17 that the two forms differ; this test fails if
+        // the arg order ever regresses to the persisting form.
+        let Ok(git) = find_git() else {
+            return; // no git on this machine — skip
+        };
+        let src = make_bare_repo_with_manifest("persist-src", None);
+        let dst = tempfile::tempdir().unwrap();
+        let clone_dir = dst.path().join("clone");
+        let header = basic_auth_header("alice", "tok-SECRET-123");
+        let cfg = extra_header_config("https://gitcode.com/o/r", &header);
+        // EXACT arg order produced by clone_with_optional_auth's run(Some(..)):
+        // git_command base, then `-c <cfg>`, then the `clone …` args.
+        let status = git_command(&git)
+            .args(["-c", &cfg, "clone", "--depth", "1"])
+            .arg(&src)
+            .arg(&clone_dir)
+            .status()
+            .expect("spawn git clone");
+        assert!(status.success(), "local clone should succeed");
+        let config = std::fs::read_to_string(clone_dir.join(".git/config")).unwrap();
+        let lc = config.to_lowercase();
+        assert!(
+            !lc.contains("extraheader") && !config.contains("tok-SECRET-123"),
+            "auth header / token must NOT be persisted to .git/config; got:\n{}",
+            config
+        );
     }
 
     #[test]
