@@ -12,7 +12,7 @@
 //!   observe the result in place and return, bounded, without panicking.
 
 use super::{catch_async, with_timeout, ConformanceReport, DEFAULT_CHECK_TIMEOUT};
-use crate::middleware::ToolMiddleware;
+use crate::middleware::{BeforeOutcome, ToolMiddleware};
 use crate::request::RequestCtx;
 use crate::tool::{RiskLevel, Tool, ToolCall, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -66,8 +66,10 @@ pub async fn check(mw: Arc<dyn ToolMiddleware>) -> ConformanceReport {
             "before_returns_result",
             true,
             match res {
-                Ok(()) => "Ok(()) — allowed".to_string(),
-                Err(e) => format!("Err — blocked: {e}"),
+                BeforeOutcome::Proceed => "Proceed — allowed".to_string(),
+                BeforeOutcome::Allow { .. } => "Allow — force-approved".to_string(),
+                BeforeOutcome::Ask { .. } => "Ask — approval requested".to_string(),
+                BeforeOutcome::Deny { reason } => format!("Deny — blocked: {reason}"),
             },
         ),
         Ok(Err(p)) => r.record(
@@ -86,7 +88,7 @@ pub async fn check(mw: Arc<dyn ToolMiddleware>) -> ConformanceReport {
     let mut result = ToolResult { call_id: "c1".into(), content: "result body".into(), is_error: false };
     let after_fut = async { mw.after(&mut result).await };
     match with_timeout(DEFAULT_CHECK_TIMEOUT, catch_async(after_fut)).await {
-        Ok(Ok(())) => r.record("after_returns", true, ""),
+        Ok(Ok(_)) => r.record("after_returns", true, ""),
         Ok(Err(p)) => r.record("after_no_panic", false, format!("after() panicked: {p} — transform/observe the result in place, never panic")),
         Err(t) => r.record("after_terminates", false, format!("after() {t} — after() must return, bounded")),
     }

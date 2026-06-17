@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message};
-use atomcode_kernel::middleware::ToolMiddleware;
+use atomcode_kernel::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
@@ -389,14 +389,14 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
         call: &mut ToolCall,
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         if let Ok(mut m) = self.inflight.lock() {
             m.insert(call.id.clone(), (call.name.clone(), Instant::now()));
         }
-        Ok(())
+        BeforeOutcome::Proceed
     }
 
-    async fn after(&self, result: &mut ToolResult) {
+    async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
         // No stamp ⇒ this middleware's `before` never ran (a prior middleware blocked
         // the call); nothing to attribute.
         let Some((name, started)) = self
@@ -405,7 +405,7 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
             .ok()
             .and_then(|mut m| m.remove(&result.call_id))
         else {
-            return;
+            return AfterOutcome::Proceed;
         };
         let success = !result.is_error;
         // A middleware block (e.g. approval deny) yields a deterministic
@@ -427,6 +427,7 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
             error_data: None,
         };
         self.attr.emit(event).await;
+        AfterOutcome::Proceed
     }
 }
 
@@ -758,7 +759,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = RequestCtx::new(tx, None);
         let mut call = ToolCall { id: "c9".into(), name: "bash".into(), arguments: "{}".into() };
-        mw.before(&mut call, &tool, &rt).await.unwrap();
+        let _ = mw.before(&mut call, &tool, &rt).await;
         // Approval denied upstream → the kernel hands `after` a "blocked: …" result.
         let mut result =
             ToolResult { call_id: "c9".into(), content: "blocked: user denied".into(), is_error: true };
@@ -787,7 +788,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = RequestCtx::new(tx, None);
         let mut call = ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() };
-        mw.before(&mut call, &tool, &rt).await.unwrap();
+        let _ = mw.before(&mut call, &tool, &rt).await;
         let mut result = ToolResult { call_id: "c1".into(), content: "ok".into(), is_error: false };
         mw.after(&mut result).await;
 
