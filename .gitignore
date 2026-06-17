@@ -113,3 +113,4 @@ extensions/vscode/webview/webview.css.map
 extensions/vscode/webview/webview.js
 extensions/vscode/webview/webview.js.map
 .hooks.json
+extensions/jetbrains/.spec_docs

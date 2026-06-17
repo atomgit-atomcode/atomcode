@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.ui.message
 
+import com.google.gson.Gson
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.util.ui.UIUtil
@@ -16,6 +17,7 @@ import javax.swing.SwingUtilities
  * - 如果 JBCefJSQuery 回调未就绪（API 废弃/兼容问题），2 秒后自动切为强制模式
  */
 class JBCefMessageView : JPanel(BorderLayout()) {
+    private val gson = Gson()
 
     // 延迟初始化：避免在 IDE 启动早期访问 Registry (COMPONENTS_LOADED 之前)
     private var browser: JBCefBrowser? = null
@@ -83,9 +85,13 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     fun replaceThinkingWithAssistant(text: String) { sendJs("replaceThinkingWithAssistant", text) }
     fun removeThinkingIndicator()               { sendJs("removeThinkingIndicator") }
     fun addSystemMessage(text: String)          { sendJs("addSystemMessage", text) }
+    fun addAssistantEvent(text: String)         { sendJs("addAssistantEvent", text) }
     fun addReasoningBlock(text: String)         { sendJs("addReasoningBlock", text) }
     fun updateLastAssistantMessage(text: String) { sendJs("updateLastAssistantMessage", text) }
+    fun showStreamingCursor()                   { sendJs("showStreamingCursor") }
+    fun hideStreamingCursor()                   { sendJs("hideStreamingCursor") }
     fun clear()                                 { sendJs("clearMessages") }
+    fun render(model: ChatRenderModel)          { sendRawJs("renderChatModel(${gson.toJson(model)})") }
 
     // ── Internals ──
 
@@ -95,6 +101,14 @@ class JBCefMessageView : JPanel(BorderLayout()) {
                 .replace("\n", "\\n").replace("\r", "\\r") + "\""
         }
         val call = "$fn($escaped)"
+        if (jsReady || forceReady) {
+            executeJs(call)
+        } else {
+            pendingCalls.add(call)
+        }
+    }
+
+    private fun sendRawJs(call: String) {
         if (jsReady || forceReady) {
             executeJs(call)
         } else {
@@ -147,48 +161,64 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         return """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:$bg;color:$fg;font:13px -apple-system,'Segoe UI',sans-serif;line-height:1.5;padding:10px 12px;overflow-y:auto}
-#m{display:flex;flex-direction:column;gap:8px}
-.um{display:flex;justify-content:flex-end}
-.um .b{background:$ubg;color:$ufg;padding:8px 14px;border-radius:12px 4px 12px 12px;max-width:78%;white-space:pre-wrap;word-break:break-word}
-.am{display:flex;flex-direction:column;align-items:flex-start}
-.am .av{color:$vfg;font-size:11px;margin-bottom:2px}
-.am .b{background:$abg;color:$afg;padding:8px 14px;border-radius:4px 12px 12px 12px;max-width:90%;white-space:pre-wrap;word-break:break-word}
+	body{background:$bg;color:$fg;font:13px -apple-system,'Segoe UI',sans-serif;line-height:1.5;padding:10px 12px;overflow-y:auto}
+	#m{display:flex;flex-direction:column;gap:8px}
+	.um{display:flex;justify-content:flex-end}
+	.um .b{background:$ubg;color:$ufg;padding:8px 14px;border-radius:12px 4px 12px 12px;max-width:78%;white-space:pre-wrap;word-break:break-word}
+	.am{display:flex;flex-direction:column;align-items:flex-start}
+	.am .av{color:$vfg;font-size:11px;margin-bottom:2px}
+	.am .parts{display:flex;flex-direction:column;gap:8px;align-items:flex-start;width:100%}
+	.am .b{background:$abg;color:$afg;padding:8px 14px;border-radius:4px 12px 12px 12px;max-width:90%;white-space:pre-wrap;word-break:break-word}
+	.am .b:empty{display:none}
 .cm{border:1px solid $cbo;border-radius:6px;overflow:hidden;background:$cbg}
 .cm .h{background:$chb;color:$chf;padding:4px 10px;font-size:11px}
 .cm pre{margin:0;padding:8px 12px;font:12px 'JetBrains Mono','Consolas',monospace;line-height:1.5;overflow-x:auto;white-space:pre;color:$fg}
-.tm{border:1px solid $tbo;border-radius:6px;background:$tbg;color:$tfg;padding:6px 10px;font-size:12px}
+	.tm{border:1px solid $tbo;border-radius:6px;background:$tbg;color:$tfg;padding:6px 10px;font-size:12px}
+	.tm summary{cursor:pointer;list-style:none}
+	.tm summary::-webkit-details-marker{display:none}
+	.tm pre{margin:6px 0 0 0;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:$fg;background:$cbg;border:1px solid $cbo;border-radius:4px;padding:6px 8px}
 .em{border:1px solid $ebo;border-radius:6px;background:$ebg;color:$efg;padding:6px 10px;font-size:12px}
 .qm{display:flex;justify-content:flex-end}
 .qm .b{background:$qbg;color:$qfg;padding:6px 12px;border-radius:10px 4px 10px 10px;max-width:78%;font-size:11px}
-.rm{border:1px solid $rbo;border-radius:6px;background:$rbg;color:$sfg;padding:4px 10px;font-size:10px}
+.rm{border:1px solid $rbo;border-radius:6px;background:$rbg;color:$sfg;padding:4px 10px;font-size:10px;max-width:90%;margin-bottom:4px}
 .sm{color:$sfg;font-size:11px}
-.th{display:flex;align-items:center;gap:6px;color:$sfg;font-size:12px}
-.dots::after{content:'';animation:d 1.5s steps(4,end) infinite}
-@keyframes d{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
+.th{display:flex;flex-direction:column;align-items:flex-start;color:$sfg}
+.th .av{color:$vfg;font-size:11px;margin-bottom:2px}
+	.dots::after{content:'';animation:d 1.5s steps(4,end) infinite}
+	.streaming-cursor{display:inline-block;width:7px;height:1.1em;margin-left:2px;background:$afg;vertical-align:-2px;animation:blink 1s steps(2,start) infinite}
+	@keyframes d{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
+	@keyframes blink{0%,45%{opacity:1}46%,100%{opacity:0}}
 </style></head><body>
 <div id="m"></div>
 <script>
-var m=document.getElementById('m'),last=null,ti=-1,nb=true;
+	var m=document.getElementById('m'),last=null,ti=-1,nb=true,cv=false;
 document.body.addEventListener('scroll',function(){nb=document.body.scrollHeight-document.body.scrollTop-document.body.clientHeight<120});
 function sd(){if(nb)requestAnimationFrame(function(){document.body.scrollTop=document.body.scrollHeight})}
 function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function setTheme(d){}
-function addUserMessage(t){var d=document.createElement('div');d.className='um';d.innerHTML='<span class="b">'+h(t)+'</span>';m.appendChild(d);last=null;sd()}
-function addAssistantMessage(t){last=buildAsst(t);m.appendChild(last);sd()}
-function buildAsst(t){var d=document.createElement('div');d.className='am';d.innerHTML='<div class="av">🤖 AtomCode</div><div class="b">'+h(t)+'</div>';return d}
-function updateLastAssistantMessage(t){if(last)last.querySelector('.b').textContent=t;else addAssistantMessage(t);sd()}
-function addCodeBlock(l,c,f){var d=document.createElement('div');d.className='cm';d.innerHTML='<div class="h">📄 '+h(f||l||'Code')+'</div><pre>'+h(c)+'</pre>';m.appendChild(d);last=null;sd()}
-function addToolCall(n,s,d){var e=document.createElement('div');e.className='tm';e.innerHTML='🔧 '+h(n)+' — '+h(s)+(d?'<br><small>'+h(d)+'</small>':'');m.appendChild(e);last=null;sd()}
-function updateToolCall(n,s,d){var e=m.querySelector('.tm:last-child');if(e&&e.textContent.startsWith(n)){e.innerHTML='🔧 '+h(n)+' — '+h(s)+(d?'<br><small>'+h(d)+'</small>':'');sd()}else addToolCall(n,s,d)}
+	function setTheme(d){}
+	function addUserMessage(t){var d=document.createElement('div');d.className='um';d.innerHTML='<span class="b">'+h(t)+'</span>';m.appendChild(d);last=null;sd()}
+	function ensureAssistant(){if(last&&last.className==='am')return last;last=buildAsst('');m.appendChild(last);return last}
+	function parts(){var a=ensureAssistant();return a.querySelector('.parts')}
+	function addAssistantMessage(t){var p=parts();var b=p.querySelector('.b');if(!b){b=document.createElement('div');b.className='b';p.appendChild(b)}b.textContent=t;renderCursor();sd()}
+	function buildAsst(t){var d=document.createElement('div');d.className='am';d.innerHTML='<div class="av">🤖 AtomCode</div><div class="parts"><div class="b">'+h(t)+'</div></div>';return d}
+	function renderCursor(){if(!last)return;var b=last.querySelector('.b');if(!b)return;var old=b.querySelector('.streaming-cursor');if(old)old.remove();if(cv){var c=document.createElement('span');c.className='streaming-cursor';b.appendChild(c)}}
+	function updateLastAssistantMessage(t){if(last)last.querySelector('.b').textContent=t;else addAssistantMessage(t);renderCursor();sd()}
+	function showStreamingCursor(){cv=true;renderCursor();sd()}
+	function hideStreamingCursor(){cv=false;renderCursor();sd()}
+	function addCodeBlock(l,c,f){var d=document.createElement('div');d.className='cm';d.innerHTML='<div class="h">📄 '+h(f||l||'Code')+'</div><pre>'+h(c)+'</pre>';parts().appendChild(d);sd()}
+	function toolHtml(n,s,d){var summary='🔧 '+h(n)+' — '+h(s);return d?'<details open><summary>'+summary+'</summary><pre>'+h(d)+'</pre></details>':summary}
+	function addToolCall(n,s,d){var e=document.createElement('div');e.className='tm';e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d);parts().appendChild(e);sd()}
+	function updateToolCall(n,s,d){var ps=parts();var e=Array.prototype.slice.call(ps.querySelectorAll('.tm')).reverse().find(function(x){return x.getAttribute('data-name')===n});if(e){e.innerHTML=toolHtml(n,s,d);sd()}else addToolCall(n,s,d)}
 function addError(t){var d=document.createElement('div');d.className='em';d.innerHTML='⚠️ '+h(t);m.appendChild(d);last=null;sd()}
 function addQueuedMessage(t){var d=document.createElement('div');d.className='qm';d.innerHTML='<span class="b">📥 '+h(t)+'</span>';m.appendChild(d);last=null;sd()}
-function addThinkingIndicator(){ti=m.children.length;var d=document.createElement('div');d.className='th';d.innerHTML='<span style="color:$vfg;font-size:11px">🤖 AtomCode</span> <span>思考中<span class="dots"></span></span>';m.appendChild(d);last=null;sd()}
-function replaceThinkingWithAssistant(t){if(ti>=0&&ti<m.children.length){m.removeChild(m.children[ti]);ti=-1}if(t)addAssistantMessage(t)}
-function removeThinkingIndicator(){if(ti>=0&&ti<m.children.length){m.removeChild(m.children[ti]);ti=-1}}
-function addSystemMessage(t){var d=document.createElement('div');d.className='sm';d.textContent=t;m.appendChild(d);last=null;sd()}
-function addReasoningBlock(t){var d=document.createElement('div');d.className='rm';var fl=t.split('\n')[0].substring(0,80);if(t.length>fl.length)fl+='...';d.innerHTML='💭 思考 — '+h(fl);m.appendChild(d);last=null;sd()}
-function clearMessages(){m.innerHTML='';last=null;ti=-1}
+	function addThinkingIndicator(){var d=document.createElement('div');d.className='rm thp';d.innerHTML='💭 思考中<span class="dots"></span>';parts().appendChild(d);sd()}
+	function replaceThinkingWithAssistant(t){var a=ensureAssistant();var th=a.querySelector('.thp');if(th)th.remove();addAssistantMessage(t||'')}
+	function removeThinkingIndicator(){var a=last&&last.className==='am'?last:null;if(a){var th=a.querySelector('.thp');if(th)th.remove()}}
+	function addSystemMessage(t){var d=document.createElement('div');d.className='sm';d.textContent=t;m.appendChild(d);last=null;sd()}
+	function addAssistantEvent(t){var d=document.createElement('div');d.className='sm';d.textContent=t;parts().appendChild(d);sd()}
+	function addReasoningBlock(t){var d=document.createElement('div');d.className='rm';var fl=t.split('\n')[0].substring(0,80);if(t.length>fl.length)fl+='...';d.innerHTML='💭 思考 — '+h(fl);var p=parts();p.insertBefore(d,p.firstChild);sd()}
+	function renderChatModel(model){clearMessages();(model.messages||[]).forEach(function(x){if(x.text!==undefined&&x.contextSummary!==undefined)addUserMessage(x.text);else if(x.markdown!==undefined)addAssistantMessage(x.markdown);else if(x.toolName!==undefined)addSystemMessage('[Permission] '+x.toolName+': '+(x.reason||''));else if(x.name!==undefined&&x.callId!==undefined)addToolCall(x.name,x.status||'',x.output||x.argumentsJson||'');else if(x.text!==undefined)addSystemMessage(x.text)});sd()}
+	function clearMessages(){m.innerHTML='';last=null;ti=-1;cv=false}
 (function find(){for(var k in window){if(k.indexOf('JBCefQuery_')===0&&typeof window[k]==='function'){window[k]('js:ready');return}}setTimeout(find,50)})();
 </script></body></html>""".trimIndent()
     }

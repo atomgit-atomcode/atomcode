@@ -24,19 +24,24 @@ class StreamEventHandler(
     var reasoningText: String = ""
         private set
 
+    private var activeToolName: String? = null
+    private var activeToolOutput: String = ""
+
     // ── Event handlers ──
 
     fun onText(content: String) {
         assistantText += content
         if (!hasOutput) {
-            // 首次正文：如果有思考过程先展示，再替换思考指示器
+            messageView.replaceThinkingWithAssistant("")
             if (reasoningText.isNotBlank()) {
                 messageView.addReasoningBlock(reasoningText)
             }
-            messageView.replaceThinkingWithAssistant(assistantText)
+            messageView.updateLastAssistantMessage(assistantText)
+            messageView.showStreamingCursor()
             hasOutput = true
         } else {
             messageView.updateLastAssistantMessage(assistantText)
+            messageView.showStreamingCursor()
         }
     }
 
@@ -46,51 +51,66 @@ class StreamEventHandler(
     }
 
     fun onToolBatch() {
-        messageView.addSystemMessage("[Tools queued]")
+        messageView.addAssistantEvent("[Tools queued]")
     }
 
     fun onToolStart(name: String) {
+        activeToolName = name
+        activeToolOutput = ""
         messageView.addToolCall(name, "running...")
     }
 
-    fun onToolResult(name: String, success: Boolean, durationMs: Long) {
+    fun onToolOutput(chunk: String) {
+        if (chunk.isEmpty()) return
+        val name = activeToolName ?: "tool"
+        activeToolName = name
+        activeToolOutput += chunk
+        val status = "running... (${activeToolOutput.length} chars)"
+        messageView.updateToolCall(name, status, activeToolOutput)
+    }
+
+    fun onToolResult(name: String, output: String, success: Boolean, durationMs: Long) {
         val status = if (success) "done (${durationMs}ms)" else "failed"
-        messageView.updateToolCall(name, status)
+        val detail = output.ifBlank { activeToolOutput }
+        messageView.updateToolCall(name, status, detail)
+        activeToolName = null
+        activeToolOutput = ""
     }
 
     fun onArtifactStart(title: String?) {
-        messageView.addSystemMessage("[Artifact] ${title ?: "untitled"} started")
+        messageView.addAssistantEvent("[Artifact] ${title ?: "untitled"} started")
     }
 
     fun onArtifactContent(content: String) {
-        assistantText += content
-        if (hasOutput) {
-            messageView.updateLastAssistantMessage(assistantText)
-        }
+        // Artifacts are rendered as separate daemon events. Do not append them to
+        // assistantText here, otherwise final assistant content can be duplicated.
     }
 
     fun onArtifactEnd(id: String) {
-        messageView.addSystemMessage("[Artifact] $id ended")
+        messageView.addAssistantEvent("[Artifact] $id ended")
     }
 
     fun onPermissionRequired(event: ChatEvent.PermissionRequest) {
-        messageView.addSystemMessage("[Permission required] ${event.toolName}: ${event.reason}")
+        messageView.addAssistantEvent("[Permission required] ${event.toolName}: ${event.reason}")
     }
 
     fun onStopped() {
-        messageView.addSystemMessage("[Stopped]")
+        messageView.hideStreamingCursor()
+        messageView.addAssistantEvent("[Stopped]")
     }
 
     fun onError(message: String) {
+        messageView.hideStreamingCursor()
         messageView.addError(message)
     }
 
     fun onUnknown(type: String) {
-        messageView.addSystemMessage("[Unknown event] $type")
+        messageView.addAssistantEvent("[Unknown event] $type")
     }
 
     /** 流完成时收尾：如果没有输出，清理思考指示器 */
     fun onComplete() {
+        messageView.hideStreamingCursor()
         if (!hasOutput) {
             messageView.replaceThinkingWithAssistant("(no output)")
         }
@@ -101,5 +121,7 @@ class StreamEventHandler(
         hasOutput = false
         assistantText = ""
         reasoningText = ""
+        activeToolName = null
+        activeToolOutput = ""
     }
 }

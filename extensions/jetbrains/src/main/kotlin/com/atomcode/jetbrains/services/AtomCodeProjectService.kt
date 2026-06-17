@@ -9,6 +9,7 @@ import com.atomcode.jetbrains.daemon.ConnectionErrorKind
 import com.atomcode.jetbrains.daemon.ConnectionState
 import com.atomcode.jetbrains.daemon.CreateProviderRequest
 import com.atomcode.jetbrains.daemon.DaemonAuth
+import com.atomcode.jetbrains.daemon.HealthResponse
 import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
 import com.atomcode.jetbrains.daemon.PatchProviderRequest
@@ -33,6 +34,13 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+
+private const val DAEMON_PROBE_TIMEOUT_MS = 3_000
+private const val DAEMON_STARTUP_PROBE_TIMEOUT_MS = 1_000
+private const val DAEMON_STARTUP_WAIT_SECONDS = 15L
+private const val DAEMON_STARTUP_RETRY_DELAY_MS = 150L
+private const val BACKGROUND_HEALTH_INITIAL_DELAY_SECONDS = 5L
+private const val BACKGROUND_HEALTH_INTERVAL_SECONDS = 30L
 
 @Service(Service.Level.PROJECT)
 class AtomCodeProjectService(private val project: Project) : Disposable {
@@ -86,8 +94,8 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
             {
                 refreshConnectionHealth()
             },
-            30,
-            30,
+            BACKGROUND_HEALTH_INITIAL_DELAY_SECONDS,
+            BACKGROUND_HEALTH_INTERVAL_SECONDS,
             TimeUnit.SECONDS,
         )
     }
@@ -123,7 +131,8 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
 
         // 初始探测用短超时（3s），daemon 本地响应只需 <100ms
         // 避免 daemon 未运行时等满 30s 才超时
-        val probeClient = AtomCodeDaemonClient(settings.host, settings.port, 3000, auth)
+        val probeClient = AtomCodeDaemonClient(settings.host, settings.port, DAEMON_PROBE_TIMEOUT_MS, auth)
+        val startupProbeClient = AtomCodeDaemonClient(settings.host, settings.port, DAEMON_STARTUP_PROBE_TIMEOUT_MS, auth)
         val client = AtomCodeDaemonClient(settings.host, settings.port, settings.requestTimeoutMs, auth)
 
         return probeClient.health()
@@ -149,7 +158,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                         setConnectionState(ConnectionState.SetupRequired("AtomCode CLI was not found."))
                         CompletableFuture.completedFuture<String?>(null)
                     } else {
-                        client.health().thenApply { it.version }
+                        waitForDaemonReady(startupProbeClient)
                     }
                 }
             }
@@ -188,11 +197,12 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                             setConnectionState(ConnectionState.SetupRequired("AtomCode CLI was not found."))
                             CompletableFuture.completedFuture<String?>(null)
                         } else {
-                            client.health().thenApply { health ->
-                                if (health.version != expectedVersion) {
-                                    throw IllegalStateException("AtomCode daemon restarted with ${health.version}, expected $expectedVersion")
+                            waitForDaemonReady(client).thenApply { version ->
+                                val healthVersion = version ?: throw IllegalStateException("AtomCode daemon did not become ready after restart.")
+                                if (healthVersion != expectedVersion) {
+                                    throw IllegalStateException("AtomCode daemon restarted with $healthVersion, expected $expectedVersion")
                                 }
-                                health.version
+                                healthVersion
                             }
                         }
                     }
@@ -215,6 +225,11 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                     ).thenCompose { waitForDaemonStop(client, deadlineNanos) }
                 }
             }
+    }
+
+    private fun waitForDaemonReady(client: AtomCodeDaemonClient): CompletableFuture<String?> {
+        val deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(DAEMON_STARTUP_WAIT_SECONDS)
+        return waitForDaemonHealth(deadlineNanos) { client.health() }
     }
 
     fun sendPrompt(prompt: String): CompletableFuture<Unit> {
@@ -286,6 +301,16 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
             } else {
                 val client = getOrCreateClient()
                 client.listSessions()
+            }
+        }
+
+    fun searchSessions(query: String): CompletableFuture<List<SessionMeta>> =
+        ensureConnected().thenCompose { state ->
+            if (state !is ConnectionState.Ready) {
+                CompletableFuture.completedFuture(emptyList())
+            } else {
+                val client = getOrCreateClient()
+                client.searchSessions(query)
             }
         }
 
@@ -640,6 +665,28 @@ private fun ConnectionState.isConnecting(): Boolean =
         this == ConnectionState.Connecting ||
         this == ConnectionState.SyncingProject ||
         this == ConnectionState.CheckingProvider
+
+internal fun waitForDaemonHealth(
+    deadlineNanos: Long,
+    retryDelayMs: Long = DAEMON_STARTUP_RETRY_DELAY_MS,
+    health: () -> CompletableFuture<HealthResponse>,
+): CompletableFuture<String?> =
+    health()
+        .handle { response, error ->
+            if (error == null && response.service == "atomcode-daemon") response.version else null
+        }
+        .thenCompose { version ->
+            if (version != null) {
+                CompletableFuture.completedFuture(version)
+            } else if (System.nanoTime() >= deadlineNanos) {
+                CompletableFuture.completedFuture(null)
+            } else {
+                CompletableFuture.supplyAsync(
+                    { Unit },
+                    CompletableFuture.delayedExecutor(retryDelayMs, TimeUnit.MILLISECONDS),
+                ).thenCompose { waitForDaemonHealth(deadlineNanos, retryDelayMs, health) }
+            }
+        }
 
 data class SessionRefView(
     val id: String,

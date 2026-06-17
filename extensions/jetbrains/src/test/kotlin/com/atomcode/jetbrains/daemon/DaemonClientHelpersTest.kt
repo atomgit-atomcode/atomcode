@@ -75,4 +75,46 @@ class DaemonClientHelpersTest {
     fun `urlPathEncoded encodes slashes`() {
         assertEquals("path%2Fto%2Ffile", "path/to/file".urlPathEncoded())
     }
+
+    @Test
+    fun `urlQueryEncoded keeps spaces as plus for query strings`() {
+        assertEquals("hello+world", "hello world".urlQueryEncoded())
+    }
+
+    @Test
+    fun `parseSessionMetaList parses ordinary session list`() {
+        val sessions = parseSessionMetaList(
+            """
+            [
+              {"project_hash":"hash-1","id":"s1","name":"One","updated_at":10,"message_count":2}
+            ]
+            """.trimIndent(),
+        )
+
+        assertEquals(1, sessions.size)
+        assertEquals("s1", sessions.single().id)
+        assertEquals("hash-1", sessions.single().projectHash)
+        assertEquals(10L, sessions.single().updatedAt)
+        assertEquals(2, sessions.single().messageCount)
+    }
+
+    @Test
+    fun `parseSessionMetaList parses search result wrapper`() {
+        val sessions = parseSessionMetaList(
+            """
+            [
+              {
+                "project_hash":"hash-2",
+                "meta":{"id":"s2","name":"Two","updated_at":20,"message_count":3}
+              }
+            ]
+            """.trimIndent(),
+        )
+
+        assertEquals(1, sessions.size)
+        assertEquals("s2", sessions.single().id)
+        assertEquals("hash-2", sessions.single().projectHash)
+        assertEquals(20L, sessions.single().updatedAt)
+        assertEquals(3, sessions.single().messageCount)
+    }
 }

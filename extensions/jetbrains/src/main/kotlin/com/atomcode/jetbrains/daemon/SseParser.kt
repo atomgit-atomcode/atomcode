@@ -1,5 +1,11 @@
 package com.atomcode.jetbrains.daemon
 
+import com.google.gson.JsonArray
+import com.google.gson.JsonElement
+import com.google.gson.JsonNull
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+
 class SseParser {
     private var buffer = StringBuilder()
     private val maxBufferSize = 10 * 1024 * 1024 // 10 MB
@@ -43,183 +49,102 @@ class SseParser {
             .joinToString("\n")
 
         if (data.isBlank()) return null
-        val type = data.jsonString("type") ?: return ChatEvent.Unknown("missing")
+        val json = data.jsonObjectOrNull() ?: return ChatEvent.Unknown("invalid_json")
+        val type = json.string("type") ?: return ChatEvent.Unknown("missing")
         return when (type) {
-            "text" -> ChatEvent.Text(data.jsonString("content").orEmpty())
-            "reasoning" -> ChatEvent.Reasoning(data.jsonString("content").orEmpty())
+            "text" -> ChatEvent.Text(json.string("content").orEmpty())
+            "reasoning" -> ChatEvent.Reasoning(json.string("content").orEmpty())
             "tool_batch" -> ChatEvent.ToolBatch(data)
-            "tool_start" -> ChatEvent.ToolStart(data.jsonString("id"), data.jsonString("name").orEmpty(), data.jsonString("arguments").orEmpty())
-            "tool_output" -> ChatEvent.ToolOutput(data.jsonString("chunk").orEmpty())
+            "tool_start" -> ChatEvent.ToolStart(json.string("id"), json.string("name").orEmpty(), json.string("arguments").orEmpty())
+            "tool_output" -> ChatEvent.ToolOutput(json.string("chunk").orEmpty())
             "tool_result" -> ChatEvent.ToolResult(
-                data.jsonString("id"),
-                data.jsonString("name").orEmpty(),
-                data.jsonString("output").orEmpty(),
-                data.jsonBoolean("success") ?: false,
-                data.jsonLong("duration_ms") ?: 0L,
+                json.string("id"),
+                json.string("name").orEmpty(),
+                json.string("output").orEmpty(),
+                json.boolean("success") ?: false,
+                json.long("duration_ms") ?: 0L,
             )
             "artifact_start" -> ChatEvent.ArtifactStart(
-                data.jsonString("id").orEmpty(),
-                data.jsonString("artifact_type").orEmpty(),
-                data.jsonString("language"),
-                data.jsonString("title"),
+                json.string("id").orEmpty(),
+                json.string("artifact_type").orEmpty(),
+                json.string("language"),
+                json.string("title"),
             )
-            "artifact_content" -> ChatEvent.ArtifactContent(data.jsonString("id").orEmpty(), data.jsonString("content").orEmpty())
-            "artifact_end" -> ChatEvent.ArtifactEnd(data.jsonString("id").orEmpty())
+            "artifact_content" -> ChatEvent.ArtifactContent(json.string("id").orEmpty(), json.string("content").orEmpty())
+            "artifact_end" -> ChatEvent.ArtifactEnd(json.string("id").orEmpty())
             "permission_request" -> ChatEvent.PermissionRequest(
-                data.jsonString("session_id").orEmpty(),
-                data.jsonString("tool_name").orEmpty(),
-                data.jsonString("reason").orEmpty(),
-                data.jsonString("call_id").orEmpty(),
-                data.jsonString("arguments").orEmpty(),
+                json.string("session_id").orEmpty(),
+                json.string("tool_name").orEmpty(),
+                json.string("reason").orEmpty(),
+                json.string("call_id").orEmpty(),
+                json.string("arguments").orEmpty(),
             )
-            "tokens" -> ChatEvent.Tokens(data.jsonInt("prompt") ?: 0, data.jsonInt("completion") ?: 0, data.jsonInt("total") ?: 0)
-            "done" -> ChatEvent.Done(data.jsonInt("tokens") ?: 0, data.jsonInt("tool_calls") ?: 0, data.jsonString("session_id"))
+            "tokens" -> ChatEvent.Tokens(json.int("prompt") ?: 0, json.int("completion") ?: 0, json.int("total") ?: 0)
+            "done" -> ChatEvent.Done(json.int("tokens") ?: 0, json.int("tool_calls") ?: 0, json.string("session_id"))
             "stopped" -> ChatEvent.Stopped
-            "error" -> ChatEvent.Error(data.jsonString("message").orEmpty())
+            "error" -> ChatEvent.Error(json.string("message").orEmpty())
             else -> ChatEvent.Unknown(type)
         }
     }
 }
 
-internal fun String.jsonString(key: String): String? {
-    val pattern = Regex("\"${Regex.escape(key)}\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"")
-    return pattern.find(this)?.groupValues?.get(1)?.jsonUnescaped()
-}
+internal fun String.jsonString(key: String): String? = jsonObjectOrNull()?.string(key)
 
-internal fun String.jsonInt(key: String): Int? = jsonLong(key)?.toInt()
+internal fun String.jsonInt(key: String): Int? = jsonObjectOrNull()?.int(key)
 
-internal fun String.jsonLong(key: String): Long? {
-    val pattern = Regex("\"${Regex.escape(key)}\"\\s*:\\s*(-?\\d+)")
-    return pattern.find(this)?.groupValues?.get(1)?.toLongOrNull()
-}
+internal fun String.jsonLong(key: String): Long? = jsonObjectOrNull()?.long(key)
 
-internal fun String.jsonBoolean(key: String): Boolean? {
-    val pattern = Regex("\"${Regex.escape(key)}\"\\s*:\\s*(true|false)")
-    return pattern.find(this)?.groupValues?.get(1)?.toBooleanStrictOrNull()
-}
+internal fun String.jsonBoolean(key: String): Boolean? = jsonObjectOrNull()?.boolean(key)
 
-internal fun String.jsonObjects(): List<String> {
-    val trimmed = trim()
-    if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return emptyList()
-    return trimmed.jsonObjectRanges(0, trimmed.length).map { trimmed.substring(it.first, it.second) }
-}
+internal fun String.jsonObjects(): List<String> =
+    jsonArrayOrNull()
+        ?.mapNotNull { it.asObjectOrNull()?.toString() }
+        .orEmpty()
 
-internal fun String.jsonArrayObjects(key: String): List<String> {
-    val keyPattern = Regex("\"${Regex.escape(key)}\"\\s*:\\s*\\[")
-    val match = keyPattern.find(this) ?: return emptyList()
-    val arrayStart = match.range.last
-    var depth = 0
-    var inString = false
-    var escaped = false
+internal fun String.jsonArrayObjects(key: String): List<String> =
+    jsonObjectOrNull()
+        ?.array(key)
+        ?.mapNotNull { it.asObjectOrNull()?.toString() }
+        .orEmpty()
 
-    for (index in arrayStart until length) {
-        val char = this[index]
-        if (escaped) {
-            escaped = false
-            continue
-        }
-        if (char == '\\' && inString) {
-            escaped = true
-            continue
-        }
-        if (char == '"') {
-            inString = !inString
-            continue
-        }
-        if (inString) continue
-        when (char) {
-            '[' -> depth++
-            ']' -> {
-                depth--
-                if (depth == 0) {
-                    return substring(arrayStart, index + 1).jsonObjects()
-                }
-            }
-        }
+internal fun String.jsonNestedObject(key: String): String? =
+    jsonObjectOrNull()?.objectOrNull(key)?.toString()
+
+private fun String.jsonObjectOrNull(): JsonObject? = parseJsonElementOrNull()?.asObjectOrNull()
+
+private fun String.jsonArrayOrNull(): JsonArray? = parseJsonElementOrNull()?.takeIf { it.isJsonArray }?.asJsonArray
+
+private fun String.parseJsonElementOrNull(): JsonElement? =
+    try {
+        JsonParser.parseString(this)
+    } catch (_: Exception) {
+        null
     }
-    return emptyList()
-}
 
-internal fun String.jsonNestedObject(key: String): String? {
-    val keyPattern = Regex("\"${Regex.escape(key)}\"\\s*:\\s*\\{")
-    val match = keyPattern.find(this) ?: return null
-    val objectStart = match.range.last
-    return jsonObjectRanges(objectStart, length).firstOrNull()?.let { substring(it.first, it.second) }
-}
+private fun JsonElement.asObjectOrNull(): JsonObject? =
+    takeIf { it.isJsonObject }?.asJsonObject
 
-private fun String.jsonObjectRanges(start: Int, end: Int): List<Pair<Int, Int>> {
-    val ranges = mutableListOf<Pair<Int, Int>>()
-    var depth = 0
-    var objectStart = -1
-    var inString = false
-    var escaped = false
+private fun JsonObject.value(key: String): JsonElement? =
+    get(key)?.takeUnless { it is JsonNull || it.isJsonNull }
 
-    for (index in start until end) {
-        val char = this[index]
-        if (escaped) {
-            escaped = false
-            continue
-        }
-        if (char == '\\' && inString) {
-            escaped = true
-            continue
-        }
-        if (char == '"') {
-            inString = !inString
-            continue
-        }
-        if (inString) continue
+private fun JsonObject.string(key: String): String? =
+    value(key)?.takeIf { it.isJsonPrimitive }?.asJsonPrimitive?.takeIf { it.isString }?.asString
 
-        when (char) {
-            '{' -> {
-                if (depth == 0) objectStart = index
-                depth++
-            }
-            '}' -> {
-                depth--
-                if (depth == 0 && objectStart >= 0) {
-                    ranges += objectStart to index + 1
-                    objectStart = -1
-                }
-            }
-        }
+private fun JsonObject.int(key: String): Int? =
+    long(key)?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
+
+private fun JsonObject.long(key: String): Long? =
+    try {
+        value(key)?.takeIf { it.isJsonPrimitive }?.asJsonPrimitive?.takeIf { it.isNumber }?.asLong
+    } catch (_: NumberFormatException) {
+        null
     }
-    return ranges
-}
 
-private fun String.jsonUnescaped(): String {
-    val result = StringBuilder(length)
-    var index = 0
-    while (index < length) {
-        val char = this[index]
-        if (char != '\\' || index == lastIndex) {
-            result.append(char)
-            index++
-            continue
-        }
+private fun JsonObject.boolean(key: String): Boolean? =
+    value(key)?.takeIf { it.isJsonPrimitive }?.asJsonPrimitive?.takeIf { it.isBoolean }?.asBoolean
 
-        when (val escaped = this[index + 1]) {
-            '"' -> result.append('"')
-            '\\' -> result.append('\\')
-            '/' -> result.append('/')
-            'b' -> result.append('\b')
-            'f' -> result.append('\u000C')
-            'n' -> result.append('\n')
-            'r' -> result.append('\r')
-            't' -> result.append('\t')
-            'u' -> {
-                val hex = substring(index + 2, (index + 6).coerceAtMost(length))
-                val code = hex.takeIf { it.length == 4 }?.toIntOrNull(16)
-                if (code != null) {
-                    result.append(code.toChar())
-                    index += 4
-                } else {
-                    result.append("\\u")
-                }
-            }
-            else -> result.append(escaped)
-        }
-        index += 2
-    }
-    return result.toString()
-}
+private fun JsonObject.array(key: String): JsonArray? =
+    value(key)?.takeIf { it.isJsonArray }?.asJsonArray
+
+private fun JsonObject.objectOrNull(key: String): JsonObject? =
+    value(key)?.asObjectOrNull()
