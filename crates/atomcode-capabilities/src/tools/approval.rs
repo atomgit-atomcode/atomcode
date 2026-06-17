@@ -31,6 +31,10 @@ pub const APPROVAL_KIND: &str = "approval";
 /// `AgentCommand::Respond { value: serde_json::to_value(ApprovalResponse)? }`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
+    /// The originating model tool-call id. Drivers use it to correlate an approval
+    /// prompt with the later started/result events for the same call.
+    #[serde(default)]
+    pub call_id: String,
     /// The tool about to execute.
     pub tool: String,
     /// The EXACT argument bytes that will execute (approve-what-runs contract).
@@ -168,6 +172,7 @@ impl ToolMiddleware for ApprovalMiddleware {
         // RequestCtx, never in an event → events stay serializable). Built from the
         // exported typed contract so the wire shape can never drift from it.
         let payload = serde_json::to_value(ApprovalRequest {
+            call_id: call.id.clone(),
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
         })
@@ -264,10 +269,23 @@ mod tests {
     #[test]
     fn typed_contract_matches_wire_shapes() {
         // Request side: what the middleware emits parses as ApprovalRequest.
-        let payload =
-            serde_json::to_value(ApprovalRequest { tool: "bash".into(), args: "{\"cmd\":\"ls\"}".into() })
+        let payload = serde_json::to_value(ApprovalRequest {
+            call_id: "call_1".into(),
+            tool: "bash".into(),
+            args: "{\"cmd\":\"ls\"}".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "call_id": "call_1", "tool": "bash", "args": "{\"cmd\":\"ls\"}" })
+        );
+
+        // Older approval payloads without call_id still parse; they simply cannot
+        // correlate a pre-execution prompt with a later ToolStarted row.
+        let legacy: ApprovalRequest =
+            serde_json::from_value(serde_json::json!({ "tool": "bash", "args": "{}" }))
                 .unwrap();
-        assert_eq!(payload, serde_json::json!({ "tool": "bash", "args": "{\"cmd\":\"ls\"}" }));
+        assert_eq!(legacy.call_id, "");
 
         // Response side: each constructor round-trips through from_value exactly.
         let v = serde_json::to_value(ApprovalResponse::allow()).unwrap();

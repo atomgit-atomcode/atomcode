@@ -604,6 +604,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
+    fn tool_bullet_style(&self) -> CellStyle {
+        self.style_bold(Role::ToolName)
+    }
+
     /// Build the cells for a spinner body row: `<frame> <label>`,
     /// flush-left at col 0 (no PAD_COL indent) so the frame glyph
     /// aligns with `❯` user echoes and `▸` tool calls in the same
@@ -654,7 +658,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let safe_detail = scrub_controls(detail);
 
         let prefix = format!("{} ", icon);
-        let prefix_style = self.style_for(Role::Muted);
+        let prefix_style = self.tool_bullet_style();
         let name_style = self.style_bold(Role::ToolName);
         let detail_style = self.style_for(Role::Secondary);
         let meta_style = self.style_bold(Role::ToolName);
@@ -2282,7 +2286,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             if safe_detail.is_empty() {
                 self.push_body_prefixed(
                     "\u{25cf} ",
-                    &self.style_for(Role::Muted),
+                    &self.tool_bullet_style(),
                     &safe_name,
                     &self.style_bold(Role::ToolName),
                 );
@@ -2291,7 +2295,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let body_str = format!("{}({})", safe_name, safe_detail);
                 let body_str = truncate_body_str(&body_str, 500);
                 let detail_str = format!("({})", safe_detail);
-                let prefix_style = self.style_for(Role::Muted);
+                let prefix_style = self.tool_bullet_style();
                 let name_style = self.style_bold(Role::ToolName);
                 let detail_style = self.style_for(Role::Secondary);
                 let rows = self.build_mixed_style_rows(
@@ -3074,6 +3078,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: tools & diffs ──
             UiLine::ToolCallInFlight { id, name, detail } => {
+                self.clear_live_spinner();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
@@ -3118,6 +3123,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 header,
                 children,
             } => {
+                self.clear_live_spinner();
                 // Mark the batch header as a ToolCall anchor — Alt+↑/↓
                 // (message-jump) walks `message_marks`; without this
                 // the whole "● Running N calls in parallel" header +
@@ -3273,21 +3279,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_row(row);
             }
             UiLine::ToolCall { name, detail } => {
+                self.clear_live_spinner();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
-                // Same dark-theme color hierarchy as the `└` result line:
-                // on dark themes `Role::Muted` is SGR 37 (near-white), so the
-                // `●` anchor reads as the same tier as the bold command name
-                // beside it. Render it FAINT on dark to dim it to a gray,
-                // matching light theme (where `●` is DarkGrey against the
-                // black bold name). Light theme keeps the plain muted color.
-                let bullet_style = if crate::highlight::theme::is_light_for_render() {
-                    self.style_for(Role::Muted)
-                } else {
-                    self.style_faint(Role::Muted)
-                };
+                let bullet_style = self.tool_bullet_style();
                 let tool_name_style = self.style_bold(Role::ToolName);
+                let detail_style = self.style_for(Role::Secondary);
                 let safe_name = scrub_controls(&name);
                 let safe_detail = scrub_controls(&detail);
                 let body_str = if safe_detail.is_empty() {
@@ -3309,12 +3307,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // unifies the visual anchor with the parallel-batch
                 // header (also ●), matching Claude Code's single-glyph
                 // model for tool-call entries.
-                self.push_body_prefixed(
-                    "● ",
-                    &bullet_style,
-                    &body_str,
-                    &tool_name_style,
-                );
+                if safe_detail.is_empty() {
+                    self.push_body_prefixed(
+                        "● ",
+                        &bullet_style,
+                        &body_str,
+                        &tool_name_style,
+                    );
+                } else {
+                    let detail_str = format!("({})", safe_detail);
+                    let rows = self.build_mixed_style_rows(
+                        "● ", &bullet_style,
+                        &safe_name, &tool_name_style,
+                        &detail_str, &detail_style,
+                        "", &tool_name_style,
+                        &body_str,
+                    );
+                    for row in rows {
+                        self.push_body_row(row);
+                    }
+                }
             }
             UiLine::ToolResult { success, summary } => {
                 self.mark_message(crate::render::MarkKind::ToolResult);
@@ -6595,6 +6607,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retained_committed_inflight_tool_uses_static_tool_call_styles() {
+        let (mut static_r, _static_buf) = new_capturing(80, 24);
+        static_r.render(UiLine::ToolCall {
+            name: "EditFile".into(),
+            detail: "test.txt ← \"10\"".into(),
+        });
+        let static_row = static_r.body_lines.last().expect("static tool row");
+
+        let (mut inflight_r, _inflight_buf) = new_capturing(80, 24);
+        inflight_r.render(UiLine::ToolCallInFlight {
+            id: "call-edit-1".into(),
+            name: "EditFile".into(),
+            detail: "test.txt ← \"10\"".into(),
+        });
+        inflight_r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-edit-1".into()),
+        });
+        let committed_row = inflight_r.body_lines.last().expect("committed tool row");
+
+        let static_bullet = static_row.iter().find(|c| c.ch == '●').expect("static bullet");
+        let committed_bullet = committed_row.iter().find(|c| c.ch == '●').expect("committed bullet");
+        assert_eq!(
+            committed_bullet.style, static_bullet.style,
+            "committed inflight bullet must match static ToolCall bullet style"
+        );
+        assert!(
+            static_bullet.style.bold,
+            "tool-call bullet must be highlighted"
+        );
+
+        let static_detail = static_row
+            .iter()
+            .find(|c| c.ch == '(')
+            .expect("static detail opener");
+        let committed_detail = committed_row
+            .iter()
+            .find(|c| c.ch == '(')
+            .expect("committed detail opener");
+        assert_eq!(
+            committed_detail.style, static_detail.style,
+            "committed inflight detail must match static ToolCall detail style"
+        );
+        assert!(
+            !static_detail.style.bold,
+            "tool-call detail must use normal foreground, not highlighted text"
+        );
+    }
+
     /// ToolResult success: `⎿ summary` + blank spacer; failure
     /// prepends `✗ `. We test success path here; the error styling
     /// (Role::Error red) is a cell-style detail not asserted in
@@ -7537,6 +7598,92 @@ mod tests {
             !spinner_in_history,
             "spinner row still in body_lines — it must be popped when \
              covered"
+        );
+    }
+
+    /// Tool-call streaming paints a transient "Preparing Tool(...)" live spinner.
+    /// When the real in-flight tool row arrives, that spinner must be removed
+    /// rather than becoming a second visible `WriteFile(test.txt)` row.
+    #[test]
+    fn retained_tool_call_inflight_covers_streaming_spinner_row() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "●",
+            label: "Preparing WriteFile(test.txt)".into(),
+            status,
+            menu: None,
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-write-1".into(),
+            name: "WriteFile".into(),
+            detail: "test.txt".into(),
+        });
+
+        let row_texts: Vec<String> = r
+            .body_lines
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect();
+        let write_rows = row_texts.iter().filter(|t| t.contains("WriteFile(test.txt)")).count();
+
+        assert_eq!(
+            write_rows, 1,
+            "streaming spinner plus in-flight tool must leave exactly one WriteFile row: {:?}",
+            row_texts
+        );
+        assert!(
+            !row_texts.iter().any(|t| t.contains("Preparing WriteFile")),
+            "transient Preparing row leaked into history: {:?}",
+            row_texts
+        );
+        assert!(
+            !r.live_spinner_active,
+            "live spinner state must be cleared once the tool row owns the slot"
+        );
+    }
+
+    /// Same as the in-flight path, but for approval/replay paths that render a
+    /// static ToolCall row directly.
+    #[test]
+    fn retained_static_tool_call_covers_streaming_spinner_row() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "●",
+            label: "Preparing WriteFile(test.txt)".into(),
+            status,
+            menu: None,
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::ToolCall {
+            name: "WriteFile".into(),
+            detail: "test.txt".into(),
+        });
+
+        let row_texts: Vec<String> = r
+            .body_lines
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect();
+        let write_rows = row_texts.iter().filter(|t| t.contains("WriteFile(test.txt)")).count();
+
+        assert_eq!(
+            write_rows, 1,
+            "streaming spinner plus static tool call must leave exactly one WriteFile row: {:?}",
+            row_texts
+        );
+        assert!(
+            !row_texts.iter().any(|t| t.contains("Preparing WriteFile")),
+            "transient Preparing row leaked into history: {:?}",
+            row_texts
         );
     }
 

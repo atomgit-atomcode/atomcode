@@ -828,7 +828,7 @@ impl Bridge {
                     tool_name: req.tool.clone(),
                     reason: truncate(&req.args, 200),
                     call: atomcode_core::tool::ToolCall {
-                        id: String::new(),
+                        id: req.call_id,
                         name: req.tool,
                         arguments: req.args,
                     },
