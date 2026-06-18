@@ -6573,7 +6573,7 @@ fn turn_summary_label(
             turn_count,
             tool_call_count,
             duration: dur,
-            total_tokens: atomcode_core::fmt_tokens(total_tokens),
+            total_tokens,
         })
         .into_owned()
     } else {
@@ -6583,7 +6583,7 @@ fn turn_summary_label(
             turn_count,
             tool_call_count,
             duration: dur,
-            total_tokens: atomcode_core::fmt_tokens(total_tokens),
+            total_tokens,
         })
         .into_owned()
     }

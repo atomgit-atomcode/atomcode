@@ -698,8 +698,7 @@ pub enum Msg<'a> {
         turn_count: usize,
         tool_call_count: usize,
         duration: &'a str,
-        /// Pre-formatted by `fmt_tokens()` – e.g. "3.67M" / "12.3K".
-        total_tokens: String,
+        total_tokens: usize,
     },
 
     /// Turn-end summary when the turn terminated in an error (the red
@@ -711,8 +710,7 @@ pub enum Msg<'a> {
         turn_count: usize,
         tool_call_count: usize,
         duration: &'a str,
-        /// Pre-formatted by `fmt_tokens()` – e.g. "3.67M" / "12.3K".
-        total_tokens: String,
+        total_tokens: usize,
     },
 
     // ── OAuth login chrome (/login + /codingplan share these) ──

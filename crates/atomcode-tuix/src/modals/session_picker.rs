@@ -433,7 +433,7 @@ fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String
             turn_count: s.turn_count,
             tool_call_count: s.tool_call_count,
             duration: &crate::render::fmt_dur(std::time::Duration::from_millis(s.duration_ms)),
-            total_tokens: atomcode_core::fmt_tokens(s.total_tokens),
+            total_tokens: s.total_tokens,
         })
         .into_owned(),
         Some(s) => crate::i18n::t(crate::i18n::Msg::TurnSummary {
@@ -441,7 +441,7 @@ fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String
             turn_count: s.turn_count,
             tool_call_count: s.tool_call_count,
             duration: &crate::render::fmt_dur(std::time::Duration::from_millis(s.duration_ms)),
-            total_tokens: atomcode_core::fmt_tokens(s.total_tokens),
+            total_tokens: s.total_tokens,
         })
         .into_owned(),
         None => String::new(),
