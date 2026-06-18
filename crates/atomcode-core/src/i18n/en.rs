@@ -882,9 +882,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::VisionPreprocessSuccess { char_count } =>
             format!("✓ VL recognised image, returned {char_count} chars").into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {total_tokens} tokens").into(),
+            format!("✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
         Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✗ Stopped · {turn_count} rounds · {tool_call_count} tools · {duration} · {total_tokens} tokens").into(),
+            format!("✗ Stopped · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
         Msg::LoginQrHeader =>
             "  Sign in to AtomGit — scan the QR code with your WeChat:\n\n".into(),
         Msg::LoginUrlAfterQr =>

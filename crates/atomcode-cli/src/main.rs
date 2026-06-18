@@ -1624,6 +1624,9 @@ async fn run() -> Result<i32> {
             cli.provider.as_deref(),
             Some(telemetry.clone()),
             cli.dangerously_skip_permissions,
+            // Interactive (TUI) ⇒ approvals park until answered; headless (`-p`) keeps the
+            // fail-closed timeout so an unanswered approval can't park the run forever.
+            !is_headless,
         );
         eprintln!("[engine v2] new stack active (model {})", bridge_cfg.model);
         let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
@@ -1651,6 +1654,8 @@ async fn run() -> Result<i32> {
                     None,
                     Some(tel.clone()),
                     skip_perms,
+                    // In-TUI re-spawns (/session, /bg, /resume) are always interactive.
+                    true,
                 ))
             },
         ))
@@ -1954,6 +1959,7 @@ fn bridge_config_from(
     provider_override: Option<&str>,
     telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
     dangerously_skip_permissions: bool,
+    interactive: bool,
 ) -> atomcode_bridge::BridgeConfig {
     let p = config.active_provider(provider_override).ok();
     atomcode_bridge::BridgeConfig {
@@ -1971,6 +1977,7 @@ fn bridge_config_from(
         thinking_type: p.and_then(|p| p.thinking_type.clone()),
         thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
         dangerously_skip_permissions,
+        interactive,
     }
 }
 
@@ -2248,7 +2255,7 @@ async fn run_headless(
                     eprintln!(
                         "[done] {:.1}s tokens={} turns={} tool_calls={}{}",
                         duration.as_secs_f64(),
-                        total_tokens,
+                        atomcode_core::i18n::fmt_tokens(total_tokens),
                         turn_count,
                         tool_call_count,
                         suffix
@@ -3220,14 +3227,14 @@ mod tests {
         let wd = PathBuf::from("/tmp/x");
 
         // No override → the config default (gateway), no reasoning_history set.
-        let def = bridge_config_from(&config, &wd, None, None, false);
+        let def = bridge_config_from(&config, &wd, None, None, false, false);
         assert_eq!(def.base_url, "https://llm-api.atomgit.com/v1");
         assert_eq!(def.model, "gw-model");
         assert_eq!(def.reasoning_history, None);
 
         // `--provider direct` → that provider's endpoint/model/key + its per-provider
         // reasoning_history override, NOT the default.
-        let ov = bridge_config_from(&config, &wd, Some("direct"), None, false);
+        let ov = bridge_config_from(&config, &wd, Some("direct"), None, false, false);
         assert_eq!(ov.base_url, "https://api.deepseek.com");
         assert_eq!(ov.model, "direct-model");
         assert_eq!(ov.api_key, "sk-direct");

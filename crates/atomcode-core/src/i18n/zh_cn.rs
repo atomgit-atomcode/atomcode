@@ -869,9 +869,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::VisionPreprocessSuccess { char_count } =>
             format!("✓ VL 识别图片成功，返回 {char_count} chars").into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✓ {done} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {total_tokens} tokens").into(),
+            format!("✓ {done} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
         Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✗ 已中断 · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {total_tokens} tokens").into(),
+            format!("✗ 已中断 · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
         Msg::LoginQrHeader =>
             "  登录 AtomGit — 使用微信扫描下方二维码：\n\n".into(),
         Msg::LoginUrlAfterQr =>

@@ -18,7 +18,7 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
 
     let mut cfg = CodingAgentConfig::new("k", "http://unused", "test-model", project.path());
     cfg.stream_timeout = Duration::from_secs(5);
-    cfg.request_timeout = Duration::from_secs(5);
+    cfg.request_timeout = Some(Duration::from_secs(5));
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
         skill_dirs: Some(vec![project.path().join("skills")]),

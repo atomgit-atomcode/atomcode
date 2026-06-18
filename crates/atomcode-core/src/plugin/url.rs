@@ -57,7 +57,7 @@ fn normalize_name_source(url: &str) -> &str {
 }
 
 fn last_path_segment(url: &str) -> Option<&str> {
-    url.rsplit(|c: char| c == '/' || c == ':')
+    url.rsplit(['/', ':'])
         .next()
         .filter(|s| !s.is_empty())
 }

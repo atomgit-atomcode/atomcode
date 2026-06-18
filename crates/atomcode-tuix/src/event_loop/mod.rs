@@ -6595,7 +6595,9 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
     let label = if as_goal_end {
         format!(
             "{} tools · {} · {} tokens",
-            ps.tool_call_count, dur, ps.total_tokens
+            ps.tool_call_count,
+            dur,
+            crate::i18n::fmt_tokens(ps.total_tokens)
         )
     } else if ps.was_goal_round {
         format!(
@@ -6603,7 +6605,7 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
             state.goal_round.max(1),
             ps.tool_call_count,
             dur,
-            ps.total_tokens
+            crate::i18n::fmt_tokens(ps.total_tokens)
         )
     } else {
         // Reached only if a non-goal turn was ever buffered (today they
@@ -6619,6 +6621,69 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
     };
     renderer.render(UiLine::TurnSeparator { label });
     renderer.flush();
+}
+
+/// If an approval prompt is still showing when the agent moves on (a tool result arrives,
+/// the turn ends), the approval was resolved WITHOUT a user keypress — a headless timeout
+/// fail-close, a displaced second approval, or a cancel. Retract the orphaned "Waiting for
+/// approval" body row with the SAME cleanup the Y/A/N keypath does (`pop_approval_prompt` +
+/// `on_approval_resolved`), so it can't linger above the result. Returns false (no-op) when
+/// no approval is pending — the normal path, where the keypress already cleared it.
+fn retract_stale_approval(state: &mut UiState, renderer: &mut dyn Renderer) -> bool {
+    if matches!(state.phase, UiPhase::Approval) {
+        renderer.pop_approval_prompt();
+        state.on_approval_resolved();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod approval_retract_tests {
+    use super::retract_stale_approval;
+    use crate::render::{Renderer, UiLine};
+    use crate::state::{UiPhase, UiState};
+
+    #[derive(Default)]
+    struct CountingRenderer {
+        pops: usize,
+    }
+    impl Renderer for CountingRenderer {
+        fn render(&mut self, _line: UiLine) {}
+        fn flush(&mut self) {}
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+        fn pop_approval_prompt(&mut self) {
+            self.pops += 1;
+        }
+    }
+
+    #[test]
+    fn retracts_orphaned_approval_when_resolved_without_keypress() {
+        let mut state = UiState::new();
+        state.on_approval_needed("EditFile");
+        assert!(matches!(state.phase, UiPhase::Approval));
+        let mut r = CountingRenderer::default();
+        // A result/cancel arriving while the prompt is still up = resolved without a keypress.
+        let retracted = retract_stale_approval(&mut state, &mut r);
+        assert!(retracted, "a still-pending approval must be retracted");
+        assert_eq!(r.pops, 1, "the orphaned 'Waiting for approval' body row must be popped");
+        assert!(!matches!(state.phase, UiPhase::Approval), "phase must leave Approval");
+    }
+
+    #[test]
+    fn noop_when_no_approval_pending() {
+        let mut state = UiState::new(); // not in Approval phase
+        let mut r = CountingRenderer::default();
+        let retracted = retract_stale_approval(&mut state, &mut r);
+        assert!(!retracted, "nothing to retract when no prompt is up");
+        assert_eq!(r.pops, 0, "must not pop when no approval prompt is showing");
+    }
 }
 
 fn handle_agent_event(
@@ -6763,6 +6828,11 @@ fn handle_agent_event(
             success,
             ..
         } => {
+            // A result for this call arrived while an approval prompt is still up ⇒ the
+            // approval was resolved WITHOUT the user answering (headless timeout fail-close,
+            // a displaced second approval, or a cancel). Retract the orphaned "Waiting for
+            // approval" row first so it doesn't linger above the result.
+            retract_stale_approval(state, renderer);
             // If this call belongs to an active batch, the group header
             // already accounts for it; emit a single-line `  ↳ ✓ / ✗`
             // child completion and skip the full ▸ + ⎿ body render.
@@ -8365,8 +8435,19 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
         "web_search" => get_str("query")
             .map(|q| crate::width::truncate_with_ellipsis(&q, 100))
             .unwrap_or_default(),
-        "find_references" | "trace_callees" | "trace_callers" | "trace_chain" => {
+        "find_references" | "trace_callees" | "trace_callers" => {
             get_str("symbol").unwrap_or_default()
+        }
+        "trace_chain" => {
+            // trace_chain takes `from`/`to`, not `symbol` — keep this branch
+            // separate so the detail isn't blank. See trace_chain.rs Args.
+            let from = get_str("from").unwrap_or_default();
+            let to = get_str("to").unwrap_or_default();
+            if from.is_empty() || to.is_empty() {
+                String::new()
+            } else {
+                format!("{} → {}", from, to)
+            }
         }
         "blast_radius" | "file_dependencies" => {
             // Same as above: basename for single-call; batch disambiguation

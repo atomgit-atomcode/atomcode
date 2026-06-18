@@ -20,7 +20,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
     let mut cfg = CodingAgentConfig::new("k", "http://unused", "test-model", project.path());
     cfg.stream_timeout = Duration::from_secs(5);
     // A driver-approval wait this short degrades the un-answered round-trip to Deny fast.
-    cfg.request_timeout = Duration::from_millis(100);
+    cfg.request_timeout = Some(Duration::from_millis(100));
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
         skill_dirs: Some(vec![project.path().join("skills")]),
