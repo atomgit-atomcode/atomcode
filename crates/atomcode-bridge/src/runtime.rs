@@ -239,7 +239,10 @@ impl Bridge {
             Ok(p) => Some(p),
             Err(e) => {
                 let _ = ev_tx.send(CoreEv::Error {
-                    error: format!("engine v2 provider init failed: {e}"),
+                    error: atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitFailed {
+                        detail: &e.to_string(),
+                    })
+                    .into_owned(),
                     snapshot: ConversationSnapshot::default(),
                 });
                 None
@@ -765,7 +768,12 @@ impl Bridge {
                             }
                         }
                         Err(e) => self.emit(CoreEv::Error {
-                            error: format!("provider init failed: {e}"),
+                            error: atomcode_core::i18n::t(
+                                atomcode_core::i18n::Msg::ProviderInitFailed {
+                                    detail: &e.to_string(),
+                                },
+                            )
+                            .into_owned(),
                             snapshot: ConversationSnapshot::default(),
                         }),
                     }
@@ -1715,10 +1723,10 @@ fn build_provider(
             if crypto::is_atomgit_gateway(&cfg.base_url) {
                 if !crypto::signer_available() {
                     anyhow::bail!(
-                        "provider base_url '{}' is an AtomGit gateway this build can't \
-                         authenticate against. Use the official binary, or point the provider \
-                         at a plain OpenAI-compatible endpoint with an api_key.",
-                        cfg.base_url
+                        "{}",
+                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::GatewayAuthUnavailable {
+                            base_url: &cfg.base_url,
+                        })
                     );
                 }
                 pc.request_signer = Some(crate::sign::atomgit_signer(&cfg.base_url)?);
