@@ -396,12 +396,14 @@ pub fn flush_aligned_table_with_width(
         return render_flat_table(&parsed, caps);
     }
 
-    // Bright-black / DarkGrey (SGR 90) — table borders are chrome,
-    // not content. Cyan (SGR 96) made them collide with the input
-    // box separator and the inline-code colour, collapsing the
-    // visual hierarchy. Gray reads as quiet structure and lets
-    // header text + cell content carry the visual weight.
-    let border_on = if caps.colors { theme::MD_MUTED_OPEN } else { "" };
+    // Gray chrome — table borders are structure, not content (cyan made
+    // them collide with the input-box separator and inline-code colour).
+    // But the shade must be theme-aware: a fixed SGR 90 (DarkGrey) maps to
+    // ~#3F3F3F on dark themes, ~3:1 against the bg, so the whole grid went
+    // invisible until a selection highlight revealed it. `md_border_open`
+    // keeps SGR 90 on light and switches to SGR 37 (soft light-gray) on
+    // dark — quiet structure that stays visible on both.
+    let border_on = if caps.colors { theme::md_border_open() } else { "" };
     let border_off = if caps.colors { theme::MD_MUTED_CLOSE } else { "" };
 
     // Draw a horizontal rule row with given connector characters.

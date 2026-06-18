@@ -98,6 +98,10 @@ impl OpenAiCompatProvider {
             .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model, &cfg.base_url));
         let client = reqwest::Client::builder()
             .connect_timeout(cfg.connect_timeout)
+            // Drop idle keep-alive connections before the gateway LB does, so
+            // we don't reuse a server-closed socket (the "error sending
+            // request" / ConnectionReset class). See POOL_IDLE_TIMEOUT.
+            .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
             .build()
             .map_err(|e| ProviderError {
                 retryable: false,
@@ -224,9 +228,12 @@ impl LlmProvider for OpenAiCompatProvider {
                         return;
                     }
                     Ok(Some(Err(e))) => {
+                        // Mid-stream stays non-retryable (partial deltas may
+                        // already have reached the consumer), but surface the
+                        // full cause chain for diagnosis.
                         yield StreamEvent::Error(ProviderError {
                             retryable: false,
-                            message: format!("stream read error: {e}"),
+                            message: format!("stream read error: {}", retry::err_chain(&e)),
                             ..Default::default()
                         });
                         return;
@@ -450,8 +457,11 @@ fn effort_str(e: ReasoningEffort) -> &'static str {
 
 fn open_error(e: reqwest::Error) -> ProviderError {
     ProviderError {
-        retryable: e.is_timeout() || e.is_connect(),
-        message: format!("open failed: {e}"),
+        // Broadened: also retry stale-keep-alive resets (is_connect()==false).
+        retryable: retry::is_retryable_reqwest_error(&e),
+        // Surface the full source chain so the cause (connection reset / dns /
+        // proxy) is visible in the error line instead of the opaque shell.
+        message: format!("open failed: {}", retry::err_chain(&e)),
         ..Default::default()
     }
 }

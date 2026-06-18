@@ -64,7 +64,7 @@ pub use edit::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list::ListDirTool;
-pub use open_file::OpenFileTool;
+pub use open_file::{OpenFileTool, OpenFileWorkspaceGate};
 pub use parallel_edit::ParallelEditTool;
 pub use read::ReadFileTool;
 pub use report_finding::{Finding, ReportFindingTool};

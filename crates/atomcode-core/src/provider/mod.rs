@@ -127,6 +127,12 @@ pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool
         // SSE-level idle timeout (openai.rs, 120 s) catches dead streams
         // before the request-level timeout.
         .timeout(std::time::Duration::from_secs(1800))
+        // Drop idle keep-alive connections (default 90s) before the gateway LB
+        // closes them (≈60s) — otherwise we reuse a server-closed socket and
+        // hit "error sending request" / ConnectionReset. Only reaps *idle*
+        // connections; active streams are untouched. Pairs with the broadened
+        // retry classifier in `retry::is_retryable_error` as a backstop.
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
         .user_agent(ua);
 
     if skip_tls_verify {

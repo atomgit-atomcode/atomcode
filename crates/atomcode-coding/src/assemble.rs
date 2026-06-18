@@ -6,7 +6,9 @@ use crate::persona::coding_persona;
 use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
 use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_capabilities::session::SessionContextHook;
-use atomcode_capabilities::tools::{coding_tool_names, register_coding_tools, ApprovalMiddleware};
+use atomcode_capabilities::tools::{
+    coding_tool_names, register_coding_tools, ApprovalMiddleware, OpenFileWorkspaceGate,
+};
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, ToolRegistry};
@@ -39,10 +41,14 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
 /// provider yourself; otherwise prefer [`build_coding_agent`].
 pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmProvider>) -> Agent {
     let summary_provider = provider.clone(); // tier-2 overflow summary uses the same provider
-    Agent::builder()
+    let mut builder = Agent::builder()
         .provider(provider)
         .tools(mount_coding_tools())
         .persona(coding_persona(&cfg.model))
+        // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
+        // preview). This path pins an immutable working_dir, so the gate pins the same root.
+        // BEFORE approval so its `Allow` short-circuits the prompt.
+        .middleware(Arc::new(OpenFileWorkspaceGate::pinned(cfg.working_dir.clone())))
         // Approval runs BEFORE any (future) arg-rewriting middleware — load-bearing order.
         .middleware(Arc::new(ApprovalMiddleware::in_memory()))
         // Env / project-instructions / git context at session start (after persona).
@@ -57,9 +63,13 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
         )))
         .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
-        .request_timeout(cfg.request_timeout)
-        .max_continuations(cfg.max_continuations)
-        .build()
+        .max_continuations(cfg.max_continuations);
+    // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
+    // answered (interactive). Kernel defaults to unbounded when unset, so None = park.
+    if let Some(d) = cfg.request_timeout {
+        builder = builder.request_timeout(d);
+    }
+    builder.build()
 }
 
 /// Register the neutral coding tools + codeintel into a fresh registry and mount the

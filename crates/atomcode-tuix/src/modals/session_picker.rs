@@ -450,6 +450,14 @@ fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String
 
 pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, reset: bool) {
     use atomcode_core::conversation::message::{MessageContent, Role};
+    // Bracket the whole replay — the `reset()` screen wipe plus the
+    // line-by-line re-emit of the entire transcript — in ONE DECSET 2026
+    // synchronized-output envelope. Capable hosts then paint it as a single
+    // atomic update instead of visibly blanking the screen and re-scrolling
+    // the history (the reported `/resume` flicker). `end_sync()` lands the
+    // final frame inside the envelope and closes it. No-op on renderers
+    // without synchronized output (plain/pipe mode).
+    renderer.begin_sync();
     if reset {
         renderer.reset();
     }
@@ -535,6 +543,7 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
         label: resumed,
     });
     renderer.flush();
+    renderer.end_sync();
 }
 
 #[cfg(test)]

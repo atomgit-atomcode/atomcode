@@ -29,7 +29,8 @@ use atomcode_capabilities::session::{
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
-    register_coding_tools, ApprovalMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool,
+    register_coding_tools, ApprovalMiddleware, OpenFileWorkspaceGate, SensitivePathGate, WebFetchTool,
+    WebSearchTool,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::hook::LifecycleHooks;
@@ -179,7 +180,9 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
                 model: cfg.model.clone(),
                 context_window: cfg.context_window,
                 stream_timeout: cfg.stream_timeout,
-                request_timeout: cfg.request_timeout,
+                // The review sub-agent isn't the interactive approval surface; keep a
+                // concrete fail-closed bound even when the main agent parks (None).
+                request_timeout: cfg.request_timeout.unwrap_or_else(|| std::time::Duration::from_secs(300)),
                 rules_dir: None,
             },
         )));
@@ -217,12 +220,23 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
         }),
         SessionMode::Resume(id) => {
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
-            let snap = manager.load_snapshot(id)?;
-            // A version-mismatched snapshot must FAIL here, not fall through to the
-            // kernel's empty-start seam — that would silently fresh-start under the
-            // SAME session id and corrupt the session's on-disk state.
-            check_snapshot_version(&snap)?;
-            Some(SessionBinding { id: id.clone(), manager, resume: Some(snap) })
+            match manager.load_snapshot(id) {
+                Ok(snap) => {
+                    // A version-mismatched snapshot must FAIL here, not fall through
+                    // to the kernel's empty-start seam — that would silently fresh-
+                    // start under the SAME session id and corrupt on-disk state.
+                    check_snapshot_version(&snap)?;
+                    Some(SessionBinding { id: id.clone(), manager, resume: Some(snap) })
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // Snapshot not found (possibly due to a previous save_snapshot
+                    // IO failure that was logged and skipped). Downgrade to Fresh:
+                    // start a new session under a new id rather than crashing.
+                    let fresh_id = uuid::Uuid::new_v4().to_string();
+                    Some(SessionBinding { id: fresh_id, manager, resume: None })
+                }
+                Err(e) => return Err(e),
+            }
         }
     };
 
@@ -394,6 +408,12 @@ pub fn assemble(
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
         // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
         .middleware(Arc::new(SensitivePathGate::new()))
+        // open_file is Risky (launches a GUI), so approval would prompt on EVERY preview.
+        // Restore the legacy engine's behavior: auto-approve when the target is inside the
+        // workspace (benign side effect on the user's own files). BEFORE approval so its
+        // `Allow` short-circuits the prompt; out-of-workspace paths fall through and still
+        // prompt. Reads the SAME live cwd handle below, so a /cd moves the boundary.
+        .middleware(Arc::new(OpenFileWorkspaceGate::new(parts.shared_cwd.clone())))
         // Approval BEFORE any arg-rewriting middleware — the user approves the exact
         // bytes that run.
         .middleware(parts.approval.clone())
@@ -409,8 +429,13 @@ pub fn assemble(
         )))
         .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
-        .request_timeout(cfg.request_timeout)
         .max_continuations(cfg.max_continuations);
+    // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
+    // answered (interactive — a present human must not be auto-denied). The kernel defaults
+    // to unbounded when `.request_timeout` is never set, so None = park.
+    if let Some(d) = cfg.request_timeout {
+        builder = builder.request_timeout(d);
+    }
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
     }

@@ -57,7 +57,7 @@ fn normalize_name_source(url: &str) -> &str {
 }
 
 fn last_path_segment(url: &str) -> Option<&str> {
-    url.rsplit(|c: char| c == '/' || c == ':')
+    url.rsplit(['/', ':'])
         .next()
         .filter(|s| !s.is_empty())
 }
@@ -71,6 +71,31 @@ pub fn infer_marketplace_name_from_url(url: &str) -> Result<String> {
     let last = last_path_segment(trimmed)
         .ok_or_else(|| anyhow!("cannot infer name from url: {}", url))?;
     Ok(last.to_string())
+}
+
+/// True when `url`'s host is an AtomCode-platform git host we may inject the
+/// stored login token into. NEVER widen without thought — the token must
+/// never be sent to a third-party host. ssh shorthand / malformed → false.
+pub(crate) fn host_is_trusted(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host == "gitcode.com"
+        || host == "atomgit.com"
+        || host.ends_with(".gitcode.com")
+        || host.ends_with(".atomgit.com")
+}
+
+/// `scheme://host` prefix (no path), for scoping git's per-URL
+/// `http.<base>.extraHeader` so an injected credential header can't leak on a
+/// cross-host redirect. None for unparseable URLs / hostless (ssh shorthand).
+pub(crate) fn scheme_host_prefix(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(format!("{}://{}", parsed.scheme(), host))
 }
 
 #[cfg(test)]
@@ -154,5 +179,35 @@ mod tests {
             infer_marketplace_name_from_url("https://x.com/u/foo.git.git").unwrap(),
             "foo.git"
         );
+    }
+}
+
+#[cfg(test)]
+mod trusted_host_tests {
+    use super::{host_is_trusted, scheme_host_prefix};
+
+    #[test]
+    fn trusted_hosts_and_subdomains() {
+        assert!(host_is_trusted("https://gitcode.com/o/r"));
+        assert!(host_is_trusted("https://atomgit.com/o/r"));
+        assert!(host_is_trusted("https://www.gitcode.com/o/r"));
+        assert!(host_is_trusted("https://x.atomgit.com/o/r.git"));
+    }
+
+    #[test]
+    fn untrusted_or_malformed_is_false() {
+        assert!(!host_is_trusted("https://github.com/o/r"));
+        assert!(!host_is_trusted("https://gitcode.com.evil.com/o/r"));
+        assert!(!host_is_trusted("git@gitcode.com:o/r")); // ssh shorthand, not a parseable URL host
+        assert!(!host_is_trusted("not a url"));
+    }
+
+    #[test]
+    fn scheme_host_prefix_strips_path() {
+        assert_eq!(
+            scheme_host_prefix("https://gitcode.com/owner/repo.git").as_deref(),
+            Some("https://gitcode.com")
+        );
+        assert_eq!(scheme_host_prefix("git@gitcode.com:o/r"), None);
     }
 }

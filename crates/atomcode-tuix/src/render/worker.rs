@@ -69,6 +69,12 @@ enum RenderCmd {
     ScrollToNextMessage,
     ScrollToPrevUserMessage,
     ScrollToNextUserMessage,
+    /// Open / close the `/resume` replay's single DECSET 2026 envelope.
+    /// Fire-and-forget: FIFO ordering on this channel keeps `BeginSync`
+    /// before the subsequent `Reset` Ack and `EndSync` after the trailing
+    /// `Flush`, exactly as `replay_session` issues them.
+    BeginSync,
+    EndSync,
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -158,6 +164,14 @@ impl Renderer for TaskRenderer {
 
     fn clear_screen(&mut self) {
         self.ack(AckOp::ClearScreen);
+    }
+
+    fn begin_sync(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::BeginSync);
+    }
+
+    fn end_sync(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::EndSync);
     }
 
     fn suspend_for_external(&mut self) {
@@ -287,6 +301,12 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             RenderCmd::ScrollToNextUserMessage => {
                 inner.scroll_to_next_user_message();
             }
+            RenderCmd::BeginSync => {
+                inner.begin_sync();
+            }
+            RenderCmd::EndSync => {
+                inner.end_sync();
+            }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();
                 match op {
@@ -387,6 +407,8 @@ mod tests {
         suspends: usize,
         resumes: usize,
         deferred: usize,
+        begin_syncs: usize,
+        end_syncs: usize,
     }
 
     struct TestRenderer {
@@ -418,6 +440,12 @@ mod tests {
         fn flush_deferred(&mut self) {
             self.counts.lock().unwrap().deferred += 1;
         }
+        fn begin_sync(&mut self) {
+            self.counts.lock().unwrap().begin_syncs += 1;
+        }
+        fn end_sync(&mut self) {
+            self.counts.lock().unwrap().end_syncs += 1;
+        }
     }
 
     fn setup() -> (TaskRenderer, Arc<Mutex<Counts>>) {
@@ -442,6 +470,24 @@ mod tests {
         assert_eq!(c.renders, 2);
         assert_eq!(c.flushes, 1);
         assert_eq!(c.resets, 1);
+    }
+
+    #[test]
+    fn begin_and_end_sync_forward_to_inner() {
+        let (mut r, counts) = setup();
+        // The `/resume` replay brackets reset()+renders in begin_sync/end_sync.
+        // Both are fire-and-forget; FIFO ordering on the channel keeps
+        // begin_sync before, and end_sync after, the work in between.
+        r.begin_sync();
+        r.render(UiLine::User("replayed".into()));
+        r.end_sync();
+        // reset() is an ACK op — blocks until the worker has drained the
+        // three earlier commands, so the counts are settled when it returns.
+        r.reset();
+        let c = counts.lock().unwrap();
+        assert_eq!(c.begin_syncs, 1, "begin_sync must forward to inner");
+        assert_eq!(c.end_syncs, 1, "end_sync must forward to inner");
+        assert_eq!(c.renders, 1);
     }
 
     #[test]
