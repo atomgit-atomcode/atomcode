@@ -230,7 +230,7 @@ fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
 
 /// 把 TUI 附着到指定的 LiveSession（回放快照 + 启动转发器 + 渲染确认）。
 /// 供 `/webui` 自动附着和 `/sync` 手动附着共用，不重复逻辑。
-fn attach_live_session(
+pub(crate) fn attach_live_session(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     session: std::sync::Arc<atomcode_core::live::LiveSession>,

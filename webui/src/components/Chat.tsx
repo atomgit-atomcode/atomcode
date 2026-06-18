@@ -117,6 +117,8 @@ interface ChatProps {
   activeSession?: SessionMetaWithProject | null;
   /** 刷新后正按 URL 短 id 还原会话；为 true 时抑制新建落地页，避免闪屏。 */
   restoring?: boolean;
+  /** /live turn 完成后通知 App 刷新侧栏列表（session 已落盘，列表需更新）。 */
+  onLiveTurnDone?: () => void;
 }
 
 function formatArgs(args: unknown): string {
@@ -270,7 +272,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -568,6 +570,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setProvider(e.provider);
       return;
     }
+    // 会话切换：另一端（webui 新建对话 / TUI /session）创建了新会话，
+    // 本端跟随切换——更新 session id 并重置画布。
+    // 不设置 loadedForRef：让 Chat useEffect 在 activeSession 到位后
+    // 正常走 getSession 加载（空）历史并清除 historyHint；
+    // 否则 loadedForRef 会阻止加载，导致 historyHint 永远不被清除。
+    if (e.type === 'session_switched') {
+      liveSessionIdRef.current = e.session_id;
+      activeIdRef.current = e.session_id;
+      onSessionId(e.session_id);
+      setMessages([]);
+      setTokens(null);
+      setHistoryHint(null);
+      return;
+    }
 
     // 门控：仅当"当前查看的会话"就是实时会话时，才把实时输出渲染进画布。否则用户
     // 从侧栏打开了另一个历史会话，实时事件不应串进该页面（串进去刷新还会消失）。
@@ -593,7 +609,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setBusy(e.running);
         // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
         // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
-        if (!e.running) setLivePending(null);
+        if (!e.running) {
+          setLivePending(null);
+          // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
+          onLiveTurnDone?.();
+        }
         break;
       }
       case 'permission_request': {
@@ -784,11 +804,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       //    event will arrive back via the live stream, keeping all tabs in sync).
       setBusy(true);
       await postLiveMessage(text, images.length ? images : undefined, provider ?? undefined, activeIdRef.current);
+      // 消息发出后立即刷新侧栏列表（session 可能已落盘，尽早显示新 session-item）；
+      // turn 完成后 state(running=false) 会再刷一次确保更新。
+      onLiveTurnDone?.();
       return;
     }
 
     // ── Normal path ──
     setBusy(true);
+    // 消息发出后立即刷新侧栏列表（session 可能已落盘，尽早显示新 session-item）；
+    // done 事件中 onSessionId 会再刷一次确保更新。
+    onLiveTurnDone?.();
 
     // Push user message + empty assistant placeholder
     setMessages((prev) => [

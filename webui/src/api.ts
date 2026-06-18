@@ -201,6 +201,27 @@ export async function listSessions(): Promise<SessionMetaWithProject[]> {
   return resp.json();
 }
 
+export interface CreateSessionResponse {
+  id: string;
+  name: string;
+  working_dir: string;
+  project_hash: string;
+  created_at: number;
+}
+
+export async function createSession(workingDir?: string, title?: string): Promise<CreateSessionResponse> {
+  const body: Record<string, string> = {};
+  if (workingDir) body.working_dir = workingDir;
+  if (title) body.title = title;
+  const resp = await fetch('/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw new Error(`create session failed: ${resp.status}`);
+  return resp.json();
+}
+
 export async function renameSession(
   projectHash: string,
   sessionId: string,
@@ -458,7 +479,8 @@ export type LiveWireEvent =
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'state'; running: boolean }
   | { type: 'error'; message: string }
-  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string };
+  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
+  | { type: 'session_switched'; session_id: string };
 
 export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,

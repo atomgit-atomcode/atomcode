@@ -9,7 +9,7 @@ import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
-import { getProject, listSessions, SessionMetaWithProject } from './api';
+import { getProject, listSessions, createSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
 
 function cwdDisplay(cwd: string): { prefix: string; name: string } {
@@ -152,9 +152,30 @@ export function App() {
   }, []);
 
   function handleNewSession() {
+    // 立即重置画布（清空消息、回到落地页），保证用户看到即时反馈
     setSessionId(null);
     setActiveSession(null);
     setSidebarOpen(false);
+    // 异步在后端创建新会话，成功后切过去（Chat useEffect 加载空历史）
+    const prevCwd = cwd;
+    createSession(prevCwd || undefined)
+      .then((data) => {
+        setSessionId(data.id);
+        setActiveSession({
+          id: data.id,
+          name: data.name,
+          working_dir: data.working_dir,
+          project_hash: data.project_hash,
+          created_at: data.created_at,
+          updated_at: data.created_at,
+          message_count: 0,
+        });
+        setSessionListVersion((v) => v + 1);
+      })
+      .catch((err) => {
+        // 创建失败时已在前端落地页，仅打印日志
+        console.warn('[newSession] create session failed:', err);
+      });
   }
 
   function handleSelectSession(session: SessionMetaWithProject) {
@@ -327,6 +348,7 @@ export function App() {
               )}
             activeSession={activeSession}
             restoring={restoring}
+            onLiveTurnDone={() => setSessionListVersion((v) => v + 1)}
           />
         </div>
       </div>

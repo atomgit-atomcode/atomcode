@@ -441,6 +441,8 @@ pub enum AgentEvent {
     PeerBusy(bool),
     /// 同步会话的另一视图（webui 下拉框）切换了模型。TUI 据此更新头部显示与活动 provider。
     ProviderChanged(String),
+    /// 同步会话的另一视图（webui）创建了新会话。TUI 据此跟随切换到新会话。
+    SessionSwitched(String),
 }
 
 /// The current phase of the agent (for UI display).
