@@ -77,30 +77,15 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
     }
 }
 
-/// 把新会话创建事件广播给所有视图，并替换当前 LiveSession。webui 新建对话时调用，
-/// 让同进程 TUI 跟随切换到新会话。替换 LiveSession 可确保旧 turn 的输出不再
-/// 流入新的 forwarder（否则旧 LiveSession 被复用，旧 turn 的 TextDelta 等事件
-/// 仍会出现在 TUI 画面上）。无活动 LiveSession 时静默跳过。
+/// 把新会话创建事件广播给所有视图。webui 新建对话时调用，让同进程 TUI 跟随
+/// 切换到新会话。无活动 LiveSession 时静默跳过。
+/// 注意：不更新 LIVE_SESSION_ID——该变量由 ensure_live_session_global 在
+/// 实际创建/替换 LiveSession 时更新；提前更新会导致 ensure_live_session_global
+/// 误判旧 LiveSession 已匹配新 session_id 而复用它。
 pub fn live_switch_session(session_id: atomcode_core::session::SessionId) {
     let id_str = session_id.to_string();
-    // 同步更新 LIVE_SESSION_ID，使后续 /live SSE 的 snapshot 回显新 id。
-    *LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(id_str.clone());
-    // 先广播 SessionSwitched 事件，让已订阅旧 LiveSession 的 forwarder
-    // 收到通知并处理（TUI 切换会话、重置画布）。
-    if let Some(old) = current_live_session() {
-        old.notify_session_switched(id_str.clone());
-    }
-    // 替换 LIVE 中的 LiveSession 为新实例（绑定新 session_id），
-    // 使后续 ensure_live_session_global / /live SSE / /live/message
-    // 全部走新 LiveSession。旧的 LiveSession 的 Arc 计数归零后
-    // coordinator task 也会退出（input_tx 被 drop）。
-    let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    if g.is_some() {
-        // 从旧 LiveSession 取 working_dir 和 telemetry 以创建新实例。
-        // 不能直接从 LIVE 嵌入 AppState，因为此函数可能在非 async 上下文中调用。
-        // 所以用懒初始化：新 LiveSession 稍后由 ensure_live_session_global
-        // 在 /live/message 调用时按需创建。此处只清空旧引用。
-        *g = None;
+    if let Some(s) = current_live_session() {
+        s.notify_session_switched(id_str);
     }
 }
 

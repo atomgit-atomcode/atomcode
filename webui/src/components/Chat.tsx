@@ -575,6 +575,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 不设置 loadedForRef：让 Chat useEffect 在 activeSession 到位后
     // 正常走 getSession 加载（空）历史并清除 historyHint；
     // 否则 loadedForRef 会阻止加载，导致 historyHint 永远不被清除。
+    // 重启 SSE 连接：旧连接订阅的是旧 LiveSession，后续 turn 事件不会到达；
+    // 重新连接后 /live handler 会绑定到新 LiveSession。
     if (e.type === 'session_switched') {
       liveSessionIdRef.current = e.session_id;
       activeIdRef.current = e.session_id;
@@ -582,6 +584,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setMessages([]);
       setTokens(null);
       setHistoryHint(null);
+      if (sync) {
+        stopLiveStream();
+        startLiveStream();
+      }
       return;
     }
 
