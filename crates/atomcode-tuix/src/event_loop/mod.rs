@@ -4218,11 +4218,6 @@ fn attach_typed_image_paths(
         app.state.session_image_count += 1;
         let n = app.state.session_image_count;
         *text = text.replacen(&tok, &format!("[Image #{}]", n), 1);
-        // Sync mode re-renders the echo from UserEcho — skip the local one (see
-        // the idle-submit path) so it can't orphan above the later user row.
-        if ctx.sync_session.is_none() {
-            renderer.render(UiLine::ImageAttachment(n));
-        }
         images.push(img);
         kept_markers.push(n);
     }
@@ -5630,14 +5625,6 @@ fn handle_idle_key(
                     .zip(pending_hashes.into_iter())
                 {
                     if line.contains(&format!("[Image #{}]", n)) {
-                        // Sync mode re-renders the user row (and now its image
-                        // echoes) from AgentEvent::UserEcho; emitting the echo
-                        // locally too would orphan a `└ [Image #N]` ABOVE the
-                        // later user row. Skip the local echo when synced — the
-                        // attachment data below still rides with the message.
-                        if ctx.sync_session.is_none() {
-                            renderer.render(UiLine::ImageAttachment(n));
-                        }
                         kept_refs.push(crate::input::history::HistoryImageRef {
                             hash: format!("{:016x}", hash),
                             mt: img.media_type.clone(),
@@ -5666,10 +5653,6 @@ fn handle_idle_key(
                         text: line.clone(),
                         attachments: kept_markers.clone(),
                     });
-                } else {
-                    for n in &kept_markers {
-                        renderer.render(UiLine::ImageAttachment(*n));
-                    }
                 }
                 renderer.flush();
                 ctx.history.push(crate::input::history::HistoryEntry {
@@ -6330,11 +6313,6 @@ fn handle_streaming_key(
                 .zip(pending_hashes.into_iter())
             {
                 if line.contains(&format!("[Image #{}]", n)) {
-                    // Sync mode re-renders the echo via UserEcho when the queued
-                    // message dispatches; skip the local one (see idle path).
-                    if ctx.sync_session.is_none() {
-                        renderer.render(UiLine::ImageAttachment(n));
-                    }
                     q_refs.push(crate::input::history::HistoryImageRef {
                         hash: format!("{:016x}", hash),
                         mt: img.media_type.clone(),
@@ -6349,10 +6327,6 @@ fn handle_streaming_key(
                     text: line.clone(),
                     attachments: q_markers.clone(),
                 });
-            } else {
-                for n in &q_markers {
-                    renderer.render(UiLine::ImageAttachment(*n));
-                }
             }
             ctx.history.push(crate::input::history::HistoryEntry {
                 text: line.clone(),
@@ -8049,16 +8023,11 @@ fn handle_agent_event(
             }
         }
         AgentEvent::UserEcho(text) => {
-            // Live-sync: render the peer's user message as a user bubble, then
-            // its `└ [Image #N]` attachment echoes BELOW it. In sync mode the
-            // local submit path skips both (waiting for this echo) — emitting the
-            // image echoes locally at submit time would orphan them above the
-            // later user row (the reported "stray └ [Image #1]" bug).
             let markers = image_markers_in_order(&text);
-            renderer.render(UiLine::User(text));
-            for n in markers {
-                renderer.render(UiLine::ImageAttachment(n));
-            }
+            renderer.render(UiLine::UserWithAttachments {
+                text,
+                attachments: markers,
+            });
             renderer.flush();
         }
         AgentEvent::PeerBusy(running) => {
