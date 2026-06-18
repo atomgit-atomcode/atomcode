@@ -1223,9 +1223,9 @@ impl Bridge {
             KEv::Error { message, .. } => {
                 self.emit(CoreEv::Error { error: message, snapshot: ConversationSnapshot::default() });
             }
-            KEv::Compacted { committed, .. } => {
-                if committed {
-                    self.emit(CoreEv::Warning("conversation compacted".into()));
+            KEv::Compacted { committed, trigger, .. } => {
+                if let Some(msg) = compaction_advisory(committed, &trigger) {
+                    self.emit(CoreEv::Warning(msg));
                 }
             }
             KEv::TurnComplete { reason } => {
@@ -1618,6 +1618,31 @@ fn build_provider(
     }
 }
 
+/// Decide the user-facing advisory (if any) for a kernel `Compacted` outcome.
+///
+/// - A COMMITTED compaction always announces itself.
+/// - A NO-OP compaction only speaks when the user explicitly asked for it
+///   (`Manual` = `/compact`): v1 acknowledged the no-op, but the bridge used to
+///   stay silent, leaving the user unsure the command ran. Auto/Overflow no-ops
+///   stay silent — there's no user action to acknowledge and it would be spam.
+fn compaction_advisory(
+    committed: bool,
+    trigger: &atomcode_kernel::message::CompactTrigger,
+) -> Option<String> {
+    use atomcode_kernel::message::CompactTrigger;
+    if committed {
+        Some("conversation compacted".to_string())
+    } else if matches!(trigger, CompactTrigger::Manual { .. }) {
+        Some(
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactNothingShort)
+                .trim_end()
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -1664,9 +1689,27 @@ mod goal_summary_tests {
 
 #[cfg(test)]
 mod undo_tests {
-    use super::{build_provider, compute_undo};
+    use super::{build_provider, compaction_advisory, compute_undo};
     use atomcode_coding::CodingAgentConfig;
-    use atomcode_kernel::message::Message;
+    use atomcode_kernel::message::{CompactTrigger, Message};
+
+    #[test]
+    fn compaction_advisory_speaks_for_manual_noop_but_stays_silent_for_auto() {
+        // Committed compaction always announces, regardless of trigger.
+        assert!(compaction_advisory(true, &CompactTrigger::Manual { focus: None }).is_some());
+        assert!(compaction_advisory(true, &CompactTrigger::Auto { utilization: 0.9 }).is_some());
+
+        // A user-typed `/compact` that's a no-op must be acknowledged — this is the
+        // v1-parity regression: the bridge previously stayed silent here.
+        let manual_noop = compaction_advisory(false, &CompactTrigger::Manual { focus: None });
+        assert!(manual_noop.as_deref().is_some_and(|m| !m.is_empty()));
+        // No trailing newline — it renders as a single Warning line.
+        assert!(!manual_noop.unwrap().ends_with('\n'));
+
+        // Auto / Overflow no-op compaction stays silent (no user action to ack, no spam).
+        assert!(compaction_advisory(false, &CompactTrigger::Auto { utilization: 0.9 }).is_none());
+        assert!(compaction_advisory(false, &CompactTrigger::Overflow { attempt: 0 }).is_none());
+    }
 
     fn coding_cfg(reasoning_history: Option<&str>) -> CodingAgentConfig {
         // A plain (non-AtomGit) OpenAI-compatible endpoint so build_provider takes the

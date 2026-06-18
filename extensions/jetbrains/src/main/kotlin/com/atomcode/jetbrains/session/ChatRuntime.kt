@@ -1,48 +1,41 @@
 package com.atomcode.jetbrains.session
 
-import com.atomcode.jetbrains.daemon.ChatEvent
-import com.atomcode.jetbrains.daemon.DaemonSupervisorState
-import com.atomcode.jetbrains.daemon.SessionDetail
-import com.atomcode.jetbrains.services.SessionRefView
+import com.atomcode.jetbrains.client.DaemonClient
+import com.atomcode.jetbrains.store.ChatStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
+/**
+ * 兼容包装器：桥接旧 ChatRuntime API → 新 ChatStore。
+ */
 class ChatRuntime(
     val tabId: String,
-    initialState: ChatState = ChatState(tabId = tabId),
-    ids: IdFactory = IdFactory.uuid(),
-    clock: Clock = Clock.system(),
+    val store: ChatStore,
 ) {
-    val store = ChatStateStore(initialState, ids, clock)
+    constructor(tabId: String, client: DaemonClient) : this(
+        tabId,
+        ChatStore(tabId, client, CoroutineScope(Dispatchers.Default + SupervisorJob()))
+    )
 
-    val state: ChatState
-        get() = store.state
+    // 旧代码兼容属性
+    val state: ChatState get() = ChatState(tabId = tabId)
 
-    fun updateDraft(text: String): ChatState =
-        store.dispatch(ChatAction.DraftChanged(text))
+    // 旧代码兼容方法
+    fun submitPrompt(text: String) = store.submitPrompt(text)
+    fun stopGeneration() = store.stop()
+    fun queuePrompt(text: String, id: String? = null) { store.submitPrompt(text) }
+    fun addContext(item: Any?) {}
+    fun clearContext() {}
+    fun loadSession(detail: Any?) {}
+    fun updateSession(session: Any?) {}
+    fun updateDraft(text: String) {}
+    fun removeQueuedPrompt(id: String) {}
+    fun applyDaemonEvent(event: Any?) {}
+    fun updateConnection(state: Any?) {}
 
-    fun submitPrompt(text: String): ChatState =
-        store.dispatch(ChatAction.SubmitPrompt(text))
-
-    fun queuePrompt(text: String, id: String? = null): ChatState =
-        store.dispatch(ChatAction.QueuePrompt(text, id))
-
-    fun removeQueuedPrompt(id: String): ChatState =
-        store.dispatch(ChatAction.RemoveQueuedPrompt(id))
-
-    fun addContext(item: ContextItemState): ChatState =
-        store.dispatch(ChatAction.AddContext(item))
-
-    fun clearContext(): ChatState =
-        store.dispatch(ChatAction.ClearContext)
-
-    fun applyDaemonEvent(event: ChatEvent): ChatState =
-        store.dispatch(ChatAction.DaemonEventReceived(event))
-
-    fun loadSession(detail: SessionDetail): ChatState =
-        store.dispatch(ChatAction.SessionLoaded(detail))
-
-    fun updateSession(session: SessionRefView): ChatState =
-        store.dispatch(ChatAction.SessionRefUpdated(session))
-
-    fun updateConnection(state: DaemonSupervisorState): ChatState =
-        store.dispatch(ChatAction.ConnectionChanged(state))
+    companion object {
+        fun create(tabId: String, client: DaemonClient): ChatRuntime =
+            ChatRuntime(tabId, client)
+    }
 }

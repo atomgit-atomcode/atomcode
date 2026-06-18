@@ -1,8 +1,10 @@
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.TimeUnit
 
 plugins {
     kotlin("jvm") version "2.2.21"
+    kotlin("plugin.serialization") version "2.2.21"
     id("org.jetbrains.intellij.platform") version "2.16.0"
 }
 
@@ -30,7 +32,11 @@ kotlin {
 }
 
 dependencies {
-    implementation("com.google.code.gson:gson:2.11.0")
+    implementation("com.google.code.gson:gson:2.11.0")  // 保留，逐步迁移后移除
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.3.8")
 
     intellijPlatform {
         val localIdePath = providers.gradleProperty("platformLocalPath")
@@ -97,9 +103,55 @@ tasks {
         DaemonTarget("win32-x64", "atomcode-daemon.exe", "ATOMCODE_DAEMON_WIN32_X64", "x86_64-pc-windows-msvc"),
     )
     val currentTargetId = currentDaemonTargetId()
+    val currentDaemonTarget = daemonTargets.firstOrNull { it.id == currentTargetId }
+
+    // The AtomGit gateway signer is supplied only by build-official.sh. Never run a
+    // plain Cargo build here: it would overwrite the official daemon with the stub
+    // implementation at the exact same target/release path.
+    val verifyOfficialDaemonForRunIde by registering {
+        val executable = currentDaemonTarget?.executable ?: "atomcode-daemon"
+        val daemon = repoRoot.resolve("target/release/$executable")
+        onlyIf {
+            currentDaemonTarget != null &&
+                providers.environmentVariable(currentDaemonTarget.env).orNull.isNullOrBlank()
+        }
+        doLast {
+            if (!Files.isRegularFile(daemon)) {
+                throw GradleException(
+                    "Official AtomCode daemon is missing. Run ./build-official.sh from the repository root before runIde."
+                )
+            }
+            val process = ProcessBuilder(daemon.toAbsolutePath().toString(), "--check-official-build")
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start()
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                throw GradleException(
+                    "target/release/$executable does not support official-build verification. " +
+                        "Run ./build-official.sh again before runIde."
+                )
+            }
+            if (process.exitValue() != 0) {
+                throw GradleException(
+                    "target/release/$executable does not contain the official AtomGit signer. " +
+                        "Run ./build-official.sh again before runIde."
+                )
+            }
+        }
+    }
 
     val bundleDaemon by registering {
+        val daemonSources = providers.provider {
+            daemonTargets.mapNotNull { target ->
+                providers.environmentVariable(target.env).orNull
+                    ?.let { repoRoot.fileSystem.getPath(it).toAbsolutePath().normalize() }
+                    ?: localDaemonCandidate(repoRoot, target, currentTargetId)
+            }.map { it.toFile() }
+        }
+        inputs.files(daemonSources)
         outputs.dir(bundledDaemonDir)
+        mustRunAfter(verifyOfficialDaemonForRunIde)
         doLast {
             val outputRoot = bundledDaemonDir.get().asFile.toPath()
             Files.createDirectories(outputRoot)
@@ -138,9 +190,18 @@ tasks {
         useJUnitPlatform()
     }
 
+    val buildWebview by registering(Exec::class) {
+        workingDir = file("src/main/resources/webview")
+        commandLine("npm", "run", "build")
+    }
+
     processResources {
-        dependsOn(bundleDaemon)
+        dependsOn(bundleDaemon, buildWebview)
         from(bundledDaemonDir)
+    }
+
+    named("runIde") {
+        dependsOn(verifyOfficialDaemonForRunIde)
     }
 
     listOf("buildSearchableOptions", "prepareJarSearchableOptions", "jarSearchableOptions").forEach { taskName ->
