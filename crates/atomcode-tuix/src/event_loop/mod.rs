@@ -227,6 +227,42 @@ fn cache_write_image(cache_dir: &std::path::Path, img: &atomcode_core::conversat
 /// input box. Mirror of the post-submit echo (`UiLine::ImageAttachment`)
 /// — same visual treatment so users see the attachment status pre-
 /// AND post-submit identically.
+/// Extract every `[Image #N]` marker number from `text`, in first-occurrence
+/// order, de-duped. Unlike `compute_input_attachments` this does NOT filter
+/// against pending state — it re-derives the markers purely from the text, used
+/// to render the `└ [Image #N]` echoes for a user message that arrives via
+/// `UserEcho` (sync mode), where the local submit path intentionally skipped
+/// them (the user row itself is also re-rendered from the echo, so emitting the
+/// echoes locally at submit time would orphan them ABOVE the later user row).
+fn image_markers_in_order(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let needle = b"[Image #";
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + needle.len() < bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let mut j = i + needle.len();
+            let mut n: usize = 0;
+            let mut had_digit = false;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n.saturating_mul(10).saturating_add((bytes[j] - b'0') as usize);
+                j += 1;
+                had_digit = true;
+            }
+            if had_digit && j < bytes.len() && bytes[j] == b']' {
+                if seen.insert(n) {
+                    out.push(n);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 pub(crate) fn compute_input_attachments(
     state: &crate::state::UiState,
     buf_text: &str,
@@ -4189,7 +4225,11 @@ fn attach_typed_image_paths(
         app.state.session_image_count += 1;
         let n = app.state.session_image_count;
         *text = text.replacen(&tok, &format!("[Image #{}]", n), 1);
-        renderer.render(UiLine::ImageAttachment(n));
+        // Sync mode re-renders the echo from UserEcho — skip the local one (see
+        // the idle-submit path) so it can't orphan above the later user row.
+        if ctx.sync_session.is_none() {
+            renderer.render(UiLine::ImageAttachment(n));
+        }
         images.push(img);
         kept_markers.push(n);
     }
@@ -5602,7 +5642,14 @@ fn handle_idle_key(
                     .zip(pending_hashes.into_iter())
                 {
                     if line.contains(&format!("[Image #{}]", n)) {
-                        renderer.render(UiLine::ImageAttachment(n));
+                        // Sync mode re-renders the user row (and now its image
+                        // echoes) from AgentEvent::UserEcho; emitting the echo
+                        // locally too would orphan a `└ [Image #N]` ABOVE the
+                        // later user row. Skip the local echo when synced — the
+                        // attachment data below still rides with the message.
+                        if ctx.sync_session.is_none() {
+                            renderer.render(UiLine::ImageAttachment(n));
+                        }
                         kept_refs.push(crate::input::history::HistoryImageRef {
                             hash: format!("{:016x}", hash),
                             mt: img.media_type.clone(),
@@ -5835,6 +5882,20 @@ mod parse_already_latest_versions_tests {
     #[test]
     fn rejects_unrelated_strings() {
         assert!(parse_already_latest_versions("something else entirely").is_none());
+    }
+}
+
+#[cfg(test)]
+mod image_marker_tests {
+    use super::image_markers_in_order as marks;
+
+    #[test]
+    fn extracts_markers_in_order_deduped() {
+        assert_eq!(marks("[Image #1] hi"), vec![1]);
+        assert_eq!(marks("[Image #2] and [Image #5] and [Image #2]"), vec![2, 5]);
+        assert_eq!(marks("no images here"), Vec::<usize>::new());
+        // Malformed markers are ignored.
+        assert_eq!(marks("[Image #] [Image #x] [Image #3]"), vec![3]);
     }
 }
 
@@ -6271,7 +6332,11 @@ fn handle_streaming_key(
                 .zip(pending_hashes.into_iter())
             {
                 if line.contains(&format!("[Image #{}]", n)) {
-                    renderer.render(UiLine::ImageAttachment(n));
+                    // Sync mode re-renders the echo via UserEcho when the queued
+                    // message dispatches; skip the local one (see idle path).
+                    if ctx.sync_session.is_none() {
+                        renderer.render(UiLine::ImageAttachment(n));
+                    }
                     q_refs.push(crate::input::history::HistoryImageRef {
                         hash: format!("{:016x}", hash),
                         mt: img.media_type.clone(),
@@ -7976,8 +8041,16 @@ fn handle_agent_event(
             }
         }
         AgentEvent::UserEcho(text) => {
-            // Live-sync: render the peer's user message as a user bubble.
+            // Live-sync: render the peer's user message as a user bubble, then
+            // its `└ [Image #N]` attachment echoes BELOW it. In sync mode the
+            // local submit path skips both (waiting for this echo) — emitting the
+            // image echoes locally at submit time would orphan them above the
+            // later user row (the reported "stray └ [Image #1]" bug).
+            let markers = image_markers_in_order(&text);
             renderer.render(UiLine::User(text));
+            for n in markers {
+                renderer.render(UiLine::ImageAttachment(n));
+            }
             renderer.flush();
         }
         AgentEvent::PeerBusy(running) => {
