@@ -134,6 +134,12 @@ pub struct UiState {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub cached_tokens: usize,
+    /// Per-turn token tallies (reset at turn end). Feed the footer's billable
+    /// token count + cache-hit annotation via [`turn_token_summary`]; kept
+    /// separate from the session-cumulative `*_tokens` above.
+    pub turn_prompt_tokens: usize,
+    pub turn_completion_tokens: usize,
+    pub turn_cached_tokens: usize,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
     /// While waiting on a tool approval, holds the `"Running {Tool}"`
@@ -296,6 +302,29 @@ pub struct PendingSeparator {
     /// flush render the ✗ "stopped" summary instead of a celebratory ✓ under
     /// the red Error line (preserves the pre-/goal-merge behaviour).
     pub errored: bool,
+    /// Cache-hit ratio over the turn's input, if the provider reported cached
+    /// tokens. `None` ⇒ no annotation. Rendered as `· N% cached`.
+    pub cached_pct: Option<u8>,
+}
+
+/// Turn-end token summary for the footer separator.
+///
+/// Returns `(billable_tokens, cached_pct)` from a turn's summed
+/// `prompt` / `completion` / `cached` token counts:
+///   - `billable` = output + UNCACHED input = `completion + (prompt - cached)`.
+///     This is what the turn actually cost — re-reading the cached prefix every
+///     round is near-free, so summing gross `prompt + completion` (the old v2
+///     footer) overstated usage by ~10-100× on long, multi-round turns.
+///   - `cached_pct` = `cached / prompt` rounded, or `None` when the provider
+///     reported no cached tokens (so we never show a misleading `0% cached`).
+pub fn turn_token_summary(prompt: usize, completion: usize, cached: usize) -> (usize, Option<u8>) {
+    let billable = completion + prompt.saturating_sub(cached);
+    let pct = if cached > 0 && prompt > 0 {
+        Some(((cached as u128 * 100 / prompt as u128).min(100)) as u8)
+    } else {
+        None
+    };
+    (billable, pct)
 }
 
 impl Default for UiState {
@@ -323,6 +352,9 @@ impl UiState {
             prompt_tokens: 0,
             completion_tokens: 0,
             cached_tokens: 0,
+            turn_prompt_tokens: 0,
+            turn_completion_tokens: 0,
+            turn_cached_tokens: 0,
             prior_phase: None,
             prior_spinner_label: None,
             thinking_idx: 0,
@@ -459,6 +491,11 @@ impl UiState {
         self.spinner_label.clear();
         self.turn_started_at = None;
         self.phase_started_at = None;
+        // Per-turn token tallies are consumed by the separator that renders just
+        // before this; clear them so the next turn starts fresh.
+        self.turn_prompt_tokens = 0;
+        self.turn_completion_tokens = 0;
+        self.turn_cached_tokens = 0;
         // Turn finished normally — no need to offer resubmit of the
         // message any more. (On cancel, the streaming-key handler
         // already took() the Option before the TurnCancelled event
@@ -472,6 +509,9 @@ impl UiState {
         self.spinner_label.clear();
         self.turn_started_at = None;
         self.phase_started_at = None;
+        self.turn_prompt_tokens = 0;
+        self.turn_completion_tokens = 0;
+        self.turn_cached_tokens = 0;
     }
 
     pub fn on_error(&mut self) {
@@ -680,6 +720,32 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_token_summary_reports_billable_and_cached_pct() {
+        // A heavily-cached round: 118K context, 114.46K of it cached, 2K output.
+        // Billable = output + uncached input = 2000 + (118000 - 114460) = 5540.
+        // Cached% = 114460 / 118000 ≈ 97%.
+        let (billable, pct) = turn_token_summary(118_000, 2_000, 114_460);
+        assert_eq!(billable, 5_540);
+        assert_eq!(pct, Some(97));
+    }
+
+    #[test]
+    fn turn_token_summary_no_cache_info_omits_pct() {
+        // Provider didn't report cached tokens → no annotation, billable = prompt+completion.
+        let (billable, pct) = turn_token_summary(100, 10, 0);
+        assert_eq!(billable, 110);
+        assert_eq!(pct, None);
+    }
+
+    #[test]
+    fn turn_token_summary_clamps_degenerate_cached() {
+        // Defensive: a provider reporting cached > prompt must not underflow or exceed 100%.
+        let (billable, pct) = turn_token_summary(100, 5, 150);
+        assert_eq!(billable, 5); // prompt.saturating_sub(cached) == 0
+        assert_eq!(pct, Some(100));
+    }
 
     // Regression: terminals whose font lacks `◐` / `…` (Windows legacy
     // conhost with default Consolas) used to show `□` tofu for both.

@@ -6588,6 +6588,7 @@ fn turn_summary_label(
     turn_count: usize,
     tool_call_count: usize,
     total_tokens: usize,
+    cached_pct: Option<u8>,
     dur: &str,
 ) -> String {
     if errored {
@@ -6609,6 +6610,7 @@ fn turn_summary_label(
             tool_call_count,
             duration: dur,
             total_tokens,
+            cached_pct,
         })
         .into_owned()
     }
@@ -6617,20 +6619,26 @@ fn turn_summary_label(
 fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_goal_end: bool) {
     let Some(ps) = state.pending_separator.take() else { return };
     let dur = crate::render::fmt_dur(ps.duration);
+    let cached = ps
+        .cached_pct
+        .map(|p| format!(" · {p}% cached"))
+        .unwrap_or_default();
     let label = if as_goal_end {
         format!(
-            "{} tools · {} · {} tokens",
+            "{} tools · {} · {} tokens{}",
             ps.tool_call_count,
             dur,
-            crate::i18n::fmt_tokens(ps.total_tokens)
+            crate::i18n::fmt_tokens(ps.total_tokens),
+            cached,
         )
     } else if ps.was_goal_round {
         format!(
-            "↻ goal round {} · {} tools · {} · {} tokens",
+            "↻ goal round {} · {} tools · {} · {} tokens{}",
             state.goal_round.max(1),
             ps.tool_call_count,
             dur,
-            crate::i18n::fmt_tokens(ps.total_tokens)
+            crate::i18n::fmt_tokens(ps.total_tokens),
+            cached,
         )
     } else {
         // Reached only if a non-goal turn was ever buffered (today they
@@ -6641,6 +6649,7 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
             ps.turn_count,
             ps.tool_call_count,
             ps.total_tokens,
+            ps.cached_pct,
             &dur,
         )
     };
@@ -7158,6 +7167,21 @@ fn handle_agent_event(
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
             let errored = matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error);
+            // Footer token count: bill output + UNCACHED input (re-reading the
+            // cached prefix each round is near-free). The event's `total_tokens`
+            // is the v2 gross sum (prompt+completion per round) which overstates
+            // usage ~10-100× on long multi-round turns — recompute from the
+            // per-turn tallies instead. Falls back to the event value if no
+            // per-round usage arrived (turn_prompt 0).
+            let (total_tokens, cached_pct) = if state.turn_prompt_tokens > 0 {
+                crate::state::turn_token_summary(
+                    state.turn_prompt_tokens,
+                    state.turn_completion_tokens,
+                    state.turn_cached_tokens,
+                )
+            } else {
+                (total_tokens, None)
+            };
             if state.goal_condition.is_some() {
                 // A /goal is active: DEFER the separator so the next event can
                 // choose its form — a `✓ Goal met` banner ABOVE a stats-only
@@ -7171,6 +7195,7 @@ fn handle_agent_event(
                     total_tokens,
                     was_goal_round: true,
                     errored,
+                    cached_pct,
                 });
             } else {
                 // No active goal: render the turn summary immediately, exactly
@@ -7178,8 +7203,15 @@ fn handle_agent_event(
                 // the turn that just finished instead of waiting for the next
                 // event. Same i18n + Error-aware label as the deferred path.
                 let dur = crate::render::fmt_dur(duration);
-                let label =
-                    turn_summary_label(state, errored, turn_count, tool_call_count, total_tokens, &dur);
+                let label = turn_summary_label(
+                    state,
+                    errored,
+                    turn_count,
+                    tool_call_count,
+                    total_tokens,
+                    cached_pct,
+                    &dur,
+                );
                 renderer.render(UiLine::TurnSeparator { label });
             }
             renderer.flush();
@@ -7474,6 +7506,11 @@ fn handle_agent_event(
             state.completion_tokens += u.completion_tokens;
             state.cached_tokens += u.cached_tokens;
             state.total_tokens += u.completion_tokens;
+            // Per-turn tallies for the footer's billable count + cache annotation
+            // (reset in on_turn_complete / on_turn_cancelled).
+            state.turn_prompt_tokens += u.prompt_tokens;
+            state.turn_completion_tokens += u.completion_tokens;
+            state.turn_cached_tokens += u.cached_tokens;
         }
         AgentEvent::WorkingDirChanged(new_dir) => {
             // Fires when a tool (change_dir / bash cd) or an AgentCommand::ChangeDir

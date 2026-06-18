@@ -442,6 +442,7 @@ fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String
             tool_call_count: s.tool_call_count,
             duration: &crate::render::fmt_dur(std::time::Duration::from_millis(s.duration_ms)),
             total_tokens: s.total_tokens,
+            cached_pct: None,
         })
         .into_owned(),
         None => String::new(),

@@ -699,6 +699,9 @@ pub enum Msg<'a> {
         tool_call_count: usize,
         duration: &'a str,
         total_tokens: usize,
+        /// Cache-hit ratio over the turn's input, if reported. `Some(n)` appends
+        /// `· n% cached`; `None` appends nothing.
+        cached_pct: Option<u8>,
     },
 
     /// Turn-end summary when the turn terminated in an error (the red
