@@ -1055,6 +1055,15 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CliHelpMarketplaceName => "市场名称".into(),
         Msg::CliAboutHelp => "打印帮助信息".into(),
         Msg::CliHelpMcpCommand => "可执行文件及参数".into(),
+
+        // ── engine v2 provider init (atomcode-bridge) ──
+        Msg::ProviderInitFailed { detail } =>
+            format!("模型初始化失败：{detail}").into(),
+        Msg::GatewayAuthUnavailable { base_url } =>
+            format!(
+                "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\
+                 或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
+            ).into(),
     }
 }
 

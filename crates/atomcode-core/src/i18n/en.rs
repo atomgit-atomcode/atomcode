@@ -1072,6 +1072,16 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CliHelpMarketplaceName => "Marketplace name".into(),
         Msg::CliAboutHelp => "Print this message or the help of the given subcommand(s)".into(),
         Msg::CliHelpMcpCommand => "Executable and arguments".into(),
+
+        // ── engine v2 provider init (atomcode-bridge) ──
+        Msg::ProviderInitFailed { detail } =>
+            format!("provider init failed: {detail}").into(),
+        Msg::GatewayAuthUnavailable { base_url } =>
+            format!(
+                "provider base_url '{base_url}' is an AtomGit gateway this build can't \
+                 authenticate against. Use the official binary, or point the provider at a \
+                 plain OpenAI-compatible endpoint with an api_key."
+            ).into(),
     }
 }
 

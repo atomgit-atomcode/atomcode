@@ -933,4 +933,13 @@ pub enum Msg<'a> {
     CliHelpMcpCommand,
     /// About for the built-in help subcommand.
     CliAboutHelp,
+
+    // ── engine v2 provider init (atomcode-bridge) ──
+    /// Frame for a provider/engine init failure surfaced to the driver.
+    /// `detail` carries the underlying cause (often `GatewayAuthUnavailable`).
+    ProviderInitFailed { detail: &'a str },
+    /// The configured `base_url` is an AtomGit gateway that this (open-source)
+    /// build can't sign requests for. Points the user at the official binary
+    /// or a plain OpenAI-compatible endpoint.
+    GatewayAuthUnavailable { base_url: &'a str },
 }
