@@ -12,6 +12,16 @@
 
 use std::time::Duration;
 
+/// How long an idle keep-alive connection may sit in the pool before we drop
+/// it. reqwest's default is 90s; gateway load balancers commonly close idle
+/// connections sooner (≈60s), so the default lets us reuse a connection the
+/// server has already closed — surfacing as "error sending request"
+/// (`ConnectionReset`). Dropping our side at 30s keeps us under typical LB
+/// windows; the broadened retry classifier ([`is_retryable_reqwest_error`])
+/// is the correctness backstop if a stale connection is reused anyway. Only
+/// affects *idle* connections — an active stream is never reaped.
+pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Retry configuration for the open call.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
@@ -52,9 +62,56 @@ pub(crate) fn is_retryable_status(code: u16) -> bool {
     matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
-/// Transient transport errors worth retrying (connect / timeout).
+/// Transient transport errors worth retrying.
+///
+/// `is_timeout() || is_connect()` alone is too narrow: reqwest only reports
+/// `is_connect()` for failures during connection *establishment*. The common
+/// real-world case — a keep-alive connection that the gateway's load balancer
+/// silently closed on idle-timeout, then we reuse it — surfaces as
+/// "error sending request" with `is_connect() == false`, wrapping an
+/// `io::Error(ConnectionReset)`. That used to be classified non-retryable and
+/// hard-failed (the user-reported "open failed" that `/login` "fixed" by
+/// rebuilding the client's pool). We now also walk the source chain for a
+/// transient transport `io::Error` so the open loop reconnects transparently.
 pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
+    err.is_timeout() || err.is_connect() || chain_has_transient_io(err)
+}
+
+/// True if any error in `err`'s `source()` chain is an `io::Error` whose kind
+/// indicates a dropped/half-open connection (as opposed to a logical failure
+/// like NotFound). Retrying these is safe **only on the OPEN path** (no
+/// response bytes consumed yet) — mid-stream errors stay non-retryable.
+pub(crate) fn chain_has_transient_io(err: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind::*;
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected
+            ) {
+                return true;
+            }
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// Render an error plus its full `source()` chain as `top: cause: root`.
+/// reqwest's Display for a transport failure is only the opaque shell
+/// ("error sending request for url (…)"); the actionable cause
+/// (`connection reset by peer (os error 54)`, `dns error`, …) lives in the
+/// chain. Surfacing it turns the error line into a self-diagnosing probe.
+pub(crate) fn err_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut cur = err.source();
+    while let Some(e) = cur {
+        out.push_str(": ");
+        out.push_str(&e.to_string());
+        cur = e.source();
+    }
+    out
 }
 
 /// Parse `Retry-After` as integer seconds. `None` for absent / malformed / HTTP-date.
@@ -140,5 +197,77 @@ mod tests {
         let a1 = compute_backoff(1, &policy);
         let a5 = compute_backoff(5, &policy);
         assert!(a5 > a1, "backoff should grow: a1={a1:?} a5={a5:?}");
+    }
+
+    // A two-level error chain `outer -> io::Error(kind)`, mirroring how a
+    // reqwest "error sending request" wraps a hyper error wrapping the
+    // underlying io error.
+    #[derive(Debug)]
+    struct Wrap(std::io::Error);
+    impl std::fmt::Display for Wrap {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "error sending request")
+        }
+    }
+    impl std::error::Error for Wrap {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn chain_has_transient_io_detects_connection_drops() {
+        use std::io::{Error, ErrorKind};
+        // The exact class we were missing: a connection reset surfaced
+        // *through* a wrapper (is_connect() == false), so the old
+        // `is_timeout() || is_connect()` check would have said "not
+        // retryable" and hard-failed instead of reconnecting.
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::NotConnected,
+        ] {
+            let e = Wrap(Error::new(kind, "boom"));
+            assert!(
+                chain_has_transient_io(&e),
+                "{kind:?} buried in the chain must be treated as transient"
+            );
+        }
+        // A bare io error (no wrapper) is detected too.
+        assert!(chain_has_transient_io(&Error::new(ErrorKind::BrokenPipe, "bp")));
+    }
+
+    #[test]
+    fn chain_has_transient_io_ignores_non_transport_errors() {
+        use std::io::{Error, ErrorKind};
+        // NotFound / PermissionDenied are not transport hiccups — must NOT
+        // be retried (re-sending won't help and could mask a real fault).
+        assert!(!chain_has_transient_io(&Wrap(Error::new(ErrorKind::NotFound, "nf"))));
+        assert!(!chain_has_transient_io(&Wrap(Error::new(ErrorKind::PermissionDenied, "pd"))));
+        // An error chain with no io::Error at all → not classified transient.
+        #[derive(Debug)]
+        struct Plain;
+        impl std::fmt::Display for Plain {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "plain")
+            }
+        }
+        impl std::error::Error for Plain {}
+        assert!(!chain_has_transient_io(&Plain));
+    }
+
+    #[test]
+    fn err_chain_appends_the_underlying_cause() {
+        use std::io::{Error, ErrorKind};
+        // The whole point of the probe: the top-level reqwest Display
+        // ("error sending request") hides the cause; err_chain must surface
+        // the buried "connection reset by peer" so the next failure is
+        // diagnosable at a glance.
+        let e = Wrap(Error::new(ErrorKind::ConnectionReset, "connection reset by peer (os error 54)"));
+        let s = err_chain(&e);
+        assert!(s.contains("error sending request"), "keeps the top message: {s}");
+        assert!(s.contains("connection reset by peer (os error 54)"), "appends the cause: {s}");
     }
 }

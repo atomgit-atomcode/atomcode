@@ -73,7 +73,7 @@ To list directories, use `list_directory` instead of `bash ls` / `find` when a t
 To find files by path/name, use `glob` instead of `bash find` / `fd` unless you need shell-specific predicates.
 To search file contents, use `grep` instead of `bash grep` / `rg` unless you need shell-specific flags or streaming output.
 To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites.
-To change the working directory for future tools, use `change_dir` instead of `bash cd`.
+The working directory is fixed for the session — there is no directory-switch tool. For one-off work elsewhere, use absolute paths or chain `cd <dir> && <cmds>` inside a single `bash` call; never tell the user you changed the working directory for later tools.
 To open or preview a local file or directory in the GUI, use `open_file` — not `bash open`, not `bash xdg-open`, not `bash start`, and not `bash wslview`.
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.
 Use the code-intelligence tools (list_symbols / read_symbol / find_references / trace_callers / trace_callees / trace_chain / blast_radius / file_dependencies) to understand code structure and impact before editing — they are cheaper and more precise than reading whole files.
@@ -131,14 +131,37 @@ mod tests {
         // Every mounted tool the discipline/model relies on must be advertised, so the
         // model knows it exists. edit_file in particular: the verify hook keys on it and
         // the persona tells the model to "prefer editing existing files".
+        // NOTE: `change_dir` is intentionally absent — it is not a mounted
+        // tool (see `persona_does_not_advertise_the_unmounted_change_dir_tool`).
         for tool in [
             "read_file", "write_file", "edit_file", "grep", "glob", "bash",
-            "list_directory", "change_dir", "open_file", "list_symbols", "read_symbol",
+            "list_directory", "open_file", "list_symbols", "read_symbol",
             "find_references", "trace_callers", "trace_callees", "trace_chain",
             "blast_radius", "file_dependencies",
         ] {
             assert!(p.contains(tool), "persona must advertise the mounted tool `{tool}`");
         }
+    }
+
+    #[test]
+    fn persona_does_not_advertise_the_unmounted_change_dir_tool() {
+        // `change_dir` is deliberately NOT registered (capabilities `cd.rs`:
+        // weak models loop on it, and the working directory stays fixed for
+        // the session). The system prompt must therefore not tell the model
+        // to use it — otherwise the model obeys, calls an unmounted tool, and
+        // hits "unknown or unmounted tool: change_dir" (the reported
+        // regression), then misleadingly claims `bash cd` switched the dir.
+        let p = coding_persona("m");
+        assert!(
+            !p.contains("change_dir"),
+            "persona must not advertise the unmounted `change_dir` tool"
+        );
+        // Guard the premise: change_dir is unregistered by design. If it ever
+        // gets mounted, restore the directory-switch guidance deliberately.
+        assert!(
+            !atomcode_capabilities::tools::coding_tool_names().contains(&"change_dir"),
+            "change_dir is intentionally unregistered; if that changes, update the persona too"
+        );
     }
 
     #[test]
@@ -185,7 +208,6 @@ mod tests {
             "instead of `bash ls`",
             "instead of `bash find`",
             "instead of `bash grep`",
-            "instead of `bash cd`",
             "not `bash open`",
             "not `bash xdg-open`",
             "not `bash start`",

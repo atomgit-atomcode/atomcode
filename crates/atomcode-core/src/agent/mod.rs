@@ -528,6 +528,13 @@ pub struct AgentLoop {
     /// LLM returns no tool calls, or when the step budget is hit).
     max_turns: Option<usize>,
     retry_count: usize,
+    /// Independent retry budget for empty-response failures (provider
+    /// returned 200 OK with no text and no tool calls). Kept separate from
+    /// `retry_count` because an empty response is an instant, transient
+    /// upstream hiccup that usually recovers on a quick resend — it gets
+    /// more attempts and a far shorter backoff than the generic error path.
+    /// Reset alongside `retry_count` on each new user message / goal round.
+    empty_response_retries: usize,
     /// Tool-call IDs already forwarded to the renderer in the current
     /// user turn. Cleared at the start of each new user message (in
     /// `process_user_input` per-turn reset block).
@@ -1069,6 +1076,7 @@ impl AgentLoop {
             turn_count: 0,
             max_turns: None,
             retry_count: 0,
+            empty_response_retries: 0,
             emitted_tool_ids: std::collections::HashSet::new(),
             approval_req_rx,
             approval_resp_tx,
@@ -1971,6 +1979,7 @@ impl AgentLoop {
         self.tool_call_count = 0;
         self.turn_count = 0;
         self.retry_count = 0;
+        self.empty_response_retries = 0;
         self.emitted_tool_ids.clear();
         self.files_read_this_turn.clear();
         self.files_edited_this_turn.clear();
@@ -2147,6 +2156,7 @@ impl AgentLoop {
                     self.turn_count = 0;
                     self.tool_call_count = 0;
                     self.retry_count = 0;
+                    self.empty_response_retries = 0;
                     self.cancel_token = CancellationToken::new();
                     self.files_edited_this_turn.clear();
                     self.files_read_this_turn.clear();
@@ -2982,6 +2992,10 @@ impl AgentLoop {
                     // "[API error 请求失败]" lines hardcoded in Chinese that
                     // would also display to English-locale users).
                     let is_official_build_required = is_codingplan_unavailable_error(&e);
+                    // Provider returned 200 OK with a completely empty
+                    // completion (no text, no tool calls). Transient upstream
+                    // hiccup — handled by its own fast-retry branch below.
+                    let is_empty_response = is_empty_response_error(&e);
 
                     if is_official_build_required {
                         self.datalog.log_error(&e);
@@ -2992,6 +3006,48 @@ impl AgentLoop {
                         });
                         self.finish_turn(TurnStopReason::Error);
                         return self.last_stop_reason;
+                    } else if is_empty_response {
+                        // Provider returned a 200 OK with a completely empty
+                        // completion (no text, no tool calls). Confirmed
+                        // transient on deepseek-v4-flash via the atomgit
+                        // gateway, which only forwards to DeepSeek's official
+                        // API: datalog shows the SAME request resent recovers
+                        // (one session logged empty×3 then success on the 4th
+                        // send), and the empty rate was actually HIGHER at
+                        // <10K context than at >100K — so this is an upstream/
+                        // model hiccup, not a context-size or request problem.
+                        // It returns instantly, so the generic 3/6/9s backoff
+                        // is pure wasted latency: retry quickly, a few more
+                        // times, on an independent budget.
+                        if self.empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES {
+                            self.empty_response_retries += 1;
+                            // Front-loaded short backoff: 1,1,2,2,3s (~9s for
+                            // all 5 attempts vs 18s for the old 3-shot path).
+                            let wait =
+                                (((self.empty_response_retries + 1) / 2).min(3)) as u64;
+                            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                                "\n[模型返回空响应，重试中({}/{})...]\n",
+                                self.empty_response_retries, EMPTY_RESPONSE_MAX_RETRIES
+                            )));
+                            tokio::time::sleep(Duration::from_secs(wait)).await;
+                            continue;
+                        } else {
+                            // Exhausted: surface a clear, non-alarming reason
+                            // (not the misleading generic "请求失败") and keep
+                            // the conversation snapshot so the user can simply
+                            // resend.
+                            self.datalog.log_error(&e);
+                            self.report_error("empty_response", &e).await;
+                            let _ = self.event_tx.send(AgentEvent::Error {
+                                error: format!(
+                                    "模型连续 {} 次返回空响应（上游偶发，与上下文长度无关）。可直接回车重试，或稍后再试。",
+                                    EMPTY_RESPONSE_MAX_RETRIES
+                                ),
+                                snapshot: self.conversation.snapshot(),
+                            });
+                            self.finish_turn(TurnStopReason::Error);
+                            return self.last_stop_reason;
+                        }
                     } else if (is_messages_illegal || is_context_overflow) && self.retry_count < 2 {
                         self.retry_count += 1;
                         let sys_prompt = self.build_system_prompt();
@@ -4077,6 +4133,28 @@ fn is_codingplan_unavailable_error(e: &str) -> bool {
     e.contains("atomgit_atomcode/atomcode/releases")
 }
 
+/// Max quick-retries for an empty provider response before giving up.
+/// Empty responses are instant and transient (see `is_empty_response_error`),
+/// so more attempts with a short backoff recover the common bursty case far
+/// better than the generic 3-shot / 18s path.
+const EMPTY_RESPONSE_MAX_RETRIES: usize = 5;
+
+/// True when the turn failed because the provider returned a 200 OK with a
+/// completely empty completion — no text and no tool calls (per datalog,
+/// usually no reasoning either). Emitted verbatim by `turn::runner` when both
+/// `text_buf` and `tool_calls_buf` are empty.
+///
+/// Confirmed transient on deepseek-v4-flash (atomgit gateway → DeepSeek's
+/// official API): the identical request resent recovers — one logged session
+/// returned empty×3 then succeeded on the 4th send — and the empty rate was
+/// higher at <10K context than at >100K, ruling out a context-size cause.
+/// The retry classifier routes this to a dedicated fast-retry branch instead
+/// of the generic backoff, so the common hiccup recovers in ~1-2s rather than
+/// stalling 18s and then mislabeling itself "请求失败".
+fn is_empty_response_error(e: &str) -> bool {
+    e.contains("Provider returned an empty response")
+}
+
 fn should_show_raw_api_error() -> bool {
     !matches!(
         std::env::var("ATOMCODE_SHOW_RAW_API_ERROR").as_deref(),
@@ -4450,8 +4528,9 @@ mod agent_handle_tests {
 mod classifier_tests {
     use super::{
         extract_provider_ctx_limit, is_auth_error, is_codingplan_unavailable_error,
-        is_context_overflow_error, is_rate_limited_error, parse_retry_after_hint,
-        public_error_message, public_error_reason, reload_should_clear_conversation,
+        is_context_overflow_error, is_empty_response_error, is_insufficient_balance_error,
+        is_rate_limited_error, parse_retry_after_hint, public_error_message, public_error_reason,
+        reload_should_clear_conversation,
     };
 
     // ── reload_should_clear_conversation ──
@@ -4538,6 +4617,32 @@ mod classifier_tests {
     #[test]
     fn generic_rate_limit_is_not_overflow() {
         assert!(!is_context_overflow_error("429 Too Many Requests"));
+    }
+
+    #[test]
+    fn empty_provider_response_is_classified() {
+        // Exact string emitted by turn::runner when text_buf + tool_calls
+        // are both empty (crates/atomcode-core/src/turn/runner.rs).
+        let msg = "Provider returned an empty response (no text, no tool calls).";
+        assert!(is_empty_response_error(msg));
+    }
+
+    #[test]
+    fn empty_response_not_confused_with_other_errors() {
+        let msg = "Provider returned an empty response (no text, no tool calls).";
+        // Must NOT be stolen by (or fail-fast'd in) any other classifier:
+        // the dedicated fast-retry branch has to win.
+        assert!(!is_context_overflow_error(msg));
+        assert!(!is_rate_limited_error(msg));
+        assert!(!is_auth_error(msg));
+        assert!(!is_insufficient_balance_error(msg));
+        assert!(!is_codingplan_unavailable_error(msg));
+        // The inline `is_messages_illegal` guard keys off "illegal"/"messages";
+        // neither appears in the empty-response string, so it can't steal it.
+        assert!(!msg.contains("illegal") && !msg.contains("messages"));
+        // And real errors are not misread as empty responses.
+        assert!(!is_empty_response_error("429 Too Many Requests"));
+        assert!(!is_empty_response_error("prompt is too long: 250000 tokens"));
     }
 
     #[test]

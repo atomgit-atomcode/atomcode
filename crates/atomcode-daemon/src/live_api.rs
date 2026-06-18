@@ -686,6 +686,9 @@ impl KernelTurnExecutor {
             // BypassAll decider / `/chat` interactive perm_rx), so the bridge must
             // NOT auto-approve — keep the round-trip and the daemon decides.
             dangerously_skip_permissions: false,
+            // Keep the fail-closed approval timeout for the daemon (current behavior); the
+            // interactive PARK behavior is wired for the cli TUI path for now.
+            interactive: false,
         })
     }
 }
@@ -997,6 +1000,8 @@ pub(crate) fn chat_bridge_config(
         // The daemon answers `/chat` approvals at its own seam (interactive perm_rx),
         // so the bridge must keep the round-trip rather than auto-approving here.
         dangerously_skip_permissions: false,
+        // Keep the fail-closed approval timeout for the daemon (current behavior).
+        interactive: false,
     }
 }
 

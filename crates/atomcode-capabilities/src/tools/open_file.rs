@@ -7,10 +7,14 @@
 
 use super::{err, ok, resolve_path};
 use async_trait::async_trait;
-use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
+use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
+use atomcode_kernel::request::RequestCtx;
+use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, RwLock};
 
 pub struct OpenFileTool;
 
@@ -205,6 +209,85 @@ impl Tool for OpenFileTool {
     }
 }
 
+/// Auto-approve `open_file` when its target is INSIDE the live workspace.
+///
+/// `open_file` is intrinsically [`Risky`](RiskLevel::Risky) (it launches a GUI viewer —
+/// a user-visible side effect), so [`ApprovalMiddleware`] prompts on every call. But for
+/// a file inside the working directory the side effect is benign — the user asked to
+/// preview their own project file — and the legacy engine auto-approved exactly this case
+/// (its path-aware `approval_with_context`). The kernel's `Tool::risk(&self, _args)` is
+/// deliberately context-free (no `working_dir`), so the policy can't live on the tool; it
+/// lives here, in v2's middleware idiom (the same shape as [`SensitivePathGate`], inverted:
+/// that gate ADDS a prompt for Safe reads of sensitive paths, this one REMOVES the prompt
+/// for a Risky open of an in-workspace path).
+///
+/// It force-[`Allow`](BeforeOutcome::Allow)s an in-workspace `open_file` so the call
+/// bypasses the approval round-trip; any out-of-workspace path falls through
+/// ([`Proceed`](BeforeOutcome::Proceed)) and still prompts. **Register it BEFORE
+/// [`ApprovalMiddleware`]** so its `Allow` short-circuits the `before` chain.
+///
+/// The workspace boundary is read from the SAME live cwd handle the kernel uses to build
+/// each call's `ToolContext.working_dir`, so a mid-session `change_dir` is reflected and
+/// the decision always matches where the file actually opens.
+///
+/// [`ApprovalMiddleware`]: super::approval::ApprovalMiddleware
+/// [`SensitivePathGate`]: super::sensitive_path::SensitivePathGate
+pub struct OpenFileWorkspaceGate {
+    cwd: Arc<RwLock<PathBuf>>,
+}
+
+impl OpenFileWorkspaceGate {
+    /// Gate over the LIVE (mutable) working dir — the handle the kernel also reads per call,
+    /// so a `change_dir` mid-session moves the boundary with it.
+    pub fn new(cwd: Arc<RwLock<PathBuf>>) -> Self {
+        Self { cwd }
+    }
+
+    /// Gate over a FIXED workspace root — for assemblies that pin an immutable working dir
+    /// (no shared cwd handle to follow).
+    pub fn pinned(root: PathBuf) -> Self {
+        Self { cwd: Arc::new(RwLock::new(root)) }
+    }
+
+    /// True iff `args` names an `open_file` target that canonicalizes to a path inside
+    /// `working_dir`. CONSERVATIVE: any parse / canonicalize failure returns `false` (→ defer
+    /// to approval), and a `..` escape is rejected because BOTH sides are canonicalized
+    /// before the prefix check (a lexical `starts_with` would let `ws/../etc` through).
+    fn target_in_workspace(args: &str, working_dir: &Path) -> bool {
+        let Ok(parsed) = serde_json::from_str::<Args>(args) else {
+            return false;
+        };
+        let Ok(root) = std::fs::canonicalize(working_dir) else {
+            return false;
+        };
+        let target = resolve_path(&parsed.file_path, working_dir);
+        let Ok(canon) = std::fs::canonicalize(&target) else {
+            return false; // missing / unreadable file → let approval handle it
+        };
+        canon.starts_with(&root)
+    }
+}
+
+#[async_trait]
+impl ToolMiddleware for OpenFileWorkspaceGate {
+    async fn before(&self, call: &mut ToolCall, tool: &Arc<dyn Tool>, _rt: &RequestCtx) -> BeforeOutcome {
+        if tool.name() != "open_file" {
+            return BeforeOutcome::Proceed;
+        }
+        // Snapshot the live cwd. A poisoned lock means we can't tell where we are — defer to
+        // approval rather than risk a wrong auto-approve (and never panic: kernel is panic=abort).
+        let cwd = match self.cwd.read() {
+            Ok(g) => g.clone(),
+            Err(_) => return BeforeOutcome::Proceed,
+        };
+        if Self::target_in_workspace(&call.arguments, &cwd) {
+            BeforeOutcome::Allow { reason: Some("open_file target is inside the workspace".into()) }
+        } else {
+            BeforeOutcome::Proceed
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +372,133 @@ mod tests {
         assert!(r.is_error);
         assert!(r.content.contains("cannot open in GUI"), "{}", r.content);
         assert!(r.content.contains("x.html"), "{}", r.content);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::{OpenFileTool, OpenFileWorkspaceGate};
+    use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
+    use atomcode_kernel::request::RequestCtx;
+    use atomcode_kernel::tool::{Tool, ToolCall};
+    use std::path::Path;
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    /// A driver that never answers — the gate must decide WITHOUT a round-trip, so a
+    /// silent rt is safe (any `.await` on it would hang/time out, which no test wants).
+    fn silent_rt() -> RequestCtx {
+        let (tx, _rx) = unbounded_channel();
+        RequestCtx::new(tx, Some(Duration::from_millis(20)))
+    }
+
+    fn cwd_handle(p: &Path) -> Arc<RwLock<std::path::PathBuf>> {
+        Arc::new(RwLock::new(p.to_path_buf()))
+    }
+
+    fn open_call(file_path: &str) -> ToolCall {
+        ToolCall {
+            id: "1".into(),
+            name: "open_file".into(),
+            arguments: format!(r#"{{"file_path":{file_path:?}}}"#),
+        }
+    }
+
+    #[tokio::test]
+    async fn in_workspace_file_is_auto_approved() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(d.path()).unwrap();
+        std::fs::write(cwd.join("page.html"), "<h1>hi</h1>").unwrap();
+        let gate = OpenFileWorkspaceGate::new(cwd_handle(&cwd));
+        let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
+        let mut call = open_call("page.html"); // relative → resolves inside the workspace
+        let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            matches!(outcome, BeforeOutcome::Allow { .. }),
+            "in-workspace open_file must auto-approve, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_in_workspace_path_is_auto_approved() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(d.path()).unwrap();
+        let abs = cwd.join("p.html");
+        std::fs::write(&abs, "x").unwrap();
+        let gate = OpenFileWorkspaceGate::new(cwd_handle(&cwd));
+        let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
+        let mut call = open_call(abs.to_str().unwrap()); // absolute, but still under cwd
+        let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(matches!(outcome, BeforeOutcome::Allow { .. }), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn out_of_workspace_file_defers_to_approval() {
+        let ws = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other = std::fs::canonicalize(other.path()).unwrap();
+        std::fs::write(other.join("x.html"), "x").unwrap();
+        let gate = OpenFileWorkspaceGate::new(cwd_handle(&std::fs::canonicalize(ws.path()).unwrap()));
+        let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
+        let mut call = open_call(other.join("x.html").to_str().unwrap());
+        let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert_eq!(outcome, BeforeOutcome::Proceed, "out-of-workspace open_file must still prompt");
+    }
+
+    #[tokio::test]
+    async fn dotdot_escape_is_not_in_workspace() {
+        // workspace = ws/sub; target ws/sub/../secret.html canonicalizes to ws/secret.html
+        // (OUTSIDE) — a lexical starts_with would wrongly pass, canonicalization rejects it.
+        let ws = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(ws.path()).unwrap();
+        std::fs::create_dir(ws.join("sub")).unwrap();
+        std::fs::write(ws.join("secret.html"), "x").unwrap();
+        let gate = OpenFileWorkspaceGate::new(cwd_handle(&ws.join("sub")));
+        let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
+        let mut call = open_call("../secret.html");
+        let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert_eq!(outcome, BeforeOutcome::Proceed, "a ../ escape must NOT auto-approve");
+    }
+
+    #[tokio::test]
+    async fn non_open_file_tool_is_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(d.path()).unwrap();
+        std::fs::write(cwd.join("a.txt"), "x").unwrap();
+        let gate = OpenFileWorkspaceGate::new(cwd_handle(&cwd));
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::write::WriteFileTool);
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "write_file".into(),
+            arguments: r#"{"file_path":"a.txt","content":"x"}"#.into(),
+        };
+        let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert_eq!(outcome, BeforeOutcome::Proceed, "the gate must only touch open_file");
+    }
+
+    #[tokio::test]
+    async fn unparseable_args_defer_to_approval() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(d.path()).unwrap();
+        let gate = OpenFileWorkspaceGate::new(cwd_handle(&cwd));
+        let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
+        let mut call =
+            ToolCall { id: "1".into(), name: "open_file".into(), arguments: r#"{"wrong":1}"#.into() };
+        let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert_eq!(outcome, BeforeOutcome::Proceed, "bad args must fall through (conservative)");
+    }
+
+    #[tokio::test]
+    async fn legacy_path_alias_in_workspace_is_auto_approved() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(d.path()).unwrap();
+        std::fs::write(cwd.join("p.html"), "x").unwrap();
+        let gate = OpenFileWorkspaceGate::new(cwd_handle(&cwd));
+        let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
+        let mut call =
+            ToolCall { id: "1".into(), name: "open_file".into(), arguments: r#"{"path":"p.html"}"#.into() };
+        let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(matches!(outcome, BeforeOutcome::Allow { .. }), "legacy `path` alias, got {outcome:?}");
     }
 }
