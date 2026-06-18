@@ -5820,6 +5820,40 @@ mod parse_already_latest_versions_tests {
     }
 }
 
+#[cfg(test)]
+mod streaming_slash_tests {
+    use super::streaming_executable_slash as exec;
+
+    #[test]
+    fn goal_halt_subcommands_run_mid_stream() {
+        // The whole point: `/goal clear` (and its aliases) must execute while a
+        // turn is running, because a server-driven goal keeps the TUI in
+        // Streaming where commands are otherwise blocked.
+        for sub in ["clear", "stop", "off", "reset", "none", "cancel"] {
+            let got = exec(&format!("/goal {sub}"));
+            assert_eq!(got, Some(("goal".to_string(), sub.to_string())), "sub={sub}");
+        }
+    }
+
+    #[test]
+    fn bg_no_arg_runs_but_setting_a_goal_does_not() {
+        assert_eq!(exec("/bg"), Some(("bg".to_string(), String::new())));
+        // Backgrounding a NEW message and SETTING a new goal must NOT run mid-stream.
+        assert_eq!(exec("/bg go do a thing"), None);
+        assert_eq!(exec("/goal write all the tests"), None);
+        assert_eq!(exec("/goal"), None); // bare /goal = status, not whitelisted
+    }
+
+    #[test]
+    fn unrelated_commands_and_non_slash_are_blocked() {
+        assert_eq!(exec("/model"), None);
+        assert_eq!(exec("/clear"), None);
+        assert_eq!(exec("just a message"), None);
+        // Case-insensitive command + sub.
+        assert_eq!(exec("/GOAL Clear"), Some(("goal".to_string(), "Clear".to_string())));
+    }
+}
+
 /// Redraw after running a slash command. If the command installed a
 /// modal, delegate the draw to it so the modal's menu appears; otherwise
 /// fall through to the plain idle prompt.
@@ -5921,6 +5955,37 @@ fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, 
             app.menu.selected,
         );
     }
+}
+
+/// Slash commands allowed to EXECUTE while a turn is running. Everything else is
+/// blocked with the "disabled while a turn is running" hint. Returns the
+/// `(command, args)` to run, or `None` to fall through to the block/queue.
+///
+/// Minimal whitelist:
+///   - `/bg` (no args) — background the current turn.
+///   - `/goal clear|stop|off|reset|none|cancel` — halt a server-driven `/goal`
+///     loop. Load-bearing: a goal keeps the TUI in Streaming (see `on_thinking`)
+///     where commands are otherwise blocked, so without this a typed
+///     `/goal clear` never reaches the bridge and the goal is uninterruptible by
+///     command (Esc/Ctrl+C bypass the command system; a typed command does not).
+///
+/// A NEW goal (`/goal <condition>`) and `/goal status` are intentionally NOT
+/// whitelisted — only the halt sub-commands.
+fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
+    let (cmd, arg) = parse_slash_line(line)?;
+    if cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty() {
+        return Some(("bg".to_string(), String::new()));
+    }
+    if cmd.eq_ignore_ascii_case("goal") {
+        let head = arg.trim().split_whitespace().next().unwrap_or("");
+        if matches!(
+            head.to_ascii_lowercase().as_str(),
+            "clear" | "stop" | "off" | "reset" | "none" | "cancel"
+        ) {
+            return Some(("goal".to_string(), arg.trim().to_string()));
+        }
+    }
+    None
 }
 
 fn handle_streaming_key(
@@ -6112,13 +6177,16 @@ fn handle_streaming_key(
             // leave the buf alone. Gate strictly on *registered*
             // commands; unrecognised `/foo …` falls through to the
             // type-ahead queue as a regular message.
-            let bg_background_current = parse_slash_line(&line)
-                .map(|(cmd, arg)| cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty())
-                .unwrap_or(false);
-            if bg_background_current {
+            //
+            // EXCEPT a small whitelist that must RUN mid-stream (see
+            // `streaming_executable_slash`): `/bg` (background the current turn)
+            // and `/goal`'s halt sub-commands — a server-driven `/goal` keeps the
+            // TUI in Streaming, so without this a typed `/goal clear` could never
+            // reach the bridge and the goal was uninterruptible by command.
+            if let Some((cmd, arg)) = streaming_executable_slash(&line) {
                 commands::execute_slash_command(
-                    "bg",
-                    "",
+                    &cmd,
+                    &arg,
                     &mut app.state,
                     ctx,
                     renderer,
