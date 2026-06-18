@@ -37,13 +37,14 @@ pub enum UiPhase {
     Suspended,
 }
 
-/// How long the stream may go silent before the spinner warns the user the
-/// network may be down. A mid-stream drop fails cleanly at the provider's idle
-/// watchdog (~120s), but that is silent dead-air; this surfaces a "network may be
-/// down · esc to cancel" hint well before then so the user knows it isn't frozen
-/// and that esc is the instant escape hatch. Kept short of any legitimate
-/// inter-chunk gap (reasoning models still stream reasoning deltas).
-pub const STREAM_STALL_HINT: std::time::Duration = std::time::Duration::from_secs(12);
+/// How long the model may go silent before the spinner surfaces the "slow
+/// response · esc to cancel" hint. A mid-stream drop fails cleanly at the
+/// provider's idle watchdog (~120s), but that is silent dead-air; this reassures
+/// the user well before then that it isn't frozen and that esc cancels. Set to
+/// 20s (was 12s): long enough that a merely-slow model / gateway first-byte
+/// doesn't trip it — only a genuine stall does — so the hint isn't a false alarm.
+/// Reasoning models still stream reasoning deltas, which reset the clock.
+pub const STREAM_STALL_HINT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Whether the streaming spinner should warn the network may be down: we're
 /// awaiting the MODEL stream AND it's been silent for at least
