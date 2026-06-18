@@ -7426,11 +7426,18 @@ fn handle_agent_event(
         AgentEvent::RestorePendingImages { images, markers } => {
             // VL preprocessing failed — re-attach the user's images to
             // the input state so they can retry without re-pasting from
-            // clipboard. The `[Image #N]` text marker is gone (lives in
-            // the conversation history echo at this point), so the user
-            // typically UP-recalls or retypes the caption + Enter to
-            // resubmit. The attached image bytes ride along automatically
-            // with the next submit.
+            // clipboard.
+            //
+            // Restore the full original message text (including the text
+            // between [Image #N] markers) from `last_submitted_message`.
+            // Without this, only markers get re-inserted into the cleared
+            // buffer and the user's caption text is silently lost — the
+            // user sees blank space where their text should be (bug report:
+            // "多张图片发送后丢失文字，只保留了最后一张").
+            if let Some(restore) = state.last_submitted_message.take() {
+                buf.text = restore;
+                buf.cursor = buf.text.len();
+            }
             //
             // Hash table is rebuilt as best-effort: we hash the base64
             // payload (not raw RGBA), which means a fresh clipboard copy
@@ -7448,13 +7455,10 @@ fn handle_agent_event(
                 state.pending_image_hashes.push(h);
                 state.pending_images.push(img);
                 state.pending_image_markers.push(marker);
-                // Re-insert [Image #N] marker into the buffer so the user
-                // can see the restored marker and continue editing without
-                // having to retype the marker text manually. The marker
-                // is placed at the current cursor position (typically at
-                // the end of the cleared buffer). If the user was already
-                // typing during the streaming phase, their existing text
-                // is preserved before the marker.
+                // Only insert the marker if it's NOT already in the
+                // restored message text — `last_submitted_message` above
+                // already carries the original markers in the correct
+                // positions alongside the user's text.
                 let marker_text = format!("[Image #{}]", marker);
                 if !buf.text.contains(&marker_text) {
                     buf.text.insert_str(buf.cursor, &marker_text);
