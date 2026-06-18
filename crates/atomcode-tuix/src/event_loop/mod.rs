@@ -1389,6 +1389,24 @@ mod buffer_tests {
     use super::*;
 
     #[test]
+    fn spinner_label_surfaces_network_stall_hint_then_clears_on_activity() {
+        // End-to-end on the REAL spinner renderer: a model stream silent past the
+        // threshold must put the localized "network may be down · esc" hint into the
+        // footer label; a fresh chunk (note_stream_activity) must clear it.
+        let mut s = UiState::new();
+        s.on_submit(); // phase=Streaming, spinner = a thinking label
+        s.last_stream_activity =
+            Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT * 2);
+        let hint = crate::i18n::t(crate::i18n::Msg::StreamStalled);
+        let stalled = format_spinner_label(&s, 0, None);
+        assert!(stalled.contains(&*hint), "stalled spinner must show the hint, got {stalled:?}");
+
+        s.note_stream_activity(); // a byte arrived → stream is alive again
+        let live = format_spinner_label(&s, 0, None);
+        assert!(!live.contains(&*hint), "live stream must not show the hint, got {live:?}");
+    }
+
+    #[test]
     fn small_paste_inserts_inline() {
         let mut b = Buffer::new();
         b.insert_paste("hi\n".to_string());
