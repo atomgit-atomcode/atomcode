@@ -2399,7 +2399,8 @@ async fn run_headless(
             AgentEvent::UserEcho(_)
             | AgentEvent::PeerBusy(_)
             | AgentEvent::ProviderChanged(_)
-            | AgentEvent::ProjectSwitched(_) => {
+            | AgentEvent::ProjectSwitched(_)
+            | AgentEvent::SessionSwitched(_) => {
                 // Live-sync only — not applicable in headless CLI.
             }
             AgentEvent::GoalUpdate { .. } => {

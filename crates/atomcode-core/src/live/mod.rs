@@ -50,6 +50,9 @@ pub enum LiveEvent {
     /// 会切到新目录并开一个全新 session（见 event_loop/live_sync 转发）。仅广播
     /// 路径，不触碰 turn 状态。
     WorkingDirChanged(std::path::PathBuf),
+    /// 任一视图（webui）创建了新会话并切换到它。其余视图据此同步创建新会话。
+    /// 参数为新会话 ID。
+    SessionSwitched(String),
 }
 
 /// turn 执行策略。实现者负责对 `conv` 跑一次完整 turn（含工具循环），并把过程
@@ -174,6 +177,12 @@ impl LiveSession {
     /// 让同进程 TUI 跟随切目录并开一个全新会话。返回 false 表示当前无订阅者（无妨）。
     pub fn notify_working_dir_changed(&self, dir: std::path::PathBuf) -> bool {
         self.events.send(LiveEvent::WorkingDirChanged(dir)).is_ok()
+    }
+
+    /// 广播一次会话切换给所有视图（不触碰 turn 状态）。webui 新建对话时调用，
+    /// 让同进程 TUI 跟随切换到新会话。返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_session_switched(&self, session_id: String) -> bool {
+        self.events.send(LiveEvent::SessionSwitched(session_id)).is_ok()
     }
 
     /// 任一视图批准/拒绝，投递决定到执行器持有的审批通道。
