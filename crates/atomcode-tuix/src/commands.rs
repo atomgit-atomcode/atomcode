@@ -113,7 +113,12 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // sub-mode menu renders the three choices. Selecting one commits as
     // `/effort <choice>` → dispatched by the `effort` arm.
     Command { name: "effort",  desc: "DeepSeek reasoning effort control (high / max / off)", needs_args: true },
-    Command { name: "goal",    desc: "Set a completion goal (autonomous loop until met)", needs_args: false },
+    // needs_args=true so selecting `/goal` from the palette only completes to
+    // `/goal ` and waits for the user to type the goal — it must NOT execute
+    // immediately (a bare `/goal` would just print status). Setting a goal
+    // requires the condition text; `/goal status` / `/goal clear` still work by
+    // typing the sub-command + Enter.
+    Command { name: "goal",    desc: "Set a completion goal (autonomous loop until met)", needs_args: true },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true },
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
@@ -331,6 +336,16 @@ mod tests {
         let reg = CommandRegistry::builtin();
         let matches = reg.matching_prefix("h");
         assert!(matches.iter().any(|c| c.name == "help"));
+    }
+
+    #[test]
+    fn goal_needs_args_so_selection_waits_for_input() {
+        // Selecting `/goal` from the palette must only complete to `/goal ` and
+        // wait for the user to type the goal — not execute (which would just
+        // print status). The needs_args flag drives that menu behaviour.
+        let reg = CommandRegistry::builtin();
+        let goal = reg.find("goal").expect("/goal must be a built-in command");
+        assert!(goal.needs_args, "/goal selection must wait for the goal text");
     }
 
     #[test]
