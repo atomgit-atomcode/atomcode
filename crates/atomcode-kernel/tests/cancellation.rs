@@ -9,7 +9,7 @@
 //! Determinism: cancellation is driven by a COOPERATING test tool that fires
 //! `ctx.cancel.cancel()` from inside its own `execute` — no timing races.
 
-use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{EchoTool, RecordingProvider};
@@ -17,6 +17,75 @@ use atomcode_kernel::tool::{Tool, ToolCall, ToolContext, ToolRegistry, ToolResul
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// A provider whose `chat_stream` — the OPEN — never resolves: it models a
+/// connection that hangs establishing / awaiting the first response byte (e.g. a
+/// stale keep-alive socket reused after a `/model` switch). The turn blocks at the
+/// open, BEFORE the consume loop, so only a cancel that RACES the open can end it.
+struct HangingOpenProvider;
+
+#[async_trait]
+impl atomcode_kernel::provider::LlmProvider for HangingOpenProvider {
+    fn model_name(&self) -> &str {
+        "hanging-open"
+    }
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[atomcode_kernel::tool::ToolDef],
+        _: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, atomcode_kernel::stream::ProviderError>
+    {
+        futures::future::pending().await
+    }
+}
+
+// REGRESSION: Esc / Ctrl+C must abort a turn that is hung in the stream OPEN
+// (`provider.chat_stream(...).await`), not just one that is mid-stream. The open's
+// connect / first-byte wait can hang for a long time on a slow / stale / dead
+// connection (the reported "esc can't terminate" after a /model switch). Before
+// the fix the open was a bare `.await` that ignored the cancel token, so this test
+// parks until the 5s timeout fires.
+#[tokio::test]
+async fn cancel_aborts_a_turn_hung_in_the_stream_open() {
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(Arc::new(HangingOpenProvider))
+        .tools(ToolRegistry::new().mount(&[]))
+        .build()
+        .spawn();
+
+    handle
+        .commands
+        .send(AgentCommand::SendMessage { text: "hi".into(), images: vec![] })
+        .unwrap();
+
+    let drive = async {
+        let mut sent_cancel = false;
+        let mut reason = None;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                // The turn is now in flight and about to block in the open. Cancel.
+                AgentEvent::TurnStarted if !sent_cancel => {
+                    sent_cancel = true;
+                    handle.commands.send(AgentCommand::Cancel).unwrap();
+                }
+                AgentEvent::TurnComplete { reason: r } => {
+                    reason = Some(r);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        reason
+    };
+    let reason = tokio::time::timeout(std::time::Duration::from_secs(5), drive)
+        .await
+        .expect("Cancel must abort a turn hung in the stream OPEN — it must not hang");
+    assert_eq!(reason, Some(StopReason::Cancelled), "a cancelled open terminates as Cancelled");
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
 
 /// A tool that fires the turn's cancellation token from INSIDE its own execute,
 /// then returns a REAL result. Used to drive the between-tools checkpoint
