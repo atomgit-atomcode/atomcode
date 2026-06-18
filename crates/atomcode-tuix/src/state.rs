@@ -614,7 +614,15 @@ impl UiState {
         // New LLM round-trip → new phase clock. Without this reset the
         // displayed time keeps growing across consecutive thinks/tools
         // and ends up showing "Noodling… 1301s" mid-turn.
-        self.phase_started_at = Some(std::time::Instant::now());
+        //
+        // EXCEPT during a parallel batch: the bridge emits PhaseChange(Thinking)
+        // after every ToolResult, so in a batch these interleave with the tool
+        // events and would restart the clock on each completion — the spinner's
+        // elapsed-ms flicker 0→N→0. The batch anchors the clock once
+        // (`on_tool_batch_started`); leave it alone until the batch finishes.
+        if self.active_tool_batches.is_empty() {
+            self.phase_started_at = Some(std::time::Instant::now());
+        }
     }
 
     /// Begin a fork dispatch. Stores the per-task descriptors so the UI
@@ -1062,6 +1070,34 @@ mod tests {
             s.phase_started_at.unwrap() > before,
             "standalone tool event must reset the clock"
         );
+    }
+
+    #[test]
+    fn thinking_does_not_reset_phase_clock_during_batch() {
+        // The bridge emits PhaseChange(Thinking) after EVERY ToolResult, so in a
+        // parallel batch these interleave with the tool events. on_thinking must
+        // NOT restart the phase clock then — otherwise the spinner ms still
+        // flickers 0→N→0 even with the tool-event guards.
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_batch_started();
+        let anchor = s.phase_started_at.unwrap();
+        s.active_tool_batches
+            .insert("b1".into(), ActiveToolBatch { call_ids: vec![] });
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        s.on_thinking();
+        assert_eq!(s.phase_started_at, Some(anchor), "thinking restarted the batch clock");
+    }
+
+    #[test]
+    fn thinking_resets_phase_clock_when_no_batch() {
+        // Outside a batch, a new think is a genuine new phase → clock resets.
+        let mut s = UiState::new();
+        s.on_submit();
+        let before = s.phase_started_at.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        s.on_thinking();
+        assert!(s.phase_started_at.unwrap() > before, "think must reset the clock outside a batch");
     }
 
     #[test]
