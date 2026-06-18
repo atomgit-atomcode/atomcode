@@ -697,7 +697,15 @@ pub fn approval_for_path(
                     scope: access.path.to_string_lossy().into_owned(),
                 }
             } else {
-                ApprovalRequirement::AutoApprove
+                // Enumerating (listing/searching) a non-sensitive path outside
+                // the workspace still requires confirmation -- without an OS-level
+                // sandbox to constrain the process (#220), any filesystem access
+                // to unauthorised paths risks information leakage and wastes time
+                // on irrelevant directories.  Users can grant per-session approval
+                // with [A] if the access is intentional.
+                ApprovalRequirement::RequireApproval(format!(
+                    "{base_reason}. Enumerating paths outside the workspace requires confirmation."
+                ))
             }
         }
         ExternalPathAction::Read => {
@@ -1597,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_for_non_sensitive_enumeration_outside_workspace_is_auto() {
+    fn approval_for_non_sensitive_enumeration_outside_workspace_requires_confirmation() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
 
@@ -1607,8 +1615,67 @@ mod tests {
             ExternalPathAction::Enumerate,
         )
         .unwrap();
-        assert!(matches!(approval, ApprovalRequirement::AutoApprove));
+        // #220: enumerating paths outside the workspace requires confirmation
+        // even when non-sensitive, because there is no OS-level sandbox.
+        assert!(matches!(approval, ApprovalRequirement::RequireApproval(_)));
     }
+
+    // Regression (#220): Enumerate action on external paths must require confirmation.
+    // Before the fix, non-sensitive external paths were AutoApprove,
+    // so find/ls on unauthorised paths ran without prompts.
+    #[test]
+    fn enumerate_outside_workspace_can_be_granted_by_session() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let approval = approval_for_path(
+            &outside.path().to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Enumerate,
+        )
+        .unwrap();
+
+        // RequireApproval can be granted by a session grant (user pressed [A]),
+        // so repeated operations on the same tool do not re-prompt.
+        let mut store = PermissionStore::new();
+        let decision = store.check("bash", &approval);
+        assert!(matches!(decision, PermissionDecision::Ask(_)));
+
+        store.grant_session("bash");
+        let decision_again = store.check("bash", &approval);
+        assert!(matches!(decision_again, PermissionDecision::Allow));
+    }
+
+    // #220: Enumerate is NOT scoped -- it uses RequireApproval, not RequireApprovalScoped.
+    // A tool-wide [A] grant on bash can cover this,
+    // but sensitive paths (._ssh, /etc) still use RequireApprovalScoped
+    // and cannot be bypassed by a tool-wide grant.
+    #[test]
+    fn enumerate_outside_workspace_is_not_scoped() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let approval = approval_for_path(
+            &outside.path().to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Enumerate,
+        )
+        .unwrap();
+
+        // Non-scoped: matches RequireApproval, not RequireApprovalScoped
+        assert!(
+            matches!(approval, ApprovalRequirement::RequireApproval(_)),
+            "non-sensitive external enumeration should use RequireApproval"
+        );
+
+        // A tool-wide session grant should cover RequireApproval,
+        // but NOT RequireApprovalScoped (sensitive paths).
+        let mut store = PermissionStore::new();
+        store.grant_session("bash");
+        let decision = store.check("bash", &approval);
+        assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
 
     #[test]
     fn approval_for_non_sensitive_read_outside_workspace_requires_confirmation() {

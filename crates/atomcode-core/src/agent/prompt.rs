@@ -64,13 +64,31 @@ impl AgentLoop {
         let instructions = crate::config::instructions::LayeredInstructions::load(&wd);
         let merged_instructions = instructions.merged();
 
-        // Stable environment metadata (no date — changes every day, breaks cache)
+        // Stable environment metadata. The date is DAY-GRANULAR and snapshotted
+        // here ONCE per session (assemble_system_prompt runs only on a cold cache
+        // — see build_system_prompt), so it stays byte-identical across every turn
+        // and does NOT trigger the per-turn prefix-cache collapse the old "no date"
+        // note worried about. Residual cost: cross-day sessions don't share this
+        // prefix (~one cold prefill on the first session of a new day) — negligible
+        // vs the within-session reuse, which is preserved. Without a date anchor
+        // the model falls back to its training-era year and builds e.g. "2025
+        // latest news" web_search queries in 2026 (user-reported). A long session
+        // crossing midnight keeps the start-of-session date until the next cache
+        // invalidation (/clear, /cd, config reload, plan toggle); the YEAR — the
+        // part that fixes the search bug — stays correct regardless. (opencode does
+        // the same, day-granular, in its <env> block: session/system.ts.)
         let shell = if cfg!(target_os = "windows") {
             std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
         } else {
             std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
         };
-        let env_info = format!("Platform: {} | Shell: {}", std::env::consts::OS, shell,);
+        let today = chrono::Local::now().format("%Y-%m-%d (%A)");
+        let env_info = format!(
+            "Platform: {} | Shell: {} | Today's date: {}",
+            std::env::consts::OS,
+            shell,
+            today,
+        );
 
         // Identity: inject model name so the model correctly identifies itself.
         let model_display = self

@@ -114,7 +114,13 @@ fn spawn_runtime(
     Session,
 ) {
     let runtime_id = ctx.bg_manager.allocate_runtime_id();
-    let (client, event_rx) = ctx.runtime_factory.spawn_runtime(Conversation::new());
+    // Engine v2: spawn through the injected bridge so in-TUI session switches run
+    // on the new stack too. The override reads the CURRENT config/working_dir (the
+    // same values the v1 factory would), keeping /model /provider /cd honoured.
+    let (client, event_rx) = match &ctx.runtime_spawn_override {
+        Some(spawn) => spawn(&ctx.config, &ctx.working_dir),
+        None => ctx.runtime_factory.spawn_runtime(Conversation::new()),
+    };
     bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
     (runtime_id, client, session)
 }
@@ -224,7 +230,7 @@ fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
 
 /// 把 TUI 附着到指定的 LiveSession（回放快照 + 启动转发器 + 渲染确认）。
 /// 供 `/webui` 自动附着和 `/sync` 手动附着共用，不重复逻辑。
-fn attach_live_session(
+pub(crate) fn attach_live_session(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     session: std::sync::Arc<atomcode_core::live::LiveSession>,
@@ -511,6 +517,32 @@ pub(super) fn execute_slash_command(
             ));
             renderer.flush();
         }
+        "review" => {
+            // Trigger the v2 coding agent's `code_review` sub-agent tool. Map the optional
+            // arg to the tool's scope (default = working-tree changes; `staged`; or a base
+            // ref), then the model calls the tool and summarizes its findings. If the
+            // running engine lacks the tool (e.g. legacy v1), the model simply says so.
+            let scope = arg.trim();
+            let text = if scope.is_empty() {
+                "Review my current uncommitted changes: call the `code_review` tool with no \
+                 arguments, then give me a concise summary of its findings."
+                    .to_string()
+            } else if scope.eq_ignore_ascii_case("staged") {
+                "Review my staged changes: call the `code_review` tool with {\"staged\": true}, \
+                 then give me a concise summary of its findings."
+                    .to_string()
+            } else {
+                format!(
+                    "Review the changes since `{scope}`: call the `code_review` tool with \
+                     {{\"base\": \"{scope}\"}}, then give me a concise summary of its findings."
+                )
+            };
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SendMessage { text, images: vec![], image_markers: vec![] })
+                .ok();
+            state.on_submit();
+        }
         "config" => {
             // Head: current active provider + config path so users know
             // which provider is talking and where to edit.
@@ -583,17 +615,13 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "clear" => {
-            // Physical clear via the renderer (keeps cached footer state
-            // coherent with the terminal). Scrollback is preserved by
-            // most terminals — \x1b[3J would nuke it, which we don't
-            // want; `clear_screen` emits \x1b[2J\x1b[H.
-            renderer.clear_screen();
-            let dir_display = ctx.working_dir.to_string_lossy().to_string();
-            renderer.render(UiLine::Welcome {
-                model: ctx.model_name.clone(),
-                working_dir: dir_display,
-            });
-            renderer.flush();
+            // `/clear` starts a fresh conversation (matches Claude Code and the
+            // common expectation): it was previously a SCREEN-ONLY wipe, so the
+            // engine kept the full history and the model still "remembered"
+            // everything after a clear. Delegate to the same reset `/session`
+            // uses — it sends ClearConversation to the engine AND wipes the
+            // screen + re-renders the welcome banner.
+            reset_to_new_session(ctx, state, renderer);
         }
         "session" => {
             // Start fresh in the current directory. Ports `/session` from the
@@ -789,13 +817,13 @@ pub(super) fn execute_slash_command(
             } else {
                 0
             };
-            let cost = atomcode_core::pricing::calculate_cost(
+            let cost = crate::pricing::calculate_cost(
                 &ctx.model_name,
                 state.prompt_tokens,
                 state.completion_tokens,
                 state.cached_tokens,
             );
-            let cost_str = atomcode_core::pricing::format_cost(cost);
+            let cost_str = crate::pricing::format_cost(cost);
             renderer.render(UiLine::CommandOutput(
                 t(Msg::CostReport {
                     prompt: state.prompt_tokens,
@@ -1168,6 +1196,11 @@ pub(super) fn execute_slash_command(
                     ctx.current_session = new_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
                     state.on_turn_complete();
+                    // One DECSET 2026 envelope around the wipe + welcome
+                    // re-render so the foreground swap shows no blank frame
+                    // (same anti-flicker as `/resume`). Self-contained: the
+                    // arm has no early return between begin/end_sync.
+                    renderer.begin_sync();
                     renderer.reset();
                     render_welcome(renderer, ctx);
                     renderer.render(UiLine::CommandOutput(
@@ -1179,6 +1212,8 @@ pub(super) fn execute_slash_command(
                         })
                         .into_owned(),
                     ));
+                    renderer.flush();
+                    renderer.end_sync();
                 }
                 bg_runtime::BgCommand::Resume(slot) => {
                     sync_bg_foreground(ctx);
@@ -1360,7 +1395,7 @@ pub(super) fn execute_slash_command(
                 renderer.flush();
                 return Ok(());
             }
-            let content = atomcode_core::init::generate_project_instructions(&ctx.working_dir);
+            let content = crate::init::generate_project_instructions(&ctx.working_dir);
             match std::fs::write(&target, &content) {
                 Ok(()) => {
                     let path_str = target.display().to_string();
@@ -1568,6 +1603,12 @@ pub(super) fn execute_slash_command(
                 );
                 ctx.mcp_registry = Some(std::sync::Arc::new(registry));
                 ctx.mcp_connect_rx = Some(rx);
+
+                // The driver registry above feeds the palette; the ENGINE binds its own MCP
+                // at prepare time. Ask it to re-prepare so the reloaded servers reach the
+                // model too. (Legacy engine: a no-op hook reload; engine v2: a Resume
+                // respawn that re-mounts MCP/skills/hooks.)
+                ctx.agent.cmd_tx.send(AgentCommand::ReloadHooks).ok();
 
                 renderer.render(UiLine::CommandOutput(
                     t(Msg::McpClearedReconnecting { removed }).into_owned(),
@@ -1798,6 +1839,89 @@ pub(super) fn execute_slash_command(
                         ));
                         renderer.flush();
                     }
+                }
+            }
+        }
+        "goal" => {
+            // Sub-commands aligned with Claude Code's /goal (v2.1.139+):
+            //   /goal <condition>             → set a new goal
+            //   /goal                         → show status (or hint if none)
+            //   /goal status                  → explicit status (same)
+            //   /goal clear|stop|off|reset|none|cancel  → halt the active goal
+            //   /goal help|?|-h|--help        → usage
+            //
+            // CC has no `--max-rounds` flag and no wall-clock cap. Users
+            // express budgets in the condition text instead (e.g. "or stop
+            // after 20 turns"). Esc / Ctrl+C also halts at any time.
+            let trimmed = arg.trim();
+            let (head, _rest) = trimmed
+                .split_once(char::is_whitespace)
+                .map(|(h, r)| (h, r.trim()))
+                .unwrap_or((trimmed, ""));
+            match head {
+                "" | "status" => {
+                    if let Some(ref cond) = state.goal_condition {
+                        // Display 1-based, consistent with the footer goal row.
+                        let round = state.goal_round + 1;
+                        let elapsed = state
+                            .goal_started_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let mins = elapsed / 60;
+                        let secs = elapsed % 60;
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalStatus {
+                                condition: cond.as_str(),
+                                round,
+                                mins,
+                                secs,
+                            })
+                            .into_owned(),
+                        ));
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalNoActive).into_owned(),
+                        ));
+                    }
+                    renderer.flush();
+                }
+                "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
+                    ctx.agent.cmd_tx.send(AgentCommand::ClearGoal).ok();
+                    state.goal_condition = None;
+                    state.goal_round = 0;
+                    state.goal_started_at = None;
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::GoalCleared).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                "help" | "?" | "-h" | "--help" => {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::GoalHelp).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                _ => {
+                    // Treat the entire trimmed input as the condition.
+                    // (Empty input is unreachable here — `head` would be ""
+                    // and the `"" | "status"` arm above would have matched.)
+                    let condition = trimmed.to_owned();
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SetGoal { condition: condition.clone() })
+                        .ok();
+                    state.goal_condition = Some(condition.clone());
+                    state.goal_round = 0;
+                    state.goal_started_at = Some(std::time::Instant::now());
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: condition,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                    state.on_submit();
                 }
             }
         }
@@ -2454,7 +2578,7 @@ fn parse_scope_arg(s: &str) -> atomcode_core::plugin::InstallScope {
 
 /// Handle `/worktree` subcommands: create, list, done, cleanup.
 fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> Result<()> {
-    use atomcode_core::git::worktree::WorktreeManager;
+    use crate::git::worktree::WorktreeManager;
 
     let parts: Vec<&str> = arg.split_whitespace().collect();
     let sub = parts.first().map(|s| s.to_ascii_lowercase());
@@ -3075,6 +3199,9 @@ pub(crate) fn reset_to_new_session(
     bind_telemetry_to_session(ctx, &ctx.current_session);
     // `reset()` wipes the terminal AND the renderer's cached footer/stream
     // state, so the next Welcome renders against a known (row 1, col 1) anchor.
+    // Wrap the wipe + welcome re-render in one DECSET 2026 envelope so capable
+    // hosts show no intermediate blank frame (same anti-flicker as `/resume`).
+    renderer.begin_sync();
     renderer.reset();
     let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     renderer.render(UiLine::Welcome {
@@ -3083,6 +3210,7 @@ pub(crate) fn reset_to_new_session(
     });
     renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
     renderer.flush();
+    renderer.end_sync();
 }
 
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
@@ -3506,6 +3634,37 @@ fn run_oauth_with_renderer(
     session.finish(Some(&ctx.telemetry))
 }
 
+/// Run `coding_plan::run()` on a blocking thread to prevent
+/// `reqwest::blocking::Client`'s internal tokio runtime from being
+/// dropped inside the TUI's async context. Returns the mutated config
+/// alongside the report — the caller MUST write the returned config back
+/// into `ctx.config`.
+///
+/// See `run_login_flow` for the rationale — the short version is that
+/// `reqwest::blocking::Client` creates its own runtime, and dropping it
+/// inside an existing runtime panics with "Cannot drop a runtime in a
+/// context where blocking is not allowed".
+fn run_coding_plan_blocking(
+    config: &atomcode_core::config::Config,
+    tel: &std::sync::Arc<atomcode_telemetry::Telemetry>,
+) -> Result<(atomcode_core::config::Config, atomcode_core::coding_plan::SetupReport)> {
+    let mut cfg = config.clone();
+    let tel = tel.clone();
+    // Run on a dedicated OS thread so `reqwest::blocking::Client`'s
+    // internal tokio runtime is created AND dropped outside the TUI's
+    // async context. Using `std::thread` instead of
+    // `tokio::task::spawn_blocking` keeps the call site synchronous
+    // (`run_login_flow` isn't async) and avoids the need to
+    // `Handle::block_on`.
+    std::thread::spawn(move || {
+        let report = atomcode_core::coding_plan::run(&mut cfg, Some(&tel));
+        (cfg, report)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("coding plan flow panicked"))
+    .and_then(|(cfg, report)| Ok((cfg, report?)))
+}
+
 /// Run the full login + CodingPlan setup flow: OAuth (if needed) →
 /// claim → fetch models + register providers → fetch status. Shares
 /// the orchestrator with `atomcode login` / `atomcode codingplan` (CLI).
@@ -3544,6 +3703,14 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // stdin / stdout interaction, so we don't need to suspend the
     // renderer. `step_login` short-circuits via `is_logged_in()`.
     //
+    // CodingPlan's `Client` wraps `reqwest::blocking::Client`, which
+    // internally creates its own tokio runtime. Dropping that runtime
+    // inside the TUI's async context (where this slash command runs)
+    // panics with "Cannot drop a runtime in a context where blocking is
+    // not allowed" and `panic = "abort"` kills the process. Run the
+    // whole flow on a blocking thread so the internal runtime is created
+    // and dropped outside the async context.
+    //
     // If the stored token is locally valid (file present, expires_in
     // not yet past) but the server rejects it (revoked, refresh-token
     // dead, etc.), the orchestrator surfaces `report.auth_expired =
@@ -3552,24 +3719,39 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // this the user sees "✓ already logged in as X" followed by
     // "✗ claim failed — run `atomcode login` again" and has to do
     // manually what `/codingplan` could do itself.
-    let mut report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
-    if matches!(&report, Ok(r) if r.auth_expired) {
+    let (cfg_after, mut report) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
+        Ok((cfg, r)) => (cfg, r),
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("internal error: {e:#}")));
+            renderer.flush();
+            return Ok(());
+        }
+    };
+    ctx.config = cfg_after;
+    if report.auth_expired {
         renderer.render(UiLine::CommandOutput(t(Msg::CpReauthAfter401).into_owned()));
         renderer.flush();
         match run_oauth_with_renderer(renderer, ctx)
             .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
-                report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+                let (cfg_after2, r2) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
+                    Ok((cfg, r)) => (cfg, r),
+                    Err(e) => {
+                        renderer.render(UiLine::Error(format!("internal error: {e:#}")));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                };
+                ctx.config = cfg_after2;
+                report = r2;
             }
             Err(e) => {
                 // Re-OAuth itself failed (user pressed ESC, network
                 // dead, etc.). Render the *original* report so they
                 // still see what triggered the retry, then surface the
                 // OAuth error.
-                if let Ok(r) = &report {
-                    renderer.render(UiLine::CommandOutput(r.render()));
-                }
+                renderer.render(UiLine::CommandOutput(report.render()));
                 renderer.render(UiLine::Error(
                     t(Msg::CodingPlanSetupFailed {
                         error: &e.to_string(),
@@ -3582,55 +3764,47 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         }
     }
 
-    match report {
-        Ok(report) => {
-            if report.should_persist_config() {
-                // Config mutation only persists when critical steps passed —
-                // don't write a half-set-up config if login or models failed.
-                save_and_reload(ctx, renderer);
-                // Stamp the drift-monitor sync marker alongside the config
-                // write. Failures are non-fatal: at worst the 24h staleness
-                // hint mis-fires once.
-                let _ = atomcode_core::coding_plan::write_last_sync_now();
-                // Also bump our own last-seen timestamp so the cross-process
-                // sync-check on the next keystroke doesn't redundantly
-                // reload the config we just saved ourselves.
-                ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
-                // Sync ctx.model_name with the freshly-picked default so the
-                // status line and the next turn use the right model without
-                // requiring a /reload.
-                if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
-                    ctx.model_name = p.model.clone();
-                }
-                // Clear any stale drift warning now that we've just
-                // re-synced. Also reset the cooldown so the next
-                // pre-turn trigger (if conditions change) can fire
-                // immediately — no need to wait 15 min after a manual
-                // refresh.
-                if let Ok(mut g) = ctx.monitor_warning.lock() {
-                    *g = None;
-                }
-                ctx.monitor_last_check_at = None;
-                // Same for usage slot — a fresh /login run may have
-                // rotated the quota window or switched plan tiers.
-                if let Ok(mut g) = ctx.usage_slot.lock() {
-                    *g = None;
-                }
-                ctx.usage_last_check_at = None;
-            }
-            renderer.render(UiLine::CommandOutput(report.render()));
-            renderer.flush();
+    if report.should_persist_config() {
+        // Config mutation only persists when critical steps passed —
+        // don't write a half-set-up config if login or models failed.
+        save_and_reload(ctx, renderer);
+        // Stamp the drift-monitor sync marker alongside the config
+        // write. Failures are non-fatal: at worst the 24h staleness
+        // hint mis-fires once.
+        let _ = atomcode_core::coding_plan::write_last_sync_now();
+        // Also bump our own last-seen timestamp so the cross-process
+        // sync-check on the next keystroke doesn't redundantly
+        // reload the config we just saved ourselves.
+        ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
+        // Update `ctx.model_name` to reflect the new default provider from
+        // the just-completed login/setup. This ensures the status line shows
+        // the current model immediately rather than the pre-login value.
+        // The bridge's ReloadConfig is asynchronous (sent by `save_and_reload`
+        // above) — if the bridge fails to switch (e.g. gateway signer
+        // unavailable), the user will see the error on their next chat turn
+        // and can fall back to `/model`. This matches `/model`'s approach
+        // which also updates `ctx.model_name` optimistically.
+        if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
+            ctx.model_name = p.model.clone();
         }
-        Err(e) => {
-            renderer.render(UiLine::Error(
-                t(Msg::CodingPlanSetupFailed {
-                    error: &format!("{:#}", e),
-                })
-                .into_owned(),
-            ));
-            renderer.flush();
+        // Clear any stale drift warning now that we've just
+        // re-synced. Also reset the cooldown so the next
+        // pre-turn trigger (if conditions change) can fire
+        // immediately — no need to wait 15 min after a manual
+        // refresh.
+        if let Ok(mut g) = ctx.monitor_warning.lock() {
+            *g = None;
         }
+        ctx.monitor_last_check_at = None;
+        // Same for usage slot — a fresh /login run may have
+        // rotated the quota window or switched plan tiers.
+        if let Ok(mut g) = ctx.usage_slot.lock() {
+            *g = None;
+        }
+        ctx.usage_last_check_at = None;
     }
+    renderer.render(UiLine::CommandOutput(report.render()));
+    renderer.flush();
     Ok(())
 }
 

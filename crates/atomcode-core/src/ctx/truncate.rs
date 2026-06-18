@@ -117,12 +117,14 @@ pub(crate) fn truncate_generic(
 ) {
     let lines: Vec<&str> = result.output.lines().collect();
     if lines.len() > max_lines {
-        let head_part: String = lines[..head].join("\n");
-        let tail_part: String = lines[lines.len() - tail..].join("\n");
+        let head_end = head.min(lines.len());
+        let tail_start = lines.len().saturating_sub(tail);
+        let head_part: String = lines[..head_end].join("\n");
+        let tail_part: String = lines[tail_start..].join("\n");
         result.output = format!(
             "{}\n\n[... {} lines omitted ...]\n\n{}",
             head_part,
-            lines.len() - head - tail,
+            lines.len().saturating_sub(head).saturating_sub(tail),
             tail_part
         );
     }

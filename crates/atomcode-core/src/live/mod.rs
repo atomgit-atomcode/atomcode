@@ -50,6 +50,9 @@ pub enum LiveEvent {
     /// 会切到新目录并开一个全新 session（见 event_loop/live_sync 转发）。仅广播
     /// 路径，不触碰 turn 状态。
     WorkingDirChanged(std::path::PathBuf),
+    /// 任一视图（webui）创建了新会话并切换到它。其余视图据此同步创建新会话。
+    /// 参数为新会话 ID。
+    SessionSwitched(String),
 }
 
 /// turn 执行策略。实现者负责对 `conv` 跑一次完整 turn（含工具循环），并把过程
@@ -176,6 +179,12 @@ impl LiveSession {
         self.events.send(LiveEvent::WorkingDirChanged(dir)).is_ok()
     }
 
+    /// 广播一次会话切换给所有视图（不触碰 turn 状态）。webui 新建对话时调用，
+    /// 让同进程 TUI 跟随切换到新会话。返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_session_switched(&self, session_id: String) -> bool {
+        self.events.send(LiveEvent::SessionSwitched(session_id)).is_ok()
+    }
+
     /// 任一视图批准/拒绝，投递决定到执行器持有的审批通道。
     ///
     /// 通道在整个回合内保持注册（**不**取走 sender）：同一回合里 TurnRunner 可能
@@ -205,11 +214,14 @@ async fn coordinator(
     turn_state: Arc<Mutex<TurnState>>,
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
 ) {
+    eprintln!("[DEBUG coordinator] START");
     while let Some(input) = input_rx.recv().await {
+        eprintln!("[DEBUG coordinator] received input: {} chars", input.text.len());
         // 单写者守卫：运行中直接忽略本次输入（不排队，避免乱序）。
         {
             let mut st = turn_state.lock().await;
             if *st == TurnState::Running {
+                eprintln!("[DEBUG coordinator] REJECTED input: already running");
                 let _ = events.send(LiveEvent::Turn(TurnEvent::Warning(
                     "对方正在对话，已忽略本次输入".to_string(),
                 )));
@@ -217,6 +229,7 @@ async fn coordinator(
             }
             *st = TurnState::Running;
         }
+        eprintln!("[DEBUG coordinator] ACCEPTED input, broadcasting StateChanged(Running)");
         let _ = events.send(LiveEvent::StateChanged(TurnState::Running));
 
         // 先即时回显用户消息（原始文本 + 原图），让发送方立刻看到自己的输入，不被随后
@@ -289,8 +302,10 @@ async fn coordinator(
             )));
         }
         *turn_state.lock().await = TurnState::Idle;
+        eprintln!("[DEBUG coordinator] turn done, broadcasting StateChanged(Idle)");
         let _ = events.send(LiveEvent::StateChanged(TurnState::Idle));
     }
+    eprintln!("[DEBUG coordinator] EXIT (input_rx closed)");
 }
 
 #[cfg(test)]

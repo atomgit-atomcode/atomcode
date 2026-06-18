@@ -1549,6 +1549,7 @@ mod tests {
     fn blank_config_for_test() -> atomcode_core::config::Config {
         atomcode_core::config::Config {
             default_provider: String::new(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: Default::default(),
             datalog: Default::default(),

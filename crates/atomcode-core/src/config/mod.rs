@@ -82,6 +82,10 @@ impl Default for SubAgentConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub default_provider: String,
+    /// Optional provider key for /goal evaluator (fast model like Haiku).
+    /// Falls back to `default_provider` when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluator_provider: Option<String>,
     /// Default working directory. Saved on /cd, restored on startup.
     pub default_workdir: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
@@ -274,6 +278,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             default_provider: String::new(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
             datalog: Default::default(),
@@ -774,6 +779,7 @@ mod tests {
     fn blank_config_with_lsp(lsp: LspConfig) -> Config {
         Config {
             default_provider: "x".into(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: Default::default(),
             datalog: Default::default(),
@@ -936,6 +942,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("atomcode_cfg_rt_{}.toml", std::process::id()));
         let mut cfg = Config {
             default_provider: "p".to_string(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
             datalog: DatalogConfig {
@@ -1154,6 +1161,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut cfg = Config {
             default_provider: "p".to_string(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
             datalog: DatalogConfig::default(),
@@ -1258,6 +1266,7 @@ mod tests {
         );
         Config {
             default_provider: "active".into(),
+            evaluator_provider: None,
             default_workdir: None,
             providers,
             datalog: Default::default(),

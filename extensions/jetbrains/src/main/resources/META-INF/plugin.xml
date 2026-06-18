@@ -1,0 +1,150 @@
+<idea-plugin>
+  <id>com.atomcode.jetbrains</id>
+  <name>AtomCode</name>
+  <vendor email="support@atomcode.dev">AtomCode</vendor>
+
+  <description><![CDATA[
+    AtomCode for JetBrains brings the local AtomCode coding agent into IntelliJ IDEA.
+  ]]></description>
+
+  <change-notes><![CDATA[
+    Initial JetBrains plugin scaffold.
+  ]]></change-notes>
+
+  <depends>com.intellij.modules.platform</depends>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <toolWindow
+      id="AtomCode"
+      anchor="right"
+      canCloseContents="true"
+      factoryClass="com.atomcode.jetbrains.ui.AtomCodeToolWindowFactory"
+      icon="/icons/atomcode.svg" />
+
+    <applicationConfigurable
+      id="atomcode.settings"
+      displayName="AtomCode"
+      instance="com.atomcode.jetbrains.settings.AtomCodeConfigurable" />
+
+    <statusBarWidgetFactory
+      id="AtomCodeStatus"
+      implementation="com.atomcode.jetbrains.ui.AtomCodeStatusBarWidgetFactory" />
+
+    <intentionAction>
+      <className>com.atomcode.jetbrains.actions.ExplainSelectionIntention</className>
+      <category>AtomCode</category>
+    </intentionAction>
+    <intentionAction>
+      <className>com.atomcode.jetbrains.actions.FixSelectionIntention</className>
+      <category>AtomCode</category>
+    </intentionAction>
+    <intentionAction>
+      <className>com.atomcode.jetbrains.actions.OptimizeSelectionIntention</className>
+      <category>AtomCode</category>
+    </intentionAction>
+    <intentionAction>
+      <className>com.atomcode.jetbrains.actions.AddContextIntention</className>
+      <category>AtomCode</category>
+    </intentionAction>
+
+    <projectService serviceImplementation="com.atomcode.jetbrains.services.AtomCodeProjectService" />
+    <projectService serviceImplementation="com.atomcode.jetbrains.core.AtomCodeProjectController" />
+    <projectService serviceImplementation="com.atomcode.jetbrains.session.SessionWorkspace" />
+    <projectService serviceImplementation="com.atomcode.jetbrains.persistence.AtomCodeProjectWorkspaceState" />
+    <applicationService serviceImplementation="com.atomcode.jetbrains.settings.AtomCodeSettingsState" />
+    <postStartupActivity implementation="com.atomcode.jetbrains.services.AtomCodeStartupActivity" />
+  </extensions>
+
+  <actions>
+    <action
+      id="atomcode.openChat"
+      class="com.atomcode.jetbrains.actions.OpenChatAction"
+      text="AtomCode: Open Chat"
+      description="Open the AtomCode chat tool window">
+      <add-to-group group-id="ToolsMenu" anchor="last" />
+    </action>
+
+    <action
+      id="atomcode.openChatInNewTab"
+      class="com.atomcode.jetbrains.actions.OpenChatInNewTabAction"
+      text="AtomCode: Open Chat in New Tab"
+      description="Open a separate AtomCode chat tab in the tool window">
+      <add-to-group group-id="ToolsMenu" anchor="last" />
+    </action>
+
+    <action
+      id="atomcode.focusInput"
+      class="com.atomcode.jetbrains.actions.FocusInputAction"
+      text="AtomCode: Focus Input"
+      description="Open AtomCode and focus the chat input">
+      <add-to-group group-id="ToolsMenu" anchor="last" />
+      <keyboard-shortcut keymap="$default" first-keystroke="control alt shift I" />
+    </action>
+
+    <action
+      id="atomcode.newConversation"
+      class="com.atomcode.jetbrains.actions.NewConversationAction"
+      text="AtomCode: New Conversation"
+      description="Start a new AtomCode conversation">
+      <add-to-group group-id="ToolsMenu" anchor="last" />
+      <keyboard-shortcut keymap="$default" first-keystroke="control alt shift N" />
+    </action>
+
+    <action
+      id="atomcode.stopGeneration"
+      class="com.atomcode.jetbrains.actions.StopGenerationAction"
+      text="AtomCode: Stop Generation"
+      description="Stop the active AtomCode generation">
+      <add-to-group group-id="ToolsMenu" anchor="last" />
+    </action>
+
+    <action
+      id="atomcode.openChanges"
+      class="com.atomcode.jetbrains.actions.OpenChangesAction"
+      text="AtomCode: Open Changes"
+      description="Open project changes used by AtomCode">
+      <add-to-group group-id="ToolsMenu" anchor="last" />
+    </action>
+
+    <action
+      id="atomcode.openSettings"
+      class="com.atomcode.jetbrains.actions.OpenSettingsAction"
+      text="AtomCode: Open Settings"
+      description="Open AtomCode plugin settings">
+      <add-to-group group-id="ToolsMenu" anchor="last" />
+    </action>
+
+    <action
+      id="atomcode.explainSelection"
+      class="com.atomcode.jetbrains.actions.ExplainSelectionAction"
+      text="AtomCode: Explain Selection"
+      description="Explain the selected code with AtomCode">
+      <add-to-group group-id="EditorPopupMenu" anchor="last" />
+      <keyboard-shortcut keymap="$default" first-keystroke="control alt shift E" />
+    </action>
+
+    <action
+      id="atomcode.fixSelection"
+      class="com.atomcode.jetbrains.actions.FixSelectionAction"
+      text="AtomCode: Fix Selection"
+      description="Fix the selected code with AtomCode">
+      <add-to-group group-id="EditorPopupMenu" anchor="last" />
+    </action>
+
+    <action
+      id="atomcode.optimizeSelection"
+      class="com.atomcode.jetbrains.actions.OptimizeSelectionAction"
+      text="AtomCode: Optimize Selection"
+      description="Optimize the selected code with AtomCode">
+      <add-to-group group-id="EditorPopupMenu" anchor="last" />
+    </action>
+
+    <action
+      id="atomcode.addContext"
+      class="com.atomcode.jetbrains.actions.AddContextAction"
+      text="AtomCode: Add Selection/File as Context"
+      description="Attach the current selection or file to the next AtomCode message">
+      <add-to-group group-id="EditorPopupMenu" anchor="last" />
+    </action>
+  </actions>
+</idea-plugin>

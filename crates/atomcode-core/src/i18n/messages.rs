@@ -699,6 +699,9 @@ pub enum Msg<'a> {
         tool_call_count: usize,
         duration: &'a str,
         total_tokens: usize,
+        /// Cache-hit ratio over the turn's input, if reported. `Some(n)` appends
+        /// `· n% cached`; `None` appends nothing.
+        cached_pct: Option<u8>,
     },
 
     /// Turn-end summary when the turn terminated in an error (the red
@@ -754,6 +757,17 @@ pub enum Msg<'a> {
     CompactStarting,
     CompactNothingNoSavings { before: &'a str, after: &'a str },
     CompactDropped { messages: usize, before: &'a str, after: &'a str },
+
+    // ── /goal ──
+    /// The full `/goal help` usage block (header + Usage + Notes).
+    GoalHelp,
+    /// `/goal` / `/goal status` while a goal is active. `condition` is the goal
+    /// text; `round`/`mins`/`secs` are the live progress counters.
+    GoalStatus { condition: &'a str, round: u32, mins: u64, secs: u64 },
+    /// `/goal status` (or bare `/goal`) when no goal is active.
+    GoalNoActive,
+    /// Confirmation line after `/goal clear` (and its aliases).
+    GoalCleared,
 
     /// Surfaced when the user pastes/attaches an image but the active
     /// model can't accept images AND no `vision_preprocessor_provider`
@@ -850,4 +864,92 @@ pub enum Msg<'a> {
     BgTaskCancelled,
     /// Background task finished but produced no summary text.
     BgTaskNoSummary,
+
+    // CLI atomcode --help i18n
+    CliAbout,
+    CliAboutLogin,
+    CliAboutLogout,
+    CliAboutStatus,
+    CliAboutUpgrade,
+    CliAboutRollback,
+    CliAboutFixissue,
+    CliAboutMcp,
+    CliAboutDaemon,
+    CliAboutWebui,
+    CliAboutTelemetry,
+    CliAboutPlugin,
+    CliAboutUninstall,
+    CliAboutSetup,
+    CliAboutHooks,
+    CliAboutHooksList,
+    CliAboutHooksTest,
+    CliAboutHooksPaths,
+    CliAboutPluginMarketplace,
+    CliAboutPluginInstall,
+    CliAboutPluginUninstall,
+    CliAboutPluginList,
+    CliAboutMarketplaceAdd,
+    CliAboutMarketplaceRemove,
+    CliAboutMarketplaceUpdate,
+    CliAboutMarketplaceList,
+    CliAboutMcpAdd,
+    CliAboutMcpAddGithubOauth,
+    CliAboutMcpLogin,
+    CliAboutMcpLogout,
+    CliAboutTelemetryStatus,
+    CliAboutTelemetryEnable,
+    CliAboutTelemetryDisable,
+    CliAboutTelemetryDump,
+    CliAboutTelemetryClear,
+    CliHelpContinue,
+    CliHelpProvider,
+    CliHelpModel,
+    CliHelpLang,
+    CliHelpConfig,
+    CliHelpDir,
+    CliHelpPrompt,
+    CliHelpPromptFile,
+    CliHelpVerbose,
+    CliHelpMaxTurns,
+    CliHelpDev,
+    CliHelpDisableTools,
+    CliHelpNoTelemetry,
+    CliHelpDangerouslySkipPermissions,
+    CliHelpForce,
+    CliHelpPortDaemon,
+    CliHelpClient,
+    CliHelpIdleTimeout,
+    CliHelpPortWebui,
+    CliHelpHost,
+    CliHelpFixissueUrl,
+    CliHelpUninstallYes,
+    CliHelpUninstallPurge,
+    CliHelpUninstallKeepData,
+    CliHelpUninstallDryRun,
+    CliHelpMcpGlobal,
+    CliHelpMcpDir,
+    CliHelpMcpName,
+    CliHelpHooksTestName,
+    CliHelpPluginSpec,
+    CliHelpMarketplaceUrl,
+    CliHelpMarketplaceName,
+    CliHelpMcpCommand,
+    /// About for the built-in help subcommand.
+    CliAboutHelp,
+
+    // ── engine v2 provider init (atomcode-bridge) ──
+    /// Frame for a provider/engine init failure surfaced to the driver.
+    /// `detail` carries the underlying cause (often `GatewayAuthUnavailable`).
+    ProviderInitFailed { detail: &'a str },
+    /// The configured `base_url` is an AtomGit gateway that this (open-source)
+    /// build can't sign requests for. Points the user at the official binary
+    /// or a plain OpenAI-compatible endpoint.
+    GatewayAuthUnavailable { base_url: &'a str },
+
+    // ── streaming liveness (atomcode-tuix spinner) ──
+    /// Spinner hint shown when a streaming response has gone silent past the stall
+    /// threshold. The cause is UNKNOWN (slow first byte, a slow gateway, or a
+    /// dropped connection), so the text does NOT blame the network — it just notes
+    /// the slow response and that esc cancels. Reassures the user it isn't frozen.
+    StreamStalled,
 }

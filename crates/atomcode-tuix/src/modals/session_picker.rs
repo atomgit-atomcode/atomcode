@@ -442,6 +442,7 @@ fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String
             tool_call_count: s.tool_call_count,
             duration: &crate::render::fmt_dur(std::time::Duration::from_millis(s.duration_ms)),
             total_tokens: s.total_tokens,
+            cached_pct: None,
         })
         .into_owned(),
         None => String::new(),
@@ -450,6 +451,14 @@ fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String
 
 pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, reset: bool) {
     use atomcode_core::conversation::message::{MessageContent, Role};
+    // Bracket the whole replay — the `reset()` screen wipe plus the
+    // line-by-line re-emit of the entire transcript — in ONE DECSET 2026
+    // synchronized-output envelope. Capable hosts then paint it as a single
+    // atomic update instead of visibly blanking the screen and re-scrolling
+    // the history (the reported `/resume` flicker). `end_sync()` lands the
+    // final frame inside the envelope and closes it. No-op on renderers
+    // without synchronized output (plain/pipe mode).
+    renderer.begin_sync();
     if reset {
         renderer.reset();
     }
@@ -535,6 +544,7 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
         label: resumed,
     });
     renderer.flush();
+    renderer.end_sync();
 }
 
 #[cfg(test)]
@@ -567,10 +577,16 @@ mod tests {
             errored: false,
         };
         // Persisted stat → the same `✓ … 工具 · tokens` line the live turn showed
-        // (locale-independent: digits + glyph appear in both en/zh templates).
+        // (locale-independent: digits + glyph appear in both en/zh templates). Token
+        // counts render abbreviated (K/M) via `fmt_tokens`, so assert on that form
+        // (1651 → "1.65K") rather than the raw integer.
         let normal = super::turn_divider_label(Some(&s));
         assert!(normal.contains('✓'), "got {normal:?}");
-        assert!(normal.contains('3') && normal.contains('5') && normal.contains("1651"), "got {normal:?}");
+        let tokens = crate::i18n::fmt_tokens(1651);
+        assert!(
+            normal.contains('3') && normal.contains('5') && normal.contains(&tokens),
+            "got {normal:?}"
+        );
         // Errored turn → ✗ variant.
         let err = TurnStat { errored: true, ..s.clone() };
         assert!(super::turn_divider_label(Some(&err)).contains('✗'));

@@ -40,6 +40,12 @@ const PAD_COL: usize = 2;
 /// Bounded so memory doesn't grow without limit on long sessions.
 pub const MAX_SCROLLBACK_ROWS: usize = 5000;
 
+/// Hard cap on how many rows the input box may DISPLAY before it scrolls
+/// internally. Bounds the footer so a long paste / typed text can't grow it
+/// past the screen height (the overflow bug). This caps DISPLAY only — the
+/// full text always lives in `input_buf` and is sent verbatim on submit.
+const MAX_INPUT_ROWS: usize = 6;
+
 /// Render context usage as `12.3k/131k tok` when both used and window
 /// are known, or `12.3k tok` when only the used count is known (provider
 /// hasn't reported its window yet, e.g. pre-config or fallback).
@@ -56,6 +62,75 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
         let window_label = format_tok_count(window, /*round_clean=*/ true);
         format!("{}/{} tok", used_label, window_label)
     }
+}
+
+/// Marker prefix for the dedicated footer goal row. A width-1 BMP "ring" from
+/// the Geometric Shapes block when the terminal's font has it, ASCII `*`
+/// otherwise — the SAME `unicode_symbols` gate the spinner (`◐`→`|/-\`) and
+/// ellipsis (`…`→`...`) use, so Windows legacy conhost / Consolas don't show
+/// `□` tofu. Deliberately NOT an emoji (e.g. 🎯): emoji width is rendered
+/// inconsistently across terminals and would drift every column after it in the
+/// cell-diff renderer, and emoji font coverage is far spottier than Geometric
+/// Shapes. Both variants are width-1 + a trailing space, so the layout math is
+/// identical either way.
+fn goal_marker(unicode: bool) -> &'static str {
+    if unicode {
+        "◎ "
+    } else {
+        "* "
+    }
+}
+
+/// The three display segments of the dedicated footer goal row, width-fitted:
+/// `(marker, condition, meta)`. The caller styles each independently — marker as
+/// an accent, condition as normal text, `meta` (` · round N · elapsed`) muted —
+/// so the row reads as a calm persistent status with hierarchy, not a loud
+/// activity line. Joining the three reproduces the full row text.
+///
+/// `round` is shown verbatim (callers pass a 1-based value). Elapsed is `13s`
+/// under a minute else `2m13s`. The meta is RESERVED (always shown); the
+/// condition fills the remaining columns and is truncated with `…`. When the row
+/// is too narrow for any condition, the condition (and the leading separator)
+/// drop entirely but round/elapsed survive. CJK/width-safe via `crate::width`.
+fn goal_row_parts(
+    condition: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+) -> (&'static str, String, String) {
+    let marker = goal_marker(unicode);
+    let m = elapsed_secs / 60;
+    let s = elapsed_secs % 60;
+    let elapsed = if m == 0 { format!("{s}s") } else { format!("{m}m{s}s") };
+    let icon_w = crate::width::display_width(marker);
+    let meta = format!(" · round {round} · {elapsed}");
+    let meta_w = crate::width::display_width(&meta);
+    let cond_budget = max_cols.saturating_sub(icon_w).saturating_sub(meta_w);
+    if cond_budget == 0 {
+        // Too narrow for any condition — drop it (and the leading separator),
+        // keep marker + round/elapsed, truncating the meta to the cols left.
+        let bare = format!("round {round} · {elapsed}");
+        let meta_only = crate::width::truncate_to_width(&bare, max_cols.saturating_sub(icon_w));
+        return (marker, String::new(), meta_only);
+    }
+    let cond = crate::width::truncate_with_ellipsis(condition, cond_budget);
+    (marker, cond, meta)
+}
+
+/// Full goal-row text (marker + condition + meta joined). Thin wrapper over
+/// [`goal_row_parts`] for width assertions / tests; the renderer styles the
+/// parts separately via `goal_row_parts` directly.
+#[cfg(test)]
+fn format_goal_row(
+    condition: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+) -> String {
+    let (marker, cond, meta) = goal_row_parts(condition, round, elapsed_secs, max_cols, unicode);
+    format!("{marker}{cond}{meta}")
 }
 
 /// Format a token count using k/m units. `round_clean=true` drops the
@@ -236,6 +311,11 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
             Some(7) => style.reverse = true,
             Some(27) => style.reverse = false,
             Some(39) => style.fg = None,
+            // SGR 37 (regular white → soft light-gray on dark themes). Used
+            // by `theme::md_border_open()` for table borders in dark mode,
+            // where SGR 90 (DarkGrey) collapses to ~3:1 against the bg and
+            // the grid goes invisible. Maps to Color::Grey, NOT bright white.
+            Some(37) => style.fg = Some(Color::Grey),
             Some(90) => style.fg = Some(Color::DarkGrey),
             Some(91) => style.fg = Some(Color::Red),
             Some(92) => style.fg = Some(Color::Green),
@@ -385,6 +465,18 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// the row (flag flips to false) so the last animation frame
     /// stays frozen as a historical paragraph header.
     live_spinner_active: bool,
+    /// Set by `emit_body_line_inner` when an overflow LF scrolled the whole
+    /// viewport (footer included) up one row; consumed (cleared) by
+    /// `take_pending_scroll_flush` so the render worker repaints the footer
+    /// the same tick instead of waiting ~5ms for the deferred FlushDeferred.
+    pending_scroll_flush: bool,
+    /// True between `begin_sync()` and `end_sync()` — a single OUTER DECSET
+    /// 2026 envelope spanning a whole multi-operation burst (the `/resume`
+    /// replay). While set, `screen.sync_suppressed` is held on so per-frame
+    /// `render_diff`s don't emit nested envelopes. Tracked at the renderer
+    /// level (not only on `screen`) because `reset()` rebuilds `screen` —
+    /// the flag is re-applied to the fresh `screen` so suppression survives.
+    in_sync_batch: bool,
     /// When `Some`, the live row at body_bottom is the animated
     /// in-flight tool-call line (`<frame> Bash(cmd)`), not the generic
     /// spinner. The Spinner / StreamingBox tick handlers consult this:
@@ -414,16 +506,23 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// When Some, `paint_frame` paints the overlay cells after the normal
     /// body+footer, so the diff sees the combined frame.
     modal_overlay: Option<ModalOverlayState>,
-    /// Windows only: the STD_INPUT_HANDLE console mode value saved by
-    /// `enable_conhost_mouse_capture`. Currently always `None` — mouse
-    /// capture is intentionally disabled (see `with_writer` comment),
-    /// so there's nothing to restore. Field retained because the
-    /// suspend / shutdown paths still defensively call
-    /// `restore_conhost_console_in_mode` if it ever became `Some`
-    /// (belt-and-suspenders against a future re-enable being added
-    /// only on one side of the lifecycle).
+    /// Windows only: the STD_INPUT_HANDLE console mode saved before
+    /// `disable_conhost_quick_edit` cleared `ENABLE_QUICK_EDIT_MODE` at
+    /// startup (the conhost click-to-freeze fix). `Some(prev)` on a real
+    /// interactive console; `None` in unit tests and whenever stdin isn't a
+    /// console. The suspend / shutdown / Drop paths `take()` it and call
+    /// `restore_conhost_console_in_mode` to put the mode back byte-for-byte.
     #[cfg(windows)]
     prior_console_in_mode: Option<u32>,
+    /// Windows only: `true` once the real `new()` constructor has taken
+    /// ownership of the conhost QuickEdit bit on an interactive console.
+    /// Gates the re-clear in `resume_from_external` so that path's
+    /// `SetConsoleMode` syscall fires ONLY for a renderer built by `new()`
+    /// — never by the generic `with_writer` test path. `caps.tty` cannot be
+    /// the gate: it is `true` in unit tests too (see `caps_with_color`), so
+    /// gating resume on it would mutate the CI runner's console.
+    #[cfg(windows)]
+    quick_edit_managed: bool,
 }
 
 /// Pre-computed overlay cell grid + screen position for a modal window.
@@ -491,7 +590,30 @@ impl RetainedRenderer<StdoutTap> {
             inner: BufWriter::new(std::io::stdout()),
             mirror,
         };
-        Self::with_writer(tap, caps, w, h)
+        // Clear conhost's QuickEdit bit on a real interactive console so a
+        // click can't pause our stdout writes and freeze the render worker
+        // (see `conhost::disable_conhost_quick_edit`). This is the ONLY place
+        // the syscall fires: `new()` is monomorphic for the real stdout
+        // writer and is never reached by unit tests (they call `with_writer`
+        // with in-memory sinks), so the CI console is never mutated. Note
+        // `caps.tty` alone would NOT be a safe gate — test caps report
+        // tty=true too — the constructor boundary is the real protection.
+        #[cfg(windows)]
+        let manage_quick_edit = caps.tty;
+        #[cfg(windows)]
+        let prior = if manage_quick_edit {
+            crate::render::conhost::disable_conhost_quick_edit()
+        } else {
+            None
+        };
+        #[allow(unused_mut)]
+        let mut r = Self::with_writer(tap, caps, w, h);
+        #[cfg(windows)]
+        {
+            r.prior_console_in_mode = prior;
+            r.quick_edit_managed = manage_quick_edit;
+        }
+        r
     }
 }
 
@@ -514,9 +636,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // panicked before Drop) having left capture on.
         let _ = out.write_all(b"\x1b[3J");
         let _ = out.flush();
+        // `with_writer` never touches the console mode: it's generic over the
+        // writer and is the path unit tests use with in-memory sinks, so
+        // issuing a `SetConsoleMode` here would mutate the CI runner's real
+        // console. The conhost QuickEdit clear lives in `new()` (the real
+        // StdoutTap constructor, never reached by tests); this stays `None`
+        // and `new()` overwrites it after construction.
         #[cfg(windows)]
-        // Conhost mouse capture intentionally skipped — see comment
-        // above re: deferring to terminal-native selection/wheel/copy.
         let prior_console_in_mode: Option<u32> = None;
         Self {
             out,
@@ -539,12 +665,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             welcome_banner: None,
             welcome_line_count: 0,
             live_spinner_active: false,
+            pending_scroll_flush: false,
+            in_sync_batch: false,
             inflight_tool: None,
             inflight_tool_rows: 0,
             live_group: None,
             modal_overlay: None,
             #[cfg(windows)]
             prior_console_in_mode,
+            // Generic constructor (incl. all unit tests): never manages the
+            // console QuickEdit bit. Only the real `new()` flips this true.
+            #[cfg(windows)]
+            quick_edit_managed: false,
         }
     }
 
@@ -590,6 +722,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             reverse: false,
             faint: true,
         }
+    }
+
+    fn tool_bullet_style(&self) -> CellStyle {
+        self.style_bold(Role::ToolName)
     }
 
     /// Build the cells for a spinner body row: `<frame> <label>`,
@@ -642,7 +778,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let safe_detail = scrub_controls(detail);
 
         let prefix = format!("{} ", icon);
-        let prefix_style = self.style_for(Role::Muted);
+        let prefix_style = self.tool_bullet_style();
         let name_style = self.style_bold(Role::ToolName);
         let detail_style = self.style_for(Role::Secondary);
         let meta_style = self.style_bold(Role::ToolName);
@@ -1221,7 +1357,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .saturating_sub(crate::width::display_width(&ctx_str))
             .saturating_sub(sep_w);
 
-        let mut parts: Vec<String> = Vec::with_capacity(3);
+        let mut parts: Vec<String> = Vec::with_capacity(4);
         if !model_str.is_empty() {
             parts.push(model_str);
         }
@@ -1239,6 +1375,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if !ctx_str.is_empty() {
             parts.push(ctx_str);
         }
+        // NOTE: the goal indicator is NOT appended here any more — it lives on
+        // its own dedicated footer row (`build_goal_row`) so it can't be the
+        // first thing truncated off this line under a hint / narrow terminal.
         let left = parts.join(" · ");
 
         // Helper: emit the badge (with trailing space) then the rest, so
@@ -1295,6 +1434,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
+    /// Build the dedicated goal row (one full-width line, shown only while a
+    /// `/goal` loop is active). Sits directly above the status line, with a calm
+    /// hierarchy so it reads as persistent status, not a loud activity line:
+    /// the `◎` marker in `Brand` (a small accent), the condition in normal text,
+    /// and the ` · round N · elapsed` meta in `Muted` gray.
+    fn build_goal_row(&self, goal: &crate::render::GoalStatus, rule_width: usize) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let (marker, condition, meta) = goal_row_parts(
+            &scrub_controls(&goal.condition),
+            goal.round,
+            goal.elapsed_secs,
+            rule_width.max(1),
+            self.caps.unicode_symbols,
+        );
+        push_str_cells(&mut row, marker, &self.style_for(Role::Brand));
+        push_str_cells(&mut row, &condition, &CellStyle::default());
+        push_str_cells(&mut row, &meta, &self.style_for(Role::Muted));
+        row
+    }
+
     /// Paint the full footer into `self.screen`. Layout mirrors
     /// `AnsiRenderer::draw_footer_here_with_prev_cursor`:
     ///
@@ -1334,7 +1493,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if lines.is_empty() {
             lines.push(String::new());
         }
-        let middle_rows = lines.len();
 
         // Paginate menu using the kind-specific cap.
         let max_menu = self
@@ -1383,7 +1541,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        let total_rows = 1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows;
+        // Dedicated goal row: one full-width line above the status row, only
+        // while a `/goal` loop is active.
+        let goal_rows = if self.status.goal.is_some() { 1 } else { 0 };
+        // Cap the input-box height so a long paste / typed text can't grow the
+        // footer past the screen (overflow). The full text stays in input_buf;
+        // we render a scrolling window that keeps the cursor row visible. The
+        // `[Pasted #N]` folding (insert_paste) already shrinks most big pastes;
+        // this is the backstop for the rest (unfolded single-line pastes,
+        // sub-threshold pastes, typed text). The goal row is folded into the
+        // status-rows reservation so the input box height accounts for it too.
+        let max_input_rows =
+            Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows);
+        let input_view_start = if lines.len() > max_input_rows {
+            cursor_row_in_middle
+                .saturating_sub(max_input_rows.saturating_sub(1))
+                .min(lines.len() - max_input_rows)
+        } else {
+            0
+        };
+        let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
+        let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
+        let total_rows =
+            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + status_rows;
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
         // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
@@ -1401,18 +1581,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
             input_rule_width,
             self.status.session_name.as_deref(),
         );
-        let middle_cells: Vec<Vec<Cell>> = lines
+        let middle_cells: Vec<Vec<Cell>> = lines[input_view_start..input_view_start + middle_rows]
             .iter()
             .enumerate()
-            .map(|(i, line)| self.build_middle_row(line, i == 0))
+            .map(|(i, line)| self.build_middle_row(line, input_view_start + i == 0))
             .collect();
-        let bot_rule = self.build_rule_row(input_rule_width);
+        // When the input is scrolled (windowed), show "+N more lines" on the
+        // bottom rule so it's visible that content is hidden, not lost.
+        let hidden_rows = lines.len() - middle_rows;
+        let bot_rule = self.build_input_bot_rule(input_rule_width, hidden_rows);
         let status_clone = self.status.clone();
         let status_cells = if has_status {
             Some(self.build_status_row(&status_clone, rule_width))
         } else {
             None
         };
+        let goal_cells = status_clone
+            .goal
+            .as_ref()
+            .map(|g| self.build_goal_row(g, rule_width));
         let menu_kind = self
             .menu
             .as_ref()
@@ -1475,10 +1662,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(menu_top + i, 0, &padded);
         }
+        // Goal row sits directly above the status line (between the menu and
+        // the status row), so `· menu / goal / status ·`.
+        let goal_top = menu_top + menu_rows;
+        if let Some(gr) = goal_cells {
+            let mut padded = gr;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(goal_top, 0, &padded);
+        }
         if let Some(st) = status_cells {
             let mut padded = st;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(menu_top + menu_rows, 0, &padded);
+            self.screen.draw_row(goal_top + goal_rows, 0, &padded);
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
@@ -1529,11 +1724,48 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
+        let goal_rows = if self.status.goal.is_some() { 1 } else { 0 };
         let attachment_rows = self.input_attachments.len();
-        // 1 top rule + middle + 1 bot rule + attachments + menu + status.
+        // Cap the input height (mirrors paint_footer) so a long paste / typed
+        // input can't make the footer exceed the screen.
+        let capped_middle = middle_rows
+            .min(Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows));
+        // 1 top rule + middle + 1 bot rule + attachments + menu + goal + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows
+        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + status_rows
+    }
+
+    /// Max rows the input box may DISPLAY before scrolling internally. Bounds
+    /// the footer to leave the rule rows, any attachment/menu/status chrome,
+    /// and at least one body row — so the footer never exceeds the screen no
+    /// matter how long the input is. Also capped to `MAX_INPUT_ROWS` so a huge
+    /// paste can't take the whole screen on tall terminals.
+    fn max_input_rows(h: usize, attachment_rows: usize, menu_rows: usize, status_rows: usize) -> usize {
+        // top rule + bot rule + chrome, plus one reserved body row.
+        let reserved = 2 + attachment_rows + menu_rows + status_rows + 1;
+        h.saturating_sub(reserved).min(MAX_INPUT_ROWS).max(1)
+    }
+
+    /// Bottom rule of the input box. When `hidden_rows > 0` (the input is
+    /// scrolled), embed a muted `+N more lines` hint at the right so the user
+    /// sees the content is hidden (still in `input_buf`), not lost.
+    fn build_input_bot_rule(&self, rule_width: usize, hidden_rows: usize) -> Vec<Cell> {
+        let mut row = self.build_rule_row(rule_width);
+        if hidden_rows == 0 {
+            return row;
+        }
+        let hint = format!(" +{hidden_rows} more lines ");
+        let hint_chars: Vec<char> = hint.chars().collect();
+        if hint_chars.len() >= rule_width {
+            return row;
+        }
+        let muted = self.style_for(Role::Muted);
+        let start = rule_width - hint_chars.len();
+        for (i, ch) in hint_chars.into_iter().enumerate() {
+            row[start + i] = Cell { ch, style: muted.clone(), width: 1 };
+        }
+        row
     }
 
     /// Single-entry-point for painting a full frame. Append-only
@@ -1905,6 +2137,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // pushes don't treat it as visible — and don't re-promote
             // it on the next overflow LF after an intervening tail pop.
             self.scrolled_off = self.scrolled_off.saturating_add(1);
+            // The whole-viewport scroll just lifted the footer up one row;
+            // flag it so the render worker repaints the footer this tick
+            // (see `take_pending_scroll_flush`) instead of waiting ~5ms for
+            // the event loop's deferred FlushDeferred.
+            self.pending_scroll_flush = true;
             visible_len -= 1;
         }
         // 1-indexed row where the NEW body line should land on the
@@ -2208,7 +2445,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             if safe_detail.is_empty() {
                 self.push_body_prefixed(
                     "\u{25cf} ",
-                    &self.style_for(Role::Muted),
+                    &self.tool_bullet_style(),
                     &safe_name,
                     &self.style_bold(Role::ToolName),
                 );
@@ -2217,7 +2454,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let body_str = format!("{}({})", safe_name, safe_detail);
                 let body_str = truncate_body_str(&body_str, 500);
                 let detail_str = format!("({})", safe_detail);
-                let prefix_style = self.style_for(Role::Muted);
+                let prefix_style = self.tool_bullet_style();
                 let name_style = self.style_bold(Role::ToolName);
                 let detail_style = self.style_for(Role::Secondary);
                 let rows = self.build_mixed_style_rows(
@@ -2800,6 +3037,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.welcome_line_count = new_len;
     }
 
+    fn push_user_message(&mut self, text: &str, attachments: &[usize]) {
+        self.mark_message(crate::render::MarkKind::User);
+        self.last_mark_was_assistant = false;
+        let safe = scrub_controls(text);
+        let accent = self.style_bold(Role::Accent);
+        let plain = CellStyle::default();
+        self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &plain);
+        let muted = self.style_for(Role::Muted);
+        for n in attachments {
+            self.push_body_text(&format!("└ [Image #{}]", n), &muted);
+        }
+        self.push_body_row(Vec::new());
+        self.md_state.reset();
+    }
+
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -2880,17 +3132,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_welcome(&model_scrubbed, &wd_scrubbed);
             }
             UiLine::User(text) => {
-                self.mark_message(crate::render::MarkKind::User);
-                self.last_mark_was_assistant = false;
-                let safe = scrub_controls(&text);
-                let accent = self.style_bold(Role::Accent);
-                let plain = CellStyle::default();
-                self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &plain);
-                // Blank spacer row.
-                self.push_body_row(Vec::new());
-                // New user turn — reset markdown parser so code-block
-                // / table state from previous turn doesn't bleed.
-                self.md_state.reset();
+                self.push_user_message(&text, &[]);
+            }
+            UiLine::UserWithAttachments { text, attachments } => {
+                self.push_user_message(&text, &attachments);
             }
             UiLine::TurnSeparator { label } => {
                 self.last_mark_was_assistant = false;
@@ -3000,6 +3245,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: tools & diffs ──
             UiLine::ToolCallInFlight { id, name, detail } => {
+                self.clear_live_spinner();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
@@ -3044,6 +3290,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 header,
                 children,
             } => {
+                self.clear_live_spinner();
                 // Mark the batch header as a ToolCall anchor — Alt+↑/↓
                 // (message-jump) walks `message_marks`; without this
                 // the whole "● Running N calls in parallel" header +
@@ -3199,21 +3446,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_row(row);
             }
             UiLine::ToolCall { name, detail } => {
+                self.clear_live_spinner();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
-                // Same dark-theme color hierarchy as the `└` result line:
-                // on dark themes `Role::Muted` is SGR 37 (near-white), so the
-                // `●` anchor reads as the same tier as the bold command name
-                // beside it. Render it FAINT on dark to dim it to a gray,
-                // matching light theme (where `●` is DarkGrey against the
-                // black bold name). Light theme keeps the plain muted color.
-                let bullet_style = if crate::highlight::theme::is_light_for_render() {
-                    self.style_for(Role::Muted)
-                } else {
-                    self.style_faint(Role::Muted)
-                };
+                let bullet_style = self.tool_bullet_style();
                 let tool_name_style = self.style_bold(Role::ToolName);
+                let detail_style = self.style_for(Role::Secondary);
                 let safe_name = scrub_controls(&name);
                 let safe_detail = scrub_controls(&detail);
                 let body_str = if safe_detail.is_empty() {
@@ -3235,12 +3474,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // unifies the visual anchor with the parallel-batch
                 // header (also ●), matching Claude Code's single-glyph
                 // model for tool-call entries.
-                self.push_body_prefixed(
-                    "● ",
-                    &bullet_style,
-                    &body_str,
-                    &tool_name_style,
-                );
+                if safe_detail.is_empty() {
+                    self.push_body_prefixed(
+                        "● ",
+                        &bullet_style,
+                        &body_str,
+                        &tool_name_style,
+                    );
+                } else {
+                    let detail_str = format!("({})", safe_detail);
+                    let rows = self.build_mixed_style_rows(
+                        "● ", &bullet_style,
+                        &safe_name, &tool_name_style,
+                        &detail_str, &detail_style,
+                        "", &tool_name_style,
+                        &body_str,
+                    );
+                    for row in rows {
+                        self.push_body_row(row);
+                    }
+                }
             }
             UiLine::ToolResult { success, summary } => {
                 self.mark_message(crate::render::MarkKind::ToolResult);
@@ -3879,6 +4132,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.write_all(seq.as_bytes());
         self.screen =
             Screen::new(self.screen.width(), self.screen.height()).with_jediterm(self.caps.jediterm);
+        // Rebuilding `screen` dropped any suppression flag — re-apply it so a
+        // `reset()` issued INSIDE a `begin_sync()` batch (the `/resume` replay)
+        // keeps the next render_diff from emitting a nested DECSET 2026 envelope.
+        self.screen.set_sync_suppressed(self.in_sync_batch);
         self.body_lines.clear();
         self.scrolled_off = 0;
         self.welcome_line_count = 0;
@@ -3889,6 +4146,43 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
         // Force cold-start CUP+EL on next paint to wipe pre-reset stdout writes.
         self.screen.invalidate();
+    }
+
+    fn begin_sync(&mut self) {
+        // Open ONE outer DECSET 2026 envelope around a whole upcoming burst
+        // — specifically the `/resume` replay, which blanks the screen
+        // (`reset()`) and then re-emits the entire transcript line-by-line
+        // via direct stdout writes that LF-scroll history into native
+        // scrollback. Without this, the blank flushes unwrapped and every
+        // re-emitted row paints unsynchronized, so the user sees the screen
+        // blank and the history visibly re-scroll (the reported flicker).
+        // Inside the envelope, suppress per-frame `render_diff` envelopes
+        // (`sync_suppressed`) so a nested ESU can't end the batch early.
+        // Idempotent: a second begin keeps the single open envelope.
+        if self.in_sync_batch {
+            return;
+        }
+        self.in_sync_batch = true;
+        self.screen.set_sync_suppressed(true);
+        let _ = self.out.write_all(b"\x1b[?2026h");
+        let _ = self.out.flush();
+    }
+
+    fn end_sync(&mut self) {
+        if !self.in_sync_batch {
+            return;
+        }
+        // Land the final frame (settled footer) INSIDE the still-open
+        // envelope so nothing paints after it closes — suppression is still
+        // on here, so this render_diff emits no nested envelope of its own.
+        self.flush_deferred();
+        self.in_sync_batch = false;
+        self.screen.set_sync_suppressed(false);
+        // Close the envelope: capable hosts now paint the whole burst as one
+        // atomic update. Hosts that ignore DECSET 2026 (Terminal.app, older
+        // SSH) saw the writes immediately — no worse than before.
+        let _ = self.out.write_all(b"\x1b[?2026l");
+        let _ = self.out.flush();
     }
 
     fn clear_screen(&mut self) {
@@ -3967,7 +4261,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // coming as `Repeat`, Shift+Enter stops carrying SHIFT, and any
         // other logic that depended on CSI u event types silently
         // degrades. Same flag set as `TerminalGuard::activate`.
-        if self.caps.tty {
+        //
+        // Windows is excluded for the same reason as the initial push: the
+        // Win32 console backend can't decode `CSI u`, so re-arming the
+        // protocol after a resume would reintroduce the numpad-leak bug
+        // (`ESC[57400u` for keypad keys) on every OAuth/shell round-trip.
+        // See `TerminalGuard::activate` in lib.rs for the full rationale.
+        if self.caps.tty && !cfg!(windows) {
             let _ = execute!(
                 self.out,
                 PushKeyboardEnhancementFlags(
@@ -4027,12 +4327,27 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // an external subprocess. The matching disable in
         // suspend_for_external is still emitted so any subprocess that
         // somehow turned capture on during its run gets cleaned up here.
+        // Re-clear conhost QuickEdit after returning from an external
+        // subprocess. `suspend_for_external` restored the original mode
+        // (re-enabling QuickEdit so the child — OAuth browser, `/shell` —
+        // got a normal console) and took the saved value to `None`;
+        // crossterm's `enable_raw_mode` above does not touch QuickEdit. So
+        // without re-clearing here, the click-to-freeze bug would return
+        // after every external round-trip. Win32 console-mode change only —
+        // no ANSI bytes, no mouse capture re-enabled. Gated on
+        // `quick_edit_managed` (set only by the real `new()`), NOT on
+        // `caps.tty`, so the generic `with_writer` test path — which also
+        // reports tty=true and DOES call `resume_from_external` in tests —
+        // never issues a `SetConsoleMode` syscall against the CI console.
         #[cfg(windows)]
-        {
-            // Mirror the lib-level decision: leave conhost mode alone.
-            self.prior_console_in_mode = None;
+        if self.quick_edit_managed {
+            self.prior_console_in_mode = crate::render::conhost::disable_conhost_quick_edit();
         }
         let _ = self.out.flush();
+    }
+
+    fn take_pending_scroll_flush(&mut self) -> bool {
+        std::mem::take(&mut self.pending_scroll_flush)
     }
 
     fn flush_deferred(&mut self) {
@@ -4222,6 +4537,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // repaint below stamps a second copy. EL is row-local and
         // unambiguous across terminals.
         //
+        // Open ONE outer DECSET 2026 envelope around the whole resize: the
+        // wipe below and the body tail re-emit further down are direct stdout
+        // writes that, unwrapped, made the terminal visibly blank and re-stamp
+        // the body on every resize (same flicker class as the `/resume`
+        // replay). Capable hosts now paint the resize as one atomic update;
+        // the inner `paint_frame`/`render_diff` is suppressed below so it
+        // can't nest its own envelope. `?2026l` closes it at the very end.
+        let _ = self.out.write_all(b"\x1b[?2026h");
         // Release DECSTBM first so EL isn't constrained by the
         // stale (pre-resize) scroll region.
         let _ = self.out.write_all(b"\x1b[r");
@@ -4248,6 +4571,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         crate::tuix_trace!("RSZ", "wipe written");
         self.screen.resize(cols, rows);
+        // `screen.resize` rebuilds the Screen (resetting `sync_suppressed`) —
+        // re-assert suppression so the `flush_frame` render_diff below paints
+        // inside the outer envelope without emitting a nested one.
+        self.screen.set_sync_suppressed(true);
         // Mark physical state unknown so the upcoming paint_frame's
         // render_diff cold-starts with a per-row CUP+EL preamble — exactly
         // like reset() (:~3627) and resume_from_external() (:~3732), which
@@ -4306,6 +4633,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         crate::tuix_trace!("RSZ", "body done; paint begin");
         self.paint_frame();
         self.flush_frame();
+        // Close the envelope after the final frame has landed inside it.
+        self.screen.set_sync_suppressed(false);
+        let _ = self.out.write_all(b"\x1b[?2026l");
         let _ = self.out.flush();
         crate::tuix_trace!("RSZ", "done");
         self.last_painted_footer_rows = self.current_footer_rows();
@@ -4439,6 +4769,63 @@ mod tests {
         // they want to see how close to the limit the context is. With a
         // window, render `used/window tok` so saturation is visible.
         assert_eq!(format_ctx_usage(10_400, 131_000), "10.4k/131k tok");
+    }
+
+    #[test]
+    fn goal_row_shows_condition_round_and_elapsed() {
+        // Wide row (unicode caps): ◎ marker + full condition + round + elapsed.
+        let row = format_goal_row("重构 auth 模块直到测试全过", 3, 133, 80, true);
+        assert!(row.starts_with("◎ "), "geometric marker present: {row}");
+        assert!(!row.contains('🎯'), "must NOT use an emoji marker: {row}");
+        assert!(row.contains("重构 auth 模块直到测试全过"), "full condition kept: {row}");
+        assert!(row.contains("· round 3 ·"), "round shown: {row}");
+        assert!(row.contains("2m13s"), "elapsed mm/ss: {row}");
+    }
+
+    #[test]
+    fn goal_row_ascii_fallback_avoids_geometric_and_emoji_glyphs() {
+        // Windows legacy conhost / Consolas (unicode_symbols=false): no ◎ tofu,
+        // no emoji — a plain ASCII `*` marker, same gate as the spinner.
+        let row = format_goal_row("ship it", 4, 7, 80, false);
+        assert!(row.starts_with("* "), "ascii marker: {row}");
+        assert!(!row.contains('◎') && !row.contains('🎯'), "no non-ASCII glyph: {row}");
+        assert!(row.contains("· round 4 · 7s"), "round/elapsed intact: {row}");
+    }
+
+    #[test]
+    fn goal_row_parts_split_marker_condition_meta_for_styling() {
+        // Marker / condition / meta are returned separately so the renderer can
+        // style them with hierarchy (accent / normal / muted). Round shown verbatim.
+        let (marker, cond, meta) = goal_row_parts("fix tests", 1, 8, 80, true);
+        assert_eq!(marker, "◎ ");
+        assert_eq!(cond, "fix tests");
+        assert_eq!(meta, " · round 1 · 8s");
+        // ASCII fallback marker on non-unicode terminals.
+        assert_eq!(goal_row_parts("x", 1, 8, 80, false).0, "* ");
+    }
+
+    #[test]
+    fn goal_row_elapsed_under_a_minute_omits_minutes() {
+        let row = format_goal_row("x", 1, 42, 80, true);
+        assert!(row.contains("· 42s"), "seconds-only under a minute: {row}");
+        assert!(!row.contains("0m"), "no leading 0m: {row}");
+    }
+
+    #[test]
+    fn goal_row_truncates_long_condition_but_keeps_round_and_elapsed() {
+        let cond = "a".repeat(200);
+        let row = format_goal_row(&cond, 7, 5, 40, true);
+        assert!(crate::width::display_width(&row) <= 40, "row fits width: {row}");
+        assert!(row.contains("· round 7 · 5s"), "round/elapsed survive: {row}");
+        assert!(row.contains('…'), "condition truncated with ellipsis: {row}");
+    }
+
+    #[test]
+    fn goal_row_degrades_to_round_elapsed_when_too_narrow() {
+        // No room for any condition → drop it, keep marker + round/elapsed.
+        let row = format_goal_row("some long condition", 2, 9, 14, true);
+        assert!(crate::width::display_width(&row) <= 14, "row fits narrow width: {row}");
+        assert!(row.contains("round 2"), "round survives even when condition dropped: {row}");
     }
 
     #[test]
@@ -4588,6 +4975,7 @@ mod tests {
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
+            goal: None,
         }
     }
 
@@ -4612,6 +5000,7 @@ mod tests {
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
+            goal: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -4665,6 +5054,7 @@ mod tests {
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
             reasoning_effort: None,
+            goal: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -4710,6 +5100,7 @@ mod tests {
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
             reasoning_effort: None,
+            goal: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -5131,6 +5522,95 @@ mod tests {
             vterm_after.scrollback_len(),
             baseline_scrollback
         );
+    }
+
+    /// Footer-jitter fix invariant: a body overflow scrolls the whole
+    /// viewport (footer included) up one row, so it must flag a pending
+    /// scroll-flush — that's the signal the render worker uses to repaint the
+    /// footer the same tick instead of waiting ~5ms for the deferred tick.
+    /// `take_pending_scroll_flush` returns it once, then clears.
+    #[test]
+    fn body_overflow_flags_pending_scroll_flush_and_take_clears() {
+        // Short viewport so a handful of body rows overflow the visible cap.
+        let (mut r, _c) = new_counting(80, 10);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        assert!(
+            !r.take_pending_scroll_flush(),
+            "no body scroll has happened yet"
+        );
+
+        // Push well past the visible cap so the overflow LF fires.
+        for i in 0..20 {
+            r.render(UiLine::User(format!("line-{i}")));
+        }
+        assert!(
+            r.take_pending_scroll_flush(),
+            "overflow must flag a pending scroll-flush for the worker"
+        );
+        assert!(
+            !r.take_pending_scroll_flush(),
+            "take must clear the flag (one repaint per drained burst)"
+        );
+    }
+
+    /// Coalescing guard: InputPrompt / IME bursts never push body rows, so
+    /// they must NEVER set the scroll-flush flag — otherwise the worker would
+    /// eager-paint per keystroke and defeat the deferred-tick coalescing that
+    /// `retained_coalesce_many_renders_one_emit` pins.
+    #[test]
+    fn input_prompt_burst_never_flags_scroll_flush() {
+        let (mut r, _c) = new_counting(80, 24);
+        let status = status_basic();
+        r.flush_deferred();
+        let mut buf = String::new();
+        for ch in "你是谁你是谁你是谁你是谁你是谁你是谁你是谁".chars() {
+            buf.push(ch);
+            r.render(UiLine::InputPrompt {
+                buf: buf.clone(),
+                cursor_byte: buf.len(),
+                menu: None,
+                status: status.clone(),
+                attachments: Vec::new(),
+            });
+        }
+        assert!(
+            !r.take_pending_scroll_flush(),
+            "InputPrompt never scrolls the body, so it must not trigger the eager scroll-flush"
+        );
+    }
+
+    /// Overflow fix: a long paste / typed text used to grow the input box (and
+    /// the footer) past the screen height. The footer must now stay within the
+    /// screen, with the input box capped to a scrolling window (full text still
+    /// lives in input_buf — display-only cap).
+    #[test]
+    fn long_input_does_not_overflow_footer() {
+        let (mut r, _c) = new_counting(80, 24);
+        let big = (0..60).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        r.input_buf = big.clone();
+        r.input_cursor_byte = big.len();
+        let footer = r.current_footer_rows();
+        assert!(
+            footer < 24,
+            "footer ({footer}) must not exceed screen height for a 60-line input"
+        );
+        // top rule + <=MAX_INPUT_ROWS input rows + bot rule (no menu/status here).
+        assert!(
+            footer <= 1 + MAX_INPUT_ROWS + 1,
+            "input box must be capped near MAX_INPUT_ROWS, got footer={footer}"
+        );
+        // A short input is unaffected.
+        r.input_buf = "hi".into();
+        r.input_cursor_byte = 2;
+        assert!(r.current_footer_rows() < footer, "short input should be smaller");
     }
 
     /// Regression: after a `/skills` menu containing CJK skill names/descs
@@ -6424,6 +6904,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retained_committed_inflight_tool_uses_static_tool_call_styles() {
+        let (mut static_r, _static_buf) = new_capturing(80, 24);
+        static_r.render(UiLine::ToolCall {
+            name: "EditFile".into(),
+            detail: "test.txt ← \"10\"".into(),
+        });
+        let static_row = static_r.body_lines.last().expect("static tool row");
+
+        let (mut inflight_r, _inflight_buf) = new_capturing(80, 24);
+        inflight_r.render(UiLine::ToolCallInFlight {
+            id: "call-edit-1".into(),
+            name: "EditFile".into(),
+            detail: "test.txt ← \"10\"".into(),
+        });
+        inflight_r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-edit-1".into()),
+        });
+        let committed_row = inflight_r.body_lines.last().expect("committed tool row");
+
+        let static_bullet = static_row.iter().find(|c| c.ch == '●').expect("static bullet");
+        let committed_bullet = committed_row.iter().find(|c| c.ch == '●').expect("committed bullet");
+        assert_eq!(
+            committed_bullet.style, static_bullet.style,
+            "committed inflight bullet must match static ToolCall bullet style"
+        );
+        assert!(
+            static_bullet.style.bold,
+            "tool-call bullet must be highlighted"
+        );
+
+        let static_detail = static_row
+            .iter()
+            .find(|c| c.ch == '(')
+            .expect("static detail opener");
+        let committed_detail = committed_row
+            .iter()
+            .find(|c| c.ch == '(')
+            .expect("committed detail opener");
+        assert_eq!(
+            committed_detail.style, static_detail.style,
+            "committed inflight detail must match static ToolCall detail style"
+        );
+        assert!(
+            !static_detail.style.bold,
+            "tool-call detail must use normal foreground, not highlighted text"
+        );
+    }
+
     /// ToolResult success: `⎿ summary` + blank spacer; failure
     /// prepends `✗ `. We test success path here; the error styling
     /// (Role::Error red) is a cell-style detail not asserted in
@@ -6502,17 +7031,17 @@ mod tests {
             summary_cell,
         );
 
-        // Header line: the `●` anchor must be faint (subordinate tier,
-        // in lockstep with the `└` line), while the tool name must be
-        // bold and NOT faint — the prominent tier.
+        // Header line: the `●` anchor is bold and NOT faint — it shares the tool
+        // name's prominent tier (`tool_bullet_style` = `style_bold(Role::ToolName)`),
+        // anchoring the tool-call row as a single bold glyph + name.
         let hdr_idx = (0..vterm.height() as usize)
             .find(|&i| vterm.row_text(i).contains("ListDirectory"))
             .unwrap_or_else(|| panic!("header row missing\ndump:\n{}", vterm.dump()));
         let bullet_col = vterm.row_text(hdr_idx).find('●').unwrap();
         let bullet_cell = vterm.cell_at(hdr_idx, bullet_col);
         assert!(
-            bullet_cell.faint,
-            "`●` bullet must be faint in dark theme, got {:?}",
+            bullet_cell.bold && !bullet_cell.faint,
+            "`●` bullet must be bold (prominent tier) in dark theme, got {:?}",
             bullet_cell,
         );
         let name_col = vterm.row_text(hdr_idx).find("ListDirectory").unwrap();
@@ -7366,6 +7895,92 @@ mod tests {
             !spinner_in_history,
             "spinner row still in body_lines — it must be popped when \
              covered"
+        );
+    }
+
+    /// Tool-call streaming paints a transient "Preparing Tool(...)" live spinner.
+    /// When the real in-flight tool row arrives, that spinner must be removed
+    /// rather than becoming a second visible `WriteFile(test.txt)` row.
+    #[test]
+    fn retained_tool_call_inflight_covers_streaming_spinner_row() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "●",
+            label: "Preparing WriteFile(test.txt)".into(),
+            status,
+            menu: None,
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-write-1".into(),
+            name: "WriteFile".into(),
+            detail: "test.txt".into(),
+        });
+
+        let row_texts: Vec<String> = r
+            .body_lines
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect();
+        let write_rows = row_texts.iter().filter(|t| t.contains("WriteFile(test.txt)")).count();
+
+        assert_eq!(
+            write_rows, 1,
+            "streaming spinner plus in-flight tool must leave exactly one WriteFile row: {:?}",
+            row_texts
+        );
+        assert!(
+            !row_texts.iter().any(|t| t.contains("Preparing WriteFile")),
+            "transient Preparing row leaked into history: {:?}",
+            row_texts
+        );
+        assert!(
+            !r.live_spinner_active,
+            "live spinner state must be cleared once the tool row owns the slot"
+        );
+    }
+
+    /// Same as the in-flight path, but for approval/replay paths that render a
+    /// static ToolCall row directly.
+    #[test]
+    fn retained_static_tool_call_covers_streaming_spinner_row() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "●",
+            label: "Preparing WriteFile(test.txt)".into(),
+            status,
+            menu: None,
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::ToolCall {
+            name: "WriteFile".into(),
+            detail: "test.txt".into(),
+        });
+
+        let row_texts: Vec<String> = r
+            .body_lines
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect();
+        let write_rows = row_texts.iter().filter(|t| t.contains("WriteFile(test.txt)")).count();
+
+        assert_eq!(
+            write_rows, 1,
+            "streaming spinner plus static tool call must leave exactly one WriteFile row: {:?}",
+            row_texts
+        );
+        assert!(
+            !row_texts.iter().any(|t| t.contains("Preparing WriteFile")),
+            "transient Preparing row leaked into history: {:?}",
+            row_texts
         );
     }
 
@@ -8718,6 +9333,48 @@ mod tests {
         );
     }
 
+    /// A full viewport used to lose the user row when the event loop emitted
+    /// `User` first and `ImageAttachment` second: `User` committed a spacer,
+    /// the attachment popped it only from memory, and the already-emitted LF
+    /// could not be undone. The grouped variant emits no temporary row.
+    #[test]
+    fn user_with_attachment_stays_visible_when_body_is_full() {
+        let w = 80;
+        let h = 12;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let cap = h as usize - r.current_footer_rows();
+        for i in 0..cap {
+            r.render(UiLine::CommandOutput(format!("filler-{i}")));
+        }
+        r.render(UiLine::UserWithAttachments {
+            text: "[Image #1]你好".into(),
+            attachments: vec![1],
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let visible = vterm.dump();
+        assert!(
+            visible.contains("❯ [Image #1]") && visible.contains('你') && visible.contains('好'),
+            "user text must remain visible beside its attachment:\n{visible}"
+        );
+        assert!(
+            visible.contains("└ [Image #1]"),
+            "attachment echo must remain visible below user text:\n{visible}"
+        );
+    }
+
     /// Regression: SGR (`\x1b[31m…\x1b[39m`) embedded in a
     /// `UiLine::CommandOutput` payload — emitted by the `/codingplan`
     /// SetupReport for locked-model rows — must reach the cell grid
@@ -9112,6 +9769,18 @@ mod tests {
     }
 
     #[test]
+    fn apply_sgr_37_is_grey_for_dark_table_borders() {
+        // SGR 37 is emitted by `theme::md_border_open()` for table borders
+        // on dark themes (DarkGrey/SGR 90 is swallowed by the bg there).
+        // The parser must map it to Color::Grey — a visible light-gray —
+        // not drop it (which would fall back to the default fg) and not
+        // bright white (Color::White / SGR 97).
+        let mut style = CellStyle::default();
+        apply_sgr("37", &mut style);
+        assert_eq!(style.fg, Some(Color::Grey), "SGR 37 must map to Color::Grey");
+    }
+
+    #[test]
     fn apply_sgr_22_clears_both_bold_and_faint() {
         let mut style = CellStyle {
             bold: true,
@@ -9197,6 +9866,30 @@ mod tests {
             after_drop.contains("\x1b[?1006l"),
             "Drop must emit mouse-mode disable (1006l) defensively: {:?}",
             after_drop
+        );
+    }
+
+    /// Lock the test-safety boundary for the conhost QuickEdit fix: the
+    /// generic `with_writer` constructor (the path every unit test uses)
+    /// must NEVER take ownership of the console mode — i.e. it must not call
+    /// `SetConsoleMode`. If a future change moves the QuickEdit clear out of
+    /// the real `new()` and into `with_writer` gated only on `caps.tty`
+    /// (which is `true` in tests), it would mutate the CI runner's console;
+    /// this assertion catches that. Windows-only because the fields are
+    /// `#[cfg(windows)]`.
+    #[cfg(windows)]
+    #[test]
+    fn retained_with_writer_never_manages_console_quick_edit() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        assert!(
+            r.prior_console_in_mode.is_none(),
+            "with_writer must not capture a console mode (no SetConsoleMode in the test path)"
+        );
+        assert!(
+            !r.quick_edit_managed,
+            "with_writer must not flag itself as managing QuickEdit — only real new() does"
         );
     }
 
@@ -9996,6 +10689,174 @@ mod tests {
         );
     }
 
+    /// Bug repro: single edit_file tool call (auto-approved) must render
+    /// exactly ONE ● EditFile row in body_lines. User report shows two
+    /// when ToolCallResult arrives and both ToolCallCommit → commit_inflight_tool
+    /// AND ToolResult's defense-in-depth commit_inflight_tool produce a row.
+    #[test]
+    fn retained_single_edit_file_does_not_double_editfile() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Simulate ToolCallStarted -> inflight spinner for edit_file
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-edit-1".into(),
+            name: "EditFile".into(),
+            detail: "numbers.txt ← \"5\"".into(),
+        });
+        r.flush_deferred();
+
+        // Count rows before result (should be 1: the spinner)
+        let before = r.body_lines.iter().filter(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("EditFile")
+        }).count();
+        eprintln!("EditFile rows before ToolCallResult: {}", before);
+        assert_eq!(before, 1, "spinner row must exist before result");
+
+        // Simulate ToolCallResult doing EXACTLY what the event loop does:
+        //   ToolCallCommit (line 6813) + ToolResult (line 6859)
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-edit-1".into()),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "Edited /path/numbers.txt (1 replacement)".into(),
+        });
+        r.flush_deferred();
+
+        // Count ● EditFile rows after result
+        let after = r.body_lines.iter().filter(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("EditFile") && text.contains("●")
+        }).count();
+
+        eprintln!("Body lines after ToolCallResult:");
+        for (i, row) in r.body_lines.iter().enumerate() {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if !text.is_empty() {
+                eprintln!("  [{}] {:?}", i, text);
+            }
+        }
+
+        assert_eq!(
+            after, 1,
+            "ToolCallResult must produce exactly ONE ● EditFile row, got {}. body_lines has {} total rows.\n{:?}",
+            after,
+            r.body_lines.len(),
+            r.body_lines.iter().map(|row| row.iter().map(|c| c.ch).collect::<String>()).collect::<Vec<_>>()
+        );
+
+        // Verify the └ result row is immediately after the ● row
+        let tool_idx = r.body_lines.iter().rposition(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("EditFile") && text.contains("●")
+        }).unwrap();
+        let result_idx = r.body_lines.iter().position(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("Edited") && text.contains("replacement")
+        }).unwrap();
+        assert_eq!(
+            result_idx, tool_idx + 1,
+            "result row must be immediately after tool row, gap of {} rows",
+            result_idx - tool_idx - 1
+        );
+    }
+
+    /// Bug repro: approval flow — ApprovalNeeded commits inflight to ●,
+    /// THEN ToolCallResult arrives later. Must not produce a second ●.
+    #[test]
+    fn retained_approval_flow_does_not_double_editfile() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Phase 1: ToolCallStarted → inflight spinner
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-edit-1".into(),
+            name: "EditFile".into(),
+            detail: "numbers.txt ← \"5\"".into(),
+        });
+        r.flush_deferred();
+
+        // Phase 2: ApprovalNeeded → ToolCallCommit (commit inflight) + ApprovalPrompt
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-edit-1".into()),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "EditFile".into(),
+            detail: "numbers.txt ← \"5\"".into(),
+        });
+        r.flush_deferred();
+
+        // Count ● rows AFTER approval commit (should be 1)
+        let mid = r.body_lines.iter().filter(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("EditFile") && text.contains("●")
+        }).count();
+        eprintln!("● EditFile rows after ApprovalNeeded: {}", mid);
+        assert_eq!(mid, 1, "ApprovalNeeded must produce exactly ONE ● EditFile row");
+
+        // Phase 3: User approves → pop_approval_prompt
+        r.pop_approval_prompt();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Phase 4: ToolCallResult arrives
+        // EXACT sequence from event loop: AssistantLineBreak + ToolCallCommit + ToolResult
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-edit-1".into()),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "Edited /path/numbers.txt (1 replacement)".into(),
+        });
+        r.flush_deferred();
+
+        eprintln!("Body lines after ToolCallResult:");
+        for (i, row) in r.body_lines.iter().enumerate() {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if !text.is_empty() {
+                eprintln!("  [{}] {:?}", i, text);
+            }
+        }
+
+        // Count ● EditFile rows after ToolCallResult (must still be 1)
+        let after = r.body_lines.iter().filter(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("EditFile") && text.contains("●")
+        }).count();
+
+        assert_eq!(
+            after, 1,
+            "Full approval flow must produce exactly ONE ● EditFile row, got {}.\n{:?}",
+            after,
+            r.body_lines.iter().map(|row| row.iter().map(|c| c.ch).collect::<String>()).collect::<Vec<_>>()
+        );
+    }
+
     /// Regression for the "missing top rule after /model switch" bug.
     ///
     /// Reproduction sequence (mirrors the real /model flow):
@@ -10774,11 +11635,163 @@ mod tests {
         }
     }
 
+    /// REGRESSION (`/resume` flicker): replaying a session re-emits the
+    /// whole transcript through the append-only direct-stdout path —
+    /// `reset()` blanks the screen, then every historical row goes out via
+    /// `emit_body_line_inner` (CUP+EL+cells+LF), LF-scrolling rows into
+    /// native scrollback. Each overflow scroll also makes the render
+    /// worker repaint the footer (`take_pending_scroll_flush` →
+    /// `flush_deferred`). Pre-fix, the `reset()` blank flushed entirely
+    /// OUTSIDE any DECSET 2026 envelope, and every one of those footer
+    /// repaints emitted its OWN `?2026h…?2026l` — so the terminal visibly
+    /// blanked and then re-scrolled the history (the user-reported flash).
+    ///
+    /// Fix: `replay_session` brackets the whole sequence in ONE
+    /// synchronized envelope via `begin_sync()` / `end_sync()`, and while
+    /// that batch is open `render_diff` SUPPRESSES its per-frame envelope
+    /// (a nested `?2026l` would end the batch early). Contract, asserted at
+    /// the byte-stream level: across a full replay — including viewport
+    /// overflow and per-row footer repaints — the output contains EXACTLY
+    /// ONE `?2026h` (at the very start, so nothing paints before it) and
+    /// EXACTLY ONE `?2026l` (at the very end, after the final frame lands).
+    #[test]
+    fn replay_sync_batch_emits_single_2026_envelope_even_with_overflow() {
+        let w: u16 = 40;
+        let h: u16 = 8;
+        let (mut r, buf) = new_capturing(w, h);
+
+        // Warm prev_cells so reset() + the first diff have real work
+        // (mirrors a populated pre-resume session — see
+        // `retained_post_reset_replay_then_burst_does_not_duplicate_tail`).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::AssistantText("pre-resume content\n".into()));
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // Drive the same call shape `replay_session` uses: one synchronized
+        // batch around reset() + the body re-emit + the trailing prompt.
+        // 16 rows on an 8-row terminal guarantees viewport overflow, so
+        // `emit_body_line_inner` LF-scrolls and the per-row footer repaint
+        // (`flush_deferred` after each row, mimicking the worker) runs —
+        // the exact multi-envelope failure mode.
+        r.begin_sync();
+        r.reset();
+        for i in 0..16 {
+            r.render(UiLine::AssistantText(format!("replay row {i}\n")));
+            r.flush_deferred();
+        }
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        r.end_sync();
+
+        let out = {
+            let g = buf.lock().unwrap();
+            String::from_utf8_lossy(&g).into_owned()
+        };
+        let opens = out.matches("\x1b[?2026h").count();
+        let closes = out.matches("\x1b[?2026l").count();
+        assert_eq!(
+            opens, 1,
+            "replay must open exactly ONE synchronized envelope (no nested \
+             per-frame BSU), got {opens}.\nbytes: {:?}",
+            out
+        );
+        assert_eq!(
+            closes, 1,
+            "replay must close exactly ONE synchronized envelope, got {closes}.\nbytes: {:?}",
+            out
+        );
+        // The single envelope must bracket EVERYTHING: BSU is the very
+        // first byte (nothing — not even reset()'s blank — paints before
+        // it) and ESU is the very last (emitted after the final frame).
+        assert!(
+            out.starts_with("\x1b[?2026h"),
+            "stream must open with BSU so the reset() blank never shows: {:?}",
+            out
+        );
+        assert!(
+            out.ends_with("\x1b[?2026l"),
+            "stream must close with ESU after the final paint: {:?}",
+            out
+        );
+    }
+
     /// Windows resize footer-duplication regression: `on_resize` must call
     /// `screen.invalidate()` after rebuilding the Screen so the repaint
     /// cold-starts with a per-row CUP+EL preamble — like `reset()` and
     /// `resume_from_external()` already do.
     ///
+    /// REGRESSION (resize flicker — sibling of the `/resume` fix): `on_resize`
+    /// wipes the screen and re-emits the visible body tail via direct stdout
+    /// writes (`retained.rs` wipe + `emit`), all OUTSIDE the DECSET 2026
+    /// envelope, before a final synchronized `paint_frame`. Pre-fix the
+    /// terminal visibly blanked then re-stamped the body unsynchronized on
+    /// every resize. Fix: bracket the whole `on_resize` body in ONE outer 2026
+    /// envelope and suppress the inner `render_diff`'s own envelope so it can't
+    /// nest. Contract: the resize byte stream opens with EXACTLY ONE `?2026h`
+    /// (the very first byte, before the wipe) and closes with EXACTLY ONE
+    /// `?2026l` (the very last, after the final paint).
+    #[test]
+    fn on_resize_emits_single_2026_envelope() {
+        let (mut r, buf) = new_capturing(40, 10);
+        // Populate body + paint so the resize has real content to re-emit.
+        for i in 0..6 {
+            r.render(UiLine::AssistantText(format!("line {i}\n")));
+        }
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // Height change → real resize work (wipe + body re-emit + paint).
+        r.on_resize(40, 8);
+
+        let out = {
+            let g = buf.lock().unwrap();
+            String::from_utf8_lossy(&g).into_owned()
+        };
+        let opens = out.matches("\x1b[?2026h").count();
+        let closes = out.matches("\x1b[?2026l").count();
+        assert_eq!(
+            opens, 1,
+            "resize must open exactly ONE envelope (no nested per-frame BSU), \
+             got {opens}.\nbytes: {:?}",
+            out
+        );
+        assert_eq!(
+            closes, 1,
+            "resize must close exactly ONE envelope, got {closes}.\nbytes: {:?}",
+            out
+        );
+        assert!(
+            out.starts_with("\x1b[?2026h"),
+            "resize must open with BSU so the wipe never shows unsynchronized: {:?}",
+            out
+        );
+        assert!(
+            out.ends_with("\x1b[?2026l"),
+            "resize must close with ESU after the final paint: {:?}",
+            out
+        );
+    }
+
     /// On legacy conhost the resize wipe is forced down to a single ED2 (to
     /// dodge the 0xc0000409 fastfail), so it emits NO per-row CUP+EL. The
     /// body re-emit only covers body rows. That leaves the cold-start as the

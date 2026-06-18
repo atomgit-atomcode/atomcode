@@ -185,8 +185,10 @@ fn download_path(exe: &Path) -> PathBuf {
     dir.join(".atomcode.download")
 }
 
-/// Same-dir temp used during a three-way rollback swap.
-pub(crate) fn rolling_path(exe: &Path) -> PathBuf {
+/// Same-dir temp used during a three-way rollback swap. Also reused by the
+/// Windows uninstaller (atomcode-cli) to rename the live exe out of the way
+/// before deleting the install dir, hence `pub` rather than `pub(crate)`.
+pub fn rolling_path(exe: &Path) -> PathBuf {
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
     dir.join(".atomcode.rolling")
 }

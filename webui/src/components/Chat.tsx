@@ -11,23 +11,7 @@ import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
-
-interface ToolRow {
-  id: string;
-  name: string;
-  args: string;
-  status: 'pending' | 'done' | 'error' | 'waiting_approval';
-  duration_ms?: number;
-  output?: string;
-}
-
-/** One ordered conversation segment: a run of assistant text, or one tool
- *  call. Storing parts in arrival order preserves the chronological
- *  text→tool→text→tool interleaving the LLM produced (matching the TUI),
- *  instead of collapsing every tool to the head of the message. */
-type MsgPart =
-  | { kind: 'text'; text: string }
-  | { kind: 'tool'; tool: ToolRow };
+import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -117,6 +101,8 @@ interface ChatProps {
   activeSession?: SessionMetaWithProject | null;
   /** 刷新后正按 URL 短 id 还原会话；为 true 时抑制新建落地页，避免闪屏。 */
   restoring?: boolean;
+  /** /live turn 完成后通知 App 刷新侧栏列表（session 已落盘，列表需更新）。 */
+  onLiveTurnDone?: () => void;
 }
 
 function formatArgs(args: unknown): string {
@@ -270,7 +256,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -460,10 +446,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // ── 共享的实时流启/停逻辑 ──
   function startLiveStream() {
+    // Abort any prior stream FIRST. /live is a broadcast channel, so a leaked
+    // subscription would re-deliver every turn event (duplicate tool rows, double
+    // token counts). startLiveStream is reachable from mount, toggleSync, and
+    // session_switched — without this, those overlap into N concurrent streams.
+    liveAbortRef.current?.abort();
     const controller = new AbortController();
     liveAbortRef.current = controller;
     streamLive(onLiveEvent, controller.signal, activeIdRef.current).catch(() => {
-      // Stream ended or errored; turn sync back off
+      // Stream ended or errored; turn sync back off — but NOT when the
+      // stream was deliberately aborted (session switch / manual toggle),
+      // because a new stream is already being (re)started and setting
+      // sync=false here would cause the next user message to go through
+      // /chat instead of /live/message, breaking TUI sync output.
+      if (controller.signal.aborted) return;
       setSync(false);
     });
   }
@@ -568,6 +564,26 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setProvider(e.provider);
       return;
     }
+    // 会话切换：另一端（webui 新建对话 / TUI /session）创建了新会话，
+    // 本端跟随切换——更新 session id 并重置画布。
+    // 不设置 loadedForRef：让 Chat useEffect 在 activeSession 到位后
+    // 正常走 getSession 加载（空）历史并清除 historyHint；
+    // 否则 loadedForRef 会阻止加载，导致 historyHint 永远不被清除。
+    // 重启 SSE 连接：旧连接订阅的是旧 LiveSession，后续 turn 事件不会到达；
+    // 重新连接后 /live handler 会绑定到新 LiveSession。
+    if (e.type === 'session_switched') {
+      liveSessionIdRef.current = e.session_id;
+      activeIdRef.current = e.session_id;
+      onSessionId(e.session_id);
+      setMessages([]);
+      setTokens(null);
+      setHistoryHint(null);
+      if (sync) {
+        stopLiveStream();
+        startLiveStream();
+      }
+      return;
+    }
 
     // 门控：仅当"当前查看的会话"就是实时会话时，才把实时输出渲染进画布。否则用户
     // 从侧栏打开了另一个历史会话，实时事件不应串进该页面（串进去刷新还会消失）。
@@ -593,7 +609,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setBusy(e.running);
         // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
         // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
-        if (!e.running) setLivePending(null);
+        if (!e.running) {
+          setLivePending(null);
+          // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
+          onLiveTurnDone?.();
+        }
         break;
       }
       case 'permission_request': {
@@ -694,10 +714,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (prev.length === 0) return prev;
       const last = prev[prev.length - 1];
       if (last.role !== 'assistant') return prev;
-      return [
-        ...prev.slice(0, -1),
-        { ...last, parts: [...last.parts, { kind: 'tool', tool }] },
-      ];
+      // Dedup by call_id: a tool_start re-delivered (e.g. a leaked /live
+      // subscription replays the turn) must update the existing row, not append
+      // a duplicate. See lib/toolRows.upsertToolPart.
+      return [...prev.slice(0, -1), { ...last, parts: upsertToolPart(last.parts, tool) }];
     });
   }
 
@@ -784,11 +804,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       //    event will arrive back via the live stream, keeping all tabs in sync).
       setBusy(true);
       await postLiveMessage(text, images.length ? images : undefined, provider ?? undefined, activeIdRef.current);
+      // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
+      // turn 完成后 state(running=false) 会再刷一次确保更新。
+      setTimeout(() => onLiveTurnDone?.(), 200);
       return;
     }
 
     // ── Normal path ──
     setBusy(true);
+    // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
+    // done 事件中 onSessionId 会再刷一次确保更新。
+    setTimeout(() => onLiveTurnDone?.(), 200);
 
     // Push user message + empty assistant placeholder
     setMessages((prev) => [

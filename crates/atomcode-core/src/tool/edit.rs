@@ -235,7 +235,9 @@ impl Tool for EditFileTool {
                 1. Line mode: use start_line + end_line + new_string. Line numbers from read_file or grep output.\n\
                 2. Text mode: use old_string + new_string. old_string must match exactly.\n\
                 Both modes work. Use whichever is faster — if grep already showed the code, edit directly.\n\
-                For multiple changes in one file: make separate edit_file calls, one per region.".to_string(),
+                For multiple changes in one file: make separate edit_file calls, one per region.\n\
+                IMPORTANT: If an edit succeeds, do NOT send another edit_file for the same region. \
+                Proceed to the next change or call read_file to verify.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -14,6 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
+# Engine v2: drive the new stack behind the legacy command/event protocol. The
+# daemon's live turns can run on it via KernelTurnExecutor ($ATOMCODE_ENGINE=v2).
+atomcode-bridge = { path = "../atomcode-bridge" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 
 # HTTP
@@ -41,6 +44,7 @@ uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
 regex = "1"
 tracing = "0.1"
+sha2 = "0.10"
 # 远程访问二维码（/tunnel/status 的 SVG）
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 

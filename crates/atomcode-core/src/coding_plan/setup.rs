@@ -44,14 +44,11 @@ use crate::config::Config;
 /// the `models-v2` payload doesn't carry a per-model `base_url`. Used
 /// only inside [`codingplan_llm_base_url`] — call that, not this.
 ///
-/// The new signed gateway. `coding_plan::crypto::is_atomgit_gateway`
-/// **only** matches `pre-llm-api-cce.atomgit.com` (see the host whitelist at
-/// `crypto.rs:129`), so this is the URL where codingplan request
-/// signing actually engages. The previous default (the legacy
-/// `api-ai.gitcode.com` host) silently routed new installs to a
-/// plaintext path that bypassed signing — and surfaced in users'
-/// error logs as "my requests go to a URL I never configured."
-const DEFAULT_CODINGPLAN_LLM_BASE_URL: &str = "https://pre-llm-api-cce.atomgit.com/v1";
+/// The signed gateway. `coding_plan::crypto::is_atomgit_gateway` matches
+/// `llm-api.atomgit.com`, `pre-llm-api-cce.atomgit.com`, and the legacy
+/// `api-ai.gitcode.com` host (see the host whitelist at `crypto.rs`), so
+/// codingplan request signing engages for all three.
+const DEFAULT_CODINGPLAN_LLM_BASE_URL: &str = "https://llm-api.atomgit.com/v1";
 
 /// Resolve the LLM gateway base URL for CodingPlan-managed providers.
 ///
@@ -1164,6 +1161,7 @@ mod tests {
     fn blank_config() -> Config {
         Config {
             default_provider: String::new(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
             datalog: Default::default(),
@@ -1293,10 +1291,10 @@ mod tests {
         // Lock in the default. If `ATOMCODE_CODINGPLAN_LLM_BASE_URL` is
         // set in the test environment (CI / staging override / dev box
         // with a stray export), honour it — otherwise the default must
-        // be the modern `pre-llm-api-cce.atomgit.com` host. Anything else (most
+        // be the modern `llm-api.atomgit.com` host. Anything else (most
         // notably the legacy `api-ai.gitcode.com`) silently disables
         // codingplan request signing because `is_atomgit_gateway` in
-        // `coding_plan::crypto` only whitelists the new host.
+        // `coding_plan::crypto` also whitelists the legacy host.
         //
         // OnceLock caches across test threads, so this test reflects
         // whatever the env was at the FIRST call site in the process.
@@ -1312,8 +1310,8 @@ mod tests {
             assert_eq!(actual, want, "env override must win when set");
         } else {
             assert_eq!(
-                actual, "https://pre-llm-api-cce.atomgit.com/v1",
-                "default must point at the new signed gateway (NOT legacy api-ai.gitcode.com); \
+                actual, "https://llm-api.atomgit.com/v1",
+                "default must point at the signed gateway (NOT legacy api-ai.gitcode.com); \
                  otherwise codingplan signing never engages"
             );
         }

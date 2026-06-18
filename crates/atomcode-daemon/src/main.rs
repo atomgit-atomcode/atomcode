@@ -120,6 +120,16 @@ async fn main() {
         unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
     }
 
+    // Used by IDE packaging to reject a daemon compiled after the private
+    // signer overlay was removed. Keep this check side-effect free.
+    if std::env::args().any(|arg| arg == "--check-official-build") {
+        std::process::exit(if atomcode_core::coding_plan::signer_available() {
+            0
+        } else {
+            1
+        });
+    }
+
     // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/atomcode/sessions)
     // are migrated to the canonical location ($ATOMCODE_HOME/sessions) before any handler reads it.
     SessionManager::migrate_from_legacy();

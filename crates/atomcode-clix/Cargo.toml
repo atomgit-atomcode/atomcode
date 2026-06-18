@@ -1,0 +1,26 @@
+[package]
+name = "atomcode-clix"
+version = "0.0.0"
+edition = "2021"
+description = "Standalone new-stack CLI (D-layer driver): `code` drives the full coding agent (prepare/assemble), `review` drives the atomcode-review agent over a git diff. Decoupled from atomcode-cli / atomcode-core."
+
+[[bin]]
+name = "atomcodex"
+path = "src/main.rs"
+
+[dependencies]
+atomcode-review = { path = "../atomcode-review" }
+atomcode-coding = { path = "../atomcode-coding" }
+# Direct dep for the D-layer pieces the driver owns: MemoryStore (slash commands),
+# the typed approval wire contract, SessionManager (session listing).
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "session", "memory", "mcp"] }
+atomcode-kernel = { path = "../atomcode-kernel" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "signal", "time"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
