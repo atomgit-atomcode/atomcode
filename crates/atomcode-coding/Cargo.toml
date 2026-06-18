@@ -35,3 +35,6 @@ atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
 async-trait = "0.1"
+# Serialize tests that mutate the process-global ATOMCODE_HOME env var so they
+# don't race (cache_prefix asserts byte-identical system prompt across assemblies).
+serial_test = "3"

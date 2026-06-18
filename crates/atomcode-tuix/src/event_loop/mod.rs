@@ -6701,7 +6701,9 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
     let label = if as_goal_end {
         format!(
             "{} tools · {} · {} tokens",
-            ps.tool_call_count, dur, ps.total_tokens
+            ps.tool_call_count,
+            dur,
+            crate::i18n::fmt_tokens(ps.total_tokens)
         )
     } else if ps.was_goal_round {
         format!(
@@ -6709,7 +6711,7 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
             state.goal_round.max(1),
             ps.tool_call_count,
             dur,
-            ps.total_tokens
+            crate::i18n::fmt_tokens(ps.total_tokens)
         )
     } else {
         // Reached only if a non-goal turn was ever buffered (today they
