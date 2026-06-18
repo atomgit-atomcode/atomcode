@@ -1,10 +1,10 @@
 //! CLAIM 17: COOPERATIVE CANCELLATION — a per-turn CancellationToken rides
 //! through ToolContext; `AgentCommand::Cancel` fires it; run_turn polls it at the
-//! stream, between tools, and inside execute; and the conversation is REPAIRED so
-//! every assistant tool_call still has a matching tool_result after a cancel
-//! (append-only "(cancelled)" backfill — API stays valid, prefix-cache stays
-//! intact). Carried faithfully from production
-//! (turn/runner.rs cancel checkpoints + conversation backfill_cancelled_tool_results).
+//! stream OPEN, between tools, and inside execute. CANCEL = UNDO: a cancelled turn
+//! is ROLLED BACK to before its user message, so the prompt + any partial
+//! assistant/tool work leaves NO trace in history. (No dangling tool_calls to
+//! repair — the whole turn is gone; the API stays valid trivially. The TUI
+//! separately restores the prompt to the input box for edit-and-resend.)
 //!
 //! Determinism: cancellation is driven by a COOPERATING test tool that fires
 //! `ctx.cancel.cancel()` from inside its own `execute` — no timing races.
@@ -83,6 +83,21 @@ async fn cancel_aborts_a_turn_hung_in_the_stream_open() {
         .expect("Cancel must abort a turn hung in the stream OPEN — it must not hang");
     assert_eq!(reason, Some(StopReason::Cancelled), "a cancelled open terminates as Cancelled");
 
+    // Cancel = undo: the "hi" prompt must be rolled back, leaving no trace.
+    handle.commands.send(AgentCommand::Snapshot).unwrap();
+    let snap = loop {
+        match handle.events.recv().await {
+            Some(AgentEvent::Snapshot { snapshot }) => break snapshot,
+            Some(_) => continue,
+            None => panic!("channel closed before Snapshot reply"),
+        }
+    };
+    assert!(
+        !snap.messages.iter().any(|m| m.text.contains("hi")),
+        "cancelled prompt must be rolled back, leaving no trace: {:?}",
+        snap.messages
+    );
+
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 }
@@ -140,17 +155,17 @@ fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
     ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
 }
 
-// CLAIM 17a: BETWEEN-TOOLS cancel. The model returns an assistant message with
-// TWO tool_calls [self_cancel, echo]; self_cancel fires the token inside its
-// execute; the between-tools checkpoint then SKIPS echo. We assert:
+// CLAIM 17a: BETWEEN-TOOLS cancel rolls the turn back. The model returns an
+// assistant message with TWO tool_calls [self_cancel, echo]; self_cancel fires the
+// token inside its execute; the between-tools checkpoint then SKIPS echo and
+// CANCELS the turn. We assert:
 //   * AgentEvent::Cancelled is emitted, immediately followed by TurnComplete;
 //   * echo was NOT executed (no echo ToolResult);
-//   * the conversation ends with BOTH tool_calls paired with a result
-//     (self_cancel real, echo "(cancelled)") — verified by driving a SECOND turn
-//     and asserting (via RecordingProvider) that EVERY assistant tool_call in the
-//     messages sent on the next request has a matching tool_result (no dangling).
+//   * the cancelled turn leaves NO trace — verified by driving a SECOND turn and
+//     asserting (via RecordingProvider) that its first request carries neither the
+//     cancelled user message nor either tool_call/result (the whole turn is gone).
 #[tokio::test]
-async fn cancel_between_tools_backfills_and_ends() {
+async fn cancel_between_tools_rolls_back_the_turn() {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(SelfCancelTool));
     reg.register(Arc::new(EchoTool));
@@ -202,9 +217,9 @@ async fn cancel_between_tools_backfills_and_ends() {
     let cancel_tool_ran = events.iter().any(|e| matches!(e, AgentEvent::ToolResult { result } if result.content.contains("did the work")));
     assert!(cancel_tool_ran, "self_cancel must have executed (its real result emitted)");
 
-    // (3) No-dangling property: drive a SECOND turn and inspect the messages the
-    // provider received on its FIRST request — every assistant tool_call must have
-    // a matching tool_result.
+    // (3) ROLL-BACK: the cancelled turn leaves NO trace. Drive a SECOND turn; its
+    // first request carries the post-cancel history, which must contain neither
+    // turn 1's user message nor either tool_call/result — the whole turn is gone.
     handle.commands.send(AgentCommand::SendMessage { text: "again".into(), images: vec![] }).unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
@@ -216,27 +231,23 @@ async fn cancel_between_tools_backfills_and_ends() {
 
     let calls = calls.lock().unwrap();
     assert!(calls.len() >= 2, "expected >=2 recorded requests; got {}", calls.len());
-    // The second turn's first request = calls[1]; it carries turn 1's repaired history.
+    // The second turn's first request = calls[1]; it carries the post-cancel history.
     let history = &calls[1].0;
-    assert_no_dangling_tool_calls(history);
-
-    // Concretely: both call_ids have a result; echo's is "(cancelled)".
-    let result_ids: std::collections::HashSet<&str> = history
+    assert_no_dangling_tool_calls(history); // trivially holds — turn 1 is gone
+    assert!(
+        !history.iter().any(|m| m.text.contains("do two things")),
+        "cancelled turn's user message must be rolled back: {history:?}"
+    );
+    let result_ids: std::collections::HashSet<&str> =
+        history.iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+    assert!(
+        !result_ids.contains("c_cancel") && !result_ids.contains("c_echo"),
+        "cancelled turn's tool results must be gone: {history:?}"
+    );
+    let has_turn1_calls = history
         .iter()
-        .filter_map(|m| m.tool_call_id.as_deref())
-        .collect();
-    assert!(result_ids.contains("c_cancel"), "self_cancel's result must be present");
-    assert!(result_ids.contains("c_echo"), "echo must have a backfilled (cancelled) result");
-    let echo_result = history
-        .iter()
-        .find(|m| m.tool_call_id.as_deref() == Some("c_echo"))
-        .expect("echo result present");
-    assert_eq!(echo_result.text, "(cancelled)", "skipped echo must be backfilled with (cancelled)");
-    let cancel_result = history
-        .iter()
-        .find(|m| m.tool_call_id.as_deref() == Some("c_cancel"))
-        .expect("self_cancel result present");
-    assert!(cancel_result.text.contains("did the work"), "self_cancel keeps its REAL result, not (cancelled)");
+        .any(|m| m.tool_calls.iter().any(|tc| tc.id == "c_cancel" || tc.id == "c_echo"));
+    assert!(!has_turn1_calls, "cancelled turn's assistant tool_calls must be gone: {history:?}");
 }
 
 // CLAIM 17b: an out-of-band `AgentCommand::Cancel` ends a turn while a long tool
