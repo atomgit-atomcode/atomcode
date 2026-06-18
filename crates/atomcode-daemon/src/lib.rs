@@ -1101,6 +1101,19 @@ pub struct HealthResponse {
     pub status: &'static str,
     pub version: &'static str,
     pub service: &'static str,
+    pub binary_hash: &'static str,
+}
+
+fn executable_sha256() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+
+        std::env::current_exe()
+            .and_then(std::fs::read)
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+            .unwrap_or_else(|_| "unknown".to_string())
+    })
 }
 
 /// GET /health - Health check endpoint
@@ -1109,6 +1122,7 @@ async fn health() -> impl IntoResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         service: "atomcode-daemon",
+        binary_hash: executable_sha256(),
     })
 }
 

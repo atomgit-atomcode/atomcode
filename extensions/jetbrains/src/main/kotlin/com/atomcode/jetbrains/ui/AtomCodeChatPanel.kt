@@ -680,7 +680,6 @@ class AtomCodeChatPanel(
         if (generating) {
             val queued = QueuedPrompt(UUID.randomUUID().toString(), transformedPrompt, message, contextNames)
             queuedPrompts += queued
-            runtime?.queuePrompt(transformedPrompt, queued.id)
             if (pendingContextForSend.isNotEmpty()) clearPendingContext()
             inputPanel.clearInput()
             renderQueueState()
@@ -692,7 +691,6 @@ class AtomCodeChatPanel(
 
     private fun startPrompt(prompt: String, message: String, contextNames: List<String>) {
         // Add user message + immediate thinking feedback
-        runtime?.submitPrompt(prompt)
         renderQueueState()
         messageView.addUserMessage(prompt)
         messageView.beginAssistantTurn()
@@ -705,6 +703,7 @@ class AtomCodeChatPanel(
         inputPanel.setGenerating(true)
         streamHandler.reset()
 
+        val provider = (modelPicker.selectedItem as? ModelInfo)?.provider
         service.sendPrompt(message, currentSession, object : ChatStreamListener {
             override fun onEvent(event: ChatEvent) {
                 SwingUtilities.invokeLater {
@@ -728,7 +727,7 @@ class AtomCodeChatPanel(
                 replaceSelectedSession(session.id)
                 persistRuntimeSession()
             }
-        }).whenComplete { session, error ->
+        }, provider = provider).whenComplete { session, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
                     finishPromptAndContinue()

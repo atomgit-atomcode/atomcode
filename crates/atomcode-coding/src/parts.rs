@@ -34,7 +34,7 @@ use atomcode_capabilities::tools::{
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::hook::LifecycleHooks;
-use atomcode_kernel::message::SessionSnapshot;
+use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, ToolRegistry};
 use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
@@ -347,18 +347,7 @@ pub fn assemble(
         match b.manager.load_snapshot(&b.id) {
             Ok(mut snap) => {
                 check_snapshot_version(&snap)?;
-                // Model-swap respawn: the snapshot's first system message carries
-                // the OLD persona (with the old model name). Replace it with the
-                // new persona so the resumed agent self-identifies correctly.
-                // Without this, a /model switch respawns with the new provider
-                // but the conversation still says "running the <old-model>"
-                // (issue #659).
-                let new_persona = coding_persona(&cfg.model);
-                if let Some(msg) = snap.messages.first_mut() {
-                    if msg.role == atomcode_kernel::message::Role::System {
-                        msg.text = new_persona;
-                    }
-                }
+                reconcile_coding_persona(&mut snap, &cfg.model);
                 b.resume = Some(snap);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -460,6 +449,31 @@ pub fn assemble(
     Ok(builder.build())
 }
 
+const ATOMCODE_PERSONA_PREFIX: &str =
+    "You are AtomCode, an AI coding agent by AtomGit running the ";
+
+/// Legacy drivers persist conversation history without the separately supplied
+/// system prompt. A v2 resume must restore that prompt, while a model switch must
+/// replace the old model identity instead of retaining or duplicating it.
+fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
+    let persona = coding_persona(model);
+    let is_persona = |message: &Message| {
+        message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
+    };
+    let already_current = snapshot
+        .messages
+        .first()
+        .is_some_and(|message| message.role == Role::System && message.text == persona)
+        && snapshot.messages.iter().skip(1).all(|message| !is_persona(message));
+    if already_current {
+        return;
+    }
+
+    snapshot.messages.retain(|message| !is_persona(message));
+    snapshot.messages.insert(0, Message::system(persona));
+    snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+}
+
 /// A snapshot from another kernel version must NOT be silently re-bound to its
 /// session id: the kernel's forward-compat seam would start EMPTY, and the session
 /// hooks would then overwrite the (newer-format) snapshot and append duplicate
@@ -477,4 +491,54 @@ fn check_snapshot_version(snap: &SessionSnapshot) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_adds_persona_before_legacy_session_context() {
+        let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
+
+        reconcile_coding_persona(&mut snapshot, "deepseek-v4-flash");
+
+        assert!(snapshot.messages[0].text.contains("running the deepseek-v4-flash model"));
+        assert_eq!(snapshot.messages[1].text, "SESSION CONTEXT");
+        assert_eq!(snapshot.cache_epoch, 1);
+    }
+
+    #[test]
+    fn model_switch_replaces_persona_without_duplication() {
+        let mut snapshot = SessionSnapshot::new(vec![
+            Message::system(coding_persona("old-model")),
+            Message::system("SESSION CONTEXT"),
+        ]);
+
+        reconcile_coding_persona(&mut snapshot, "deepseek-v4-flash");
+
+        let personas = snapshot
+            .messages
+            .iter()
+            .filter(|message| message.text.starts_with(ATOMCODE_PERSONA_PREFIX))
+            .count();
+        assert_eq!(personas, 1);
+        assert!(snapshot.messages[0].text.contains("running the deepseek-v4-flash model"));
+        assert!(!snapshot.messages[0].text.contains("old-model"));
+        assert_eq!(snapshot.cache_epoch, 1);
+    }
+
+    #[test]
+    fn current_persona_keeps_snapshot_byte_stable() {
+        let persona = coding_persona("deepseek-v4-flash");
+        let mut snapshot = SessionSnapshot::new(vec![
+            Message::system(persona.clone()),
+            Message::system("SESSION CONTEXT"),
+        ]);
+
+        reconcile_coding_persona(&mut snapshot, "deepseek-v4-flash");
+
+        assert_eq!(snapshot.messages[0].text, persona);
+        assert_eq!(snapshot.cache_epoch, 0);
+    }
 }
