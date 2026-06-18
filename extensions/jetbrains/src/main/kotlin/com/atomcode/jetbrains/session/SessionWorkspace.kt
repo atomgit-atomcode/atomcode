@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.session
 
+import com.atomcode.jetbrains.client.DaemonClient
 import com.atomcode.jetbrains.persistence.AtomCodeProjectWorkspaceState
 import com.atomcode.jetbrains.persistence.WorkspaceTabState
 import com.intellij.openapi.Disposable
@@ -12,21 +13,21 @@ import java.util.concurrent.ConcurrentHashMap
 class SessionWorkspace(private val project: Project) : Disposable {
     private val workspaceState = AtomCodeProjectWorkspaceState.getInstance(project)
     private val runtimes = ConcurrentHashMap<String, ChatRuntime>()
+    private val defaultClient: DaemonClient by lazy {
+        DaemonClient(baseUrl = "http://127.0.0.1:13456")
+    }
 
-    fun createRuntime(title: String = "Chat"): ChatRuntime {
+    fun createRuntime(title: String = "Chat", client: DaemonClient): ChatRuntime {
         val tabId = "tab-${UUID.randomUUID()}"
-        val runtime = ChatRuntime(tabId)
+        val runtime = ChatRuntime(tabId, client)
         runtimes[tabId] = runtime
         workspaceState.upsertTab(WorkspaceTabState(tabId = tabId, title = title))
         workspaceState.selectTab(tabId)
         return runtime
     }
 
-    fun createRuntimeForRestoredTab(tab: WorkspaceTabState): ChatRuntime {
-        val runtime = runtimes[tab.tabId] ?: ChatRuntime(
-            tab.tabId,
-            initialState = ChatState(tabId = tab.tabId, draft = tab.draft),
-        )
+    fun createRuntimeForRestoredTab(tab: WorkspaceTabState, client: DaemonClient): ChatRuntime {
+        val runtime = runtimes[tab.tabId] ?: ChatRuntime(tab.tabId, client)
         runtimes[tab.tabId] = runtime
         workspaceState.upsertTab(tab)
         return runtime
@@ -66,7 +67,7 @@ class SessionWorkspace(private val project: Project) : Disposable {
 
     private fun restoreRuntime(tabId: String): ChatRuntime? {
         val tab = workspaceState.state.tabs.firstOrNull { it.tabId == tabId } ?: return null
-        val runtime = ChatRuntime(tab.tabId, initialState = ChatState(tabId = tab.tabId, draft = tab.draft))
+        val runtime = ChatRuntime(tab.tabId, defaultClient)
         runtimes[tabId] = runtime
         return runtime
     }

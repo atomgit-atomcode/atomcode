@@ -25,6 +25,7 @@ class AtomCodeDaemonClient(
                 status = it.jsonString("status").orEmpty(),
                 version = it.jsonString("version").orEmpty(),
                 service = it.jsonString("service").orEmpty(),
+                binaryHash = it.jsonString("binary_hash"),
             )
         }
 

@@ -140,9 +140,16 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 if (healthError == null && health.service == "atomcode-daemon") {
                     setConnectionState(ConnectionState.Connecting)
                     val expectedVersion = daemonProcess.expectedBundledVersion()
-                    if (expectedVersion != null && health.version != expectedVersion) {
+                    val expectedHash = daemonProcess.expectedBundledHash()
+                    val binaryMismatch = expectedHash != null && health.binaryHash != expectedHash
+                    if (binaryMismatch || (expectedVersion != null && health.version != expectedVersion)) {
                         setConnectionState(ConnectionState.StartingDaemon)
-                        return@handle restartMismatchedDaemon(client, daemonProcess, health.version, expectedVersion)
+                        return@handle restartMismatchedDaemon(
+                            client,
+                            daemonProcess,
+                            health.version,
+                            expectedVersion ?: health.version,
+                        )
                     }
                     return@handle CompletableFuture.completedFuture(health.version)
                 }
@@ -248,6 +255,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         prompt: String,
         session: SessionRefView?,
         listener: ChatStreamListener,
+        provider: String? = null,
         onSessionReady: (SessionRefView) -> Unit,
     ): CompletableFuture<SessionRefView> {
         if (settingsService.state.autoSaveBeforeRead) {
@@ -260,7 +268,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
             if (state !is ConnectionState.Ready) {
                 CompletableFuture.failedFuture(IllegalStateException("AtomCode is not connected."))
             } else {
-                sendPromptWhenReady(prompt, state.projectPath, session, listener, onSessionReady)
+                sendPromptWhenReady(prompt, state.projectPath, session, listener, onSessionReady, provider)
             }
         }.whenComplete { _, error ->
             if (error != null) {
@@ -576,6 +584,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         session: SessionRefView?,
         listener: ChatStreamListener,
         onSessionReady: (SessionRefView) -> Unit,
+        provider: String?,
     ): CompletableFuture<SessionRefView> {
         val client = getOrCreateClient()
         val workingDir = projectPath.ifBlank { project.basePath.orEmpty() }
@@ -591,6 +600,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 message = prompt,
                 workingDir = sessionRef.workingDir.ifBlank { workingDir },
                 sessionId = sessionRef.id,
+                provider = provider,
             )
 
             client.streamChat(request) { event ->

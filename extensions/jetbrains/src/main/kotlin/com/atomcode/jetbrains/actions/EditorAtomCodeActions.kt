@@ -1,9 +1,9 @@
 package com.atomcode.jetbrains.actions
 
+import com.atomcode.jetbrains.core.AtomCodeProjectController
 import com.atomcode.jetbrains.security.PathSensitivity
 import com.atomcode.jetbrains.security.SensitivePathClassifier
 import com.atomcode.jetbrains.settings.AtomCodeSettingsState
-import com.atomcode.jetbrains.ui.ChatContextItem
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
@@ -47,7 +47,10 @@ internal object EditorAtomCodeActions {
         }
 
         ToolWindowManager.getInstance(project).getToolWindow("AtomCode")?.activate {
-            findChatPanel(project)?.submitPrompt(prompt)
+            AtomCodeProjectController.getInstance(project).activeChatStore?.submitPrompt(
+                text = prompt,
+                workingDir = project.basePath,
+            )
         }
     }
 
@@ -83,16 +86,20 @@ internal object EditorAtomCodeActions {
         }
 
         ToolWindowManager.getInstance(project).getToolWindow("AtomCode")?.activate {
-            findChatPanel(project)?.addContext(
-                ChatContextItem(
-                    path = path,
-                    displayName = displayName,
-                    language = virtualFile.extension ?: "text",
-                    content = content,
-                    selection = selectedText,
-                    startLine = startLine,
-                    endLine = endLine,
-                ),
+            val contextPrefix = buildString {
+                appendLine("File: $displayName")
+                if (startLine != null && endLine != null) {
+                    appendLine("Lines: $startLine-$endLine")
+                }
+                appendLine()
+                appendLine("```${virtualFile.extension ?: "text"}")
+                appendLine(content)
+                appendLine("```")
+            }
+            AtomCodeProjectController.getInstance(project).activeChatStore?.submitPrompt(
+                text = contextPrefix,
+                contextFiles = listOf(path),
+                workingDir = project.basePath,
             )
         }
     }
