@@ -4434,7 +4434,6 @@ fn handle_input(
                 let image_paste: Option<(ImagePart, u64)> = if text.trim().is_empty() {
                     try_paste_clipboard_image()
                 } else {
-                    crate::tuix_trace!("IMG", "CmdV-paste-text len={} head={:?}", text.len(), &text[..text.len().min(120)]);
                     try_attach_image_from_path(&text)
                 };
                 if attach_image_to_input(app, ctx, renderer, image_paste)? {
