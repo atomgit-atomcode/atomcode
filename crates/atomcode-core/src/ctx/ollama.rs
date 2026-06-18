@@ -49,7 +49,7 @@ impl OllamaCtx {
         // Ollama 的默认 ctx 是 8000(见 default_context_window_for).
         // 再给一个硬下限防 0 / 配置漂移。
         Self {
-            ctx_window: provider.context_window.min(crate::config::provider::MAX_CONTEXT_WINDOW).max(4000),
+            ctx_window: provider.context_window.max(4000),
             model_id: provider.model.to_lowercase(),
         }
     }

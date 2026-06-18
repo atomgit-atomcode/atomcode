@@ -139,12 +139,6 @@ pub struct OpenAiProvider {
     reasoning_history_override: Option<ReasoningPolicy>,
     /// DeepSeek V4 reasoning effort control (high / max / off).
     reasoning_effort: Option<String>,
-    /// Whether the active model accepts image inputs. Drives `MultiPart`
-    /// serialisation: vision-capable → OpenAI image_url schema, text-only
-    /// → flat string. Computed once from `ProviderConfig::accepts_images()`
-    /// at construction; a `/model` switch rebuilds the provider so this
-    /// stays in sync with the live config.
-    supports_vision: bool,
     /// Stable per-conversation id, set once via `set_session_id` after the
     /// owning agent generates it. Sent as the `x-atomcode-session-id` header
     /// on every request so a forwarding gateway (LiteLLM) can pin the
@@ -208,7 +202,6 @@ impl OpenAiProvider {
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
             reasoning_effort,
-            supports_vision: config.accepts_images(),
             session_id: std::sync::Arc::new(std::sync::RwLock::new(String::new())),
         })
     }
@@ -298,8 +291,25 @@ impl OpenAiProvider {
         reasoning_policy: ReasoningPolicy,
         supports_vision: bool,
     ) -> Vec<serde_json::Value> {
+        let _ = std::fs::write("/tmp/atomcode-debug.log", format!("[IMG-DEBUG] format_messages vision={}\n", supports_vision));
         messages
             .iter()
+            .map(|m| {
+                // Pre-degrade MultiPart → Text before any serialisation when
+                // the model doesn't support vision. Runs at the Message level
+                // so image_url blocks can't leak into the JSON payload.
+                if !supports_vision {
+                    if let MessageContent::MultiPart { text, .. } = &m.content {
+                        let _ = std::fs::write("/tmp/atomcode-debug.log", "[IMG-DEBUG] hit MultiPart, degrading\n");
+                        let t = text.clone().unwrap_or_else(|| "[image]".into());
+                        return Message {
+                            content: MessageContent::Text(t),
+                            ..m.clone()
+                        };
+                    }
+                }
+                m.clone()
+            })
             .filter_map(|m| {
                 match &m.content {
                     MessageContent::Text(s) => {
@@ -468,7 +478,30 @@ impl OpenAiProvider {
                     }
                 }
             })
+            .map(|msg| {
+                if !supports_vision {
+                    let mut m = msg;
+                    Self::strip_image_url(&mut m);
+                    m
+                } else {
+                    msg
+                }
+            })
             .collect()
+    }
+
+    /// Strip `image_url` content blocks from a single serialised message
+    /// value in-place. Used as a safety net after `/model` switches from
+    /// a vision-capable provider — historical MultiPart messages should
+    /// already be degraded by the `supports_vision` branch above, but this
+    /// catches any edge case the degradation misses so a text-only provider
+    /// never sees `unknown variant 'image_url'` from the upstream.
+    fn strip_image_url(msg: &mut serde_json::Value) {
+        if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+            content.retain(|block| {
+                block.get("type").and_then(|t| t.as_str()) != Some("image_url")
+            });
+        }
     }
 }
 
@@ -555,13 +588,24 @@ impl LlmProvider for OpenAiProvider {
         tools: Option<&[ToolDef]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let url = normalize_base_url(&self.base_url);
+        let _ = std::fs::write("/tmp/atomcode-debug.log", format!("[IMG-DEBUG] chat_stream model={} suggest_vision={}\n", self.model, super::model_name_suggests_vision(&self.model)));
         let mut body = json!({
             "model": self.model,
-            "messages": Self::format_messages(messages, self.reasoning_history_policy(), self.supports_vision),
+            "messages": Self::format_messages(messages, self.reasoning_history_policy(), super::model_name_suggests_vision(&self.model)),
             "stream": true,
             "stream_options": { "include_usage": true },
             "max_tokens": self.max_tokens,
         });
+
+        // Defence-in-depth: strip residual image_url blocks after /model
+        // switches from a vision-capable provider.
+        if !super::model_name_suggests_vision(&self.model) {
+            if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                for msg in msgs {
+                    Self::strip_image_url(msg);
+                }
+            }
+        }
 
         if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {

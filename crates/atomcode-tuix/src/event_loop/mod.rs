@@ -2991,7 +2991,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         .config
         .providers
         .get(&ctx.config.default_provider)
-        .map(|p| p.context_window.min(atomcode_core::config::provider::MAX_CONTEXT_WINDOW))
+        .map(|p| p.context_window)
         .unwrap_or(128_000);
     app.state.on_context_stats(0, 0, 0, 0, 0, initial_ctx_window, "", "");
 

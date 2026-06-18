@@ -580,7 +580,7 @@ impl Config {
     pub fn default_context_window(&self) -> usize {
         self.providers
             .get(&self.default_provider)
-            .map(|p| p.context_window.min(provider::MAX_CONTEXT_WINDOW))
+            .map(|p| p.context_window)
             .unwrap_or(128_000)
     }
 

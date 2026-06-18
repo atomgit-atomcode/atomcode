@@ -260,8 +260,16 @@ impl LlmProvider for OpenAiCompatProvider {
 // Request building (pure, deterministic)
 // ---------------------------------------------------------------------------
 
+fn suggests_vision(model: &str) -> bool {
+    let n = model.to_lowercase();
+    n.contains("vision") || n.contains("-vl") || n.contains("vl-")
+        || n.starts_with("gpt-4o") || n.starts_with("claude-")
+        || n.starts_with("gemini") || n.contains("llava") || n.contains("qvq")
+        || n.starts_with("kimi-k2.5") || n.starts_with("kimi-k2.6")
+}
+
 /// Map kernel `Message`s onto OpenAI-compatible wire `messages[]`.
-fn format_messages(messages: &[Message], policy: ReasoningPolicy) -> Vec<Value> {
+fn format_messages(messages: &[Message], policy: ReasoningPolicy, model: &str) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m.role {
@@ -269,8 +277,8 @@ fn format_messages(messages: &[Message], policy: ReasoningPolicy) -> Vec<Value> 
             // OpenAI-compatible models accept only a single system message.
             Role::System => super::push_system_coalesced(&mut out, &m.text),
             Role::User => {
-                if m.images.is_empty() {
-                    // Text-only: `content` stays a STRING — byte-identical to the prior
+                if m.images.is_empty() || !suggests_vision(model) {
+                    // Text-only or model doesn't support vision — keep content as STRING
                     // path, so a no-image conversation's prefix cache is unperturbed.
                     out.push(json!({ "role": "user", "content": m.text }));
                 } else {
@@ -372,7 +380,7 @@ fn build_request_body(
 ) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
-    body.insert("messages".into(), json!(format_messages(messages, policy)));
+    body.insert("messages".into(), json!(format_messages(messages, policy, model)));
     body.insert("stream".into(), json!(true));
     body.insert("stream_options".into(), json!({ "include_usage": true }));
 
