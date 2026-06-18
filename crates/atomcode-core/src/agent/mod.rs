@@ -659,6 +659,14 @@ pub struct AgentLoop {
     /// `finish_turn` so `run_turn_loop` can return it.
     last_stop_reason: TurnStopReason,
 
+    /// Set by the inner-turn Shutdown handler so the outer command loop
+    /// can break after `handle_send_message` / `handle_local_shell`
+    /// returns. Without this, Shutdown consumed inside a turn (e.g. /quit
+    /// during Streaming) only cancels the current LLM call and the agent
+    /// stays alive waiting for the next command — the user has to type
+    /// /quit a second time to actually exit.
+    shutdown_requested: std::sync::atomic::AtomicBool,
+
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -1109,6 +1117,7 @@ impl AgentLoop {
             goal_files_edited: Vec::new(),
             goal_evaluator: None,
             last_stop_reason: TurnStopReason::Natural,
+            shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             cmd_rx,
             event_tx,
         };
@@ -1287,9 +1296,15 @@ impl AgentLoop {
             match cmd {
                 AgentCommand::SendMessage { text, images, image_markers } => {
                     self.handle_send_message(text, images, image_markers).await;
+                    if self.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
                 }
                 AgentCommand::LocalShell { cmd } => {
                     self.handle_local_shell(cmd).await;
+                    if self.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
                 }
                 AgentCommand::Cancel => {
                     crate::ctrace!("AGT", "outer Cancel -> cancel_token.cancel() (was_cancelled={})", self.cancel_token.is_cancelled());
@@ -2724,6 +2739,7 @@ impl AgentLoop {
                                 }
                                 AgentCommand::Shutdown => {
                                     cancel_token.cancel();
+                                    self.shutdown_requested.store(true, std::sync::atomic::Ordering::Release);
                                 }
                                 AgentCommand::AppendInput(text) => {
                                     if let Some(ref mut existing) = pending_input {

@@ -1,7 +1,7 @@
 use crate::event::{AgentCommand, AgentEvent, StopReason, ToolBatchCall};
 use crate::hook::{HookChain, LifecycleHooks, TurnCtx};
 use crate::message::{
-    CompactTrigger, CompactionStrategy, CompactionView, Conversation, ImageContent, Message,
+    CompactTrigger, CompactionStrategy, CompactionView, Conversation, ImageContent, Message, Role,
     MessageMeta, NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
 };
 use crate::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
@@ -429,6 +429,17 @@ impl RunningAgent {
                 // Carry the snapshot's `cache_epoch` so a resume restores the same
                 // prefix generation (defaults to 0 for v1 snapshots via serde).
                 let mut c = Conversation { messages: snap.messages.clone(), cache_epoch: snap.cache_epoch };
+                // Replace the first system message (persona) with the current one.
+                // A /model switch rebuilds the agent with a new persona, but the
+                // snapshot still carries the old model's name. Without this patch,
+                // the model self-identifies with the wrong name indefinitely.
+                if !self.persona.is_empty() {
+                    if let Some(sys) = c.messages.first_mut().filter(|m| m.role == Role::System) {
+                        sys.text = self.persona.clone();
+                    } else {
+                        c.messages.insert(0, Message::system(self.persona.clone()));
+                    }
+                }
                 // An externally-supplied or mid-turn-persisted snapshot may be
                 // API-INVALID: a DANGLING assistant tool_call (a tool_use with no
                 // tool_result) OR an ORPHAN tool_result (a tool_result with no matching
@@ -1641,5 +1652,25 @@ mod cap_tests {
         cap_tool_result(&mut a, 333);
         cap_tool_result(&mut b, 333);
         assert_eq!(a.content, b.content, "same content + same cap must yield byte-identical truncation");
+    }
+
+    /// When a session is resumed, the first system message (persona) must be
+    /// replaced with the current persona so a /model switch updates the
+    /// model's self-identification.
+    #[test]
+    fn resume_replaces_stale_persona() {
+        let old = Conversation {
+            messages: vec![Message::system("model: qwen3-vl-32b")],
+            cache_epoch: 0,
+        };
+        let snap = SessionSnapshot { messages: old.messages.clone(), cache_epoch: 0, version: SNAPSHOT_VERSION };
+        // Simulate the `resume` branch: seed from snapshot, then replace persona.
+        let mut c = Conversation { messages: snap.messages.clone(), cache_epoch: snap.cache_epoch };
+        let new_persona = "model: deepseek-v4-pro";
+        // The code under test:
+        if let Some(sys) = c.messages.first_mut().filter(|m| m.role == Role::System) {
+            sys.text = new_persona.into();
+        }
+        assert_eq!(c.messages[0].text, new_persona);
     }
 }
