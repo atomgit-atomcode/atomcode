@@ -157,15 +157,14 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         val fg = if (dark) "#d4d4d4" else "#1e1e1e"
         val ubg = if (dark) "#094771" else "#d0e4f7"
         val ufg = if (dark) "#e0e0e0" else "#1e1e1e"
-        val abg = if (dark) "#2d2d2d" else "#e8e8e8"
         val afg = if (dark) "#d4d4d4" else "#333"
         val cbg = if (dark) "#1e1e1e" else "#fafafa" // code
         val cbo = if (dark) "#3c3c3c" else "#ccc"    // code border
         val chb = if (dark) "#2d2d2d" else "#e0e0e0" // code head bg
         val chf = if (dark) "#9cdcfe" else "#005a9e" // code head fg
-        val tbg = if (dark) "#1a281a" else "#e0f0e0" // tool
-        val tbo = if (dark) "#2d4a2d" else "#a0c8a0"
-        val tfg = if (dark) "#6a9955" else "#3d7a3d"
+        val tbg = if (dark) "#252526" else "#f4f4f4" // tool
+        val tbo = if (dark) "#3c3c3c" else "#d8d8d8"
+        val tfg = if (dark) "#a7a7a7" else "#666"
         val ebg = if (dark) "#3d2020" else "#f8e0e0" // error
         val ebo = if (dark) "#5a3030" else "#d8a0a0"
         val efg = if (dark) "#f48771" else "#c04040"
@@ -174,23 +173,24 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         val rbg = if (dark) "#1a2330" else "#f0f4f8" // reason
         val rbo = if (dark) "#2a3a4a" else "#d0d8e0"
         val sfg = if (dark) "#888" else "#666"       // system
-        val vfg = if (dark) "#6a9955" else "#3d7a3d" // avatar
+        val vfg = if (dark) "#8fbc72" else "#4f7f3a" // avatar
 
         return """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><style>
 *{margin:0;padding:0;box-sizing:border-box}
-	body{background:$bg;color:$fg;font:13px -apple-system,'Segoe UI',sans-serif;line-height:1.5;padding:10px 12px;overflow-y:auto}
-	#m{display:flex;flex-direction:column;gap:8px}
-	.um{display:flex;justify-content:flex-end}
-	.um .b{background:$ubg;color:$ufg;padding:8px 14px;border-radius:12px 4px 12px 12px;max-width:78%;white-space:pre-wrap;word-break:break-word}
-	.am{display:flex;flex-direction:column;align-items:flex-start}
-	.am .av{color:$vfg;font-size:11px;margin-bottom:2px}
-	.am .parts{display:flex;flex-direction:column;gap:8px;align-items:flex-start;width:100%}
-	.am .b{background:$abg;color:$afg;padding:8px 14px;border-radius:4px 12px 12px 12px;max-width:90%;white-space:normal;word-break:break-word}
+	body{background:$bg;color:$fg;font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.55;padding:18px 20px 28px;overflow-y:auto}
+	#m{display:flex;flex-direction:column;gap:18px;width:100%;max-width:920px;margin:0 auto}
+	.um{display:flex;justify-content:flex-end;padding-left:48px}
+	.um .b{background:$ubg;color:$ufg;padding:8px 13px;border-radius:14px 14px 4px 14px;max-width:76%;white-space:pre-wrap;word-break:break-word;box-shadow:0 1px 0 rgba(0,0,0,.12)}
+	.am{display:flex;flex-direction:column;align-items:stretch;min-width:0}
+	.am .av{display:flex;align-items:center;gap:7px;color:$vfg;font-size:11px;font-weight:600;letter-spacing:.01em;margin-bottom:6px}
+	.am .av:before{content:'A';display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:5px;background:${if (dark) "#293424" else "#edf5e9"};color:$vfg;font-size:10px;font-weight:700}
+	.am .parts{display:flex;flex-direction:column;gap:6px;align-items:stretch;width:100%;padding-left:25px}
+	.am .b{color:$afg;padding:0;max-width:100%;white-space:normal;word-break:break-word}
 	.am .b:empty{display:none}
 	.am .b h1,.am .b h2,.am .b h3,.am .b h4{margin:12px 0 6px;line-height:1.3}
 	.am .b h1{font-size:1.45em}.am .b h2{font-size:1.3em}.am .b h3{font-size:1.15em}
-	.am .b p{margin:6px 0}
+	.am .b p{margin:5px 0}
 	.am .b ul,.am .b ol{margin:6px 0;padding-left:24px}
 	.am .b blockquote{margin:8px 0;padding-left:10px;border-left:3px solid $cbo;color:$sfg}
 	.am .b code{font:12px 'JetBrains Mono','Consolas',monospace;background:$cbg;border-radius:3px;padding:1px 4px}
@@ -200,18 +200,29 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 	.am .b th,.am .b td{border:1px solid $cbo;padding:5px 8px;text-align:left}
 	.am .b a{color:$chf}
 	.am .b>:first-child{margin-top:0}.am .b>:last-child{margin-bottom:0}
-.cm{border:1px solid $cbo;border-radius:6px;overflow:hidden;background:$cbg}
-.cm .h{background:$chb;color:$chf;padding:4px 10px;font-size:11px}
-.cm pre{margin:0;padding:8px 12px;font:12px 'JetBrains Mono','Consolas',monospace;line-height:1.5;overflow-x:auto;white-space:pre;color:$fg}
-	.tm{border:1px solid $tbo;border-radius:6px;background:$tbg;color:$tfg;padding:6px 10px;font-size:12px}
-	.tm summary{cursor:pointer;list-style:none}
+.cm{border:1px solid $cbo;border-radius:7px;overflow:hidden;background:$cbg;margin:2px 0}
+.cm .h{background:$chb;color:$chf;padding:5px 10px;font-size:11px;border-bottom:1px solid $cbo}
+.cm pre{margin:0;padding:9px 12px;font:12px 'JetBrains Mono','Consolas',monospace;line-height:1.55;overflow-x:auto;white-space:pre;color:$fg}
+	.tm{color:$tfg;font-size:12px;min-width:0}
+	.tm details{border-radius:6px}
+	.tm details[open]{background:$tbg;border:1px solid $tbo}
+	.tm summary{display:flex;align-items:center;gap:7px;min-height:28px;padding:4px 8px;cursor:pointer;list-style:none;border-radius:6px;white-space:nowrap;overflow:hidden}
+	.tm summary:hover{background:$tbg;color:$fg}
 	.tm summary::-webkit-details-marker{display:none}
-	.tm pre{margin:6px 0 0 0;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:$fg;background:$cbg;border:1px solid $cbo;border-radius:4px;padding:6px 8px}
+	.tm .chev{width:10px;color:$sfg;font-size:10px;transition:transform .12s ease}
+	.tm details[open] .chev{transform:rotate(90deg)}
+	.tm .tool-dot{width:6px;height:6px;border-radius:50%;background:$sfg;flex:0 0 auto}
+	.tm.ts-success .tool-dot{background:${if (dark) "#73a857" else "#5c8f43"}}
+	.tm.ts-running .tool-dot{background:$chf;box-shadow:0 0 0 3px ${if (dark) "rgba(156,220,254,.12)" else "rgba(0,90,158,.10)"}}
+	.tm.ts-error .tool-dot{background:$efg}
+	.tm .tool-name{color:$fg;font-family:'JetBrains Mono','Consolas',monospace;overflow:hidden;text-overflow:ellipsis}
+	.tm .tool-status{margin-left:auto;color:$sfg;font-size:11px;overflow:hidden;text-overflow:ellipsis}
+	.tm pre{margin:0;border-top:1px solid $tbo;max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:$fg;background:$cbg;padding:9px 12px;font:11px/1.5 'JetBrains Mono','Consolas',monospace}
 .em{border:1px solid $ebo;border-radius:6px;background:$ebg;color:$efg;padding:6px 10px;font-size:12px}
 .qm{display:flex;justify-content:flex-end}
 .qm .b{background:$qbg;color:$qfg;padding:6px 12px;border-radius:10px 4px 10px 10px;max-width:78%;font-size:11px}
-.rm{border:1px solid $rbo;border-radius:6px;background:$rbg;color:$sfg;padding:4px 10px;font-size:10px;max-width:90%;margin-bottom:4px}
-.sm{color:$sfg;font-size:11px}
+.rm{border-left:2px solid $rbo;background:$rbg;color:$sfg;padding:5px 9px;font-size:11px;max-width:100%;margin-bottom:2px}
+.sm{color:$sfg;font-size:11px;padding:1px 8px}
 .th{display:flex;flex-direction:column;align-items:flex-start;color:$sfg}
 .th .av{color:$vfg;font-size:11px;margin-bottom:2px}
 	.dots::after{content:'';animation:d 1.5s steps(4,end) infinite}
@@ -223,9 +234,17 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 <script>$markedScript</script>
 <script>$purifyScript</script>
 <script>
-		var m=document.getElementById('m'),last=null,active=null,ti=-1,nb=true,cv=false;
-document.body.addEventListener('scroll',function(){nb=document.body.scrollHeight-document.body.scrollTop-document.body.clientHeight<120});
-function sd(){if(nb)requestAnimationFrame(function(){document.body.scrollTop=document.body.scrollHeight})}
+		var m=document.getElementById('m'),last=null,active=null,ti=-1,nb=true,cv=false,sr=0;
+	function scroller(){return document.scrollingElement||document.documentElement||document.body}
+	function updateNearBottom(){var e=scroller();nb=e.scrollHeight-e.scrollTop-e.clientHeight<120}
+	document.addEventListener('scroll',updateNearBottom,true);
+	function sd(force){
+		if(force)nb=true;
+		if(!nb)return;
+		if(sr)cancelAnimationFrame(sr);
+		sr=requestAnimationFrame(function(){var e=scroller();e.scrollTop=e.scrollHeight;sr=0})
+	}
+	if(typeof ResizeObserver!=='undefined')new ResizeObserver(function(){sd()}).observe(m);
 function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 	function md(s){
 		var source=String(s||'');
@@ -233,7 +252,7 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 		return DOMPurify.sanitize(marked.parse(source,{gfm:true,breaks:true}),{USE_PROFILES:{html:true}})
 	}
 	function setTheme(d){}
-		function addUserMessage(t){var d=document.createElement('div');d.className='um';d.innerHTML='<span class="b">'+h(t)+'</span>';m.appendChild(d);last=null;sd()}
+		function addUserMessage(t){var d=document.createElement('div');d.className='um';d.innerHTML='<span class="b">'+h(t)+'</span>';m.appendChild(d);last=null;sd(true)}
 		function beginAssistantTurn(){active=buildAsst('');last=active;m.appendChild(active);cv=false;sd()}
 		function currentAssistant(){return active&&active.parentNode?active:null}
 		function ensureAssistant(){var a=currentAssistant();if(a){last=a;return a}beginAssistantTurn();return active}
@@ -241,16 +260,18 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 	function lastBody(p){var bs=(p||parts()).querySelectorAll('.b');return bs.length?bs[bs.length-1]:null}
 	function textSegment(){var p=parts(),tail=p.lastElementChild;if(tail&&tail.classList.contains('b'))return tail;var b=document.createElement('div');b.className='b';p.appendChild(b);return b}
 	function addAssistantMessage(t){var b=textSegment();b.innerHTML=md(t);renderCursor();sd()}
-	function buildAsst(t){var d=document.createElement('div');d.className='am';d.innerHTML='<div class="av">🤖 AtomCode</div><div class="parts"><div class="b">'+md(t)+'</div></div>';return d}
+	function buildAsst(t){var d=document.createElement('div');d.className='am';d.innerHTML='<div class="av">AtomCode</div><div class="parts"><div class="b">'+md(t)+'</div></div>';return d}
 	function renderCursor(){if(!last)return;var olds=last.querySelectorAll('.streaming-cursor');Array.prototype.forEach.call(olds,function(x){x.remove()});var b=lastBody(last.querySelector('.parts'));if(!b)return;if(cv){var c=document.createElement('span');c.className='streaming-cursor';b.appendChild(c)}}
 	function updateLastAssistantMessage(t){var b=textSegment();b.innerHTML=md(t);renderCursor();sd()}
 		function showStreamingCursor(){cv=true;renderCursor();sd()}
 		function hideStreamingCursor(){cv=false;renderCursor();sd()}
 		function finishAssistantTurn(){cv=false;hideStreamingCursor();removeThinkingIndicator();removeReasoningBlock()}
 	function addCodeBlock(l,c,f){var d=document.createElement('div');d.className='cm';d.innerHTML='<div class="h">📄 '+h(f||l||'Code')+'</div><pre>'+h(c)+'</pre>';parts().appendChild(d);sd()}
-	function toolHtml(n,s,d){var summary='🔧 '+h(n)+' — '+h(s);return d?'<details open><summary>'+summary+'</summary><pre>'+h(d)+'</pre></details>':summary}
-	function addToolCall(n,s,d){var e=document.createElement('div');e.className='tm';e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d);parts().appendChild(e);sd()}
-		function updateToolCall(n,s,d){var ps=parts();var tools=Array.prototype.slice.call(ps.querySelectorAll('.tm')).reverse();var e=tools.find(function(x){return x.getAttribute('data-name')===n})||tools[0];if(e){e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d);sd()}else addToolCall(n,s,d)}
+	function toolTone(s){s=String(s||'').toLowerCase();return s.indexOf('error')>=0||s.indexOf('fail')>=0?'error':s.indexOf('running')>=0||s.indexOf('queued')>=0?'running':s.indexOf('done')>=0||s.indexOf('success')>=0||s.indexOf('complete')>=0?'success':'idle'}
+	function toolHtml(n,s,d){var summary='<summary><span class="chev">›</span><span class="tool-dot"></span><span class="tool-name">'+h(n)+'</span><span class="tool-status">'+h(s)+'</span></summary>';return '<details>'+summary+(d?'<pre>'+h(d)+'</pre>':'')+'</details>'}
+	function setTool(e,n,s,d){e.className='tm ts-'+toolTone(s);e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d)}
+	function addToolCall(n,s,d){var e=document.createElement('div');setTool(e,n,s,d);parts().appendChild(e);sd()}
+		function updateToolCall(n,s,d){var ps=parts();var tools=Array.prototype.slice.call(ps.querySelectorAll('.tm')).reverse();var e=tools.find(function(x){return x.getAttribute('data-name')===n})||tools[0];if(e){setTool(e,n,s,d);sd()}else addToolCall(n,s,d)}
 function addError(t){var d=document.createElement('div');d.className='em';d.innerHTML='⚠️ '+h(t);m.appendChild(d);last=null;sd()}
 function addQueuedMessage(t){var d=document.createElement('div');d.className='qm';d.innerHTML='<span class="b">📥 '+h(t)+'</span>';m.appendChild(d);last=null;sd()}
 	function addThinkingIndicator(){var d=document.createElement('div');d.className='rm thp';d.innerHTML='💭 思考中<span class="dots"></span>';parts().appendChild(d);sd()}
@@ -263,7 +284,7 @@ function addQueuedMessage(t){var d=document.createElement('div');d.className='qm
 	function updateReasoningBlock(t){var p=parts(),d=p.querySelector('.reasoning-content');if(!d){addReasoningBlock(t);return}d.innerHTML=reasoningPreview(t);sd()}
 	function removeReasoningBlock(){var a=currentAssistant();if(!a)return;var blocks=a.querySelectorAll('.reasoning-content');Array.prototype.forEach.call(blocks,function(x){x.remove()})}
 	function renderChatModel(model){clearMessages();(model.messages||[]).forEach(function(x){if(x.text!==undefined&&x.contextSummary!==undefined)addUserMessage(x.text);else if(x.markdown!==undefined)addAssistantMessage(x.markdown);else if(x.toolName!==undefined)addSystemMessage('[Permission] '+x.toolName+': '+(x.reason||''));else if(x.name!==undefined&&x.callId!==undefined)addToolCall(x.name,x.status||'',x.output||x.argumentsJson||'');else if(x.text!==undefined)addSystemMessage(x.text)});sd()}
-		function clearMessages(){m.innerHTML='';last=null;active=null;ti=-1;cv=false}
+		function clearMessages(){m.innerHTML='';last=null;active=null;ti=-1;cv=false;nb=true}
 (function find(){for(var k in window){if(k.indexOf('JBCefQuery_')===0&&typeof window[k]==='function'){window[k]('js:ready');return}}setTimeout(find,50)})();
 </script></body></html>""".trimIndent()
     }
