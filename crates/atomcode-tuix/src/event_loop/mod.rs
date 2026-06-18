@@ -6801,6 +6801,10 @@ fn handle_agent_event(
     reasoning_buffer: &mut String,
     buf: &mut Buffer,
 ) {
+    // Any foreground event means the stream is alive — refresh the stall clock so
+    // the spinner only warns "network may be down" after genuine silence.
+    state.note_stream_activity();
+
     // Whitelist which events should flush a buffered turn-end separator
     // BEFORE we handle them. The buffered separator was deferred at
     // `TurnComplete` precisely so that — if the goal is about to end —
@@ -7762,6 +7766,11 @@ fn handle_agent_event(
                 batch_id.clone(),
                 crate::state::ActiveToolBatch { call_ids },
             );
+            // Anchor the spinner clock to the batch start. The interleaved
+            // per-tool events that follow won't reset it (they no-op the reset
+            // while a batch is active), so the elapsed-ms ticks steadily instead
+            // of flickering 0→N→0.
+            state.on_tool_batch_started();
         }
         AgentEvent::GoalUpdate { active, round, condition, last_reason, .. } => {
             if active {
@@ -8512,6 +8521,14 @@ fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Opt
     }
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
+    }
+    // Network-stall warning: a streaming response that's gone silent past the
+    // threshold (e.g. mid-stream network drop) reads as a freeze with no feedback.
+    // Surface a hint that it isn't frozen and esc cancels. Static text, placed
+    // BEFORE the ticking elapsed so its width never jitters the segments after it.
+    if state.stream_stalled() {
+        out.push_str(" · ");
+        out.push_str(&crate::i18n::t(crate::i18n::Msg::StreamStalled));
     }
     // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
     // `Running ReadFile… 4s`. CC behaviour: timer resets on every phase

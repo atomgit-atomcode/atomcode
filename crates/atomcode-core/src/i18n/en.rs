@@ -1086,6 +1086,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                  authenticate against. Use the official binary, or point the provider at a \
                  plain OpenAI-compatible endpoint with an api_key."
             ).into(),
+        Msg::StreamStalled => "network may be down · esc to cancel".into(),
     }
 }
 

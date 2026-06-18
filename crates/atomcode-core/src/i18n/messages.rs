@@ -945,4 +945,10 @@ pub enum Msg<'a> {
     /// build can't sign requests for. Points the user at the official binary
     /// or a plain OpenAI-compatible endpoint.
     GatewayAuthUnavailable { base_url: &'a str },
+
+    // ── streaming liveness (atomcode-tuix spinner) ──
+    /// Spinner warning shown when a streaming response has gone silent past the
+    /// stall threshold (e.g. the network dropped mid-stream). Tells the user it
+    /// isn't frozen and that esc cancels immediately.
+    StreamStalled,
 }

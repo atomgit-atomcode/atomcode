@@ -37,6 +37,24 @@ pub enum UiPhase {
     Suspended,
 }
 
+/// How long the stream may go silent before the spinner warns the user the
+/// network may be down. A mid-stream drop fails cleanly at the provider's idle
+/// watchdog (~120s), but that is silent dead-air; this surfaces a "network may be
+/// down · esc to cancel" hint well before then so the user knows it isn't frozen
+/// and that esc is the instant escape hatch. Kept short of any legitimate
+/// inter-chunk gap (reasoning models still stream reasoning deltas).
+pub const STREAM_STALL_HINT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Whether the streaming spinner should warn the network may be down: we're
+/// awaiting the MODEL stream AND it's been silent for at least
+/// [`STREAM_STALL_HINT`]. `awaiting_model` MUST exclude tool execution — a slow
+/// local tool (a 30s build) emits no events but is not a network stall, so warning
+/// there would be a false positive. `None` elapsed (no activity stamped yet) never
+/// warns. Pure (no clock) so the threshold logic is unit-testable.
+pub fn stream_stalled_for(awaiting_model: bool, since_activity: Option<std::time::Duration>) -> bool {
+    awaiting_model && since_activity.is_some_and(|d| d >= STREAM_STALL_HINT)
+}
+
 /// Rotating pool of "thinking" labels — CC-style playful verbs.
 /// Advances once per turn so consecutive turns vary.
 pub const THINKING_LABELS: &[&str] = &[
@@ -164,6 +182,12 @@ pub struct UiState {
     /// turn-complete / turn-cancelled / error so the idle spinner
     /// (rare) doesn't tick a stale duration.
     pub phase_started_at: Option<std::time::Instant>,
+    /// When the last stream activity (any foreground agent event) was observed.
+    /// Set on submit and refreshed on every received event; the spinner reads its
+    /// elapsed to warn the user when the stream has gone silent (e.g. network drop)
+    /// past [`STREAM_STALL_HINT`]. Distinct from `phase_started_at`, which does NOT
+    /// reset per chunk and so can't tell "alive but slow" from "connection dead".
+    pub last_stream_activity: Option<std::time::Instant>,
     /// Last observed context breakdown. Populated from
     /// `AgentEvent::ContextStats` — `/context` renders this. `None`
     /// before the first turn completes.
@@ -360,6 +384,7 @@ impl UiState {
             thinking_idx: 0,
             turn_started_at: None,
             phase_started_at: None,
+            last_stream_activity: None,
             last_context: None,
             last_submitted_message: None,
             pending_context_render: None,
@@ -472,6 +497,22 @@ impl UiState {
             .or_else(|| self.turn_elapsed())
     }
 
+    /// Stamp "the stream is alive" — called on submit and on every received
+    /// foreground agent event. Resets the stall clock read by [`Self::stream_stalled`].
+    pub fn note_stream_activity(&mut self) {
+        self.last_stream_activity = Some(std::time::Instant::now());
+    }
+
+    /// Whether the spinner should warn the network may be down (see
+    /// [`stream_stalled_for`]). "Awaiting the model" = Streaming with a thinking
+    /// label showing — NOT a tool label (`Running …`/`Preparing …`), approval, or
+    /// sub-agent label, so a slow local tool never trips the network warning.
+    pub fn stream_stalled(&self) -> bool {
+        let awaiting_model = matches!(self.phase, UiPhase::Streaming)
+            && THINKING_LABELS.contains(&self.spinner_label.as_str());
+        stream_stalled_for(awaiting_model, self.last_stream_activity.map(|t| t.elapsed()))
+    }
+
     fn current_thinking(&self) -> &'static str {
         THINKING_LABELS[self.thinking_idx % THINKING_LABELS.len()]
     }
@@ -484,6 +525,9 @@ impl UiState {
         let now = std::time::Instant::now();
         self.turn_started_at = Some(now);
         self.phase_started_at = Some(now);
+        // Seed the stall clock so the first silent stretch is measured from submit,
+        // not a stale stamp from the previous turn (which would flash the warning).
+        self.last_stream_activity = Some(now);
     }
 
     pub fn on_turn_complete(&mut self) {
@@ -527,11 +571,26 @@ impl UiState {
     /// the spinner timer starts fresh on this tool execution.
     pub fn on_tool_call_started(&mut self, name: &str) {
         self.spinner_label = format!("Running {}", name);
-        self.phase_started_at = Some(std::time::Instant::now());
+        // During a parallel batch many tool events interleave; resetting the
+        // phase clock on each made the spinner's elapsed-ms flicker 0→N→0. The
+        // batch anchors the clock once (`on_tool_batch_started`); only a
+        // standalone tool call resets it here.
+        if self.active_tool_batches.is_empty() {
+            self.phase_started_at = Some(std::time::Instant::now());
+        }
     }
 
     pub fn on_tool_call_streaming(&mut self, name: &str) {
         self.spinner_label = format!("Preparing {}", name);
+        if self.active_tool_batches.is_empty() {
+            self.phase_started_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// A parallel tool batch is starting. Anchor the spinner clock once here so
+    /// the elapsed-ms ticks steadily for the whole batch, instead of being reset
+    /// by every interleaved per-tool event (the "Preparing … · 0ms" flicker).
+    pub fn on_tool_batch_started(&mut self) {
         self.phase_started_at = Some(std::time::Instant::now());
     }
 
@@ -720,6 +779,33 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spinner_warns_only_when_model_stream_silent_past_threshold() {
+        use std::time::Duration;
+        // Awaiting model + silent at/over the threshold → warn (network may be down).
+        assert!(stream_stalled_for(true, Some(STREAM_STALL_HINT)));
+        assert!(stream_stalled_for(true, Some(STREAM_STALL_HINT + Duration::from_secs(5))));
+        // Awaiting model but a chunk arrived recently → no warn (stream is alive).
+        assert!(!stream_stalled_for(true, Some(Duration::from_secs(1))));
+        // No activity recorded yet (fresh turn) → no warn, so it can't flash on submit.
+        assert!(!stream_stalled_for(true, None));
+        // NOT awaiting the model (tool running / approval / idle) → never warn, even
+        // after long silence: a slow local tool is not a network stall.
+        assert!(!stream_stalled_for(false, Some(STREAM_STALL_HINT * 100)));
+    }
+
+    #[test]
+    fn stream_stalled_is_gated_to_the_model_thinking_phase() {
+        // End-to-end on UiState: a thinking label past the threshold warns; a tool
+        // label (Running …) with the same silence does NOT.
+        let mut s = UiState::new();
+        s.on_submit(); // phase=Streaming, spinner = a THINKING_LABEL
+        s.last_stream_activity = Some(std::time::Instant::now() - STREAM_STALL_HINT * 2);
+        assert!(s.stream_stalled(), "silent model stream past threshold must warn");
+        s.on_tool_call_started("Bash"); // spinner = "Running Bash" — not a thinking label
+        assert!(!s.stream_stalled(), "a slow tool must NOT trip the network warning");
+    }
 
     #[test]
     fn turn_token_summary_reports_billable_and_cached_pct() {
@@ -944,6 +1030,38 @@ mod tests {
         s.on_approval_resolved();
         let resumed = s.phase_started_at.unwrap();
         assert!(resumed > waiting_started, "phase_started_at should advance");
+    }
+
+    #[test]
+    fn tool_events_during_batch_keep_phase_clock_stable() {
+        // Parallel batch: interleaved ToolCallStreaming/Started events must NOT
+        // restart the phase clock — that reset-on-each made the spinner's
+        // elapsed-ms flicker 0→N→0 (the reported "Preparing … · 0ms" bug).
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_batch_started();
+        let anchor = s.phase_started_at.unwrap();
+        s.active_tool_batches
+            .insert("b1".into(), ActiveToolBatch { call_ids: vec![] });
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        s.on_tool_call_streaming("Bash(a)");
+        assert_eq!(s.phase_started_at, Some(anchor), "streaming restarted the batch clock");
+        s.on_tool_call_started("Bash(b)");
+        assert_eq!(s.phase_started_at, Some(anchor), "started restarted the batch clock");
+    }
+
+    #[test]
+    fn standalone_tool_event_resets_phase_clock() {
+        // No active batch → a single tool call anchors a fresh clock (unchanged).
+        let mut s = UiState::new();
+        s.on_submit();
+        let before = s.phase_started_at.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        s.on_tool_call_streaming("Bash(x)");
+        assert!(
+            s.phase_started_at.unwrap() > before,
+            "standalone tool event must reset the clock"
+        );
     }
 
     #[test]
