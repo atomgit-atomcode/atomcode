@@ -448,10 +448,27 @@ pub struct StatusLine {
     /// Current reasoning_effort for the active provider's model.
     /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
-    /// When an autonomous `/goal` loop is active, this carries a compact
-    /// progress label like `"◎ /goal (round 3, 1m 42s)"`. Rendered in
-    /// the status row between the left info and the right-aligned hint.
-    pub goal_indicator: Option<String>,
+    /// When an autonomous `/goal` loop is active, this carries its live status
+    /// for the DEDICATED footer goal row (its own full-width line above the
+    /// status row). `None` ⇒ no goal running, row omitted. Previously this was
+    /// a pre-formatted suffix crammed onto the shared status line, where it was
+    /// the first thing truncated under a hint / narrow terminal and omitted the
+    /// condition text — so users couldn't reliably see the goal while tool
+    /// output scrolled. Its own row fixes that.
+    pub goal: Option<GoalStatus>,
+}
+
+/// Live status of an active autonomous `/goal` loop, rendered on the dedicated
+/// footer goal row. The renderer width-truncates `condition` to fit; `round`
+/// and the elapsed time always survive (see `format_goal_row`).
+#[derive(Debug, Clone)]
+pub struct GoalStatus {
+    /// The goal condition text (truncated with `…` to fit the row width).
+    pub condition: String,
+    /// Current autonomous round (0-based at set, increments per continuation).
+    pub round: u32,
+    /// Wall-clock seconds since the goal was set.
+    pub elapsed_secs: u64,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

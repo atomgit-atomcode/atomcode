@@ -8434,17 +8434,14 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         None
     };
-    let goal_indicator = if state.goal_condition.is_some() {
-        let round = state.goal_round;
-        let elapsed = state.goal_started_at
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
-        let mins = elapsed / 60;
-        let secs = elapsed % 60;
-        Some(format!("◎ /goal (round {}, {}m {}s)", round, mins, secs))
-    } else {
-        None
-    };
+    // Active /goal → the dedicated footer goal row (width-truncated by the
+    // renderer). Carries the condition text so the user can SEE what the goal
+    // is, not just that one is running.
+    let goal = state.goal_condition.as_ref().map(|cond| crate::render::GoalStatus {
+        condition: cond.clone(),
+        round: state.goal_round,
+        elapsed_secs: state.goal_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+    });
     crate::render::StatusLine {
         model,
         cwd,
@@ -8459,7 +8456,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             None
         },
         session_name,
-        goal_indicator,
+        goal,
     }
 }
 

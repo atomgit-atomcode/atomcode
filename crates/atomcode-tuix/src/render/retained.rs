@@ -64,6 +64,54 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
     }
 }
 
+/// Marker prefix for the dedicated footer goal row. A width-1 BMP "ring" from
+/// the Geometric Shapes block when the terminal's font has it, ASCII `*`
+/// otherwise — the SAME `unicode_symbols` gate the spinner (`◐`→`|/-\`) and
+/// ellipsis (`…`→`...`) use, so Windows legacy conhost / Consolas don't show
+/// `□` tofu. Deliberately NOT an emoji (e.g. 🎯): emoji width is rendered
+/// inconsistently across terminals and would drift every column after it in the
+/// cell-diff renderer, and emoji font coverage is far spottier than Geometric
+/// Shapes. Both variants are width-1 + a trailing space, so the layout math is
+/// identical either way.
+fn goal_marker(unicode: bool) -> &'static str {
+    if unicode {
+        "◎ "
+    } else {
+        "* "
+    }
+}
+
+/// Format the dedicated footer goal row, width-aware. Shape:
+/// `◎ {condition} · round {N} · {elapsed}`, where elapsed is `13s` under a
+/// minute else `2m13s`. The `· round … · …` suffix is RESERVED (always shown);
+/// the condition fills whatever columns remain and is truncated with `…`. When
+/// the row is too narrow for any condition, the condition (and its separator)
+/// drop entirely but round/elapsed survive. CJK/width-safe via `crate::width`.
+fn format_goal_row(
+    condition: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+) -> String {
+    let icon = goal_marker(unicode);
+    let m = elapsed_secs / 60;
+    let s = elapsed_secs % 60;
+    let elapsed = if m == 0 { format!("{s}s") } else { format!("{m}m{s}s") };
+    let suffix = format!(" · round {round} · {elapsed}");
+    let icon_w = crate::width::display_width(icon);
+    let suffix_w = crate::width::display_width(&suffix);
+    let cond_budget = max_cols.saturating_sub(icon_w).saturating_sub(suffix_w);
+    if cond_budget == 0 {
+        // No room for the condition — keep the marker + round/elapsed, drop the
+        // condition and its leading separator. Hard-truncate as a backstop.
+        let bare = format!("{icon}round {round} · {elapsed}");
+        return crate::width::truncate_to_width(&bare, max_cols);
+    }
+    let cond = crate::width::truncate_with_ellipsis(condition, cond_budget);
+    format!("{icon}{cond}{suffix}")
+}
+
 /// Format a token count using k/m units. `round_clean=true` drops the
 /// decimal when the value is an exact multiple of the unit (used for
 /// the model's advertised window — `128_000` → `128k`, `1_000_000` →
@@ -1306,9 +1354,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if !ctx_str.is_empty() {
             parts.push(ctx_str);
         }
-        if let Some(ref gi) = status.goal_indicator {
-            parts.push(scrub_controls(gi));
-        }
+        // NOTE: the goal indicator is NOT appended here any more — it lives on
+        // its own dedicated footer row (`build_goal_row`) so it can't be the
+        // first thing truncated off this line under a hint / narrow terminal.
         let left = parts.join(" · ");
 
         // Helper: emit the badge (with trailing space) then the rest, so
@@ -1362,6 +1410,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_str_cells(&mut row, &truncated, &secondary);
             push_bypass(&mut row);
         }
+        row
+    }
+
+    /// Build the dedicated goal row (one full-width line, shown only while a
+    /// `/goal` loop is active). Sits directly above the status line; the whole
+    /// row renders in `Brand` so the active autonomous mode draws the eye.
+    fn build_goal_row(&self, goal: &crate::render::GoalStatus, rule_width: usize) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let text = format_goal_row(
+            &scrub_controls(&goal.condition),
+            goal.round,
+            goal.elapsed_secs,
+            rule_width.max(1),
+            self.caps.unicode_symbols,
+        );
+        push_str_cells(&mut row, &text, &self.style_for(Role::Brand));
         row
     }
 
@@ -1452,13 +1516,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
+        // Dedicated goal row: one full-width line above the status row, only
+        // while a `/goal` loop is active.
+        let goal_rows = if self.status.goal.is_some() { 1 } else { 0 };
         // Cap the input-box height so a long paste / typed text can't grow the
         // footer past the screen (overflow). The full text stays in input_buf;
         // we render a scrolling window that keeps the cursor row visible. The
         // `[Pasted #N]` folding (insert_paste) already shrinks most big pastes;
         // this is the backstop for the rest (unfolded single-line pastes,
-        // sub-threshold pastes, typed text).
-        let max_input_rows = Self::max_input_rows(h, attachment_rows, menu_rows, status_rows);
+        // sub-threshold pastes, typed text). The goal row is folded into the
+        // status-rows reservation so the input box height accounts for it too.
+        let max_input_rows =
+            Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows);
         let input_view_start = if lines.len() > max_input_rows {
             cursor_row_in_middle
                 .saturating_sub(max_input_rows.saturating_sub(1))
@@ -1468,7 +1537,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
         let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
-        let total_rows = 1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows;
+        let total_rows =
+            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + status_rows;
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
         // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
@@ -1501,6 +1571,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             None
         };
+        let goal_cells = status_clone
+            .goal
+            .as_ref()
+            .map(|g| self.build_goal_row(g, rule_width));
         let menu_kind = self
             .menu
             .as_ref()
@@ -1563,10 +1637,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(menu_top + i, 0, &padded);
         }
+        // Goal row sits directly above the status line (between the menu and
+        // the status row), so `· menu / goal / status ·`.
+        let goal_top = menu_top + menu_rows;
+        if let Some(gr) = goal_cells {
+            let mut padded = gr;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(goal_top, 0, &padded);
+        }
         if let Some(st) = status_cells {
             let mut padded = st;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(menu_top + menu_rows, 0, &padded);
+            self.screen.draw_row(goal_top + goal_rows, 0, &padded);
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
@@ -1617,15 +1699,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
+        let goal_rows = if self.status.goal.is_some() { 1 } else { 0 };
         let attachment_rows = self.input_attachments.len();
         // Cap the input height (mirrors paint_footer) so a long paste / typed
         // input can't make the footer exceed the screen.
-        let capped_middle =
-            middle_rows.min(Self::max_input_rows(h, attachment_rows, menu_rows, status_rows));
-        // 1 top rule + middle + 1 bot rule + attachments + menu + status.
+        let capped_middle = middle_rows
+            .min(Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows));
+        // 1 top rule + middle + 1 bot rule + attachments + menu + goal + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        1 + capped_middle + 1 + attachment_rows + menu_rows + status_rows
+        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + status_rows
     }
 
     /// Max rows the input box may DISPLAY before scrolling internally. Bounds
@@ -4656,6 +4739,51 @@ mod tests {
     }
 
     #[test]
+    fn goal_row_shows_condition_round_and_elapsed() {
+        // Wide row (unicode caps): ◎ marker + full condition + round + elapsed.
+        let row = format_goal_row("重构 auth 模块直到测试全过", 3, 133, 80, true);
+        assert!(row.starts_with("◎ "), "geometric marker present: {row}");
+        assert!(!row.contains('🎯'), "must NOT use an emoji marker: {row}");
+        assert!(row.contains("重构 auth 模块直到测试全过"), "full condition kept: {row}");
+        assert!(row.contains("· round 3 ·"), "round shown: {row}");
+        assert!(row.contains("2m13s"), "elapsed mm/ss: {row}");
+    }
+
+    #[test]
+    fn goal_row_ascii_fallback_avoids_geometric_and_emoji_glyphs() {
+        // Windows legacy conhost / Consolas (unicode_symbols=false): no ◎ tofu,
+        // no emoji — a plain ASCII `*` marker, same gate as the spinner.
+        let row = format_goal_row("ship it", 4, 7, 80, false);
+        assert!(row.starts_with("* "), "ascii marker: {row}");
+        assert!(!row.contains('◎') && !row.contains('🎯'), "no non-ASCII glyph: {row}");
+        assert!(row.contains("· round 4 · 7s"), "round/elapsed intact: {row}");
+    }
+
+    #[test]
+    fn goal_row_elapsed_under_a_minute_omits_minutes() {
+        let row = format_goal_row("x", 1, 42, 80, true);
+        assert!(row.contains("· 42s"), "seconds-only under a minute: {row}");
+        assert!(!row.contains("0m"), "no leading 0m: {row}");
+    }
+
+    #[test]
+    fn goal_row_truncates_long_condition_but_keeps_round_and_elapsed() {
+        let cond = "a".repeat(200);
+        let row = format_goal_row(&cond, 7, 5, 40, true);
+        assert!(crate::width::display_width(&row) <= 40, "row fits width: {row}");
+        assert!(row.contains("· round 7 · 5s"), "round/elapsed survive: {row}");
+        assert!(row.contains('…'), "condition truncated with ellipsis: {row}");
+    }
+
+    #[test]
+    fn goal_row_degrades_to_round_elapsed_when_too_narrow() {
+        // No room for any condition → drop it, keep marker + round/elapsed.
+        let row = format_goal_row("some long condition", 2, 9, 14, true);
+        assert!(crate::width::display_width(&row) <= 14, "row fits narrow width: {row}");
+        assert!(row.contains("round 2"), "round survives even when condition dropped: {row}");
+    }
+
+    #[test]
     fn ctx_usage_keeps_round_window_clean() {
         // 128k window is the common default — render as `128k`, not `128.0k`.
         assert_eq!(format_ctx_usage(50_000, 128_000), "50.0k/128k tok");
@@ -4802,7 +4930,7 @@ mod tests {
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
-            goal_indicator: None,
+            goal: None,
         }
     }
 
@@ -4827,7 +4955,7 @@ mod tests {
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
-            goal_indicator: None,
+            goal: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -4881,7 +5009,7 @@ mod tests {
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
             reasoning_effort: None,
-            goal_indicator: None,
+            goal: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -4927,7 +5055,7 @@ mod tests {
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
             reasoning_effort: None,
-            goal_indicator: None,
+            goal: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
