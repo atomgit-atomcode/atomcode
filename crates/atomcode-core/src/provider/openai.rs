@@ -465,11 +465,11 @@ impl OpenAiProvider {
     }
 
     /// Strip `image_url` content blocks from a single serialised message
-    /// value in-place. (Retained as a utility; no longer called in hot path.)
-    /// a vision-capable provider — historical MultiPart messages should
-    /// already be degraded by the `supports_vision` branch above, but this
-    /// catches any edge case the degradation misses so a text-only provider
-    /// never sees `unknown variant 'image_url'` from the upstream.
+    /// value in-place. Called in `chat_stream` as defence-in-depth: when the
+    /// current model doesn't support vision, we strip any residual image_url
+    /// blocks that might remain after a `/model` switch from a vision-capable
+    /// provider. The `format_messages` MultiPart branch handles the common case;
+    /// this catches any edge case it misses.
     fn strip_image_url(msg: &mut serde_json::Value) {
         if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
             content.retain(|block| {

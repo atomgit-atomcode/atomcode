@@ -4238,7 +4238,8 @@ fn attach_typed_image_paths(
             }
             let quote = remaining.as_bytes()[start];
             let Some(end) = remaining[start + 1..].find(quote as char) else {
-                break;
+                // unmatched quote — skip it so the post-loop doesn't reprocess text
+                remaining = &remaining[start + 1..]; break;
             };
             let quoted = &remaining[start + 1..start + 1 + end];
             if quoted.contains('/') || quoted.contains('\\') {

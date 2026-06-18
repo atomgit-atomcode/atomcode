@@ -260,6 +260,11 @@ impl LlmProvider for OpenAiCompatProvider {
 // Request building (pure, deterministic)
 // ---------------------------------------------------------------------------
 
+/// Byte-for-byte duplicate of `atomcode_core::provider::model_name_suggests_vision`.
+/// Layering rules (L0/L1) prevent `atomcode-capabilities` from importing
+/// `atomcode-core`. When adding a new vision model, you MUST update BOTH this
+/// function AND `crates/atomcode-core/src/provider/mod.rs:model_name_suggests_vision`.
+/// A mismatched copy causes silent image drops or 400 errors.
 fn suggests_vision(model: &str) -> bool {
     let n = model.to_lowercase();
     n.contains("vision")
@@ -867,12 +872,23 @@ mod tests {
             "look",
             vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, "test-model");
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, "gpt-4o");
         let c = &out[0]["content"];
         assert!(c.is_array(), "multimodal content must be an array: {c}");
         assert_eq!(c[0], json!({"type":"text","text":"look"}));
         assert_eq!(c[1]["type"], "image_url");
         assert_eq!(c[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+    }
+
+    #[test]
+    fn user_with_images_degraded_when_model_is_text_only() {
+        use atomcode_kernel::message::ImageContent;
+        let m = Message::user_with_images(
+            "look",
+            vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
+        );
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, "test-model");
+        assert_eq!(out[0], json!({"role":"user","content":"look"}));
     }
 
     #[test]
@@ -882,7 +898,7 @@ mod tests {
             "",
             vec![ImageContent { media_type: "image/jpeg".into(), data: "eHl6".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, "test-model");
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, "gpt-4o");
         let c = out[0]["content"].as_array().unwrap();
         assert_eq!(c.len(), 1, "no text part when text is empty");
         assert_eq!(c[0]["type"], "image_url");
@@ -907,7 +923,7 @@ mod tests {
             "x",
             vec![ImageContent { media_type: "".into(), data: "QUJD".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, "test-model");
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, "gpt-4o");
         assert_eq!(out[0]["content"][1]["image_url"]["url"], "data:application/octet-stream;base64,QUJD");
     }
 
