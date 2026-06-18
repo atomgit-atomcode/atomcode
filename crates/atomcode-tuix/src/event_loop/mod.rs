@@ -3621,9 +3621,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                 live.send_input(UserInput { text: queued.text, images: queued.images });
                                 app.state.on_submit();
                             } else {
-                                // —— 原有逻辑，原样保留 ——
-                                renderer.render(UiLine::User(queued.text.clone()));
-                                renderer.flush();
                                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
                                     text: queued.text,
                                     images: queued.images,
@@ -4012,9 +4009,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                 live.send_input(UserInput { text: queued.text, images: queued.images });
                                 app.state.on_submit();
                             } else {
-                                // —— 原有逻辑，原样保留 ——
-                                renderer.render(UiLine::User(queued.text.clone()));
-                                renderer.flush();
                                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
                                     text: queued.text,
                                     images: queued.images,
@@ -4202,7 +4196,6 @@ fn attach_image_to_input(
 fn attach_typed_image_paths(
     app: &mut App,
     ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
     text: &mut String,
     images: &mut Vec<ImagePart>,
     kept_markers: &mut Vec<usize>,
@@ -5602,11 +5595,6 @@ fn handle_idle_key(
                 for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir) {
                     renderer.render(UiLine::Warning(n));
                 }
-                // 同步模式：不在本地渲染用户行；等 LiveEvent::UserMessage →
-                // AgentEvent::UserEcho 回灌，保证两端一致。非同步模式原样渲染。
-                if ctx.sync_session.is_none() {
-                    renderer.render(UiLine::User(line.clone()));
-                }
                 let mut expanded = app.buf.expand_pastes(&line);
                 // Pastes have now been substituted into `expanded`;
                 // safe to drop the registry. Doing it any earlier
@@ -5669,11 +5657,21 @@ fn handle_idle_key(
                 attach_typed_image_paths(
                     app,
                     ctx,
-                    renderer,
                     &mut expanded,
                     &mut images,
                     &mut kept_markers,
                 );
+                if ctx.sync_session.is_none() {
+                    renderer.render(UiLine::UserWithAttachments {
+                        text: line.clone(),
+                        attachments: kept_markers.clone(),
+                    });
+                } else {
+                    for n in &kept_markers {
+                        renderer.render(UiLine::ImageAttachment(*n));
+                    }
+                }
+                renderer.flush();
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: line.clone(),
                     images: kept_refs,
@@ -6344,6 +6342,16 @@ fn handle_streaming_key(
                     });
                     q_images.push(img);
                     q_markers.push(n);
+                }
+            }
+            if ctx.sync_session.is_none() {
+                renderer.render(UiLine::UserWithAttachments {
+                    text: line.clone(),
+                    attachments: q_markers.clone(),
+                });
+            } else {
+                for n in &q_markers {
+                    renderer.render(UiLine::ImageAttachment(*n));
                 }
             }
             ctx.history.push(crate::input::history::HistoryEntry {

@@ -41,6 +41,13 @@ pub enum UiLine {
         working_dir: String,
     },
     User(String),
+    /// A user message and its image echoes rendered as one append-only
+    /// group. Retained renderers must not commit a temporary spacer between
+    /// the text and attachments because that scroll cannot be undone.
+    UserWithAttachments {
+        text: String,
+        attachments: Vec<usize>,
+    },
     AssistantText(String),
     /// LLM reasoning/thinking content (displayed in gray/dimmed style)
     ReasoningText(String),

@@ -358,6 +358,7 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
     match l {
         UiLine::Welcome { .. } => "Welcome",
         UiLine::User(_) => "User",
+        UiLine::UserWithAttachments { .. } => "UserWithAttachments",
             UiLine::AssistantText(_) => "AssistantText",
             UiLine::ReasoningText(_) => "ReasoningText",
             UiLine::AssistantLineBreak => "AssistantLineBreak",

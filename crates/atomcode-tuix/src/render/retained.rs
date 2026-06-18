@@ -3037,6 +3037,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.welcome_line_count = new_len;
     }
 
+    fn push_user_message(&mut self, text: &str, attachments: &[usize]) {
+        self.mark_message(crate::render::MarkKind::User);
+        self.last_mark_was_assistant = false;
+        let safe = scrub_controls(text);
+        let accent = self.style_bold(Role::Accent);
+        let plain = CellStyle::default();
+        self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &plain);
+        let muted = self.style_for(Role::Muted);
+        for n in attachments {
+            self.push_body_text(&format!("└ [Image #{}]", n), &muted);
+        }
+        self.push_body_row(Vec::new());
+        self.md_state.reset();
+    }
+
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -3117,17 +3132,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_welcome(&model_scrubbed, &wd_scrubbed);
             }
             UiLine::User(text) => {
-                self.mark_message(crate::render::MarkKind::User);
-                self.last_mark_was_assistant = false;
-                let safe = scrub_controls(&text);
-                let accent = self.style_bold(Role::Accent);
-                let plain = CellStyle::default();
-                self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &plain);
-                // Blank spacer row.
-                self.push_body_row(Vec::new());
-                // New user turn — reset markdown parser so code-block
-                // / table state from previous turn doesn't bleed.
-                self.md_state.reset();
+                self.push_user_message(&text, &[]);
+            }
+            UiLine::UserWithAttachments { text, attachments } => {
+                self.push_user_message(&text, &attachments);
             }
             UiLine::TurnSeparator { label } => {
                 self.last_mark_was_assistant = false;
@@ -9322,6 +9330,48 @@ mod tests {
             r.current_footer_rows(),
             baseline + 2,
             "two attachments must add exactly two preview rows"
+        );
+    }
+
+    /// A full viewport used to lose the user row when the event loop emitted
+    /// `User` first and `ImageAttachment` second: `User` committed a spacer,
+    /// the attachment popped it only from memory, and the already-emitted LF
+    /// could not be undone. The grouped variant emits no temporary row.
+    #[test]
+    fn user_with_attachment_stays_visible_when_body_is_full() {
+        let w = 80;
+        let h = 12;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let cap = h as usize - r.current_footer_rows();
+        for i in 0..cap {
+            r.render(UiLine::CommandOutput(format!("filler-{i}")));
+        }
+        r.render(UiLine::UserWithAttachments {
+            text: "[Image #1]你好".into(),
+            attachments: vec![1],
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let visible = vterm.dump();
+        assert!(
+            visible.contains("❯ [Image #1]") && visible.contains('你') && visible.contains('好'),
+            "user text must remain visible beside its attachment:\n{visible}"
+        );
+        assert!(
+            visible.contains("└ [Image #1]"),
+            "attachment echo must remain visible below user text:\n{visible}"
         );
     }
 
