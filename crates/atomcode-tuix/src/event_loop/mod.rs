@@ -4865,6 +4865,30 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
+    // so the TUI can legitimately sit in Idle while the agent keeps looping
+    // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
+    // they never reach the cancel path (that lives in `handle_streaming_key`),
+    // which is why a goal felt uninterruptible. When a goal is active, route
+    // Ctrl+C and a bare Esc (empty buffer — don't steal Esc from clearing a
+    // draft the user is editing to nudge the goal) to `Cancel`: the bridge
+    // turns that into "clear the goal + cancel the running turn", and the
+    // follow-up GoalUpdate(active=false) resets the local goal state. Belt and
+    // suspenders alongside `on_thinking` keeping the TUI in Streaming.
+    if app.state.goal_condition.is_some() {
+        let is_ctrl_c = code == KeyCode::Char('c')
+            && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+        let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
+        if is_ctrl_c || is_bare_esc {
+            ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+            crate::tuix_trace!(
+                "KEY",
+                "idle goal-active {} -> Cancel",
+                if is_ctrl_c { "Ctrl+C" } else { "Esc" }
+            );
+            return Ok(());
+        }
+    }
     // If the menu is active (buf starts with '/'), intercept navigation keys.
     // Suppress while scrolling history / right after a restore (see
     // `menu_for_display`) — otherwise a recalled `/se…` immediately re-pops.

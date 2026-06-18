@@ -496,6 +496,18 @@ impl UiState {
     }
 
     pub fn on_thinking(&mut self) {
+        // A model round is starting. Restore Streaming if we'd fallen back to
+        // Idle: a `/goal` continuation runs SERVER-SIDE (the bridge injects the
+        // next round, it never flows through the local `on_submit` that normally
+        // sets Streaming), so without this the TUI can sit in Idle while the
+        // agent keeps looping — and Esc / Ctrl+C, which only reach the cancel
+        // path from `handle_streaming_key`, become silent no-ops (the reported
+        // "goal can't be interrupted"). Only Idle→Streaming: never clobber an
+        // active Approval prompt (a Thinking event can't arrive during one, but
+        // guard anyway).
+        if matches!(self.phase, UiPhase::Idle) {
+            self.phase = UiPhase::Streaming;
+        }
         // Reuse the current pool label (don't bump the index — that's done
         // on submit, one rotation per turn not per state transition).
         let idx = self.thinking_idx.saturating_sub(1) % THINKING_LABELS.len();
@@ -778,6 +790,32 @@ mod tests {
         let mut s = UiState::new();
         s.on_submit();
         s.on_approval_needed("Bash");
+        assert_eq!(s.phase, UiPhase::Approval);
+    }
+
+    #[test]
+    fn thinking_restores_streaming_from_idle() {
+        // A server-driven /goal continuation: the turn ended (Idle), then the
+        // next round's PhaseChange(Thinking) arrives with NO local on_submit.
+        // on_thinking must pull the TUI back into Streaming so Esc/Ctrl+C can
+        // reach the cancel path — otherwise the goal is uninterruptible.
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_turn_complete();
+        assert_eq!(s.phase, UiPhase::Idle);
+        s.on_thinking();
+        assert_eq!(s.phase, UiPhase::Streaming);
+    }
+
+    #[test]
+    fn thinking_does_not_clobber_approval() {
+        // A Thinking event must never yank the UI out of an open approval
+        // prompt (the guard is Idle→Streaming only).
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_approval_needed("Bash");
+        assert_eq!(s.phase, UiPhase::Approval);
+        s.on_thinking();
         assert_eq!(s.phase, UiPhase::Approval);
     }
 

@@ -905,6 +905,13 @@ impl Bridge {
                     let ev = goal_update_ev(&g);
                     self.emit(ev);
                 }
+                // Stop the turn running RIGHT NOW, not just the loop — `/goal
+                // clear` while a round is mid-tool (e.g. a long bash) must
+                // interrupt it, exactly like the Cancel branch (which already
+                // forwards KCmd::Cancel). Without this, clearing only disarmed
+                // the next round and the user watched the current tool run to
+                // completion (part of the reported "goal can't be interrupted").
+                let _ = self.handle.commands.send(KCmd::Cancel);
                 // An eval was holding a turn open — close it now.
                 if let Some((_, messages)) = self.pending_goal.take() {
                     self.finish_turn(StopReason::Cancelled, messages);
