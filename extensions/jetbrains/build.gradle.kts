@@ -143,8 +143,13 @@ tasks {
         useJUnitPlatform()
     }
 
+    val buildWebview by registering(Exec::class) {
+        workingDir = file("src/main/resources/webview")
+        commandLine("npm", "run", "build")
+    }
+
     processResources {
-        dependsOn(bundleDaemon)
+        dependsOn(bundleDaemon, buildWebview)
         from(bundledDaemonDir)
     }
 
