@@ -529,7 +529,11 @@ impl RunningAgent {
             };
             match cmd {
                 AgentCommand::Shutdown => break,
-                AgentCommand::Cancel => {}
+                // No turn is running at the top-level loop, but a Cancel that races in
+                // here (turn just returned) must still flush any orphaned parked request
+                // → Null (fail-closed), so a stranded approval oneshot can't linger. A
+                // no-op map (the common case) is harmless.
+                AgentCommand::Cancel => self.rt.cancel_pending(),
                 AgentCommand::Respond { id, value } => self.rt.resolve(id, value),
                 AgentCommand::Snapshot => {
                     self.rt.emit(AgentEvent::Snapshot { snapshot: self.capture_snapshot(&convo) });
