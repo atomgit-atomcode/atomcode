@@ -151,6 +151,11 @@ struct Bridge {
     /// `--dangerously-skip-permissions`: auto-approve kernel approval round-trips
     /// instead of prompting the driver (see [`bypass_auto_approval`]).
     dangerously_skip_permissions: bool,
+    /// `true` when the bridge was built with a [`noop_handle`] because the kernel
+    /// agent could not be initialised. In this state `SendMessage` is answered with
+    /// an `Error` instead of being forwarded to the (nonexistent) kernel so the user
+    /// sees feedback instead of an infinite "Pondering…" spinner.
+    degraded: bool,
     /// Active `/goal` state (loop-until-evaluator-met), or None. Reuses v1's
     /// `GoalState`; the loop is driven from the turn-end Snapshot hook.
     goal: Option<GoalState>,
@@ -221,30 +226,37 @@ impl Bridge {
                     error: format!("engine v2 prepare failed: {e}"),
                     snapshot: ConversationSnapshot::default(),
                 });
+                // prepare() failed — we can't build a Bridge at all (no parts).
+                // Enter a keep-alive loop so the TUI doesn't exit, but the user
+                // must restart atomcode to recover.
+                Self::keep_alive_loop(ev_tx, cmd_rx).await;
                 return;
             }
         };
         let bridge_session =
             parts.session.as_ref().map(|b| b.id.clone()).unwrap_or_default();
         let provider = match build_provider(&coding_cfg) {
-            Ok(p) => p,
+            Ok(p) => Some(p),
             Err(e) => {
                 let _ = ev_tx.send(CoreEv::Error {
                     error: format!("engine v2 provider init failed: {e}"),
                     snapshot: ConversationSnapshot::default(),
                 });
-                return;
+                None
             }
         };
-        let handle = match assemble(&mut parts, &coding_cfg, provider) {
-            Ok(a) => a.spawn(),
-            Err(e) => {
-                let _ = ev_tx.send(CoreEv::Error {
-                    error: format!("engine v2 assemble failed: {e}"),
-                    snapshot: ConversationSnapshot::default(),
-                });
-                return;
-            }
+        let (handle, degraded) = match provider {
+            Some(provider) => match assemble(&mut parts, &coding_cfg, provider) {
+                Ok(a) => (a.spawn(), false),
+                Err(e) => {
+                    let _ = ev_tx.send(CoreEv::Error {
+                        error: format!("engine v2 assemble failed: {e}"),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                    (Self::noop_handle(), true)
+                }
+            },
+            None => (Self::noop_handle(), true),
         };
 
         let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
@@ -269,6 +281,7 @@ impl Bridge {
             pending_local_shell: Vec::new(),
             local_shell_seq: 0,
             dangerously_skip_permissions: cfg.dangerously_skip_permissions,
+            degraded,
             goal: None,
             goal_provider: None,
             goal_cancel: CancellationToken::new(),
@@ -443,6 +456,20 @@ impl Bridge {
                 // forwarder injects so the OTHER end mirrors a message it didn't type.
                 // The bridge never drives sync sessions, so emitting it here just
                 // double-renders the user's line (the "两条 input" duplicate).
+                //
+                // Degraded mode (noop kernel handle): the message would be forwarded
+                // to a draining task and silently dropped, leaving the TUI spinning
+                // "Pondering…" forever. Answer with an Error instead so the user sees
+                // feedback immediately.
+                if self.degraded {
+                    self.emit(CoreEv::Error {
+                        error: "engine v2 failed to initialise — the kernel agent is not \
+                                running. Use /model to switch to a working provider, or \
+                                restart atomcode.".into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                    return false;
+                }
                 self.start_turn_stats();
                 // Prepend any pending context that must ride in on this turn but does
                 // NOT itself start one: a just-toggled plan-mode note, then accumulated
@@ -703,25 +730,44 @@ impl Bridge {
                     self.coding_cfg.thinking_keep = p.thinking_keep.clone();
                     match build_provider(&self.coding_cfg) {
                         Ok(provider) => {
-                            let _ = self.handle.commands.send(KCmd::Shutdown);
-                            let task = std::mem::replace(
-                                &mut self.handle.task,
-                                tokio::spawn(async {}),
-                            );
-                            let _ = task.await;
+                            // Assemble BEFORE tearing down the old handle — if
+                            // assemble fails, the old (possibly noop) handle
+                            // stays intact and the bridge keeps running.
                             match assemble(&mut self.parts, &self.coding_cfg, provider) {
                                 Ok(a) => {
-                                    self.handle = a.spawn();
+                                    let new_handle = a.spawn();
+                                    // Shut down old handle and swap.
+                                    let _ = self.handle.commands.send(KCmd::Shutdown);
+                                    let old_task = std::mem::replace(
+                                        &mut self.handle.task,
+                                        tokio::spawn(async {}),
+                                    );
+                                    let _ = old_task.await;
+                                    self.handle = new_handle;
+                                    self.degraded = false;
+                                    // Clear any stale state that may have accumulated
+                                    // while the (possibly noop) old handle was active.
+                                    self.turn_running = false;
+                                    self.pending_approval = None;
+                                    self.pending_finish = None;
+                                    self.pending_sync = false;
+                                    self.pending_undo = None;
+                                    self.pending_goal = None;
                                 }
-                                Err(e) => self.emit(CoreEv::Error {
-                                    error: format!("provider switch failed: {e}"),
-                                    snapshot: ConversationSnapshot::default(),
-                                }),
+                                Err(e) => {
+                                    self.emit(CoreEv::Error {
+                                        error: format!("provider switch failed: {e}"),
+                                        snapshot: ConversationSnapshot::default(),
+                                    });
+                                    // Keep the existing handle (may be noop_handle) so
+                                    // the bridge stays alive for another retry.
+                                }
                             }
                         }
-                        Err(e) => self.emit(CoreEv::Warning(format!(
-                            "provider init failed: {e}"
-                        ))),
+                        Err(e) => self.emit(CoreEv::Error {
+                            error: format!("provider init failed: {e}"),
+                            snapshot: ConversationSnapshot::default(),
+                        }),
                     }
                 }
             }
@@ -914,6 +960,7 @@ impl Bridge {
                         snapshot: ConversationSnapshot::default(),
                     });
                     self.handle = Self::noop_handle();
+                    self.degraded = true;
                     return;
                 }
                 opts.session = SessionMode::Fresh;
@@ -927,6 +974,7 @@ impl Bridge {
                             snapshot: ConversationSnapshot::default(),
                         });
                         self.handle = Self::noop_handle();
+                        self.degraded = true;
                         return;
                     }
                 }
@@ -951,6 +999,7 @@ impl Bridge {
                 self.parts = parts;
                 self.turn_running = false;
                 self.pending_approval = None;
+                self.degraded = false;
             }
             Err(e) => {
                 self.emit(CoreEv::Error {
@@ -960,6 +1009,7 @@ impl Bridge {
                 // Must install a live handle so the bridge event loop's
                 // recv() never returns None and kills the process.
                 self.handle = Self::noop_handle();
+                self.degraded = true;
             }
         }
     }
@@ -968,18 +1018,74 @@ impl Bridge {
     /// alive (its events channel never closes). Used as a safety net when respawn
     /// fails — the bridge stays running and can still process driver commands even
     /// though the agent kernel is gone.
+    ///
+    /// The task listens for `Shutdown` on the kernel command channel (sent by
+    /// `respawn()` and the `run()` shutdown path) instead of blocking forever on
+    /// `std::future::pending()` — otherwise `task.await` hangs permanently and the
+    /// bridge can never exit cleanly.
     fn noop_handle() -> atomcode_kernel::agent::AgentHandle {
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<KCmd>();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<KEv>();
         atomcode_kernel::agent::AgentHandle {
             commands: cmd_tx,
             events: ev_rx,
             // Hold ev_tx in the task so the receiver side stays open forever.
+            // Listen for Shutdown on cmd_rx so the task can be cleanly awaited.
             task: tokio::spawn(async move {
                 let _keep_alive = ev_tx;
-                std::future::pending::<()>().await;
+                loop {
+                    match cmd_rx.recv().await {
+                        Some(KCmd::Shutdown) | None => break,
+                        _ => {} // drain: ignore all other kernel commands
+                    }
+                }
             }),
         }
+    }
+
+    /// Keep-alive loop for when the initial bridge startup fails. Holds `ev_tx` open
+    /// (via a spawned task that never exits, mirroring [`noop_handle`]) so the TUI
+    /// event forwarder doesn't see the channel close and exit. Listens for driver
+    /// commands — `Shutdown` exits; `ReloadConfig` warns that a restart is needed;
+    /// `SendMessage` is answered with an error; everything else is drained.
+    /// The initial Error event was already sent to the driver before entering.
+    async fn keep_alive_loop(
+        ev_tx: mpsc::UnboundedSender<CoreEv>,
+        mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
+    ) {
+        // Clone ev_tx so we can still send error feedback from this loop while
+        // holding the original open in the spawned task (keeps forwarder alive).
+        let feedback_tx = ev_tx.clone();
+        let _keep = tokio::spawn(async move {
+            let _hold = ev_tx;
+            std::future::pending::<()>().await;
+        });
+        loop {
+            match cmd_rx.recv().await {
+                Some(CoreCmd::Shutdown) | None => break,
+                Some(CoreCmd::ReloadConfig(_)) => {
+                    // The TUI already rendered the switch confirmation
+                    // optimistically; this error makes it clear a restart
+                    // is needed.
+                    let _ = feedback_tx.send(CoreEv::Error {
+                        error: "engine v2 is in degraded mode — /model and /provider \
+                                require a restart. Please quit and re-launch atomcode."
+                            .into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                }
+                Some(CoreCmd::SendMessage { .. }) => {
+                    let _ = feedback_tx.send(CoreEv::Error {
+                        error: "engine v2 failed to initialise — messages cannot be \
+                                processed. Please quit and re-launch atomcode."
+                            .into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                }
+                _ => {} // drain: ignore all other commands
+            }
+        }
+        _keep.abort();
     }
 
     fn finish_turn(&mut self, reason: StopReason, messages: Vec<atomcode_core::conversation::message::Message>) {
