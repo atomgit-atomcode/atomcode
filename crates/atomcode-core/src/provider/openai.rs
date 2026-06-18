@@ -293,21 +293,6 @@ impl OpenAiProvider {
     ) -> Vec<serde_json::Value> {
         messages
             .iter()
-            .map(|m| {
-                // Pre-degrade MultiPart → Text before any serialisation when
-                // the model doesn't support vision. Runs at the Message level
-                // so image_url blocks can't leak into the JSON payload.
-                if !supports_vision {
-                    if let MessageContent::MultiPart { text, .. } = &m.content {
-                        let t = text.clone().unwrap_or_else(|| "[image]".into());
-                        return Message {
-                            content: MessageContent::Text(t),
-                            ..m.clone()
-                        };
-                    }
-                }
-                m.clone()
-            })
             .filter_map(|m| {
                 match &m.content {
                     MessageContent::Text(s) => {
@@ -476,20 +461,11 @@ impl OpenAiProvider {
                     }
                 }
             })
-            .map(|msg| {
-                if !supports_vision {
-                    let mut m = msg;
-                    Self::strip_image_url(&mut m);
-                    m
-                } else {
-                    msg
-                }
-            })
             .collect()
     }
 
     /// Strip `image_url` content blocks from a single serialised message
-    /// value in-place. Used as a safety net after `/model` switches from
+    /// value in-place. (Retained as a utility; no longer called in hot path.)
     /// a vision-capable provider — historical MultiPart messages should
     /// already be degraded by the `supports_vision` branch above, but this
     /// catches any edge case the degradation misses so a text-only provider
