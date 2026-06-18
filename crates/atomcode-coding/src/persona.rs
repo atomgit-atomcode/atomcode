@@ -17,8 +17,10 @@
 pub fn coding_persona(model: &str) -> String {
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
     let mut p = format!(
-        "You are AtomCode, a coding agent (model: {model}) that helps users with \
-software engineering tasks within the current project.\n{RULES}\n\n\
+        "You are AtomCode, an AI coding agent by AtomGit running the {model} model. \
+When asked who or what model you are, identify yourself as AtomCode running {model}. \
+Never claim to be Claude, ChatGPT, or another product, organization, or model. \
+You help users with software engineering tasks within the current project.\n{RULES}\n\n\
 ## GIT COMMITS:\n\
 When you create a git commit on the user's behalf, end the commit message with this \
 trailer (preceded by a blank line) — use a HEREDOC for `git commit -m` so the blank line \
@@ -122,8 +124,19 @@ mod tests {
     #[test]
     fn persona_carries_model_and_anchors() {
         let p = coding_persona("deepseek-chat");
-        assert!(p.contains("model: deepseek-chat"), "identity must carry the model");
+        assert!(
+            p.contains("running the deepseek-chat model"),
+            "identity must carry the model"
+        );
         assert!(p.starts_with("You are AtomCode"), "identity line first");
+        assert!(
+            p.contains("identify yourself as AtomCode running deepseek-chat"),
+            "identity questions must use the configured model"
+        );
+        assert!(
+            p.contains("Never claim to be Claude"),
+            "identity must not drift to another product"
+        );
         // Discipline anchors the verify hook + tests rely on:
         assert!(p.contains("## WORKFLOW:"));
         assert!(p.contains("VERIFY"));
@@ -132,12 +145,28 @@ mod tests {
         // model knows it exists. edit_file in particular: the verify hook keys on it and
         // the persona tells the model to "prefer editing existing files".
         for tool in [
-            "read_file", "write_file", "edit_file", "grep", "glob", "bash",
-            "list_directory", "change_dir", "open_file", "list_symbols", "read_symbol",
-            "find_references", "trace_callers", "trace_callees", "trace_chain",
-            "blast_radius", "file_dependencies",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "grep",
+            "glob",
+            "bash",
+            "list_directory",
+            "change_dir",
+            "open_file",
+            "list_symbols",
+            "read_symbol",
+            "find_references",
+            "trace_callers",
+            "trace_callees",
+            "trace_chain",
+            "blast_radius",
+            "file_dependencies",
         ] {
-            assert!(p.contains(tool), "persona must advertise the mounted tool `{tool}`");
+            assert!(
+                p.contains(tool),
+                "persona must advertise the mounted tool `{tool}`"
+            );
         }
     }
 
@@ -145,8 +174,14 @@ mod tests {
     fn persona_drops_compaction_claim() {
         // MVP has no compaction — must NOT promise unlimited context.
         let p = coding_persona("m");
-        assert!(!p.contains("not limited by the context window"), "no false compaction promise");
-        assert!(!p.contains("## CONTEXT:"), "CONTEXT section dropped for MVP honesty");
+        assert!(
+            !p.contains("not limited by the context window"),
+            "no false compaction promise"
+        );
+        assert!(
+            !p.contains("## CONTEXT:"),
+            "CONTEXT section dropped for MVP honesty"
+        );
     }
 
     #[test]
@@ -164,7 +199,10 @@ mod tests {
         // The system-reminder section must name the EXACT tag the injectors emit — guard
         // persona ↔ the single-source `SYSTEM_REMINDER_TAG` so they can't drift apart.
         let open = format!("<{}>", atomcode_capabilities::reminder::SYSTEM_REMINDER_TAG);
-        assert!(p.contains(&open), "persona must explain the `{open}` tag the injectors use");
+        assert!(
+            p.contains(&open),
+            "persona must explain the `{open}` tag the injectors use"
+        );
         // The commit trailer carries the model (v1 parity).
         assert!(
             p.contains("Co-Authored-By: AtomCode (deepseek-v4-flash)"),
@@ -174,7 +212,11 @@ mod tests {
         assert!(p.contains("rest unchanged"), "no-placeholder rule present");
         assert!(p.contains("~/.claude"), "scope names the ~/.claude guard");
         // PLATFORM section only on Windows builds.
-        assert_eq!(p.contains("## PLATFORM"), cfg!(windows), "PLATFORM section iff windows");
+        assert_eq!(
+            p.contains("## PLATFORM"),
+            cfg!(windows),
+            "PLATFORM section iff windows"
+        );
     }
 
     #[test]
@@ -191,7 +233,10 @@ mod tests {
             "not `bash start`",
             "not `bash wslview`",
         ] {
-            assert!(p.contains(phrase), "persona must preserve tool preference: {phrase}");
+            assert!(
+                p.contains(phrase),
+                "persona must preserve tool preference: {phrase}"
+            );
         }
     }
 }

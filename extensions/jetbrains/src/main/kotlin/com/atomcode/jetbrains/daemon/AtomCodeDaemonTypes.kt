@@ -4,6 +4,7 @@ data class HealthResponse(
     val status: String,
     val version: String,
     val service: String,
+    val binaryHash: String? = null,
 )
 
 data class ProjectState(

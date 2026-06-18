@@ -5,6 +5,8 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.util.HexFormat
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 
@@ -38,6 +40,24 @@ class AtomCodeDaemonProcess(
         val loader = AtomCodeDaemonProcess::class.java.classLoader
         return loader.getResourceAsStream("resources/bin/daemon-version.txt")?.use { stream ->
             stream.bufferedReader().readText().trim().takeIf { it.isNotBlank() }
+        }
+    }
+
+    fun expectedBundledHash(): String? {
+        if (settings.daemonBinaryPath.trim().isNotEmpty()) return null
+        val platformDir = platformDir() ?: return null
+        val executable = executableName("atomcode-daemon")
+        val resourcePath = "resources/bin/$platformDir/$executable"
+        val loader = AtomCodeDaemonProcess::class.java.classLoader
+        return loader.getResourceAsStream(resourcePath)?.use { stream ->
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = stream.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+            HexFormat.of().formatHex(digest.digest())
         }
     }
 

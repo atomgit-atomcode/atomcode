@@ -101,6 +101,7 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     fun addSystemMessage(text: String)          { sendJs("addSystemMessage", text) }
     fun addAssistantEvent(text: String)         { sendJs("addAssistantEvent", text) }
     fun addReasoningBlock(text: String)         { sendJs("addReasoningBlock", text) }
+    fun updateReasoningBlock(text: String)      { sendJs("updateReasoningBlock", text) }
     fun updateLastAssistantMessage(text: String) { sendJs("updateLastAssistantMessage", text) }
     fun showStreamingCursor()                   { sendJs("showStreamingCursor") }
     fun hideStreamingCursor()                   { sendJs("hideStreamingCursor") }
@@ -149,6 +150,8 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     // ── Inline HTML (避免 classpath 资源加载问题) ──
 
     private fun buildChatHtml(): String {
+        val markedScript = loadWebScript("/markdown/marked.min.js")
+        val purifyScript = loadWebScript("/markdown/purify.min.js")
         val dark = isDarkTheme()
         val bg = if (dark) "#1e1e1e" else "#fff"
         val fg = if (dark) "#d4d4d4" else "#1e1e1e"
@@ -183,8 +186,20 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 	.am{display:flex;flex-direction:column;align-items:flex-start}
 	.am .av{color:$vfg;font-size:11px;margin-bottom:2px}
 	.am .parts{display:flex;flex-direction:column;gap:8px;align-items:flex-start;width:100%}
-	.am .b{background:$abg;color:$afg;padding:8px 14px;border-radius:4px 12px 12px 12px;max-width:90%;white-space:pre-wrap;word-break:break-word}
+	.am .b{background:$abg;color:$afg;padding:8px 14px;border-radius:4px 12px 12px 12px;max-width:90%;white-space:normal;word-break:break-word}
 	.am .b:empty{display:none}
+	.am .b h1,.am .b h2,.am .b h3,.am .b h4{margin:12px 0 6px;line-height:1.3}
+	.am .b h1{font-size:1.45em}.am .b h2{font-size:1.3em}.am .b h3{font-size:1.15em}
+	.am .b p{margin:6px 0}
+	.am .b ul,.am .b ol{margin:6px 0;padding-left:24px}
+	.am .b blockquote{margin:8px 0;padding-left:10px;border-left:3px solid $cbo;color:$sfg}
+	.am .b code{font:12px 'JetBrains Mono','Consolas',monospace;background:$cbg;border-radius:3px;padding:1px 4px}
+	.am .b pre{margin:8px 0;padding:10px 12px;overflow-x:auto;white-space:pre;background:$cbg;border:1px solid $cbo;border-radius:6px}
+	.am .b pre code{padding:0;background:transparent}
+	.am .b table{border-collapse:collapse;margin:8px 0;max-width:100%;display:block;overflow-x:auto}
+	.am .b th,.am .b td{border:1px solid $cbo;padding:5px 8px;text-align:left}
+	.am .b a{color:$chf}
+	.am .b>:first-child{margin-top:0}.am .b>:last-child{margin-bottom:0}
 .cm{border:1px solid $cbo;border-radius:6px;overflow:hidden;background:$cbg}
 .cm .h{background:$chb;color:$chf;padding:4px 10px;font-size:11px}
 .cm pre{margin:0;padding:8px 12px;font:12px 'JetBrains Mono','Consolas',monospace;line-height:1.5;overflow-x:auto;white-space:pre;color:$fg}
@@ -205,24 +220,33 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 	@keyframes blink{0%,45%{opacity:1}46%,100%{opacity:0}}
 </style></head><body>
 <div id="m"></div>
+<script>$markedScript</script>
+<script>$purifyScript</script>
 <script>
 		var m=document.getElementById('m'),last=null,active=null,ti=-1,nb=true,cv=false;
 document.body.addEventListener('scroll',function(){nb=document.body.scrollHeight-document.body.scrollTop-document.body.clientHeight<120});
 function sd(){if(nb)requestAnimationFrame(function(){document.body.scrollTop=document.body.scrollHeight})}
 function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+	function md(s){
+		var source=String(s||'');
+		if(typeof marked==='undefined'||typeof DOMPurify==='undefined')return h(source).replace(/\n/g,'<br>');
+		return DOMPurify.sanitize(marked.parse(source,{gfm:true,breaks:true}),{USE_PROFILES:{html:true}})
+	}
 	function setTheme(d){}
 		function addUserMessage(t){var d=document.createElement('div');d.className='um';d.innerHTML='<span class="b">'+h(t)+'</span>';m.appendChild(d);last=null;sd()}
 		function beginAssistantTurn(){active=buildAsst('');last=active;m.appendChild(active);cv=false;sd()}
 		function currentAssistant(){return active&&active.parentNode?active:null}
 		function ensureAssistant(){var a=currentAssistant();if(a){last=a;return a}beginAssistantTurn();return active}
 	function parts(){var a=ensureAssistant();return a.querySelector('.parts')}
-	function addAssistantMessage(t){var p=parts();var b=p.querySelector('.b');if(!b){b=document.createElement('div');b.className='b';p.appendChild(b)}b.textContent=t;renderCursor();sd()}
-	function buildAsst(t){var d=document.createElement('div');d.className='am';d.innerHTML='<div class="av">🤖 AtomCode</div><div class="parts"><div class="b">'+h(t)+'</div></div>';return d}
-	function renderCursor(){if(!last)return;var b=last.querySelector('.b');if(!b)return;var old=b.querySelector('.streaming-cursor');if(old)old.remove();if(cv){var c=document.createElement('span');c.className='streaming-cursor';b.appendChild(c)}}
-	function updateLastAssistantMessage(t){if(last)last.querySelector('.b').textContent=t;else addAssistantMessage(t);renderCursor();sd()}
+	function lastBody(p){var bs=(p||parts()).querySelectorAll('.b');return bs.length?bs[bs.length-1]:null}
+	function textSegment(){var p=parts(),tail=p.lastElementChild;if(tail&&tail.classList.contains('b'))return tail;var b=document.createElement('div');b.className='b';p.appendChild(b);return b}
+	function addAssistantMessage(t){var b=textSegment();b.innerHTML=md(t);renderCursor();sd()}
+	function buildAsst(t){var d=document.createElement('div');d.className='am';d.innerHTML='<div class="av">🤖 AtomCode</div><div class="parts"><div class="b">'+md(t)+'</div></div>';return d}
+	function renderCursor(){if(!last)return;var olds=last.querySelectorAll('.streaming-cursor');Array.prototype.forEach.call(olds,function(x){x.remove()});var b=lastBody(last.querySelector('.parts'));if(!b)return;if(cv){var c=document.createElement('span');c.className='streaming-cursor';b.appendChild(c)}}
+	function updateLastAssistantMessage(t){var b=textSegment();b.innerHTML=md(t);renderCursor();sd()}
 		function showStreamingCursor(){cv=true;renderCursor();sd()}
 		function hideStreamingCursor(){cv=false;renderCursor();sd()}
-		function finishAssistantTurn(){cv=false;hideStreamingCursor();removeThinkingIndicator()}
+		function finishAssistantTurn(){cv=false;hideStreamingCursor();removeThinkingIndicator();removeReasoningBlock()}
 	function addCodeBlock(l,c,f){var d=document.createElement('div');d.className='cm';d.innerHTML='<div class="h">📄 '+h(f||l||'Code')+'</div><pre>'+h(c)+'</pre>';parts().appendChild(d);sd()}
 	function toolHtml(n,s,d){var summary='🔧 '+h(n)+' — '+h(s);return d?'<details open><summary>'+summary+'</summary><pre>'+h(d)+'</pre></details>':summary}
 	function addToolCall(n,s,d){var e=document.createElement('div');e.className='tm';e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d);parts().appendChild(e);sd()}
@@ -234,10 +258,16 @@ function addQueuedMessage(t){var d=document.createElement('div');d.className='qm
 		function removeThinkingIndicator(){var a=currentAssistant();if(a){var th=a.querySelector('.thp');if(th)th.remove()}}
 	function addSystemMessage(t){var d=document.createElement('div');d.className='sm';d.textContent=t;m.appendChild(d);last=null;sd()}
 	function addAssistantEvent(t){var d=document.createElement('div');d.className='sm';d.textContent=t;parts().appendChild(d);sd()}
-	function addReasoningBlock(t){var d=document.createElement('div');d.className='rm';var fl=t.split('\n')[0].substring(0,80);if(t.length>fl.length)fl+='...';d.innerHTML='💭 思考 — '+h(fl);var p=parts();p.insertBefore(d,p.firstChild);sd()}
+	function reasoningPreview(t){var fl=String(t||'').split('\n')[0].substring(0,80);if(String(t||'').length>fl.length)fl+='...';return '💭 思考 — '+h(fl)}
+	function addReasoningBlock(t){var p=parts(),th=p.querySelector('.thp');if(th)th.remove();var d=document.createElement('div');d.className='rm reasoning-content';d.innerHTML=reasoningPreview(t);p.insertBefore(d,p.firstChild);sd()}
+	function updateReasoningBlock(t){var p=parts(),d=p.querySelector('.reasoning-content');if(!d){addReasoningBlock(t);return}d.innerHTML=reasoningPreview(t);sd()}
+	function removeReasoningBlock(){var a=currentAssistant();if(!a)return;var blocks=a.querySelectorAll('.reasoning-content');Array.prototype.forEach.call(blocks,function(x){x.remove()})}
 	function renderChatModel(model){clearMessages();(model.messages||[]).forEach(function(x){if(x.text!==undefined&&x.contextSummary!==undefined)addUserMessage(x.text);else if(x.markdown!==undefined)addAssistantMessage(x.markdown);else if(x.toolName!==undefined)addSystemMessage('[Permission] '+x.toolName+': '+(x.reason||''));else if(x.name!==undefined&&x.callId!==undefined)addToolCall(x.name,x.status||'',x.output||x.argumentsJson||'');else if(x.text!==undefined)addSystemMessage(x.text)});sd()}
 		function clearMessages(){m.innerHTML='';last=null;active=null;ti=-1;cv=false}
 (function find(){for(var k in window){if(k.indexOf('JBCefQuery_')===0&&typeof window[k]==='function'){window[k]('js:ready');return}}setTimeout(find,50)})();
 </script></body></html>""".trimIndent()
     }
+
+    private fun loadWebScript(path: String): String =
+        JBCefMessageView::class.java.getResource(path)?.readText().orEmpty()
 }

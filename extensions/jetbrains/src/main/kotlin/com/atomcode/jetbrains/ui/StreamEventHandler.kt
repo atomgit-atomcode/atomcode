@@ -20,6 +20,9 @@ class StreamEventHandler(
     var assistantText: String = ""
         private set
 
+    /** 当前工具事件之间的文本段；用于保持“文本 → 工具 → 文本”的展示顺序。 */
+    private var assistantSegmentText: String = ""
+
     /** AI 思考过程累积 */
     var reasoningText: String = ""
         private set
@@ -31,30 +34,32 @@ class StreamEventHandler(
 
     fun onText(content: String) {
         assistantText += content
+        assistantSegmentText += content
         if (!hasOutput) {
             messageView.replaceThinkingWithAssistant("")
-            if (reasoningText.isNotBlank()) {
-                messageView.addReasoningBlock(reasoningText)
-            }
-            messageView.updateLastAssistantMessage(assistantText)
+            messageView.updateLastAssistantMessage(assistantSegmentText)
             messageView.showStreamingCursor()
             hasOutput = true
         } else {
-            messageView.updateLastAssistantMessage(assistantText)
+            messageView.updateLastAssistantMessage(assistantSegmentText)
             messageView.showStreamingCursor()
         }
     }
 
     fun onReasoning(content: String) {
         reasoningText += content
-        // 思考内容仅累积，不替换思考指示器
+        messageView.updateReasoningBlock(reasoningText)
     }
 
     fun onToolBatch() {
+        assistantSegmentText = ""
+        messageView.hideStreamingCursor()
         messageView.addAssistantEvent("[Tools queued]")
     }
 
     fun onToolStart(name: String) {
+        assistantSegmentText = ""
+        messageView.hideStreamingCursor()
         activeToolName = name
         activeToolOutput = ""
         messageView.addToolCall(name, "running...")
@@ -120,6 +125,7 @@ class StreamEventHandler(
     fun reset() {
         hasOutput = false
         assistantText = ""
+        assistantSegmentText = ""
         reasoningText = ""
         activeToolName = null
         activeToolOutput = ""
