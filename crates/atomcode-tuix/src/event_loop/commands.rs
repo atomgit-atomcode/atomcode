@@ -615,23 +615,13 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "clear" => {
-            // Physical clear via the renderer (keeps cached footer state
-            // coherent with the terminal). Scrollback is preserved by
-            // most terminals — \x1b[3J would nuke it, which we don't
-            // want; `clear_screen` emits \x1b[2J\x1b[H.
-            //
-            // Wrap the wipe + welcome re-render in one DECSET 2026 envelope so
-            // capable hosts swap old content straight to the fresh welcome with
-            // no intermediate blank frame (same anti-flicker as `/resume`).
-            renderer.begin_sync();
-            renderer.clear_screen();
-            let dir_display = ctx.working_dir.to_string_lossy().to_string();
-            renderer.render(UiLine::Welcome {
-                model: ctx.model_name.clone(),
-                working_dir: dir_display,
-            });
-            renderer.flush();
-            renderer.end_sync();
+            // `/clear` starts a fresh conversation (matches Claude Code and the
+            // common expectation): it was previously a SCREEN-ONLY wipe, so the
+            // engine kept the full history and the model still "remembered"
+            // everything after a clear. Delegate to the same reset `/session`
+            // uses — it sends ClearConversation to the engine AND wipes the
+            // screen + re-renders the welcome banner.
+            reset_to_new_session(ctx, state, renderer);
         }
         "session" => {
             // Start fresh in the current directory. Ports `/session` from the

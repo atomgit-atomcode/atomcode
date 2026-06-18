@@ -91,7 +91,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "bg",      desc: "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>", needs_args: false },
     Command { name: "background", desc: "Compatibility alias: start a one-shot task in a /bg slot", needs_args: true },
     Command { name: "diff",    desc: "Show git diff", needs_args: false },
-    Command { name: "clear",   desc: "Clear screen", needs_args: false },
+    Command { name: "clear",   desc: "Start a new conversation (clears context + screen)", needs_args: false },
     Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false },
     Command { name: "cost",    desc: "Show token cost", needs_args: false },
     Command { name: "context", desc: "Show context budget breakdown", needs_args: false },
