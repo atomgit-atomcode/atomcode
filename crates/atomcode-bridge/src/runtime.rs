@@ -597,6 +597,13 @@ impl Bridge {
                     let ev = goal_update_ev(&g);
                     self.emit(ev);
                 }
+                // Release + clear any parked approval BEFORE forwarding Cancel: the
+                // kernel then backfills the cancelled tool's result, and clearing our
+                // mirror means a later /model swap (which re-reads the snapshot) can't
+                // find a lingering approval to re-trigger on the next prompt.
+                if let Some(cmd) = take_deny_cmd(&mut self.pending_approval) {
+                    let _ = self.handle.commands.send(cmd);
+                }
                 let _ = self.handle.commands.send(KCmd::Cancel);
                 // If an eval was holding a turn open, close it as cancelled.
                 if let Some((_, messages)) = self.pending_goal.take() {
@@ -710,6 +717,13 @@ impl Bridge {
             CoreCmd::ReloadConfig(config) => {
                 // Switch to the (possibly new) default provider, same parts —
                 // approval grants + conversation survive (C1 respawn semantics).
+                // FIRST settle any in-flight turn/approval so the kernel persists a
+                // clean snapshot before `assemble` below re-reads it — otherwise a
+                // turn cancelled by this swap leaves a dangling tool_use that the
+                // fresh agent re-triggers on the next prompt.
+                if self.turn_running || self.pending_approval.is_some() {
+                    self.settle_in_flight_turn().await;
+                }
                 if let Some(p) = config.providers.get(&config.default_provider) {
                     self.coding_cfg.model = p.model.clone();
                     if let Some(b) = &p.base_url {
@@ -938,6 +952,45 @@ impl Bridge {
             let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
             let _ = self.handle.commands.send(KCmd::Respond { id, value });
             self.emit(CoreEv::PhaseChange(AgentPhase::Thinking));
+        }
+    }
+
+    /// Drive the CURRENT kernel to a clean terminal and let it persist the snapshot
+    /// BEFORE a /model swap re-assembles from that snapshot. `assemble` reloads the
+    /// latest on-disk snapshot (the SnapshotHook writes one on every `turn_complete`,
+    /// cancel included) — so if a turn (or a parked approval) is still in flight when
+    /// /model fires, the swap would otherwise read a snapshot with a dangling tool_use
+    /// and the fresh agent re-triggers the just-cancelled tool on the next prompt.
+    ///
+    /// Releases any parked approval as a deny + cancels the turn, then drains the
+    /// kernel's events until the turn fully finalizes (TurnComplete → Snapshot
+    /// round-trip → driver-facing finish). Bounded by a per-event timeout so a wedged
+    /// kernel can't hang the swap.
+    async fn settle_in_flight_turn(&mut self) {
+        if let Some(cmd) = take_deny_cmd(&mut self.pending_approval) {
+            let _ = self.handle.commands.send(cmd);
+        }
+        let _ = self.handle.commands.send(KCmd::Cancel);
+        let mut saw_complete = false;
+        for _ in 0..256 {
+            // Bound each await: the cancel/deny above guarantees a TurnComplete in
+            // the normal case, but a crashed kernel must not strand the swap.
+            match tokio::time::timeout(Duration::from_secs(5), self.handle.events.recv()).await {
+                Ok(Some(ev)) => {
+                    if matches!(ev, KEv::TurnComplete { .. }) {
+                        saw_complete = true;
+                    }
+                    self.on_kernel_event(ev).await;
+                    // TurnComplete defers the driver-facing finish until its Snapshot
+                    // reply lands (clearing pending_finish). Wait for BOTH so the
+                    // snapshot is on disk before we re-assemble from it.
+                    if saw_complete && self.pending_finish.is_none() {
+                        break;
+                    }
+                }
+                Ok(None) => break, // kernel task ended
+                Err(_) => break,   // timed out — give up rather than hang the swap
+            }
         }
     }
 
@@ -1371,6 +1424,21 @@ impl Bridge {
 /// path does.
 fn bypass_auto_approval(skip_permissions: bool) -> Option<ApprovalResponse> {
     skip_permissions.then(ApprovalResponse::allow)
+}
+
+/// TAKE a parked approval out of the bridge's mirror and return the kernel command
+/// that releases its round-trip as a fail-closed DENY. `None` when nothing is parked.
+///
+/// Used on EVERY teardown of an in-flight turn (Cancel, /model swap): denying the
+/// parked request lets the kernel backfill the cancelled tool's result (so the
+/// conversation has no dangling tool_use), and `take()` clears the mirror so a stale
+/// approval can't re-fire after a model swap re-reads the snapshot.
+fn take_deny_cmd(pending: &mut Option<(RequestId, String)>) -> Option<KCmd> {
+    pending.take().map(|(id, _tool)| {
+        let value =
+            serde_json::to_value(ApprovalResponse::deny()).unwrap_or(serde_json::Value::Null);
+        KCmd::Respond { id, value }
+    })
 }
 
 /// Build the legacy `GoalUpdate` event from goal state (free fn so callers don't
@@ -1956,5 +2024,40 @@ mod undo_tests {
         // Still 2 real prompts; the synthetic note must not shift the count/target.
         assert_eq!(p.prompts_before, 2);
         assert_eq!(p.restored_prompt, "second question");
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::take_deny_cmd;
+    use atomcode_capabilities::tools::PermissionDecision;
+    use atomcode_kernel::event::AgentCommand as KCmd;
+
+    #[test]
+    fn cancel_releases_a_parked_approval_as_deny_and_clears_the_mirror() {
+        // A tool is parked awaiting approval (request id 7). Cancelling the turn must
+        // release that round-trip as a DENY *and* clear the bridge's mirror — so the
+        // kernel backfills the cancelled tool's result and a subsequent /model swap
+        // can't find a lingering approval to re-trigger on the next prompt.
+        let mut pending = Some((7u64, "geocoding".to_string()));
+        let cmd = take_deny_cmd(&mut pending).expect("a parked approval must be released on cancel");
+        assert!(pending.is_none(), "the bridge's pending-approval mirror must be cleared");
+        match cmd {
+            KCmd::Respond { id, value } => {
+                assert_eq!(id, 7);
+                assert_eq!(
+                    PermissionDecision::from_value(&value),
+                    PermissionDecision::Deny,
+                    "the released approval must read as a fail-closed DENY"
+                );
+            }
+            other => panic!("expected Respond(deny), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_to_release_when_no_approval_is_parked() {
+        let mut pending: Option<(u64, String)> = None;
+        assert!(take_deny_cmd(&mut pending).is_none());
     }
 }
