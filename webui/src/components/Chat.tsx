@@ -804,11 +804,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       //    event will arrive back via the live stream, keeping all tabs in sync).
       setBusy(true);
       await postLiveMessage(text, images.length ? images : undefined, provider ?? undefined, activeIdRef.current);
+      // 消息发出后立即刷新侧栏列表（session 可能已落盘，尽早显示新 session-item）；
+      // turn 完成后 state(running=false) 会再刷一次确保更新。
+      onLiveTurnDone?.();
       return;
     }
 
     // ── Normal path ──
     setBusy(true);
+    // 消息发出后立即刷新侧栏列表（session 可能已落盘，尽早显示新 session-item）；
+    // done 事件中 onSessionId 会再刷一次确保更新。
+    onLiveTurnDone?.();
 
     // Push user message + empty assistant placeholder
     setMessages((prev) => [
