@@ -175,9 +175,13 @@ pub(crate) fn ensure_live_session_global(
             None => true,
         };
         if dominated {
+            eprintln!("[DEBUG ensure_live_session_global] REUSE existing session, dominated=true, req_id={:?} live_id={:?}", session_id, LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
             return s.clone();
         }
         // session_id 不匹配 → 当前 LiveSession 属于旧会话，需要替换。
+        eprintln!("[DEBUG ensure_live_session_global] REPLACE old session, dominated=false, req_id={:?} live_id={:?}", session_id, LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
+    } else {
+        eprintln!("[DEBUG ensure_live_session_global] CREATE new session, no existing, req_id={:?}", session_id);
     }
     let session_id = session_id.unwrap_or_default();
     // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
@@ -1472,7 +1476,10 @@ pub(crate) async fn live_message(
     set_live_provider(req.provider);
     // #561 修复：把调用方的 session_id 传递给 LiveSession，使 sync 与常规会话统一。
     // 历史惰性加载——会话已存在且匹配时直接复用，不会为被丢弃的历史读盘。
+    let req_session_id = req.session_id.clone();
     let sid = parse_session_id(req.session_id);
+    let current_live_id = LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    eprintln!("[DEBUG live_message] req.session_id={:?} parsed_sid={:?} current_LIVE_SESSION_ID={:?}", req_session_id, sid, current_live_id);
     let load_dir = working_dir.clone();
     let load_sid = sid.clone();
     let session = ensure_live_session_global(
@@ -1485,6 +1492,8 @@ pub(crate) async fn live_message(
             None => (Vec::new(), Vec::new()),
         },
     );
+    let after_live_id = LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    eprintln!("[DEBUG live_message] after ensure: LIVE_SESSION_ID={:?} session_ptr={:p}", after_live_id, Arc::as_ptr(&session));
     // 视觉预处理在 coordinator 经 executor.preprocess_input 统一做（TUI / webui 共享），
     // 此处只负责投递原始输入。
     let ok = session.send_input(UserInput {
@@ -1498,6 +1507,7 @@ pub(crate) async fn live_message(
             })
             .collect(),
     });
+    eprintln!("[DEBUG live_message] send_input accepted={}", ok);
     Json(serde_json::json!({ "accepted": ok }))
 }
 

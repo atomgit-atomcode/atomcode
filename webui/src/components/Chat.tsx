@@ -464,13 +464,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function startLiveStream() {
     const controller = new AbortController();
     liveAbortRef.current = controller;
-    streamLive(onLiveEvent, controller.signal, activeIdRef.current).catch(() => {
-      // Stream ended or errored; turn sync back off
+    console.log('[DEBUG startLiveStream] sessionId=', activeIdRef.current, 'aborted=', controller.signal.aborted);
+    streamLive(onLiveEvent, controller.signal, activeIdRef.current).catch((e) => {
+      // Stream ended or errored; turn sync back off — but NOT when the
+      // stream was deliberately aborted (session switch / manual toggle),
+      // because a new stream is already being (re)started and setting
+      // sync=false here would cause the next user message to go through
+      // /chat instead of /live/message, breaking TUI sync output.
+      console.log('[DEBUG startLiveStream] catch: aborted=', controller.signal.aborted, 'error=', e);
+      if (controller.signal.aborted) return;
       setSync(false);
     });
   }
 
   function stopLiveStream() {
+    console.log('[DEBUG stopLiveStream] aborting=', !!liveAbortRef.current);
     liveAbortRef.current?.abort();
     liveAbortRef.current = null;
   }
@@ -578,6 +586,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 重启 SSE 连接：旧连接订阅的是旧 LiveSession，后续 turn 事件不会到达；
     // 重新连接后 /live handler 会绑定到新 LiveSession。
     if (e.type === 'session_switched') {
+      console.log('[DEBUG onLiveEvent] session_switched: session_id=', e.session_id, 'sync=', sync);
       liveSessionIdRef.current = e.session_id;
       activeIdRef.current = e.session_id;
       onSessionId(e.session_id);
@@ -805,6 +814,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // 实际投递一条消息（同步 / 常规两条路径）；busy 由各自的事件流复位。
   async function deliver(text: string, images: ImageData[]) {
+    console.log('[DEBUG deliver] sync=', sync, 'activeIdRef=', activeIdRef.current, 'liveSessionIdRef=', liveSessionIdRef.current);
     if (sync) {
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
