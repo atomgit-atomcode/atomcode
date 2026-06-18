@@ -81,12 +81,47 @@ fn goal_marker(unicode: bool) -> &'static str {
     }
 }
 
-/// Format the dedicated footer goal row, width-aware. Shape:
-/// `◎ {condition} · round {N} · {elapsed}`, where elapsed is `13s` under a
-/// minute else `2m13s`. The `· round … · …` suffix is RESERVED (always shown);
-/// the condition fills whatever columns remain and is truncated with `…`. When
-/// the row is too narrow for any condition, the condition (and its separator)
+/// The three display segments of the dedicated footer goal row, width-fitted:
+/// `(marker, condition, meta)`. The caller styles each independently — marker as
+/// an accent, condition as normal text, `meta` (` · round N · elapsed`) muted —
+/// so the row reads as a calm persistent status with hierarchy, not a loud
+/// activity line. Joining the three reproduces the full row text.
+///
+/// `round` is shown verbatim (callers pass a 1-based value). Elapsed is `13s`
+/// under a minute else `2m13s`. The meta is RESERVED (always shown); the
+/// condition fills the remaining columns and is truncated with `…`. When the row
+/// is too narrow for any condition, the condition (and the leading separator)
 /// drop entirely but round/elapsed survive. CJK/width-safe via `crate::width`.
+fn goal_row_parts(
+    condition: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+) -> (&'static str, String, String) {
+    let marker = goal_marker(unicode);
+    let m = elapsed_secs / 60;
+    let s = elapsed_secs % 60;
+    let elapsed = if m == 0 { format!("{s}s") } else { format!("{m}m{s}s") };
+    let icon_w = crate::width::display_width(marker);
+    let meta = format!(" · round {round} · {elapsed}");
+    let meta_w = crate::width::display_width(&meta);
+    let cond_budget = max_cols.saturating_sub(icon_w).saturating_sub(meta_w);
+    if cond_budget == 0 {
+        // Too narrow for any condition — drop it (and the leading separator),
+        // keep marker + round/elapsed, truncating the meta to the cols left.
+        let bare = format!("round {round} · {elapsed}");
+        let meta_only = crate::width::truncate_to_width(&bare, max_cols.saturating_sub(icon_w));
+        return (marker, String::new(), meta_only);
+    }
+    let cond = crate::width::truncate_with_ellipsis(condition, cond_budget);
+    (marker, cond, meta)
+}
+
+/// Full goal-row text (marker + condition + meta joined). Thin wrapper over
+/// [`goal_row_parts`] for width assertions / tests; the renderer styles the
+/// parts separately via `goal_row_parts` directly.
+#[cfg(test)]
 fn format_goal_row(
     condition: &str,
     round: u32,
@@ -94,22 +129,8 @@ fn format_goal_row(
     max_cols: usize,
     unicode: bool,
 ) -> String {
-    let icon = goal_marker(unicode);
-    let m = elapsed_secs / 60;
-    let s = elapsed_secs % 60;
-    let elapsed = if m == 0 { format!("{s}s") } else { format!("{m}m{s}s") };
-    let suffix = format!(" · round {round} · {elapsed}");
-    let icon_w = crate::width::display_width(icon);
-    let suffix_w = crate::width::display_width(&suffix);
-    let cond_budget = max_cols.saturating_sub(icon_w).saturating_sub(suffix_w);
-    if cond_budget == 0 {
-        // No room for the condition — keep the marker + round/elapsed, drop the
-        // condition and its leading separator. Hard-truncate as a backstop.
-        let bare = format!("{icon}round {round} · {elapsed}");
-        return crate::width::truncate_to_width(&bare, max_cols);
-    }
-    let cond = crate::width::truncate_with_ellipsis(condition, cond_budget);
-    format!("{icon}{cond}{suffix}")
+    let (marker, cond, meta) = goal_row_parts(condition, round, elapsed_secs, max_cols, unicode);
+    format!("{marker}{cond}{meta}")
 }
 
 /// Format a token count using k/m units. `round_clean=true` drops the
@@ -1414,18 +1435,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// Build the dedicated goal row (one full-width line, shown only while a
-    /// `/goal` loop is active). Sits directly above the status line; the whole
-    /// row renders in `Brand` so the active autonomous mode draws the eye.
+    /// `/goal` loop is active). Sits directly above the status line, with a calm
+    /// hierarchy so it reads as persistent status, not a loud activity line:
+    /// the `◎` marker in `Brand` (a small accent), the condition in normal text,
+    /// and the ` · round N · elapsed` meta in `Muted` gray.
     fn build_goal_row(&self, goal: &crate::render::GoalStatus, rule_width: usize) -> Vec<Cell> {
         let mut row = Vec::new();
-        let text = format_goal_row(
+        let (marker, condition, meta) = goal_row_parts(
             &scrub_controls(&goal.condition),
             goal.round,
             goal.elapsed_secs,
             rule_width.max(1),
             self.caps.unicode_symbols,
         );
-        push_str_cells(&mut row, &text, &self.style_for(Role::Brand));
+        push_str_cells(&mut row, marker, &self.style_for(Role::Brand));
+        push_str_cells(&mut row, &condition, &CellStyle::default());
+        push_str_cells(&mut row, &meta, &self.style_for(Role::Muted));
         row
     }
 
@@ -4760,6 +4785,18 @@ mod tests {
     }
 
     #[test]
+    fn goal_row_parts_split_marker_condition_meta_for_styling() {
+        // Marker / condition / meta are returned separately so the renderer can
+        // style them with hierarchy (accent / normal / muted). Round shown verbatim.
+        let (marker, cond, meta) = goal_row_parts("fix tests", 1, 8, 80, true);
+        assert_eq!(marker, "◎ ");
+        assert_eq!(cond, "fix tests");
+        assert_eq!(meta, " · round 1 · 8s");
+        // ASCII fallback marker on non-unicode terminals.
+        assert_eq!(goal_row_parts("x", 1, 8, 80, false).0, "* ");
+    }
+
+    #[test]
     fn goal_row_elapsed_under_a_minute_omits_minutes() {
         let row = format_goal_row("x", 1, 42, 80, true);
         assert!(row.contains("· 42s"), "seconds-only under a minute: {row}");
@@ -6986,17 +7023,17 @@ mod tests {
             summary_cell,
         );
 
-        // Header line: the `●` anchor must be faint (subordinate tier,
-        // in lockstep with the `└` line), while the tool name must be
-        // bold and NOT faint — the prominent tier.
+        // Header line: the `●` anchor is bold and NOT faint — it shares the tool
+        // name's prominent tier (`tool_bullet_style` = `style_bold(Role::ToolName)`),
+        // anchoring the tool-call row as a single bold glyph + name.
         let hdr_idx = (0..vterm.height() as usize)
             .find(|&i| vterm.row_text(i).contains("ListDirectory"))
             .unwrap_or_else(|| panic!("header row missing\ndump:\n{}", vterm.dump()));
         let bullet_col = vterm.row_text(hdr_idx).find('●').unwrap();
         let bullet_cell = vterm.cell_at(hdr_idx, bullet_col);
         assert!(
-            bullet_cell.faint,
-            "`●` bullet must be faint in dark theme, got {:?}",
+            bullet_cell.bold && !bullet_cell.faint,
+            "`●` bullet must be bold (prominent tier) in dark theme, got {:?}",
             bullet_cell,
         );
         let name_col = vterm.row_text(hdr_idx).find("ListDirectory").unwrap();

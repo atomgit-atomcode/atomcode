@@ -1871,7 +1871,8 @@ pub(super) fn execute_slash_command(
             match head {
                 "" | "status" => {
                     if let Some(ref cond) = state.goal_condition {
-                        let round = state.goal_round;
+                        // Display 1-based, consistent with the footer goal row.
+                        let round = state.goal_round + 1;
                         let elapsed = state
                             .goal_started_at
                             .map(|t| t.elapsed().as_secs())

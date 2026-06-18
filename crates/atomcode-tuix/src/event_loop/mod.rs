@@ -8439,7 +8439,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // is, not just that one is running.
     let goal = state.goal_condition.as_ref().map(|cond| crate::render::GoalStatus {
         condition: cond.clone(),
-        round: state.goal_round,
+        // Display 1-based: the engine's round is 0 on the first attempt.
+        round: state.goal_round + 1,
         elapsed_secs: state.goal_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
     });
     crate::render::StatusLine {

@@ -465,7 +465,8 @@ pub struct StatusLine {
 pub struct GoalStatus {
     /// The goal condition text (truncated with `…` to fit the row width).
     pub condition: String,
-    /// Current autonomous round (0-based at set, increments per continuation).
+    /// Round number AS DISPLAYED — 1-based (the first attempt reads `round 1`).
+    /// The caller adds 1 to the engine's 0-based internal round.
     pub round: u32,
     /// Wall-clock seconds since the goal was set.
     pub elapsed_secs: u64,
