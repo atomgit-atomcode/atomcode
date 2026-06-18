@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.actions
 
+import com.atomcode.jetbrains.core.AtomCodeProjectController
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
@@ -16,7 +17,10 @@ class NewConversationAction : AnAction() {
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.getData(CommonDataKeys.PROJECT) ?: return
         ToolWindowManager.getInstance(project).getToolWindow("AtomCode")?.activate {
-            findChatPanel(project)?.startNewConversation()
+            val controller = AtomCodeProjectController.getInstance(project)
+            val tabId = java.util.UUID.randomUUID().toString()
+            controller.createChatStore(tabId)
+            // 创建新 tab 通过 AtomCodeToolWindow
         }
     }
 }
