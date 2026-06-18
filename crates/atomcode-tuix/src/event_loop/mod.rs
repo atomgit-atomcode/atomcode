@@ -4218,6 +4218,9 @@ fn attach_typed_image_paths(
         app.state.session_image_count += 1;
         let n = app.state.session_image_count;
         *text = text.replacen(&tok, &format!("[Image #{}]", n), 1);
+        // No render here: the caller groups the collected `kept_markers` into a
+        // single `UiLine::UserWithAttachments` echo (the viewport-overflow fix),
+        // so this helper only collects.
         images.push(img);
         kept_markers.push(n);
     }

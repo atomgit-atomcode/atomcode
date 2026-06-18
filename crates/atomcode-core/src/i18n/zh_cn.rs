@@ -1068,7 +1068,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\
                  或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
             ).into(),
-        Msg::StreamStalled => "网络可能中断 · esc 取消".into(),
+        Msg::StreamStalled => "响应较慢 · esc 取消".into(),
     }
 }
 

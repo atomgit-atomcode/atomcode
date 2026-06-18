@@ -786,7 +786,25 @@ impl RunningAgent {
             // no empty-success illusion. The session-level `chat_options` (the
             // neutral SLOT) ride along as a sideband request param — NOT part of
             // `messages`, so they never perturb the append-only wire prefix.
-            let mut stream = match self.provider.chat_stream(&messages, &defs, &self.chat_options).await {
+            // Race the OPEN against cancel — the same checkpoint the consume loop
+            // (below) and the retry backoff (above) already use. `chat_stream`'s
+            // connect / first-byte wait can hang for a long time on a slow / stale /
+            // dead connection (notably right after a /model switch reuses a dead
+            // pooled socket), and a bare `.await` here would ignore Esc / Ctrl+C
+            // until it resolves — the reported "esc can't terminate" freeze, with the
+            // spinner (TurnStarted/Thinking fire BEFORE this) still animating. `biased`
+            // keeps cancel first; on cancel, drop the open future (which aborts the
+            // in-flight request) and finish exactly like the mid-stream cancel arm.
+            let opened = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.rt.emit(AgentEvent::Cancelled);
+                    self.finish_turn(convo, StopReason::Cancelled, &turn_ctx).await;
+                    return;
+                }
+                opened = self.provider.chat_stream(&messages, &defs, &self.chat_options) => opened,
+            };
+            let mut stream = match opened {
                 Ok(s) => {
                     overflow_attempt = 0; // a successful open resets the per-round counter
                     provider_retry = 0; // ditto for the transient-failure budget

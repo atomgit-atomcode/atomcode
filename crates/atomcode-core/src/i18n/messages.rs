@@ -947,8 +947,9 @@ pub enum Msg<'a> {
     GatewayAuthUnavailable { base_url: &'a str },
 
     // ── streaming liveness (atomcode-tuix spinner) ──
-    /// Spinner warning shown when a streaming response has gone silent past the
-    /// stall threshold (e.g. the network dropped mid-stream). Tells the user it
-    /// isn't frozen and that esc cancels immediately.
+    /// Spinner hint shown when a streaming response has gone silent past the stall
+    /// threshold. The cause is UNKNOWN (slow first byte, a slow gateway, or a
+    /// dropped connection), so the text does NOT blame the network — it just notes
+    /// the slow response and that esc cancels. Reassures the user it isn't frozen.
     StreamStalled,
 }
