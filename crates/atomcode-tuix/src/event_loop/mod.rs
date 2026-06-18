@@ -21,6 +21,7 @@ pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
 use commands::execute_slash_command;
+use commands::attach_live_session;
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
@@ -4434,7 +4435,6 @@ fn handle_input(
                 let image_paste: Option<(ImagePart, u64)> = if text.trim().is_empty() {
                     try_paste_clipboard_image()
                 } else {
-                    crate::tuix_trace!("IMG", "CmdV-paste-text len={} head={:?}", text.len(), &text[..text.len().min(120)]);
                     try_attach_image_from_path(&text)
                 };
                 if attach_image_to_input(app, ctx, renderer, image_paste)? {
@@ -7964,6 +7964,53 @@ fn handle_agent_event(
                 renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
                 renderer.flush();
             }
+        }
+        AgentEvent::SessionSwitched(session_id) => {
+            // webui 新建对话，TUI 跟随切换到新会话。与 ProjectSwitched 不同，
+            // 这里不切目录，只切换到指定 session_id 的新会话。
+            let sid = atomcode_core::session::SessionId::from_string(session_id);
+            // 清除当前对话、重置到新 session，但用 webui 指定的 session_id
+            // 以确保三端（TUI / webui / 磁盘）落到同一个文件。
+            ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+            ctx.current_session_id = None;
+            state.total_tokens = 0;
+            state.prompt_tokens = 0;
+            state.completion_tokens = 0;
+            state.cached_tokens = 0;
+            state.last_context = None;
+            state.pending_context_render = None;
+            state.thinking_idx = 0;
+            state.on_turn_complete();
+            // 使用 webui 指定的 session_id 创建新 session，保证三端一致。
+            let mut new_session =
+                atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+            new_session.id = sid;
+            ctx.current_session = new_session;
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone());
+            commands::bind_telemetry_to_session(ctx, &ctx.current_session);
+            // 如果在同步模式，重新附着 LiveSession 以绑定新 session_id。
+            if ctx.sync_session.is_some() {
+                let session = atomcode_daemon::ensure_live_session(
+                    ctx.working_dir.clone(),
+                    ctx.telemetry.clone(),
+                    Some(ctx.current_session.id.clone()),
+                    Vec::new(),
+                );
+                attach_live_session(ctx, renderer, session, false);
+            }
+            renderer.begin_sync();
+            renderer.reset();
+            let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+            renderer.render(UiLine::Welcome {
+                model: ctx.model_name.clone(),
+                working_dir: dir_display,
+            });
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
+            ));
+            renderer.flush();
+            renderer.end_sync();
         }
     }
 }

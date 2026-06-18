@@ -77,6 +77,33 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
     }
 }
 
+/// 把新会话创建事件广播给所有视图，并替换当前 LiveSession。webui 新建对话时调用，
+/// 让同进程 TUI 跟随切换到新会话。替换 LiveSession 可确保旧 turn 的输出不再
+/// 流入新的 forwarder（否则旧 LiveSession 被复用，旧 turn 的 TextDelta 等事件
+/// 仍会出现在 TUI 画面上）。无活动 LiveSession 时静默跳过。
+pub fn live_switch_session(session_id: atomcode_core::session::SessionId) {
+    let id_str = session_id.to_string();
+    // 同步更新 LIVE_SESSION_ID，使后续 /live SSE 的 snapshot 回显新 id。
+    *LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(id_str.clone());
+    // 先广播 SessionSwitched 事件，让已订阅旧 LiveSession 的 forwarder
+    // 收到通知并处理（TUI 切换会话、重置画布）。
+    if let Some(old) = current_live_session() {
+        old.notify_session_switched(id_str.clone());
+    }
+    // 替换 LIVE 中的 LiveSession 为新实例（绑定新 session_id），
+    // 使后续 ensure_live_session_global / /live SSE / /live/message
+    // 全部走新 LiveSession。旧的 LiveSession 的 Arc 计数归零后
+    // coordinator task 也会退出（input_tx 被 drop）。
+    let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_some() {
+        // 从旧 LiveSession 取 working_dir 和 telemetry 以创建新实例。
+        // 不能直接从 LIVE 嵌入 AppState，因为此函数可能在非 async 上下文中调用。
+        // 所以用懒初始化：新 LiveSession 稍后由 ensure_live_session_global
+        // 在 /live/message 调用时按需创建。此处只清空旧引用。
+        *g = None;
+    }
+}
+
 /// 当前生效的 provider 名：优先进程级选择（LIVE_PROVIDER），回退 config 默认。
 /// 供 /live 快照在新 tab 连上时回显正确的选中模型。
 fn live_current_provider() -> String {
@@ -1202,6 +1229,8 @@ pub(crate) enum LiveWireEvent {
         call_id: String,
         arguments: String,
     },
+    #[serde(rename = "session_switched")]
+    SessionSwitched { session_id: String },
 }
 
 /// Map one LiveEvent → 0/1 wire events (variants the frontend doesn't need → None).
@@ -1226,6 +1255,8 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
         // sync-mode TUI follows it directly via the in-process LiveEvent. Skip
         // the SSE wire (would need a dedicated LiveWireEvent + frontend handler).
         LiveEvent::WorkingDirChanged(_) => return None,
+        // 会话切换：通知所有 webui tab 跟随切换到新会话。
+        LiveEvent::SessionSwitched(session_id) => LiveWireEvent::SessionSwitched { session_id },
         LiveEvent::Turn(te) => match te {
             TE::TextDelta(content) => LiveWireEvent::TextDelta { content },
             TE::ReasoningDelta(content) => LiveWireEvent::ReasoningDelta { content },

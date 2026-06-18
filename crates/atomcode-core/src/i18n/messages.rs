@@ -760,6 +760,17 @@ pub enum Msg<'a> {
     CompactNothingNoSavings { before: &'a str, after: &'a str },
     CompactDropped { messages: usize, before: &'a str, after: &'a str },
 
+    // ── /goal ──
+    /// The full `/goal help` usage block (header + Usage + Notes).
+    GoalHelp,
+    /// `/goal` / `/goal status` while a goal is active. `condition` is the goal
+    /// text; `round`/`mins`/`secs` are the live progress counters.
+    GoalStatus { condition: &'a str, round: u32, mins: u64, secs: u64 },
+    /// `/goal status` (or bare `/goal`) when no goal is active.
+    GoalNoActive,
+    /// Confirmation line after `/goal clear` (and its aliases).
+    GoalCleared,
+
     /// Surfaced when the user pastes/attaches an image but the active
     /// model can't accept images AND no `vision_preprocessor_provider`
     /// is configured. `model` is the current model identifier.

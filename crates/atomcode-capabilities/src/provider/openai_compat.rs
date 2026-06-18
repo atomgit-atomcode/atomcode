@@ -1339,22 +1339,33 @@ mod tests {
     }
 
     #[test]
-    fn suggests_vision_recognises_known_multimodal_models() {
-        assert!(suggests_vision("gpt-4o"));
-        assert!(suggests_vision("claude-sonnet"));
-        assert!(suggests_vision("Gemini-2.0-Flash"));
+    /// Golden-set regression: every pattern in `suggests_vision` must have
+    /// at least one positive test case below. Copy the same assertion to
+    /// `crates/atomcode-core/src/provider/mod.rs` tests as well.
+    #[test]
+    fn suggests_vision_golden_set() {
+        // Generic patterns
+        assert!(suggests_vision("gpt-4o"));           // starts_with gpt-4o
+        assert!(suggests_vision("Qwen2-VL-7B"));      // -vl
+        assert!(suggests_vision("llava-1.6"));        // llava
+        assert!(suggests_vision("MonkeyOCR-v1"));     // ocr
+        assert!(suggests_vision("Phi-4v"));           // -4v
+        assert!(suggests_vision("gpt-4.1v"));         // -4.1v
+        assert!(suggests_vision("Gemini-2.0-Flash")); // gemini
+        assert!(suggests_vision("pixtral-12b"));      // pixtral
+        assert!(suggests_vision("qvq-72b-preview"));  // qvq
+        // Claude 3+ (not claude-2/2.1)
+        assert!(suggests_vision("claude-3-5-sonnet"));
+        assert!(suggests_vision("claude-sonnet-4-6"));
+        assert!(suggests_vision("claude-opus-3"));
+        assert!(suggests_vision("claude-haiku-3-5"));
+        // Kimi K2 vision variants
         assert!(suggests_vision("kimi-k2.5"));
         assert!(suggests_vision("kimi-k2.6"));
-        assert!(suggests_vision("Qwen2-VL-7B"));
-        assert!(suggests_vision("llava-1.6"));
-    }
-
-    #[test]
-    fn suggests_vision_rejects_text_only_models() {
-        assert!(!suggests_vision("deepseek-v4-pro"));
-        assert!(!suggests_vision("deepseek-chat"));
-        assert!(!suggests_vision("gpt-3.5-turbo"));
-        assert!(!suggests_vision("kimi-k2"));
-        assert!(!suggests_vision("kimi-k2-thinking"));
+        // Must reject
+        for m in ["deepseek-v4-pro","deepseek-chat","gpt-3.5-turbo",
+                  "kimi-k2","kimi-k2-thinking","claude-2.1","claude-2"] {
+            assert!(!suggests_vision(m), "{m} must not be vision");
+        }
     }
 }

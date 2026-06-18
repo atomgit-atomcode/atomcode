@@ -1,0 +1,32 @@
+[
+  {
+    "file": "/Users/zhzh/workspace/gitcode_project/atomcode_family/atomcode/crates/atomcode-bridge/src/runtime.rs",
+    "line": 992,
+    "summary": "respawn() failure installs noop_handle but does not set degraded = true, causing TUI to hang permanently",
+    "failure_scenario": "User has a healthy bridge. User does /clear, /cd, /undo, /resume, or /reload which calls respawn(). If respawn() fails (e.g., transient MCP/skills loading error), self.handle becomes noop_handle but self.degraded stays false. TUI sees the Error event and sets phase to Idle. When the user types a message and presses Enter, TUI sets phase to Streaming (on_submit), bridge processes SendMessage — degraded check passes (false) — message forwarded to noop_handle which silently drops it, emitting no events. TUI stays in Pondering... forever. Esc/Ctrl+C sends Cancel to noop_handle which is also silently dropped. The user is completely stuck and must kill the process."
+  },
+  {
+    "file": "/Users/zhzh/workspace/gitcode_project/atomcode_family/atomcode/crates/atomcode-bridge/src/runtime.rs",
+    "line": 731,
+    "summary": "ReloadConfig success path does not clear pending_approval, pending_finish, pending_sync, pending_undo, pending_plan_note, turn_running, or live_tools state from the old handle",
+    "failure_scenario": "ReloadConfig is processed while pending_undo or pending_sync was already set from a prior UndoToPrompt or SyncMessages command. After the handle swap, stale pending_ flags could be incorrectly consumed by a future KEv::Snapshot from the new handle, triggering an unintended undo or sync on a conversation that doesn't need it."
+  },
+  {
+    "file": "/Users/zhzh/workspace/gitcode_project/atomcode_family/atomcode/crates/atomcode-bridge/src/runtime.rs",
+    "line": 746,
+    "summary": "No event emitted to inform TUI when ReloadConfig clears degraded, leaving the user unsure if recovery succeeded",
+    "failure_scenario": "Bridge starts degraded. User sees the Error in scrollback. User types /model to switch provider. ReloadConfig succeeds, self.degraded = false, new handle installed. No event tells the TUI 'recovery succeeded.' TUI remains in Idle phase. The user cannot tell if recovery worked until trying to send a message, and may unnecessarily restart the app instead."
+  },
+  {
+    "file": "/Users/zhzh/workspace/gitcode_project/atomcode_family/atomcode/crates/atomcode-bridge/src/runtime.rs",
+    "line": 608,
+    "summary": "Compact, AppendInput, UndoToPrompt, SyncMessages, SetGoal do not check self.degraded; with noop_handle they silently drop commands and leak pending flags",
+    "failure_scenario": "Bridge is degraded (degraded=true, noop_handle installed). User tries /compact — KCmd::Compact is sent to noop_handle and silently dropped. No Warning or Error emitted. User sees no feedback. UndoToPrompt and SyncMessages also leak their respective pending_ flags which are never consumed."
+  },
+  {
+    "file": "/Users/zhzh/workspace/gitcode_project/atomcode_family/atomcode/crates/atomcode-bridge/src/runtime.rs",
+    "line": 318,
+    "summary": "KEv::Error forwarding followed by kernel termination can emit two CoreEv::Error events; harmless due to idempotent TUI handler but unnecessary",
+    "failure_scenario": "Kernel panics mid-stream. KEv::Error arrives and is forwarded as CoreEv::Error (line 1319). Kernel handle's events channel then closes (None), triggering the termination handler (line 318-321) which emits another CoreEv::Error. TUI handles both — state.on_error() called twice (idempotent, sets phase to Idle), persist_current_session is no-op for empty snapshots. No visible harm, but unnecessary double dispatch."
+  }
+]

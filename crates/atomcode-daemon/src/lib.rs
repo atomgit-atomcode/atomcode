@@ -14,6 +14,7 @@ pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
 pub use live_api::live_set_provider;
+pub use live_api::live_switch_session;
 pub mod auth_token;
 pub mod permission_bridge;
 mod telemetry_scope;
@@ -1489,6 +1490,10 @@ async fn create_session(
         project_hash,
         created_at: session.created_at,
     };
+
+    // Broadcast new session creation to other views (sync-mode TUI / other webui tabs)
+    // so they follow: create new session with the same ID.
+    crate::live_api::live_switch_session(session.id.clone());
 
     (StatusCode::CREATED, Json(response)).into_response()
 }
