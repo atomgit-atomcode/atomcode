@@ -33,6 +33,35 @@ pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 /// than spinning — a genuinely-unrecoverable history (sacred floor alone over the window).
 const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 
+/// How many times the agent loop re-opens a round after a TRANSIENT provider
+/// failure (`ProviderError::retryable`) before surfacing the error. This is the
+/// SECOND retry tier — the provider's transport layer already did its own fast
+/// backoff (~1.5s) underneath. Mirrors v1's agent-loop budget (3, with 3/6/9s
+/// waits) so the user perceives a retry is happening AND a fresh connection gets
+/// a real chance to recover (the stale keep-alive class). NON-retryable errors
+/// (auth / 400 / balance) never enter this path — they fail fast.
+const MAX_PROVIDER_RETRIES: u32 = 3;
+
+/// Short, human reason for the visible "retrying" advisory. Branches on the
+/// STRUCTURED fields (`http_status`) where possible, falling back to a coarse
+/// message sniff for transport errors that carry no status. Mirrors v1's
+/// `public_error_reason` but only for the transient (retryable) classes — the
+/// only ones that reach the retry notice.
+fn retry_reason(e: &crate::stream::ProviderError) -> &'static str {
+    match e.http_status {
+        Some(429) => "请求过于频繁或额度已用尽",
+        Some(500 | 502 | 503 | 504 | 529) => "上游服务暂时不可用",
+        _ => {
+            let m = e.message.to_ascii_lowercase();
+            if m.contains("timeout") || m.contains("timed out") {
+                "模型响应超时"
+            } else {
+                "网络连接失败"
+            }
+        }
+    }
+}
+
 /// Enforce the kernel's tool-result size cap on `result.content`, IN PLACE.
 ///
 /// Contract:
@@ -682,6 +711,10 @@ impl RunningAgent {
         // OVERFLOW recovery counter for the CURRENT round: incremented each time a hard
         // context-overflow triggers a compact-and-retry; reset to 0 on a successful open.
         let mut overflow_attempt: u8 = 0;
+        // TRANSIENT-failure retry counter for the CURRENT round: incremented on each
+        // visible re-open after a retryable provider error; reset to 0 on a successful
+        // open so every round gets its own fresh budget.
+        let mut provider_retry: u32 = 0;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -744,6 +777,7 @@ impl RunningAgent {
             let mut stream = match self.provider.chat_stream(&messages, &defs, &self.chat_options).await {
                 Ok(s) => {
                     overflow_attempt = 0; // a successful open resets the per-round counter
+                    provider_retry = 0; // ditto for the transient-failure budget
                     s
                 }
                 // HARD OVERFLOW recovery (OFF the normal path): the prompt exceeded the
@@ -759,6 +793,37 @@ impl RunningAgent {
                     )));
                     self.run_compaction(convo, CompactTrigger::Overflow { attempt: overflow_attempt }).await;
                     overflow_attempt += 1;
+                    round -= 1; // a RETRY of the same logical round, not a new one
+                    continue;
+                }
+                // TRANSIENT failure (429/5xx/transport — `retryable` is set by the
+                // provider's classifier, incl. `is_retryable_reqwest_error` covering
+                // the stale keep-alive ConnectionReset class). The transport layer
+                // already did its OWN fast retries (~1.5s); this is the SECOND,
+                // user-VISIBLE tier ported from v1's agent loop. Re-opening the SAME
+                // round gives a FRESH connection — the real recovery for a dead pooled
+                // connection — and the Warning tells the user a retry is underway
+                // (silent fast-fail read as "no retry happened at all"). NON-retryable
+                // errors (auth / 400 / balance) skip this and hard-fail below, so we
+                // never spin ~18s on an error that cannot recover.
+                Err(e) if e.retryable && provider_retry < MAX_PROVIDER_RETRIES => {
+                    provider_retry += 1;
+                    let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
+                    self.rt.emit(AgentEvent::Warning(format!(
+                        "API error {}，{wait} 秒后重试({provider_retry}/{MAX_PROVIDER_RETRIES})...",
+                        retry_reason(&e)
+                    )));
+                    // Cancellable backoff: Esc during the wait aborts the turn instead
+                    // of forcing the user to sit through the full delay.
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            self.rt.emit(AgentEvent::Cancelled);
+                            self.finish_turn(convo, StopReason::Cancelled, &turn_ctx).await;
+                            return;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                    }
                     round -= 1; // a RETRY of the same logical round, not a new one
                     continue;
                 }

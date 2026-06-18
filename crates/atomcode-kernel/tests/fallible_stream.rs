@@ -196,3 +196,152 @@ fn spawn_agent(
         .build()
         .spawn()
 }
+
+// --- agent-layer visible retry (second tier above the transport retry) ---
+
+use async_trait::async_trait;
+use atomcode_kernel::message::Message;
+use atomcode_kernel::provider::ChatOptions;
+use atomcode_kernel::tool::ToolDef;
+use futures::stream::BoxStream;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// A provider whose open FAILS the first `fail_first` times (returning a clone of
+/// `err`), then SUCCEEDS with a bare `Done`. Counts total opens so a test can
+/// assert how many re-opens the agent loop drove.
+struct FlakyProvider {
+    fail_first: u32,
+    err: ProviderError,
+    calls: AtomicU32,
+}
+
+impl FlakyProvider {
+    fn new(fail_first: u32, err: ProviderError) -> Self {
+        Self { fail_first, err, calls: AtomicU32::new(0) }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for FlakyProvider {
+    fn model_name(&self) -> &str {
+        "flaky"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n < self.fail_first {
+            return Err(self.err.clone());
+        }
+        Ok(Box::pin(futures::stream::iter(vec![StreamEvent::Done { truncated: false }])))
+    }
+}
+
+// A RETRYABLE open failure must NOT hard-fail the turn: the agent loop re-opens
+// the same round, emits a VISIBLE Warning ("…秒后重试…") per attempt, and the turn
+// SUCCEEDS once the provider recovers. `start_paused` advances the 3/6/9s backoff
+// on virtual time so the test is instant.
+#[tokio::test(start_paused = true)]
+async fn retryable_open_failure_retries_visibly_then_succeeds() {
+    let reg = ToolRegistry::new();
+    // Fail twice (→ two retries, 3s + 6s), then succeed on the third open.
+    let provider = Arc::new(FlakyProvider::new(
+        2,
+        ProviderError {
+            retryable: true,
+            message: "open failed: dns error".into(),
+            ..Default::default()
+        },
+    ));
+    let calls_seen = provider.clone();
+    let recorder = Arc::new(RecorderHook::new());
+
+    let handle = spawn_agent(provider, reg, recorder);
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut errored = false;
+    let mut stop: Option<String> = None;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            AgentEvent::Warning(w) => warnings.push(w),
+            AgentEvent::Error { .. } => errored = true,
+            AgentEvent::TurnComplete { reason } => {
+                stop = Some(format!("{reason:?}"));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let retry_notes: Vec<&String> = warnings.iter().filter(|w| w.contains("秒后重试")).collect();
+    assert_eq!(
+        retry_notes.len(),
+        2,
+        "two retryable failures must emit two visible retry notices; got {warnings:?}"
+    );
+    assert!(
+        retry_notes[0].contains("(1/3)") && retry_notes[1].contains("(2/3)"),
+        "retry notices must be numbered 1/3 then 2/3; got {retry_notes:?}"
+    );
+    assert!(!errored, "a recovered turn must NOT surface a terminal Error");
+    assert_eq!(stop.as_deref(), Some("Stopped"), "the turn must end successfully");
+    assert_eq!(
+        calls_seen.calls.load(Ordering::SeqCst),
+        3,
+        "two failed opens + one successful open = three chat_stream calls"
+    );
+}
+
+// A NON-retryable open failure (auth/400) must FAIL FAST: no retry notice, exactly
+// one open, terminal Error — never spin the 18s retry budget on an error that
+// cannot recover.
+#[tokio::test(start_paused = true)]
+async fn non_retryable_open_failure_fails_fast() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(FlakyProvider::new(
+        99, // would fail forever, but classification must stop it at the first open
+        ProviderError {
+            retryable: false,
+            message: "auth failed (401)".into(),
+            http_status: Some(401),
+            ..Default::default()
+        },
+    ));
+    let calls_seen = provider.clone();
+    let recorder = Arc::new(RecorderHook::new());
+
+    let handle = spawn_agent(provider, reg, recorder);
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut error_msg: Option<String> = None;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            AgentEvent::Warning(w) => warnings.push(w),
+            AgentEvent::Error { message, .. } => error_msg = Some(message),
+            AgentEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        !warnings.iter().any(|w| w.contains("秒后重试")),
+        "a non-retryable error must emit NO retry notice; got {warnings:?}"
+    );
+    assert_eq!(
+        error_msg.as_deref(),
+        Some("auth failed (401)"),
+        "the terminal error must surface verbatim"
+    );
+    assert_eq!(
+        calls_seen.calls.load(Ordering::SeqCst),
+        1,
+        "a non-retryable error must open exactly once (fail fast)"
+    );
+}
