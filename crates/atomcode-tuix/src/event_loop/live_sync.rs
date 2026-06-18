@@ -96,6 +96,15 @@ pub(crate) fn spawn_live_forwarder(
                         break;
                     }
                 }
+                // webui 新建对话 → follow it: TUI 切换到新会话。
+                Ok(LiveEvent::SessionSwitched(session_id)) => {
+                    if fan_tx
+                        .send(RuntimeEvent { runtime_id, event: AgentEvent::SessionSwitched(session_id) })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }
