@@ -664,6 +664,9 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
 /// ships rather than threading a per-provider config knob (no
 /// user-discoverable opt-in exists). False-positives waste a turn on
 /// a 400, so when in doubt this returns false.
+///
+/// Byte-for-byte duplicate in `crates/atomcode-capabilities/src/provider/
+/// openai_compat.rs:suggests_vision`. Update BOTH when adding a new model.
 pub fn model_name_suggests_vision(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("vision")
