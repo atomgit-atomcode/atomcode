@@ -40,6 +40,24 @@ pub fn set_locale(locale: Locale) {
     }
 }
 
+/// Format a raw token count into a compact, scannable string for the
+/// inter-turn divider. Large totals (e.g. `3672812`) are hard to read at a
+/// glance, so we collapse them with `K` / `M` suffixes:
+///   `< 1_000`        → `942`        (verbatim)
+///   `>= 1_000`       → `3.67K`      (two decimals)
+///   `>= 1_000_000`   → `3.67M`      (two decimals)
+/// The caller appends the localised `tokens` word, so this returns only the
+/// numeric part. Unit-agnostic across locales — the digits read the same.
+pub fn fmt_tokens(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.2}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Determine the initial locale from (in priority order):
 /// CLI `--lang` flag, config file `language` field, environment
 /// variables `LC_ALL` / `LC_MESSAGES` / `LANG`.
@@ -149,6 +167,21 @@ impl Drop for LocaleTestGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_tokens_scales_with_magnitude() {
+        // < 1_000 → verbatim, no suffix.
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(942), "942");
+        assert_eq!(fmt_tokens(999), "999");
+        // >= 1_000 → K with two decimals.
+        assert_eq!(fmt_tokens(1_000), "1.00K");
+        assert_eq!(fmt_tokens(1_696), "1.70K");
+        assert_eq!(fmt_tokens(999_999), "1000.00K");
+        // >= 1_000_000 → M with two decimals.
+        assert_eq!(fmt_tokens(1_000_000), "1.00M");
+        assert_eq!(fmt_tokens(3_672_812), "3.67M");
+    }
 
     #[test]
     fn t_with_returns_english_for_en() {
