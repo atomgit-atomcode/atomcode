@@ -619,6 +619,11 @@ pub(super) fn execute_slash_command(
             // coherent with the terminal). Scrollback is preserved by
             // most terminals — \x1b[3J would nuke it, which we don't
             // want; `clear_screen` emits \x1b[2J\x1b[H.
+            //
+            // Wrap the wipe + welcome re-render in one DECSET 2026 envelope so
+            // capable hosts swap old content straight to the fresh welcome with
+            // no intermediate blank frame (same anti-flicker as `/resume`).
+            renderer.begin_sync();
             renderer.clear_screen();
             let dir_display = ctx.working_dir.to_string_lossy().to_string();
             renderer.render(UiLine::Welcome {
@@ -626,6 +631,7 @@ pub(super) fn execute_slash_command(
                 working_dir: dir_display,
             });
             renderer.flush();
+            renderer.end_sync();
         }
         "session" => {
             // Start fresh in the current directory. Ports `/session` from the
@@ -1200,6 +1206,11 @@ pub(super) fn execute_slash_command(
                     ctx.current_session = new_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
                     state.on_turn_complete();
+                    // One DECSET 2026 envelope around the wipe + welcome
+                    // re-render so the foreground swap shows no blank frame
+                    // (same anti-flicker as `/resume`). Self-contained: the
+                    // arm has no early return between begin/end_sync.
+                    renderer.begin_sync();
                     renderer.reset();
                     render_welcome(renderer, ctx);
                     renderer.render(UiLine::CommandOutput(
@@ -1211,6 +1222,8 @@ pub(super) fn execute_slash_command(
                         })
                         .into_owned(),
                     ));
+                    renderer.flush();
+                    renderer.end_sync();
                 }
                 bg_runtime::BgCommand::Resume(slot) => {
                     sync_bg_foreground(ctx);
@@ -3201,6 +3214,9 @@ pub(crate) fn reset_to_new_session(
     bind_telemetry_to_session(ctx, &ctx.current_session);
     // `reset()` wipes the terminal AND the renderer's cached footer/stream
     // state, so the next Welcome renders against a known (row 1, col 1) anchor.
+    // Wrap the wipe + welcome re-render in one DECSET 2026 envelope so capable
+    // hosts show no intermediate blank frame (same anti-flicker as `/resume`).
+    renderer.begin_sync();
     renderer.reset();
     let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     renderer.render(UiLine::Welcome {
@@ -3209,6 +3225,7 @@ pub(crate) fn reset_to_new_session(
     });
     renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
     renderer.flush();
+    renderer.end_sync();
 }
 
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {

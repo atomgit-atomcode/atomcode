@@ -94,11 +94,24 @@ pub const MD_BOLD_CLOSE: &str = "\x1b[22m";
 pub const MD_ITALIC_OPEN: &str = "\x1b[3m";
 pub const MD_ITALIC_CLOSE: &str = "\x1b[23m";
 
-/// Muted / structural chrome (list markers, table borders): bright
-/// black / dark grey (SGR 90). The terminal's profile maps this to a
-/// shade with adequate contrast on either background — keep as constant.
+/// Muted / structural chrome (list markers): bright black / dark grey
+/// (SGR 90). Adequate as a small accent glyph next to bright text on
+/// either background. NOTE: NOT adequate for large structures like table
+/// grids on dark themes — those use the theme-aware [`md_border_open`].
 pub const MD_MUTED_OPEN: &str = "\x1b[90m";
 pub const MD_MUTED_CLOSE: &str = "\x1b[39m";
+
+/// Table-border / structural-rule colour — theme-aware, unlike the fixed
+/// [`MD_MUTED_OPEN`]. Light themes: SGR 90 (bright-black → mid-gray,
+/// ~4.5:1 on white). Dark themes: SGR 90 maps to ~`#3F3F3F` (~3:1 — the
+/// whole grid is swallowed by the background, the "table lines invisible
+/// until selected" bug), so use SGR 37 (regular white → soft light-gray),
+/// the shade `Palette::MUTED_DARK` uses for text. `parse_markdown_to_cells`
+/// maps SGR 37 → `Color::Grey`; close with [`MD_MUTED_CLOSE`] (SGR 39,
+/// reset fg) on both themes.
+pub fn md_border_open() -> &'static str {
+    if is_light() { "\x1b[90m" } else { "\x1b[37m" }
+}
 
 #[cfg(test)]
 mod tests {
@@ -147,6 +160,22 @@ mod tests {
     #[test]
     fn dark_md_inline_code_is_bold_bright_cyan() {
         with_dark(|| assert_eq!(md_inline_code_open(), "\x1b[1;96m"));
+    }
+
+    #[test]
+    fn dark_md_border_is_visible_gray_not_swallowed_darkgrey() {
+        // Regression: on dark themes a fixed SGR 90 (DarkGrey) collapsed to
+        // ~3:1 against the bg and the whole table grid went invisible until
+        // selected. Dark mode must emit SGR 37 (soft light-gray), which the
+        // cell parser maps to Color::Grey.
+        with_dark(|| assert_eq!(md_border_open(), "\x1b[37m"));
+    }
+
+    #[test]
+    fn light_md_border_is_darkgrey() {
+        // On light themes SGR 90 is a readable mid-gray (~4.5:1 on white);
+        // SGR 37 would be near-invisible there, so light keeps SGR 90.
+        with_light(|| assert_eq!(md_border_open(), "\x1b[90m"));
     }
 
     #[test]

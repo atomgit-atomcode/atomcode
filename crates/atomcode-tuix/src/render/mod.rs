@@ -239,6 +239,21 @@ pub trait Renderer: Send {
     /// command after which the footer immediately redraws).
     fn clear_screen(&mut self);
 
+    /// Open a single DECSET 2026 synchronized-output envelope spanning the
+    /// burst of operations up to the matching `end_sync()`. Used by the
+    /// `/resume` replay so the screen wipe + full-transcript re-emit paint
+    /// as ONE atomic update on capable hosts instead of visibly blanking
+    /// and re-scrolling (the flicker). Between the two calls, per-frame
+    /// envelopes are suppressed so they can't end the batch early.
+    ///
+    /// Default no-op: renderers that don't use synchronized output
+    /// (PlainRenderer, pipe mode, tests) just emit their writes as usual.
+    fn begin_sync(&mut self) {}
+
+    /// Close the envelope opened by `begin_sync()` (after landing the final
+    /// frame inside it). Default no-op. Must be paired with `begin_sync()`.
+    fn end_sync(&mut self) {}
+
     /// Hand the terminal off to a non-TUI child process (blocking OAuth
     /// flow, `/shell`, etc.): disable raw mode + bracketed paste, finish
     /// any pending writes. After this returns, the child is free to use
@@ -437,6 +452,9 @@ pub struct StatusLine {
     /// progress label like `"◎ /goal (round 3, 1m 42s)"`. Rendered in
     /// the status row between the left info and the right-aligned hint.
     pub goal_indicator: Option<String>,
+    /// Whether the active model supports vision. When true the status
+    /// bar renders a  glyph before the model name.
+    pub vision: bool,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

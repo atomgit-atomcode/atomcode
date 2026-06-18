@@ -102,6 +102,8 @@ impl AnthropicProvider {
     pub fn new(cfg: AnthropicConfig) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .connect_timeout(cfg.connect_timeout)
+            // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
+            .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
             .build()
             .map_err(|e| ProviderError {
                 retryable: false,
@@ -490,8 +492,8 @@ fn effort_str(e: ReasoningEffort) -> &'static str {
 
 fn open_error(e: reqwest::Error) -> ProviderError {
     ProviderError {
-        retryable: e.is_timeout() || e.is_connect(),
-        message: format!("open failed: {e}"),
+        retryable: retry::is_retryable_reqwest_error(&e),
+        message: format!("open failed: {}", retry::err_chain(&e)),
         ..Default::default()
     }
 }

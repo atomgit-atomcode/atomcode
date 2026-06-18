@@ -5,6 +5,7 @@ import com.intellij.ui.JBColor
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
+import javax.swing.BoxLayout
 import javax.swing.AbstractAction
 import javax.swing.BorderFactory
 import javax.swing.JButton
@@ -61,6 +62,7 @@ class InputPanel(
     }
 
     private val contextChips = ContextChipsPanel(onClear = onClearContext)
+    private val queueChips = PromptQueuePanel()
 
     private val tokenLabel = JLabel("").apply {
         font = font.deriveFont(font.size2D - 2f)
@@ -130,7 +132,14 @@ class InputPanel(
             add(right, BorderLayout.EAST)
         }
 
-        add(contextChips, BorderLayout.NORTH)
+        val chips = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            add(queueChips)
+            add(contextChips)
+        }
+
+        add(chips, BorderLayout.NORTH)
         add(inputRow, BorderLayout.CENTER)
         add(toolbar, BorderLayout.SOUTH)
     }
@@ -153,6 +162,10 @@ class InputPanel(
 
     fun setContextItems(items: List<ChatContextItem>) {
         contextChips.setItems(items) { item -> onRemoveContext(item) }
+    }
+
+    fun setQueuedPrompts(items: List<QueuedPromptView>, onRemove: (QueuedPromptView) -> Unit) {
+        queueChips.setItems(items, onRemove)
     }
 
     fun setModelName(name: String) {

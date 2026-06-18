@@ -56,7 +56,7 @@ class AtomCodeDaemonClient(
             ConfigResponse(
                 path = it.jsonString("path").orEmpty(),
                 defaultProvider = it.jsonString("default_provider"),
-                providerCount = Regex("\"name\"\\s*:").findAll(it).count(),
+                providerCount = it.jsonArrayObjects("providers").size,
             )
         }
 
@@ -207,17 +207,13 @@ class AtomCodeDaemonClient(
         }
 
     fun listSessions(): CompletableFuture<List<SessionMeta>> =
-        send("GET", "/sessions").thenApply { raw ->
-            raw.jsonObjects().map {
-                SessionMeta(
-                    id = it.jsonString("id").orEmpty(),
-                    name = it.jsonString("name").orEmpty(),
-                    projectHash = it.jsonString("project_hash").orEmpty(),
-                    updatedAt = it.jsonLong("updated_at") ?: 0L,
-                    messageCount = it.jsonInt("message_count") ?: 0,
-                )
-            }.filter { it.id.isNotBlank() }
-        }
+        send("GET", "/sessions").thenApply(::parseSessionMetaList)
+
+    fun searchSessions(query: String): CompletableFuture<List<SessionMeta>> {
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) return listSessions()
+        return send("GET", "/sessions/search?q=${trimmed.urlQueryEncoded()}").thenApply(::parseSessionMetaList)
+    }
 
     fun getSession(projectHash: String, sessionId: String): CompletableFuture<SessionDetail> =
         send("GET", "/projects/${projectHash.urlPathEncoded()}/sessions/${sessionId.urlPathEncoded()}").thenApply { raw ->
@@ -357,6 +353,21 @@ internal fun String?.jsonQuotedOrNull(): String = this?.jsonQuoted() ?: "null"
 
 internal fun String.urlPathEncoded(): String =
     java.net.URLEncoder.encode(this, Charsets.UTF_8).replace("+", "%20")
+
+internal fun String.urlQueryEncoded(): String =
+    java.net.URLEncoder.encode(this, Charsets.UTF_8)
+
+internal fun parseSessionMetaList(raw: String): List<SessionMeta> =
+    raw.jsonObjects().map {
+        val meta = it.jsonNestedObject("meta") ?: it
+        SessionMeta(
+            id = meta.jsonString("id").orEmpty(),
+            name = meta.jsonString("name").orEmpty(),
+            projectHash = it.jsonString("project_hash") ?: meta.jsonString("project_hash").orEmpty(),
+            updatedAt = meta.jsonLong("updated_at") ?: 0L,
+            messageCount = meta.jsonInt("message_count") ?: 0,
+        )
+    }.filter { it.id.isNotBlank() }
 
 private fun String.toProviderInfo(): ProviderInfo =
     ProviderInfo(

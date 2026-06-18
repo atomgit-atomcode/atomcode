@@ -242,6 +242,11 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
             Some(7) => style.reverse = true,
             Some(27) => style.reverse = false,
             Some(39) => style.fg = None,
+            // SGR 37 (regular white → soft light-gray on dark themes). Used
+            // by `theme::md_border_open()` for table borders in dark mode,
+            // where SGR 90 (DarkGrey) collapses to ~3:1 against the bg and
+            // the grid goes invisible. Maps to Color::Grey, NOT bright white.
+            Some(37) => style.fg = Some(Color::Grey),
             Some(90) => style.fg = Some(Color::DarkGrey),
             Some(91) => style.fg = Some(Color::Red),
             Some(92) => style.fg = Some(Color::Green),
@@ -396,6 +401,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// `take_pending_scroll_flush` so the render worker repaints the footer
     /// the same tick instead of waiting ~5ms for the deferred FlushDeferred.
     pending_scroll_flush: bool,
+    /// True between `begin_sync()` and `end_sync()` — a single OUTER DECSET
+    /// 2026 envelope spanning a whole multi-operation burst (the `/resume`
+    /// replay). While set, `screen.sync_suppressed` is held on so per-frame
+    /// `render_diff`s don't emit nested envelopes. Tracked at the renderer
+    /// level (not only on `screen`) because `reset()` rebuilds `screen` —
+    /// the flag is re-applied to the fresh `screen` so suppression survives.
+    in_sync_batch: bool,
     /// When `Some`, the live row at body_bottom is the animated
     /// in-flight tool-call line (`<frame> Bash(cmd)`), not the generic
     /// spinner. The Spinner / StreamingBox tick handlers consult this:
@@ -585,6 +597,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             welcome_line_count: 0,
             live_spinner_active: false,
             pending_scroll_flush: false,
+            in_sync_batch: false,
             inflight_tool: None,
             inflight_tool_rows: 0,
             live_group: None,
@@ -1250,6 +1263,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // segments with ".../" and keeps only the last segment.
         let model_str = if !status.model.is_empty() {
             let mut s = scrub_controls(&status.model);
+            if status.vision {
+                let fallback = t(Msg::StatusVisionIndicator);
+                let glyph = if self.caps.unicode_symbols {
+                    "\u{f06e}"
+                } else {
+                    fallback.as_ref()
+                };
+                s = format!("{} · {} ", s, glyph);
+            }
             if let Some(ref effort) = status.reasoning_effort {
                 use std::fmt::Write;
                 let _ = write!(s, " [{}]", effort);
@@ -4003,6 +4025,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.write_all(seq.as_bytes());
         self.screen =
             Screen::new(self.screen.width(), self.screen.height()).with_jediterm(self.caps.jediterm);
+        // Rebuilding `screen` dropped any suppression flag — re-apply it so a
+        // `reset()` issued INSIDE a `begin_sync()` batch (the `/resume` replay)
+        // keeps the next render_diff from emitting a nested DECSET 2026 envelope.
+        self.screen.set_sync_suppressed(self.in_sync_batch);
         self.body_lines.clear();
         self.scrolled_off = 0;
         self.welcome_line_count = 0;
@@ -4013,6 +4039,43 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
         // Force cold-start CUP+EL on next paint to wipe pre-reset stdout writes.
         self.screen.invalidate();
+    }
+
+    fn begin_sync(&mut self) {
+        // Open ONE outer DECSET 2026 envelope around a whole upcoming burst
+        // — specifically the `/resume` replay, which blanks the screen
+        // (`reset()`) and then re-emits the entire transcript line-by-line
+        // via direct stdout writes that LF-scroll history into native
+        // scrollback. Without this, the blank flushes unwrapped and every
+        // re-emitted row paints unsynchronized, so the user sees the screen
+        // blank and the history visibly re-scroll (the reported flicker).
+        // Inside the envelope, suppress per-frame `render_diff` envelopes
+        // (`sync_suppressed`) so a nested ESU can't end the batch early.
+        // Idempotent: a second begin keeps the single open envelope.
+        if self.in_sync_batch {
+            return;
+        }
+        self.in_sync_batch = true;
+        self.screen.set_sync_suppressed(true);
+        let _ = self.out.write_all(b"\x1b[?2026h");
+        let _ = self.out.flush();
+    }
+
+    fn end_sync(&mut self) {
+        if !self.in_sync_batch {
+            return;
+        }
+        // Land the final frame (settled footer) INSIDE the still-open
+        // envelope so nothing paints after it closes — suppression is still
+        // on here, so this render_diff emits no nested envelope of its own.
+        self.flush_deferred();
+        self.in_sync_batch = false;
+        self.screen.set_sync_suppressed(false);
+        // Close the envelope: capable hosts now paint the whole burst as one
+        // atomic update. Hosts that ignore DECSET 2026 (Terminal.app, older
+        // SSH) saw the writes immediately — no worse than before.
+        let _ = self.out.write_all(b"\x1b[?2026l");
+        let _ = self.out.flush();
     }
 
     fn clear_screen(&mut self) {
@@ -4367,6 +4430,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // repaint below stamps a second copy. EL is row-local and
         // unambiguous across terminals.
         //
+        // Open ONE outer DECSET 2026 envelope around the whole resize: the
+        // wipe below and the body tail re-emit further down are direct stdout
+        // writes that, unwrapped, made the terminal visibly blank and re-stamp
+        // the body on every resize (same flicker class as the `/resume`
+        // replay). Capable hosts now paint the resize as one atomic update;
+        // the inner `paint_frame`/`render_diff` is suppressed below so it
+        // can't nest its own envelope. `?2026l` closes it at the very end.
+        let _ = self.out.write_all(b"\x1b[?2026h");
         // Release DECSTBM first so EL isn't constrained by the
         // stale (pre-resize) scroll region.
         let _ = self.out.write_all(b"\x1b[r");
@@ -4393,6 +4464,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         crate::tuix_trace!("RSZ", "wipe written");
         self.screen.resize(cols, rows);
+        // `screen.resize` rebuilds the Screen (resetting `sync_suppressed`) —
+        // re-assert suppression so the `flush_frame` render_diff below paints
+        // inside the outer envelope without emitting a nested one.
+        self.screen.set_sync_suppressed(true);
         // Mark physical state unknown so the upcoming paint_frame's
         // render_diff cold-starts with a per-row CUP+EL preamble — exactly
         // like reset() (:~3627) and resume_from_external() (:~3732), which
@@ -4451,6 +4526,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         crate::tuix_trace!("RSZ", "body done; paint begin");
         self.paint_frame();
         self.flush_frame();
+        // Close the envelope after the final frame has landed inside it.
+        self.screen.set_sync_suppressed(false);
+        let _ = self.out.write_all(b"\x1b[?2026l");
         let _ = self.out.flush();
         crate::tuix_trace!("RSZ", "done");
         self.last_painted_footer_rows = self.current_footer_rows();
@@ -9485,6 +9563,18 @@ mod tests {
     }
 
     #[test]
+    fn apply_sgr_37_is_grey_for_dark_table_borders() {
+        // SGR 37 is emitted by `theme::md_border_open()` for table borders
+        // on dark themes (DarkGrey/SGR 90 is swallowed by the bg there).
+        // The parser must map it to Color::Grey — a visible light-gray —
+        // not drop it (which would fall back to the default fg) and not
+        // bright white (Color::White / SGR 97).
+        let mut style = CellStyle::default();
+        apply_sgr("37", &mut style);
+        assert_eq!(style.fg, Some(Color::Grey), "SGR 37 must map to Color::Grey");
+    }
+
+    #[test]
     fn apply_sgr_22_clears_both_bold_and_faint() {
         let mut style = CellStyle {
             bold: true,
@@ -11339,11 +11429,163 @@ mod tests {
         }
     }
 
+    /// REGRESSION (`/resume` flicker): replaying a session re-emits the
+    /// whole transcript through the append-only direct-stdout path —
+    /// `reset()` blanks the screen, then every historical row goes out via
+    /// `emit_body_line_inner` (CUP+EL+cells+LF), LF-scrolling rows into
+    /// native scrollback. Each overflow scroll also makes the render
+    /// worker repaint the footer (`take_pending_scroll_flush` →
+    /// `flush_deferred`). Pre-fix, the `reset()` blank flushed entirely
+    /// OUTSIDE any DECSET 2026 envelope, and every one of those footer
+    /// repaints emitted its OWN `?2026h…?2026l` — so the terminal visibly
+    /// blanked and then re-scrolled the history (the user-reported flash).
+    ///
+    /// Fix: `replay_session` brackets the whole sequence in ONE
+    /// synchronized envelope via `begin_sync()` / `end_sync()`, and while
+    /// that batch is open `render_diff` SUPPRESSES its per-frame envelope
+    /// (a nested `?2026l` would end the batch early). Contract, asserted at
+    /// the byte-stream level: across a full replay — including viewport
+    /// overflow and per-row footer repaints — the output contains EXACTLY
+    /// ONE `?2026h` (at the very start, so nothing paints before it) and
+    /// EXACTLY ONE `?2026l` (at the very end, after the final frame lands).
+    #[test]
+    fn replay_sync_batch_emits_single_2026_envelope_even_with_overflow() {
+        let w: u16 = 40;
+        let h: u16 = 8;
+        let (mut r, buf) = new_capturing(w, h);
+
+        // Warm prev_cells so reset() + the first diff have real work
+        // (mirrors a populated pre-resume session — see
+        // `retained_post_reset_replay_then_burst_does_not_duplicate_tail`).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::AssistantText("pre-resume content\n".into()));
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // Drive the same call shape `replay_session` uses: one synchronized
+        // batch around reset() + the body re-emit + the trailing prompt.
+        // 16 rows on an 8-row terminal guarantees viewport overflow, so
+        // `emit_body_line_inner` LF-scrolls and the per-row footer repaint
+        // (`flush_deferred` after each row, mimicking the worker) runs —
+        // the exact multi-envelope failure mode.
+        r.begin_sync();
+        r.reset();
+        for i in 0..16 {
+            r.render(UiLine::AssistantText(format!("replay row {i}\n")));
+            r.flush_deferred();
+        }
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        r.end_sync();
+
+        let out = {
+            let g = buf.lock().unwrap();
+            String::from_utf8_lossy(&g).into_owned()
+        };
+        let opens = out.matches("\x1b[?2026h").count();
+        let closes = out.matches("\x1b[?2026l").count();
+        assert_eq!(
+            opens, 1,
+            "replay must open exactly ONE synchronized envelope (no nested \
+             per-frame BSU), got {opens}.\nbytes: {:?}",
+            out
+        );
+        assert_eq!(
+            closes, 1,
+            "replay must close exactly ONE synchronized envelope, got {closes}.\nbytes: {:?}",
+            out
+        );
+        // The single envelope must bracket EVERYTHING: BSU is the very
+        // first byte (nothing — not even reset()'s blank — paints before
+        // it) and ESU is the very last (emitted after the final frame).
+        assert!(
+            out.starts_with("\x1b[?2026h"),
+            "stream must open with BSU so the reset() blank never shows: {:?}",
+            out
+        );
+        assert!(
+            out.ends_with("\x1b[?2026l"),
+            "stream must close with ESU after the final paint: {:?}",
+            out
+        );
+    }
+
     /// Windows resize footer-duplication regression: `on_resize` must call
     /// `screen.invalidate()` after rebuilding the Screen so the repaint
     /// cold-starts with a per-row CUP+EL preamble — like `reset()` and
     /// `resume_from_external()` already do.
     ///
+    /// REGRESSION (resize flicker — sibling of the `/resume` fix): `on_resize`
+    /// wipes the screen and re-emits the visible body tail via direct stdout
+    /// writes (`retained.rs` wipe + `emit`), all OUTSIDE the DECSET 2026
+    /// envelope, before a final synchronized `paint_frame`. Pre-fix the
+    /// terminal visibly blanked then re-stamped the body unsynchronized on
+    /// every resize. Fix: bracket the whole `on_resize` body in ONE outer 2026
+    /// envelope and suppress the inner `render_diff`'s own envelope so it can't
+    /// nest. Contract: the resize byte stream opens with EXACTLY ONE `?2026h`
+    /// (the very first byte, before the wipe) and closes with EXACTLY ONE
+    /// `?2026l` (the very last, after the final paint).
+    #[test]
+    fn on_resize_emits_single_2026_envelope() {
+        let (mut r, buf) = new_capturing(40, 10);
+        // Populate body + paint so the resize has real content to re-emit.
+        for i in 0..6 {
+            r.render(UiLine::AssistantText(format!("line {i}\n")));
+        }
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // Height change → real resize work (wipe + body re-emit + paint).
+        r.on_resize(40, 8);
+
+        let out = {
+            let g = buf.lock().unwrap();
+            String::from_utf8_lossy(&g).into_owned()
+        };
+        let opens = out.matches("\x1b[?2026h").count();
+        let closes = out.matches("\x1b[?2026l").count();
+        assert_eq!(
+            opens, 1,
+            "resize must open exactly ONE envelope (no nested per-frame BSU), \
+             got {opens}.\nbytes: {:?}",
+            out
+        );
+        assert_eq!(
+            closes, 1,
+            "resize must close exactly ONE envelope, got {closes}.\nbytes: {:?}",
+            out
+        );
+        assert!(
+            out.starts_with("\x1b[?2026h"),
+            "resize must open with BSU so the wipe never shows unsynchronized: {:?}",
+            out
+        );
+        assert!(
+            out.ends_with("\x1b[?2026l"),
+            "resize must close with ESU after the final paint: {:?}",
+            out
+        );
+    }
+
     /// On legacy conhost the resize wipe is forced down to a single ED2 (to
     /// dodge the 0xc0000409 fastfail), so it emits NO per-row CUP+EL. The
     /// body re-emit only covers body rows. That leaves the cold-start as the

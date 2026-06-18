@@ -2297,9 +2297,14 @@ async fn process_chat_request(
     let conversation = Arc::new(tokio::sync::Mutex::new(session.to_conversation()));
     // 构造用户消息：带图走 MultiPart（vision）；模型不支持视觉时经 vision_preprocessor
     // 用 VL 模型把图片转文字（与 TUI/agent 行为一致）。无图则纯文本。
+    //
+    // v2 引擎时跳过 VL 预处理——bridge 的 on_command 会在收到 SendMessage 时
+    // 调用 maybe_preprocess，此时再做一次是冗余的（VL 模型会被多调一次）。
+    // v2 路径直接把原文 + 原图写入 MultiPart，bridge 收到后负责 VL 转换并清空
+    // images 发给 kernel；conversation 中保留原图用于 webui 缩略图渲染。
+    let engine_v2 = live_api::live_engine_v2();
     {
         use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-        use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
 
         let images: Vec<ImagePart> = req
             .images
@@ -2313,10 +2318,25 @@ async fn process_chat_request(
         let mut conv = conversation.lock().await;
         if images.is_empty() {
             conv.add_user_message(&req.message);
+        } else if engine_v2 {
+            // v2 引擎：跳过 VL 预处理，直接用原文 + 原图写入 MultiPart。
+            // bridge 的 on_command 会负责 VL 预处理并清空发给 kernel 的 images。
+            let idx = conv.messages.len();
+            conv.messages.push(Message {
+                role: Role::User,
+                content: MessageContent::MultiPart {
+                    text: if req.message.is_empty() { None } else { Some(req.message.clone()) },
+                    images,
+                },
+                synthetic: false,
+            });
+            conv.turn_tracker.on_user_message(idx);
         } else {
-            // VL 文本只决定喂给模型的 `text`；原图始终保留在 MultiPart 里。
-            // 非视觉模型在 provider 层会把 MultiPart 降级为纯文本（VL 文本得以
-            // 送达），而会话/历史保留原图，用于在对话里渲染缩略图。
+            // v1 引擎：在此做 VL 预处理。VL 文本决定喂给模型的 `text`；
+            // 原图始终保留在 MultiPart 里。非视觉模型在 provider 层会把
+            // MultiPart 降级为纯文本（VL 文本得以送达），而会话/历史保留原图，
+            // 用于在对话里渲染缩略图。
+            use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
             let text = match maybe_preprocess(&config, &*provider, &req.message, &images).await {
                 PreprocessOutcome::Skipped => req.message.clone(),
                 PreprocessOutcome::Replaced { text, vl_key } => {
