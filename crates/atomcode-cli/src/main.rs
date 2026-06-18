@@ -2255,7 +2255,7 @@ async fn run_headless(
                     eprintln!(
                         "[done] {:.1}s tokens={} turns={} tool_calls={}{}",
                         duration.as_secs_f64(),
-                        total_tokens,
+                        atomcode_core::i18n::fmt_tokens(total_tokens),
                         turn_count,
                         tool_call_count,
                         suffix

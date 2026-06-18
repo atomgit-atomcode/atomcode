@@ -345,8 +345,20 @@ pub fn assemble(
     // yet → NotFound → start empty). Anything else unreadable is a real failure.
     if let Some(b) = &mut parts.session {
         match b.manager.load_snapshot(&b.id) {
-            Ok(snap) => {
+            Ok(mut snap) => {
                 check_snapshot_version(&snap)?;
+                // Model-swap respawn: the snapshot's first system message carries
+                // the OLD persona (with the old model name). Replace it with the
+                // new persona so the resumed agent self-identifies correctly.
+                // Without this, a /model switch respawns with the new provider
+                // but the conversation still says "running the <old-model>"
+                // (issue #659).
+                let new_persona = coding_persona(&cfg.model);
+                if let Some(msg) = snap.messages.first_mut() {
+                    if msg.role == atomcode_kernel::message::Role::System {
+                        msg.text = new_persona;
+                    }
+                }
                 b.resume = Some(snap);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}

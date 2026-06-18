@@ -813,7 +813,7 @@ mod tests {
             Message::assistant("ans", vec![]),
             Message::tool_result("call_1", "result text", false),
         ];
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude);
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude, "test-model");
         assert_eq!(out[0], json!({"role":"system","content":"sys"}));
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         assert_eq!(out[2]["role"], "assistant");
@@ -834,7 +834,7 @@ mod tests {
             Message::system("MEMORY\n- fact"),
             Message::user("hi"),
         ];
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude);
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude, "test-model");
         let systems = out.iter().filter(|v| v["role"] == "system").count();
         assert_eq!(systems, 1, "consecutive system messages must coalesce to one: {out:?}");
         assert_eq!(out[0], json!({"role":"system","content":"persona\n\nMEMORY\n- fact"}));
@@ -846,7 +846,7 @@ mod tests {
     fn user_without_images_stays_a_content_string() {
         // Byte-identical to the pre-multimodal path → a no-image conversation's prefix
         // cache is unperturbed.
-        let out = format_messages(&[Message::user("hi")], ReasoningPolicy::Exclude);
+        let out = format_messages(&[Message::user("hi")], ReasoningPolicy::Exclude, "test-model");
         assert_eq!(out[0], json!({"role":"user","content":"hi"}));
     }
 
@@ -857,7 +857,7 @@ mod tests {
             "look",
             vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, "test-model");
         let c = &out[0]["content"];
         assert!(c.is_array(), "multimodal content must be an array: {c}");
         assert_eq!(c[0], json!({"type":"text","text":"look"}));
@@ -872,7 +872,7 @@ mod tests {
             "",
             vec![ImageContent { media_type: "image/jpeg".into(), data: "eHl6".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, "test-model");
         let c = out[0]["content"].as_array().unwrap();
         assert_eq!(c.len(), 1, "no text part when text is empty");
         assert_eq!(c[0]["type"], "image_url");
@@ -887,7 +887,7 @@ mod tests {
             "",
             vec![ImageContent { media_type: "image/png".into(), data: "".into() }],
         );
-        assert_eq!(format_messages(&[m], ReasoningPolicy::Exclude)[0], json!({"role":"user","content":""}));
+        assert_eq!(format_messages(&[m], ReasoningPolicy::Exclude, "test-model")[0], json!({"role":"user","content":""}));
     }
 
     #[test]
@@ -897,7 +897,7 @@ mod tests {
             "x",
             vec![ImageContent { media_type: "".into(), data: "QUJD".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, "test-model");
         assert_eq!(out[0]["content"][1]["image_url"]["url"], "data:application/octet-stream;base64,QUJD");
     }
 
@@ -911,7 +911,7 @@ mod tests {
                 arguments: "{\"path\":\"a\"}".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, "test-model");
         let a = &out[0];
         assert_eq!(a["role"], "assistant");
         assert_eq!(a["content"], ""); // present even when empty
@@ -926,7 +926,7 @@ mod tests {
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning = Some("because".into());
         let no = Message::assistant("ans2", vec![]);
-        let out = format_messages(&[with, no], ReasoningPolicy::Include);
+        let out = format_messages(&[with, no], ReasoningPolicy::Include, "test-model");
         assert_eq!(out[0]["reasoning_content"], "because");
         assert_eq!(out[1]["reasoning_content"], REASONING_PLACEHOLDER);
     }
@@ -935,7 +935,7 @@ mod tests {
     fn reasoning_exclude_never_echoes() {
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning = Some("because".into());
-        let out = format_messages(&[with], ReasoningPolicy::Exclude);
+        let out = format_messages(&[with], ReasoningPolicy::Exclude, "test-model");
         assert!(out[0].get("reasoning_content").is_none());
     }
 
@@ -1030,8 +1030,8 @@ mod tests {
         let h1 = vec![Message::system("s"), Message::user("u1")];
         let mut h2 = h1.clone();
         h2.push(Message::assistant("a1", vec![]));
-        let f1 = format_messages(&h1, ReasoningPolicy::Exclude);
-        let f2 = format_messages(&h2, ReasoningPolicy::Exclude);
+        let f1 = format_messages(&h1, ReasoningPolicy::Exclude, "test-model");
+        let f2 = format_messages(&h2, ReasoningPolicy::Exclude, "test-model");
         for i in 0..f1.len() {
             assert_eq!(
                 serde_json::to_string(&f1[i]).unwrap(),
@@ -1310,5 +1310,25 @@ mod tests {
         // no [DONE]; the network loop calls finish() on EOF
         ev.extend(d.finish());
         assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+    }
+
+    #[test]
+    fn suggests_vision_recognises_known_multimodal_models() {
+        assert!(suggests_vision("gpt-4o"));
+        assert!(suggests_vision("claude-sonnet"));
+        assert!(suggests_vision("Gemini-2.0-Flash"));
+        assert!(suggests_vision("kimi-k2.5"));
+        assert!(suggests_vision("kimi-k2.6"));
+        assert!(suggests_vision("Qwen2-VL-7B"));
+        assert!(suggests_vision("llava-1.6"));
+    }
+
+    #[test]
+    fn suggests_vision_rejects_text_only_models() {
+        assert!(!suggests_vision("deepseek-v4-pro"));
+        assert!(!suggests_vision("deepseek-chat"));
+        assert!(!suggests_vision("gpt-3.5-turbo"));
+        assert!(!suggests_vision("kimi-k2"));
+        assert!(!suggests_vision("kimi-k2-thinking"));
     }
 }

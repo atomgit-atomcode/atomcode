@@ -291,7 +291,6 @@ impl OpenAiProvider {
         reasoning_policy: ReasoningPolicy,
         supports_vision: bool,
     ) -> Vec<serde_json::Value> {
-        let _ = std::fs::write("/tmp/atomcode-debug.log", format!("[IMG-DEBUG] format_messages vision={}\n", supports_vision));
         messages
             .iter()
             .map(|m| {
@@ -300,7 +299,6 @@ impl OpenAiProvider {
                 // so image_url blocks can't leak into the JSON payload.
                 if !supports_vision {
                     if let MessageContent::MultiPart { text, .. } = &m.content {
-                        let _ = std::fs::write("/tmp/atomcode-debug.log", "[IMG-DEBUG] hit MultiPart, degrading\n");
                         let t = text.clone().unwrap_or_else(|| "[image]".into());
                         return Message {
                             content: MessageContent::Text(t),
@@ -588,7 +586,6 @@ impl LlmProvider for OpenAiProvider {
         tools: Option<&[ToolDef]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let url = normalize_base_url(&self.base_url);
-        let _ = std::fs::write("/tmp/atomcode-debug.log", format!("[IMG-DEBUG] chat_stream model={} suggest_vision={}\n", self.model, super::model_name_suggests_vision(&self.model)));
         let mut body = json!({
             "model": self.model,
             "messages": Self::format_messages(messages, self.reasoning_history_policy(), super::model_name_suggests_vision(&self.model)),
