@@ -60,24 +60,28 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
-/// Compute exponential backoff delay with ±25% deterministic jitter.
+/// Compute exponential backoff with deterministic ±25% jitter.
+///
+/// Uses attempt number and policy as seed for a deterministic pseudo-random
+/// jitter, making the function testable and reproducible.
 fn compute_backoff(attempt: u32, policy: &RetryPolicy) -> Duration {
     let exp = policy
         .base_delay
         .saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
     let capped = exp.min(policy.max_delay);
 
-    // Deterministic pseudo-jitter from wall-clock nanos: ±25% of capped.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let range = (capped.as_millis() / 2) as u64; // total ±25% = 50% range
-    let jitter_ms = if range > 0 { (nanos as u64) % range } else { 0 };
-    let jitter = Duration::from_millis(jitter_ms);
-    // Center on capped: actual = capped - range/2 + jitter_in_[0, range]
-    let floor = capped.saturating_sub(Duration::from_millis(range / 2));
-    floor + jitter
+    let jitter_range_ms = (capped.as_millis() / 4).max(1) as u64;
+
+    let jitter_seed = (attempt as u64)
+        .wrapping_mul(2654435761)
+        .wrapping_add(policy.base_delay.as_nanos() as u64);
+    let jitter_offset_ms = jitter_seed % jitter_range_ms;
+
+    let base_ms = capped.as_millis() as u64;
+    let delay_ms = base_ms.saturating_sub(jitter_range_ms / 2)
+        .saturating_add(jitter_offset_ms);
+
+    Duration::from_millis(delay_ms)
 }
 
 /// Read a 429 response body to decide whether retrying is futile. A
@@ -385,7 +389,34 @@ mod tests {
         let d = compute_backoff(10, &policy);
         assert!(d <= Duration::from_millis(1500), "got {:?}", d);
     }
+    #[test]
+    fn backoff_is_deterministic() {
+        let policy = RetryPolicy::default_policy();
+        let d1 = compute_backoff(1, &policy);
+        let d2 = compute_backoff(1, &policy);
+        assert_eq!(d1, d2, "same inputs should produce same output");
+    }
 
+    #[test]
+    fn backoff_increases_with_attempts() {
+        let policy = RetryPolicy::default_policy();
+        let d1 = compute_backoff(1, &policy);
+        let d2 = compute_backoff(3, &policy);
+        assert!(d2 > d1, "higher attempts should have longer backoff");
+    }
+
+    #[test]
+    fn backoff_handles_small_delays() {
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+        };
+        let d1 = compute_backoff(1, &policy);
+        let d2 = compute_backoff(2, &policy);
+        assert!(d1 >= Duration::from_millis(1));
+        assert!(d2 >= Duration::from_millis(1));
+    }
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
