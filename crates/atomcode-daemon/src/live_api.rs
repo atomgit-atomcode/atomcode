@@ -638,6 +638,10 @@ struct BridgeState {
     events: mpsc::UnboundedReceiver<AgentEvent>,
     /// Whether the pre-existing history has been seeded into the bridge.
     seeded: bool,
+    /// The provider name used to build this bridge. Compared against
+    /// `LIVE_PROVIDER` on each `run_turn` to detect model switches
+    /// that require a `ReloadConfig` to the bridge runtime.
+    provider_name: String,
 }
 
 impl KernelTurnExecutor {
@@ -658,15 +662,24 @@ impl KernelTurnExecutor {
         }
     }
 
+    /// Resolve the currently active provider name using the same precedence as
+    /// `bridge_config`: LIVE_PROVIDER → executor default → config default.
+    fn resolve_provider_name(&self) -> String {
+        let live = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        live.or_else(|| self.provider_name.clone())
+            .unwrap_or_else(|| {
+                Config::load(&Config::default_path())
+                    .map(|c| c.default_provider)
+                    .unwrap_or_default()
+            })
+    }
+
     /// Resolve the bridge config from the live provider selection + on-disk config.
     /// Mirrors `build_turn_parts`' provider resolution (LIVE_PROVIDER → executor
     /// default → config default).
     fn bridge_config(&self) -> Option<atomcode_bridge::BridgeConfig> {
         let config = Config::load(&Config::default_path()).ok()?;
-        let live = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let name = live
-            .or_else(|| self.provider_name.clone())
-            .unwrap_or_else(|| config.default_provider.clone());
+        let name = self.resolve_provider_name();
         let p = config.providers.get(&name)?;
         Some(atomcode_bridge::BridgeConfig {
             api_key: p.api_key.clone().unwrap_or_default(),
@@ -745,10 +758,27 @@ impl TurnExecutor for KernelTurnExecutor {
                 emit(TurnEvent::Error("engine v2：provider 未配置".into()));
                 return;
             };
+            let provider_name = self.resolve_provider_name();
             let (client, rx) = atomcode_bridge::spawn_bridged_runtime(cfg);
-            *guard = Some(BridgeState { client, events: rx, seeded: false });
+            *guard = Some(BridgeState { client, events: rx, seeded: false, provider_name });
         }
+
+        // Detect model switch: if LIVE_PROVIDER changed since this bridge was built,
+        // send ReloadConfig so the bridge runtime updates its system prompt, provider,
+        // and context strategy. Without this, a webui dropdown switch updates
+        // LIVE_PROVIDER but the bridge's frozen system prompt still carries the old
+        // model name — the agent mis-identifies itself (issue #659).
+        let current_provider = self.resolve_provider_name();
         let state = guard.as_mut().unwrap();
+        if current_provider != state.provider_name {
+            if let Ok(new_config) = Config::load(&Config::default_path()) {
+                let _ = state.client.cmd_tx.send(
+                    atomcode_core::agent::AgentCommand::ReloadConfig(new_config),
+                );
+            }
+            state.provider_name = current_provider;
+        }
+
         let client = state.client.clone();
 
         // `conv` already has the just-typed user message appended (coordinator).
