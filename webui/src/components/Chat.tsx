@@ -11,23 +11,7 @@ import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
-
-interface ToolRow {
-  id: string;
-  name: string;
-  args: string;
-  status: 'pending' | 'done' | 'error' | 'waiting_approval';
-  duration_ms?: number;
-  output?: string;
-}
-
-/** One ordered conversation segment: a run of assistant text, or one tool
- *  call. Storing parts in arrival order preserves the chronological
- *  text→tool→text→tool interleaving the LLM produced (matching the TUI),
- *  instead of collapsing every tool to the head of the message. */
-type MsgPart =
-  | { kind: 'text'; text: string }
-  | { kind: 'tool'; tool: ToolRow };
+import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -462,23 +446,25 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // ── 共享的实时流启/停逻辑 ──
   function startLiveStream() {
+    // Abort any prior stream FIRST. /live is a broadcast channel, so a leaked
+    // subscription would re-deliver every turn event (duplicate tool rows, double
+    // token counts). startLiveStream is reachable from mount, toggleSync, and
+    // session_switched — without this, those overlap into N concurrent streams.
+    liveAbortRef.current?.abort();
     const controller = new AbortController();
     liveAbortRef.current = controller;
-    console.log('[DEBUG startLiveStream] sessionId=', activeIdRef.current, 'aborted=', controller.signal.aborted);
-    streamLive(onLiveEvent, controller.signal, activeIdRef.current).catch((e) => {
+    streamLive(onLiveEvent, controller.signal, activeIdRef.current).catch(() => {
       // Stream ended or errored; turn sync back off — but NOT when the
       // stream was deliberately aborted (session switch / manual toggle),
       // because a new stream is already being (re)started and setting
       // sync=false here would cause the next user message to go through
       // /chat instead of /live/message, breaking TUI sync output.
-      console.log('[DEBUG startLiveStream] catch: aborted=', controller.signal.aborted, 'error=', e);
       if (controller.signal.aborted) return;
       setSync(false);
     });
   }
 
   function stopLiveStream() {
-    console.log('[DEBUG stopLiveStream] aborting=', !!liveAbortRef.current);
     liveAbortRef.current?.abort();
     liveAbortRef.current = null;
   }
@@ -586,7 +572,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 重启 SSE 连接：旧连接订阅的是旧 LiveSession，后续 turn 事件不会到达；
     // 重新连接后 /live handler 会绑定到新 LiveSession。
     if (e.type === 'session_switched') {
-      console.log('[DEBUG onLiveEvent] session_switched: session_id=', e.session_id, 'sync=', sync);
       liveSessionIdRef.current = e.session_id;
       activeIdRef.current = e.session_id;
       onSessionId(e.session_id);
@@ -729,10 +714,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (prev.length === 0) return prev;
       const last = prev[prev.length - 1];
       if (last.role !== 'assistant') return prev;
-      return [
-        ...prev.slice(0, -1),
-        { ...last, parts: [...last.parts, { kind: 'tool', tool }] },
-      ];
+      // Dedup by call_id: a tool_start re-delivered (e.g. a leaked /live
+      // subscription replays the turn) must update the existing row, not append
+      // a duplicate. See lib/toolRows.upsertToolPart.
+      return [...prev.slice(0, -1), { ...last, parts: upsertToolPart(last.parts, tool) }];
     });
   }
 
@@ -814,7 +799,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // 实际投递一条消息（同步 / 常规两条路径）；busy 由各自的事件流复位。
   async function deliver(text: string, images: ImageData[]) {
-    console.log('[DEBUG deliver] sync=', sync, 'activeIdRef=', activeIdRef.current, 'liveSessionIdRef=', liveSessionIdRef.current);
     if (sync) {
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
