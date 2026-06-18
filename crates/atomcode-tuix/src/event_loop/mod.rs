@@ -2984,6 +2984,17 @@ pub enum ExitReason {
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
 
+    // Seed the context window from the active provider config so the
+    // status bar shows "0/128k tok" (etc.) from the very beginning
+    // instead of waiting for the first LLM turn to populate it.
+    let initial_ctx_window = ctx
+        .config
+        .providers
+        .get(&ctx.config.default_provider)
+        .map(|p| p.context_window)
+        .unwrap_or(128_000);
+    app.state.on_context_stats(0, 0, 0, 0, 0, initial_ctx_window, "", "");
+
     crate::tuix_trace!(
         "SES",
         "run_loop start model={} cwd={}",
