@@ -8433,8 +8433,19 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
         "web_search" => get_str("query")
             .map(|q| crate::width::truncate_with_ellipsis(&q, 100))
             .unwrap_or_default(),
-        "find_references" | "trace_callees" | "trace_callers" | "trace_chain" => {
+        "find_references" | "trace_callees" | "trace_callers" => {
             get_str("symbol").unwrap_or_default()
+        }
+        "trace_chain" => {
+            // trace_chain takes `from`/`to`, not `symbol` — keep this branch
+            // separate so the detail isn't blank. See trace_chain.rs Args.
+            let from = get_str("from").unwrap_or_default();
+            let to = get_str("to").unwrap_or_default();
+            if from.is_empty() || to.is_empty() {
+                String::new()
+            } else {
+                format!("{} → {}", from, to)
+            }
         }
         "blast_radius" | "file_dependencies" => {
             // Same as above: basename for single-call; batch disambiguation
