@@ -13,9 +13,13 @@ import javax.swing.BorderFactory
 import javax.swing.JButton
 import javax.swing.JLabel
 import javax.swing.JPanel
+import javax.swing.JPopupMenu
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
 import javax.swing.KeyStroke
+import javax.swing.SwingUtilities
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
 
 /**
  * 输入区域容器：ContextChips + 输入行 + 底部工具栏。Claude Code 风格。
@@ -29,6 +33,8 @@ class InputPanel(
     private val onRemoveContext: (ChatContextItem) -> Unit,
     private val onModelSelect: () -> Unit,
 ) : JPanel(BorderLayout()) {
+
+    private var slashTriggerConsumed = false
 
     private val inputArea = JTextArea().apply {
         rows = 3
@@ -101,6 +107,12 @@ class InputPanel(
         // JBColor(亮色, 暗色)
         background = JBColor(0xF5F5F5, 0x1E1E1E)
 
+        inputArea.document.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(event: DocumentEvent) = handleSlashTrigger()
+            override fun removeUpdate(event: DocumentEvent) = handleSlashTrigger()
+            override fun changedUpdate(event: DocumentEvent) = handleSlashTrigger()
+        })
+
         val inputScroll = JScrollPane(inputArea).apply {
             border = BorderFactory.createEmptyBorder()
             isOpaque = false
@@ -138,6 +150,7 @@ class InputPanel(
                 BorderFactory.createLineBorder(COMPOSER_BORDER, 1, true),
                 BorderFactory.createEmptyBorder(5, 9, 7, 7),
             )
+            add(contextChips, BorderLayout.NORTH)
             add(inputScroll, BorderLayout.CENTER)
             add(toolbar, BorderLayout.SOUTH)
         }
@@ -152,7 +165,6 @@ class InputPanel(
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
             add(queueChips)
-            add(contextChips)
         }
 
         add(chips, BorderLayout.NORTH)
@@ -167,6 +179,10 @@ class InputPanel(
 
     fun focusInput() {
         inputArea.requestFocusInWindow()
+    }
+
+    fun showCommandPopup(menu: JPopupMenu) {
+        menu.show(inputArea, 0, -menu.preferredSize.height)
     }
 
     fun setGenerating(generating: Boolean) {
@@ -231,6 +247,20 @@ class InputPanel(
         if (text.isNotEmpty()) {
             inputArea.text = ""
             onSend(text)
+        }
+    }
+
+    private fun handleSlashTrigger() {
+        val isSlashOnly = inputArea.text.trim() == "/"
+        if (!isSlashOnly) {
+            slashTriggerConsumed = false
+            return
+        }
+        if (slashTriggerConsumed) return
+
+        slashTriggerConsumed = true
+        SwingUtilities.invokeLater {
+            if (inputArea.text.trim() == "/") onSlashCommand()
         }
     }
 

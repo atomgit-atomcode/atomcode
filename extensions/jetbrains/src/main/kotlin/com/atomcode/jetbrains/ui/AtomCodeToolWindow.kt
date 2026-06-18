@@ -101,6 +101,15 @@ fun closeCurrentChatTab(project: Project) {
 fun contentTabId(content: Content): String? =
     content.getUserData(ATOMCODE_TAB_ID_KEY)
 
+fun updateAtomCodeChatTabTitle(project: Project, panel: AtomCodeChatPanel, title: String) {
+    val normalizedTitle = title.trim()
+    if (normalizedTitle.isEmpty()) return
+    val toolWindow = ToolWindowManager.getInstance(project).getToolWindow(ATOMCODE_TOOL_WINDOW_ID) ?: return
+    val content = toolWindow.contentManager.getContent(panel) ?: return
+    content.displayName = normalizedTitle
+    content.description = normalizedTitle
+}
+
 private fun nextChatTabName(toolWindow: ToolWindow): String {
     val count = toolWindow.contentManager.contentCount
     return if (count == 0) "Chat" else "Chat ${count + 1}"
@@ -171,6 +180,10 @@ private fun installContentSelectionListener(toolWindow: ToolWindow, project: Pro
     toolWindow.contentManager.addContentManagerListener(object : ContentManagerListener {
         override fun selectionChanged(event: ContentManagerEvent) {
             contentTabId(event.content)?.let { AtomCodeProjectController.getInstance(project).selectChatRuntime(it) }
+        }
+
+        override fun contentRemoved(event: ContentManagerEvent) {
+            closeRuntimeForContent(project, event.content)
         }
     })
 }

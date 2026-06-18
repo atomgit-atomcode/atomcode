@@ -3,6 +3,7 @@ package com.atomcode.jetbrains.session
 import com.atomcode.jetbrains.client.DaemonClient
 import com.atomcode.jetbrains.persistence.AtomCodeProjectWorkspaceState
 import com.atomcode.jetbrains.persistence.WorkspaceTabState
+import com.atomcode.jetbrains.services.SessionRefView
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.project.Project
@@ -55,6 +56,20 @@ class SessionWorkspace(private val project: Project) : Disposable {
                 workingDir = session.workingDir,
                 title = session.name.ifBlank { session.id.take(8) },
                 draft = runtime.state.draft,
+            ),
+        )
+    }
+
+    fun updateTabSession(tabId: String, session: SessionRefView) {
+        val existing = workspaceState.state.tabs.firstOrNull { it.tabId == tabId }
+        workspaceState.upsertTab(
+            WorkspaceTabState(
+                tabId = tabId,
+                sessionId = session.id,
+                projectHash = session.projectHash,
+                workingDir = session.workingDir,
+                title = session.name.ifBlank { existing?.title ?: session.id.take(8) },
+                draft = existing?.draft.orEmpty(),
             ),
         )
     }

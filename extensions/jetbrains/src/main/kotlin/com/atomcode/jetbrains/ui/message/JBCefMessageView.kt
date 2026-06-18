@@ -1,10 +1,17 @@
 package com.atomcode.jetbrains.ui.message
 
 import com.google.gson.Gson
+import com.intellij.diagnostic.LoadingState
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ModalityState
+import com.intellij.ui.JBColor
+import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
+import javax.swing.BorderFactory
+import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.Timer
 
@@ -41,17 +48,32 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     }
 
     private fun scheduleBrowserInit() {
-        Timer(300) {
+        if (!isDisplayable) return
+        if (!LoadingState.COMPONENTS_LOADED.isOccurred) {
+            Timer(100) { scheduleBrowserInit() }.apply {
+                isRepeats = false
+                start()
+            }
+            return
+        }
+        ApplicationManager.getApplication().invokeLater({
             if (browser == null && isDisplayable) {
                 initBrowser()
             }
-        }.apply {
-            isRepeats = false
-            start()
-        }
+        }, ModalityState.nonModal())
     }
 
     private fun initBrowser() {
+        if (!JBCefApp.isSupported()) {
+            showBrowserUnavailable()
+            return
+        }
+
+        // JBCefApp lazily reads proxy settings from inside Holder.<clinit>. On recent
+        // IDE builds that is reported as an illegal service request if the HTTP
+        // configuration has not been created yet. Resolve it on demand, outside the
+        // JCEF class initializer, before constructing the first browser.
+        prepareProxySettings()
         val b = JBCefBrowser()
         browser = b
         val q = JBCefJSQuery.create(b)
@@ -85,14 +107,43 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         }
     }
 
+    private fun showBrowserUnavailable() {
+        removeAll()
+        add(JLabel("AtomCode message rendering is unavailable in this IDE runtime.").apply {
+            foreground = JBColor.GRAY
+            border = BorderFactory.createEmptyBorder(16, 16, 16, 16)
+        }, BorderLayout.NORTH)
+        revalidate()
+        repaint()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun prepareProxySettings() {
+        com.intellij.util.net.HttpConfigurable.getInstance()
+    }
+
+    fun dispose() {
+        pendingCalls.clear()
+        jsQuery?.dispose()
+        jsQuery = null
+        browser?.dispose()
+        browser = null
+    }
+
     // ── Public API ──
 
-    fun addUserMessage(text: String)            { sendJs("addUserMessage", text) }
+    fun addUserMessage(text: String, contextSummary: List<String> = emptyList()) {
+        sendRawJs("addUserMessage(${gson.toJson(text)},${gson.toJson(contextSummary)})")
+    }
     fun beginAssistantTurn()                    { sendJs("beginAssistantTurn") }
     fun addAssistantMessage(text: String)       { sendJs("addAssistantMessage", text) }
     fun addCodeBlock(lang: String, code: String, file: String? = null) { sendJs("addCodeBlock", lang, code, file ?: "") }
-    fun addToolCall(name: String, status: String, detail: String? = null) { sendJs("addToolCall", name, status, detail ?: "") }
-    fun updateToolCall(name: String, status: String, detail: String? = null) { sendJs("updateToolCall", name, status, detail ?: "") }
+    fun addToolCall(name: String, status: String, detail: String? = null, summary: String = "") {
+        sendJs("addToolCall", name, status, detail ?: "", summary)
+    }
+    fun updateToolCall(name: String, status: String, detail: String? = null, summary: String = "") {
+        sendJs("updateToolCall", name, status, detail ?: "", summary)
+    }
     fun addError(text: String)                  { sendJs("addError", text) }
     fun addQueuedMessage(text: String)          { sendJs("addQueuedMessage", text) }
     fun addThinkingIndicator()                  { sendJs("addThinkingIndicator") }
@@ -181,7 +232,15 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 	body{background:$bg;color:$fg;font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.55;padding:18px 20px 28px;overflow-y:auto}
 	#m{display:flex;flex-direction:column;gap:18px;width:100%;max-width:920px;margin:0 auto}
 	.um{display:flex;justify-content:flex-end;padding-left:48px}
-	.um .b{background:$ubg;color:$ufg;padding:8px 13px;border-radius:14px 14px 4px 14px;max-width:76%;white-space:pre-wrap;word-break:break-word;box-shadow:0 1px 0 rgba(0,0,0,.12)}
+	.um .u-card{background:$ubg;color:$ufg;border:1px solid ${if (dark) "#245b82" else "#b8d3e7"};border-radius:14px 14px 4px 14px;max-width:82%;min-width:180px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,.12)}
+	.um .u-text{padding:9px 13px;white-space:pre-wrap;word-break:break-word}
+	.um .u-text:empty{display:none}
+	.um .u-files{display:flex;flex-direction:column;gap:1px;padding:6px;border-top:1px solid ${if (dark) "rgba(255,255,255,.12)" else "rgba(0,70,115,.14)"};background:${if (dark) "rgba(0,0,0,.10)" else "rgba(255,255,255,.28)"}}
+	.um .u-file{display:grid;grid-template-columns:28px minmax(0,1fr);gap:8px;align-items:center;padding:6px 7px;border-radius:7px;background:${if (dark) "rgba(255,255,255,.055)" else "rgba(255,255,255,.55)"}}
+	.um .u-file-icon{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:6px;background:${if (dark) "#21405a" else "#e4f1fa"};color:${if (dark) "#9bd3f5" else "#286c99"};font:700 8px 'JetBrains Mono','Consolas',monospace;text-transform:uppercase}
+	.um .u-file-copy{min-width:0;line-height:1.25}
+	.um .u-file-name{font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+	.um .u-file-path{margin-top:2px;color:${if (dark) "#a9c3d5" else "#55768c"};font-size:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 	.am{display:flex;flex-direction:column;align-items:stretch;min-width:0}
 	.am .av{display:flex;align-items:center;gap:7px;color:$vfg;font-size:11px;font-weight:600;letter-spacing:.01em;margin-bottom:6px}
 	.am .av:before{content:'A';display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:5px;background:${if (dark) "#293424" else "#edf5e9"};color:$vfg;font-size:10px;font-weight:700}
@@ -216,7 +275,8 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 	.tm.ts-running .tool-dot{background:$chf;box-shadow:0 0 0 3px ${if (dark) "rgba(156,220,254,.12)" else "rgba(0,90,158,.10)"}}
 	.tm.ts-error .tool-dot{background:$efg}
 	.tm .tool-name{color:$fg;font-family:'JetBrains Mono','Consolas',monospace;overflow:hidden;text-overflow:ellipsis}
-	.tm .tool-status{margin-left:auto;color:$sfg;font-size:11px;overflow:hidden;text-overflow:ellipsis}
+	.tm .tool-summary{min-width:0;flex:1;margin-left:5px;color:$sfg;font:11px 'JetBrains Mono','Consolas',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+	.tm .tool-status{margin-left:8px;color:$sfg;font-size:11px;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}
 	.tm pre{margin:0;border-top:1px solid $tbo;max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:$fg;background:$cbg;padding:9px 12px;font:11px/1.5 'JetBrains Mono','Consolas',monospace}
 .em{border:1px solid $ebo;border-radius:6px;background:$ebg;color:$efg;padding:6px 10px;font-size:12px}
 .qm{display:flex;justify-content:flex-end}
@@ -245,14 +305,17 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 		sr=requestAnimationFrame(function(){var e=scroller();e.scrollTop=e.scrollHeight;sr=0})
 	}
 	if(typeof ResizeObserver!=='undefined')new ResizeObserver(function(){sd()}).observe(m);
-function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 	function md(s){
 		var source=String(s||'');
 		if(typeof marked==='undefined'||typeof DOMPurify==='undefined')return h(source).replace(/\n/g,'<br>');
 		return DOMPurify.sanitize(marked.parse(source,{gfm:true,breaks:true}),{USE_PROFILES:{html:true}})
 	}
 	function setTheme(d){}
-		function addUserMessage(t){var d=document.createElement('div');d.className='um';d.innerHTML='<span class="b">'+h(t)+'</span>';m.appendChild(d);last=null;sd(true)}
+	function fileParts(p){var n=String(p||'').replace(/\\/g,'/'),i=n.lastIndexOf('/');return {name:i>=0?n.substring(i+1):n,path:i>=0?n.substring(0,i):''}}
+	function fileType(n){var i=String(n||'').lastIndexOf('.');return i>=0?String(n).substring(i+1,i+5):'file'}
+	function attachmentHtml(items){if(!items||!items.length)return '';var rows=items.map(function(x){var p=fileParts(x);return '<div class="u-file" title="'+h(x)+'"><span class="u-file-icon">'+h(fileType(p.name))+'</span><span class="u-file-copy"><div class="u-file-name">'+h(p.name||x)+'</div><div class="u-file-path">'+h(p.path||'Attached file')+'</div></span></div>'}).join('');return '<div class="u-files">'+rows+'</div>'}
+		function addUserMessage(t,a){var d=document.createElement('div');d.className='um';d.innerHTML='<div class="u-card"><div class="u-text">'+h(t)+'</div>'+attachmentHtml(a)+'</div>';m.appendChild(d);last=null;sd(true)}
 		function beginAssistantTurn(){active=buildAsst('');last=active;m.appendChild(active);cv=false;sd()}
 		function currentAssistant(){return active&&active.parentNode?active:null}
 		function ensureAssistant(){var a=currentAssistant();if(a){last=a;return a}beginAssistantTurn();return active}
@@ -261,17 +324,18 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 	function textSegment(){var p=parts(),tail=p.lastElementChild;if(tail&&tail.classList.contains('b'))return tail;var b=document.createElement('div');b.className='b';p.appendChild(b);return b}
 	function addAssistantMessage(t){var b=textSegment();b.innerHTML=md(t);renderCursor();sd()}
 	function buildAsst(t){var d=document.createElement('div');d.className='am';d.innerHTML='<div class="av">AtomCode</div><div class="parts"><div class="b">'+md(t)+'</div></div>';return d}
-	function renderCursor(){if(!last)return;var olds=last.querySelectorAll('.streaming-cursor');Array.prototype.forEach.call(olds,function(x){x.remove()});var b=lastBody(last.querySelector('.parts'));if(!b)return;if(cv){var c=document.createElement('span');c.className='streaming-cursor';b.appendChild(c)}}
+	function removeStreamingCursors(){var olds=document.querySelectorAll('.streaming-cursor');Array.prototype.forEach.call(olds,function(x){x.remove()})}
+	function renderCursor(){removeStreamingCursors();if(!last)return;var b=lastBody(last.querySelector('.parts'));if(!b)return;if(cv){var c=document.createElement('span');c.className='streaming-cursor';b.appendChild(c)}}
 	function updateLastAssistantMessage(t){var b=textSegment();b.innerHTML=md(t);renderCursor();sd()}
 		function showStreamingCursor(){cv=true;renderCursor();sd()}
-		function hideStreamingCursor(){cv=false;renderCursor();sd()}
-		function finishAssistantTurn(){cv=false;hideStreamingCursor();removeThinkingIndicator();removeReasoningBlock()}
+		function hideStreamingCursor(){cv=false;removeStreamingCursors();sd()}
+		function finishAssistantTurn(){cv=false;removeStreamingCursors();removeThinkingIndicator();removeReasoningBlock();sd()}
 	function addCodeBlock(l,c,f){var d=document.createElement('div');d.className='cm';d.innerHTML='<div class="h">📄 '+h(f||l||'Code')+'</div><pre>'+h(c)+'</pre>';parts().appendChild(d);sd()}
 	function toolTone(s){s=String(s||'').toLowerCase();return s.indexOf('error')>=0||s.indexOf('fail')>=0?'error':s.indexOf('running')>=0||s.indexOf('queued')>=0?'running':s.indexOf('done')>=0||s.indexOf('success')>=0||s.indexOf('complete')>=0?'success':'idle'}
-	function toolHtml(n,s,d){var summary='<summary><span class="chev">›</span><span class="tool-dot"></span><span class="tool-name">'+h(n)+'</span><span class="tool-status">'+h(s)+'</span></summary>';return '<details>'+summary+(d?'<pre>'+h(d)+'</pre>':'')+'</details>'}
-	function setTool(e,n,s,d){e.className='tm ts-'+toolTone(s);e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d)}
-	function addToolCall(n,s,d){var e=document.createElement('div');setTool(e,n,s,d);parts().appendChild(e);sd()}
-		function updateToolCall(n,s,d){var ps=parts();var tools=Array.prototype.slice.call(ps.querySelectorAll('.tm')).reverse();var e=tools.find(function(x){return x.getAttribute('data-name')===n})||tools[0];if(e){setTool(e,n,s,d);sd()}else addToolCall(n,s,d)}
+	function toolHtml(n,s,d,a){var row='<summary><span class="chev">›</span><span class="tool-dot"></span><span class="tool-name">'+h(n)+'</span><span class="tool-summary">'+h(a||'')+'</span><span class="tool-status">'+h(s)+'</span></summary>';return '<details>'+row+(d?'<pre>'+h(d)+'</pre>':'')+'</details>'}
+	function setTool(e,n,s,d,a){e.className='tm ts-'+toolTone(s);e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d,a)}
+	function addToolCall(n,s,d,a){var e=document.createElement('div');setTool(e,n,s,d,a);parts().appendChild(e);sd()}
+		function updateToolCall(n,s,d,a){var ps=parts();var tools=Array.prototype.slice.call(ps.querySelectorAll('.tm')).reverse();var e=tools.find(function(x){return x.getAttribute('data-name')===n})||tools[0];if(e){setTool(e,n,s,d,a);sd()}else addToolCall(n,s,d,a)}
 function addError(t){var d=document.createElement('div');d.className='em';d.innerHTML='⚠️ '+h(t);m.appendChild(d);last=null;sd()}
 function addQueuedMessage(t){var d=document.createElement('div');d.className='qm';d.innerHTML='<span class="b">📥 '+h(t)+'</span>';m.appendChild(d);last=null;sd()}
 	function addThinkingIndicator(){var d=document.createElement('div');d.className='rm thp';d.innerHTML='💭 思考中<span class="dots"></span>';parts().appendChild(d);sd()}
@@ -283,7 +347,7 @@ function addQueuedMessage(t){var d=document.createElement('div');d.className='qm
 	function addReasoningBlock(t){var p=parts(),th=p.querySelector('.thp');if(th)th.remove();var d=document.createElement('div');d.className='rm reasoning-content';d.innerHTML=reasoningPreview(t);p.insertBefore(d,p.firstChild);sd()}
 	function updateReasoningBlock(t){var p=parts(),d=p.querySelector('.reasoning-content');if(!d){addReasoningBlock(t);return}d.innerHTML=reasoningPreview(t);sd()}
 	function removeReasoningBlock(){var a=currentAssistant();if(!a)return;var blocks=a.querySelectorAll('.reasoning-content');Array.prototype.forEach.call(blocks,function(x){x.remove()})}
-	function renderChatModel(model){clearMessages();(model.messages||[]).forEach(function(x){if(x.text!==undefined&&x.contextSummary!==undefined)addUserMessage(x.text);else if(x.markdown!==undefined)addAssistantMessage(x.markdown);else if(x.toolName!==undefined)addSystemMessage('[Permission] '+x.toolName+': '+(x.reason||''));else if(x.name!==undefined&&x.callId!==undefined)addToolCall(x.name,x.status||'',x.output||x.argumentsJson||'');else if(x.text!==undefined)addSystemMessage(x.text)});sd()}
+	function renderChatModel(model){clearMessages();(model.messages||[]).forEach(function(x){if(x.text!==undefined&&x.contextSummary!==undefined)addUserMessage(x.text,x.contextSummary||[]);else if(x.markdown!==undefined)addAssistantMessage(x.markdown);else if(x.toolName!==undefined)addSystemMessage('[Permission] '+x.toolName+': '+(x.reason||''));else if(x.name!==undefined&&x.callId!==undefined)addToolCall(x.name,x.status||'',x.output||x.argumentsJson||'');else if(x.text!==undefined)addSystemMessage(x.text)});sd()}
 		function clearMessages(){m.innerHTML='';last=null;active=null;ti=-1;cv=false;nb=true}
 (function find(){for(var k in window){if(k.indexOf('JBCefQuery_')===0&&typeof window[k]==='function'){window[k]('js:ready');return}}setTimeout(find,50)})();
 </script></body></html>""".trimIndent()
