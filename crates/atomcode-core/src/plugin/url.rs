@@ -66,7 +66,20 @@ fn last_path_segment(url: &str) -> Option<&str> {
 /// Examples:
 ///   https://gitcode.com/u/foo.git → foo
 ///   git@github.com:o/bar         → bar
+///   file:///C:/Users/u/bar       → bar   (Windows)
 pub fn infer_marketplace_name_from_url(url: &str) -> Result<String> {
+    // Prefer the URL parser: it handles `file:///C:/...` (Windows),
+    // `file:///tmp/foo` (Unix) and standard remote URLs correctly.
+    // Fall back to text-level splitting for SSH shorthand (`git@host:o/r`).
+    if let Ok(parsed) = url::Url::parse(url) {
+        let path = parsed.path().trim_end_matches('/');
+        let last = path
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("cannot infer name from url: {}", url))?;
+        return Ok(strip_git_suffix_once(last).to_string());
+    }
+    // SSH shorthand fallback
     let trimmed = normalize_name_source(url);
     let last = last_path_segment(trimmed)
         .ok_or_else(|| anyhow!("cannot infer name from url: {}", url))?;
