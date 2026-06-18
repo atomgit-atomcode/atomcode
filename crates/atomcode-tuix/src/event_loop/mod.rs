@@ -7448,6 +7448,18 @@ fn handle_agent_event(
                 state.pending_image_hashes.push(h);
                 state.pending_images.push(img);
                 state.pending_image_markers.push(marker);
+                // Re-insert [Image #N] marker into the buffer so the user
+                // can see the restored marker and continue editing without
+                // having to retype the marker text manually. The marker
+                // is placed at the current cursor position (typically at
+                // the end of the cleared buffer). If the user was already
+                // typing during the streaming phase, their existing text
+                // is preserved before the marker.
+                let marker_text = format!("[Image #{}]", marker);
+                if !buf.text.contains(&marker_text) {
+                    buf.text.insert_str(buf.cursor, &marker_text);
+                    buf.cursor += marker_text.len();
+                }
             }
             // Don't redraw — TUI is in Streaming phase here (turn isn't
             // over yet); the next idle/streaming redraw picks up the new

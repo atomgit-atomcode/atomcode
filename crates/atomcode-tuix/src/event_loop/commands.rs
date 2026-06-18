@@ -3785,13 +3785,17 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         // sync-check on the next keystroke doesn't redundantly
         // reload the config we just saved ourselves.
         ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
-        // NOTE: we deliberately do NOT update ctx.model_name here.
-        // The bridge's ReloadConfig is asynchronous — model_name must
-        // reflect the model the bridge is ACTUALLY running, not the
-        // config default. If the bridge fails to switch (e.g. gateway
-        // signer unavailable in an open-source build), the old model
-        // stays active and the status line must show it. Use /model to
-        // switch explicitly when the bridge confirms readiness.
+        // Update `ctx.model_name` to reflect the new default provider from
+        // the just-completed login/setup. This ensures the status line shows
+        // the current model immediately rather than the pre-login value.
+        // The bridge's ReloadConfig is asynchronous (sent by `save_and_reload`
+        // above) — if the bridge fails to switch (e.g. gateway signer
+        // unavailable), the user will see the error on their next chat turn
+        // and can fall back to `/model`. This matches `/model`'s approach
+        // which also updates `ctx.model_name` optimistically.
+        if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
+            ctx.model_name = p.model.clone();
+        }
         // Clear any stale drift warning now that we've just
         // re-synced. Also reset the cooldown so the next
         // pre-turn trigger (if conditions change) can fire
