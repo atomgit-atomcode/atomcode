@@ -4218,11 +4218,9 @@ fn attach_typed_image_paths(
         app.state.session_image_count += 1;
         let n = app.state.session_image_count;
         *text = text.replacen(&tok, &format!("[Image #{}]", n), 1);
-        // Sync mode re-renders the echo from UserEcho — skip the local one (see
-        // the idle-submit path) so it can't orphan above the later user row.
-        if ctx.sync_session.is_none() {
-            renderer.render(UiLine::ImageAttachment(n));
-        }
+        // No render here: the caller groups the collected `kept_markers` into a
+        // single `UiLine::UserWithAttachments` echo (the viewport-overflow fix),
+        // so this helper only collects.
         images.push(img);
         kept_markers.push(n);
     }
