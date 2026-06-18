@@ -1878,14 +1878,18 @@ pub(super) fn execute_slash_command(
                             .unwrap_or(0);
                         let mins = elapsed / 60;
                         let secs = elapsed % 60;
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  ◎ Goal: {}\n  Round: {}\n  Elapsed: {}m {}s\n",
-                            cond, round, mins, secs
-                        )));
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalStatus {
+                                condition: cond.as_str(),
+                                round,
+                                mins,
+                                secs,
+                            })
+                            .into_owned(),
+                        ));
                     } else {
                         renderer.render(UiLine::CommandOutput(
-                            "  No active goal.\n  Usage: /goal <condition>   |   /goal help\n"
-                                .into(),
+                            crate::i18n::t(crate::i18n::Msg::GoalNoActive).into_owned(),
                         ));
                     }
                     renderer.flush();
@@ -1895,24 +1899,14 @@ pub(super) fn execute_slash_command(
                     state.goal_condition = None;
                     state.goal_round = 0;
                     state.goal_started_at = None;
-                    renderer.render(UiLine::CommandOutput("  Goal cleared.\n".into()));
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::GoalCleared).into_owned(),
+                    ));
                     renderer.flush();
                 }
                 "help" | "?" | "-h" | "--help" => {
                     renderer.render(UiLine::CommandOutput(
-                        "  /goal — autonomous multi-round work toward a stated condition.\n  \
-                         Usage:\n  \
-                         \u{20}\u{20}/goal <condition>     set a new goal; agent loops until the evaluator says met\n  \
-                         \u{20}\u{20}/goal                 show current goal status\n  \
-                         \u{20}\u{20}/goal status          same as above\n  \
-                         \u{20}\u{20}/goal clear           stop the active goal (aliases: stop, off, reset, none, cancel)\n  \
-                         \u{20}\u{20}/goal help            this help\n  \
-                         Notes:\n  \
-                         \u{20}\u{20}- A fast model evaluates each round; configure via [providers] +\n  \
-                         \u{20}\u{20}\u{20}\u{20}evaluator_provider in ~/.atomcode/config.toml.\n  \
-                         \u{20}\u{20}- No built-in round / time cap — express budgets in the condition\n  \
-                         \u{20}\u{20}\u{20}\u{20}text itself (e.g. \"or stop after 20 turns\"). CC's /goal works the same way.\n  \
-                         \u{20}\u{20}- Esc / Ctrl+C stops the goal at any time.\n".into(),
+                        crate::i18n::t(crate::i18n::Msg::GoalHelp).into_owned(),
                     ));
                     renderer.flush();
                 }

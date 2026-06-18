@@ -903,6 +903,25 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("（无需压缩 — 压缩后不会节省 token：{} → {}）\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } =>
             format!("（已压缩 — 丢弃 {} 条消息，{} → {} tokens）\n", messages, before, after).into(),
+        Msg::GoalHelp =>
+            "  /goal — 朝着设定的条件自主进行多轮工作。\n  \
+             用法：\n  \
+             \u{20}\u{20}/goal <条件>          设定新目标；智能体循环执行直到评估器判定达成\n  \
+             \u{20}\u{20}/goal                 显示当前目标状态\n  \
+             \u{20}\u{20}/goal status          同上\n  \
+             \u{20}\u{20}/goal clear           停止当前目标（别名：stop、off、reset、none、cancel）\n  \
+             \u{20}\u{20}/goal help            显示本帮助\n  \
+             说明：\n  \
+             \u{20}\u{20}- 每轮由一个快速模型评估；通过 ~/.atomcode/config.toml 中的 [providers] +\n  \
+             \u{20}\u{20}\u{20}\u{20}evaluator_provider 配置。\n  \
+             \u{20}\u{20}- 没有内置的轮次 / 时间上限——请在条件文本中自行表达预算\n  \
+             \u{20}\u{20}\u{20}\u{20}（例如 \"或在 20 轮后停止\"）。Claude Code 的 /goal 也是这样工作的。\n  \
+             \u{20}\u{20}- 随时可用 Esc / Ctrl+C 停止目标。\n".into(),
+        Msg::GoalStatus { condition, round, mins, secs } =>
+            format!("  ◎ 目标：{}\n  轮次：{}\n  已用时：{}分 {}秒\n", condition, round, mins, secs).into(),
+        Msg::GoalNoActive =>
+            "  当前没有进行中的目标。\n  用法：/goal <条件>   |   /goal help\n".into(),
+        Msg::GoalCleared => "  已清除目标。\n".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "当前模型 \"{}\" 不支持图片输入，且未配置 vision_preprocessor_provider。\
              请用 /model 切换到支持视觉的模型，或在配置中设置 vision_preprocessor_provider。",
