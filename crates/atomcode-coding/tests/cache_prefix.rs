@@ -97,6 +97,7 @@ async fn drive(handle: &mut atomcode_kernel::agent::AgentHandle, text: &str) {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -176,6 +177,7 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
 /// (the fix was ordered registration). Without it, a second process keys a different
 /// prefix and never hits the first's cache.
 #[tokio::test]
+#[serial_test::serial]
 async fn tool_block_and_system_are_deterministic_across_independent_assemblies() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();

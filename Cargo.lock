@@ -302,6 +302,7 @@ dependencies = [
  "dirs 6.0.0",
  "futures",
  "serde_json",
+ "serial_test",
  "tempfile",
  "tokio",
  "uuid",
