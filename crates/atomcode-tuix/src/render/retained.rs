@@ -4812,6 +4812,7 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal_indicator: None,
+            vision: false,
         }
     }
 
@@ -4837,6 +4838,7 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal_indicator: None,
+            vision: false,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -4891,6 +4893,7 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal_indicator: None,
+            vision: false,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -4937,6 +4940,7 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal_indicator: None,
+            vision: false,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();

@@ -4261,6 +4261,20 @@ fn attach_typed_image_paths(
         app.state.session_image_count += 1;
         let n = app.state.session_image_count;
         *text = text.replacen(&tok, &format!("[Image #{}]", n), 1);
+        // The token is the UNQUOTED path extracted by the quote-aware
+        // scanner. But the original text may carry the path wrapped in
+        // single / double quotes. If the bare replace didn't match (text
+        // unchanged), retry with the quoted forms so the marker replaces
+        // the original text including the wrapping quotes.
+        if !text.contains(&format!("[Image #{}]", n)) {
+            for q in ["'", "\""] {
+                let quoted = format!("{}{}{}", q, tok, q);
+                *text = text.replacen(&quoted, &format!("[Image #{}]", n), 1);
+                if text.contains(&format!("[Image #{}]", n)) {
+                    break;
+                }
+            }
+        }
         renderer.render(UiLine::ImageAttachment(n));
         images.push(img);
         kept_markers.push(n);
