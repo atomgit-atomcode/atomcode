@@ -1397,8 +1397,48 @@ impl Bridge {
             KEv::Error { message, .. } => {
                 self.emit(CoreEv::Error { error: message, snapshot: ConversationSnapshot::default() });
             }
-            KEv::Compacted { committed, trigger, .. } => {
-                if let Some(msg) = compaction_advisory(committed, &trigger) {
+            // A manual `/compact` may make a slow one-shot LLM summary call; announce it
+            // so the user sees a progress line while it runs (v1 streamed the same
+            // "(compacting with LLM summary...)" text). Auto/Overflow stub silently — no
+            // LLM call, no user action to acknowledge — so they stay quiet here.
+            KEv::CompactionStarted { trigger } => {
+                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                    self.emit(CoreEv::TextDelta(
+                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting)
+                            .into_owned(),
+                    ));
+                }
+            }
+            KEv::Compacted { committed, trigger, removed, bytes_before, bytes_after, .. } => {
+                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                    // v1 parity: stream the authoritative result as a plain TextDelta line
+                    // (the TUI's `/compact` handler renders these directly). The kernel
+                    // measures BYTES, so the token figures are derived from the last
+                    // provider usage report (see `manual_compact_result`).
+                    let before_tokens =
+                        self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
+                    self.emit(CoreEv::TextDelta(manual_compact_result(
+                        committed,
+                        removed,
+                        bytes_before,
+                        bytes_after,
+                        before_tokens,
+                    )));
+                    if committed {
+                        // v1 parity: refresh the cached context size so the footer /
+                        // `/context` reflect the shrunk conversation immediately. v1
+                        // recomputes via `build_messages`; the kernel only tracks bytes,
+                        // so update `last_usage` to the same estimate the result line
+                        // shows. The next real turn overwrites it with the exact count.
+                        if let Some(meta) = self.last_usage.as_mut() {
+                            meta.used_tokens =
+                                estimate_after_tokens(before_tokens, bytes_before, bytes_after)
+                                    as u32;
+                        }
+                        self.emit_context_stats();
+                    }
+                } else if let Some(msg) = compaction_advisory(committed, &trigger) {
+                    // Auto/Overflow keep the terse one-line advisory.
                     self.emit(CoreEv::Warning(msg));
                 }
             }
@@ -1807,28 +1847,84 @@ fn build_provider(
     }
 }
 
-/// Decide the user-facing advisory (if any) for a kernel `Compacted` outcome.
+/// Terse one-line advisory for an AUTO / OVERFLOW compaction.
 ///
-/// - A COMMITTED compaction always announces itself.
-/// - A NO-OP compaction only speaks when the user explicitly asked for it
-///   (`Manual` = `/compact`): v1 acknowledged the no-op, but the bridge used to
-///   stay silent, leaving the user unsure the command ran. Auto/Overflow no-ops
-///   stay silent — there's no user action to acknowledge and it would be spam.
+/// A manual `/compact` is handled by the richer streaming path
+/// ([`manual_compact_result`], emitted as a `TextDelta`) so this returns `None` for
+/// it. A committed auto/overflow compaction announces itself once; a no-op stays
+/// silent — there's no user action to acknowledge and it would be spam.
 fn compaction_advisory(
     committed: bool,
     trigger: &atomcode_kernel::message::CompactTrigger,
 ) -> Option<String> {
     use atomcode_kernel::message::CompactTrigger;
+    if matches!(trigger, CompactTrigger::Manual { .. }) {
+        return None; // manual → the TextDelta `manual_compact_result` path
+    }
+    committed.then(|| "conversation compacted".to_string())
+}
+
+/// v1-parity result line for a manual `/compact`, emitted as a `TextDelta` so it
+/// renders as a plain line (matching core's `run_compact`).
+///
+/// The kernel measures conversation BYTES, not tokens, so the token figures are
+/// derived:
+///   - `before_tokens` is the real pre-compaction context size from the last
+///     provider usage report (`last_usage.used_tokens`);
+///   - the after-figure scales `before_tokens` by the byte-reduction ratio
+///     (`bytes_after / bytes_before`).
+/// This reproduces v1's `(compacted — dropped N messages, X → Y tokens)` within
+/// estimation error. A refused / no-op compaction reports `(nothing to compact …)`.
+fn manual_compact_result(
+    committed: bool,
+    removed: usize,
+    bytes_before: usize,
+    bytes_after: usize,
+    before_tokens: usize,
+) -> String {
+    use atomcode_core::i18n::{t, Msg};
+    // Fall back to a coarse bytes/4 estimate only if no usage has been reported yet
+    // (e.g. `/compact` issued before any turn) so figures never read "0 → 0".
+    let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
+    let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
+    let before = fmt_k_tokens(before_tokens);
+    let after = fmt_k_tokens(after_tokens);
     if committed {
-        Some("conversation compacted".to_string())
-    } else if matches!(trigger, CompactTrigger::Manual { .. }) {
-        Some(
-            atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactNothingShort)
-                .trim_end()
-                .to_string(),
-        )
+        return t(Msg::CompactDropped { messages: removed, before: &before, after: &after })
+            .into_owned();
+    }
+    // Refused. Distinguish "would not save tokens" (a summary was built but the
+    // candidate did not shrink — `bytes_after > bytes_before`) from "conversation is
+    // short" (a true no-op plan whose candidate is byte-identical). Mirrors v1, which
+    // shows these as two distinct messages.
+    if bytes_after > bytes_before {
+        t(Msg::CompactNothingNoSavings { before: &before, after: &after }).into_owned()
     } else {
-        None
+        t(Msg::CompactNothingShort).into_owned()
+    }
+}
+
+/// Estimate the post-compaction token count by scaling the pre-compaction count by
+/// the kernel's byte-reduction ratio. The kernel measures conversation BYTES, not
+/// tokens; `before_tokens` (the real provider count) also covers the fixed
+/// system + tools prefix, so this slightly UNDER-states a compaction that left a
+/// large prefix. v1 estimates too (via `build_messages`); this tracks its numbers
+/// closely and is honest about being an estimate. `bytes_before == 0` ⇒ unchanged.
+fn estimate_after_tokens(before_tokens: usize, bytes_before: usize, bytes_after: usize) -> usize {
+    if bytes_before > 0 {
+        ((before_tokens as u128 * bytes_after as u128) / bytes_before as u128) as usize
+    } else {
+        before_tokens
+    }
+}
+
+/// Port of core's (private) `fmt_k_tokens`: `1234` → `"1.2K"`, `< 1000` → verbatim.
+/// Kept local to the bridge so the manual-compact line matches v1's formatting.
+fn fmt_k_tokens(t: usize) -> String {
+    if t >= 1000 {
+        format!("{:.1}K", t as f64 / 1000.0)
+    } else {
+        t.to_string()
     }
 }
 
@@ -1878,26 +1974,88 @@ mod goal_summary_tests {
 
 #[cfg(test)]
 mod undo_tests {
-    use super::{build_provider, compaction_advisory, compute_undo};
+    use super::{
+        build_provider, compaction_advisory, compute_undo, estimate_after_tokens, fmt_k_tokens,
+        manual_compact_result,
+    };
     use atomcode_coding::CodingAgentConfig;
     use atomcode_kernel::message::{CompactTrigger, Message};
 
     #[test]
-    fn compaction_advisory_speaks_for_manual_noop_but_stays_silent_for_auto() {
-        // Committed compaction always announces, regardless of trigger.
-        assert!(compaction_advisory(true, &CompactTrigger::Manual { focus: None }).is_some());
-        assert!(compaction_advisory(true, &CompactTrigger::Auto { utilization: 0.9 }).is_some());
+    fn compaction_advisory_announces_committed_auto_overflow_and_ignores_manual() {
+        // Manual `/compact` is handled by the richer streaming `manual_compact_result`
+        // path, so the terse advisory stays silent for it on BOTH outcomes.
+        assert!(compaction_advisory(true, &CompactTrigger::Manual { focus: None }).is_none());
+        assert!(compaction_advisory(false, &CompactTrigger::Manual { focus: None }).is_none());
 
-        // A user-typed `/compact` that's a no-op must be acknowledged — this is the
-        // v1-parity regression: the bridge previously stayed silent here.
-        let manual_noop = compaction_advisory(false, &CompactTrigger::Manual { focus: None });
-        assert!(manual_noop.as_deref().is_some_and(|m| !m.is_empty()));
-        // No trailing newline — it renders as a single Warning line.
-        assert!(!manual_noop.unwrap().ends_with('\n'));
+        // A committed auto/overflow compaction announces itself once.
+        assert!(compaction_advisory(true, &CompactTrigger::Auto { utilization: 0.9 }).is_some());
+        assert!(compaction_advisory(true, &CompactTrigger::Overflow { attempt: 0 }).is_some());
 
         // Auto / Overflow no-op compaction stays silent (no user action to ack, no spam).
         assert!(compaction_advisory(false, &CompactTrigger::Auto { utilization: 0.9 }).is_none());
         assert!(compaction_advisory(false, &CompactTrigger::Overflow { attempt: 0 }).is_none());
+    }
+
+    #[test]
+    fn manual_compact_result_reports_dropped_count_and_token_reduction() {
+        // 129 messages dropped; pre-compaction context = 42.9K tokens; the conversation
+        // shrank to ~25.9% of its bytes → after ≈ 11.1K. Numbers + the `→` arrow are
+        // locale-invariant (en: "dropped N messages, X → Y tokens"; zh: "丢弃 N 条消息，
+        // X → Y tokens"), so we assert on those rather than the surrounding words.
+        let line = manual_compact_result(true, 129, 170_000, 44_000, 42_900);
+        assert!(line.contains("129"), "dropped-count missing: {line}");
+        assert!(line.contains("42.9K"), "before figure missing: {line}");
+        assert!(line.contains("11.1K"), "after figure missing: {line}");
+        assert!(line.contains('→'), "token-reduction arrow missing: {line}");
+    }
+
+    #[test]
+    fn manual_compact_result_true_noop_is_short_line_without_arrow() {
+        // A TRUE no-op (candidate byte-identical: bytes_after == bytes_before) reports the
+        // "(nothing to compact — conversation is short)" line, which — in every locale —
+        // carries NO `→` arrow (unlike the committed / no-savings lines).
+        let noop = manual_compact_result(false, 0, 8_000, 8_000, 6_000);
+        assert!(!noop.is_empty(), "no-op must still acknowledge the command");
+        assert!(!noop.contains('→'), "true no-op must not show a token comparison: {noop}");
+        // Degenerate all-zero inputs also resolve to the short (no-arrow) line.
+        assert!(!manual_compact_result(false, 0, 0, 0, 0).contains('→'));
+    }
+
+    #[test]
+    fn manual_compact_result_net_loss_reports_no_savings_with_figures() {
+        // A refused compaction whose candidate GREW (bytes_after > bytes_before) — e.g.
+        // running `/compact` twice — is NOT "short"; v1 shows a "would not save tokens:
+        // X → Y" line WITH a `→` arrow. before = 5.0K; after = 5000*15000/10000 = 7500.
+        let line = manual_compact_result(false, 0, 10_000, 15_000, 5_000);
+        assert!(line.contains('→'), "net-loss line shows a token comparison: {line}");
+        assert!(line.contains("5.0K"), "before figure: {line}");
+        assert!(line.contains("7.5K"), "after figure: {line}");
+    }
+
+    #[test]
+    fn manual_compact_result_falls_back_to_byte_estimate_without_usage() {
+        // No provider usage yet (before_tokens = 0): rather than show "0 → 0", fall back
+        // to a coarse bytes/4 estimate. 40_000 bytes → ~10K before; halved bytes → ~5K.
+        let line = manual_compact_result(true, 3, 40_000, 20_000, 0);
+        assert!(line.contains("10.0K"), "byte-fallback before figure: {line}");
+        assert!(line.contains("5.0K"), "byte-fallback after figure: {line}");
+    }
+
+    #[test]
+    fn estimate_after_tokens_scales_by_byte_ratio() {
+        // 42.9K tokens, conversation bytes 170K → 44K → ~11.1K (the screenshot's case).
+        assert_eq!(estimate_after_tokens(42_900, 170_000, 44_000), 11_103);
+        // Degenerate bytes_before == 0 leaves the count unchanged (no divide-by-zero).
+        assert_eq!(estimate_after_tokens(5_000, 0, 0), 5_000);
+    }
+
+    #[test]
+    fn fmt_k_tokens_matches_core_format() {
+        assert_eq!(fmt_k_tokens(0), "0");
+        assert_eq!(fmt_k_tokens(999), "999");
+        assert_eq!(fmt_k_tokens(1000), "1.0K");
+        assert_eq!(fmt_k_tokens(42_900), "42.9K");
     }
 
     fn coding_cfg(reasoning_history: Option<&str>) -> CodingAgentConfig {

@@ -438,6 +438,14 @@ impl RunningAgent {
                 utilization,
                 sacred_floor: floor,
             };
+            // Announce BEFORE the (possibly multi-second) LLM summary so a driver can
+            // show a "compacting…" progress line — but ONLY if the strategy will
+            // actually do that slow drain/summarize. A manual `/compact` that turns out
+            // to be a no-op (nothing older than the active turn) must NOT show a
+            // spurious "compacting…" line ahead of "nothing to compact" (v1 parity).
+            if self.compaction.will_summarize(&view) {
+                self.rt.emit(AgentEvent::CompactionStarted { trigger: trigger_for_event.clone() });
+            }
             self.compaction.plan(&view).await
         };
         let report = convo.apply_plan(plan, floor);
