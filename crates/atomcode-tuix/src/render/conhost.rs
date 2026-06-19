@@ -61,10 +61,14 @@ fn managed_console_in_mode(original: u32) -> u32 {
 /// Returns the original mode on success so the caller can restore it
 /// byte-for-byte via [`restore_conhost_console_in_mode`]; returns `None` if
 /// stdin isn't a console (redirected / piped) or Get/SetConsoleMode fails.
-/// Under Windows Terminal / VSCode ConPTY there is no host-window Select mode
-/// to pause output, so the syscall succeeds but the clear is an inert no-op —
-/// making this one code path safe on both conhost and ConPTY with no runtime
-/// detection.
+///
+/// CALLERS MUST GATE THIS TO LEGACY CONHOST (`caps.legacy_conhost`). On Windows
+/// Terminal / VSCode ConPTY, clearing QuickEdit is NOT an inert no-op (the
+/// original assumption, now known wrong): ConPTY reacts by enabling mouse-event
+/// forwarding, so the terminal stops doing native click-drag text selection —
+/// the user can no longer select/copy and clicks hit atomcode's no-op handler
+/// ("mouse dead / can't copy on Windows Terminal"). The click-to-freeze this
+/// fixes is conhost-only, so skipping it on ConPTY is correct regardless.
 ///
 /// All results are mirrored to `tuix_trace!` (gated on `ATOMCODE_TUIX_LOG`)
 /// so a freeze report shows exactly which syscall returned what mask.
