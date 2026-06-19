@@ -103,6 +103,8 @@
           <tr><td><code>/view &lt;filepath&gt;</code></td><td>Open a read-only overlay to view a file's content (supports arrow keys, PageUp/Down, g/G to jump to top/bottom)</td></tr>
           <tr><td><code>/undo</code> · <code>/undo N</code></td><td>Roll conversation memory back to before the last turn (or turn N) and restore that prompt into the input box; rewinds memory only — does not revert files on disk</td></tr>
           <tr><td><code>/diff</code></td><td>Show the git diff of uncommitted changes in the working directory</td></tr>
+          <tr><td><code>/review</code></td><td>Code review the current changes: <code>/review</code> reviews uncommitted changes, <code>/review staged</code> the staged diff, <code>/review &lt;base&gt;</code> against a base ref</td></tr>
+          <tr><td><code>/paste</code></td><td>Attach an image from the clipboard (Windows fallback for when <code>Ctrl+V</code> is captured by the terminal)</td></tr>
           <tr><td><code>/cost</code></td><td>Show output tokens for the current session. APIs without usage reporting are estimated automatically</td></tr>
           <tr><td><code>/context</code></td><td>Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage</td></tr>
           <tr><td><code>/compact</code></td><td>Compact history: summarise earlier messages to free up context budget</td></tr>
@@ -122,8 +124,10 @@
         <tbody>
           <tr><td><code>/plan</code></td><td>Switch to <strong>Plan mode</strong>: read-only exploration. The model can call <code>read_file</code> / <code>grep</code> / <code>list_directory</code> and other non-writing tools, but <code>edit_file</code> / <code>bash</code> are blocked. Useful for getting alignment before action</td></tr>
           <tr><td><code>/build</code></td><td>Switch back to <strong>Build mode</strong> (the default): all tools available — read, write, execute. <code>/plan</code> and <code>/build</code> are freely interchangeable</td></tr>
+          <tr><td><code>/goal &lt;text&gt;</code></td><td>Set a completion goal and let the agent run an <strong>autonomous loop</strong> — turn after turn — until the goal is met. <code>/goal</code> (no args) shows the current goal and round count; <code>/goal clear</code> stops it</td></tr>
           <tr><td><code>/think on</code> / <code>off</code></td><td>Toggle extended thinking (for supported models — Claude / DeepSeek-R1 / GLM-4.5 / …). When on, the model surfaces its reasoning at the cost of latency and tokens</td></tr>
           <tr><td><code>/think budget &lt;N&gt;</code></td><td>Cap the thinking token budget (Claude family); controls reasoning length</td></tr>
+          <tr><td><code>/effort &lt;high|max|off&gt;</code></td><td>DeepSeek reasoning-effort control — trade latency/tokens for deeper reasoning on DeepSeek models</td></tr>
         </tbody>
       </table>
 
@@ -158,6 +162,9 @@
         </tbody>
       </table>
       <p>See <a href="./skills.html">Skills</a> and <a href="./plugins.html">Plugin System</a> for details.</p>
+      <p>Plugins can register their own slash commands. For example, the official channel plugin adds <code>/wechat</code> (shows the AtomCode WeChat community group QR code):</p>
+      <pre><code>/plugin marketplace add https://atomgit.com/atomgit_atomcode/AtomCode-Channel
+/plugin install weixin@atomcode-channel</code></pre>
 
       <h2>MCP integration</h2>
       <table>
@@ -204,7 +211,7 @@
           <tr><td><code>/guide</code></td><td>Built-in onboarding guide: <code>/guide</code> lists topics you can ask about (quickstart, switch model, MCP, Skills, memory, background tasks, context, keybindings, config); <code>/guide &lt;topic&gt;</code> explains it right in the chat (first run auto-installs the <code>atomcode-skills</code> plugin)</td></tr>
           <tr><td><code>/help</code></td><td>List every available slash command</td></tr>
           <tr><td><code>/keys</code></td><td>Show the keyboard-shortcut reference (grouped by input / history / session / modal navigation, with per-terminal compatibility notes for <code>Shift+Enter</code> and <code>Alt+Enter</code>). See <a href="./keybindings.html">Keybindings</a></td></tr>
-          <tr><td><code>/quit</code></td><td>Exit atomcode (or hit <code>Ctrl+C</code> twice)</td></tr>
+          <tr><td><code>/quit</code> · <code>/exit</code></td><td>Exit atomcode (or hit <code>Ctrl+C</code> twice)</td></tr>
         </tbody>
       </table>
 
