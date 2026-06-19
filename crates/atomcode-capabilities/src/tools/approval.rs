@@ -146,8 +146,13 @@ impl ApprovalMiddleware {
         self.kind = kind.into();
         self
     }
-    fn grant_key(call: &ToolCall) -> String {
-        format!("{}::{}", call.name, call.arguments)
+    /// Key under which an `AllowAlways` grant is cached. The SCOPE comes from the
+    /// tool (`Tool::always_grant_scope`), NOT blindly from the raw args: a
+    /// file-mutation tool reports a tool-wide scope so "Always" covers every later
+    /// edit this session (v1 parity), while `bash` keeps the default per-command
+    /// scope so approving one destructive command never blanket-approves others.
+    fn grant_key(call: &ToolCall, tool: &dyn Tool) -> String {
+        format!("{}::{}", call.name, tool.always_grant_scope(&call.arguments))
     }
 }
 
@@ -164,7 +169,7 @@ impl ToolMiddleware for ApprovalMiddleware {
             return BeforeOutcome::Proceed;
         }
         // Session grant cache: an identical risky call already approved-always.
-        let key = Self::grant_key(call);
+        let key = Self::grant_key(call, tool.as_ref());
         if self.store.is_granted(&key) {
             return BeforeOutcome::Proceed;
         }
@@ -212,6 +217,53 @@ mod tests {
         ToolCall { id: "2".into(), name: "read_file".into(), arguments: r#"{"file_path":"a.txt"}"#.into() }
     }
 
+    /// REGRESSION: "总是 / Always" must be tool-wide for file-mutation tools (v1
+    /// parity) — approving one edit auto-approves every later edit this session —
+    /// while `bash` stays per-command so approving one destructive command never
+    /// blanket-approves another. The bug: the grant key included the full args, so
+    /// each distinct edit re-prompted ("Always" degraded to "allow once").
+    #[test]
+    fn always_grant_is_tool_wide_for_edits_but_per_command_for_bash() {
+        use crate::tools::bash::BashTool;
+        use crate::tools::edit::EditFileTool;
+
+        // edit_file: two DIFFERENT edits collapse to the SAME grant key.
+        let edit: Arc<dyn Tool> = Arc::new(EditFileTool);
+        let a = ToolCall {
+            id: "1".into(),
+            name: "edit_file".into(),
+            arguments: r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#.into(),
+        };
+        let b = ToolCall {
+            id: "2".into(),
+            name: "edit_file".into(),
+            arguments: r#"{"file_path":"b.rs","old_string":"p","new_string":"q"}"#.into(),
+        };
+        assert_eq!(
+            ApprovalMiddleware::grant_key(&a, edit.as_ref()),
+            ApprovalMiddleware::grant_key(&b, edit.as_ref()),
+            "edit_file 'Always' must grant the whole tool, not just one exact call"
+        );
+
+        // bash: two DIFFERENT destructive commands keep DISTINCT grant keys.
+        let bash: Arc<dyn Tool> = Arc::new(BashTool);
+        let c1 = ToolCall {
+            id: "3".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"rm -rf foo"}"#.into(),
+        };
+        let c2 = ToolCall {
+            id: "4".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"rm -rf bar"}"#.into(),
+        };
+        assert_ne!(
+            ApprovalMiddleware::grant_key(&c1, bash.as_ref()),
+            ApprovalMiddleware::grant_key(&c2, bash.as_ref()),
+            "bash 'Always' must stay per-command so one approval never covers another"
+        );
+    }
+
     #[test]
     fn decision_parsing_fails_closed() {
         use serde_json::json;
@@ -243,9 +295,9 @@ mod tests {
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
         let store = Arc::new(InMemoryPermissionStore::new());
         let call = risky_call();
-        store.grant(&ApprovalMiddleware::grant_key(&call));
-        let mw = ApprovalMiddleware::new(store);
         let tool: Arc<dyn Tool> = Arc::new(WriteFileTool);
+        store.grant(&ApprovalMiddleware::grant_key(&call, tool.as_ref()));
+        let mw = ApprovalMiddleware::new(store);
         let mut c = call;
         assert!(!mw.before(&mut c, &tool, &rt).await.is_deny());
     }
