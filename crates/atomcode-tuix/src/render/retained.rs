@@ -64,6 +64,19 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
     }
 }
 
+/// Whether atomcode should take over the conhost console input mode (clear
+/// QuickEdit + mouse input via [`conhost::disable_conhost_quick_edit`]). ONLY on a
+/// real **legacy-conhost** TTY — that's the only host with the click-to-freeze
+/// bug. On Windows Terminal / VSCode ConPTY (`legacy_conhost = false`) clearing
+/// QuickEdit makes ConPTY enable mouse forwarding, which kills the terminal's
+/// native click-drag selection (the "can't click / can't copy on Windows
+/// Terminal" regression) — so leave the console mode untouched there. Pure +
+/// cross-platform-testable (the syscall site is `#[cfg(windows)]`).
+#[cfg(any(windows, test))]
+fn manage_conhost_quick_edit(tty: bool, legacy_conhost: bool) -> bool {
+    tty && legacy_conhost
+}
+
 /// Marker prefix for the dedicated footer goal row. A width-1 BMP "ring" from
 /// the Geometric Shapes block when the terminal's font has it, ASCII `*`
 /// otherwise — the SAME `unicode_symbols` gate the spinner (`◐`→`|/-\`) and
@@ -592,14 +605,20 @@ impl RetainedRenderer<StdoutTap> {
         };
         // Clear conhost's QuickEdit bit on a real interactive console so a
         // click can't pause our stdout writes and freeze the render worker
-        // (see `conhost::disable_conhost_quick_edit`). This is the ONLY place
-        // the syscall fires: `new()` is monomorphic for the real stdout
-        // writer and is never reached by unit tests (they call `with_writer`
-        // with in-memory sinks), so the CI console is never mutated. Note
-        // `caps.tty` alone would NOT be a safe gate — test caps report
-        // tty=true too — the constructor boundary is the real protection.
+        // (see `conhost::disable_conhost_quick_edit`).
+        //
+        // GATED TO LEGACY CONHOST. The click-to-freeze is a conhost-only bug, and
+        // on Windows Terminal / VSCode (ConPTY) clearing QuickEdit is NOT harmless:
+        // ConPTY responds by turning ON mouse-event forwarding, so the terminal
+        // stops doing native click-drag text SELECTION — the user can no longer
+        // select/copy, and clicks land on our no-op handler (reported as "mouse
+        // dead / can't copy" on Windows Terminal). The earlier "inert no-op on WT"
+        // assumption was wrong; restrict the syscall to where the freeze actually
+        // happens. (`new()` is also the ONLY place it fires — monomorphic for the
+        // real stdout writer, never reached by unit tests that use `with_writer` —
+        // and `caps.tty` alone is not a safe gate since test caps report tty=true.)
         #[cfg(windows)]
-        let manage_quick_edit = caps.tty;
+        let manage_quick_edit = manage_conhost_quick_edit(caps.tty, caps.legacy_conhost);
         #[cfg(windows)]
         let prior = if manage_quick_edit {
             crate::render::conhost::disable_conhost_quick_edit()
@@ -4262,12 +4281,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // other logic that depended on CSI u event types silently
         // degrades. Same flag set as `TerminalGuard::activate`.
         //
-        // Windows is excluded for the same reason as the initial push: the
-        // Win32 console backend can't decode `CSI u`, so re-arming the
-        // protocol after a resume would reintroduce the numpad-leak bug
-        // (`ESC[57400u` for keypad keys) on every OAuth/shell round-trip.
-        // See `TerminalGuard::activate` in lib.rs for the full rationale.
-        if self.caps.tty && !cfg!(windows) {
+        // Windows and JediTerm are excluded for the same reason as the
+        // initial push: Windows' Win32 console backend can't decode `CSI u`
+        // (numpad-leak `ESC[57400u`), and JediTerm re-frames mouse reports as
+        // kitty key events while the protocol is armed (mouse-move gibberish
+        // in the input box). Re-arming either after a resume would reintroduce
+        // the leak on every OAuth/shell round-trip. Shared predicate with the
+        // initial push; see `TerminalGuard::activate` in lib.rs for the full
+        // rationale.
+        if crate::should_enable_kitty_keyboard(&self.caps) {
             let _ = execute!(
                 self.out,
                 PushKeyboardEnhancementFlags(
@@ -4665,11 +4687,16 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
         // scroll region. The latter three mirror `shutdown()`'s
         // force-restore so a panic mid-spinner doesn't leak
         // DECTCEM-off into the parent shell.
-        // \x1b[>1u pops one level of Kitty keyboard enhancement
-        // (same as crossterm's PopKeyboardEnhancementFlags).
+        // \x1b[<1u POPS one level of Kitty keyboard enhancement (this is
+        // crossterm's PopKeyboardEnhancementFlags). NOTE: the introducer is
+        // `<` (pop), not `>` (push) — `\x1b[>1u` would *arm* the protocol on
+        // the way out, leaving the parent shell in CSI-u mode. On JediTerm
+        // (DevEco/IDEA) that armed state turns every mouse move into input-box
+        // gibberish, so a panic here must never push. Popping a level we never
+        // pushed is a harmless no-op (empty kitty stack).
         let _ = self
             .out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[>1u\x1b[?25h\x1b[?7h\x1b[r");
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
         #[cfg(windows)]
         if let Some(prior) = self.prior_console_in_mode.take() {
             crate::render::conhost::restore_conhost_console_in_mode(prior);
@@ -4769,6 +4796,19 @@ mod tests {
         // they want to see how close to the limit the context is. With a
         // window, render `used/window tok` so saturation is visible.
         assert_eq!(format_ctx_usage(10_400, 131_000), "10.4k/131k tok");
+    }
+
+    #[test]
+    fn conhost_quick_edit_managed_only_on_legacy_conhost() {
+        // Legacy conhost = the only host with the click-to-freeze; manage it.
+        assert!(manage_conhost_quick_edit(true, true));
+        // Windows Terminal / ConPTY (legacy_conhost=false): must NOT touch the
+        // console mode — clearing QuickEdit there kills native click-drag
+        // selection (the "can't click / can't copy on Windows Terminal" bug).
+        assert!(!manage_conhost_quick_edit(true, false));
+        // Non-TTY (piped / redirected): never.
+        assert!(!manage_conhost_quick_edit(false, true));
+        assert!(!manage_conhost_quick_edit(false, false));
     }
 
     #[test]

@@ -458,6 +458,40 @@ mod tests {
         assert!(win_jt.jediterm);
     }
 
+    /// The Kitty keyboard push (CSI u) must be suppressed on JediTerm —
+    /// arming it makes DevEco/IDEA's terminal re-frame mouse-move reports as
+    /// kitty key events, which crossterm decodes into a stream of gibberish
+    /// `Char`s in the input box. Mirrors the long-standing Windows exclusion.
+    #[test]
+    fn jediterm_suppresses_kitty_keyboard_push() {
+        let jt = TerminalCaps::from_env(EnvView {
+            terminal_emulator: Some("JetBrains-JediTerm".to_string()),
+            ..env()
+        });
+        assert!(
+            !crate::should_enable_kitty_keyboard(&jt),
+            "JediTerm TTY must NOT get the Kitty keyboard push"
+        );
+        // Forced via ATOMCODE_JEDITERM=1 even when the env marker is absent
+        // (DevEco launchers that drop TERMINAL_EMULATOR).
+        let forced = TerminalCaps::from_env(EnvView {
+            force_jediterm: Some(true),
+            ..env()
+        });
+        assert!(!crate::should_enable_kitty_keyboard(&forced));
+        // A plain non-JediTerm TTY still gets the push — but only where the
+        // protocol is usable (the predicate is hard-false on Windows).
+        let plain = TerminalCaps::from_env(env());
+        assert_eq!(
+            crate::should_enable_kitty_keyboard(&plain),
+            cfg!(not(windows)),
+            "non-JediTerm TTY: push iff non-Windows"
+        );
+        // Never pushed when stdout isn't a TTY, JediTerm or not.
+        let not_tty = TerminalCaps::from_env(EnvView { is_stdout_tty: false, ..env() });
+        assert!(!crate::should_enable_kitty_keyboard(&not_tty));
+    }
+
     #[test]
     fn force_ascii_beats_force_unicode_when_both_set() {
         // ATOMCODE_ASCII=1 takes priority — explicit "I want ASCII" wins.
