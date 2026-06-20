@@ -30,7 +30,7 @@ use atomcode_capabilities::session::{
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
     register_coding_tools, ApprovalMiddleware, OpenFileWorkspaceGate, SensitivePathGate, WebFetchTool,
-    WebSearchTool,
+    WebSearchTool, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::hook::LifecycleHooks;
@@ -415,6 +415,12 @@ pub fn assemble(
         // `Allow` short-circuits the prompt; out-of-workspace paths fall through and still
         // prompt. Reads the SAME live cwd handle below, so a /cd moves the boundary.
         .middleware(Arc::new(OpenFileWorkspaceGate::new(parts.shared_cwd.clone())))
+        // Workspace-aware, per-path approval for the file-mutation tools (v1 granularity):
+        // in-workspace non-sensitive writes auto-approve; sensitive writes always re-prompt
+        // (never remembered); out-of-workspace writes prompt with a PER-PATH "Always". Owns
+        // write-tool approval, so it must sit BEFORE the generic approval gate (its `Allow`
+        // short-circuits the prompt). Reads the SAME live cwd handle, so /cd moves the boundary.
+        .middleware(Arc::new(WriteApprovalGate::new(parts.shared_cwd.clone())))
         // Approval BEFORE any arg-rewriting middleware — the user approves the exact
         // bytes that run.
         .middleware(parts.approval.clone())
