@@ -251,26 +251,16 @@ pub enum UiTheme {
 }
 
 impl Config {
-    /// True iff attaching an image to the active turn will reach a model
-    /// that can process it — either the active provider accepts images
-    /// directly, or `vision_preprocessor_provider` points at a real entry
-    /// in `providers` that will OCR them before forwarding. Used by the
-    /// TUIX Ctrl+V paste gate to decide whether to accept the image or
-    /// reject with the "switch to a vision-capable model" hint.
+    /// True iff the active provider's model natively accepts image inputs.
+    /// This is the single gate for the TUIX Ctrl+V paste gate and the
+    /// vision indicator (eye icon) in the status line — both reflect the
+    /// active model's own capability, not whether a vision preprocessor
+    /// could OCR images on its behalf.
     pub fn can_handle_attached_images(&self) -> bool {
-        let active_accepts = self
-            .providers
+        self.providers
             .get(&self.default_provider)
             .map(|p| p.accepts_images())
-            .unwrap_or(false);
-        if active_accepts {
-            return true;
-        }
-        let vp_key = match self.vision_preprocessor_provider.as_deref() {
-            Some(k) if !k.is_empty() => k,
-            _ => return false,
-        };
-        self.providers.contains_key(vp_key)
+            .unwrap_or(false)
     }
 }
 
@@ -1286,24 +1276,24 @@ mod tests {
 
     #[test]
     fn can_handle_attached_images_true_when_active_provider_accepts_images() {
-        // Vision-capable main provider — preprocessor irrelevant.
         let cfg = cfg_with("claude-sonnet-4-5", None);
         assert!(cfg.can_handle_attached_images());
     }
 
     #[test]
-    fn can_handle_attached_images_false_for_text_only_main_and_no_preprocessor() {
-        // The original gate's behaviour: refuse paste.
+    fn can_handle_attached_images_false_for_text_only_model() {
+        // Text-only main provider — must refuse paste regardless of
+        // whether a vision_preprocessor_provider is configured.
         let cfg = cfg_with("deepseek-v4-flash", None);
         assert!(!cfg.can_handle_attached_images());
     }
 
     #[test]
-    fn can_handle_attached_images_false_when_preprocessor_key_does_not_resolve() {
-        // Configured but the key is missing from `providers`. Must NOT
-        // accept the paste — the user would just hit `[图片识别失败]` on
-        // every send. Better to surface the error at paste time.
-        let cfg = cfg_with("deepseek-v4-flash", Some("NoSuchProvider"));
+    fn can_handle_attached_images_false_for_text_only_even_with_preprocessor() {
+        // The preprocessor no longer gates paste acceptance — the status
+        // indicator and paste gate both reflect the active model's own
+        // capability.
+        let cfg = cfg_with("deepseek-v4-flash", Some("vl-helper"));
         assert!(!cfg.can_handle_attached_images());
     }
 
@@ -1311,34 +1301,6 @@ mod tests {
     fn can_handle_attached_images_false_when_preprocessor_key_is_empty_string() {
         let cfg = cfg_with("deepseek-v4-flash", Some(""));
         assert!(!cfg.can_handle_attached_images());
-    }
-
-    #[test]
-    fn can_handle_attached_images_true_when_preprocessor_resolves() {
-        // Main is text-only but a preprocessor is configured + present.
-        let mut cfg = cfg_with("deepseek-v4-flash", Some("vl-helper"));
-        cfg.providers.insert(
-            "vl-helper".into(),
-            crate::config::provider::ProviderConfig {
-                provider_type: "openai".into(),
-                api_key: Some("sk-vl".into()),
-                model: "Qwen/Qwen3-VL-32B-Instruct".into(),
-                base_url: Some("http://127.0.0.1/".into()),
-                system_prompt: None,
-                user_agent: None,
-                context_window: 8000,
-                max_tokens: None,
-                thinking_type: None,
-                thinking_keep: None,
-                reasoning_history: None,
-                reasoning_effort: None,
-                thinking_enabled: None,
-                thinking_budget: None,
-                skip_tls_verify: false,
-                ephemeral: false,
-            },
-        );
-        assert!(cfg.can_handle_attached_images());
     }
 }
 
