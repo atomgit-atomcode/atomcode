@@ -56,6 +56,10 @@ impl Tool for SearchReplaceTool {
     fn risk(&self, _args: &str) -> RiskLevel {
         RiskLevel::Risky // mutates the filesystem
     }
+    fn always_grant_scope(&self, _args: &str) -> String {
+        // Tool-wide: "总是 / Always" approves every search-replace this session (v1 parity).
+        String::new()
+    }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,

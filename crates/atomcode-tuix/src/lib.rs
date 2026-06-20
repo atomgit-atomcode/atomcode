@@ -58,6 +58,18 @@ struct TerminalGuard {
     kbd_flags_pushed: bool,
 }
 
+/// Whether to push the Kitty keyboard protocol (CSI u progressive
+/// enhancement) for this terminal. True only on a real non-Windows TTY
+/// that is not JediTerm. Windows has no `CSI u` decoder and JediTerm
+/// mis-frames mouse reports as kitty key events once the protocol is
+/// armed — both leak raw bytes into the input box (see the call site for
+/// the full rationale). Pure so it can be unit-tested without touching
+/// the real stdout. Mirrored by the resume-path gate in
+/// `RetainedRenderer::resume_after_external`.
+pub(crate) fn should_enable_kitty_keyboard(caps: &TerminalCaps) -> bool {
+    caps.tty && !cfg!(windows) && !caps.jediterm
+}
+
 impl TerminalGuard {
     /// Activate terminal capabilities. Returns `(guard, kbd_enhanced)` where
     /// `kbd_enhanced` indicates whether the Kitty keyboard protocol (CSI u)
@@ -113,8 +125,21 @@ impl TerminalGuard {
         // delivers the un-decoded bytes as the literal characters `[57400u`
         // straight into the input box. Unix crossterm decodes 57400 → '1';
         // Windows can't, so we simply don't ask the terminal to use it.
-        let kbd_enhanced = caps.tty
-            && !cfg!(windows)
+        //
+        // JEDITERM EXCLUSION: same failure class on JetBrains' JediTerm (the
+        // terminal inside DevEco Studio, IDEA, Android Studio, …). Recent
+        // JediTerm advertises the Kitty protocol but mis-implements it: while
+        // the progressive-enhancement flags are active it re-frames the
+        // terminal's mouse-tracking reports as `CSI <n> u` key events, so a
+        // bare mouse *move* over the panel floods stdin with kitty key
+        // sequences. crossterm faithfully decodes each `<n>` codepoint to a
+        // `Char`, which lands in the input box as a stream of coordinate
+        // gibberish (`#B'#B(#@)…`). The push buys nothing here either — the
+        // IDE terminals deliver Shift+Enter usably without it — so, exactly
+        // like Windows, we don't arm the protocol. Detection reuses
+        // `caps.jediterm` (`TERMINAL_EMULATOR=JetBrains-JediTerm`, with the
+        // `ATOMCODE_JEDITERM` override for launchers that drop the env var).
+        let kbd_enhanced = should_enable_kitty_keyboard(&caps)
             && execute!(
                 io::stdout(),
                 PushKeyboardEnhancementFlags(

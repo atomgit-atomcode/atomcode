@@ -166,6 +166,21 @@ pub trait Tool: Send + Sync {
     fn risk(&self, _args: &str) -> RiskLevel {
         RiskLevel::Safe
     }
+    /// The scope under which an "always" approval grant ("总是 / Always") is
+    /// remembered for THIS call. Two calls that yield the SAME scope string share a
+    /// single grant — approving "always" on one auto-approves the other for the
+    /// session. The conservative DEFAULT is the exact `args`, so each distinct call
+    /// is remembered on its own; this is correct for a tool like `bash`, where every
+    /// destructive command must be approved individually (approving `rm -rf foo`
+    /// must NOT blanket-approve `rm -rf bar`). A tool whose calls always differ in
+    /// args but whose approval is meaningfully tool-wide (`edit_file`, `write_file`,
+    /// …) overrides this to a constant so "Always" covers ALL its future calls this
+    /// session — matching v1's tool-wide `grant_session(&call.name)`. Advisory
+    /// metadata only: a specialization's approval middleware reads it; the kernel
+    /// itself never gates.
+    fn always_grant_scope(&self, args: &str) -> String {
+        args.to_string()
+    }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult;
 }
 
