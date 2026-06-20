@@ -271,6 +271,104 @@ async fn manual_compact_command_triggers_regardless_of_threshold() {
     let _ = handle.task.await;
 }
 
+// ── 3b. MANUAL Compact ANNOUNCES (CompactionStarted) BEFORE THE RESULT ───────
+// A `/compact` that WILL summarize drainable history emits `CompactionStarted` (the
+// driver's "compacting…" progress line) BEFORE the terminal `Compacted` — so the UI
+// can show progress during the (real, possibly slow) summary work.
+#[tokio::test]
+async fn manual_compact_emits_started_before_compacted_when_summarizing() {
+    let provider = Arc::new(
+        RecordingProvider::new(vec![vec![
+            StreamEvent::TextDelta("an assistant answer long enough to drain later".into()),
+            StreamEvent::Done { truncated: false },
+        ]])
+        .with_ctx_window(1000),
+    );
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 0 }))
+        .build()
+        .spawn();
+
+    let _ = drive_turn_collect(&mut handle, "the task with several words to drain later").await;
+
+    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    let mut events = Vec::new();
+    while let Some(ev) = handle.events.recv().await {
+        let done = matches!(ev, AgentEvent::Compacted { .. });
+        events.push(ev);
+        if done {
+            break;
+        }
+    }
+
+    let started = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::CompactionStarted { .. }))
+        .expect("a summarizing /compact must emit CompactionStarted");
+    let compacted = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Compacted { .. }))
+        .expect("and a terminal Compacted");
+    assert!(started < compacted, "CompactionStarted must precede Compacted");
+    assert!(
+        matches!(events[compacted], AgentEvent::Compacted { committed: true, .. }),
+        "the strategy shrinks → committed"
+    );
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
+// ── 3c. A NO-OP MANUAL Compact STAYS SILENT (no spurious "compacting…") ───────
+// When the strategy won't summarize (nothing older than the kept tail), the kernel
+// must NOT emit `CompactionStarted` — so a driver never shows "compacting…" ahead of
+// "nothing to compact". This is the fix for the short-conversation divergence.
+#[tokio::test]
+async fn manual_compact_stays_silent_when_nothing_to_summarize() {
+    let provider = Arc::new(
+        RecordingProvider::new(vec![vec![
+            StreamEvent::TextDelta("short".into()),
+            StreamEvent::Done { truncated: false },
+        ]])
+        .with_ctx_window(1000),
+    );
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        // keep_recent huge → nothing drainable → plan is a noop → will_summarize=false.
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 100 }))
+        .build()
+        .spawn();
+
+    let _ = drive_turn_collect(&mut handle, "the task").await;
+
+    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    let mut events = Vec::new();
+    while let Some(ev) = handle.events.recv().await {
+        let done = matches!(ev, AgentEvent::Compacted { .. });
+        events.push(ev);
+        if done {
+            break;
+        }
+    }
+
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::CompactionStarted { .. })),
+        "a no-op /compact must NOT announce 'compacting…'"
+    );
+    assert!(
+        matches!(events.last(), Some(AgentEvent::Compacted { committed: false, .. })),
+        "a no-op /compact still emits a (refused) Compacted"
+    );
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
 // ── 4. NET-LOSS PLAN IS REFUSED — NO EPOCH BUMP ──────────────────────────────
 // Inject a strategy whose plan does NOT shrink → Compacted { committed: false },
 // cache_epoch unchanged, history byte-identical.

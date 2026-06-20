@@ -49,18 +49,24 @@ pub(crate) fn spawn_live_forwarder(
     runtime_id: RuntimeId,
     fan_tx: mpsc::UnboundedSender<RuntimeEvent>,
 ) -> tokio::task::JoinHandle<()> {
+    let session_ptr = Arc::as_ptr(&session) as usize;
     tokio::spawn(async move {
+        eprintln!("[DEBUG forwarder] START session_ptr={:#x} runtime_id={:?}", session_ptr, runtime_id);
         let (_snapshot, mut rx) = session.join().await;
+        eprintln!("[DEBUG forwarder] JOINED session_ptr={:#x} snapshot_len={}", session_ptr, _snapshot.len());
         loop {
             match rx.recv().await {
                 Ok(LiveEvent::Turn(te)) => {
+                    eprintln!("[DEBUG forwarder] Turn event: {:?}", std::mem::discriminant(&te));
                     if let Some(ae) = turn_to_agent_event(te) {
                         if fan_tx.send(RuntimeEvent { runtime_id, event: ae }).is_err() {
+                            eprintln!("[DEBUG forwarder] fan_tx closed, breaking");
                             break;
                         }
                     }
                 }
                 Ok(LiveEvent::UserMessage { text, .. }) => {
+                    eprintln!("[DEBUG forwarder] UserMessage: {} chars", text.len());
                     if fan_tx
                         .send(RuntimeEvent { runtime_id, event: AgentEvent::UserEcho(text) })
                         .is_err()
@@ -70,6 +76,7 @@ pub(crate) fn spawn_live_forwarder(
                 }
                 Ok(LiveEvent::StateChanged(st)) => {
                     let running = matches!(st, atomcode_core::live::TurnState::Running);
+                    eprintln!("[DEBUG forwarder] StateChanged: running={}", running);
                     if fan_tx
                         .send(RuntimeEvent { runtime_id, event: AgentEvent::PeerBusy(running) })
                         .is_err()
@@ -78,6 +85,7 @@ pub(crate) fn spawn_live_forwarder(
                     }
                 }
                 Ok(LiveEvent::ProviderChanged(provider)) => {
+                    eprintln!("[DEBUG forwarder] ProviderChanged: {}", provider);
                     if fan_tx
                         .send(RuntimeEvent { runtime_id, event: AgentEvent::ProviderChanged(provider) })
                         .is_err()
@@ -89,6 +97,7 @@ pub(crate) fn spawn_live_forwarder(
                 // Mapped to ProjectSwitched (not WorkingDirChanged) so the agent's
                 // own in-turn `cd` never triggers a session reset.
                 Ok(LiveEvent::WorkingDirChanged(dir)) => {
+                    eprintln!("[DEBUG forwarder] WorkingDirChanged: {:?}", dir);
                     if fan_tx
                         .send(RuntimeEvent { runtime_id, event: AgentEvent::ProjectSwitched(dir) })
                         .is_err()
@@ -98,6 +107,7 @@ pub(crate) fn spawn_live_forwarder(
                 }
                 // webui 新建对话 → follow it: TUI 切换到新会话。
                 Ok(LiveEvent::SessionSwitched(session_id)) => {
+                    eprintln!("[DEBUG forwarder] SessionSwitched: {}", session_id);
                     if fan_tx
                         .send(RuntimeEvent { runtime_id, event: AgentEvent::SessionSwitched(session_id) })
                         .is_err()
@@ -105,10 +115,17 @@ pub(crate) fn spawn_live_forwarder(
                         break;
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("[DEBUG forwarder] Lagged: {} events lost", n);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[DEBUG forwarder] recv error: {:?}, breaking", e);
+                    break;
+                }
             }
         }
+        eprintln!("[DEBUG forwarder] EXIT session_ptr={:#x}", session_ptr);
     })
 }
 

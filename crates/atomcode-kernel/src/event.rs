@@ -149,6 +149,11 @@ pub enum AgentEvent {
     Reasoning(String),
     /// Non-fatal advisory (e.g. a truncated response). The turn still completes.
     Warning(String),
+    /// A compaction is ABOUT TO RUN — emitted before the strategy plans/summarizes
+    /// (a manual `/compact` may make a slow one-shot LLM summary call here). Lets a
+    /// driver show a "compacting…" progress line before the possibly multi-second
+    /// work; the outcome (sizes / committed) is not known yet — see `Compacted`.
+    CompactionStarted { trigger: crate::message::CompactTrigger },
     /// A compaction was ATTEMPTED (mirrors `message::CompactReport`). `committed`
     /// distinguishes a real shrink (history rewritten, `epoch` bumped to the NEW
     /// generation, `bytes_after < bytes_before`) from a REFUSED one (net-loss guard

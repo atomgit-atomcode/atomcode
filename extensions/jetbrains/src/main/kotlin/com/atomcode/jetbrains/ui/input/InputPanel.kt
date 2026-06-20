@@ -3,17 +3,23 @@ package com.atomcode.jetbrains.ui.input
 import com.atomcode.jetbrains.ui.ChatContextItem
 import com.intellij.ui.JBColor
 import java.awt.BorderLayout
+import java.awt.CardLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
+import java.awt.Insets
 import javax.swing.BoxLayout
 import javax.swing.AbstractAction
 import javax.swing.BorderFactory
 import javax.swing.JButton
 import javax.swing.JLabel
 import javax.swing.JPanel
+import javax.swing.JPopupMenu
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
 import javax.swing.KeyStroke
+import javax.swing.SwingUtilities
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
 
 /**
  * 输入区域容器：ContextChips + 输入行 + 底部工具栏。Claude Code 风格。
@@ -27,6 +33,8 @@ class InputPanel(
     private val onRemoveContext: (ChatContextItem) -> Unit,
     private val onModelSelect: () -> Unit,
 ) : JPanel(BorderLayout()) {
+
+    private var slashTriggerConsumed = false
 
     private val inputArea = JTextArea().apply {
         rows = 3
@@ -45,7 +53,8 @@ class InputPanel(
         // JBColor(亮色, 暗色) — 白色文字在两个主题下都适用
         foreground = JBColor(0xFFFFFF, 0xFFFFFF)
         isFocusPainted = false
-        border = BorderFactory.createEmptyBorder(6, 14, 6, 14)
+        border = BorderFactory.createEmptyBorder(5, 12, 5, 12)
+        preferredSize = Dimension(72, 30)
         isOpaque = true
         addActionListener { fireSend() }
     }
@@ -53,11 +62,11 @@ class InputPanel(
     private val stopButton = JButton("⏹ 停止").apply {
         font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 1f)
         background = STOP_BG
-        foreground = JBColor(0xFFFFFF, 0xFFFFFF)
+        foreground = STOP_FG
         isFocusPainted = false
         isOpaque = true
-        border = BorderFactory.createEmptyBorder(6, 14, 6, 14)
-        isVisible = false
+        border = BorderFactory.createEmptyBorder(5, 12, 5, 12)
+        preferredSize = Dimension(72, 30)
         addActionListener { onStop() }
     }
 
@@ -80,68 +89,86 @@ class InputPanel(
         })
     }
 
+    private val shortcutLabel = JLabel("Enter 发送 · Shift+Enter 换行").apply {
+        font = font.deriveFont(font.size2D - 2f)
+        foreground = SECONDARY_FG
+    }
+
+    private val actionCards = CardLayout()
+    private val actionPanel = JPanel(actionCards).apply {
+        isOpaque = false
+        add(sendButton, SEND_CARD)
+        add(stopButton, STOP_CARD)
+        preferredSize = Dimension(72, 30)
+    }
+
     init {
         isOpaque = true
         // JBColor(亮色, 暗色)
         background = JBColor(0xF5F5F5, 0x1E1E1E)
 
+        inputArea.document.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(event: DocumentEvent) = handleSlashTrigger()
+            override fun removeUpdate(event: DocumentEvent) = handleSlashTrigger()
+            override fun changedUpdate(event: DocumentEvent) = handleSlashTrigger()
+        })
+
         val inputScroll = JScrollPane(inputArea).apply {
-            // JBColor(亮色, 暗色)
-            border = BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(JBColor(0xBBBBBB, 0x444444), 1),
-                BorderFactory.createEmptyBorder(0, 0, 0, 0),
-            )
-            preferredSize = Dimension(200, 58)
-            minimumSize = Dimension(100, 40)
+            border = BorderFactory.createEmptyBorder()
+            isOpaque = false
+            viewport.isOpaque = false
+            preferredSize = Dimension(200, 68)
+            minimumSize = Dimension(100, 48)
             horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
             verticalScrollBarPolicy = JScrollPane.VERTICAL_SCROLLBAR_NEVER
         }
 
-        val buttonPanel = JPanel(BorderLayout(0, 4)).apply {
-            isOpaque = false
-            add(sendButton, BorderLayout.NORTH)
-            add(stopButton, BorderLayout.SOUTH)
-        }
-
-        val inputRow = JPanel(BorderLayout(6, 0)).apply {
-            isOpaque = false
-            border = BorderFactory.createEmptyBorder(6, 8, 0, 8)
-            add(inputScroll, BorderLayout.CENTER)
-            add(buttonPanel, BorderLayout.EAST)
-        }
-
-        // 底部工具栏：左(附件/命令) + 右(提示/token/model)
+        // 工具栏与输入框放在同一个 composer 容器内，状态切换时布局保持稳定。
         val toolbar = JPanel(BorderLayout()).apply {
             isOpaque = false
-            border = BorderFactory.createEmptyBorder(2, 10, 6, 10)
-            val left = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply {
+            border = BorderFactory.createEmptyBorder(5, 2, 1, 2)
+            val left = JPanel(FlowLayout(FlowLayout.LEFT, 2, 0)).apply {
                 isOpaque = false
-                add(makeToolButton("📎 附件", onAttach))
-                add(makeToolButton("⚡ /命令", onSlashCommand))
+                add(makeToolButton("附件", onAttach))
+                add(makeToolButton("/ 命令", onSlashCommand))
             }
-            val right = JPanel(FlowLayout(FlowLayout.RIGHT, 8, 0)).apply {
+            val right = JPanel(FlowLayout(FlowLayout.RIGHT, 10, 0)).apply {
                 isOpaque = false
-                add(JLabel("Enter 发送 · Shift+Enter 换行").apply {
-                    font = font.deriveFont(font.size2D - 2f)
-                    foreground = JBColor(0xAAAAAA, 0x555555)
-                })
+                add(shortcutLabel)
                 add(tokenLabel)
                 add(modelLabel)
+                add(actionPanel)
             }
             add(left, BorderLayout.WEST)
             add(right, BorderLayout.EAST)
+        }
+
+        val composer = JPanel(BorderLayout()).apply {
+            isOpaque = true
+            background = INPUT_BG
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(COMPOSER_BORDER, 1, true),
+                BorderFactory.createEmptyBorder(5, 9, 7, 7),
+            )
+            add(contextChips, BorderLayout.NORTH)
+            add(inputScroll, BorderLayout.CENTER)
+            add(toolbar, BorderLayout.SOUTH)
+        }
+
+        val composerInset = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            border = BorderFactory.createEmptyBorder(8, 10, 10, 10)
+            add(composer, BorderLayout.CENTER)
         }
 
         val chips = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
             add(queueChips)
-            add(contextChips)
         }
 
         add(chips, BorderLayout.NORTH)
-        add(inputRow, BorderLayout.CENTER)
-        add(toolbar, BorderLayout.SOUTH)
+        add(composerInset, BorderLayout.CENTER)
     }
 
     fun getInputText(): String = inputArea.text
@@ -154,10 +181,12 @@ class InputPanel(
         inputArea.requestFocusInWindow()
     }
 
+    fun showCommandPopup(menu: JPopupMenu) {
+        menu.show(inputArea, 0, -menu.preferredSize.height)
+    }
+
     fun setGenerating(generating: Boolean) {
-        sendButton.isVisible = !generating
-        stopButton.isVisible = generating
-        sendButton.text = if (generating) "排队中" else "↑ 发送"
+        actionCards.show(actionPanel, if (generating) STOP_CARD else SEND_CARD)
     }
 
     fun setContextItems(items: List<ChatContextItem>) {
@@ -183,6 +212,12 @@ class InputPanel(
     fun installKeyBindings(sendWithCtrlEnter: Boolean) {
         val enterAction = "atomcode-input-enter"
         val ctrlEnterAction = "atomcode-input-ctrl-enter"
+
+        shortcutLabel.text = if (sendWithCtrlEnter) {
+            "Ctrl+Enter 发送 · Enter 换行"
+        } else {
+            "Enter 发送 · Shift+Enter 换行"
+        }
 
         inputArea.inputMap.put(KeyStroke.getKeyStroke("ENTER"), enterAction)
         inputArea.actionMap.put(enterAction, object : AbstractAction() {
@@ -215,12 +250,27 @@ class InputPanel(
         }
     }
 
+    private fun handleSlashTrigger() {
+        val isSlashOnly = inputArea.text.trim() == "/"
+        if (!isSlashOnly) {
+            slashTriggerConsumed = false
+            return
+        }
+        if (slashTriggerConsumed) return
+
+        slashTriggerConsumed = true
+        SwingUtilities.invokeLater {
+            if (inputArea.text.trim() == "/") onSlashCommand()
+        }
+    }
+
     private fun makeToolButton(text: String, action: () -> Unit): JButton =
         JButton(text).apply {
             font = font.deriveFont(font.size2D - 2f)
             isContentAreaFilled = false
             isBorderPainted = false
             isFocusPainted = false
+            margin = Insets(2, 5, 2, 5)
             // JBColor(亮色, 暗色)
             foreground = JBColor(0x666666, 0x999999)
             addActionListener { action() }
@@ -230,7 +280,12 @@ class InputPanel(
         // JBColor(亮色, 暗色)
         private val INPUT_BG = JBColor(0xFFFFFF, 0x2D2D2D)
         private val INPUT_FG = JBColor(0x333333, 0xD4D4D4)
+        private val COMPOSER_BORDER = JBColor(0xC9C9C9, 0x454545)
+        private val SECONDARY_FG = JBColor(0x8A8A8A, 0x707070)
         private val SEND_BG = JBColor(0x0078D4, 0x0E639C)
-        private val STOP_BG = JBColor(0xC04040, 0xA03030)
+        private val STOP_BG = JBColor(0xF4DEDE, 0x4A2424)
+        private val STOP_FG = JBColor(0xA52D2D, 0xF48771)
+        private const val SEND_CARD = "send"
+        private const val STOP_CARD = "stop"
     }
 }

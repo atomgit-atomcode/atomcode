@@ -343,6 +343,14 @@ async fn drive_turn(
             }
             AgentEvent::Error { message, .. } => eprintln!("\n[error] {message}"),
             AgentEvent::Warning(w) => eprintln!("[warn] {w}"),
+            AgentEvent::CompactionStarted { trigger } => {
+                // The kernel only fires this when a real drain/summary will run; show a
+                // progress line for a user-typed `/compact` (matches the bridge/TUI).
+                // Auto/overflow stay silent in a headless CLI.
+                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                    eprintln!("[compacting …]");
+                }
+            }
             AgentEvent::Compacted { committed, .. } => {
                 eprintln!("[compacted{}]", if committed { "" } else { " — refused (no gain)" });
             }

@@ -105,6 +105,8 @@ class AtomCodeChatPanel(
     private var loadingSessions = false
     private var loadingModels = false
     private var generating = false
+    private var generationSequence = 0L
+    private var activeGenerationId: Long? = null
     private var setupSnapshot: SetupSnapshot? = null
     private var currentSession: SessionRefView? = null
     private val streamHandler = StreamEventHandler(messageView)
@@ -158,6 +160,7 @@ class AtomCodeChatPanel(
         queuedPrompts.clear()
         pendingContext.clear()
         service.removeConnectionListener(connectionListener)
+        messageView.dispose()
     }
 
     fun focusInput() {
@@ -515,6 +518,7 @@ class AtomCodeChatPanel(
                     rename.isEnabled = true
                     if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to rename session"); return@invokeLater }
                     sessions = updated.sortedByDescending { it.updatedAt }; replaceSessions(sessions, selected.id); refill(sessions)
+                    updateCurrentSessionTitle(selected.id, nextName)
                     addSystemMessage("Session renamed to $nextName.")
                 }
             }
@@ -558,7 +562,9 @@ class AtomCodeChatPanel(
         service.renameSession(selected, nextName).whenComplete { sessions, error ->
             SwingUtilities.invokeLater {
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to rename session"); return@invokeLater }
-                replaceSessions(sessions, selected.id); addSystemMessage("Session renamed to $nextName.")
+                replaceSessions(sessions, selected.id)
+                updateCurrentSessionTitle(selected.id, nextName)
+                addSystemMessage("Session renamed to $nextName.")
             }
         }
     }
@@ -614,11 +620,17 @@ class AtomCodeChatPanel(
 
     // ── Session list ──
 
-    private fun refreshSessionList() {
+    private fun refreshSessionList(updateCurrentTabTitle: Boolean = false) {
         service.refreshSessions().whenComplete { sessions, error ->
             SwingUtilities.invokeLater {
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to load sessions"); return@invokeLater }
                 replaceSessions(sessions, currentSession?.id)
+                if (updateCurrentTabTitle) {
+                    val activeSessionId = currentSession?.id
+                    sessions.firstOrNull { it.id == activeSessionId }?.let {
+                        updateCurrentSessionTitle(it.id, it.displayName)
+                    }
+                }
             }
         }
     }
@@ -646,6 +658,7 @@ class AtomCodeChatPanel(
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to load session"); return@invokeLater }
                 currentSession = SessionRefView(detail.id, detail.name, detail.projectHash, detail.workingDir)
                 runtime?.loadSession(detail)
+                updateAtomCodeChatTabTitle(project, this@AtomCodeChatPanel, detail.name.ifBlank { detail.id.take(8) })
                 persistRuntimeSession()
                 replaceSelectedSession(detail.id); renderSession(detail); inputPanel.focusInput()
             }
@@ -659,10 +672,20 @@ class AtomCodeChatPanel(
     }
 
     private fun renderHistoryMessage(message: MessageInfo) {
-        val label = when (message.role) {
-            "user" -> "You"; "assistant" -> "AtomCode"; "tool" -> "Tool"; "system" -> "System"; else -> message.role.ifBlank { "Message" }
+        when (message.role.lowercase()) {
+            "user" -> {
+                val restored = decodeHistoryUserMessage(message.content)
+                messageView.addUserMessage(restored.text, restored.contextSummary)
+            }
+            "assistant" -> {
+                messageView.beginAssistantTurn()
+                messageView.addAssistantMessage(message.content)
+                messageView.finishAssistantTurn()
+            }
+            "tool" -> addSystemMessage("Tool: ${message.content}")
+            "system" -> addSystemMessage(message.content)
+            else -> addSystemMessage(message.content)
         }
-        addSystemMessage("$label: ${message.content}\n")
     }
 
     // ── Send / Chat streaming ──
@@ -690,13 +713,12 @@ class AtomCodeChatPanel(
     }
 
     private fun startPrompt(prompt: String, message: String, contextNames: List<String>) {
+        val generationId = ++generationSequence
+        activeGenerationId = generationId
         // Add user message + immediate thinking feedback
         renderQueueState()
-        messageView.addUserMessage(prompt)
+        messageView.addUserMessage(prompt, contextNames)
         messageView.beginAssistantTurn()
-        if (contextNames.isNotEmpty()) {
-            addSystemMessage("[Context] ${contextNames.joinToString()}")
-        }
         messageView.addThinkingIndicator()
         inputPanel.clearInput()
         generating = true
@@ -707,22 +729,26 @@ class AtomCodeChatPanel(
         service.sendPrompt(message, currentSession, object : ChatStreamListener {
             override fun onEvent(event: ChatEvent) {
                 SwingUtilities.invokeLater {
+                    if (activeGenerationId != generationId) return@invokeLater
                     renderChatEvent(event)
-                    if (isTerminalEvent(event)) finishPromptAndContinue()
+                    if (isTerminalEvent(event)) finishPromptAndContinue(generationId)
                 }
             }
             override fun onComplete() {
                 SwingUtilities.invokeLater {
+                    if (activeGenerationId != generationId) return@invokeLater
                     streamHandler.onComplete()
-                    finishPromptAndContinue()
+                    finishPromptAndContinue(generationId)
                 }
             }
             override fun onError(message: String) {
-                SwingUtilities.invokeLater { streamHandler.onError(message) }
+                SwingUtilities.invokeLater {
+                    if (activeGenerationId == generationId) streamHandler.onError(message)
+                }
             }
         }, onSessionReady = { session ->
             SwingUtilities.invokeLater {
-                currentSession = session
+                setCurrentSessionReference(session)
                 runtime?.updateSession(session)
                 replaceSelectedSession(session.id)
                 persistRuntimeSession()
@@ -730,8 +756,13 @@ class AtomCodeChatPanel(
         }, provider = provider).whenComplete { session, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
-                    finishPromptAndContinue()
-                } else if (session != null) { currentSession = session; runtime?.updateSession(session); replaceSelectedSession(session.id); persistRuntimeSession() }
+                    finishPromptAndContinue(generationId)
+                } else if (session != null) {
+                    setCurrentSessionReference(session)
+                    runtime?.updateSession(session)
+                    replaceSelectedSession(session.id)
+                    persistRuntimeSession()
+                }
             }
         }
     }
@@ -742,7 +773,7 @@ class AtomCodeChatPanel(
             is ChatEvent.Text -> streamHandler.onText(event.content)
             is ChatEvent.Reasoning -> streamHandler.onReasoning(event.content)
             is ChatEvent.ToolBatch -> streamHandler.onToolBatch()
-            is ChatEvent.ToolStart -> streamHandler.onToolStart(event.name)
+            is ChatEvent.ToolStart -> streamHandler.onToolStart(event.name, event.arguments)
             is ChatEvent.ToolOutput -> streamHandler.onToolOutput(event.chunk)
             is ChatEvent.ToolResult -> streamHandler.onToolResult(event.name, event.output, event.success, event.durationMs)
             is ChatEvent.ArtifactStart -> streamHandler.onArtifactStart(event.title)
@@ -752,7 +783,8 @@ class AtomCodeChatPanel(
                 streamHandler.onPermissionRequired(event)
                 requestPermissionDecision(event)
             }
-            is ChatEvent.Tokens, is ChatEvent.Done -> { /* no-op */ }
+            is ChatEvent.Tokens -> { /* no-op */ }
+            is ChatEvent.Done -> refreshSessionList(updateCurrentTabTitle = true)
             ChatEvent.Stopped -> streamHandler.onStopped()
             is ChatEvent.Error -> streamHandler.onError(event.message)
             is ChatEvent.Unknown -> streamHandler.onUnknown(event.type)
@@ -762,24 +794,32 @@ class AtomCodeChatPanel(
     private fun isTerminalEvent(event: ChatEvent): Boolean =
         event is ChatEvent.Done || event is ChatEvent.Error || event == ChatEvent.Stopped
 
-    private fun finishPromptAndContinue() {
-        finishPrompt()
-        // 如果思考指示器未被替换（即 AI 没有输出任何内容），直接移除它
-        if (!streamHandler.hasOutput) {
-            messageView.removeThinkingIndicator()
-        }
+    private fun finishPromptAndContinue(generationId: Long) {
+        if (!generating || activeGenerationId != generationId) return
+
+        messageView.finishAssistantTurn()
         val next = if (queuedPrompts.isEmpty()) null else queuedPrompts.removeFirst()
-        if (next == null) { renderQueueState(); return }
+        if (next == null) {
+            finishPrompt(generationId, assistantAlreadyFinished = true)
+            return
+        }
+
+        // Keep the composer in its generating state while handing off to the queued
+        // prompt. Clearing it for one event-loop turn causes the visible flash.
+        activeGenerationId = null
         runtime?.removeQueuedPrompt(next.id)
-        renderQueueState()
-        addSystemMessage("Sending queued message...")
         startPrompt(next.prompt, next.message, next.contextNames)
     }
 
-    private fun finishPrompt() {
+    private fun finishPrompt(
+        expectedGenerationId: Long? = activeGenerationId,
+        assistantAlreadyFinished: Boolean = false,
+    ) {
         if (!generating) return
+        if (expectedGenerationId != null && activeGenerationId != expectedGenerationId) return
+        activeGenerationId = null
         generating = false
-        messageView.finishAssistantTurn()
+        if (!assistantAlreadyFinished) messageView.finishAssistantTurn()
         inputPanel.setGenerating(false)
         inputPanel.focusInput()
         renderQueueState()
@@ -871,7 +911,26 @@ class AtomCodeChatPanel(
 
     private fun persistRuntimeSession() {
         val runtime = runtime ?: return
-        SessionWorkspace.getInstance(project).updateRuntimeSession(runtime)
+        val session = currentSession ?: return
+        SessionWorkspace.getInstance(project).updateTabSession(runtime.tabId, session)
+    }
+
+    private fun updateCurrentSessionTitle(sessionId: String, title: String) {
+        val session = currentSession?.takeIf { it.id == sessionId } ?: return
+        val normalizedTitle = title.trim().ifBlank { session.id.take(8) }
+        currentSession = session.copy(name = normalizedTitle)
+        runtime?.updateSession(currentSession)
+        updateAtomCodeChatTabTitle(project, this, normalizedTitle)
+        persistRuntimeSession()
+    }
+
+    private fun setCurrentSessionReference(session: SessionRefView) {
+        val existing = currentSession
+        currentSession = if (existing?.id == session.id) {
+            session.copy(name = existing.name)
+        } else {
+            session
+        }
     }
 
     private fun installInputKeyBindings() {
@@ -969,14 +1028,16 @@ class AtomCodeChatPanel(
             PathSensitivity.Warn, PathSensitivity.Normal -> Unit
         }
         if (settings.state.autoSaveBeforeRead) {
-            com.intellij.openapi.application.WriteIntentReadAction.run { FileDocumentManager.getInstance().saveAllDocuments() }; file.refresh(false, false)
+            com.intellij.openapi.application.WriteIntentReadAction.run {
+                FileDocumentManager.getInstance().saveAllDocuments()
+                file.refresh(false, false)
+            }
         }
         val content = try { String(file.contentsToByteArray(), Charsets.UTF_8) } catch (error: Exception) { Messages.showWarningDialog(project, "Could not read ${file.name}: ${error.message}", "AtomCode"); return }
         if (content.isBlank()) return
         if (content.length > MAX_ATTACHED_FILE_CHARS) { Messages.showWarningDialog(project, "This file is too large to attach. Select a smaller file or attach a selection.", "AtomCode"); return }
         val relative = project.basePath?.let { base -> if (path.startsWith(base)) path.removePrefix(base).trimStart('/', '\\') else path } ?: path
         addContext(ChatContextItem(path = path, displayName = relative, language = file.extension ?: "text", content = content, selection = null, startLine = null, endLine = null))
-        addSystemMessage("Attached $relative.")
     }
 
     // ── Slash commands ──
@@ -985,7 +1046,6 @@ class AtomCodeChatPanel(
         val command = prompt.split(Regex("\\s+"), limit = 2).firstOrNull()?.lowercase() ?: return false
         return when (command) {
             "/login" -> { addSystemMessage("Opening AtomGit sign-in in your browser..."); login(); true }
-            "/codingplan" -> { addSystemMessage("Running CodingPlan setup..."); runSetup(); true }
             else -> false
         }
     }
@@ -1006,18 +1066,10 @@ class AtomCodeChatPanel(
         menu.add(JMenuItem("🔑 Login").apply { addActionListener { login() } })
         menu.add(JMenuItem("🚀 CodingPlan Setup").apply { addActionListener { runSetup() } })
         menu.add(JSeparator())
-        menu.add(JMenuItem("➕ New Chat Tab").apply { addActionListener { openAtomCodeChatTab(project, newTab = true) } })
-        menu.add(JMenuItem("✖ Close Current Tab").apply { addActionListener { closeCurrentChatTab(project) } })
-        menu.add(JSeparator())
         menu.add(JMenuItem("📋 Session History...").apply { addActionListener { showSessionHistory() } })
         menu.add(JMenuItem("✏️ Rename Session").apply { addActionListener { renameSelectedSession() } })
         menu.add(JMenuItem("🗑 Delete Session").apply { addActionListener { deleteSelectedSession() } })
         menu.add(JMenuItem("🔄 Refresh Sessions").apply { addActionListener { refreshSessionList() } })
-        menu.add(JSeparator())
-        menu.add(JMenuItem("💬 Slash Commands...").apply { addActionListener { showCommandMenu() } })
-        menu.add(JSeparator())
-        menu.add(JMenuItem("📋 Copy Last Response").apply { addActionListener { copyLastAssistantResponse() } })
-        menu.add(JMenuItem("📝 Apply Last Code Block").apply { addActionListener { applyLastCodeBlock() } })
         menu.add(JSeparator())
         menu.add(JMenuItem("📂 Open Changes").apply { addActionListener { openProjectChanges() } })
         menu.add(JMenuItem("🩺 Diagnostics").apply { addActionListener { showDiagnostics() } })
@@ -1028,18 +1080,15 @@ class AtomCodeChatPanel(
     private fun showCommandMenu() {
         val menu = JPopupMenu()
         val items = listOf(
-            SlashCommand("/login", "Sign in with AtomGit"), SlashCommand("/codingplan", "Sync CodingPlan models"),
-            SlashCommand("/explain", "Explain code"), SlashCommand("/fix", "Fix issues"),
-            SlashCommand("/test", "Write tests"), SlashCommand("/refactor", "Refactor code"),
-            SlashCommand("/docs", "Add documentation"), SlashCommand("/review", "Review code"),
-            SlashCommand("/optimize", "Optimize performance"),
+            SlashCommand("/login", "Sign in with AtomGit"),
+            SlashCommand("/review", "Review code"),
         )
         items.forEach { command ->
             menu.add(JMenuItem("${command.name} - ${command.description}").apply {
                 addActionListener { inputPanel.setInputText("${command.name} "); inputPanel.focusInput() }
             })
         }
-        val pointer = java.awt.MouseInfo.getPointerInfo().location; SwingUtilities.convertPointFromScreen(pointer, this); menu.show(this, pointer.x, pointer.y)
+        inputPanel.showCommandPopup(menu)
     }
 
     private fun showModelPickerPopup() {
@@ -1072,6 +1121,30 @@ data class ChatContextItem(
     val content: String, val selection: String?, val startLine: Int?, val endLine: Int?,
 )
 
+internal data class HistoryUserMessage(
+    val text: String,
+    val contextSummary: List<String>,
+)
+
+/** Restores the visible prompt from the context-enriched message persisted by the daemon. */
+internal fun decodeHistoryUserMessage(content: String): HistoryUserMessage {
+    val questionMarker = "\nUser question: "
+    val questionIndex = content.lastIndexOf(questionMarker)
+    if (!content.startsWith("The user has attached the following file(s)/selection(s) for context.") || questionIndex < 0) {
+        return HistoryUserMessage(content, emptyList())
+    }
+
+    val contextPrefix = content.substring(0, questionIndex)
+    val contextNames = HISTORY_CONTEXT_FILE_PATTERN.findAll(contextPrefix)
+        .map { match -> match.groupValues[1].trim() }
+        .toList()
+    val question = content.substring(questionIndex + questionMarker.length)
+    return HistoryUserMessage(question, contextNames)
+}
+
+private val HISTORY_CONTEXT_FILE_PATTERN =
+    Regex("(?m)^File: (.+?)(?: \\(lines \\d+-\\d+\\))?\\r?\\n```")
+
 private fun ChatContextItem.toContextItemState(): ContextItemState =
     ContextItemState(
         id = "$path:${startLine ?: 0}:${endLine ?: 0}:${selection?.hashCode() ?: 0}",
@@ -1087,13 +1160,7 @@ internal fun slashPromptTemplate(prompt: String): String? {
     val command = parts.firstOrNull()?.lowercase() ?: return null
     val suffix = parts.getOrNull(1)?.trim().orEmpty()
     val template = when (command) {
-        "/explain" -> "Please explain this code. What does it do, and why?"
-        "/fix" -> "Please fix any bugs or issues in this code."
-        "/test" -> "Please write tests for this code."
-        "/refactor" -> "Please refactor this code for better readability and maintainability."
-        "/docs" -> "Please add documentation comments to this code."
         "/review" -> "Please review this code for issues, improvements, and best practices."
-        "/optimize" -> "Please optimize this code for better performance and readability."
         else -> return null
     }
     return if (suffix.isBlank()) template else "$template\n\n$suffix"

@@ -64,6 +64,88 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
     }
 }
 
+/// Whether atomcode should take over the conhost console input mode (clear
+/// QuickEdit + mouse input via [`conhost::disable_conhost_quick_edit`]). ONLY on a
+/// real **legacy-conhost** TTY — that's the only host with the click-to-freeze
+/// bug. On Windows Terminal / VSCode ConPTY (`legacy_conhost = false`) clearing
+/// QuickEdit makes ConPTY enable mouse forwarding, which kills the terminal's
+/// native click-drag selection (the "can't click / can't copy on Windows
+/// Terminal" regression) — so leave the console mode untouched there. Pure +
+/// cross-platform-testable (the syscall site is `#[cfg(windows)]`).
+#[cfg(any(windows, test))]
+fn manage_conhost_quick_edit(tty: bool, legacy_conhost: bool) -> bool {
+    tty && legacy_conhost
+}
+
+/// Marker prefix for the dedicated footer goal row. A width-1 BMP "ring" from
+/// the Geometric Shapes block when the terminal's font has it, ASCII `*`
+/// otherwise — the SAME `unicode_symbols` gate the spinner (`◐`→`|/-\`) and
+/// ellipsis (`…`→`...`) use, so Windows legacy conhost / Consolas don't show
+/// `□` tofu. Deliberately NOT an emoji (e.g. 🎯): emoji width is rendered
+/// inconsistently across terminals and would drift every column after it in the
+/// cell-diff renderer, and emoji font coverage is far spottier than Geometric
+/// Shapes. Both variants are width-1 + a trailing space, so the layout math is
+/// identical either way.
+fn goal_marker(unicode: bool) -> &'static str {
+    if unicode {
+        "◎ "
+    } else {
+        "* "
+    }
+}
+
+/// The three display segments of the dedicated footer goal row, width-fitted:
+/// `(marker, condition, meta)`. The caller styles each independently — marker as
+/// an accent, condition as normal text, `meta` (` · round N · elapsed`) muted —
+/// so the row reads as a calm persistent status with hierarchy, not a loud
+/// activity line. Joining the three reproduces the full row text.
+///
+/// `round` is shown verbatim (callers pass a 1-based value). Elapsed is `13s`
+/// under a minute else `2m13s`. The meta is RESERVED (always shown); the
+/// condition fills the remaining columns and is truncated with `…`. When the row
+/// is too narrow for any condition, the condition (and the leading separator)
+/// drop entirely but round/elapsed survive. CJK/width-safe via `crate::width`.
+fn goal_row_parts(
+    condition: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+) -> (&'static str, String, String) {
+    let marker = goal_marker(unicode);
+    let m = elapsed_secs / 60;
+    let s = elapsed_secs % 60;
+    let elapsed = if m == 0 { format!("{s}s") } else { format!("{m}m{s}s") };
+    let icon_w = crate::width::display_width(marker);
+    let meta = format!(" · round {round} · {elapsed}");
+    let meta_w = crate::width::display_width(&meta);
+    let cond_budget = max_cols.saturating_sub(icon_w).saturating_sub(meta_w);
+    if cond_budget == 0 {
+        // Too narrow for any condition — drop it (and the leading separator),
+        // keep marker + round/elapsed, truncating the meta to the cols left.
+        let bare = format!("round {round} · {elapsed}");
+        let meta_only = crate::width::truncate_to_width(&bare, max_cols.saturating_sub(icon_w));
+        return (marker, String::new(), meta_only);
+    }
+    let cond = crate::width::truncate_with_ellipsis(condition, cond_budget);
+    (marker, cond, meta)
+}
+
+/// Full goal-row text (marker + condition + meta joined). Thin wrapper over
+/// [`goal_row_parts`] for width assertions / tests; the renderer styles the
+/// parts separately via `goal_row_parts` directly.
+#[cfg(test)]
+fn format_goal_row(
+    condition: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+) -> String {
+    let (marker, cond, meta) = goal_row_parts(condition, round, elapsed_secs, max_cols, unicode);
+    format!("{marker}{cond}{meta}")
+}
+
 /// Format a token count using k/m units. `round_clean=true` drops the
 /// decimal when the value is an exact multiple of the unit (used for
 /// the model's advertised window — `128_000` → `128k`, `1_000_000` →
@@ -523,14 +605,20 @@ impl RetainedRenderer<StdoutTap> {
         };
         // Clear conhost's QuickEdit bit on a real interactive console so a
         // click can't pause our stdout writes and freeze the render worker
-        // (see `conhost::disable_conhost_quick_edit`). This is the ONLY place
-        // the syscall fires: `new()` is monomorphic for the real stdout
-        // writer and is never reached by unit tests (they call `with_writer`
-        // with in-memory sinks), so the CI console is never mutated. Note
-        // `caps.tty` alone would NOT be a safe gate — test caps report
-        // tty=true too — the constructor boundary is the real protection.
+        // (see `conhost::disable_conhost_quick_edit`).
+        //
+        // GATED TO LEGACY CONHOST. The click-to-freeze is a conhost-only bug, and
+        // on Windows Terminal / VSCode (ConPTY) clearing QuickEdit is NOT harmless:
+        // ConPTY responds by turning ON mouse-event forwarding, so the terminal
+        // stops doing native click-drag text SELECTION — the user can no longer
+        // select/copy, and clicks land on our no-op handler (reported as "mouse
+        // dead / can't copy" on Windows Terminal). The earlier "inert no-op on WT"
+        // assumption was wrong; restrict the syscall to where the freeze actually
+        // happens. (`new()` is also the ONLY place it fires — monomorphic for the
+        // real stdout writer, never reached by unit tests that use `with_writer` —
+        // and `caps.tty` alone is not a safe gate since test caps report tty=true.)
         #[cfg(windows)]
-        let manage_quick_edit = caps.tty;
+        let manage_quick_edit = manage_conhost_quick_edit(caps.tty, caps.legacy_conhost);
         #[cfg(windows)]
         let prior = if manage_quick_edit {
             crate::render::conhost::disable_conhost_quick_edit()
@@ -1315,9 +1403,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if !ctx_str.is_empty() {
             parts.push(ctx_str);
         }
-        if let Some(ref gi) = status.goal_indicator {
-            parts.push(scrub_controls(gi));
-        }
+        // NOTE: the goal indicator is NOT appended here any more — it lives on
+        // its own dedicated footer row (`build_goal_row`) so it can't be the
+        // first thing truncated off this line under a hint / narrow terminal.
         let left = parts.join(" · ");
 
         // Helper: emit the badge (with trailing space) then the rest, so
@@ -1371,6 +1459,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_str_cells(&mut row, &truncated, &secondary);
             push_bypass(&mut row);
         }
+        row
+    }
+
+    /// Build the dedicated goal row (one full-width line, shown only while a
+    /// `/goal` loop is active). Sits directly above the status line, with a calm
+    /// hierarchy so it reads as persistent status, not a loud activity line:
+    /// the `◎` marker in `Brand` (a small accent), the condition in normal text,
+    /// and the ` · round N · elapsed` meta in `Muted` gray.
+    fn build_goal_row(&self, goal: &crate::render::GoalStatus, rule_width: usize) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let (marker, condition, meta) = goal_row_parts(
+            &scrub_controls(&goal.condition),
+            goal.round,
+            goal.elapsed_secs,
+            rule_width.max(1),
+            self.caps.unicode_symbols,
+        );
+        push_str_cells(&mut row, marker, &self.style_for(Role::Brand));
+        push_str_cells(&mut row, &condition, &CellStyle::default());
+        push_str_cells(&mut row, &meta, &self.style_for(Role::Muted));
         row
     }
 
@@ -1461,13 +1569,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
+        // Dedicated goal row: one full-width line above the status row, only
+        // while a `/goal` loop is active.
+        let goal_rows = if self.status.goal.is_some() { 1 } else { 0 };
         // Cap the input-box height so a long paste / typed text can't grow the
         // footer past the screen (overflow). The full text stays in input_buf;
         // we render a scrolling window that keeps the cursor row visible. The
         // `[Pasted #N]` folding (insert_paste) already shrinks most big pastes;
         // this is the backstop for the rest (unfolded single-line pastes,
-        // sub-threshold pastes, typed text).
-        let max_input_rows = Self::max_input_rows(h, attachment_rows, menu_rows, status_rows);
+        // sub-threshold pastes, typed text). The goal row is folded into the
+        // status-rows reservation so the input box height accounts for it too.
+        let max_input_rows =
+            Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows);
         let input_view_start = if lines.len() > max_input_rows {
             cursor_row_in_middle
                 .saturating_sub(max_input_rows.saturating_sub(1))
@@ -1477,7 +1590,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
         let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
-        let total_rows = 1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows;
+        let total_rows =
+            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + status_rows;
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
         // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
@@ -1510,6 +1624,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             None
         };
+        let goal_cells = status_clone
+            .goal
+            .as_ref()
+            .map(|g| self.build_goal_row(g, rule_width));
         let menu_kind = self
             .menu
             .as_ref()
@@ -1572,10 +1690,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(menu_top + i, 0, &padded);
         }
+        // Goal row sits directly above the status line (between the menu and
+        // the status row), so `· menu / goal / status ·`.
+        let goal_top = menu_top + menu_rows;
+        if let Some(gr) = goal_cells {
+            let mut padded = gr;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(goal_top, 0, &padded);
+        }
         if let Some(st) = status_cells {
             let mut padded = st;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(menu_top + menu_rows, 0, &padded);
+            self.screen.draw_row(goal_top + goal_rows, 0, &padded);
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
@@ -1626,15 +1752,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
+        let goal_rows = if self.status.goal.is_some() { 1 } else { 0 };
         let attachment_rows = self.input_attachments.len();
         // Cap the input height (mirrors paint_footer) so a long paste / typed
         // input can't make the footer exceed the screen.
-        let capped_middle =
-            middle_rows.min(Self::max_input_rows(h, attachment_rows, menu_rows, status_rows));
-        // 1 top rule + middle + 1 bot rule + attachments + menu + status.
+        let capped_middle = middle_rows
+            .min(Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows));
+        // 1 top rule + middle + 1 bot rule + attachments + menu + goal + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        1 + capped_middle + 1 + attachment_rows + menu_rows + status_rows
+        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + status_rows
     }
 
     /// Max rows the input box may DISPLAY before scrolling internally. Bounds
@@ -2938,6 +3065,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.welcome_line_count = new_len;
     }
 
+    fn push_user_message(&mut self, text: &str, attachments: &[usize]) {
+        self.mark_message(crate::render::MarkKind::User);
+        self.last_mark_was_assistant = false;
+        let safe = scrub_controls(text);
+        let accent = self.style_bold(Role::Accent);
+        let plain = CellStyle::default();
+        self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &plain);
+        let muted = self.style_for(Role::Muted);
+        for n in attachments {
+            self.push_body_text(&format!("└ [Image #{}]", n), &muted);
+        }
+        self.push_body_row(Vec::new());
+        self.md_state.reset();
+    }
+
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -3018,17 +3160,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_welcome(&model_scrubbed, &wd_scrubbed);
             }
             UiLine::User(text) => {
-                self.mark_message(crate::render::MarkKind::User);
-                self.last_mark_was_assistant = false;
-                let safe = scrub_controls(&text);
-                let accent = self.style_bold(Role::Accent);
-                let plain = CellStyle::default();
-                self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &plain);
-                // Blank spacer row.
-                self.push_body_row(Vec::new());
-                // New user turn — reset markdown parser so code-block
-                // / table state from previous turn doesn't bleed.
-                self.md_state.reset();
+                self.push_user_message(&text, &[]);
+            }
+            UiLine::UserWithAttachments { text, attachments } => {
+                self.push_user_message(&text, &attachments);
             }
             UiLine::TurnSeparator { label } => {
                 self.last_mark_was_assistant = false;
@@ -4155,12 +4290,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // other logic that depended on CSI u event types silently
         // degrades. Same flag set as `TerminalGuard::activate`.
         //
-        // Windows is excluded for the same reason as the initial push: the
-        // Win32 console backend can't decode `CSI u`, so re-arming the
-        // protocol after a resume would reintroduce the numpad-leak bug
-        // (`ESC[57400u` for keypad keys) on every OAuth/shell round-trip.
-        // See `TerminalGuard::activate` in lib.rs for the full rationale.
-        if self.caps.tty && !cfg!(windows) {
+        // Windows and JediTerm are excluded for the same reason as the
+        // initial push: Windows' Win32 console backend can't decode `CSI u`
+        // (numpad-leak `ESC[57400u`), and JediTerm re-frames mouse reports as
+        // kitty key events while the protocol is armed (mouse-move gibberish
+        // in the input box). Re-arming either after a resume would reintroduce
+        // the leak on every OAuth/shell round-trip. Shared predicate with the
+        // initial push; see `TerminalGuard::activate` in lib.rs for the full
+        // rationale.
+        if crate::should_enable_kitty_keyboard(&self.caps) {
             let _ = execute!(
                 self.out,
                 PushKeyboardEnhancementFlags(
@@ -4558,11 +4696,16 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
         // scroll region. The latter three mirror `shutdown()`'s
         // force-restore so a panic mid-spinner doesn't leak
         // DECTCEM-off into the parent shell.
-        // \x1b[>1u pops one level of Kitty keyboard enhancement
-        // (same as crossterm's PopKeyboardEnhancementFlags).
+        // \x1b[<1u POPS one level of Kitty keyboard enhancement (this is
+        // crossterm's PopKeyboardEnhancementFlags). NOTE: the introducer is
+        // `<` (pop), not `>` (push) — `\x1b[>1u` would *arm* the protocol on
+        // the way out, leaving the parent shell in CSI-u mode. On JediTerm
+        // (DevEco/IDEA) that armed state turns every mouse move into input-box
+        // gibberish, so a panic here must never push. Popping a level we never
+        // pushed is a harmless no-op (empty kitty stack).
         let _ = self
             .out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[>1u\x1b[?25h\x1b[?7h\x1b[r");
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
         #[cfg(windows)]
         if let Some(prior) = self.prior_console_in_mode.take() {
             crate::render::conhost::restore_conhost_console_in_mode(prior);
@@ -4662,6 +4805,76 @@ mod tests {
         // they want to see how close to the limit the context is. With a
         // window, render `used/window tok` so saturation is visible.
         assert_eq!(format_ctx_usage(10_400, 131_000), "10.4k/131k tok");
+    }
+
+    #[test]
+    fn conhost_quick_edit_managed_only_on_legacy_conhost() {
+        // Legacy conhost = the only host with the click-to-freeze; manage it.
+        assert!(manage_conhost_quick_edit(true, true));
+        // Windows Terminal / ConPTY (legacy_conhost=false): must NOT touch the
+        // console mode — clearing QuickEdit there kills native click-drag
+        // selection (the "can't click / can't copy on Windows Terminal" bug).
+        assert!(!manage_conhost_quick_edit(true, false));
+        // Non-TTY (piped / redirected): never.
+        assert!(!manage_conhost_quick_edit(false, true));
+        assert!(!manage_conhost_quick_edit(false, false));
+    }
+
+    #[test]
+    fn goal_row_shows_condition_round_and_elapsed() {
+        // Wide row (unicode caps): ◎ marker + full condition + round + elapsed.
+        let row = format_goal_row("重构 auth 模块直到测试全过", 3, 133, 80, true);
+        assert!(row.starts_with("◎ "), "geometric marker present: {row}");
+        assert!(!row.contains('🎯'), "must NOT use an emoji marker: {row}");
+        assert!(row.contains("重构 auth 模块直到测试全过"), "full condition kept: {row}");
+        assert!(row.contains("· round 3 ·"), "round shown: {row}");
+        assert!(row.contains("2m13s"), "elapsed mm/ss: {row}");
+    }
+
+    #[test]
+    fn goal_row_ascii_fallback_avoids_geometric_and_emoji_glyphs() {
+        // Windows legacy conhost / Consolas (unicode_symbols=false): no ◎ tofu,
+        // no emoji — a plain ASCII `*` marker, same gate as the spinner.
+        let row = format_goal_row("ship it", 4, 7, 80, false);
+        assert!(row.starts_with("* "), "ascii marker: {row}");
+        assert!(!row.contains('◎') && !row.contains('🎯'), "no non-ASCII glyph: {row}");
+        assert!(row.contains("· round 4 · 7s"), "round/elapsed intact: {row}");
+    }
+
+    #[test]
+    fn goal_row_parts_split_marker_condition_meta_for_styling() {
+        // Marker / condition / meta are returned separately so the renderer can
+        // style them with hierarchy (accent / normal / muted). Round shown verbatim.
+        let (marker, cond, meta) = goal_row_parts("fix tests", 1, 8, 80, true);
+        assert_eq!(marker, "◎ ");
+        assert_eq!(cond, "fix tests");
+        assert_eq!(meta, " · round 1 · 8s");
+        // ASCII fallback marker on non-unicode terminals.
+        assert_eq!(goal_row_parts("x", 1, 8, 80, false).0, "* ");
+    }
+
+    #[test]
+    fn goal_row_elapsed_under_a_minute_omits_minutes() {
+        let row = format_goal_row("x", 1, 42, 80, true);
+        assert!(row.contains("· 42s"), "seconds-only under a minute: {row}");
+        assert!(!row.contains("0m"), "no leading 0m: {row}");
+    }
+
+    #[test]
+    fn goal_row_truncates_long_condition_but_keeps_round_and_elapsed() {
+        let cond = "a".repeat(200);
+        let row = format_goal_row(&cond, 7, 5, 40, true);
+        assert!(crate::width::display_width(&row) <= 40, "row fits width: {row}");
+        assert!(row.contains("· round 7 · 5s"), "round/elapsed survive: {row}");
+        assert!(row.contains('…'), "condition truncated with ellipsis: {row}");
+    }
+
+    #[test]
+    fn goal_row_degrades_to_round_elapsed_when_too_narrow() {
+        // No room for any condition → drop it, keep marker + round/elapsed.
+        let row = format_goal_row("some long condition", 2, 9, 14, true);
+        assert!(crate::width::display_width(&row) <= 14, "row fits narrow width: {row}");
+        assert!(row.contains("round 2"), "round survives even when condition dropped: {row}");
     }
 
     #[test]
@@ -4813,6 +5026,7 @@ mod tests {
             reasoning_effort: None,
             goal_indicator: None,
             vision: false,
+            goal: None,
         }
     }
 
@@ -4839,6 +5053,7 @@ mod tests {
             reasoning_effort: None,
             goal_indicator: None,
             vision: false,
+            goal: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -4894,6 +5109,7 @@ mod tests {
             reasoning_effort: None,
             goal_indicator: None,
             vision: false,
+            goal: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -4941,6 +5157,7 @@ mod tests {
             reasoning_effort: None,
             goal_indicator: None,
             vision: false,
+            goal: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -6871,17 +7088,17 @@ mod tests {
             summary_cell,
         );
 
-        // Header line: the `●` anchor must be faint (subordinate tier,
-        // in lockstep with the `└` line), while the tool name must be
-        // bold and NOT faint — the prominent tier.
+        // Header line: the `●` anchor is bold and NOT faint — it shares the tool
+        // name's prominent tier (`tool_bullet_style` = `style_bold(Role::ToolName)`),
+        // anchoring the tool-call row as a single bold glyph + name.
         let hdr_idx = (0..vterm.height() as usize)
             .find(|&i| vterm.row_text(i).contains("ListDirectory"))
             .unwrap_or_else(|| panic!("header row missing\ndump:\n{}", vterm.dump()));
         let bullet_col = vterm.row_text(hdr_idx).find('●').unwrap();
         let bullet_cell = vterm.cell_at(hdr_idx, bullet_col);
         assert!(
-            bullet_cell.faint,
-            "`●` bullet must be faint in dark theme, got {:?}",
+            bullet_cell.bold && !bullet_cell.faint,
+            "`●` bullet must be bold (prominent tier) in dark theme, got {:?}",
             bullet_cell,
         );
         let name_col = vterm.row_text(hdr_idx).find("ListDirectory").unwrap();
@@ -9170,6 +9387,48 @@ mod tests {
             r.current_footer_rows(),
             baseline + 2,
             "two attachments must add exactly two preview rows"
+        );
+    }
+
+    /// A full viewport used to lose the user row when the event loop emitted
+    /// `User` first and `ImageAttachment` second: `User` committed a spacer,
+    /// the attachment popped it only from memory, and the already-emitted LF
+    /// could not be undone. The grouped variant emits no temporary row.
+    #[test]
+    fn user_with_attachment_stays_visible_when_body_is_full() {
+        let w = 80;
+        let h = 12;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let cap = h as usize - r.current_footer_rows();
+        for i in 0..cap {
+            r.render(UiLine::CommandOutput(format!("filler-{i}")));
+        }
+        r.render(UiLine::UserWithAttachments {
+            text: "[Image #1]你好".into(),
+            attachments: vec![1],
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let visible = vterm.dump();
+        assert!(
+            visible.contains("❯ [Image #1]") && visible.contains('你') && visible.contains('好'),
+            "user text must remain visible beside its attachment:\n{visible}"
+        );
+        assert!(
+            visible.contains("└ [Image #1]"),
+            "attachment echo must remain visible below user text:\n{visible}"
         );
     }
 

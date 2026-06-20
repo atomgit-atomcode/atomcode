@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.2-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -56,6 +56,13 @@ Think of it as an open-source alternative to Claude Code / Cursor Agent, but run
 - **Loop detection** — detects and breaks out of repetitive tool-call patterns
 - **3-layer JSON repair** — recovers malformed tool-call arguments
 - **Turn-level datalog** — structured per-turn logs for replay, debugging, and eval harnesses
+
+### Modes & Autonomy
+
+- **Plan / Build modes** — `/plan` switches to read-only exploration (the agent investigates without touching files); `/build` switches back to full execution
+- **Goal mode** — `/goal <text>` sets a completion condition and the agent loops autonomously, turn after turn, until the goal is met
+- **Code review** — `/review` reviews your current changes, `/review staged` the staged diff, and `/review <base>` against a base ref
+- **Background sessions** — `/bg` runs work in detached slots so you can keep using the TUI while a long task progresses
 
 ### Built-in Tools
 
@@ -317,31 +324,96 @@ Then just type what you want:
 
 ### Slash Commands
 
+Type `/` in the TUI to browse the full list with live completion; `/help` shows commands and shortcuts.
+
+**Sessions & workspace**
+
 | Command | Action |
 |---------|--------|
 | `/resume` | Resume or switch session |
-| `/session` | Create a new session |
+| `/session` | Start a new session |
+| `/rename <name>` | Rename the current session |
+| `/clear` | Start a new conversation (clears context + screen) |
 | `/bg` | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
 | `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot |
-| `/provider` | Manage providers |
-| `/model` | Switch model / provider |
-| `/login` | Login with AtomGit OAuth |
 | `/cd` | Change working directory |
-| `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
-| `/view &lt;filepath&gt;` | View file content in an overlay modal |
-| `/undo` | Undo last turn's edits |
-| `/diff` | Show git diff of current changes |
-| `/cost` | Show token usage for this session |
-| `/copy` | Copy last AI response |
-| `/clear` | Clear conversation |
-| `/issue` | Create issue on AtomGit |
-| `/config` | Edit config file |
-| `/status` | Show login status and model info |
-| `/logout` | Logout from AtomGit |
-| `/think` | Control extended thinking (on/off/budget N) |
+| `/worktree` | Git worktree isolation (`create` / `list` / `done` / `cleanup`) |
+| `/webui` | Launch the browser webui (subcommands: `stop`, `lan`, `--host <addr>`) |
+| `/sync` | Attach to the live webui session (`/sync off` to detach) |
+
+**Modes, autonomy & review**
+
+| Command | Action |
+|---------|--------|
+| `/plan` | Switch to Plan mode (read-only exploration) |
+| `/build` | Switch to Build mode (full execution) |
+| `/goal <text>` | Set a completion goal — the agent loops autonomously until it's met |
+| `/review` | Code review the current changes (`/review` · `/review staged` · `/review <base>`) |
+| `/think` | Control extended thinking (on / off / budget N) |
 | `/effort` | DeepSeek reasoning effort control (high / max / off) |
+
+**Providers & account**
+
+| Command | Action |
+|---------|--------|
+| `/model` | Switch model / provider |
+| `/provider` | Manage providers (add / edit / delete) |
+| `/login` | Sign in with AtomGit OAuth |
+| `/logout` | Sign out of AtomGit |
+| `/whoami` | Show the current logged-in user |
+| `/status` | Show login status and model info |
+
+**Files, edits & context**
+
+| Command | Action |
+|---------|--------|
+| `/diff` | Show git diff of current changes |
+| `/undo` | Undo a turn's file edits (`/undo` or `/undo N`) |
+| `/view <filepath>` | View file content in an overlay modal |
+| `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
+| `/cost` | Show token usage for this session |
+| `/context` | Show the context budget breakdown |
+| `/compact` | Compact conversation history |
+
+**Memory**
+
+| Command | Action |
+|---------|--------|
+| `/remember <fact>` | Save a fact to memory (`--global` for all projects) |
+| `/forget <query>` | Remove matching memories |
+| `/memory` | Show all saved memories |
+
+**Extensions**
+
+| Command | Action |
+|---------|--------|
+| `/mcp` | MCP server status (subcommands: `reload`, `tools`, `login`, `logout`) |
+| `/plugin` | Plugin marketplace (`marketplace` / `install` / `uninstall` / `list`) |
+| `/skills` | Browse loaded skills |
+
+**Project & system**
+
+| Command | Action |
+|---------|--------|
+| `/init` | Generate `.atomcode.md` project instructions from the working directory |
+| `/config` | Show config path |
+| `/reload` | Reload `~/.atomcode/config.toml` from disk |
+| `/upgrade` | Upgrade atomcode to latest (subcommand: `rollback`) |
+| `/setup` | First run: install the recommended skill and run it |
+| `/welcome` | Re-run the onboarding wizard |
+| `/language` | Switch display language |
+| `/issue` | Report a bug / request a feature (interactive wizard) |
+| `/guide <question>` | Ask atomcode-guide how to use AtomCode |
+| `/keys` | Show keyboard shortcuts |
 | `/help` | Show commands & shortcuts |
-| `/quit` | Exit (or Ctrl+C ×2) |
+| `/quit`, `/exit` | Exit AtomCode (or Ctrl+C ×2) |
+
+> **Plugin commands.** Beyond the built-ins above, plugins can register their own slash commands. For example, install the official channel plugin to get `/wechat` (shows the AtomCode WeChat community group QR code):
+>
+> ```text
+> /plugin marketplace add https://atomgit.com/atomgit_atomcode/AtomCode-Channel
+> /plugin install weixin@atomcode-channel
+> ```
 
 ## Architecture
 

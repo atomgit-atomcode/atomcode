@@ -286,6 +286,21 @@ impl CompactionStrategy for OverflowCompaction {
             _ => self.inner.plan(view).await,
         }
     }
+
+    /// True only when `plan` will DRAIN old turns into a summary (the slow path) — for
+    /// a manual `/compact`, or overflow tier 2. A manual `/compact` with nothing older
+    /// than the active turn falls back to the fast inner stub (drain ≤ floor) and is NOT
+    /// announced. `Auto` and overflow tiers 0/1 only stub/truncate → never announce.
+    /// CHEAP: just the same `active_turn_start` scan `manual_plan`/`overflow_plan` use.
+    fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
+        let floor = view.sacred_floor;
+        let drains = active_turn_start(view.messages, 1).max(floor) > floor;
+        match &view.trigger {
+            CompactTrigger::Manual { .. } => drains,
+            CompactTrigger::Overflow { attempt } => *attempt >= 2 && drains,
+            _ => false,
+        }
+    }
 }
 
 /// Index at which the kept window (the `keep_recent_turns` most-recent turns) begins;
@@ -699,6 +714,53 @@ mod tests {
             .await;
         assert!(plan.summary.is_none(), "no provider → plain drain");
         assert!(plan.drain_to > floor);
+    }
+
+    #[test]
+    fn will_summarize_announces_only_drain_paths() {
+        // Multi-turn history: a manual `/compact` WILL drain old turns → announce.
+        let multi = vec![
+            Message::system("p"),
+            Message::user("u1"),
+            Message::assistant(big("a1"), vec![]),
+            Message::user(big("u2")),
+            Message::assistant(big("a2"), vec![]),
+            Message::user("u3-active"),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = multi;
+        let floor = conv.sacred_floor();
+        let strat = OverflowCompaction::new(StubCompaction::default(), None);
+
+        assert!(
+            strat.will_summarize(&manual_view(&conv.messages, floor, None)),
+            "manual /compact with >1 real turn drains → announce"
+        );
+        // Auto never announces (it only does the fast in-place stub).
+        assert!(
+            !strat.will_summarize(&view(&conv.messages, floor)),
+            "auto trigger never announces a summary"
+        );
+        // Overflow tier 0/1 (stub/truncate) stay silent; only tier 2 drains.
+        assert!(!strat.will_summarize(&overflow_view(&conv.messages, floor, 0, 8000)));
+        assert!(!strat.will_summarize(&overflow_view(&conv.messages, floor, 1, 8000)));
+        assert!(strat.will_summarize(&overflow_view(&conv.messages, floor, 2, 8000)));
+
+        // Short history (≤1 real turn): a manual `/compact` falls back to the fast inner
+        // stub (a no-op here) → NO announce, so no spurious "compacting…" line.
+        let short = vec![
+            Message::system("p"),
+            Message::user("u1-active"),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", &big("out"), false),
+        ];
+        let mut sc = Conversation::new();
+        sc.messages = short;
+        let sfloor = sc.sacred_floor();
+        assert!(
+            !strat.will_summarize(&manual_view(&sc.messages, sfloor, None)),
+            "short manual /compact is a no-op → must NOT announce"
+        );
     }
 }
 

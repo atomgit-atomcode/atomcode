@@ -214,11 +214,14 @@ async fn coordinator(
     turn_state: Arc<Mutex<TurnState>>,
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
 ) {
+    eprintln!("[DEBUG coordinator] START");
     while let Some(input) = input_rx.recv().await {
+        eprintln!("[DEBUG coordinator] received input: {} chars", input.text.len());
         // 单写者守卫：运行中直接忽略本次输入（不排队，避免乱序）。
         {
             let mut st = turn_state.lock().await;
             if *st == TurnState::Running {
+                eprintln!("[DEBUG coordinator] REJECTED input: already running");
                 let _ = events.send(LiveEvent::Turn(TurnEvent::Warning(
                     "对方正在对话，已忽略本次输入".to_string(),
                 )));
@@ -226,6 +229,7 @@ async fn coordinator(
             }
             *st = TurnState::Running;
         }
+        eprintln!("[DEBUG coordinator] ACCEPTED input, broadcasting StateChanged(Running)");
         let _ = events.send(LiveEvent::StateChanged(TurnState::Running));
 
         // 先即时回显用户消息（原始文本 + 原图），让发送方立刻看到自己的输入，不被随后
@@ -298,8 +302,10 @@ async fn coordinator(
             )));
         }
         *turn_state.lock().await = TurnState::Idle;
+        eprintln!("[DEBUG coordinator] turn done, broadcasting StateChanged(Idle)");
         let _ = events.send(LiveEvent::StateChanged(TurnState::Idle));
     }
+    eprintln!("[DEBUG coordinator] EXIT (input_rx closed)");
 }
 
 #[cfg(test)]
