@@ -1,6 +1,4 @@
 // crates/atomcode-tuix/src/render/mod.rs
-#[cfg(windows)]
-pub mod conhost;
 pub mod cell;
 pub mod plain;
 pub mod qr;
