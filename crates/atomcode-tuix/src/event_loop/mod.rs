@@ -1538,6 +1538,25 @@ mod buffer_tests {
     }
 
     #[test]
+    fn slash_command_arg_expands_folded_paste() {
+        // Regression: `/goal <pasted body>` must hand the command the
+        // real pasted text, not the literal `[Pasted #N …]` placeholder.
+        // The submit path now expands the slash arg before dispatch; this
+        // mirrors that expansion on the `arg` slice of the committed line.
+        let mut b = Buffer::new();
+        let body = "do the thing\n".repeat(69);
+        b.insert_paste(body.clone());
+        // Buffer now looks like the user typed `/goal ` then pasted.
+        let line = format!("/goal {}", b.text);
+        let (cmd, arg) = parse_slash_line(&line).expect("recognised as slash line");
+        assert_eq!(cmd, "goal");
+        assert!(arg.contains("[Pasted #1"), "arg still folded pre-expansion: {arg:?}");
+        let expanded = b.expand_pastes(arg);
+        assert_eq!(expanded, body, "slash arg must expand to the pasted body");
+        assert!(!expanded.contains("[Pasted #"), "no placeholder should survive");
+    }
+
+    #[test]
     fn expanded_text_recovers_folded_paste() {
         // Modals (e.g. the provider Template step) read `expanded_text()`
         // instead of `text`, so a folded multi-line paste is seen in full
@@ -5657,9 +5676,17 @@ fn handle_idle_key(
                     // hand it `&mut app.buf`.
                     handle_paste_command(app, ctx, renderer)?;
                 } else {
+                    // Expand `[Pasted #N …]` placeholders in the argument
+                    // before dispatch, exactly like the regular-message
+                    // path below. Without this, `/goal <pasted body>`
+                    // hands the command the literal placeholder string
+                    // (e.g. "[Pasted #1 +69 lines]") instead of the real
+                    // pasted text. The paste registry is still live here —
+                    // it's cleared a few lines down, after dispatch.
+                    let arg = app.buf.expand_pastes(arg);
                     execute_slash_command(
                         cmd,
-                        arg,
+                        &arg,
                         &mut app.state,
                         ctx,
                         renderer,
