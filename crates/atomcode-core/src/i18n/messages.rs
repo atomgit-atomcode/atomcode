@@ -704,6 +704,9 @@ pub enum Msg<'a> {
         tool_call_count: usize,
         duration: &'a str,
         total_tokens: usize,
+        /// Cache-hit ratio over the turn's input, if reported. `Some(n)` appends
+        /// `· n% cached`; `None` appends nothing.
+        cached_pct: Option<u8>,
     },
 
     /// Turn-end summary when the turn terminated in an error (the red
@@ -938,4 +941,20 @@ pub enum Msg<'a> {
     CliHelpMcpCommand,
     /// About for the built-in help subcommand.
     CliAboutHelp,
+
+    // ── engine v2 provider init (atomcode-bridge) ──
+    /// Frame for a provider/engine init failure surfaced to the driver.
+    /// `detail` carries the underlying cause (often `GatewayAuthUnavailable`).
+    ProviderInitFailed { detail: &'a str },
+    /// The configured `base_url` is an AtomGit gateway that this (open-source)
+    /// build can't sign requests for. Points the user at the official binary
+    /// or a plain OpenAI-compatible endpoint.
+    GatewayAuthUnavailable { base_url: &'a str },
+
+    // ── streaming liveness (atomcode-tuix spinner) ──
+    /// Spinner hint shown when a streaming response has gone silent past the stall
+    /// threshold. The cause is UNKNOWN (slow first byte, a slow gateway, or a
+    /// dropped connection), so the text does NOT blame the network — it just notes
+    /// the slow response and that esc cancels. Reassures the user it isn't frozen.
+    StreamStalled,
 }

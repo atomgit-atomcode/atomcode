@@ -2,6 +2,7 @@ package com.atomcode.jetbrains.ui
 
 import com.atomcode.jetbrains.daemon.ChatEvent
 import com.atomcode.jetbrains.ui.message.JBCefMessageView
+import com.google.gson.JsonParser
 
 /**
  * 流式事件集中处理器。
@@ -29,6 +30,7 @@ class StreamEventHandler(
 
     private var activeToolName: String? = null
     private var activeToolOutput: String = ""
+    private var activeToolSummary: String = ""
 
     // ── Event handlers ──
 
@@ -57,12 +59,13 @@ class StreamEventHandler(
         messageView.addAssistantEvent("[Tools queued]")
     }
 
-    fun onToolStart(name: String) {
+    fun onToolStart(name: String, arguments: String) {
         assistantSegmentText = ""
         messageView.hideStreamingCursor()
         activeToolName = name
         activeToolOutput = ""
-        messageView.addToolCall(name, "running...")
+        activeToolSummary = summarizeToolArguments(name, arguments)
+        messageView.addToolCall(name, "running...", summary = activeToolSummary)
     }
 
     fun onToolOutput(chunk: String) {
@@ -71,15 +74,16 @@ class StreamEventHandler(
         activeToolName = name
         activeToolOutput += chunk
         val status = "running... (${activeToolOutput.length} chars)"
-        messageView.updateToolCall(name, status, activeToolOutput)
+        messageView.updateToolCall(name, status, activeToolOutput, activeToolSummary)
     }
 
     fun onToolResult(name: String, output: String, success: Boolean, durationMs: Long) {
         val status = if (success) "done (${durationMs}ms)" else "failed"
         val detail = output.ifBlank { activeToolOutput }
-        messageView.updateToolCall(name, status, detail)
+        messageView.updateToolCall(name, status, detail, activeToolSummary)
         activeToolName = null
         activeToolOutput = ""
+        activeToolSummary = ""
     }
 
     fun onArtifactStart(title: String?) {
@@ -129,5 +133,37 @@ class StreamEventHandler(
         reasoningText = ""
         activeToolName = null
         activeToolOutput = ""
+        activeToolSummary = ""
     }
+}
+
+internal fun summarizeToolArguments(name: String, arguments: String): String {
+    val args = try {
+        JsonParser.parseString(arguments).takeIf { it.isJsonObject }?.asJsonObject ?: return ""
+    } catch (_: Exception) {
+        return ""
+    }
+
+    fun string(vararg keys: String): String = keys.firstNotNullOfOrNull { key ->
+        args.get(key)?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
+    }.orEmpty()
+
+    val summary = when (name.lowercase()) {
+        "bash", "execute_command" -> string("command", "cmd")
+        "read_file", "create_file", "edit_file", "write_to_file", "replace_in_file" ->
+            string("file_path", "path")
+        "list_directory" -> string("path").ifBlank { "." }
+        "grep", "search_files" -> listOf(string("pattern", "query"), string("path"))
+            .filter { it.isNotBlank() }
+            .joinToString("  ·  ")
+        "glob" -> string("pattern")
+        "web_search" -> string("query")
+        "web_fetch" -> string("url")
+        else -> ""
+    }
+
+    val singleLine = summary.lineSequence().joinToString(" ") { it.trim() }
+        .replace(Regex("\\s+"), " ")
+        .trim()
+    return if (singleLine.length <= 120) singleLine else singleLine.take(117) + "..."
 }

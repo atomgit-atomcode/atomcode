@@ -475,6 +475,11 @@ impl OpenAiProvider {
             content.retain(|block| {
                 block.get("type").and_then(|t| t.as_str()) != Some("image_url")
             });
+            // If every block was image_url, the array is now empty.
+            // Some providers reject [] with 400; degrade to plain text.
+            if content.is_empty() {
+                msg["content"] = serde_json::Value::String(String::new());
+            }
         }
     }
 }

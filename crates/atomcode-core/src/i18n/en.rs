@@ -885,8 +885,12 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdWelcomeDescription => "Re-run the onboarding wizard".into(),
         Msg::VisionPreprocessSuccess { char_count } =>
             format!("✓ VL recognised image, returned {char_count} chars").into(),
-        Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
+        Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens, cached_pct } =>
+            format!(
+                "✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens{}",
+                super::fmt_tokens(total_tokens),
+                cached_pct.map(|p| format!(" · {p}% cached")).unwrap_or_default(),
+            ).into(),
         Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
             format!("✗ Stopped · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
         Msg::LoginQrHeader =>
@@ -1076,6 +1080,17 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CliHelpMarketplaceName => "Marketplace name".into(),
         Msg::CliAboutHelp => "Print this message or the help of the given subcommand(s)".into(),
         Msg::CliHelpMcpCommand => "Executable and arguments".into(),
+
+        // ── engine v2 provider init (atomcode-bridge) ──
+        Msg::ProviderInitFailed { detail } =>
+            format!("provider init failed: {detail}").into(),
+        Msg::GatewayAuthUnavailable { base_url } =>
+            format!(
+                "provider base_url '{base_url}' is an AtomGit gateway this build can't \
+                 authenticate against. Use the official binary, or point the provider at a \
+                 plain OpenAI-compatible endpoint with an api_key."
+            ).into(),
+        Msg::StreamStalled => "slow response · esc to cancel".into(),
     }
 }
 

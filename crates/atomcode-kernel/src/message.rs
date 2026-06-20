@@ -640,6 +640,17 @@ impl CompactionPlan {
 #[async_trait]
 pub trait CompactionStrategy: Send + Sync {
     async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan;
+
+    /// CHEAP, side-effect-free pre-check (NO LLM call): will `plan(view)` perform
+    /// SLOW, user-visible work — i.e. drain old turns into an LLM summary — rather
+    /// than merely no-op or do a fast in-place stub? The kernel calls this to decide
+    /// whether to emit [`AgentEvent::CompactionStarted`] (the "compacting…" progress
+    /// line), so a manual `/compact` that turns out to be a no-op never shows a
+    /// spurious "compacting…" line ahead of "nothing to compact". Default `false`
+    /// (e.g. [`NoCompaction`] and pure-stub policies never summarize).
+    fn will_summarize(&self, _view: &CompactionView<'_>) -> bool {
+        false
+    }
 }
 
 /// The neutral DEFAULT strategy: never compacts (always returns a noop plan).

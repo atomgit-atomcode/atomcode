@@ -12,6 +12,7 @@
 //!
 //! [`ApprovalMiddleware`]: super::approval::ApprovalMiddleware
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -59,6 +60,74 @@ pub fn references_sensitive_path(args: &str) -> bool {
         return true;
     }
     SENSITIVE_MARKERS.iter().any(|m| a.contains(m))
+}
+
+/// The user's real home directory, dependency-free. Used to anchor `~/.ssh` / `~/.aws` /
+/// `~/.gnupg` so a project-local `./.ssh/` (benign) is not treated like the real keys.
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let var = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let var = std::env::var_os("HOME");
+    var.map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+}
+
+/// True iff a RESOLVED (absolute, cwd-joined) `path` is sensitive — a system-protected
+/// location, a credential dir under the real home, or a secret file by name/extension. This is
+/// the PATH-aware companion to [`references_sensitive_path`] (which substring-matches raw JSON
+/// args): it correctly catches a RELATIVE `.ssh/authorized_keys` or a Windows `…\.ssh\…` once
+/// resolved, which the substring form misses. Faithful port of the legacy (v1) `is_sensitive_path`
+/// so write approval inherits the same protected set.
+pub fn path_is_sensitive(path: &Path) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    const SYSTEM_PROTECTED_PREFIXES: &[&str] = &[
+        "/System", "/bin", "/sbin", "/usr", "/var", "/private/etc", "/private/var", "/etc",
+        "/root", "/var/root", "/private/var/root",
+    ];
+    #[cfg(target_os = "windows")]
+    const SYSTEM_PROTECTED_PREFIXES: &[&str] =
+        &[r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)", r"C:\ProgramData", r"C:\PerfLogs"];
+    #[cfg(not(target_os = "windows"))]
+    const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[
+        "/usr/local", "/private/usr/local", "/Applications", "/Library", "/var/folders",
+        "/private/var/folders", "/var/tmp", "/private/var/tmp",
+    ];
+    #[cfg(target_os = "windows")]
+    const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[];
+    const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg"];
+    const SECRET_FILE_NAMES: &[&str] = &[
+        ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".zshenv", ".npmrc", ".pypirc", ".env",
+        ".env.local", "credentials", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    ];
+    const SECRET_EXTS: &[&str] = &["pem", "key", "p12", "pfx", "der", "crt", "cer"];
+
+    let has_protected_prefix =
+        SYSTEM_PROTECTED_PREFIXES.iter().any(|p| path == Path::new(p) || path.starts_with(p));
+    let has_exception_prefix =
+        SYSTEM_PROTECTED_EXCEPTIONS.iter().any(|p| path == Path::new(p) || path.starts_with(p));
+    if has_protected_prefix && !has_exception_prefix {
+        return true;
+    }
+
+    if let Some(home) = home_dir() {
+        for dir in SECRET_HOME_DIRS {
+            if path.starts_with(home.join(dir)) {
+                return true;
+            }
+        }
+        for file in SECRET_FILE_NAMES {
+            if path == home.join(file) {
+                return true;
+            }
+        }
+    }
+
+    if path.file_name().and_then(|n| n.to_str()).is_some_and(|name| SECRET_FILE_NAMES.contains(&name)) {
+        return true;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| SECRET_EXTS.iter().any(|c| ext.eq_ignore_ascii_case(c)))
 }
 
 /// Require approval before an otherwise-`Safe` tool reads a sensitive path.

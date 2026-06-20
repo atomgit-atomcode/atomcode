@@ -769,6 +769,12 @@ impl CompactionStrategy for SummarizeOldestStrategy {
             resume_note: None,
         }
     }
+
+    /// Mirrors `plan`: this strategy announces (does slow summary work) iff there is
+    /// something between the protected prefix and the kept tail to drain.
+    fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
+        view.messages.len().saturating_sub(self.keep_recent) > view.sacred_floor
+    }
 }
 
 /// "Microcompact tool results" shape: rewrite the text of OLDER tool-result

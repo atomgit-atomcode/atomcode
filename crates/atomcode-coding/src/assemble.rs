@@ -8,6 +8,7 @@ use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_capabilities::session::SessionContextHook;
 use atomcode_capabilities::tools::{
     coding_tool_names, register_coding_tools, ApprovalMiddleware, OpenFileWorkspaceGate,
+    WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::provider::LlmProvider;
@@ -49,6 +50,11 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
         // BEFORE approval so its `Allow` short-circuits the prompt.
         .middleware(Arc::new(OpenFileWorkspaceGate::pinned(cfg.working_dir.clone())))
+        // Workspace-aware, per-path approval for the file-mutation tools (v1 granularity):
+        // in-workspace non-sensitive writes auto-approve, sensitive writes always re-prompt,
+        // out-of-workspace writes prompt with a per-path "Always". BEFORE the generic approval
+        // gate so its `Allow` short-circuits the prompt. Pins the same immutable root.
+        .middleware(Arc::new(WriteApprovalGate::pinned(cfg.working_dir.clone())))
         // Approval runs BEFORE any (future) arg-rewriting middleware — load-bearing order.
         .middleware(Arc::new(ApprovalMiddleware::in_memory()))
         // Env / project-instructions / git context at session start (after persona).

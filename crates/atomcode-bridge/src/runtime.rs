@@ -239,7 +239,10 @@ impl Bridge {
             Ok(p) => Some(p),
             Err(e) => {
                 let _ = ev_tx.send(CoreEv::Error {
-                    error: format!("engine v2 provider init failed: {e}"),
+                    error: atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitFailed {
+                        detail: &e.to_string(),
+                    })
+                    .into_owned(),
                     snapshot: ConversationSnapshot::default(),
                 });
                 None
@@ -594,6 +597,13 @@ impl Bridge {
                     let ev = goal_update_ev(&g);
                     self.emit(ev);
                 }
+                // Release + clear any parked approval BEFORE forwarding Cancel: the
+                // kernel then backfills the cancelled tool's result, and clearing our
+                // mirror means a later /model swap (which re-reads the snapshot) can't
+                // find a lingering approval to re-trigger on the next prompt.
+                if let Some(cmd) = take_deny_cmd(&mut self.pending_approval) {
+                    let _ = self.handle.commands.send(cmd);
+                }
                 let _ = self.handle.commands.send(KCmd::Cancel);
                 // If an eval was holding a turn open, close it as cancelled.
                 if let Some((_, messages)) = self.pending_goal.take() {
@@ -707,6 +717,13 @@ impl Bridge {
             CoreCmd::ReloadConfig(config) => {
                 // Switch to the (possibly new) default provider, same parts —
                 // approval grants + conversation survive (C1 respawn semantics).
+                // FIRST settle any in-flight turn/approval so the kernel persists a
+                // clean snapshot before `assemble` below re-reads it — otherwise a
+                // turn cancelled by this swap leaves a dangling tool_use that the
+                // fresh agent re-triggers on the next prompt.
+                if self.turn_running || self.pending_approval.is_some() {
+                    self.settle_in_flight_turn().await;
+                }
                 if let Some(p) = config.providers.get(&config.default_provider) {
                     self.coding_cfg.model = p.model.clone();
                     if let Some(b) = &p.base_url {
@@ -765,7 +782,12 @@ impl Bridge {
                             }
                         }
                         Err(e) => self.emit(CoreEv::Error {
-                            error: format!("provider init failed: {e}"),
+                            error: atomcode_core::i18n::t(
+                                atomcode_core::i18n::Msg::ProviderInitFailed {
+                                    detail: &e.to_string(),
+                                },
+                            )
+                            .into_owned(),
                             snapshot: ConversationSnapshot::default(),
                         }),
                     }
@@ -905,6 +927,13 @@ impl Bridge {
                     let ev = goal_update_ev(&g);
                     self.emit(ev);
                 }
+                // Stop the turn running RIGHT NOW, not just the loop — `/goal
+                // clear` while a round is mid-tool (e.g. a long bash) must
+                // interrupt it, exactly like the Cancel branch (which already
+                // forwards KCmd::Cancel). Without this, clearing only disarmed
+                // the next round and the user watched the current tool run to
+                // completion (part of the reported "goal can't be interrupted").
+                let _ = self.handle.commands.send(KCmd::Cancel);
                 // An eval was holding a turn open — close it now.
                 if let Some((_, messages)) = self.pending_goal.take() {
                     self.finish_turn(StopReason::Cancelled, messages);
@@ -923,6 +952,45 @@ impl Bridge {
             let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
             let _ = self.handle.commands.send(KCmd::Respond { id, value });
             self.emit(CoreEv::PhaseChange(AgentPhase::Thinking));
+        }
+    }
+
+    /// Drive the CURRENT kernel to a clean terminal and let it persist the snapshot
+    /// BEFORE a /model swap re-assembles from that snapshot. `assemble` reloads the
+    /// latest on-disk snapshot (the SnapshotHook writes one on every `turn_complete`,
+    /// cancel included) — so if a turn (or a parked approval) is still in flight when
+    /// /model fires, the swap would otherwise read a snapshot with a dangling tool_use
+    /// and the fresh agent re-triggers the just-cancelled tool on the next prompt.
+    ///
+    /// Releases any parked approval as a deny + cancels the turn, then drains the
+    /// kernel's events until the turn fully finalizes (TurnComplete → Snapshot
+    /// round-trip → driver-facing finish). Bounded by a per-event timeout so a wedged
+    /// kernel can't hang the swap.
+    async fn settle_in_flight_turn(&mut self) {
+        if let Some(cmd) = take_deny_cmd(&mut self.pending_approval) {
+            let _ = self.handle.commands.send(cmd);
+        }
+        let _ = self.handle.commands.send(KCmd::Cancel);
+        let mut saw_complete = false;
+        for _ in 0..256 {
+            // Bound each await: the cancel/deny above guarantees a TurnComplete in
+            // the normal case, but a crashed kernel must not strand the swap.
+            match tokio::time::timeout(Duration::from_secs(5), self.handle.events.recv()).await {
+                Ok(Some(ev)) => {
+                    if matches!(ev, KEv::TurnComplete { .. }) {
+                        saw_complete = true;
+                    }
+                    self.on_kernel_event(ev).await;
+                    // TurnComplete defers the driver-facing finish until its Snapshot
+                    // reply lands (clearing pending_finish). Wait for BOTH so the
+                    // snapshot is on disk before we re-assemble from it.
+                    if saw_complete && self.pending_finish.is_none() {
+                        break;
+                    }
+                }
+                Ok(None) => break, // kernel task ended
+                Err(_) => break,   // timed out — give up rather than hang the swap
+            }
         }
     }
 
@@ -1329,8 +1397,48 @@ impl Bridge {
             KEv::Error { message, .. } => {
                 self.emit(CoreEv::Error { error: message, snapshot: ConversationSnapshot::default() });
             }
-            KEv::Compacted { committed, trigger, .. } => {
-                if let Some(msg) = compaction_advisory(committed, &trigger) {
+            // A manual `/compact` may make a slow one-shot LLM summary call; announce it
+            // so the user sees a progress line while it runs (v1 streamed the same
+            // "(compacting with LLM summary...)" text). Auto/Overflow stub silently — no
+            // LLM call, no user action to acknowledge — so they stay quiet here.
+            KEv::CompactionStarted { trigger } => {
+                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                    self.emit(CoreEv::TextDelta(
+                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting)
+                            .into_owned(),
+                    ));
+                }
+            }
+            KEv::Compacted { committed, trigger, removed, bytes_before, bytes_after, .. } => {
+                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                    // v1 parity: stream the authoritative result as a plain TextDelta line
+                    // (the TUI's `/compact` handler renders these directly). The kernel
+                    // measures BYTES, so the token figures are derived from the last
+                    // provider usage report (see `manual_compact_result`).
+                    let before_tokens =
+                        self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
+                    self.emit(CoreEv::TextDelta(manual_compact_result(
+                        committed,
+                        removed,
+                        bytes_before,
+                        bytes_after,
+                        before_tokens,
+                    )));
+                    if committed {
+                        // v1 parity: refresh the cached context size so the footer /
+                        // `/context` reflect the shrunk conversation immediately. v1
+                        // recomputes via `build_messages`; the kernel only tracks bytes,
+                        // so update `last_usage` to the same estimate the result line
+                        // shows. The next real turn overwrites it with the exact count.
+                        if let Some(meta) = self.last_usage.as_mut() {
+                            meta.used_tokens =
+                                estimate_after_tokens(before_tokens, bytes_before, bytes_after)
+                                    as u32;
+                        }
+                        self.emit_context_stats();
+                    }
+                } else if let Some(msg) = compaction_advisory(committed, &trigger) {
+                    // Auto/Overflow keep the terse one-line advisory.
                     self.emit(CoreEv::Warning(msg));
                 }
             }
@@ -1356,6 +1464,21 @@ impl Bridge {
 /// path does.
 fn bypass_auto_approval(skip_permissions: bool) -> Option<ApprovalResponse> {
     skip_permissions.then(ApprovalResponse::allow)
+}
+
+/// TAKE a parked approval out of the bridge's mirror and return the kernel command
+/// that releases its round-trip as a fail-closed DENY. `None` when nothing is parked.
+///
+/// Used on EVERY teardown of an in-flight turn (Cancel, /model swap): denying the
+/// parked request lets the kernel backfill the cancelled tool's result (so the
+/// conversation has no dangling tool_use), and `take()` clears the mirror so a stale
+/// approval can't re-fire after a model swap re-reads the snapshot.
+fn take_deny_cmd(pending: &mut Option<(RequestId, String)>) -> Option<KCmd> {
+    pending.take().map(|(id, _tool)| {
+        let value =
+            serde_json::to_value(ApprovalResponse::deny()).unwrap_or(serde_json::Value::Null);
+        KCmd::Respond { id, value }
+    })
 }
 
 /// Build the legacy `GoalUpdate` event from goal state (free fn so callers don't
@@ -1708,10 +1831,10 @@ fn build_provider(
             if crypto::is_atomgit_gateway(&cfg.base_url) {
                 if !crypto::signer_available() {
                     anyhow::bail!(
-                        "provider base_url '{}' is an AtomGit gateway this build can't \
-                         authenticate against. Use the official binary, or point the provider \
-                         at a plain OpenAI-compatible endpoint with an api_key.",
-                        cfg.base_url
+                        "{}",
+                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::GatewayAuthUnavailable {
+                            base_url: &cfg.base_url,
+                        })
                     );
                 }
                 pc.request_signer = Some(crate::sign::atomgit_signer(&cfg.base_url)?);
@@ -1724,28 +1847,84 @@ fn build_provider(
     }
 }
 
-/// Decide the user-facing advisory (if any) for a kernel `Compacted` outcome.
+/// Terse one-line advisory for an AUTO / OVERFLOW compaction.
 ///
-/// - A COMMITTED compaction always announces itself.
-/// - A NO-OP compaction only speaks when the user explicitly asked for it
-///   (`Manual` = `/compact`): v1 acknowledged the no-op, but the bridge used to
-///   stay silent, leaving the user unsure the command ran. Auto/Overflow no-ops
-///   stay silent — there's no user action to acknowledge and it would be spam.
+/// A manual `/compact` is handled by the richer streaming path
+/// ([`manual_compact_result`], emitted as a `TextDelta`) so this returns `None` for
+/// it. A committed auto/overflow compaction announces itself once; a no-op stays
+/// silent — there's no user action to acknowledge and it would be spam.
 fn compaction_advisory(
     committed: bool,
     trigger: &atomcode_kernel::message::CompactTrigger,
 ) -> Option<String> {
     use atomcode_kernel::message::CompactTrigger;
+    if matches!(trigger, CompactTrigger::Manual { .. }) {
+        return None; // manual → the TextDelta `manual_compact_result` path
+    }
+    committed.then(|| "conversation compacted".to_string())
+}
+
+/// v1-parity result line for a manual `/compact`, emitted as a `TextDelta` so it
+/// renders as a plain line (matching core's `run_compact`).
+///
+/// The kernel measures conversation BYTES, not tokens, so the token figures are
+/// derived:
+///   - `before_tokens` is the real pre-compaction context size from the last
+///     provider usage report (`last_usage.used_tokens`);
+///   - the after-figure scales `before_tokens` by the byte-reduction ratio
+///     (`bytes_after / bytes_before`).
+/// This reproduces v1's `(compacted — dropped N messages, X → Y tokens)` within
+/// estimation error. A refused / no-op compaction reports `(nothing to compact …)`.
+fn manual_compact_result(
+    committed: bool,
+    removed: usize,
+    bytes_before: usize,
+    bytes_after: usize,
+    before_tokens: usize,
+) -> String {
+    use atomcode_core::i18n::{t, Msg};
+    // Fall back to a coarse bytes/4 estimate only if no usage has been reported yet
+    // (e.g. `/compact` issued before any turn) so figures never read "0 → 0".
+    let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
+    let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
+    let before = fmt_k_tokens(before_tokens);
+    let after = fmt_k_tokens(after_tokens);
     if committed {
-        Some("conversation compacted".to_string())
-    } else if matches!(trigger, CompactTrigger::Manual { .. }) {
-        Some(
-            atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactNothingShort)
-                .trim_end()
-                .to_string(),
-        )
+        return t(Msg::CompactDropped { messages: removed, before: &before, after: &after })
+            .into_owned();
+    }
+    // Refused. Distinguish "would not save tokens" (a summary was built but the
+    // candidate did not shrink — `bytes_after > bytes_before`) from "conversation is
+    // short" (a true no-op plan whose candidate is byte-identical). Mirrors v1, which
+    // shows these as two distinct messages.
+    if bytes_after > bytes_before {
+        t(Msg::CompactNothingNoSavings { before: &before, after: &after }).into_owned()
     } else {
-        None
+        t(Msg::CompactNothingShort).into_owned()
+    }
+}
+
+/// Estimate the post-compaction token count by scaling the pre-compaction count by
+/// the kernel's byte-reduction ratio. The kernel measures conversation BYTES, not
+/// tokens; `before_tokens` (the real provider count) also covers the fixed
+/// system + tools prefix, so this slightly UNDER-states a compaction that left a
+/// large prefix. v1 estimates too (via `build_messages`); this tracks its numbers
+/// closely and is honest about being an estimate. `bytes_before == 0` ⇒ unchanged.
+fn estimate_after_tokens(before_tokens: usize, bytes_before: usize, bytes_after: usize) -> usize {
+    if bytes_before > 0 {
+        ((before_tokens as u128 * bytes_after as u128) / bytes_before as u128) as usize
+    } else {
+        before_tokens
+    }
+}
+
+/// Port of core's (private) `fmt_k_tokens`: `1234` → `"1.2K"`, `< 1000` → verbatim.
+/// Kept local to the bridge so the manual-compact line matches v1's formatting.
+fn fmt_k_tokens(t: usize) -> String {
+    if t >= 1000 {
+        format!("{:.1}K", t as f64 / 1000.0)
+    } else {
+        t.to_string()
     }
 }
 
@@ -1795,26 +1974,88 @@ mod goal_summary_tests {
 
 #[cfg(test)]
 mod undo_tests {
-    use super::{build_provider, compaction_advisory, compute_undo};
+    use super::{
+        build_provider, compaction_advisory, compute_undo, estimate_after_tokens, fmt_k_tokens,
+        manual_compact_result,
+    };
     use atomcode_coding::CodingAgentConfig;
     use atomcode_kernel::message::{CompactTrigger, Message};
 
     #[test]
-    fn compaction_advisory_speaks_for_manual_noop_but_stays_silent_for_auto() {
-        // Committed compaction always announces, regardless of trigger.
-        assert!(compaction_advisory(true, &CompactTrigger::Manual { focus: None }).is_some());
-        assert!(compaction_advisory(true, &CompactTrigger::Auto { utilization: 0.9 }).is_some());
+    fn compaction_advisory_announces_committed_auto_overflow_and_ignores_manual() {
+        // Manual `/compact` is handled by the richer streaming `manual_compact_result`
+        // path, so the terse advisory stays silent for it on BOTH outcomes.
+        assert!(compaction_advisory(true, &CompactTrigger::Manual { focus: None }).is_none());
+        assert!(compaction_advisory(false, &CompactTrigger::Manual { focus: None }).is_none());
 
-        // A user-typed `/compact` that's a no-op must be acknowledged — this is the
-        // v1-parity regression: the bridge previously stayed silent here.
-        let manual_noop = compaction_advisory(false, &CompactTrigger::Manual { focus: None });
-        assert!(manual_noop.as_deref().is_some_and(|m| !m.is_empty()));
-        // No trailing newline — it renders as a single Warning line.
-        assert!(!manual_noop.unwrap().ends_with('\n'));
+        // A committed auto/overflow compaction announces itself once.
+        assert!(compaction_advisory(true, &CompactTrigger::Auto { utilization: 0.9 }).is_some());
+        assert!(compaction_advisory(true, &CompactTrigger::Overflow { attempt: 0 }).is_some());
 
         // Auto / Overflow no-op compaction stays silent (no user action to ack, no spam).
         assert!(compaction_advisory(false, &CompactTrigger::Auto { utilization: 0.9 }).is_none());
         assert!(compaction_advisory(false, &CompactTrigger::Overflow { attempt: 0 }).is_none());
+    }
+
+    #[test]
+    fn manual_compact_result_reports_dropped_count_and_token_reduction() {
+        // 129 messages dropped; pre-compaction context = 42.9K tokens; the conversation
+        // shrank to ~25.9% of its bytes → after ≈ 11.1K. Numbers + the `→` arrow are
+        // locale-invariant (en: "dropped N messages, X → Y tokens"; zh: "丢弃 N 条消息，
+        // X → Y tokens"), so we assert on those rather than the surrounding words.
+        let line = manual_compact_result(true, 129, 170_000, 44_000, 42_900);
+        assert!(line.contains("129"), "dropped-count missing: {line}");
+        assert!(line.contains("42.9K"), "before figure missing: {line}");
+        assert!(line.contains("11.1K"), "after figure missing: {line}");
+        assert!(line.contains('→'), "token-reduction arrow missing: {line}");
+    }
+
+    #[test]
+    fn manual_compact_result_true_noop_is_short_line_without_arrow() {
+        // A TRUE no-op (candidate byte-identical: bytes_after == bytes_before) reports the
+        // "(nothing to compact — conversation is short)" line, which — in every locale —
+        // carries NO `→` arrow (unlike the committed / no-savings lines).
+        let noop = manual_compact_result(false, 0, 8_000, 8_000, 6_000);
+        assert!(!noop.is_empty(), "no-op must still acknowledge the command");
+        assert!(!noop.contains('→'), "true no-op must not show a token comparison: {noop}");
+        // Degenerate all-zero inputs also resolve to the short (no-arrow) line.
+        assert!(!manual_compact_result(false, 0, 0, 0, 0).contains('→'));
+    }
+
+    #[test]
+    fn manual_compact_result_net_loss_reports_no_savings_with_figures() {
+        // A refused compaction whose candidate GREW (bytes_after > bytes_before) — e.g.
+        // running `/compact` twice — is NOT "short"; v1 shows a "would not save tokens:
+        // X → Y" line WITH a `→` arrow. before = 5.0K; after = 5000*15000/10000 = 7500.
+        let line = manual_compact_result(false, 0, 10_000, 15_000, 5_000);
+        assert!(line.contains('→'), "net-loss line shows a token comparison: {line}");
+        assert!(line.contains("5.0K"), "before figure: {line}");
+        assert!(line.contains("7.5K"), "after figure: {line}");
+    }
+
+    #[test]
+    fn manual_compact_result_falls_back_to_byte_estimate_without_usage() {
+        // No provider usage yet (before_tokens = 0): rather than show "0 → 0", fall back
+        // to a coarse bytes/4 estimate. 40_000 bytes → ~10K before; halved bytes → ~5K.
+        let line = manual_compact_result(true, 3, 40_000, 20_000, 0);
+        assert!(line.contains("10.0K"), "byte-fallback before figure: {line}");
+        assert!(line.contains("5.0K"), "byte-fallback after figure: {line}");
+    }
+
+    #[test]
+    fn estimate_after_tokens_scales_by_byte_ratio() {
+        // 42.9K tokens, conversation bytes 170K → 44K → ~11.1K (the screenshot's case).
+        assert_eq!(estimate_after_tokens(42_900, 170_000, 44_000), 11_103);
+        // Degenerate bytes_before == 0 leaves the count unchanged (no divide-by-zero).
+        assert_eq!(estimate_after_tokens(5_000, 0, 0), 5_000);
+    }
+
+    #[test]
+    fn fmt_k_tokens_matches_core_format() {
+        assert_eq!(fmt_k_tokens(0), "0");
+        assert_eq!(fmt_k_tokens(999), "999");
+        assert_eq!(fmt_k_tokens(1000), "1.0K");
+        assert_eq!(fmt_k_tokens(42_900), "42.9K");
     }
 
     fn coding_cfg(reasoning_history: Option<&str>) -> CodingAgentConfig {
@@ -1941,5 +2182,40 @@ mod undo_tests {
         // Still 2 real prompts; the synthetic note must not shift the count/target.
         assert_eq!(p.prompts_before, 2);
         assert_eq!(p.restored_prompt, "second question");
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::take_deny_cmd;
+    use atomcode_capabilities::tools::PermissionDecision;
+    use atomcode_kernel::event::AgentCommand as KCmd;
+
+    #[test]
+    fn cancel_releases_a_parked_approval_as_deny_and_clears_the_mirror() {
+        // A tool is parked awaiting approval (request id 7). Cancelling the turn must
+        // release that round-trip as a DENY *and* clear the bridge's mirror — so the
+        // kernel backfills the cancelled tool's result and a subsequent /model swap
+        // can't find a lingering approval to re-trigger on the next prompt.
+        let mut pending = Some((7u64, "geocoding".to_string()));
+        let cmd = take_deny_cmd(&mut pending).expect("a parked approval must be released on cancel");
+        assert!(pending.is_none(), "the bridge's pending-approval mirror must be cleared");
+        match cmd {
+            KCmd::Respond { id, value } => {
+                assert_eq!(id, 7);
+                assert_eq!(
+                    PermissionDecision::from_value(&value),
+                    PermissionDecision::Deny,
+                    "the released approval must read as a fail-closed DENY"
+                );
+            }
+            other => panic!("expected Respond(deny), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_to_release_when_no_approval_is_parked() {
+        let mut pending: Option<(u64, String)> = None;
+        assert!(take_deny_cmd(&mut pending).is_none());
     }
 }

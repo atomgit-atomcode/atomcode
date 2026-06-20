@@ -77,30 +77,15 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
     }
 }
 
-/// 把新会话创建事件广播给所有视图，并替换当前 LiveSession。webui 新建对话时调用，
-/// 让同进程 TUI 跟随切换到新会话。替换 LiveSession 可确保旧 turn 的输出不再
-/// 流入新的 forwarder（否则旧 LiveSession 被复用，旧 turn 的 TextDelta 等事件
-/// 仍会出现在 TUI 画面上）。无活动 LiveSession 时静默跳过。
+/// 把新会话创建事件广播给所有视图。webui 新建对话时调用，让同进程 TUI 跟随
+/// 切换到新会话。无活动 LiveSession 时静默跳过。
+/// 注意：不更新 LIVE_SESSION_ID——该变量由 ensure_live_session_global 在
+/// 实际创建/替换 LiveSession 时更新；提前更新会导致 ensure_live_session_global
+/// 误判旧 LiveSession 已匹配新 session_id 而复用它。
 pub fn live_switch_session(session_id: atomcode_core::session::SessionId) {
     let id_str = session_id.to_string();
-    // 同步更新 LIVE_SESSION_ID，使后续 /live SSE 的 snapshot 回显新 id。
-    *LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(id_str.clone());
-    // 先广播 SessionSwitched 事件，让已订阅旧 LiveSession 的 forwarder
-    // 收到通知并处理（TUI 切换会话、重置画布）。
-    if let Some(old) = current_live_session() {
-        old.notify_session_switched(id_str.clone());
-    }
-    // 替换 LIVE 中的 LiveSession 为新实例（绑定新 session_id），
-    // 使后续 ensure_live_session_global / /live SSE / /live/message
-    // 全部走新 LiveSession。旧的 LiveSession 的 Arc 计数归零后
-    // coordinator task 也会退出（input_tx 被 drop）。
-    let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    if g.is_some() {
-        // 从旧 LiveSession 取 working_dir 和 telemetry 以创建新实例。
-        // 不能直接从 LIVE 嵌入 AppState，因为此函数可能在非 async 上下文中调用。
-        // 所以用懒初始化：新 LiveSession 稍后由 ensure_live_session_global
-        // 在 /live/message 调用时按需创建。此处只清空旧引用。
-        *g = None;
+    if let Some(s) = current_live_session() {
+        s.notify_session_switched(id_str);
     }
 }
 
@@ -190,9 +175,13 @@ pub(crate) fn ensure_live_session_global(
             None => true,
         };
         if dominated {
+            eprintln!("[DEBUG ensure_live_session_global] REUSE existing session, dominated=true, req_id={:?} live_id={:?}", session_id, LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
             return s.clone();
         }
         // session_id 不匹配 → 当前 LiveSession 属于旧会话，需要替换。
+        eprintln!("[DEBUG ensure_live_session_global] REPLACE old session, dominated=false, req_id={:?} live_id={:?}", session_id, LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
+    } else {
+        eprintln!("[DEBUG ensure_live_session_global] CREATE new session, no existing, req_id={:?}", session_id);
     }
     let session_id = session_id.unwrap_or_default();
     // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
@@ -1487,7 +1476,10 @@ pub(crate) async fn live_message(
     set_live_provider(req.provider);
     // #561 修复：把调用方的 session_id 传递给 LiveSession，使 sync 与常规会话统一。
     // 历史惰性加载——会话已存在且匹配时直接复用，不会为被丢弃的历史读盘。
+    let req_session_id = req.session_id.clone();
     let sid = parse_session_id(req.session_id);
+    let current_live_id = LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    eprintln!("[DEBUG live_message] req.session_id={:?} parsed_sid={:?} current_LIVE_SESSION_ID={:?}", req_session_id, sid, current_live_id);
     let load_dir = working_dir.clone();
     let load_sid = sid.clone();
     let session = ensure_live_session_global(
@@ -1500,6 +1492,8 @@ pub(crate) async fn live_message(
             None => (Vec::new(), Vec::new()),
         },
     );
+    let after_live_id = LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    eprintln!("[DEBUG live_message] after ensure: LIVE_SESSION_ID={:?} session_ptr={:p}", after_live_id, Arc::as_ptr(&session));
     // 视觉预处理在 coordinator 经 executor.preprocess_input 统一做（TUI / webui 共享），
     // 此处只负责投递原始输入。
     let ok = session.send_input(UserInput {
@@ -1513,6 +1507,7 @@ pub(crate) async fn live_message(
             })
             .collect(),
     });
+    eprintln!("[DEBUG live_message] send_input accepted={}", ok);
     Json(serde_json::json!({ "accepted": ok }))
 }
 
