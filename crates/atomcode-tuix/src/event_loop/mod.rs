@@ -4269,7 +4269,6 @@ fn attach_image_to_input(
 fn attach_typed_image_paths(
     app: &mut App,
     ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
     text: &mut String,
     images: &mut Vec<ImagePart>,
     kept_markers: &mut Vec<usize>,
@@ -4332,7 +4331,6 @@ fn attach_typed_image_paths(
                 }
             }
         }
-        renderer.render(UiLine::ImageAttachment(n));
         images.push(img);
         kept_markers.push(n);
     }
@@ -5759,7 +5757,6 @@ fn handle_idle_key(
                 attach_typed_image_paths(
                     app,
                     ctx,
-                    renderer,
                     &mut expanded,
                     &mut images,
                     &mut kept_markers,
