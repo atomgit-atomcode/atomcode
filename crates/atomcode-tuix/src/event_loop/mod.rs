@@ -488,7 +488,12 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
             Some("jpg") | Some("jpeg") => "image/jpeg",
             Some("gif") => "image/gif",
             Some("webp") => "image/webp",
-            _ => return None,
+            _ => {
+                // Fallback: magic-byte detection for paths without
+                // recognisable extensions, e.g. macOS tmp files
+                // resolved from /.file/id=… references.
+                detect_image_type_from_path(path)?
+            },
         }
     };
     let meta = std::fs::metadata(path).ok()?;
@@ -4328,9 +4333,6 @@ fn attach_typed_image_paths(
             }
         }
         renderer.render(UiLine::ImageAttachment(n));
-        // No render here: the caller groups the collected `kept_markers` into a
-        // single `UiLine::UserWithAttachments` echo (the viewport-overflow fix),
-        // so this helper only collects.
         images.push(img);
         kept_markers.push(n);
     }
