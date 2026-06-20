@@ -162,3 +162,43 @@ mod tests {
         assert_eq!(serde_json::to_string(&ToolChoice::None).unwrap(), "\"None\"");
     }
 }
+
+/// Heuristic to guess whether a model name likely supports image/vision
+/// inputs.  It is intentionally conservative — a false negative may skip
+/// attaching images to an image-capable model (harmless: the user can
+/// re-attach), while a false positive may cause a 400, so when in doubt
+/// this returns false.
+///
+/// **Single source of truth** for vision-model name detection.
+/// `atomcode_core::provider::model_name_suggests_vision` and
+/// `atomcode_capabilities::provider::openai_compat::suggests_vision`
+/// both delegate here.  When adding a new vision model, update THIS
+/// function.
+pub fn model_name_suggests_vision(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("vision")
+        || n.contains("-vl")
+        || n.contains("vl-")
+        || n.contains("ocr")
+        || n.contains("-4v")
+        || n.contains("-4.1v")
+        || n.starts_with("gpt-4o")
+        // Claude 3 onwards is vision-capable.  Anthropic uses two naming
+        // forms: the legacy `claude-<gen>-<variant>` (claude-3-5-sonnet)
+        // and the newer `claude-<variant>-<gen>-<rev>` (claude-sonnet-4-6).
+        || n.starts_with("claude-3")
+        || n.starts_with("claude-4")
+        || n.starts_with("claude-5")
+        || n.starts_with("claude-6")
+        || n.starts_with("claude-7")
+        || n.starts_with("claude-sonnet")
+        || n.starts_with("claude-opus")
+        || n.starts_with("claude-haiku")
+        || n.starts_with("gemini")
+        || n.starts_with("pixtral")
+        || n.contains("llava")
+        || n.contains("qvq")
+        // Kimi K2 series — only 2.5 / 2.6 support vision.
+        || n.starts_with("kimi-k2.5")
+        || n.starts_with("kimi-k2.6")
+}
