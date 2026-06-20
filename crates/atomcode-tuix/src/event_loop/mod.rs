@@ -195,6 +195,9 @@ fn unescape_shell_escapes(raw: &str) -> String {
                 if !next.is_alphanumeric() { out.push(next); continue; }
                 out.push('\\');
                 out.push(next);
+            } else {
+                // Trailing backslash — nothing follows, preserve it verbatim.
+                out.push('\\');
             }
         } else { out.push(c); }
     }
