@@ -458,7 +458,7 @@ pub struct StatusLine {
     /// the status row between the left info and the right-aligned hint.
     pub goal_indicator: Option<String>,
     /// Whether the active model supports vision. When true the status
-    /// bar renders a  glyph before the model name.
+    /// bar appends a  glyph after the model name.
     pub vision: bool,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
