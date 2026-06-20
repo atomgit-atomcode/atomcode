@@ -269,6 +269,7 @@ fn suggests_vision(model: &str) -> bool {
 
 /// Map kernel `Message`s onto OpenAI-compatible wire `messages[]`.
 fn format_messages(messages: &[Message], policy: ReasoningPolicy, model: &str) -> Vec<Value> {
+    let vision = suggests_vision(model);
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m.role {
@@ -276,7 +277,7 @@ fn format_messages(messages: &[Message], policy: ReasoningPolicy, model: &str) -
             // OpenAI-compatible models accept only a single system message.
             Role::System => super::push_system_coalesced(&mut out, &m.text),
             Role::User => {
-                if m.images.is_empty() || !suggests_vision(model) {
+                if m.images.is_empty() || !vision {
                     // Text-only or model doesn't support vision — keep content as STRING
                     // path, so a no-image conversation's prefix cache is unperturbed.
                     out.push(json!({ "role": "user", "content": m.text }));
