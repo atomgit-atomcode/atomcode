@@ -725,26 +725,7 @@ impl Bridge {
                     self.settle_in_flight_turn().await;
                 }
                 if let Some(p) = config.providers.get(&config.default_provider) {
-                    self.coding_cfg.model = p.model.clone();
-                    if let Some(b) = &p.base_url {
-                        self.coding_cfg.base_url = b.clone();
-                    }
-                    if let Some(k) = &p.api_key {
-                        self.coding_cfg.api_key = k.clone();
-                    }
-                    // `/effort` / `/think` write the provider config then ReloadConfig: pick
-                    // up the (possibly changed) reasoning_effort so the respawned agent's
-                    // ChatOptions reflect it. (`reasoning_history` is a model-property, set
-                    // once at construction; effort is the knob users flip mid-session.)
-                    self.coding_cfg.chat_options.reasoning_effort =
-                        atomcode_kernel::provider::ReasoningEffort::from_config(p.reasoning_effort.as_deref());
-                    // A /model swap can change the adapter kind + per-provider knobs entirely
-                    // — refresh them all so the rebuilt provider matches the new config.
-                    self.coding_cfg.provider_type = p.provider_type.clone();
-                    self.coding_cfg.reasoning_history = p.reasoning_history.clone();
-                    self.coding_cfg.thinking_enabled = p.thinking_enabled;
-                    self.coding_cfg.thinking_type = p.thinking_type.clone();
-                    self.coding_cfg.thinking_keep = p.thinking_keep.clone();
+                    apply_reload_provider(&mut self.coding_cfg, p);
                     match build_provider(&self.coding_cfg) {
                         Ok(provider) => {
                             // Assemble BEFORE tearing down the old handle — if
@@ -1782,6 +1763,33 @@ fn compute_undo(
     }
 }
 
+fn apply_reload_provider(
+    cfg: &mut CodingAgentConfig,
+    provider: &atomcode_core::config::provider::ProviderConfig,
+) {
+    cfg.model = provider.model.clone();
+    if let Some(base_url) = &provider.base_url {
+        cfg.base_url = base_url.clone();
+    }
+    if let Some(api_key) = &provider.api_key {
+        cfg.api_key = api_key.clone();
+    }
+    cfg.context_window = provider.context_window as u32;
+    // `/effort` / `/think` write the provider config then ReloadConfig: pick
+    // up the (possibly changed) reasoning_effort so the respawned agent's
+    // ChatOptions reflect it. (`reasoning_history` is a model-property, set
+    // once at construction; effort is the knob users flip mid-session.)
+    cfg.chat_options.reasoning_effort =
+        atomcode_kernel::provider::ReasoningEffort::from_config(provider.reasoning_effort.as_deref());
+    // A /model swap can change the adapter kind + per-provider knobs entirely
+    // — refresh them all so the rebuilt provider matches the new config.
+    cfg.provider_type = provider.provider_type.clone();
+    cfg.reasoning_history = provider.reasoning_history.clone();
+    cfg.thinking_enabled = provider.thinking_enabled;
+    cfg.thinking_type = provider.thinking_type.clone();
+    cfg.thinking_keep = provider.thinking_keep.clone();
+}
+
 fn build_provider(
     cfg: &CodingAgentConfig,
 ) -> anyhow::Result<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
@@ -1975,11 +1983,13 @@ mod goal_summary_tests {
 #[cfg(test)]
 mod undo_tests {
     use super::{
-        build_provider, compaction_advisory, compute_undo, estimate_after_tokens, fmt_k_tokens,
-        manual_compact_result,
+        apply_reload_provider, build_provider, compaction_advisory, compute_undo,
+        estimate_after_tokens, fmt_k_tokens, manual_compact_result,
     };
+    use atomcode_core::config::provider::ProviderConfig;
     use atomcode_coding::CodingAgentConfig;
     use atomcode_kernel::message::{CompactTrigger, Message};
+    use atomcode_kernel::provider::ReasoningEffort;
 
     #[test]
     fn compaction_advisory_announces_committed_auto_overflow_and_ignores_manual() {
@@ -2078,6 +2088,49 @@ mod undo_tests {
         assert!(res.is_err(), "a reasoning_history typo must fail provider construction");
         let err = res.err().unwrap().to_string();
         assert!(err.contains("reasoning_history"), "expected a reasoning_history error, got: {err}");
+    }
+
+    #[test]
+    fn reload_provider_refreshes_context_window_and_provider_knobs() {
+        let mut cfg = CodingAgentConfig::new("old-key", "https://old.example.com/v1", "old-model", "/tmp");
+        cfg.context_window = 16_000;
+        cfg.provider_type = "openai".into();
+        cfg.reasoning_history = Some("exclude".into());
+        cfg.thinking_enabled = Some(false);
+        cfg.thinking_type = Some("disabled".into());
+        cfg.thinking_keep = Some("none".into());
+
+        let provider = ProviderConfig {
+            provider_type: "claude".into(),
+            api_key: Some("new-key".into()),
+            model: "new-model".into(),
+            base_url: Some("https://new.example.com/v1".into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 64_000,
+            max_tokens: None,
+            thinking_type: Some("enabled".into()),
+            thinking_keep: Some("all".into()),
+            reasoning_history: Some("include".into()),
+            reasoning_effort: Some("max".into()),
+            thinking_enabled: Some(true),
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        };
+
+        apply_reload_provider(&mut cfg, &provider);
+
+        assert_eq!(cfg.model, "new-model");
+        assert_eq!(cfg.base_url, "https://new.example.com/v1");
+        assert_eq!(cfg.api_key, "new-key");
+        assert_eq!(cfg.context_window, 64_000);
+        assert_eq!(cfg.provider_type, "claude");
+        assert_eq!(cfg.reasoning_history.as_deref(), Some("include"));
+        assert_eq!(cfg.chat_options.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(cfg.thinking_enabled, Some(true));
+        assert_eq!(cfg.thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(cfg.thinking_keep.as_deref(), Some("all"));
     }
 
     fn convo() -> Vec<Message> {

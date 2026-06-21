@@ -1041,7 +1041,19 @@ impl RunningAgent {
                 ));
             }
             let ctx_window = self.provider.context_window();
-            let used_tokens = usage.prompt;
+            // Prefer the provider's EXACT prompt count. FALL BACK to a byte estimate over
+            // the OUTGOING request (`messages`, post-`pre_request`) when the provider omits
+            // usage (`usage.prompt == 0`): an empty 200, or a usage chunk dropped after
+            // `finish_reason` — both observed on some OpenAI-compatible gateways. Without
+            // this, a non-reporting provider records utilization 0.0 forever, so the
+            // task-boundary auto-compaction trigger NEVER fires and context grows unbounded
+            // until a hard overflow or a manual /compact. (`tokens` below keeps the raw
+            // provider report as-is; only the DERIVED pressure is estimated.)
+            let used_tokens = if usage.prompt > 0 {
+                usage.prompt
+            } else {
+                messages.iter().map(|m| m.estimate_tokens()).sum()
+            };
             let utilization = if ctx_window > 0 {
                 used_tokens as f32 / ctx_window as f32
             } else {
