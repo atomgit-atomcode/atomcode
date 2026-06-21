@@ -1,6 +1,4 @@
 // crates/atomcode-tuix/src/render/mod.rs
-#[cfg(windows)]
-pub mod conhost;
 pub mod cell;
 pub mod plain;
 pub mod qr;
@@ -41,6 +39,13 @@ pub enum UiLine {
         working_dir: String,
     },
     User(String),
+    /// A user message and its image echoes rendered as one append-only
+    /// group. Retained renderers must not commit a temporary spacer between
+    /// the text and attachments because that scroll cannot be undone.
+    UserWithAttachments {
+        text: String,
+        attachments: Vec<usize>,
+    },
     AssistantText(String),
     /// LLM reasoning/thinking content (displayed in gray/dimmed style)
     ReasoningText(String),
@@ -453,8 +458,30 @@ pub struct StatusLine {
     /// the status row between the left info and the right-aligned hint.
     pub goal_indicator: Option<String>,
     /// Whether the active model supports vision. When true the status
-    /// bar renders a  glyph before the model name.
+    /// bar appends a  glyph after the model name.
     pub vision: bool,
+    /// When an autonomous `/goal` loop is active, this carries its live status
+    /// for the DEDICATED footer goal row (its own full-width line above the
+    /// status row). `None` ⇒ no goal running, row omitted. Previously this was
+    /// a pre-formatted suffix crammed onto the shared status line, where it was
+    /// the first thing truncated under a hint / narrow terminal and omitted the
+    /// condition text — so users couldn't reliably see the goal while tool
+    /// output scrolled. Its own row fixes that.
+    pub goal: Option<GoalStatus>,
+}
+
+/// Live status of an active autonomous `/goal` loop, rendered on the dedicated
+/// footer goal row. The renderer width-truncates `condition` to fit; `round`
+/// and the elapsed time always survive (see `format_goal_row`).
+#[derive(Debug, Clone)]
+pub struct GoalStatus {
+    /// The goal condition text (truncated with `…` to fit the row width).
+    pub condition: String,
+    /// Round number AS DISPLAYED — 1-based (the first attempt reads `round 1`).
+    /// The caller adds 1 to the engine's 0-based internal round.
+    pub round: u32,
+    /// Wall-clock seconds since the goal was set.
+    pub elapsed_secs: u64,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

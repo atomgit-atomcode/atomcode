@@ -195,6 +195,9 @@ fn unescape_shell_escapes(raw: &str) -> String {
                 if !next.is_alphanumeric() { out.push(next); continue; }
                 out.push('\\');
                 out.push(next);
+            } else {
+                // Trailing backslash — nothing follows, preserve it verbatim.
+                out.push('\\');
             }
         } else { out.push(c); }
     }
@@ -211,11 +214,13 @@ fn detect_image_type_from_path(path: &std::path::Path) -> Option<&'static str> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     let mut header = [0u8; 12];
-    f.read_exact(&mut header).ok()?;
-    if header.starts_with(b"\x89PNG\r\n\x1a\n") { return Some("image/png"); }
-    if header.starts_with(b"\xff\xd8\xff") { return Some("image/jpeg"); }
-    if header.starts_with(b"GIF8") { return Some("image/gif"); }
-    if header.starts_with(b"RIFF") && &header[8..12] == b"WEBP" { return Some("image/webp"); }
+    let n = f.read(&mut header).ok()?;
+    // Match on actual bytes read so truncated/corrupt tiny files
+    // aren't silently discarded (read_exact would return UnexpectedEof).
+    if n >= 8 && header.starts_with(b"\x89PNG\r\n\x1a\n") { return Some("image/png"); }
+    if n >= 3 && header.starts_with(b"\xff\xd8\xff") { return Some("image/jpeg"); }
+    if n >= 4 && header.starts_with(b"GIF8") { return Some("image/gif"); }
+    if n >= 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP" { return Some("image/webp"); }
     None
 }
 
@@ -282,6 +287,42 @@ fn cache_write_image(cache_dir: &std::path::Path, img: &atomcode_core::conversat
 /// input box. Mirror of the post-submit echo (`UiLine::ImageAttachment`)
 /// — same visual treatment so users see the attachment status pre-
 /// AND post-submit identically.
+/// Extract every `[Image #N]` marker number from `text`, in first-occurrence
+/// order, de-duped. Unlike `compute_input_attachments` this does NOT filter
+/// against pending state — it re-derives the markers purely from the text, used
+/// to render the `└ [Image #N]` echoes for a user message that arrives via
+/// `UserEcho` (sync mode), where the local submit path intentionally skipped
+/// them (the user row itself is also re-rendered from the echo, so emitting the
+/// echoes locally at submit time would orphan them ABOVE the later user row).
+fn image_markers_in_order(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let needle = b"[Image #";
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + needle.len() < bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let mut j = i + needle.len();
+            let mut n: usize = 0;
+            let mut had_digit = false;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n.saturating_mul(10).saturating_add((bytes[j] - b'0') as usize);
+                j += 1;
+                had_digit = true;
+            }
+            if had_digit && j < bytes.len() && bytes[j] == b']' {
+                if seen.insert(n) {
+                    out.push(n);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 pub(crate) fn compute_input_attachments(
     state: &crate::state::UiState,
     buf_text: &str,
@@ -450,7 +491,12 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
             Some("jpg") | Some("jpeg") => "image/jpeg",
             Some("gif") => "image/gif",
             Some("webp") => "image/webp",
-            _ => return None,
+            _ => {
+                // Fallback: magic-byte detection for paths without
+                // recognisable extensions, e.g. macOS tmp files
+                // resolved from /.file/id=… references.
+                detect_image_type_from_path(path)?
+            },
         }
     };
     let meta = std::fs::metadata(path).ok()?;
@@ -1444,6 +1490,24 @@ mod buffer_tests {
     use super::*;
 
     #[test]
+    fn spinner_label_surfaces_network_stall_hint_then_clears_on_activity() {
+        // End-to-end on the REAL spinner renderer: a model stream silent past the
+        // threshold must put the localized "network may be down · esc" hint into the
+        // footer label; a fresh chunk (note_stream_activity) must clear it.
+        let mut s = UiState::new();
+        s.on_submit(); // phase=Streaming, spinner = a thinking label
+        s.last_stream_activity =
+            Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT * 2);
+        let hint = crate::i18n::t(crate::i18n::Msg::StreamStalled);
+        let stalled = format_spinner_label(&s, 0, None);
+        assert!(stalled.contains(&*hint), "stalled spinner must show the hint, got {stalled:?}");
+
+        s.note_stream_activity(); // a byte arrived → stream is alive again
+        let live = format_spinner_label(&s, 0, None);
+        assert!(!live.contains(&*hint), "live stream must not show the hint, got {live:?}");
+    }
+
+    #[test]
     fn small_paste_inserts_inline() {
         let mut b = Buffer::new();
         b.insert_paste("hi\n".to_string());
@@ -1474,6 +1538,25 @@ mod buffer_tests {
     fn expand_pastes_is_noop_without_placeholders() {
         let b = Buffer::new();
         assert_eq!(b.expand_pastes("plain text"), "plain text");
+    }
+
+    #[test]
+    fn slash_command_arg_expands_folded_paste() {
+        // Regression: `/goal <pasted body>` must hand the command the
+        // real pasted text, not the literal `[Pasted #N …]` placeholder.
+        // The submit path now expands the slash arg before dispatch; this
+        // mirrors that expansion on the `arg` slice of the committed line.
+        let mut b = Buffer::new();
+        let body = "do the thing\n".repeat(69);
+        b.insert_paste(body.clone());
+        // Buffer now looks like the user typed `/goal ` then pasted.
+        let line = format!("/goal {}", b.text);
+        let (cmd, arg) = parse_slash_line(&line).expect("recognised as slash line");
+        assert_eq!(cmd, "goal");
+        assert!(arg.contains("[Pasted #1"), "arg still folded pre-expansion: {arg:?}");
+        let expanded = b.expand_pastes(arg);
+        assert_eq!(expanded, body, "slash arg must expand to the pasted body");
+        assert!(!expanded.contains("[Pasted #"), "no placeholder should survive");
     }
 
     #[test]
@@ -3633,9 +3716,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                 live.send_input(UserInput { text: queued.text, images: queued.images });
                                 app.state.on_submit();
                             } else {
-                                // —— 原有逻辑，原样保留 ——
-                                renderer.render(UiLine::User(queued.text.clone()));
-                                renderer.flush();
                                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
                                     text: queued.text,
                                     images: queued.images,
@@ -4024,9 +4104,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                 live.send_input(UserInput { text: queued.text, images: queued.images });
                                 app.state.on_submit();
                             } else {
-                                // —— 原有逻辑，原样保留 ——
-                                renderer.render(UiLine::User(queued.text.clone()));
-                                renderer.flush();
                                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
                                     text: queued.text,
                                     images: queued.images,
@@ -4214,7 +4291,6 @@ fn attach_image_to_input(
 fn attach_typed_image_paths(
     app: &mut App,
     ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
     text: &mut String,
     images: &mut Vec<ImagePart>,
     kept_markers: &mut Vec<usize>,
@@ -4277,7 +4353,6 @@ fn attach_typed_image_paths(
                 }
             }
         }
-        renderer.render(UiLine::ImageAttachment(n));
         images.push(img);
         kept_markers.push(n);
     }
@@ -4971,6 +5046,30 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
+    // so the TUI can legitimately sit in Idle while the agent keeps looping
+    // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
+    // they never reach the cancel path (that lives in `handle_streaming_key`),
+    // which is why a goal felt uninterruptible. When a goal is active, route
+    // Ctrl+C and a bare Esc (empty buffer — don't steal Esc from clearing a
+    // draft the user is editing to nudge the goal) to `Cancel`: the bridge
+    // turns that into "clear the goal + cancel the running turn", and the
+    // follow-up GoalUpdate(active=false) resets the local goal state. Belt and
+    // suspenders alongside `on_thinking` keeping the TUI in Streaming.
+    if app.state.goal_condition.is_some() {
+        let is_ctrl_c = code == KeyCode::Char('c')
+            && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+        let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
+        if is_ctrl_c || is_bare_esc {
+            ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+            crate::tuix_trace!(
+                "KEY",
+                "idle goal-active {} -> Cancel",
+                if is_ctrl_c { "Ctrl+C" } else { "Esc" }
+            );
+            return Ok(());
+        }
+    }
     // If the menu is active (buf starts with '/'), intercept navigation keys.
     // Suppress while scrolling history / right after a restore (see
     // `menu_for_display`) — otherwise a recalled `/se…` immediately re-pops.
@@ -5580,9 +5679,17 @@ fn handle_idle_key(
                     // hand it `&mut app.buf`.
                     handle_paste_command(app, ctx, renderer)?;
                 } else {
+                    // Expand `[Pasted #N …]` placeholders in the argument
+                    // before dispatch, exactly like the regular-message
+                    // path below. Without this, `/goal <pasted body>`
+                    // hands the command the literal placeholder string
+                    // (e.g. "[Pasted #1 +69 lines]") instead of the real
+                    // pasted text. The paste registry is still live here —
+                    // it's cleared a few lines down, after dispatch.
+                    let arg = app.buf.expand_pastes(arg);
                     execute_slash_command(
                         cmd,
-                        arg,
+                        &arg,
                         &mut app.state,
                         ctx,
                         renderer,
@@ -5626,11 +5733,6 @@ fn handle_idle_key(
                 for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir) {
                     renderer.render(UiLine::Warning(n));
                 }
-                // 同步模式：不在本地渲染用户行；等 LiveEvent::UserMessage →
-                // AgentEvent::UserEcho 回灌，保证两端一致。非同步模式原样渲染。
-                if ctx.sync_session.is_none() {
-                    renderer.render(UiLine::User(line.clone()));
-                }
                 let mut expanded = app.buf.expand_pastes(&line);
                 // Pastes have now been substituted into `expanded`;
                 // safe to drop the registry. Doing it any earlier
@@ -5666,7 +5768,6 @@ fn handle_idle_key(
                     .zip(pending_hashes.into_iter())
                 {
                     if line.contains(&format!("[Image #{}]", n)) {
-                        renderer.render(UiLine::ImageAttachment(n));
                         kept_refs.push(crate::input::history::HistoryImageRef {
                             hash: format!("{:016x}", hash),
                             mt: img.media_type.clone(),
@@ -5686,11 +5787,17 @@ fn handle_idle_key(
                 attach_typed_image_paths(
                     app,
                     ctx,
-                    renderer,
                     &mut expanded,
                     &mut images,
                     &mut kept_markers,
                 );
+                if ctx.sync_session.is_none() {
+                    renderer.render(UiLine::UserWithAttachments {
+                        text: line.clone(),
+                        attachments: kept_markers.clone(),
+                    });
+                }
+                renderer.flush();
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: line.clone(),
                     images: kept_refs,
@@ -5902,6 +6009,54 @@ mod parse_already_latest_versions_tests {
     }
 }
 
+#[cfg(test)]
+mod image_marker_tests {
+    use super::image_markers_in_order as marks;
+
+    #[test]
+    fn extracts_markers_in_order_deduped() {
+        assert_eq!(marks("[Image #1] hi"), vec![1]);
+        assert_eq!(marks("[Image #2] and [Image #5] and [Image #2]"), vec![2, 5]);
+        assert_eq!(marks("no images here"), Vec::<usize>::new());
+        // Malformed markers are ignored.
+        assert_eq!(marks("[Image #] [Image #x] [Image #3]"), vec![3]);
+    }
+}
+
+#[cfg(test)]
+mod streaming_slash_tests {
+    use super::streaming_executable_slash as exec;
+
+    #[test]
+    fn goal_halt_subcommands_run_mid_stream() {
+        // The whole point: `/goal clear` (and its aliases) must execute while a
+        // turn is running, because a server-driven goal keeps the TUI in
+        // Streaming where commands are otherwise blocked.
+        for sub in ["clear", "stop", "off", "reset", "none", "cancel"] {
+            let got = exec(&format!("/goal {sub}"));
+            assert_eq!(got, Some(("goal".to_string(), sub.to_string())), "sub={sub}");
+        }
+    }
+
+    #[test]
+    fn bg_no_arg_runs_but_setting_a_goal_does_not() {
+        assert_eq!(exec("/bg"), Some(("bg".to_string(), String::new())));
+        // Backgrounding a NEW message and SETTING a new goal must NOT run mid-stream.
+        assert_eq!(exec("/bg go do a thing"), None);
+        assert_eq!(exec("/goal write all the tests"), None);
+        assert_eq!(exec("/goal"), None); // bare /goal = status, not whitelisted
+    }
+
+    #[test]
+    fn unrelated_commands_and_non_slash_are_blocked() {
+        assert_eq!(exec("/model"), None);
+        assert_eq!(exec("/clear"), None);
+        assert_eq!(exec("just a message"), None);
+        // Case-insensitive command + sub.
+        assert_eq!(exec("/GOAL Clear"), Some(("goal".to_string(), "Clear".to_string())));
+    }
+}
+
 /// Redraw after running a slash command. If the command installed a
 /// modal, delegate the draw to it so the modal's menu appears; otherwise
 /// fall through to the plain idle prompt.
@@ -6003,6 +6158,37 @@ fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, 
             app.menu.selected,
         );
     }
+}
+
+/// Slash commands allowed to EXECUTE while a turn is running. Everything else is
+/// blocked with the "disabled while a turn is running" hint. Returns the
+/// `(command, args)` to run, or `None` to fall through to the block/queue.
+///
+/// Minimal whitelist:
+///   - `/bg` (no args) — background the current turn.
+///   - `/goal clear|stop|off|reset|none|cancel` — halt a server-driven `/goal`
+///     loop. Load-bearing: a goal keeps the TUI in Streaming (see `on_thinking`)
+///     where commands are otherwise blocked, so without this a typed
+///     `/goal clear` never reaches the bridge and the goal is uninterruptible by
+///     command (Esc/Ctrl+C bypass the command system; a typed command does not).
+///
+/// A NEW goal (`/goal <condition>`) and `/goal status` are intentionally NOT
+/// whitelisted — only the halt sub-commands.
+fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
+    let (cmd, arg) = parse_slash_line(line)?;
+    if cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty() {
+        return Some(("bg".to_string(), String::new()));
+    }
+    if cmd.eq_ignore_ascii_case("goal") {
+        let head = arg.trim().split_whitespace().next().unwrap_or("");
+        if matches!(
+            head.to_ascii_lowercase().as_str(),
+            "clear" | "stop" | "off" | "reset" | "none" | "cancel"
+        ) {
+            return Some(("goal".to_string(), arg.trim().to_string()));
+        }
+    }
+    None
 }
 
 fn handle_streaming_key(
@@ -6194,13 +6380,16 @@ fn handle_streaming_key(
             // leave the buf alone. Gate strictly on *registered*
             // commands; unrecognised `/foo …` falls through to the
             // type-ahead queue as a regular message.
-            let bg_background_current = parse_slash_line(&line)
-                .map(|(cmd, arg)| cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty())
-                .unwrap_or(false);
-            if bg_background_current {
+            //
+            // EXCEPT a small whitelist that must RUN mid-stream (see
+            // `streaming_executable_slash`): `/bg` (background the current turn)
+            // and `/goal`'s halt sub-commands — a server-driven `/goal` keeps the
+            // TUI in Streaming, so without this a typed `/goal clear` could never
+            // reach the bridge and the goal was uninterruptible by command.
+            if let Some((cmd, arg)) = streaming_executable_slash(&line) {
                 commands::execute_slash_command(
-                    "bg",
-                    "",
+                    &cmd,
+                    &arg,
                     &mut app.state,
                     ctx,
                     renderer,
@@ -6267,7 +6456,6 @@ fn handle_streaming_key(
                 .zip(pending_hashes.into_iter())
             {
                 if line.contains(&format!("[Image #{}]", n)) {
-                    renderer.render(UiLine::ImageAttachment(n));
                     q_refs.push(crate::input::history::HistoryImageRef {
                         hash: format!("{:016x}", hash),
                         mt: img.media_type.clone(),
@@ -6276,6 +6464,12 @@ fn handle_streaming_key(
                     q_images.push(img);
                     q_markers.push(n);
                 }
+            }
+            if ctx.sync_session.is_none() {
+                renderer.render(UiLine::UserWithAttachments {
+                    text: line.clone(),
+                    attachments: q_markers.clone(),
+                });
             }
             ctx.history.push(crate::input::history::HistoryEntry {
                 text: line.clone(),
@@ -6670,6 +6864,7 @@ fn turn_summary_label(
     turn_count: usize,
     tool_call_count: usize,
     total_tokens: usize,
+    cached_pct: Option<u8>,
     dur: &str,
 ) -> String {
     if errored {
@@ -6691,6 +6886,7 @@ fn turn_summary_label(
             tool_call_count,
             duration: dur,
             total_tokens,
+            cached_pct,
         })
         .into_owned()
     }
@@ -6699,20 +6895,26 @@ fn turn_summary_label(
 fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_goal_end: bool) {
     let Some(ps) = state.pending_separator.take() else { return };
     let dur = crate::render::fmt_dur(ps.duration);
+    let cached = ps
+        .cached_pct
+        .map(|p| format!(" · {p}% cached"))
+        .unwrap_or_default();
     let label = if as_goal_end {
         format!(
-            "{} tools · {} · {} tokens",
+            "{} tools · {} · {} tokens{}",
             ps.tool_call_count,
             dur,
-            crate::i18n::fmt_tokens(ps.total_tokens)
+            crate::i18n::fmt_tokens(ps.total_tokens),
+            cached,
         )
     } else if ps.was_goal_round {
         format!(
-            "↻ goal round {} · {} tools · {} · {} tokens",
+            "↻ goal round {} · {} tools · {} · {} tokens{}",
             state.goal_round.max(1),
             ps.tool_call_count,
             dur,
-            crate::i18n::fmt_tokens(ps.total_tokens)
+            crate::i18n::fmt_tokens(ps.total_tokens),
+            cached,
         )
     } else {
         // Reached only if a non-goal turn was ever buffered (today they
@@ -6723,6 +6925,7 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
             ps.turn_count,
             ps.tool_call_count,
             ps.total_tokens,
+            ps.cached_pct,
             &dur,
         )
     };
@@ -6806,6 +7009,10 @@ fn handle_agent_event(
     reasoning_buffer: &mut String,
     buf: &mut Buffer,
 ) {
+    // Any foreground event means the stream is alive — refresh the stall clock so
+    // the spinner only warns "network may be down" after genuine silence.
+    state.note_stream_activity();
+
     // Whitelist which events should flush a buffered turn-end separator
     // BEFORE we handle them. The buffered separator was deferred at
     // `TurnComplete` precisely so that — if the goal is about to end —
@@ -7240,6 +7447,21 @@ fn handle_agent_event(
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
             let errored = matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error);
+            // Footer token count: bill output + UNCACHED input (re-reading the
+            // cached prefix each round is near-free). The event's `total_tokens`
+            // is the v2 gross sum (prompt+completion per round) which overstates
+            // usage ~10-100× on long multi-round turns — recompute from the
+            // per-turn tallies instead. Falls back to the event value if no
+            // per-round usage arrived (turn_prompt 0).
+            let (total_tokens, cached_pct) = if state.turn_prompt_tokens > 0 {
+                crate::state::turn_token_summary(
+                    state.turn_prompt_tokens,
+                    state.turn_completion_tokens,
+                    state.turn_cached_tokens,
+                )
+            } else {
+                (total_tokens, None)
+            };
             if state.goal_condition.is_some() {
                 // A /goal is active: DEFER the separator so the next event can
                 // choose its form — a `✓ Goal met` banner ABOVE a stats-only
@@ -7253,6 +7475,7 @@ fn handle_agent_event(
                     total_tokens,
                     was_goal_round: true,
                     errored,
+                    cached_pct,
                 });
             } else {
                 // No active goal: render the turn summary immediately, exactly
@@ -7260,8 +7483,15 @@ fn handle_agent_event(
                 // the turn that just finished instead of waiting for the next
                 // event. Same i18n + Error-aware label as the deferred path.
                 let dur = crate::render::fmt_dur(duration);
-                let label =
-                    turn_summary_label(state, errored, turn_count, tool_call_count, total_tokens, &dur);
+                let label = turn_summary_label(
+                    state,
+                    errored,
+                    turn_count,
+                    tool_call_count,
+                    total_tokens,
+                    cached_pct,
+                    &dur,
+                );
                 renderer.render(UiLine::TurnSeparator { label });
             }
             renderer.flush();
@@ -7508,11 +7738,18 @@ fn handle_agent_event(
         AgentEvent::RestorePendingImages { images, markers } => {
             // VL preprocessing failed — re-attach the user's images to
             // the input state so they can retry without re-pasting from
-            // clipboard. The `[Image #N]` text marker is gone (lives in
-            // the conversation history echo at this point), so the user
-            // typically UP-recalls or retypes the caption + Enter to
-            // resubmit. The attached image bytes ride along automatically
-            // with the next submit.
+            // clipboard.
+            //
+            // Restore the full original message text (including the text
+            // between [Image #N] markers) from `last_submitted_message`.
+            // Without this, only markers get re-inserted into the cleared
+            // buffer and the user's caption text is silently lost — the
+            // user sees blank space where their text should be (bug report:
+            // "多张图片发送后丢失文字，只保留了最后一张").
+            if let Some(restore) = state.last_submitted_message.take() {
+                buf.text = restore;
+                buf.cursor = buf.text.len();
+            }
             //
             // Hash table is rebuilt as best-effort: we hash the base64
             // payload (not raw RGBA), which means a fresh clipboard copy
@@ -7530,6 +7767,15 @@ fn handle_agent_event(
                 state.pending_image_hashes.push(h);
                 state.pending_images.push(img);
                 state.pending_image_markers.push(marker);
+                // Only insert the marker if it's NOT already in the
+                // restored message text — `last_submitted_message` above
+                // already carries the original markers in the correct
+                // positions alongside the user's text.
+                let marker_text = format!("[Image #{}]", marker);
+                if !buf.text.contains(&marker_text) {
+                    buf.text.insert_str(buf.cursor, &marker_text);
+                    buf.cursor += marker_text.len();
+                }
             }
             // Don't redraw — TUI is in Streaming phase here (turn isn't
             // over yet); the next idle/streaming redraw picks up the new
@@ -7540,6 +7786,11 @@ fn handle_agent_event(
             state.completion_tokens += u.completion_tokens;
             state.cached_tokens += u.cached_tokens;
             state.total_tokens += u.completion_tokens;
+            // Per-turn tallies for the footer's billable count + cache annotation
+            // (reset in on_turn_complete / on_turn_cancelled).
+            state.turn_prompt_tokens += u.prompt_tokens;
+            state.turn_completion_tokens += u.completion_tokens;
+            state.turn_cached_tokens += u.cached_tokens;
         }
         AgentEvent::WorkingDirChanged(new_dir) => {
             // Fires when a tool (change_dir / bash cd) or an AgentCommand::ChangeDir
@@ -7723,6 +7974,11 @@ fn handle_agent_event(
                 batch_id.clone(),
                 crate::state::ActiveToolBatch { call_ids },
             );
+            // Anchor the spinner clock to the batch start. The interleaved
+            // per-tool events that follow won't reset it (they no-op the reset
+            // while a batch is active), so the elapsed-ms ticks steadily instead
+            // of flickering 0→N→0.
+            state.on_tool_batch_started();
         }
         AgentEvent::GoalUpdate { active, round, condition, last_reason, .. } => {
             if active {
@@ -7910,8 +8166,11 @@ fn handle_agent_event(
             }
         }
         AgentEvent::UserEcho(text) => {
-            // Live-sync: render the peer's user message as a user bubble.
-            renderer.render(UiLine::User(text));
+            let markers = image_markers_in_order(&text);
+            renderer.render(UiLine::UserWithAttachments {
+                text,
+                attachments: markers,
+            });
             renderer.flush();
         }
         AgentEvent::PeerBusy(running) => {
@@ -7968,6 +8227,7 @@ fn handle_agent_event(
         AgentEvent::SessionSwitched(session_id) => {
             // webui 新建对话，TUI 跟随切换到新会话。与 ProjectSwitched 不同，
             // 这里不切目录，只切换到指定 session_id 的新会话。
+            eprintln!("[DEBUG TUI] SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
             let sid = atomcode_core::session::SessionId::from_string(session_id);
             // 清除当前对话、重置到新 session，但用 webui 指定的 session_id
             // 以确保三端（TUI / webui / 磁盘）落到同一个文件。
@@ -7997,6 +8257,7 @@ fn handle_agent_event(
                     Some(ctx.current_session.id.clone()),
                     Vec::new(),
                 );
+                eprintln!("[DEBUG TUI] SessionSwitched: attaching new LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
                 attach_live_session(ctx, renderer, session, false);
             }
             renderer.begin_sync();
@@ -8368,17 +8629,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         None
     };
-    let goal_indicator = if state.goal_condition.is_some() {
-        let round = state.goal_round;
-        let elapsed = state.goal_started_at
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
-        let mins = elapsed / 60;
-        let secs = elapsed % 60;
-        Some(format!("◎ /goal (round {}, {}m {}s)", round, mins, secs))
-    } else {
-        None
-    };
+    // Active /goal → the dedicated footer goal row (width-truncated by the
+    // renderer). Carries the condition text so the user can SEE what the goal
+    // is, not just that one is running.
+    let goal = state.goal_condition.as_ref().map(|cond| crate::render::GoalStatus {
+        condition: cond.clone(),
+        // Display 1-based: the engine's round is 0 on the first attempt.
+        round: state.goal_round + 1,
+        elapsed_secs: state.goal_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+    });
     crate::render::StatusLine {
         model,
         cwd,
@@ -8393,8 +8652,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             None
         },
         session_name,
-        goal_indicator,
+        goal_indicator: None,
         vision: ctx.config.can_handle_attached_images(),
+        goal,
     }
 }
 
@@ -8474,6 +8734,14 @@ fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Opt
     }
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
+    }
+    // Network-stall warning: a streaming response that's gone silent past the
+    // threshold (e.g. mid-stream network drop) reads as a freeze with no feedback.
+    // Surface a hint that it isn't frozen and esc cancels. Static text, placed
+    // BEFORE the ticking elapsed so its width never jitters the segments after it.
+    if state.stream_stalled() {
+        out.push_str(" · ");
+        out.push_str(&crate::i18n::t(crate::i18n::Msg::StreamStalled));
     }
     // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
     // `Running ReadFile… 4s`. CC behaviour: timer resets on every phase

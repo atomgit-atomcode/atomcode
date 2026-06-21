@@ -17,6 +17,7 @@
     <toolWindow
       id="AtomCode"
       anchor="right"
+      canCloseContents="true"
       factoryClass="com.atomcode.jetbrains.ui.AtomCodeToolWindowFactory"
       icon="/icons/atomcode.svg" />
 

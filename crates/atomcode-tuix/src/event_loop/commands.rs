@@ -615,23 +615,13 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "clear" => {
-            // Physical clear via the renderer (keeps cached footer state
-            // coherent with the terminal). Scrollback is preserved by
-            // most terminals — \x1b[3J would nuke it, which we don't
-            // want; `clear_screen` emits \x1b[2J\x1b[H.
-            //
-            // Wrap the wipe + welcome re-render in one DECSET 2026 envelope so
-            // capable hosts swap old content straight to the fresh welcome with
-            // no intermediate blank frame (same anti-flicker as `/resume`).
-            renderer.begin_sync();
-            renderer.clear_screen();
-            let dir_display = ctx.working_dir.to_string_lossy().to_string();
-            renderer.render(UiLine::Welcome {
-                model: ctx.model_name.clone(),
-                working_dir: dir_display,
-            });
-            renderer.flush();
-            renderer.end_sync();
+            // `/clear` starts a fresh conversation (matches Claude Code and the
+            // common expectation): it was previously a SCREEN-ONLY wipe, so the
+            // engine kept the full history and the model still "remembered"
+            // everything after a clear. Delegate to the same reset `/session`
+            // uses — it sends ClearConversation to the engine AND wipes the
+            // screen + re-renders the welcome banner.
+            reset_to_new_session(ctx, state, renderer);
         }
         "session" => {
             // Start fresh in the current directory. Ports `/session` from the
@@ -1871,7 +1861,8 @@ pub(super) fn execute_slash_command(
             match head {
                 "" | "status" => {
                     if let Some(ref cond) = state.goal_condition {
-                        let round = state.goal_round;
+                        // Display 1-based, consistent with the footer goal row.
+                        let round = state.goal_round + 1;
                         let elapsed = state
                             .goal_started_at
                             .map(|t| t.elapsed().as_secs())
@@ -3643,6 +3634,37 @@ fn run_oauth_with_renderer(
     session.finish(Some(&ctx.telemetry))
 }
 
+/// Run `coding_plan::run()` on a blocking thread to prevent
+/// `reqwest::blocking::Client`'s internal tokio runtime from being
+/// dropped inside the TUI's async context. Returns the mutated config
+/// alongside the report — the caller MUST write the returned config back
+/// into `ctx.config`.
+///
+/// See `run_login_flow` for the rationale — the short version is that
+/// `reqwest::blocking::Client` creates its own runtime, and dropping it
+/// inside an existing runtime panics with "Cannot drop a runtime in a
+/// context where blocking is not allowed".
+fn run_coding_plan_blocking(
+    config: &atomcode_core::config::Config,
+    tel: &std::sync::Arc<atomcode_telemetry::Telemetry>,
+) -> Result<(atomcode_core::config::Config, atomcode_core::coding_plan::SetupReport)> {
+    let mut cfg = config.clone();
+    let tel = tel.clone();
+    // Run on a dedicated OS thread so `reqwest::blocking::Client`'s
+    // internal tokio runtime is created AND dropped outside the TUI's
+    // async context. Using `std::thread` instead of
+    // `tokio::task::spawn_blocking` keeps the call site synchronous
+    // (`run_login_flow` isn't async) and avoids the need to
+    // `Handle::block_on`.
+    std::thread::spawn(move || {
+        let report = atomcode_core::coding_plan::run(&mut cfg, Some(&tel));
+        (cfg, report)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("coding plan flow panicked"))
+    .and_then(|(cfg, report)| Ok((cfg, report?)))
+}
+
 /// Run the full login + CodingPlan setup flow: OAuth (if needed) →
 /// claim → fetch models + register providers → fetch status. Shares
 /// the orchestrator with `atomcode login` / `atomcode codingplan` (CLI).
@@ -3681,6 +3703,14 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // stdin / stdout interaction, so we don't need to suspend the
     // renderer. `step_login` short-circuits via `is_logged_in()`.
     //
+    // CodingPlan's `Client` wraps `reqwest::blocking::Client`, which
+    // internally creates its own tokio runtime. Dropping that runtime
+    // inside the TUI's async context (where this slash command runs)
+    // panics with "Cannot drop a runtime in a context where blocking is
+    // not allowed" and `panic = "abort"` kills the process. Run the
+    // whole flow on a blocking thread so the internal runtime is created
+    // and dropped outside the async context.
+    //
     // If the stored token is locally valid (file present, expires_in
     // not yet past) but the server rejects it (revoked, refresh-token
     // dead, etc.), the orchestrator surfaces `report.auth_expired =
@@ -3689,24 +3719,39 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // this the user sees "✓ already logged in as X" followed by
     // "✗ claim failed — run `atomcode login` again" and has to do
     // manually what `/codingplan` could do itself.
-    let mut report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
-    if matches!(&report, Ok(r) if r.auth_expired) {
+    let (cfg_after, mut report) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
+        Ok((cfg, r)) => (cfg, r),
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("internal error: {e:#}")));
+            renderer.flush();
+            return Ok(());
+        }
+    };
+    ctx.config = cfg_after;
+    if report.auth_expired {
         renderer.render(UiLine::CommandOutput(t(Msg::CpReauthAfter401).into_owned()));
         renderer.flush();
         match run_oauth_with_renderer(renderer, ctx)
             .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
-                report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+                let (cfg_after2, r2) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
+                    Ok((cfg, r)) => (cfg, r),
+                    Err(e) => {
+                        renderer.render(UiLine::Error(format!("internal error: {e:#}")));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                };
+                ctx.config = cfg_after2;
+                report = r2;
             }
             Err(e) => {
                 // Re-OAuth itself failed (user pressed ESC, network
                 // dead, etc.). Render the *original* report so they
                 // still see what triggered the retry, then surface the
                 // OAuth error.
-                if let Ok(r) = &report {
-                    renderer.render(UiLine::CommandOutput(r.render()));
-                }
+                renderer.render(UiLine::CommandOutput(report.render()));
                 renderer.render(UiLine::Error(
                     t(Msg::CodingPlanSetupFailed {
                         error: &e.to_string(),
@@ -3719,55 +3764,47 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         }
     }
 
-    match report {
-        Ok(report) => {
-            if report.should_persist_config() {
-                // Config mutation only persists when critical steps passed —
-                // don't write a half-set-up config if login or models failed.
-                save_and_reload(ctx, renderer);
-                // Stamp the drift-monitor sync marker alongside the config
-                // write. Failures are non-fatal: at worst the 24h staleness
-                // hint mis-fires once.
-                let _ = atomcode_core::coding_plan::write_last_sync_now();
-                // Also bump our own last-seen timestamp so the cross-process
-                // sync-check on the next keystroke doesn't redundantly
-                // reload the config we just saved ourselves.
-                ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
-                // Sync ctx.model_name with the freshly-picked default so the
-                // status line and the next turn use the right model without
-                // requiring a /reload.
-                if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
-                    ctx.model_name = p.model.clone();
-                }
-                // Clear any stale drift warning now that we've just
-                // re-synced. Also reset the cooldown so the next
-                // pre-turn trigger (if conditions change) can fire
-                // immediately — no need to wait 15 min after a manual
-                // refresh.
-                if let Ok(mut g) = ctx.monitor_warning.lock() {
-                    *g = None;
-                }
-                ctx.monitor_last_check_at = None;
-                // Same for usage slot — a fresh /login run may have
-                // rotated the quota window or switched plan tiers.
-                if let Ok(mut g) = ctx.usage_slot.lock() {
-                    *g = None;
-                }
-                ctx.usage_last_check_at = None;
-            }
-            renderer.render(UiLine::CommandOutput(report.render()));
-            renderer.flush();
+    if report.should_persist_config() {
+        // Config mutation only persists when critical steps passed —
+        // don't write a half-set-up config if login or models failed.
+        save_and_reload(ctx, renderer);
+        // Stamp the drift-monitor sync marker alongside the config
+        // write. Failures are non-fatal: at worst the 24h staleness
+        // hint mis-fires once.
+        let _ = atomcode_core::coding_plan::write_last_sync_now();
+        // Also bump our own last-seen timestamp so the cross-process
+        // sync-check on the next keystroke doesn't redundantly
+        // reload the config we just saved ourselves.
+        ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
+        // Update `ctx.model_name` to reflect the new default provider from
+        // the just-completed login/setup. This ensures the status line shows
+        // the current model immediately rather than the pre-login value.
+        // The bridge's ReloadConfig is asynchronous (sent by `save_and_reload`
+        // above) — if the bridge fails to switch (e.g. gateway signer
+        // unavailable), the user will see the error on their next chat turn
+        // and can fall back to `/model`. This matches `/model`'s approach
+        // which also updates `ctx.model_name` optimistically.
+        if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
+            ctx.model_name = p.model.clone();
         }
-        Err(e) => {
-            renderer.render(UiLine::Error(
-                t(Msg::CodingPlanSetupFailed {
-                    error: &format!("{:#}", e),
-                })
-                .into_owned(),
-            ));
-            renderer.flush();
+        // Clear any stale drift warning now that we've just
+        // re-synced. Also reset the cooldown so the next
+        // pre-turn trigger (if conditions change) can fire
+        // immediately — no need to wait 15 min after a manual
+        // refresh.
+        if let Ok(mut g) = ctx.monitor_warning.lock() {
+            *g = None;
         }
+        ctx.monitor_last_check_at = None;
+        // Same for usage slot — a fresh /login run may have
+        // rotated the quota window or switched plan tiers.
+        if let Ok(mut g) = ctx.usage_slot.lock() {
+            *g = None;
+        }
+        ctx.usage_last_check_at = None;
     }
+    renderer.render(UiLine::CommandOutput(report.render()));
+    renderer.flush();
     Ok(())
 }
 

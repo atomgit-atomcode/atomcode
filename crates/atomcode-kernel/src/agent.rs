@@ -438,6 +438,14 @@ impl RunningAgent {
                 utilization,
                 sacred_floor: floor,
             };
+            // Announce BEFORE the (possibly multi-second) LLM summary so a driver can
+            // show a "compacting…" progress line — but ONLY if the strategy will
+            // actually do that slow drain/summarize. A manual `/compact` that turns out
+            // to be a no-op (nothing older than the active turn) must NOT show a
+            // spurious "compacting…" line ahead of "nothing to compact" (v1 parity).
+            if self.compaction.will_summarize(&view) {
+                self.rt.emit(AgentEvent::CompactionStarted { trigger: trigger_for_event.clone() });
+            }
             self.compaction.plan(&view).await
         };
         let report = convo.apply_plan(plan, floor);
@@ -540,7 +548,11 @@ impl RunningAgent {
             };
             match cmd {
                 AgentCommand::Shutdown => break,
-                AgentCommand::Cancel => {}
+                // No turn is running at the top-level loop, but a Cancel that races in
+                // here (turn just returned) must still flush any orphaned parked request
+                // → Null (fail-closed), so a stranded approval oneshot can't linger. A
+                // no-op map (the common case) is harmless.
+                AgentCommand::Cancel => self.rt.cancel_pending(),
                 AgentCommand::Respond { id, value } => self.rt.resolve(id, value),
                 AgentCommand::Snapshot => {
                     self.rt.emit(AgentEvent::Snapshot { snapshot: self.capture_snapshot(&convo) });
@@ -629,6 +641,12 @@ impl RunningAgent {
         if let Some(trigger) = self.should_compact(convo) {
             self.run_compaction(convo, trigger).await;
         }
+        // CANCEL = UNDO: remember the history length BEFORE this turn's user
+        // message is pushed, so a cancelled turn can roll all the way back to here —
+        // the prompt + any partial assistant/tool work leaves NO trace (the TUI
+        // separately restores the prompt to the input box for edit-and-resend).
+        // Captured AFTER the pre-turn compaction above so it indexes current history.
+        let rollback_len = convo.messages.len();
         convo.push(Message::user_with_images(text, images));
         // Per-turn cancellation token: Cancel fires it; run_turn polls it at the
         // stream, between tools, and inside execute. A CLONE also rides into each
@@ -640,7 +658,7 @@ impl RunningAgent {
         let turn_token = self.new_turn_token();
         // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
         // so a middleware blocked on approval can be answered out-of-band.
-        let mut turn = Box::pin(self.run_turn(convo, turn_token.clone()));
+        let mut turn = Box::pin(self.run_turn(convo, turn_token.clone(), rollback_len));
         let mut shutdown = false;
         loop {
             tokio::select! {
@@ -692,6 +710,25 @@ impl RunningAgent {
         self.rt.emit(AgentEvent::TurnComplete { reason });
     }
 
+    /// Terminal for a CANCELLED turn under "cancel = undo" semantics: roll the
+    /// conversation back to `rollback_len` (its length before this turn's user
+    /// message was pushed) so the cancelled prompt + any partial assistant/tool
+    /// work leaves NO trace — a later unrelated message can't see it and it costs
+    /// no tokens. The TUI separately restores the prompt to the input box for
+    /// edit-and-resend. Truncating the whole turn also makes the old
+    /// `backfill_cancelled_tool_results` pairing repair unnecessary (nothing
+    /// dangles when the turn is gone). `truncate` is a safe no-op if a mid-turn
+    /// overflow compaction already shrank history below `rollback_len` (rare, off
+    /// the normal path) — it just leaves that one cancelled turn in place rather
+    /// than risk cutting compacted history at a stale index. Funnels through
+    /// `finish_turn` so the `turn_complete` hook + `TurnComplete` event still fire
+    /// (on the now-clean conversation).
+    async fn finish_cancelled(&self, convo: &mut Conversation, rollback_len: usize, ctx: &TurnCtx) {
+        convo.messages.truncate(rollback_len);
+        self.rt.emit(AgentEvent::Cancelled);
+        self.finish_turn(convo, StopReason::Cancelled, ctx).await;
+    }
+
     /// Snapshot the conversation, stamping the LIVE id counters over the
     /// derive-from-meta defaults: a turn that died before storing any assistant
     /// message is invisible to the derivation, but the counters know it — a resume
@@ -705,7 +742,12 @@ impl RunningAgent {
         snap
     }
 
-    async fn run_turn(&self, convo: &mut Conversation, cancel: tokio_util::sync::CancellationToken) {
+    async fn run_turn(
+        &self,
+        convo: &mut Conversation,
+        cancel: tokio_util::sync::CancellationToken,
+        rollback_len: usize,
+    ) {
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
@@ -785,7 +827,24 @@ impl RunningAgent {
             // no empty-success illusion. The session-level `chat_options` (the
             // neutral SLOT) ride along as a sideband request param — NOT part of
             // `messages`, so they never perturb the append-only wire prefix.
-            let mut stream = match self.provider.chat_stream(&messages, &defs, &self.chat_options).await {
+            // Race the OPEN against cancel — the same checkpoint the consume loop
+            // (below) and the retry backoff (above) already use. `chat_stream`'s
+            // connect / first-byte wait can hang for a long time on a slow / stale /
+            // dead connection (notably right after a /model switch reuses a dead
+            // pooled socket), and a bare `.await` here would ignore Esc / Ctrl+C
+            // until it resolves — the reported "esc can't terminate" freeze, with the
+            // spinner (TurnStarted/Thinking fire BEFORE this) still animating. `biased`
+            // keeps cancel first; on cancel, drop the open future (which aborts the
+            // in-flight request) and finish exactly like the mid-stream cancel arm.
+            let opened = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                    return;
+                }
+                opened = self.provider.chat_stream(&messages, &defs, &self.chat_options) => opened,
+            };
+            let mut stream = match opened {
                 Ok(s) => {
                     overflow_attempt = 0; // a successful open resets the per-round counter
                     provider_retry = 0; // ditto for the transient-failure budget
@@ -829,8 +888,7 @@ impl RunningAgent {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
-                            self.rt.emit(AgentEvent::Cancelled);
-                            self.finish_turn(convo, StopReason::Cancelled, &turn_ctx).await;
+                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                             return;
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -884,8 +942,7 @@ impl RunningAgent {
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
-                        self.rt.emit(AgentEvent::Cancelled);
-                        self.finish_turn(convo, StopReason::Cancelled, &turn_ctx).await;
+                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                         return;
                     }
                     _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
@@ -1108,11 +1165,11 @@ impl RunningAgent {
                 std::collections::HashSet::new();
             for mut call in pending_calls {
                 // BETWEEN-TOOLS cancel checkpoint: do not dispatch any remaining
-                // tool_call once cancelled. Carried from production runner.rs:916.
-                // The skipped calls (this one + the rest) are paired with synthetic
-                // "(cancelled)" results by backfill on the cancel path below.
+                // tool_call once cancelled. Under "cancel = undo" the whole turn is
+                // rolled back below, so the skipped calls vanish with it — no
+                // "(cancelled)" backfill needed (nothing dangles when the turn's
+                // messages are gone).
                 if cancel.is_cancelled() {
-                    convo.backfill_cancelled_tool_results();
                     // Close any active batch so the UI doesn't have a dangling group.
                     if let Some((batch_id, started_at)) = &batch_start {
                         self.rt.emit(AgentEvent::ToolBatchCompleted {
@@ -1122,8 +1179,7 @@ impl RunningAgent {
                             elapsed_ms: started_at.elapsed().as_millis() as u64,
                         });
                     }
-                    self.rt.emit(AgentEvent::Cancelled);
-                    self.finish_turn(convo, StopReason::Cancelled, &turn_ctx).await;
+                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                     return;
                 }
 

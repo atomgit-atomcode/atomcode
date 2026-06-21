@@ -260,31 +260,16 @@ impl LlmProvider for OpenAiCompatProvider {
 // Request building (pure, deterministic)
 // ---------------------------------------------------------------------------
 
-/// Byte-for-byte duplicate of `atomcode_core::provider::model_name_suggests_vision`.
-/// Layering rules (L0/L1) prevent `atomcode-capabilities` from importing
-/// `atomcode-core`. When adding a new vision model, you MUST update BOTH this
-/// function AND `crates/atomcode-core/src/provider/mod.rs:model_name_suggests_vision`.
-/// A mismatched copy causes silent image drops or 400 errors.
+/// Delegates to `atomcode_kernel::provider::model_name_suggests_vision`
+/// — the single source of truth.  When adding a new vision model, update
+/// the kernel function.
 fn suggests_vision(model: &str) -> bool {
-    let n = model.to_lowercase();
-    n.contains("vision")
-        || n.contains("-vl")
-        || n.contains("vl-")
-        || n.contains("ocr")
-        || n.contains("-4v")
-        || n.contains("-4.1v")
-        || n.starts_with("gpt-4o")
-        || n.starts_with("claude-3") || n.starts_with("claude-4")
-        || n.starts_with("claude-5") || n.starts_with("claude-6") || n.starts_with("claude-7")
-        || n.starts_with("claude-sonnet") || n.starts_with("claude-opus") || n.starts_with("claude-haiku")
-        || n.starts_with("gemini")
-        || n.starts_with("pixtral")
-        || n.contains("llava") || n.contains("qvq")
-        || n.starts_with("kimi-k2.5") || n.starts_with("kimi-k2.6")
+    atomcode_kernel::provider::model_name_suggests_vision(model)
 }
 
 /// Map kernel `Message`s onto OpenAI-compatible wire `messages[]`.
 fn format_messages(messages: &[Message], policy: ReasoningPolicy, model: &str) -> Vec<Value> {
+    let vision = suggests_vision(model);
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m.role {
@@ -292,7 +277,7 @@ fn format_messages(messages: &[Message], policy: ReasoningPolicy, model: &str) -
             // OpenAI-compatible models accept only a single system message.
             Role::System => super::push_system_coalesced(&mut out, &m.text),
             Role::User => {
-                if m.images.is_empty() || !suggests_vision(model) {
+                if m.images.is_empty() || !vision {
                     // Text-only or model doesn't support vision — keep content as STRING
                     // path, so a no-image conversation's prefix cache is unperturbed.
                     out.push(json!({ "role": "user", "content": m.text }));

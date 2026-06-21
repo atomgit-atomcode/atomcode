@@ -23,6 +23,7 @@ import com.atomcode.jetbrains.settings.AtomCodeSettings
 import com.atomcode.jetbrains.settings.AtomCodeSettingsState
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
@@ -258,13 +259,9 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         provider: String? = null,
         onSessionReady: (SessionRefView) -> Unit,
     ): CompletableFuture<SessionRefView> {
-        if (settingsService.state.autoSaveBeforeRead) {
-            com.intellij.openapi.application.WriteIntentReadAction.run {
-                FileDocumentManager.getInstance().saveAllDocuments()
-            }
-        }
-
-        return ensureConnected().thenCompose { state ->
+        return saveDocumentsBeforePrompt().thenCompose {
+            ensureConnected()
+        }.thenCompose { state ->
             if (state !is ConnectionState.Ready) {
                 CompletableFuture.failedFuture(IllegalStateException("AtomCode is not connected."))
             } else {
@@ -276,6 +273,30 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 listener.onError(message)
             }
         }
+    }
+
+    /**
+     * Document saves mutate the IDE model and must originate from an IntelliJ
+     * write-safe event, not an arbitrary Swing callback (such as queue handoff).
+     */
+    private fun saveDocumentsBeforePrompt(): CompletableFuture<Unit> {
+        if (!settingsService.state.autoSaveBeforeRead) {
+            return CompletableFuture.completedFuture(Unit)
+        }
+
+        val result = CompletableFuture<Unit>()
+        ApplicationManager.getApplication().invokeLater({
+            if (project.isDisposed) {
+                result.completeExceptionally(IllegalStateException("Project is already disposed."))
+                return@invokeLater
+            }
+            runCatching {
+                FileDocumentManager.getInstance().saveAllDocuments()
+            }.onSuccess {
+                result.complete(Unit)
+            }.onFailure(result::completeExceptionally)
+        }, ModalityState.nonModal())
+        return result
     }
 
     fun stopGeneration(): CompletableFuture<Unit> {

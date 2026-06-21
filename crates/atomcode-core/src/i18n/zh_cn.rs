@@ -872,8 +872,12 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdWelcomeDescription => "重新运行 onboarding 向导".into(),
         Msg::VisionPreprocessSuccess { char_count } =>
             format!("✓ VL 识别图片成功，返回 {char_count} chars").into(),
-        Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✓ {done} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
+        Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens, cached_pct } =>
+            format!(
+                "✓ {done} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens{}",
+                super::fmt_tokens(total_tokens),
+                cached_pct.map(|p| format!(" · {p}% cached")).unwrap_or_default(),
+            ).into(),
         Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
             format!("✗ 已中断 · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
         Msg::LoginQrHeader =>
@@ -1059,6 +1063,16 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CliHelpMarketplaceName => "市场名称".into(),
         Msg::CliAboutHelp => "打印帮助信息".into(),
         Msg::CliHelpMcpCommand => "可执行文件及参数".into(),
+
+        // ── engine v2 provider init (atomcode-bridge) ──
+        Msg::ProviderInitFailed { detail } =>
+            format!("模型初始化失败：{detail}").into(),
+        Msg::GatewayAuthUnavailable { base_url } =>
+            format!(
+                "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\
+                 或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
+            ).into(),
+        Msg::StreamStalled => "响应较慢 · esc 取消".into(),
     }
 }
 

@@ -2,93 +2,130 @@ package com.atomcode.jetbrains.ui.input
 
 import com.atomcode.jetbrains.ui.ChatContextItem
 import com.intellij.ui.JBColor
-import java.awt.FlowLayout
+import java.awt.BorderLayout
+import java.awt.Cursor
+import java.awt.Dimension
 import javax.swing.BorderFactory
+import javax.swing.Box
+import javax.swing.BoxLayout
 import javax.swing.JButton
 import javax.swing.JLabel
 import javax.swing.JPanel
 
-/**
- * 上下文文件标签面板，显示已附加的文件 chips + 清除按钮。
- */
+/** Displays files attached to the next prompt as compact, path-aware rows. */
 class ContextChipsPanel(
     private val onClear: () -> Unit,
-) : JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)) {
+) : JPanel(BorderLayout()) {
 
     init {
-        isOpaque = true
-        // JBColor(亮色, 暗色)
-        background = JBColor(0xF0F0F0, 0x252525)
-        border = BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(1, 0, 0, 0, JBColor(0xCCCCCC, 0x333333)),
-            BorderFactory.createEmptyBorder(3, 8, 3, 8),
-        )
+        isOpaque = false
+        border = BorderFactory.createEmptyBorder(7, 9, 3, 9)
         isVisible = false
     }
 
     fun setItems(items: List<ChatContextItem>, onRemove: (ChatContextItem) -> Unit) {
         removeAll()
-        if (items.isEmpty()) {
-            isVisible = false
-            return
-        }
-        isVisible = true
+        isVisible = items.isNotEmpty()
+        if (items.isEmpty()) return
 
-        add(JLabel("上下文:").apply {
-            font = font.deriveFont(font.size2D - 2f)
-            // JBColor(亮色, 暗色)
-            foreground = JBColor(0x666666, 0x888888)
-        })
-
-        items.forEach { item ->
-            val chip = JPanel(FlowLayout(FlowLayout.LEFT, 2, 0)).apply {
-                background = CHIP_BG
-                border = BorderFactory.createCompoundBorder(
-                    BorderFactory.createLineBorder(CHIP_BORDER, 1, true),
-                    BorderFactory.createEmptyBorder(1, 6, 1, 2),
-                )
+        add(buildHeader(items.size), BorderLayout.NORTH)
+        add(JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            border = BorderFactory.createEmptyBorder(5, 0, 0, 0)
+            items.forEachIndexed { index, item ->
+                if (index > 0) add(Box.createVerticalStrut(5))
+                add(buildAttachmentRow(item, onRemove))
             }
-            val label = buildString {
-                append("📄 ")
-                append(item.displayName)
-                if (item.startLine != null) {
-                    append(" (L${item.startLine}-${item.endLine})")
-                }
-            }
-            chip.add(JLabel(label).apply {
-                font = font.deriveFont(font.size2D - 2f)
-                foreground = CHIP_FG
-            })
-            chip.add(JButton("×").apply {
-                font = font.deriveFont(java.awt.Font.BOLD, font.size2D + 1f)
-                isContentAreaFilled = false
-                isBorderPainted = false
-                isFocusPainted = false
-                // JBColor(亮色, 暗色)
-                foreground = JBColor(0x666666, 0x888888)
-                addActionListener { onRemove(item) }
-            })
-            add(chip)
-        }
-
-        add(JButton("清除").apply {
-            font = font.deriveFont(font.size2D - 2f)
-            isContentAreaFilled = false
-            isBorderPainted = false
-            isFocusPainted = false
-            // JBColor(亮色, 暗色)
-            foreground = JBColor(0x666666, 0x888888)
-            addActionListener { onClear() }
-        })
+        }, BorderLayout.CENTER)
 
         revalidate()
         repaint()
     }
 
+    private fun buildHeader(count: Int) = JPanel(BorderLayout()).apply {
+        isOpaque = false
+        add(JLabel("附件  $count").apply {
+            font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 2f)
+            foreground = HEADER_FG
+        }, BorderLayout.WEST)
+        add(makeTextButton("全部移除", onClear), BorderLayout.EAST)
+    }
+
+    private fun buildAttachmentRow(
+        item: ChatContextItem,
+        onRemove: (ChatContextItem) -> Unit,
+    ) = JPanel(BorderLayout(8, 0)).apply {
+        isOpaque = true
+        background = ATTACHMENT_BG
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ATTACHMENT_BORDER, 1, true),
+            BorderFactory.createEmptyBorder(6, 8, 6, 5),
+        )
+        maximumSize = Dimension(Int.MAX_VALUE, 43)
+        toolTipText = item.path
+
+        val normalizedName = item.displayName.replace('\\', '/')
+        val fileName = normalizedName.substringAfterLast('/').ifBlank { normalizedName }
+        val parentPath = normalizedName.substringBeforeLast('/', "")
+        val lineRange = item.startLine?.let { start ->
+            val end = item.endLine ?: start
+            "  ·  L$start–$end"
+        }.orEmpty()
+
+        add(JLabel(item.language.uppercase().take(4).ifBlank { "FILE" }).apply {
+            horizontalAlignment = JLabel.CENTER
+            font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 3f)
+            foreground = TYPE_FG
+            background = TYPE_BG
+            isOpaque = true
+            border = BorderFactory.createEmptyBorder(3, 5, 3, 5)
+            preferredSize = Dimension(38, 24)
+        }, BorderLayout.WEST)
+
+        add(JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            add(JLabel(fileName + lineRange).apply {
+                font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 1f)
+                foreground = FILE_FG
+                toolTipText = item.path
+            })
+            add(JLabel(parentPath.ifBlank { "已附加到下一条消息" }).apply {
+                font = font.deriveFont(font.size2D - 3f)
+                foreground = PATH_FG
+                toolTipText = item.path
+            })
+        }, BorderLayout.CENTER)
+
+        add(makeTextButton("×") { onRemove(item) }.apply {
+            font = font.deriveFont(java.awt.Font.PLAIN, font.size2D + 3f)
+            foreground = REMOVE_FG
+            toolTipText = "移除附件"
+            preferredSize = Dimension(28, 28)
+        }, BorderLayout.EAST)
+    }
+
+    private fun makeTextButton(text: String, action: () -> Unit) = JButton(text).apply {
+        font = font.deriveFont(font.size2D - 2f)
+        isContentAreaFilled = false
+        isBorderPainted = false
+        isFocusPainted = false
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        foreground = ACTION_FG
+        margin = java.awt.Insets(0, 4, 0, 4)
+        addActionListener { action() }
+    }
+
     companion object {
-        // JBColor(亮色, 暗色)
-        private val CHIP_BG = JBColor(0xD0E4F7, 0x1E3A5F)
-        private val CHIP_BORDER = JBColor(0xA0C0E0, 0x264F78)
-        private val CHIP_FG = JBColor(0x005A9E, 0x9CDCFE)
+        private val HEADER_FG = JBColor(0x565A60, 0xA7ABB2)
+        private val ACTION_FG = JBColor(0x3574A8, 0x78B6E8)
+        private val ATTACHMENT_BG = JBColor(0xF6F9FC, 0x292D32)
+        private val ATTACHMENT_BORDER = JBColor(0xD8E2EA, 0x3B424A)
+        private val TYPE_BG = JBColor(0xE5F1FA, 0x263D50)
+        private val TYPE_FG = JBColor(0x256A99, 0x83C5F1)
+        private val FILE_FG = JBColor(0x25282C, 0xE3E5E8)
+        private val PATH_FG = JBColor(0x747A82, 0x8E949C)
+        private val REMOVE_FG = JBColor(0x777C83, 0x9CA1A8)
     }
 }
