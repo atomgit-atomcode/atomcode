@@ -40,6 +40,13 @@ impl Status {
             Status::Completed => "[x]",
         }
     }
+    fn as_str(self) -> &'static str {
+        match self {
+            Status::Pending => "pending",
+            Status::InProgress => "in_progress",
+            Status::Completed => "completed",
+        }
+    }
 }
 
 /// Session task list. State is shared across `execute` calls because the tool is
@@ -119,8 +126,8 @@ impl Tool for TodoTool {
                 let mut next = self.next_id.lock().unwrap();
                 *next += 1;
                 let id = *next;
-                items.push(TodoItem { id, content, status: Status::Pending });
-                ok(format!("Added task #{id}.\n{}", Self::render(&items)))
+                items.push(TodoItem { id, content: content.clone(), status: Status::Pending });
+                ok(format!("Added task #{}: {}\n{}", id, content, Self::render(&items)))
             }
             "update" => {
                 let Some(id) = a.id else {
@@ -133,8 +140,9 @@ impl Tool for TodoTool {
                 };
                 match items.iter_mut().find(|i| i.id == id) {
                     Some(it) => {
+                        let content = it.content.clone();
                         it.status = status;
-                        ok(format!("Task #{id} updated.\n{}", Self::render(&items)))
+                        ok(format!("Task #{} '{}' updated to '{}'\n{}", id, content, status.as_str(), Self::render(&items)))
                     }
                     None => err(format!("todo update: no task with id {id}.")),
                 }

@@ -217,6 +217,19 @@ function formatToolDetail(name: string, argsJson: string): string {
         .filter((x): x is string => x !== null)
         .join(', ');
     }
+    case 'todo': {
+      const action = getStr('action');
+      if (action === 'add') return getStr('content');
+      if (action === 'update') {
+        const id = typeof v.id === 'number' ? v.id : '';
+        const status = getStr('status');
+        if (id && status) return `#${id} → ${status}`;
+        if (id) return `#${id}`;
+        return status;
+      }
+      if (action === 'list') return 'list all';
+      return '';
+    }
     case 'use_skill':
       return getStr('name');
     default: {
@@ -535,6 +548,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'error': return { type: 'error', message: e.message };
+      case 'warning': return { type: 'warning', message: e.message };
       default: return null;
     }
   }
@@ -668,6 +682,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     });
   }
 
+  // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
+  // never styled as an error). Mirrors appendToLastAssistant's last-assistant guard.
+  function pushNoticeToLastAssistant(text: string) {
+    setMessages((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      if (last.role !== 'assistant') return prev;
+      const parts: MsgPart[] = [...last.parts, { kind: 'notice', text }];
+      return [...prev.slice(0, -1), { ...last, parts }];
+    });
+  }
+
   function updateToolInLastAssistant(
     id: string,
     update: Partial<ToolRow>,
@@ -789,6 +815,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setBusy(false);
         setQueued([]); // 出错：丢弃排队消息
         onPermissionResolved?.(null);
+        break;
+
+      case 'warning':
+        // 非致命提示（如"已自动压缩上下文"）：渲染成淡色 notice 行 —— 不染红、不并进
+        // 回复文本、不结束回合（任务继续）。对齐 TUI 的黄色 "!" 提示。
+        pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }));
         break;
 
       default:
@@ -1457,6 +1489,13 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
           ))}
         </div>,
       );
+    } else if (p.kind === 'notice') {
+      out.push(
+        <div class="msg-notice" key={`nt-${i}`}>
+          {p.text}
+        </div>,
+      );
+      i++;
     } else {
       if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} />);
       i++;

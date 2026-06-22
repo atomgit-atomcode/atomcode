@@ -20,6 +20,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use atomcode_capabilities::cc_hooks::CCExternalHooks;
 use atomcode_capabilities::codeintel::register_codeintel_tools;
 use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
@@ -132,6 +133,12 @@ pub struct CodingParts {
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
     pub review_provider: Option<SharedReviewProvider>,
+    /// User/project CC external hooks (`$ATOMCODE_HOME/hooks.json` + `<root>/.hooks.json`).
+    /// ONE instance is registered as BOTH a [`LifecycleHooks`] (already pushed into `hooks`)
+    /// and a [`ToolMiddleware`](atomcode_kernel::middleware::ToolMiddleware) (registered by
+    /// [`assemble`], before approval). `None` when no hooks are configured — the common path
+    /// adds zero overhead (no registration at all).
+    pub cc_external_hooks: Option<Arc<CCExternalHooks>>,
 }
 
 /// Phase 1 — gather + connect everything the agent needs (async: MCP connect,
@@ -277,6 +284,30 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
     // is skipped — see StatusReminderHook — to avoid a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
     hooks.push(Arc::new(VerifyCadenceHook::new()));
+    // CC external hooks (hooks.json): user/project commands on the kernel seams — the
+    // port of core's CC-parity hook engine onto the v2 engine. ONE instance serves both
+    // seams: pushed here for its LifecycleHooks side (session_start / user_prompt_submit /
+    // session_end) and stored in `cc_external_hooks` for its ToolMiddleware side (assemble
+    // registers it before approval). Only when hooks actually exist — an empty hooks.json
+    // (or none) registers nothing, so the no-hooks path stays free. Its session_start
+    // context append sits after the built-in context/status hooks (later = appended after),
+    // and it implements no offer_continuation, so VerifyCadenceHook's "first Some wins"
+    // contract is untouched by being earlier in the chain.
+    let cc_external = {
+        let mut cc = CCExternalHooks::load(&cfg.working_dir);
+        // Stamp the persistent session id into every CC payload (CC `session_id`), so a
+        // hook can correlate its events with the session. Empty for non-persistent runs.
+        if let Some(b) = &session {
+            cc = cc.with_session_id(b.id.as_str());
+        }
+        if cc.is_empty() {
+            None
+        } else {
+            let cc = Arc::new(cc);
+            hooks.push(cc.clone() as Arc<dyn LifecycleHooks>);
+            Some(cc)
+        }
+    };
     // 6. TelemetryHook — observation-only (on_request + on_model_response): emits
     //    LlmChat per round. Last in the chain; it mutates nothing, so order is moot.
     //    Only when the driver supplied a telemetry sink (kernel stays zero-telemetry
@@ -305,6 +336,7 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
         mcp_registry,
         mcp_events,
         review_provider,
+        cc_external_hooks: cc_external,
     })
 }
 
@@ -382,11 +414,12 @@ pub fn assemble(
         .provider(provider)
         .tools(parts.mount())
         .persona(coding_persona(&cfg.model));
-    // Tool telemetry registers BEFORE approval. It is observation-only — it never
-    // rewrites args or blocks — so it does NOT affect the approve-what-runs contract
-    // (which only requires ARG-REWRITING middleware to sit after approval). Going
-    // first means its `before` always stamps the call, so a tool that approval then
-    // DENIES is still recorded (the after-chain runs for every middleware).
+    // Tool telemetry registers FIRST. It is observation-only — it never rewrites args
+    // or blocks — so its position does not affect the approve-what-runs contract (an
+    // ARG-REWRITING gate, e.g. CC PreToolUse `updatedInput`, must instead sit BEFORE
+    // approval so the user approves the POST-rewrite bytes — see the CC hooks block
+    // below). Going first means its `before` always stamps the call, so a tool that
+    // approval then DENIES is still recorded (the after-chain runs for every middleware).
     if let Some(tel) = &cfg.telemetry {
         builder = builder.middleware(Arc::new(crate::telemetry::ToolTelemetryMiddleware::new(
             tel.clone(),
@@ -408,7 +441,21 @@ pub fn assemble(
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
         // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
-        .middleware(Arc::new(SensitivePathGate::new()))
+        .middleware(Arc::new(SensitivePathGate::new()));
+    // CC external hooks (PreToolUse gate). Runs AFTER the hard PlanMode/SensitivePath gates
+    // (which must stay un-bypassable by a hook `allow`) but BEFORE every auto-approve
+    // convenience gate — OpenFileWorkspaceGate and especially WriteApprovalGate, which
+    // auto-`Allow`s in-workspace writes and would short-circuit the chain before a hook ever
+    // sees the call (so a PreToolUse hook on edit/write would silently never run). This
+    // matches Claude Code, where a PreToolUse hook IS the permission entry point: its
+    // `updatedInput` rewrite lands before WriteApprovalGate inspects the path and before the
+    // user sees approval (so the approved bytes are what run), `allow` short-circuits the
+    // whole approval chain, and `deny` blocks. Registered only when hooks exist (else zero
+    // middleware overhead).
+    if let Some(cc) = &parts.cc_external_hooks {
+        builder = builder.middleware(cc.clone());
+    }
+    let mut builder = builder
         // open_file is Risky (launches a GUI), so approval would prompt on EVERY preview.
         // Restore the legacy engine's behavior: auto-approve when the target is inside the
         // workspace (benign side effect on the user's own files). BEFORE approval so its
@@ -421,7 +468,8 @@ pub fn assemble(
         // write-tool approval, so it must sit BEFORE the generic approval gate (its `Allow`
         // short-circuits the prompt). Reads the SAME live cwd handle, so /cd moves the boundary.
         .middleware(Arc::new(WriteApprovalGate::new(parts.shared_cwd.clone())))
-        // Approval BEFORE any arg-rewriting middleware — the user approves the exact
+        // Approval AFTER the CC PreToolUse gate + the write/open auto-approve gates — every
+        // arg-rewrite (CC `updatedInput`) has already applied, so the user approves the exact
         // bytes that run.
         .middleware(parts.approval.clone())
         // LIVE cwd handle (not the immutable pin): /cd mutates parts.shared_cwd.
@@ -502,6 +550,7 @@ fn check_snapshot_version(snap: &SessionSnapshot) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CodingAgentConfig;
 
     #[test]
     fn resume_adds_persona_before_legacy_session_context() {
@@ -546,5 +595,55 @@ mod tests {
 
         assert_eq!(snapshot.messages[0].text, persona);
         assert_eq!(snapshot.cache_epoch, 0);
+    }
+
+    /// `prepare` with all optional capabilities OFF — keeps the call I/O-free (no MCP
+    /// connect, no session/skill/home scans) so the test only exercises CC-hook wiring.
+    fn io_free_opts() -> PrepareOptions {
+        PrepareOptions {
+            session: SessionMode::Disabled,
+            skill_dirs: Some(vec![]),
+            mcp: false,
+            memory: false,
+            web: false,
+            review: false,
+        }
+    }
+
+    /// `prepare` loads a project `.hooks.json` and exposes the runner via
+    /// `cc_external_hooks` (the handle `assemble` registers as a ToolMiddleware) AND
+    /// pushes it onto the lifecycle `hooks`. With no hooks file, neither is registered —
+    /// the zero-overhead common path. ATOMCODE_HOME is pinned to an empty temp dir so the
+    /// user-level lookup can't pick up a real `~/.atomcode/hooks.json` on the dev box.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn prepare_wires_cc_external_hooks_only_when_present() {
+        let home = tempfile::tempdir().unwrap(); // empty → no user-level hooks
+        std::env::set_var("ATOMCODE_HOME", home.path());
+
+        // No project hooks → nothing wired.
+        let bare = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", bare.path());
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        assert!(parts.cc_external_hooks.is_none(), "no hooks.json ⇒ nothing registered");
+        let baseline_hooks = parts.hooks.len();
+
+        // Project .hooks.json present → wired as the middleware handle AND a lifecycle hook.
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proj.path().join(".hooks.json"),
+            r#"{"hooks":{"a":{"event":"PreToolUse","matcher":"bash","command":"echo hi"}}}"#,
+        )
+        .unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", proj.path());
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        assert!(parts.cc_external_hooks.is_some(), "project .hooks.json ⇒ wired");
+        assert_eq!(
+            parts.hooks.len(),
+            baseline_hooks + 1,
+            "the CC runner is also pushed onto the lifecycle hook chain"
+        );
+
+        std::env::remove_var("ATOMCODE_HOME");
     }
 }

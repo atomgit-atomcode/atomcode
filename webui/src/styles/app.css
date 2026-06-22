@@ -393,6 +393,19 @@ body {
   white-space: pre-wrap;
 }
 
+/* Non-fatal advisory (e.g. "conversation compacted") — muted amber notice line,
+   visually distinct from a red error and never merged into the reply text. */
+.msg-notice {
+  color: var(--app-warning-accent);
+  background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
+  border-radius: 6px;
+  padding: 4px 10px;
+  margin: 6px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .streaming-cursor {
   display: inline-block;
   width: 7px;

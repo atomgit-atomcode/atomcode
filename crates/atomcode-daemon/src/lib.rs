@@ -1901,6 +1901,10 @@ pub enum ChatEvent {
     /// Error occurred
     #[serde(rename = "error")]
     Error { message: String },
+    /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
+    /// `Error` so clients render a muted notice instead of a red error.
+    #[serde(rename = "warning")]
+    Warning { message: String },
 }
 
 /// Artifact detector for code blocks and HTML in streaming text
@@ -2841,15 +2845,11 @@ async fn process_chat_request(
                 let _ = event_tx.send(ChatEvent::Error { message: e });
             }
             TurnEvent::Warning(w) => {
-                // Non-fatal advisory — surface as an Error-shaped event
-                // for now (HTTP API clients only need to see it; we're
-                // not adding a dedicated `Warning` event variant on the
-                // wire until a consumer asks for it). Prefix makes the
-                // advisory nature explicit in case a client renders the
-                // string verbatim.
-                let _ = event_tx.send(ChatEvent::Error {
-                    message: format!("[warning] {}", w),
-                });
+                // Non-fatal advisory (e.g. "conversation compacted") — send it as its
+                // OWN `warning` event so clients render a muted notice rather than a red
+                // error. (Previously coerced to an Error-shaped event with a "[warning]"
+                // prefix, which the webui painted red as "[错误: …]" inside the reply.)
+                let _ = event_tx.send(ChatEvent::Warning { message: w });
             }
             TurnEvent::ContextStats { .. } => {
                 // Ignore context stats in API mode
@@ -4319,6 +4319,21 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发，而不是 error。
+    // webui 的 /api/chat 消费 ChatEvent；旧实现把 Warning 当成 error-shaped 事件，
+    // 被前端染成红色「[错误: …]」并塞进回复气泡。
+    #[test]
+    fn chat_warning_serializes_as_its_own_type_not_error() {
+        let json = serde_json::to_string(&ChatEvent::Warning {
+            message: "conversation compacted".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"warning","message":"conversation compacted"}"#
+        );
+    }
 
     #[test]
     fn first_query_value_extracts_token() {

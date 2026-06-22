@@ -210,6 +210,48 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Byte sequence that fully restores the terminal the TUI armed. Pure
+/// (returns the bytes; no I/O) so the restore *contract* is unit
+/// testable without a real stdout.
+///
+/// This is the same cleanup `TerminalGuard::Drop` and
+/// `RetainedRenderer::Drop` perform on the graceful path — but the
+/// release profile sets `panic = "abort"`, so on a crash NO destructor
+/// unwinds and neither Drop ever runs. The panic hook
+/// (`atomcode-cli::restore_terminal_if_tui`) is then the only code with
+/// a chance to undo the mutations, and it previously only disabled raw
+/// mode — leaving the Kitty keyboard protocol armed, so the parent
+/// shell echoed every post-crash keypress as a literal `[27u` / `[99;5u`
+/// CSI-u report (the reported crash artefact).
+///
+/// Mirrors `RetainedRenderer::Drop` (mouse-mode off, Kitty pop, cursor
+/// show, autowrap on, DECSTBM release) and appends a CRLF so the panic
+/// backtrace prints on a fresh line below the last painted TUI row
+/// instead of on top of it. Every sequence is idempotent, so emitting
+/// it after a graceful shutdown that already sent the same bytes is a
+/// harmless no-op.
+///
+/// The Kitty pop uses the `<` introducer (`\x1b[<1u`), never `>`: `>`
+/// would *arm* the protocol on the way out — the very bug this fixes.
+/// Popping a level we never pushed is a harmless no-op (empty kitty
+/// stack), so this stays unconditional and we needn't thread the
+/// `kbd_flags_pushed` state out of `TerminalGuard`.
+pub(crate) fn panic_restore_sequence() -> &'static [u8] {
+    b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\r\n"
+}
+
+/// Emit [`panic_restore_sequence`] to stdout and flush. Best-effort
+/// (errors swallowed) so it is safe to call from a panic hook. Invoked
+/// by `atomcode-cli`'s panic hook under `panic = "abort"`, where no Drop
+/// runs; see [`panic_restore_sequence`] for the full rationale.
+pub fn panic_restore_terminal() {
+    use std::io::Write as _;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let _ = out.write_all(panic_restore_sequence());
+    let _ = out.flush();
+}
+
 pub async fn run(
     config: Config,
     model_name: String,
@@ -688,4 +730,43 @@ pub async fn run(
     }
 
     result.map(|_| ())
+}
+
+#[cfg(test)]
+mod panic_restore_tests {
+    use super::panic_restore_sequence;
+
+    /// The panic hook is the ONLY terminal-cleanup that runs under
+    /// `panic = "abort"` — no Drop (TerminalGuard, RetainedRenderer)
+    /// unwinds. So the bytes it emits must single-handedly undo every
+    /// terminal mutation the TUI armed, or the parent shell is left
+    /// echoing CSI-u keypresses as literal `[27u` / `[99;5u` gibberish
+    /// (the reported crash). This pins the exact restore contract.
+    #[test]
+    fn panic_restore_sequence_pops_kitty_keyboard_protocol() {
+        let s = panic_restore_sequence();
+        let text = String::from_utf8_lossy(s);
+        // Kitty keyboard pop — `<` introducer (pop), the fix for the
+        // literal CSI-u echo. Must be present.
+        assert!(
+            text.contains("\x1b[<1u"),
+            "must pop Kitty keyboard flags (CSI < u): {text:?}"
+        );
+        // And must NEVER push (`>` introducer) — re-arming on the way
+        // out leaves the shell in CSI-u mode (the exact bug).
+        assert!(
+            !text.contains("\x1b[>"),
+            "must not re-arm Kitty protocol on exit: {text:?}"
+        );
+    }
+
+    #[test]
+    fn panic_restore_sequence_restores_cursor_autowrap_scroll_and_mouse() {
+        let text = String::from_utf8_lossy(panic_restore_sequence());
+        assert!(text.contains("\x1b[?25h"), "must show cursor (DECTCEM): {text:?}");
+        assert!(text.contains("\x1b[?7h"), "must re-enable autowrap (DECAWM): {text:?}");
+        assert!(text.contains("\x1b[r"), "must release DECSTBM scroll region: {text:?}");
+        assert!(text.contains("\x1b[?1002l"), "must disable button-event mouse: {text:?}");
+        assert!(text.contains("\x1b[?1006l"), "must disable SGR mouse coords: {text:?}");
+    }
 }
