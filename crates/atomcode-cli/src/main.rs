@@ -2539,13 +2539,13 @@ async fn run_headless_native(
                     let _ = io::stderr().flush();
                 }
             }
-            KE::ToolCallStreaming { name, arguments, .. } => {
+            // Only the FIRST streaming fragment carries the tool name — render it once.
+            // Later fragments are per-token argument deltas (name = None); rendering each
+            // would spam one line per token, so they fall through to the ignore arm.
+            KE::ToolCallStreaming { name: Some(name), .. } => {
                 if verbose {
                     close_thinking_line(&mut thinking_line_open);
-                    let name = name.unwrap_or_default();
-                    let hint = truncate_log_line(&arguments, 80);
-                    let detail = if hint.is_empty() { String::new() } else { format!(" → {}", hint) };
-                    eprintln!("[tool-streaming← {}{}]", name, detail);
+                    eprintln!("[tool-streaming← {}]", name);
                 }
             }
             KE::ToolStarted { call } => {
