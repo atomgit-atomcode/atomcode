@@ -103,6 +103,33 @@ pub fn spawn_bridged_runtime(
     (client, ev_rx)
 }
 
+/// Map a driver-supplied [`BridgeConfig`] to the [`CodingAgentConfig`] the new stack
+/// assembles from. PUBLIC so a native driver (daemon, the headless CLI) that builds a
+/// `CodingRuntime` directly reuses the EXACT same knob mapping the bridge uses — no
+/// divergence (the BridgeConfig-drops-per-provider-config footgun).
+pub fn coding_config(cfg: &BridgeConfig) -> CodingAgentConfig {
+    let mut coding_cfg =
+        CodingAgentConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model, &cfg.working_dir);
+    coding_cfg.context_window = cfg.context_window;
+    coding_cfg.telemetry = cfg.telemetry.clone();
+    coding_cfg.reasoning_history = cfg.reasoning_history.clone();
+    // `/effort`: thread the per-provider reasoning_effort into the per-call ChatOptions
+    // so v2 actually emits it (openai_compat → `reasoning_effort` body field).
+    coding_cfg.chat_options.reasoning_effort =
+        atomcode_kernel::provider::ReasoningEffort::from_config(cfg.reasoning_effort.as_deref());
+    // Adapter selection + thinking controls (so Claude-/Ollama-native + /think work in v2).
+    coding_cfg.provider_type = cfg.provider_type.clone();
+    coding_cfg.thinking_enabled = cfg.thinking_enabled;
+    coding_cfg.thinking_type = cfg.thinking_type.clone();
+    coding_cfg.thinking_keep = cfg.thinking_keep.clone();
+    // Interactive drivers PARK approvals (a present human must not be auto-denied for
+    // thinking too long); headless keeps the configured fail-closed timeout.
+    if cfg.interactive {
+        coding_cfg.request_timeout = None;
+    }
+    coding_cfg
+}
+
 /// Per-turn statistics backing the legacy `TurnComplete` payload.
 #[derive(Default)]
 struct TurnStats {
@@ -208,31 +235,7 @@ impl Bridge {
         mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
         ev_tx: mpsc::UnboundedSender<CoreEv>,
     ) {
-        let mut coding_cfg = CodingAgentConfig::new(
-            &cfg.api_key,
-            &cfg.base_url,
-            &cfg.model,
-            &cfg.working_dir,
-        );
-        coding_cfg.context_window = cfg.context_window;
-        coding_cfg.telemetry = cfg.telemetry.clone();
-        coding_cfg.reasoning_history = cfg.reasoning_history.clone();
-        // `/effort`: thread the per-provider reasoning_effort into the per-call ChatOptions
-        // so v2 actually emits it (openai_compat → `reasoning_effort` body field). Without
-        // this the knob was silently dropped at the bridge.
-        coding_cfg.chat_options.reasoning_effort =
-            atomcode_kernel::provider::ReasoningEffort::from_config(cfg.reasoning_effort.as_deref());
-        // Adapter selection + thinking controls (so Claude-/Ollama-native + /think work in v2).
-        coding_cfg.provider_type = cfg.provider_type.clone();
-        coding_cfg.thinking_enabled = cfg.thinking_enabled;
-        coding_cfg.thinking_type = cfg.thinking_type.clone();
-        coding_cfg.thinking_keep = cfg.thinking_keep.clone();
-        // Interactive drivers PARK approvals (a present human must not be auto-denied for
-        // thinking too long); headless keeps the configured fail-closed timeout. Liveness for
-        // a crashed interactive driver is handled by Cancel/Shutdown flushing pending requests.
-        if cfg.interactive {
-            coding_cfg.request_timeout = None;
-        }
+        let coding_cfg = coding_config(&cfg);
 
         let opts_template = PrepareOptions {
             session: SessionMode::Fresh,
@@ -1839,7 +1842,7 @@ fn apply_reload_provider(
     cfg.thinking_keep = provider.thinking_keep.clone();
 }
 
-fn build_provider(
+pub fn build_provider(
     cfg: &CodingAgentConfig,
 ) -> anyhow::Result<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
     use atomcode_capabilities::provider::{
@@ -2053,13 +2056,43 @@ mod goal_summary_tests {
 #[cfg(test)]
 mod undo_tests {
     use super::{
-        apply_reload_provider, build_provider, compaction_advisory, compute_undo,
+        apply_reload_provider, build_provider, coding_config, compaction_advisory, compute_undo,
         estimate_after_tokens, fmt_k_tokens, friendly_provider_error, manual_compact_result,
+        BridgeConfig,
     };
     use atomcode_core::config::provider::ProviderConfig;
     use atomcode_coding::CodingAgentConfig;
     use atomcode_kernel::message::{CompactTrigger, Message};
     use atomcode_kernel::provider::ReasoningEffort;
+
+    #[test]
+    fn coding_config_maps_bridge_knobs_without_divergence() {
+        let bcfg = BridgeConfig {
+            api_key: "k".into(),
+            base_url: "https://example.test/v1".into(),
+            model: "m".into(),
+            working_dir: "/tmp".into(),
+            context_window: 64_000,
+            mcp: true,
+            telemetry: None,
+            reasoning_history: Some("include".into()),
+            reasoning_effort: Some("high".into()),
+            provider_type: "claude".into(),
+            thinking_enabled: Some(true),
+            thinking_type: None,
+            thinking_keep: None,
+            dangerously_skip_permissions: false,
+            interactive: true,
+        };
+        let cc = coding_config(&bcfg);
+        assert_eq!(cc.provider_type, "claude");
+        assert_eq!(cc.context_window, 64_000);
+        assert_eq!(cc.model, "m");
+        assert_eq!(cc.reasoning_history.as_deref(), Some("include"));
+        assert_eq!(cc.thinking_enabled, Some(true));
+        // interactive ⇒ no fail-closed approval timeout (a present human isn't auto-denied).
+        assert_eq!(cc.request_timeout, None);
+    }
 
     #[test]
     fn atomgit_gateway_401_swaps_for_login_hint() {
