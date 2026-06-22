@@ -33,6 +33,7 @@ pub mod discipline;
 pub mod parts;
 pub mod persona;
 pub mod plan_mode;
+pub mod runtime;
 pub mod telemetry;
 
 mod assemble;
@@ -47,6 +48,7 @@ pub use parts::{
     SessionMode,
 };
 pub use persona::coding_persona;
+pub use runtime::{CodingRuntime, ProviderFactory};
 
 /// Re-export the CC external-hooks types so drivers (e.g. the bridge) that resolve
 /// plugin-contributed hooks can name [`cc_hooks::HookConfig`] without a direct

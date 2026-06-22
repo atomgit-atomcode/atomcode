@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::session::SessionManager;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
+use atomcode_coding::{CodingAgentConfig, CodingRuntime, PrepareOptions, ProviderFactory, SessionMode};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_kernel::provider::LlmProvider;
 use clap::Parser;
@@ -159,8 +159,15 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     };
 
     eprintln!("preparing ({model}) …");
-    let mut parts = prepare(&cfg, opts).await.context("prepare failed")?;
-    for ev in &parts.mcp_events {
+    // The shared driver runtime owns prepare→assemble→spawn (+ respawn). clix
+    // injects its own provider builder, which REFUSES signing gateways — keeping
+    // the AtomGit signer (auth identity + closed crate) out of the open-source CLI.
+    let factory: ProviderFactory =
+        Box::new(|cfg: &CodingAgentConfig| build_provider(cfg).map_err(|e| e.to_string()));
+    let mut rt = CodingRuntime::spawn(cfg, opts, Vec::new(), factory)
+        .await
+        .context("engine spawn failed")?;
+    for ev in &rt.parts().mcp_events {
         use atomcode_capabilities::mcp::McpConnectEvent as E;
         match ev {
             E::Connected { name } => eprintln!("  mcp ✓ {name}"),
@@ -168,11 +175,8 @@ pub async fn code(args: CodeArgs) -> Result<()> {
             E::Warning { name, message } => eprintln!("  mcp ! {name}: {message}"),
         }
     }
-    let session_id = parts.session.as_ref().map(|b| b.id.clone());
-    let resumed = parts.session.as_ref().is_some_and(|b| b.resume.is_some());
-
-    let provider = build_provider(&cfg)?;
-    let mut handle = assemble(&mut parts, &cfg, provider).context("assemble failed")?.spawn();
+    let session_id = rt.parts().session.as_ref().map(|b| b.id.clone());
+    let resumed = rt.parts().session.as_ref().is_some_and(|b| b.resume.is_some());
 
     if let Some(id) = &session_id {
         eprintln!("session {} {}", id, if resumed { "(resumed)" } else { "(new)" });
@@ -189,9 +193,9 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     // One-shot: a single turn, then exit (still persisted). A failed turn must
     // exit NON-ZERO — `--yolo -p` is the CI mode, and CI needs the signal.
     if let Some(p) = args.prompt {
-        let _ = handle.commands.send(AgentCommand::SendMessage { text: p, images: vec![] });
-        let reason = drive_turn(&mut handle, &mut input, args.yolo, &mut sigint).await;
-        finish(handle, session_id).await?;
+        let _ = rt.handle().commands.send(AgentCommand::SendMessage { text: p, images: vec![] });
+        let reason = drive_turn(rt.handle(), &mut input, args.yolo, &mut sigint).await;
+        finish(rt, session_id).await?;
         return match reason {
             Some(StopReason::Stopped) => Ok(()),
             Some(other) => bail!("turn did not complete normally: {other:?}"),
@@ -224,21 +228,21 @@ pub async fn code(args: CodeArgs) -> Result<()> {
             continue;
         }
         if let Some(cmd) = line.strip_prefix('/') {
-            match handle_slash(cmd, &dir, &handle) {
+            match handle_slash(cmd, &dir, rt.handle()) {
                 SlashOutcome::Handled => continue,
                 SlashOutcome::Quit => break,
             }
         }
-        if handle.commands.send(AgentCommand::SendMessage { text: line, images: vec![] }).is_err() {
+        if rt.handle().commands.send(AgentCommand::SendMessage { text: line, images: vec![] }).is_err() {
             eprintln!("[agent terminated — exiting]");
             break;
         }
-        if drive_turn(&mut handle, &mut input, args.yolo, &mut sigint).await.is_none() {
+        if drive_turn(rt.handle(), &mut input, args.yolo, &mut sigint).await.is_none() {
             eprintln!("[agent terminated — exiting]");
             break;
         }
     }
-    finish(handle, session_id).await
+    finish(rt, session_id).await
 }
 
 /// One process-wide SIGINT listener feeding a channel — every prompt/select in the
@@ -269,12 +273,8 @@ fn build_provider(cfg: &CodingAgentConfig) -> Result<Arc<dyn LlmProvider>> {
     Ok(Arc::new(OpenAiCompatProvider::new(pc).map_err(|e| anyhow::anyhow!(e.message))?))
 }
 
-async fn finish(
-    handle: atomcode_kernel::agent::AgentHandle,
-    session_id: Option<String>,
-) -> Result<()> {
-    let _ = handle.commands.send(AgentCommand::Shutdown);
-    let _ = handle.task.await;
+async fn finish(rt: CodingRuntime, session_id: Option<String>) -> Result<()> {
+    rt.shutdown().await;
     if let Some(id) = session_id {
         eprintln!("session saved — resume with: atomcodex code --resume {id}");
     }
