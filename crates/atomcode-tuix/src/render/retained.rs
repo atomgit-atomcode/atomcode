@@ -20,8 +20,8 @@ use std::fs::File;
 use std::io::{BufWriter, Stdout, Write};
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, EnableBracketedPaste, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 
@@ -4216,10 +4216,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Re-push Kitty keyboard enhancement flags (mirror of the pop in
         // suspend_for_external, and the initial push in TerminalGuard).
         // Without this, post-OAuth the terminal is in a different
-        // key-reporting mode than we initialised with — autorepeat stops
-        // coming as `Repeat`, Shift+Enter stops carrying SHIFT, and any
-        // other logic that depended on CSI u event types silently
-        // degrades. Same flag set as `TerminalGuard::activate`.
+        // key-reporting mode than we initialised with and Shift+Enter stops
+        // carrying SHIFT. Same flag set as `TerminalGuard::activate`; in
+        // particular, it excludes REPORT_EVENT_TYPES so release CSI-u reports
+        // cannot leak into the input box when their leading ESC is split.
         //
         // Windows and JediTerm are excluded for the same reason as the
         // initial push: Windows' Win32 console backend can't decode `CSI u`
@@ -4232,10 +4232,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if crate::should_enable_kitty_keyboard(&self.caps) {
             let _ = execute!(
                 self.out,
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
+                PushKeyboardEnhancementFlags(crate::kitty_keyboard_flags())
             );
         }
         // Wipe terminal + invalidate Screen + reset region state so
@@ -9852,6 +9849,24 @@ mod tests {
             !s.contains("\x1b[?1006h"),
             "resume must NOT re-enable SGR mouse coords — defer to terminal: {:?}",
             s
+        );
+    }
+
+    #[test]
+    fn retained_resume_does_not_request_keyboard_release_events() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        r.suspend_for_external();
+        buf.lock().unwrap().clear();
+
+        r.resume_from_external();
+
+        let bytes = buf.lock().unwrap().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(
+            output.contains("\x1b[>1u") && !output.contains("\x1b[>3u"),
+            "resume must enable disambiguation without release reports: {output:?}"
         );
     }
 

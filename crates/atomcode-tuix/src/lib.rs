@@ -70,6 +70,18 @@ pub(crate) fn should_enable_kitty_keyboard(caps: &TerminalCaps) -> bool {
     caps.tty && !cfg!(windows) && !caps.jediterm
 }
 
+/// Kitty keyboard features used by the TUI.
+///
+/// Event-type reporting is deliberately excluded. Some terminals split a
+/// release report such as `ESC [ 101;1:3u` after the ESC byte; crossterm then
+/// treats the lone ESC as a complete key and forwards the remaining bytes as
+/// printable input. Disambiguation alone is enough for Shift+Enter, while the
+/// reader's modifier+Enter deduplication handles terminals that report key
+/// autorepeat as additional presses.
+pub(crate) fn kitty_keyboard_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
 impl TerminalGuard {
     /// Activate terminal capabilities. Returns `(guard, kbd_enhanced)` where
     /// `kbd_enhanced` indicates whether the Kitty keyboard protocol (CSI u)
@@ -97,22 +109,16 @@ impl TerminalGuard {
         // this, crossterm sees `Enter, NONE` on both Enter and Shift+Enter
         // and the input box can't insert a newline.
         //
-        // `REPORT_EVENT_TYPES` is the second bit of the protocol and is what
-        // actually makes OS key autorepeat distinguishable from fresh presses:
-        // without it, every 30ms autorepeat tick reports as `KeyEventKind::Press`,
-        // so holding Shift+Enter for a normal 150ms press-down inserts 5-10
-        // newlines instead of one. With it enabled, autorepeats report as
-        // `KeyEventKind::Repeat`, which `event_loop/mod.rs` treats the same
-        // as `Press` so navigation keys (Left/Right/Backspace) auto-repeat
-        // when held — Submit-on-Enter still fires only once because Submit
-        // transitions phases.
+        // Do not request REPORT_EVENT_TYPES. Release reports are unnecessary
+        // for our input model and can leak into the input box when a terminal
+        // splits the leading ESC from the rest of a CSI-u report. The reader
+        // already deduplicates modifier+Enter autorepeat reported as Press.
         //
         // `execute!` is best-effort — terminals that don't support CSI u
         // (notably Apple Terminal.app, some Linux terminals) ignore the
         // sequence; we just don't set `kbd_flags_pushed` and Drop won't try
-        // to pop. Terminals that support DISAMBIGUATE but not
-        // REPORT_EVENT_TYPES ignore the extra bit silently — this never
-        // makes things worse than before.
+        // to pop. Terminals that don't implement disambiguation ignore the
+        // request, leaving input behavior unchanged.
         //
         // WINDOWS EXCLUSION: never push on Windows. crossterm's Windows
         // input backend reads Win32 console KEY_EVENT records (not an ANSI
@@ -142,10 +148,7 @@ impl TerminalGuard {
         let kbd_enhanced = should_enable_kitty_keyboard(&caps)
             && execute!(
                 io::stdout(),
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
+                PushKeyboardEnhancementFlags(kitty_keyboard_flags())
             )
             .is_ok();
         if kbd_enhanced {
@@ -734,7 +737,16 @@ pub async fn run(
 
 #[cfg(test)]
 mod panic_restore_tests {
-    use super::panic_restore_sequence;
+    use super::{kitty_keyboard_flags, panic_restore_sequence};
+    use crossterm::event::KeyboardEnhancementFlags;
+
+    #[test]
+    fn kitty_keyboard_flags_do_not_request_release_events() {
+        assert_eq!(
+            kitty_keyboard_flags(),
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        );
+    }
 
     /// The panic hook is the ONLY terminal-cleanup that runs under
     /// `panic = "abort"` — no Drop (TerminalGuard, RetainedRenderer)
