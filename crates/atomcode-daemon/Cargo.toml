@@ -18,6 +18,11 @@ atomcode-core = { path = "../atomcode-core" }
 # daemon's live turns can run on it via KernelTurnExecutor ($ATOMCODE_ENGINE=v2).
 atomcode-bridge = { path = "../atomcode-bridge" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
+# Native v2 stack: KernelTurnExecutor drives CodingRuntime directly (no bridge
+# membrane), consuming kernel AgentEvents and answering approvals natively.
+atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-coding = { path = "../atomcode-coding" }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools"] }
 
 # HTTP
 axum = { version = "0.7", features = ["macros"] }

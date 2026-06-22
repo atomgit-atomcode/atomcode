@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent};
+use atomcode_core::agent::{AgentCommand, AgentEvent};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
@@ -24,6 +24,9 @@ use atomcode_core::turn::permission::{
     PermissionDecider,
 };
 use atomcode_core::turn::runner::TurnRunner;
+use atomcode_coding::{
+    CodingAgentConfig, CodingRuntime, PrepareOptions, ProviderFactory, SessionMode,
+};
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -649,18 +652,16 @@ pub(crate) struct KernelTurnExecutor {
     auto_approve: bool,
     session_id: atomcode_core::session::SessionId,
     telemetry: Arc<Telemetry>,
-    /// Persistent bridge runtime; built lazily on the first turn.
-    bridge: Mutex<Option<BridgeState>>,
+    /// Persistent NATIVE runtime; built lazily on the first turn.
+    runtime: Mutex<Option<NativeState>>,
 }
 
-struct BridgeState {
-    client: AgentClient,
-    events: mpsc::UnboundedReceiver<AgentEvent>,
-    /// Whether the pre-existing history has been seeded into the bridge.
+struct NativeState {
+    runtime: CodingRuntime,
+    /// Whether the pre-existing history has been seeded into the engine.
     seeded: bool,
-    /// The provider name used to build this bridge. Compared against
-    /// `LIVE_PROVIDER` on each `run_turn` to detect model switches
-    /// that require a `ReloadConfig` to the bridge runtime.
+    /// The provider name used to build this runtime. A change (webui model switch)
+    /// drops + rebuilds the runtime on the next turn (re-seeded from `conv`).
     provider_name: String,
 }
 
@@ -678,7 +679,7 @@ impl KernelTurnExecutor {
             auto_approve,
             session_id,
             telemetry,
-            bridge: Mutex::new(None),
+            runtime: Mutex::new(None),
         }
     }
 
@@ -771,38 +772,51 @@ impl TurnExecutor for KernelTurnExecutor {
             let _ = events.send(LiveEvent::Turn(te));
         };
 
-        // Lazily build the persistent bridge for this LiveSession.
-        let mut guard = self.bridge.lock().await;
-        if guard.is_none() {
-            let Some(cfg) = self.bridge_config() else {
+        // Lazily build the persistent NATIVE runtime for this LiveSession; rebuild it
+        // when the provider changed (webui model switch) — a fresh runtime is re-seeded
+        // from `conv` below, so it continues seamlessly (the bridge path used
+        // ReloadConfig; dropping + rebuilding is the native equivalent).
+        let mut guard = self.runtime.lock().await;
+        let current_provider = self.resolve_provider_name();
+        let needs_build = match guard.as_ref() {
+            None => true,
+            Some(s) => s.provider_name != current_provider,
+        };
+        if needs_build {
+            let Some(bcfg) = self.bridge_config() else {
                 emit(TurnEvent::Error("engine v2：provider 未配置".into()));
                 return;
             };
-            let provider_name = self.resolve_provider_name();
-            let (client, rx) = atomcode_bridge::spawn_bridged_runtime(cfg);
-            *guard = Some(BridgeState { client, events: rx, seeded: false, provider_name });
-        }
-
-        // Detect model switch: if LIVE_PROVIDER changed since this bridge was built,
-        // send ReloadConfig so the bridge runtime updates its system prompt, provider,
-        // and context strategy. Without this, a webui dropdown switch updates
-        // LIVE_PROVIDER but the bridge's frozen system prompt still carries the old
-        // model name — the agent mis-identifies itself (issue #659).
-        let current_provider = self.resolve_provider_name();
-        let state = guard.as_mut().unwrap();
-        if current_provider != state.provider_name {
-            if let Ok(new_config) = Config::load(&Config::default_path()) {
-                let _ = state.client.cmd_tx.send(
-                    atomcode_core::agent::AgentCommand::ReloadConfig(new_config),
-                );
+            let coding_cfg = atomcode_bridge::coding_config(&bcfg);
+            let opts = PrepareOptions {
+                session: SessionMode::Fresh,
+                skill_dirs: None,
+                mcp: true,
+                memory: true,
+                web: true,
+                review: true,
+            };
+            let factory: ProviderFactory = Box::new(|c: &CodingAgentConfig| {
+                atomcode_bridge::build_provider(c).map_err(|e| e.to_string())
+            });
+            match CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory).await {
+                Ok(rt) => {
+                    *guard = Some(NativeState {
+                        runtime: rt,
+                        seeded: false,
+                        provider_name: current_provider,
+                    });
+                }
+                Err(e) => {
+                    emit(TurnEvent::Error(format!("engine v2 启动失败：{e}")));
+                    return;
+                }
             }
-            state.provider_name = current_provider;
         }
-
-        let client = state.client.clone();
+        let state = guard.as_mut().unwrap();
 
         // `conv` already has the just-typed user message appended (coordinator).
-        // Split it off: the prefix seeds the bridge (first turn only), the last
+        // Split it off: the prefix seeds the engine (first turn only), the last
         // message is sent as this turn's input.
         let (prefix, user_text, user_images) = {
             let c = conv.lock().await;
@@ -820,17 +834,27 @@ impl TurnExecutor for KernelTurnExecutor {
             user_images
         };
 
+        // Seed the prefix once per runtime: persist it as the session snapshot and respawn
+        // resumed so the engine continues this conversation with monotonic ids (the
+        // bridge's SetConversation recipe, done natively).
         if !state.seeded {
-            let _ = client.cmd_tx.send(AgentCommand::SetConversation(ConversationSnapshot {
-                messages: prefix,
-                cold_summaries: vec![],
-            }));
+            let kmsgs: Vec<_> =
+                prefix.iter().map(atomcode_bridge::convert::message_to_kernel).collect();
+            let ksnap = atomcode_kernel::message::SessionSnapshot::new(kmsgs);
+            let session_id = state.runtime.parts().session.as_ref().map(|b| {
+                let _ = b.manager.save_snapshot(&b.id, &ksnap);
+                b.id.clone()
+            });
+            if let Some(id) = session_id {
+                let _ = state.runtime.respawn(SessionMode::Resume(id)).await;
+            }
             state.seeded = true;
         }
-        let _ = client.cmd_tx.send(AgentCommand::SendMessage {
+
+        let commands = state.runtime.handle().commands.clone();
+        let _ = commands.send(atomcode_kernel::event::AgentCommand::SendMessage {
             text: user_text,
-            images: user_images,
-            image_markers: Vec::new(),
+            images: user_images.iter().map(atomcode_bridge::convert::image_to_kernel).collect(),
         });
 
         // Interactive approval: register the response sender so any view's
@@ -843,106 +867,101 @@ impl TurnExecutor for KernelTurnExecutor {
             Some(rx)
         };
 
+        let mut live_tools: HashMap<String, (String, std::time::Instant)> = HashMap::new();
         let mut cancelled = false;
-        let mut bridge_dead = false;
+        let mut runtime_dead = false;
+        let mut awaiting_snapshot = false;
+        use atomcode_kernel::event::AgentEvent as KE;
         let final_messages = loop {
             let ev = tokio::select! {
                 _ = cancel.cancelled(), if !cancelled => {
                     cancelled = true;
-                    let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                    let _ = commands.send(atomcode_kernel::event::AgentCommand::Cancel);
                     continue;
                 }
-                ev = state.events.recv() => ev,
+                ev = state.runtime.handle().events.recv() => ev,
             };
             let Some(ev) = ev else {
-                // Bridge task exited (channel closed). Drop it after the loop so the
-                // next turn respawns instead of no-op'ing on a dead bridge forever.
-                bridge_dead = true;
+                // Kernel task exited (channel closed). Drop the runtime after the loop so
+                // the next turn rebuilds instead of no-op'ing on a dead handle forever.
+                runtime_dead = true;
                 break None;
             };
             match ev {
-                AgentEvent::TextDelta(t) => emit(TurnEvent::TextDelta(t)),
-                AgentEvent::ReasoningDelta(t) => emit(TurnEvent::ReasoningDelta(t)),
-                AgentEvent::ToolCallStreaming { name, hint } => {
-                    emit(TurnEvent::ToolCallStreaming { name, hint })
-                }
-                AgentEvent::ToolCallStarted { id, name, arguments } => {
-                    emit(TurnEvent::ToolCallStarted { id, name, arguments })
-                }
-                AgentEvent::ToolOutputChunk { call_id, chunk } => {
-                    emit(TurnEvent::ToolOutputChunk { call_id, chunk })
-                }
-                AgentEvent::ToolCallResult { call_id, name, output, success, duration } => emit(
-                    TurnEvent::ToolCallResult { call_id, name, output, success, duration },
-                ),
-                AgentEvent::TokenUsage(u) => emit(TurnEvent::TokenUsage {
-                    prompt_tokens: u.prompt_tokens,
-                    completion_tokens: u.completion_tokens,
-                    total_tokens: u.prompt_tokens + u.completion_tokens,
-                    cached_tokens: u.cached_tokens,
-                }),
-                AgentEvent::ContextStats {
-                    system_tokens,
-                    sent_tokens,
-                    dropped_tokens,
-                    working_set_tokens,
-                    total_messages,
-                    ..
-                } => emit(TurnEvent::ContextStats {
-                    system_tokens,
-                    sent_tokens,
-                    dropped_tokens,
-                    working_set_tokens,
-                    total_messages,
-                }),
-                AgentEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
-                AgentEvent::Warning(w) => emit(TurnEvent::Warning(w)),
-                AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot } => {
-                    emit(TurnEvent::ApprovalRequested {
-                        tool_name,
-                        reason,
-                        call,
-                        snapshot,
-                    });
+                // Approval round-trip: the kernel asks via Request{APPROVAL_KIND}; the
+                // daemon answers at its own seam (auto-approve, or a view's approve()),
+                // then responds to the kernel BY ID — simpler than the bridge's id mirror.
+                KE::Request { id, kind, payload }
+                    if kind == atomcode_capabilities::tools::APPROVAL_KIND =>
+                {
+                    if let Ok(req) = serde_json::from_value::<
+                        atomcode_capabilities::tools::ApprovalRequest,
+                    >(payload)
+                    {
+                        emit(TurnEvent::ApprovalRequested {
+                            tool_name: req.tool.clone(),
+                            reason: "Requires approval".to_string(),
+                            call: atomcode_core::tool::ToolCall {
+                                id: req.call_id,
+                                name: req.tool,
+                                arguments: req.args,
+                            },
+                            snapshot: ConversationSnapshot::default(),
+                        });
+                    }
                     let decision = match &mut perm_rx {
                         // auto-approve (no interactive channel): allow.
                         None => PermissionDecision::Allow,
-                        Some(rx) => {
-                            tokio::select! {
-                                _ = cancel.cancelled(), if !cancelled => {
-                                    cancelled = true;
-                                    // Deny this tool AND stop the turn — without the
-                                    // Cancel the outer cancel branch is now disabled
-                                    // (`if !cancelled`) so the turn would otherwise run
-                                    // on after a single denied tool.
-                                    let _ = client.cmd_tx.send(AgentCommand::Cancel);
-                                    PermissionDecision::Deny
-                                }
-                                d = rx.recv() => d.unwrap_or(PermissionDecision::Deny),
+                        Some(rx) => tokio::select! {
+                            _ = cancel.cancelled(), if !cancelled => {
+                                cancelled = true;
+                                PermissionDecision::Deny
                             }
-                        }
+                            d = rx.recv() => d.unwrap_or(PermissionDecision::Deny),
+                        },
                     };
-                    let cmd = match decision {
-                        PermissionDecision::Allow => AgentCommand::ApproveTool,
-                        PermissionDecision::AllowAlways => AgentCommand::ApproveToolAlways,
+                    use atomcode_capabilities::tools::ApprovalResponse;
+                    let resp = match decision {
+                        PermissionDecision::Allow => ApprovalResponse::allow(),
+                        PermissionDecision::AllowAlways => ApprovalResponse::allow_always(),
                         PermissionDecision::Ask(_) | PermissionDecision::Deny => {
-                            AgentCommand::DenyTool
+                            ApprovalResponse::deny()
                         }
                     };
-                    let _ = client.cmd_tx.send(cmd);
+                    let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
+                    let _ = commands
+                        .send(atomcode_kernel::event::AgentCommand::Respond { id, value });
                 }
-                AgentEvent::Error { error, .. } => {
-                    // NON-terminal. The bridge forwards the kernel error HERE and then
-                    // still emits a terminal TurnComplete/TurnCancelled (or closes the
-                    // channel). Breaking now would (a) write back the bridge's empty
-                    // `messages` and WIPE the conversation + on-disk session, and (b)
-                    // leave the bridge's later terminal events to be mis-read by the
-                    // NEXT turn. Surface the error and keep draining to the real end.
-                    emit(TurnEvent::Error(error));
+                // Unknown request kind: fail closed.
+                KE::Request { id, .. } => {
+                    let _ = commands.send(atomcode_kernel::event::AgentCommand::Respond {
+                        id,
+                        value: serde_json::Value::Null,
+                    });
                 }
-                AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
-                AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
-                _ => {}
+                // Terminal: the kernel TurnComplete carries no messages — ask for the
+                // snapshot so the daemon can write back `conv` (the bridge's round-trip).
+                KE::TurnComplete { .. } => {
+                    awaiting_snapshot = true;
+                    let _ = commands.send(atomcode_kernel::event::AgentCommand::Snapshot);
+                }
+                // The snapshot we requested on the terminal = the conversation of record.
+                KE::Snapshot { snapshot } if awaiting_snapshot => {
+                    let core_msgs = snapshot
+                        .messages
+                        .iter()
+                        .map(atomcode_bridge::convert::message_to_core)
+                        .collect();
+                    break Some(core_msgs);
+                }
+                // Everything else (text/reasoning/tool stream + result, batches, usage,
+                // warning, NON-terminal error) maps 1:1 — `kernel_to_turn` threads the
+                // live-tools map so a tool result recovers its name + duration.
+                other => {
+                    if let Some(te) = kernel_to_turn(other, &mut live_tools) {
+                        emit(te);
+                    }
+                }
             }
         };
 
@@ -972,11 +991,138 @@ impl TurnExecutor for KernelTurnExecutor {
             }
         }
 
-        // A dead bridge can't serve another turn — drop it so the next run_turn
-        // rebuilds a fresh one (see the `guard.is_none()` lazy-init above).
-        if bridge_dead {
+        // A dead kernel can't serve another turn — drop the runtime so the next
+        // run_turn rebuilds a fresh one (see the lazy-init above).
+        if runtime_dead {
             *guard = None;
         }
+    }
+}
+
+/// Char-based truncation for streaming tool-arg hints (adds an ellipsis when cut).
+fn truncate_hint(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
+/// Native `kernel::AgentEvent` → `TurnEvent` for the NATIVE /live executor (parallel to
+/// [`agent_to_turn`], which maps the LEGACY bridge's `core::AgentEvent`). The kernel emits
+/// no `name`/`duration` on a tool result — that's a UI synthesis the bridge did via a
+/// live-tools map — so this threads a `live_tools` map: `ToolStarted` records `(name,
+/// start)`; `ToolResult` reads it back. Returns `None` for events the run loop orchestrates
+/// (approval `Request`, turn terminals, `Snapshot`) or that have no `TurnEvent`.
+pub(crate) fn kernel_to_turn(
+    ev: atomcode_kernel::event::AgentEvent,
+    live_tools: &mut HashMap<String, (String, std::time::Instant)>,
+) -> Option<TurnEvent> {
+    use atomcode_kernel::event::AgentEvent as KE;
+    Some(match ev {
+        KE::TextDelta(t) => TurnEvent::TextDelta(t),
+        KE::Reasoning(t) => TurnEvent::ReasoningDelta(t),
+        KE::ToolCallStreaming { name, arguments, .. } => TurnEvent::ToolCallStreaming {
+            name: name.unwrap_or_default(),
+            hint: truncate_hint(&arguments, 80),
+        },
+        KE::ToolStarted { call } => {
+            live_tools.insert(call.id.clone(), (call.name.clone(), std::time::Instant::now()));
+            TurnEvent::ToolCallStarted { id: call.id, name: call.name, arguments: call.arguments }
+        }
+        KE::ToolProgress { call_id, message } => {
+            TurnEvent::ToolOutputChunk { call_id, chunk: message }
+        }
+        KE::ToolResult { result } => {
+            let (name, started) = live_tools
+                .remove(&result.call_id)
+                .unwrap_or_else(|| ("tool".to_string(), std::time::Instant::now()));
+            TurnEvent::ToolCallResult {
+                call_id: result.call_id,
+                name,
+                output: result.content,
+                success: !result.is_error,
+                duration: started.elapsed(),
+            }
+        }
+        KE::ToolBatchStarted { batch_id, calls } => TurnEvent::ToolBatchStarted {
+            batch_id,
+            calls: calls
+                .into_iter()
+                .map(|c| atomcode_core::turn::event::ToolBatchCall {
+                    id: c.id,
+                    name: c.name,
+                    arguments: c.arguments,
+                })
+                .collect(),
+        },
+        KE::ToolBatchCompleted { batch_id, ok, total, elapsed_ms } => {
+            TurnEvent::ToolBatchCompleted { batch_id, ok, total, elapsed_ms }
+        }
+        KE::Usage(meta) => TurnEvent::TokenUsage {
+            prompt_tokens: meta.tokens.prompt as usize,
+            completion_tokens: meta.tokens.completion as usize,
+            total_tokens: (meta.tokens.prompt + meta.tokens.completion) as usize,
+            cached_tokens: meta.tokens.cached as usize,
+        },
+        KE::Warning(w) => TurnEvent::Warning(w),
+        KE::Error { message, .. } => TurnEvent::Error(message),
+        // Request (approval) / Snapshot / TurnComplete / Cancelled / TurnStarted /
+        // CompactionStarted / Compacted → the run loop orchestrates (or ignores) these.
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod kernel_to_turn_tests {
+    use super::*;
+    use atomcode_kernel::event::AgentEvent as KE;
+    use atomcode_kernel::tool::{ToolCall, ToolResult as KToolResult};
+
+    #[test]
+    fn maps_text_and_recovers_tool_name_duration_via_live_tools() {
+        let mut lt = HashMap::new();
+
+        assert!(matches!(
+            kernel_to_turn(KE::TextDelta("hi".into()), &mut lt),
+            Some(TurnEvent::TextDelta(t)) if t == "hi"
+        ));
+
+        let started = kernel_to_turn(
+            KE::ToolStarted {
+                call: ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() },
+            },
+            &mut lt,
+        );
+        assert!(matches!(started, Some(TurnEvent::ToolCallStarted { ref name, .. }) if name == "bash"));
+        assert!(lt.contains_key("c1"), "ToolStarted records the live-tools entry");
+
+        let result = kernel_to_turn(
+            KE::ToolResult {
+                result: KToolResult { call_id: "c1".into(), content: "ok".into(), is_error: false },
+            },
+            &mut lt,
+        );
+        match result {
+            Some(TurnEvent::ToolCallResult { call_id, name, output, success, .. }) => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(name, "bash", "name recovered from live_tools (kernel result carries none)");
+                assert_eq!(output, "ok");
+                assert!(success);
+            }
+            other => panic!("expected ToolCallResult, got {other:?}"),
+        }
+        assert!(!lt.contains_key("c1"), "ToolResult consumes the live-tools entry");
+    }
+
+    #[test]
+    fn turn_terminals_are_not_mapped() {
+        let mut lt = HashMap::new();
+        assert!(kernel_to_turn(
+            KE::TurnComplete { reason: atomcode_kernel::event::StopReason::Stopped },
+            &mut lt
+        )
+        .is_none());
     }
 }
 
