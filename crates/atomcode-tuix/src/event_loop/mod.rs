@@ -2541,6 +2541,16 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_edit_file_repairs_unescaped_newline() {
+        let args = concat!(
+            r#"{"file_path":"/abs/path/to/test.txt","old_string":"old","new_string":"line 1"#,
+            "\n",
+            r#"line 2"}"#
+        );
+        assert_eq!(format_tool_detail("edit_file", args), "test.txt");
+    }
+
+    #[test]
     fn format_tool_detail_read_symbol_combines_symbol_and_file() {
         let args = r#"{"symbol":"parse","file_path":"src/lexer.rs"}"#;
         assert_eq!(format_tool_detail("read_symbol", args), "parse in lexer.rs");
@@ -8699,7 +8709,8 @@ pub fn display_tool_name_short(snake: &str) -> String {
 }
 
 pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
+    let repaired_args = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired_args) else {
         return String::new();
     };
     let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
