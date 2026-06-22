@@ -1976,6 +1976,7 @@ fn bridge_config_from(
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
         working_dir: working_dir.to_path_buf(),
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
+        max_tokens: p.and_then(|p| p.max_tokens).map(|m| m as u32),
         mcp: true,
         telemetry,
         reasoning_history: p.and_then(|p| p.reasoning_history.clone()),

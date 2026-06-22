@@ -34,6 +34,11 @@ pub struct BridgeConfig {
     pub model: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
+    /// User-configured per-response output cap (`provider.max_tokens`). `None` ⇒ the engine
+    /// derives a fallback from the context window in `build_provider`. Threaded so v2 honors
+    /// the same per-provider knob the legacy engine reads (previously dropped → the gateway's
+    /// hidden default truncated long replies with `finish_reason=length`).
+    pub max_tokens: Option<u32>,
     /// Disable MCP connection (mirrors the legacy `--no-mcp` style switches).
     pub mcp: bool,
     /// Telemetry sink forwarded to the coding assembly (→ a `LlmChat`-emitting
@@ -215,6 +220,9 @@ impl Bridge {
             &cfg.working_dir,
         );
         coding_cfg.context_window = cfg.context_window;
+        // User-configured per-call output cap (parity with `apply_reload_provider`); `None` ⇒
+        // the per-provider fallback in `build_provider` applies.
+        coding_cfg.chat_options.max_tokens = cfg.max_tokens;
         coding_cfg.telemetry = cfg.telemetry.clone();
         coding_cfg.reasoning_history = cfg.reasoning_history.clone();
         // `/effort`: thread the per-provider reasoning_effort into the per-call ChatOptions
@@ -1824,6 +1832,10 @@ fn apply_reload_provider(
         cfg.api_key = api_key.clone();
     }
     cfg.context_window = provider.context_window as u32;
+    // A user-configured `max_tokens` is the per-call output cap; thread it into ChatOptions
+    // so v2 forwards it (the provider's `options.max_tokens.or(cfg.max_tokens)` then honors it).
+    // `None` ⇒ leave it to the provider-config fallback derived in `build_provider`.
+    cfg.chat_options.max_tokens = provider.max_tokens.map(|m| m as u32);
     // `/effort` / `/think` write the provider config then ReloadConfig: pick
     // up the (possibly changed) reasoning_effort so the respawned agent's
     // ChatOptions reflect it. (`reasoning_history` is a model-property, set
@@ -1837,6 +1849,15 @@ fn apply_reload_provider(
     cfg.thinking_enabled = provider.thinking_enabled;
     cfg.thinking_type = provider.thinking_type.clone();
     cfg.thinking_keep = provider.thinking_keep.clone();
+}
+
+/// Provider-config fallback output cap when neither the per-call `ChatOptions` nor an explicit
+/// user setting provides one. Mirrors the legacy v1 engine (`core::provider::{openai,claude}`):
+/// a quarter of the context window, clamped to `[8_000, 16_384]`. Without this, v2 sent NO
+/// `max_tokens` for OpenAI-compat (the gateway then applied its own small hidden cap →
+/// frequent `finish_reason=length` truncation) and a flat 4096 for Anthropic.
+fn default_max_tokens(context_window: u32) -> u32 {
+    (context_window / 4).clamp(8_000, 16_384)
 }
 
 fn build_provider(
@@ -1854,6 +1875,9 @@ fn build_provider(
         "claude" | "anthropic" => {
             let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             ac.context_window = cfg.context_window;
+            // Fallback output cap (the per-call `chat_options.max_tokens` still wins). Replaces
+            // the flat 4096 default so a large context window gets a proportionate cap.
+            ac.max_tokens = default_max_tokens(cfg.context_window);
             // `/think on` → adaptive extended thinking. (v2 uses adaptive, so v1's
             // thinking_budget has no direct mapping — intentionally dropped.)
             ac.thinking = cfg.thinking_enabled.unwrap_or(false);
@@ -1865,6 +1889,8 @@ fn build_provider(
             let mut oc = OllamaConfig::new(&cfg.base_url, &cfg.model);
             oc.api_key = cfg.api_key.clone();
             oc.context_window = cfg.context_window;
+            // Fallback `num_predict` cap (the per-call `chat_options.max_tokens` still wins).
+            oc.max_tokens = Some(default_max_tokens(cfg.context_window));
             oc.think = cfg.thinking_enabled.unwrap_or(false);
             Ok(Arc::new(
                 OllamaProvider::new(oc).map_err(|e| anyhow::anyhow!(e.message))?,
@@ -1874,6 +1900,9 @@ fn build_provider(
         _ => {
             let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             pc.context_window = cfg.context_window;
+            // Fallback `max_tokens` (the per-call `chat_options.max_tokens` still wins). Without
+            // this v2 sent NO max_tokens and the gateway's hidden default truncated long replies.
+            pc.max_tokens = Some(default_max_tokens(cfg.context_window));
             // Honor the provider's `reasoning_history` override; unset ⇒ leave `None` so the
             // adapter auto-detects by model. A typo fails fast (parity with the legacy engine).
             pc.reasoning_policy = ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
@@ -2054,7 +2083,8 @@ mod goal_summary_tests {
 mod undo_tests {
     use super::{
         apply_reload_provider, build_provider, compaction_advisory, compute_undo,
-        estimate_after_tokens, fmt_k_tokens, friendly_provider_error, manual_compact_result,
+        default_max_tokens, estimate_after_tokens, fmt_k_tokens, friendly_provider_error,
+        manual_compact_result,
     };
     use atomcode_core::config::provider::ProviderConfig;
     use atomcode_coding::CodingAgentConfig;
@@ -2195,6 +2225,17 @@ mod undo_tests {
     }
 
     #[test]
+    fn default_max_tokens_mirrors_v1_clamp() {
+        // Parity with the legacy core engine (openai.rs / claude.rs): a quarter of the
+        // context window, clamped to [8_000, 16_384]. v2 previously sent NO max_tokens for
+        // OpenAI-compat (gateway applied its own small hidden cap → finish_reason=length).
+        assert_eq!(default_max_tokens(16_000), 8_000); // 4_000 → floor
+        assert_eq!(default_max_tokens(64_000), 16_000); // in range
+        assert_eq!(default_max_tokens(128_000), 16_384); // 32_000 → ceil
+        assert_eq!(default_max_tokens(1_000_000), 16_384); // huge window → ceil
+    }
+
+    #[test]
     fn reload_provider_refreshes_context_window_and_provider_knobs() {
         let mut cfg = CodingAgentConfig::new("old-key", "https://old.example.com/v1", "old-model", "/tmp");
         cfg.context_window = 16_000;
@@ -2212,7 +2253,7 @@ mod undo_tests {
             system_prompt: None,
             user_agent: None,
             context_window: 64_000,
-            max_tokens: None,
+            max_tokens: Some(5_000),
             thinking_type: Some("enabled".into()),
             thinking_keep: Some("all".into()),
             reasoning_history: Some("include".into()),
@@ -2229,6 +2270,9 @@ mod undo_tests {
         assert_eq!(cfg.base_url, "https://new.example.com/v1");
         assert_eq!(cfg.api_key, "new-key");
         assert_eq!(cfg.context_window, 64_000);
+        // A user-configured `max_tokens` must thread into the per-call ChatOptions so v2
+        // actually sends it (previously dropped → gateway applied its own hidden output cap).
+        assert_eq!(cfg.chat_options.max_tokens, Some(5_000));
         assert_eq!(cfg.provider_type, "claude");
         assert_eq!(cfg.reasoning_history.as_deref(), Some("include"));
         assert_eq!(cfg.chat_options.reasoning_effort, Some(ReasoningEffort::Max));
