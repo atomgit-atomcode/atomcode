@@ -8,69 +8,69 @@ You can override any built-in rule at runtime without rebuilding by placing a fi
 
 ## Programming Languages
 
-| Language | Rule | File Patterns |
-|---|---|---|
-| ArkTS | `arkts` | `*.ets` |
-| C | `c` | `*.c`, `*.h` |
-| C++ | `cpp` | `*.cc`, `*.cpp`, `*.cxx`, `*.hpp` |
-| C# | `csharp` | `*.cs` |
-| Cangjie (仓颉) | `cangjie` | `*.cj` |
-| Clojure | `clojure` | `*.clj`, `*.cljs`, `*.cljc` |
-| Dart | `dart` | `*.dart` |
-| Elixir | `elixir` | `*.ex`, `*.exs` |
-| Erlang | `erlang` | `*.erl`, `*.hrl` |
-| Go | `go` | `*.go` |
-| Groovy | `groovy` | `*.groovy` |
-| Haskell | `haskell` | `*.hs` |
-| Java | `java` | `*.java` |
-| Kotlin | `kotlin` | `*.kt`, `*.kts` |
-| Lua | `lua` | `*.lua` |
-| Objective-C | `objc` | `*.m`, `*.mm` |
-| Perl | `perl` | `*.pl`, `*.pm` |
-| PHP | `php` | `*.php` |
-| Python | `python` | `*.py` |
-| R | `r` | `*.r` |
-| Ruby | `ruby` | `*.rb` |
-| Rust | `rust` | `*.rs` |
-| Scala | `scala` | `*.scala` |
-| Shell | `shell` | `*.sh`, `*.bash` |
-| Solidity | `solidity` | `*.sol` |
-| SQL | `sql` | `*.sql` |
-| Swift | `swift` | `*.swift` |
-| TypeScript / Web | `ts` | `*.js`, `*.jsx`, `*.ts`, `*.tsx`, `*.mjs`, `*.vue` |
+| Language         | Rule       | File Patterns t                                    |
+| ---------------- | ---------- | -------------------------------------------------- |
+| ArkTS            | `arkts`    | `*.ets`                                            |
+| C                | `c`        | `*.c`, `*.h`                                       |
+| C++              | `cpp`      | `*.cc`, `*.cpp`, `*.cxx`, `*.hpp`                  |
+| C#               | `csharp`   | `*.cs`                                             |
+| Cangjie (仓颉)   | `cangjie`  | `*.cj`                                             |
+| Clojure          | `clojure`  | `*.clj`, `*.cljs`, `*.cljc`                        |
+| Dart             | `dart`     | `*.dart`                                           |
+| Elixir           | `elixir`   | `*.ex`, `*.exs`                                    |
+| Erlang           | `erlang`   | `*.erl`, `*.hrl`                                   |
+| Go               | `go`       | `*.go`                                             |
+| Groovy           | `groovy`   | `*.groovy`                                         |
+| Haskell          | `haskell`  | `*.hs`                                             |
+| Java             | `java`     | `*.java`                                           |
+| Kotlin           | `kotlin`   | `*.kt`, `*.kts`                                    |
+| Lua              | `lua`      | `*.lua`                                            |
+| Objective-C      | `objc`     | `*.m`, `*.mm`                                      |
+| Perl             | `perl`     | `*.pl`, `*.pm`                                     |
+| PHP              | `php`      | `*.php`                                            |
+| Python           | `python`   | `*.py`                                             |
+| R                | `r`        | `*.r`                                              |
+| Ruby             | `ruby`     | `*.rb`                                             |
+| Rust             | `rust`     | `*.rs`                                             |
+| Scala            | `scala`    | `*.scala`                                          |
+| Shell            | `shell`    | `*.sh`, `*.bash`                                   |
+| Solidity         | `solidity` | `*.sol`                                            |
+| SQL              | `sql`      | `*.sql`                                            |
+| Swift            | `swift`    | `*.swift`                                          |
+| TypeScript / Web | `ts`       | `*.js`, `*.jsx`, `*.ts`, `*.tsx`, `*.mjs`, `*.vue` |
 
 ## Web & Markup
 
-| Category | Rule | File Patterns |
-|---|---|---|
-| HTML | `html` | `*.html`, `*.htm` |
-| CSS | `css` | `*.css`, `*.scss`, `*.sass`, `*.less` |
-| GraphQL | `graphql` | `*.graphql`, `*.gql` |
-| Markdown | `markdown` | `readme*.md`, `*.md`, `*.markdown` |
+| Category | Rule       | File Patterns                         |
+| -------- | ---------- | ------------------------------------- |
+| HTML     | `html`     | `*.html`, `*.htm`                     |
+| CSS      | `css`      | `*.css`, `*.scss`, `*.sass`, `*.less` |
+| GraphQL  | `graphql`  | `*.graphql`, `*.gql`                  |
+| Markdown | `markdown` | `readme*.md`, `*.md`, `*.markdown`    |
 
 ## Build Tools & Dependency Manifests
 
-| Tool / File | Rule | File Patterns |
-|---|---|---|
-| Gradle build file | `build_gradle` | `build.gradle` |
-| Maven POM | `pom_xml` | `pom.xml` |
-| npm package manifest | `package_json` | `package.json` |
-| CMake | `cmake` | `cmakelists.txt`, `*.cmake` |
-| Makefile | `makefile` | `makefile`, `gnumakefile`, `*.mk` |
-| Dockerfile | `dockerfile` | `dockerfile`, `dockerfile.*`, `*.dockerfile` |
-| Python dependencies | `python_deps` | `requirements*.txt`, `pyproject.toml`, `setup.py`, `setup.cfg`, `pipfile` |
+| Tool / File          | Rule           | File Patterns                                                             |
+| -------------------- | -------------- | ------------------------------------------------------------------------- |
+| Gradle build file    | `build_gradle` | `build.gradle`                                                            |
+| Maven POM            | `pom_xml`      | `pom.xml`                                                                 |
+| npm package manifest | `package_json` | `package.json`                                                            |
+| CMake                | `cmake`        | `cmakelists.txt`, `*.cmake`                                               |
+| Makefile             | `makefile`     | `makefile`, `gnumakefile`, `*.mk`                                         |
+| Dockerfile           | `dockerfile`   | `dockerfile`, `dockerfile.*`, `*.dockerfile`                              |
+| Python dependencies  | `python_deps`  | `requirements*.txt`, `pyproject.toml`, `setup.py`, `setup.cfg`, `pipfile` |
 
 ## Data, Config & Infrastructure
 
-| Category | Rule | File Patterns |
-|---|---|---|
-| JSON | `json` | `*.json`, `*.json5` |
-| YAML | `yaml` | `*.yaml`, `*.yml` |
-| TOML | `toml` | `*.toml` |
-| XML | `xml` | `*.xml` |
-| Properties | `properties` | `*.properties` |
-| Protobuf | `protobuf` | `*.proto` |
-| Terraform | `terraform` | `*.tf`, `*.tfvars` |
+| Category          | Rule             | File Patterns               |
+| ----------------- | ---------------- | --------------------------- |
+| JSON              | `json`           | `*.json`, `*.json5`         |
+| YAML              | `yaml`           | `*.yaml`, `*.yml`           |
+| TOML              | `toml`           | `*.toml`                    |
+| XML               | `xml`            | `*.xml`                     |
+| Properties        | `properties`     | `*.properties`              |
+| Protobuf          | `protobuf`       | `*.proto`                   |
+| Terraform         | `terraform`      | `*.tf`, `*.tfvars`          |
 | MyBatis / DAO XML | `mapper_dao_xml` | `*mapper*.xml`, `*dao*.xml` |
 
 ## How Matching Works
