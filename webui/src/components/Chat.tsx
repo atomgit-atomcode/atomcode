@@ -217,6 +217,19 @@ function formatToolDetail(name: string, argsJson: string): string {
         .filter((x): x is string => x !== null)
         .join(', ');
     }
+    case 'todo': {
+      const action = getStr('action');
+      if (action === 'add') return getStr('content');
+      if (action === 'update') {
+        const id = typeof v.id === 'number' ? v.id : '';
+        const status = getStr('status');
+        if (id && status) return `#${id} → ${status}`;
+        if (id) return `#${id}`;
+        return status;
+      }
+      if (action === 'list') return 'list all';
+      return '';
+    }
     case 'use_skill':
       return getStr('name');
     default: {

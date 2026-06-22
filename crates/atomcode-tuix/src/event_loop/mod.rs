@@ -2593,6 +2593,27 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_todo_add_shows_content() {
+        let args = r#"{"action":"add","content":"Write tests"}"#;
+        let out = format_tool_detail("todo", args);
+        assert_eq!(out, "Write tests");
+    }
+
+    #[test]
+    fn format_tool_detail_todo_update_shows_id_and_status() {
+        let args = r#"{"action":"update","id":2,"status":"completed"}"#;
+        let out = format_tool_detail("todo", args);
+        assert_eq!(out, "#2 → completed");
+    }
+
+    #[test]
+    fn format_tool_detail_todo_list_shows_list_all() {
+        let args = r#"{"action":"list"}"#;
+        let out = format_tool_detail("todo", args);
+        assert_eq!(out, "list all");
+    }
+
+    #[test]
     fn format_tool_detail_search_replace_shows_arrow() {
         let args = r#"{"search":"bg-blue-600","replace":"bg-violet-600","glob":"*.vue"}"#;
         let out = format_tool_detail("search_replace", args);
@@ -7839,9 +7860,32 @@ fn handle_agent_event(
                 &calls.iter().map(|c| c.arguments.as_str()).collect::<Vec<_>>(),
                 &raw_details,
             );
-            let children: Vec<crate::render::ToolGroupChild> = calls
+            // For todo add calls, prepend batch-sequential task numbers
+            // (#1, #2, …) so users can see task ids at a glance in the
+            // parallel batch display (issue #697).
+            let mut todo_add_counter: usize = 0;
+            let final_details: Vec<String> = calls
                 .iter()
                 .zip(disambiguated.iter())
+                .map(|(c, detail)| {
+                    if c.name == "todo" {
+                        // Parse the action from arguments JSON rather than
+                        // string-matching, because model-generated JSON may
+                        // contain whitespace around colons/commas.
+                        let action = serde_json::from_str::<serde_json::Value>(&c.arguments)
+                            .ok()
+                            .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string));
+                        if action.as_deref() == Some("add") {
+                            todo_add_counter += 1;
+                            return format!("#{} {}", todo_add_counter, detail);
+                        }
+                    }
+                    detail.clone()
+                })
+                .collect();
+            let children: Vec<crate::render::ToolGroupChild> = calls
+                .iter()
+                .zip(final_details.iter())
                 .map(|(c, detail)| crate::render::ToolGroupChild {
                     call_id: c.id.clone(),
                     text: format!(
@@ -7866,13 +7910,15 @@ fn handle_agent_event(
                     .call_id_to_batch
                     .insert(cid.clone(), batch_id.clone());
             }
-            // Pre-populate `pending_tools` with the disambiguated detail
-            // so that subsequent ToolCallStarted / ApprovalNeeded events
-            // use the disambiguated path (e.g. "a/SKILL.md") instead of
-            // the raw basename ("SKILL.md"). Without this, parallel batch
-            // approvals show identical "ReadFile(SKILL.md)" prompts and
-            // the user can't tell which file they're approving (issue #439).
-            for (c, detail) in calls.iter().zip(disambiguated.iter()) {
+            // Pre-populate `pending_tools` with the final (potentially
+            // todo-numbered) detail so that subsequent ToolCallStarted /
+            // ApprovalNeeded events use the disambiguated / numbered
+            // path (e.g. "a/SKILL.md", "#1 创建demo3") instead of the
+            // raw basename ("SKILL.md", "创建demo3"). Without this,
+            // parallel batch approvals show identical "ReadFile(SKILL.md)"
+            // prompts and the user can't tell which file they're
+            // approving (issue #439 / #697).
+            for (c, detail) in calls.iter().zip(final_details.iter()) {
                 pending_tools.insert(
                     c.id.clone(),
                     (display_tool_name_short(&c.name), detail.clone(), true),
@@ -8833,6 +8879,28 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 crate::width::truncate_with_ellipsis(&detail, 200)
             } else {
                 String::new()
+            }
+        }
+        "todo" => {
+            // Show the task description (add) or id+status (update) so the
+            // user can see WHAT the agent is tracking without expanding the row.
+            let action = get_str("action").unwrap_or_default();
+            match action.as_str() {
+                "add" => get_str("content")
+                    .map(|c| crate::width::truncate_with_ellipsis(&c, 100))
+                    .unwrap_or_default(),
+                "update" => {
+                    let id = v.get("id").and_then(|x| x.as_u64());
+                    let status = get_str("status").unwrap_or_default();
+                    match (id, status.as_str()) {
+                        (Some(i), s) if !s.is_empty() => format!("#{} → {}", i, s),
+                        (Some(i), _) => format!("#{}", i),
+                        (None, s) if !s.is_empty() => s.to_string(),
+                        _ => String::new(),
+                    }
+                }
+                "list" => "list all".to_string(),
+                _ => String::new(),
             }
         }
         "use_skill" => get_str("name").unwrap_or_default(),
