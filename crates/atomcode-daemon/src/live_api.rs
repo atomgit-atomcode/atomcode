@@ -866,7 +866,7 @@ impl TurnExecutor for KernelTurnExecutor {
             Some(rx)
         };
 
-        let mut live_tools: HashMap<String, (String, std::time::Instant)> = HashMap::new();
+        let mut live_tools = atomcode_coding::LiveTools::new();
         let mut cancelled = false;
         let mut runtime_dead = false;
         let mut awaiting_snapshot = false;
@@ -1015,7 +1015,7 @@ fn truncate_hint(s: &str, max: usize) -> String {
 /// `Snapshot`) or that have no `TurnEvent`.
 pub(crate) fn kernel_to_turn(
     ev: atomcode_kernel::event::AgentEvent,
-    live_tools: &mut HashMap<String, (String, std::time::Instant)>,
+    live_tools: &mut atomcode_coding::LiveTools,
 ) -> Option<TurnEvent> {
     use atomcode_kernel::event::AgentEvent as KE;
     Some(match ev {
@@ -1026,22 +1026,20 @@ pub(crate) fn kernel_to_turn(
             hint: truncate_hint(&arguments, 80),
         },
         KE::ToolStarted { call } => {
-            live_tools.insert(call.id.clone(), (call.name.clone(), std::time::Instant::now()));
+            live_tools.record(&call.id, &call.name);
             TurnEvent::ToolCallStarted { id: call.id, name: call.name, arguments: call.arguments }
         }
         KE::ToolProgress { call_id, message } => {
             TurnEvent::ToolOutputChunk { call_id, chunk: message }
         }
         KE::ToolResult { result } => {
-            let (name, started) = live_tools
-                .remove(&result.call_id)
-                .unwrap_or_else(|| ("tool".to_string(), std::time::Instant::now()));
+            let (name, duration) = live_tools.resolve(&result.call_id);
             TurnEvent::ToolCallResult {
                 call_id: result.call_id,
                 name,
                 output: result.content,
                 success: !result.is_error,
-                duration: started.elapsed(),
+                duration,
             }
         }
         KE::ToolBatchStarted { batch_id, calls } => TurnEvent::ToolBatchStarted {
@@ -1080,7 +1078,7 @@ mod kernel_to_turn_tests {
 
     #[test]
     fn maps_text_and_recovers_tool_name_duration_via_live_tools() {
-        let mut lt = HashMap::new();
+        let mut lt = atomcode_coding::LiveTools::new();
 
         assert!(matches!(
             kernel_to_turn(KE::TextDelta("hi".into()), &mut lt),
@@ -1094,7 +1092,6 @@ mod kernel_to_turn_tests {
             &mut lt,
         );
         assert!(matches!(started, Some(TurnEvent::ToolCallStarted { ref name, .. }) if name == "bash"));
-        assert!(lt.contains_key("c1"), "ToolStarted records the live-tools entry");
 
         let result = kernel_to_turn(
             KE::ToolResult {
@@ -1111,12 +1108,24 @@ mod kernel_to_turn_tests {
             }
             other => panic!("expected ToolCallResult, got {other:?}"),
         }
-        assert!(!lt.contains_key("c1"), "ToolResult consumes the live-tools entry");
+
+        // The entry is consumed: a second result for the same id falls back to the
+        // "tool" placeholder instead of re-recovering "bash".
+        let again = kernel_to_turn(
+            KE::ToolResult {
+                result: KToolResult { call_id: "c1".into(), content: "x".into(), is_error: false },
+            },
+            &mut lt,
+        );
+        assert!(
+            matches!(again, Some(TurnEvent::ToolCallResult { ref name, .. }) if name == "tool"),
+            "ToolResult consumes the live-tools entry (second resolve → \"tool\")"
+        );
     }
 
     #[test]
     fn turn_terminals_are_not_mapped() {
-        let mut lt = HashMap::new();
+        let mut lt = atomcode_coding::LiveTools::new();
         assert!(kernel_to_turn(
             KE::TurnComplete { reason: atomcode_kernel::event::StopReason::Stopped },
             &mut lt
@@ -1226,7 +1235,7 @@ pub(crate) async fn run_chat_turn_v2(
         images: user_images.iter().map(atomcode_bridge::convert::image_to_kernel).collect(),
     });
 
-    let mut live_tools: HashMap<String, (String, std::time::Instant)> = HashMap::new();
+    let mut live_tools = atomcode_coding::LiveTools::new();
     let mut cancelled = false;
     let mut awaiting_snapshot = false;
     use atomcode_kernel::event::AgentEvent as KE;

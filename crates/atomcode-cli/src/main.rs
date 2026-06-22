@@ -2501,13 +2501,12 @@ async fn run_headless_native(
     let mut last_text_ended_with_newline = true;
     let mut thinking_line_open = false;
     let mut captured: Option<String> = if capture { Some(String::new()) } else { None };
-    // TurnStats synthesis (the kernel TurnComplete carries only `reason`).
-    let start = std::time::Instant::now();
-    let mut total_tokens = 0usize;
-    let mut turn_count = 0usize;
-    let mut tool_call_count = 0usize;
-    let mut live_tools: std::collections::HashMap<String, (String, std::time::Instant)> =
-        std::collections::HashMap::new();
+    // Turn-stat + tool name/duration synthesis (kernel TurnComplete carries only
+    // `reason`; a kernel tool result carries only its call_id) — the shared helpers
+    // that daemon + tuix use too (atomcode_coding::turn_synth).
+    let mut stats = atomcode_coding::TurnStats::new();
+    stats.start();
+    let mut live = atomcode_coding::LiveTools::new();
 
     fn close_thinking_line(open: &mut bool) {
         let mut buf = String::new();
@@ -2549,8 +2548,8 @@ async fn run_headless_native(
                 }
             }
             KE::ToolStarted { call } => {
-                tool_call_count += 1;
-                live_tools.insert(call.id.clone(), (call.name.clone(), std::time::Instant::now()));
+                stats.on_tool_started();
+                live.record(&call.id, &call.name);
                 if verbose {
                     close_thinking_line(&mut thinking_line_open);
                     let args = truncate_log_line(&call.arguments, 200);
@@ -2565,13 +2564,11 @@ async fn run_headless_native(
                 }
             }
             KE::ToolResult { result } => {
-                let (name, started) = live_tools
-                    .remove(&result.call_id)
-                    .unwrap_or_else(|| ("tool".to_string(), std::time::Instant::now()));
+                let (name, dur) = live.resolve(&result.call_id);
                 if verbose {
                     close_thinking_line(&mut thinking_line_open);
                     let status = if result.is_error { "FAILED" } else { "OK" };
-                    let dur_ms = started.elapsed().as_millis();
+                    let dur_ms = dur.as_millis();
                     let trimmed = result.content.trim_end();
                     if trimmed.is_empty() {
                         eprintln!("[tool← {} {} {}ms]", name, status, dur_ms);
@@ -2610,8 +2607,7 @@ async fn run_headless_native(
                 let _ = commands.send(KCmd::Respond { id, value: serde_json::Value::Null });
             }
             KE::Usage(meta) => {
-                turn_count += 1;
-                total_tokens += (meta.tokens.prompt + meta.tokens.completion) as usize;
+                stats.on_usage(meta.tokens.prompt as usize, meta.tokens.completion as usize);
                 if verbose {
                     close_thinking_line(&mut thinking_line_open);
                     if meta.tokens.cached > 0 {
@@ -2668,10 +2664,10 @@ async fn run_headless_native(
                     };
                     eprintln!(
                         "[done] {:.1}s tokens={} turns={} tool_calls={}{}",
-                        start.elapsed().as_secs_f64(),
-                        atomcode_core::i18n::fmt_tokens(total_tokens),
-                        turn_count,
-                        tool_call_count,
+                        stats.duration().as_secs_f64(),
+                        atomcode_core::i18n::fmt_tokens(stats.total_tokens()),
+                        stats.rounds(),
+                        stats.tool_calls(),
                         suffix
                     );
                 }

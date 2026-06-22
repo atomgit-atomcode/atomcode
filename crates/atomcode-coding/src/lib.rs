@@ -35,6 +35,7 @@ pub mod persona;
 pub mod plan_mode;
 pub mod runtime;
 pub mod telemetry;
+pub mod turn_synth;
 
 mod assemble;
 
@@ -49,6 +50,7 @@ pub use parts::{
 };
 pub use persona::coding_persona;
 pub use runtime::{CodingRuntime, ProviderFactory};
+pub use turn_synth::{LiveTools, TurnStats};
 
 /// Re-export the CC external-hooks types so drivers (e.g. the bridge) that resolve
 /// plugin-contributed hooks can name [`cc_hooks::HookConfig`] without a direct
