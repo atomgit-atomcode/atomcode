@@ -8135,7 +8135,7 @@ fn handle_agent_event(
         AgentEvent::SessionSwitched(session_id) => {
             // webui 新建对话，TUI 跟随切换到新会话。与 ProjectSwitched 不同，
             // 这里不切目录，只切换到指定 session_id 的新会话。
-            eprintln!("[DEBUG TUI] SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
+            crate::tuix_trace!("TUI", "SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
             let sid = atomcode_core::session::SessionId::from_string(session_id);
             // 清除当前对话、重置到新 session，但用 webui 指定的 session_id
             // 以确保三端（TUI / webui / 磁盘）落到同一个文件。
@@ -8165,7 +8165,7 @@ fn handle_agent_event(
                     Some(ctx.current_session.id.clone()),
                     Vec::new(),
                 );
-                eprintln!("[DEBUG TUI] SessionSwitched: attaching new LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
+                crate::tuix_trace!("TUI", "SessionSwitched: attaching new LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
                 attach_live_session(ctx, renderer, session, false);
             }
             renderer.begin_sync();
