@@ -18,11 +18,13 @@ export interface ToolRow {
   output?: string;
 }
 
-/** One ordered conversation segment: a run of assistant text, or one tool call.
- *  Arrival order is preserved so the text→tool→text interleaving matches the TUI. */
+/** One ordered conversation segment: a run of assistant text, one tool call, or a
+ *  non-fatal advisory notice (e.g. "conversation compacted"). Arrival order is
+ *  preserved so the text→tool→notice interleaving matches the TUI. */
 export type MsgPart =
   | { kind: 'text'; text: string }
-  | { kind: 'tool'; tool: ToolRow };
+  | { kind: 'tool'; tool: ToolRow }
+  | { kind: 'notice'; text: string };
 
 /**
  * Append `tool` as a new tool part, OR — when a tool part with the SAME `tool.id`

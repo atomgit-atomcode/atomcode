@@ -28,6 +28,13 @@ pub mod hooks;
 /// Dependency-free, so it is always available regardless of capability features.
 pub mod reminder;
 
+/// Claude-Code-compatible EXTERNAL hooks ([`cc_hooks::CCExternalHooks`]) — runs the
+/// user's `hooks.json` commands on the kernel's [`LifecycleHooks`]/[`ToolMiddleware`]
+/// seams (the port of core's hook engine onto the v2 engine). Opt-in: spawns
+/// subprocesses, so it pulls `tokio/process` + `dirs`.
+#[cfg(feature = "cc-hooks")]
+pub mod cc_hooks;
+
 /// Cache-friendly history compaction strategy ([`compaction::StubCompaction`]) — a
 /// [`atomcode_kernel::message::CompactionStrategy`] that stubs old tool results in place.
 /// Kernel-only deps, so it is always available regardless of capability features.

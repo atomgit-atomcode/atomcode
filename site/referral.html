@@ -611,19 +611,36 @@ let currentSummary = { devices: 0, active: 0, attributions: 0, rate: 0, amount: 
 
 function getSid() {
   if (currentSid) return currentSid;
+
+  // ① sessionStorage（同 tab 优先）
   let sid = sessionStorage.getItem('referral_sid');
   if (sid) { currentSid = sid; return sid; }
+
+  // ② localStorage 降级（解决新 tab、移动端挂起恢复等场景）
+  try { sid = localStorage.getItem('referral_sid'); } catch (e) {}
+  if (sid) {
+    sessionStorage.setItem('referral_sid', sid);
+    currentSid = sid;
+    return sid;
+  }
+
+  // ③ URL 参数（OAuth 回调首次携带）
   const params = new URLSearchParams(window.location.search);
   sid = params.get('sid');
   if (sid) {
     sessionStorage.setItem('referral_sid', sid);
+    try { localStorage.setItem('referral_sid', sid); } catch (e) {}
     const envParam = ENV ? '?env=' + ENV : '';
     history.replaceState(null, '', window.location.pathname + envParam);
     currentSid = sid;
   }
   return sid || null;
 }
-function clearSid() { currentSid = null; sessionStorage.removeItem('referral_sid'); }
+function clearSid() {
+  currentSid = null;
+  sessionStorage.removeItem('referral_sid');
+  try { localStorage.removeItem('referral_sid'); } catch (e) {}
+}
 
 async function login() {
   try {
@@ -671,7 +688,23 @@ async function initPage() {
   showState('loading');
   try {
     const data = await fetchReferralMe();
-    if (!data.authenticated) { clearSid(); renderStaticSections('public'); showState('unauth'); return; }
+    if (!data || !data.authenticated) {
+      // 重试一次 — 排除 Redis 瞬时抖动 / 网络波动
+      await new Promise(function (r) { return setTimeout(r, 900); });
+      var retry = await fetchReferralMe();
+      if (!retry || !retry.authenticated) {
+        showToast('登录已过期，请重新登录');
+        clearSid();
+        currentCode = null;
+        currentUser = null;
+        renderStaticSections('public');
+        showState('unauth');
+        return;
+      }
+      // 重试成功，使用新数据
+      renderAuthenticated(retry);
+      return;
+    }
     renderAuthenticated(data);
   } catch (e) {
     console.error('Failed to load referral data', e);

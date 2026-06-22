@@ -2658,6 +2658,27 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_todo_add_shows_content() {
+        let args = r#"{"action":"add","content":"Write tests"}"#;
+        let out = format_tool_detail("todo", args);
+        assert_eq!(out, "Write tests");
+    }
+
+    #[test]
+    fn format_tool_detail_todo_update_shows_id_and_status() {
+        let args = r#"{"action":"update","id":2,"status":"completed"}"#;
+        let out = format_tool_detail("todo", args);
+        assert_eq!(out, "#2 → completed");
+    }
+
+    #[test]
+    fn format_tool_detail_todo_list_shows_list_all() {
+        let args = r#"{"action":"list"}"#;
+        let out = format_tool_detail("todo", args);
+        assert_eq!(out, "list all");
+    }
+
+    #[test]
     fn format_tool_detail_search_replace_shows_arrow() {
         let args = r#"{"search":"bg-blue-600","replace":"bg-violet-600","glob":"*.vue"}"#;
         let out = format_tool_detail("search_replace", args);
@@ -4894,7 +4915,7 @@ fn build_skill_menu_items(
                     .unwrap_or(skill.name.as_str());
                 let full_lower = skill.name.to_ascii_lowercase();
                 let bare_lower = bare.to_ascii_lowercase();
-                if bare_lower.starts_with(prefix_lower) || full_lower.starts_with(prefix_lower) {
+                if bare_lower.contains(prefix_lower) || full_lower.contains(prefix_lower) {
                     let bare_is_unique = skills.iter().all(|other| {
                         other.name == skill.name
                             || other
@@ -7070,6 +7091,14 @@ fn handle_agent_event(
         AgentEvent::TextDelta(text) => {
             let visible = think.feed(&text);
             if !visible.is_empty() {
+                // Keep the raw reply markdown for `/copy`. Clear-on-finalize:
+                // the first delta of a new turn wipes the sealed prior reply,
+                // so between turns the buffer still holds the last reply.
+                if state.response_finalized {
+                    state.last_assistant_response.clear();
+                    state.response_finalized = false;
+                }
+                state.last_assistant_response.push_str(&visible);
                 if fixissue_pending.is_some() {
                     fixissue_buffer.push_str(&visible);
                 }
@@ -7452,6 +7481,9 @@ fn handle_agent_event(
             stop_reason,
             snapshot,
         } => {
+            // Seal the assistant-reply buffer so `/copy` reads this completed
+            // reply until the next turn's first delta starts a fresh one.
+            state.response_finalized = true;
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
                 atomcode_core::notify::NotificationEvent::TurnFinished(
@@ -7608,6 +7640,8 @@ fn handle_agent_event(
             }
         }
         AgentEvent::TurnCancelled { snapshot } => {
+            // Seal the reply buffer (partial reply still copyable via `/copy`).
+            state.response_finalized = true;
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
                 atomcode_core::notify::NotificationEvent::TurnFinished(
@@ -7711,6 +7745,9 @@ fn handle_agent_event(
             renderer.flush();
         }
         AgentEvent::Error { error, snapshot } => {
+            // Seal the reply buffer (any text streamed before the error stays
+            // copyable via `/copy`).
+            state.response_finalized = true;
             renderer.render(UiLine::Error(error));
             renderer.flush();
             fixissue_pending.take();
@@ -7952,9 +7989,32 @@ fn handle_agent_event(
                 &calls.iter().map(|c| c.arguments.as_str()).collect::<Vec<_>>(),
                 &raw_details,
             );
-            let children: Vec<crate::render::ToolGroupChild> = calls
+            // For todo add calls, prepend batch-sequential task numbers
+            // (#1, #2, …) so users can see task ids at a glance in the
+            // parallel batch display (issue #697).
+            let mut todo_add_counter: usize = 0;
+            let final_details: Vec<String> = calls
                 .iter()
                 .zip(disambiguated.iter())
+                .map(|(c, detail)| {
+                    if c.name == "todo" {
+                        // Parse the action from arguments JSON rather than
+                        // string-matching, because model-generated JSON may
+                        // contain whitespace around colons/commas.
+                        let action = serde_json::from_str::<serde_json::Value>(&c.arguments)
+                            .ok()
+                            .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string));
+                        if action.as_deref() == Some("add") {
+                            todo_add_counter += 1;
+                            return format!("#{} {}", todo_add_counter, detail);
+                        }
+                    }
+                    detail.clone()
+                })
+                .collect();
+            let children: Vec<crate::render::ToolGroupChild> = calls
+                .iter()
+                .zip(final_details.iter())
                 .map(|(c, detail)| crate::render::ToolGroupChild {
                     call_id: c.id.clone(),
                     text: format!(
@@ -7979,13 +8039,15 @@ fn handle_agent_event(
                     .call_id_to_batch
                     .insert(cid.clone(), batch_id.clone());
             }
-            // Pre-populate `pending_tools` with the disambiguated detail
-            // so that subsequent ToolCallStarted / ApprovalNeeded events
-            // use the disambiguated path (e.g. "a/SKILL.md") instead of
-            // the raw basename ("SKILL.md"). Without this, parallel batch
-            // approvals show identical "ReadFile(SKILL.md)" prompts and
-            // the user can't tell which file they're approving (issue #439).
-            for (c, detail) in calls.iter().zip(disambiguated.iter()) {
+            // Pre-populate `pending_tools` with the final (potentially
+            // todo-numbered) detail so that subsequent ToolCallStarted /
+            // ApprovalNeeded events use the disambiguated / numbered
+            // path (e.g. "a/SKILL.md", "#1 创建demo3") instead of the
+            // raw basename ("SKILL.md", "创建demo3"). Without this,
+            // parallel batch approvals show identical "ReadFile(SKILL.md)"
+            // prompts and the user can't tell which file they're
+            // approving (issue #439 / #697).
+            for (c, detail) in calls.iter().zip(final_details.iter()) {
                 pending_tools.insert(
                     c.id.clone(),
                     (display_tool_name_short(&c.name), detail.clone(), true),
@@ -8234,6 +8296,10 @@ fn handle_agent_event(
                     .get(&provider)
                     .map(|p| p.model.clone())
                     .unwrap_or(provider);
+                // Footer context window follows the mirrored switch too (see
+                // model_picker) — otherwise the denominator lags a turn behind
+                // a webui-driven model change.
+                state.on_model_window_changed(ctx.config.default_context_window());
                 ctx.runtime_factory.set_config(ctx.config.clone());
                 let _ = ctx
                     .agent
@@ -8248,7 +8314,7 @@ fn handle_agent_event(
         AgentEvent::SessionSwitched(session_id) => {
             // webui 新建对话，TUI 跟随切换到新会话。与 ProjectSwitched 不同，
             // 这里不切目录，只切换到指定 session_id 的新会话。
-            eprintln!("[DEBUG TUI] SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
+            crate::tuix_trace!("TUI", "SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
             let sid = atomcode_core::session::SessionId::from_string(session_id);
             // 清除当前对话、重置到新 session，但用 webui 指定的 session_id
             // 以确保三端（TUI / webui / 磁盘）落到同一个文件。
@@ -8278,7 +8344,7 @@ fn handle_agent_event(
                     Some(ctx.current_session.id.clone()),
                     Vec::new(),
                 );
-                eprintln!("[DEBUG TUI] SessionSwitched: attaching new LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
+                crate::tuix_trace!("TUI", "SessionSwitched: attaching new LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
                 attach_live_session(ctx, renderer, session, false);
             }
             renderer.begin_sync();
@@ -8950,6 +9016,28 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 crate::width::truncate_with_ellipsis(&detail, 200)
             } else {
                 String::new()
+            }
+        }
+        "todo" => {
+            // Show the task description (add) or id+status (update) so the
+            // user can see WHAT the agent is tracking without expanding the row.
+            let action = get_str("action").unwrap_or_default();
+            match action.as_str() {
+                "add" => get_str("content")
+                    .map(|c| crate::width::truncate_with_ellipsis(&c, 100))
+                    .unwrap_or_default(),
+                "update" => {
+                    let id = v.get("id").and_then(|x| x.as_u64());
+                    let status = get_str("status").unwrap_or_default();
+                    match (id, status.as_str()) {
+                        (Some(i), s) if !s.is_empty() => format!("#{} → {}", i, s),
+                        (Some(i), _) => format!("#{}", i),
+                        (None, s) if !s.is_empty() => s.to_string(),
+                        _ => String::new(),
+                    }
+                }
+                "list" => "list all".to_string(),
+                _ => String::new(),
             }
         }
         "use_skill" => get_str("name").unwrap_or_default(),
