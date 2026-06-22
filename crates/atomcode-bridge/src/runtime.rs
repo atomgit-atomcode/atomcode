@@ -23,7 +23,7 @@ use atomcode_kernel::event::{
 use atomcode_kernel::message::SessionSnapshot;
 use tokio::sync::mpsc;
 
-use crate::convert;
+use crate::{convert, translate};
 
 /// What the bridge needs to build the new-stack agent. Resolved by the CALLER
 /// (the cli already has a loaded `Config`) so the bridge stays config-format-agnostic.
@@ -130,15 +130,6 @@ pub fn coding_config(cfg: &BridgeConfig) -> CodingAgentConfig {
     coding_cfg
 }
 
-/// Per-turn statistics backing the legacy `TurnComplete` payload.
-#[derive(Default)]
-struct TurnStats {
-    started: Option<Instant>,
-    rounds: usize,
-    tool_calls: usize,
-    total_tokens: usize,
-}
-
 /// Resolve CC hooks contributed INLINE by installed plugins into the kernel-stack hook
 /// config. The bridge is the one driver that may depend on `atomcode-core`'s plugin loader
 /// (L1 / `atomcode-coding` cannot), so this mapping lives here: core hands back neutral
@@ -176,9 +167,10 @@ struct Bridge {
     /// One pending approval at a time — the legacy protocol has no request id
     /// (`ApproveTool` / `DenyTool` are bare), so the bridge correlates.
     pending_approval: Option<(RequestId, String)>,
-    /// call_id → (name, start) for ToolCallResult's name + duration fields.
-    live_tools: std::collections::HashMap<String, (String, Instant)>,
-    stats: TurnStats,
+    /// Tool name + duration recovery for `ToolCallResult` (kernel results carry neither).
+    live_tools: atomcode_coding::LiveTools,
+    /// Per-turn tallies backing the synthesized legacy `TurnComplete`.
+    stats: atomcode_coding::TurnStats,
     last_usage: Option<atomcode_kernel::message::MessageMeta>,
     turn_running: bool,
     /// A turn just ended: hold its reason while a kernel Snapshot round-trips so
@@ -311,8 +303,8 @@ impl Bridge {
             ev_tx,
             bridge_session,
             pending_approval: None,
-            live_tools: Default::default(),
-            stats: TurnStats::default(),
+            live_tools: atomcode_coding::LiveTools::new(),
+            stats: atomcode_coding::TurnStats::new(),
             last_usage: None,
             turn_running: false,
             pending_finish: None,
@@ -1016,7 +1008,8 @@ impl Bridge {
 
     fn start_turn_stats(&mut self) {
         if !self.turn_running {
-            self.stats = TurnStats { started: Some(Instant::now()), ..Default::default() };
+            self.stats = atomcode_coding::TurnStats::new();
+            self.stats.start();
         }
     }
 
@@ -1193,7 +1186,7 @@ impl Bridge {
         // may still be marked running.
         self.turn_running = false;
         self.pending_finish = None;
-        let duration = self.stats.started.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
+        let duration = self.stats.duration();
         match reason {
             StopReason::Cancelled => {
                 self.emit(CoreEv::TurnCancelled {
@@ -1216,9 +1209,9 @@ impl Bridge {
                 // the terminal classification.
                 self.emit(CoreEv::TurnComplete {
                     duration,
-                    total_tokens: self.stats.total_tokens,
-                    turn_count: self.stats.rounds,
-                    tool_call_count: self.stats.tool_calls,
+                    total_tokens: self.stats.total_tokens(),
+                    turn_count: self.stats.rounds(),
+                    tool_call_count: self.stats.tool_calls(),
                     snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
                     stop_reason,
                 });
@@ -1258,25 +1251,10 @@ impl Bridge {
     }
 
     fn emit_context_stats(&self) {
-        let sent = self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
-        let ctx_window = self
-            .last_usage
-            .as_ref()
-            .map(|m| m.ctx_window as usize)
-            .filter(|w| *w > 0)
-            .unwrap_or(self.coding_cfg.context_window as usize);
-        self.emit(CoreEv::ContextStats {
-            system_tokens: 0,
-            sent_tokens: sent,
-            dropped_tokens: 0,
-            working_set_tokens: sent,
-            total_messages: 0,
-            tool_defs_tokens: 0,
-            cold_zone_tokens: 0,
-            ctx_window,
-            ctx_name: "engine-v2".into(),
-            system_prompt: String::new(),
-        });
+        self.emit(translate::context_stats_event(
+            self.last_usage.as_ref(),
+            &self.coding_cfg,
+        ));
     }
 
     // ---------------- kernel events → legacy ----------------
@@ -1287,55 +1265,6 @@ impl Bridge {
                 self.turn_running = true;
                 self.start_turn_stats();
                 self.emit(CoreEv::PhaseChange(AgentPhase::Thinking));
-            }
-            KEv::TextDelta(t) => self.emit(CoreEv::TextDelta(t)),
-            KEv::Reasoning(t) => self.emit(CoreEv::ReasoningDelta(t)),
-            KEv::ToolCallStreaming { name, arguments, .. } => {
-                self.emit(CoreEv::ToolCallStreaming {
-                    name: name.unwrap_or_default(),
-                    hint: truncate(&arguments, 80),
-                });
-            }
-            KEv::ToolStarted { call } => {
-                self.stats.tool_calls += 1;
-                self.live_tools
-                    .insert(call.id.clone(), (call.name.clone(), Instant::now()));
-                self.emit(CoreEv::PhaseChange(AgentPhase::CallingTool(call.name.clone())));
-                self.emit(CoreEv::ToolCallStarted {
-                    id: call.id,
-                    name: call.name,
-                    arguments: call.arguments,
-                });
-            }
-            KEv::ToolProgress { call_id, message } => {
-                self.emit(CoreEv::ToolOutputChunk { call_id, chunk: message });
-            }
-            KEv::ToolResult { result } => {
-                let (name, started) = self
-                    .live_tools
-                    .remove(&result.call_id)
-                    .unwrap_or_else(|| ("tool".into(), Instant::now()));
-                self.emit(CoreEv::ToolCallResult {
-                    call_id: result.call_id,
-                    name,
-                    output: result.content,
-                    success: !result.is_error,
-                    duration: started.elapsed(),
-                });
-                self.emit(CoreEv::PhaseChange(AgentPhase::Thinking));
-            }
-            KEv::ToolBatchStarted { batch_id, calls } => {
-                self.emit(CoreEv::ToolBatchStarted {
-                    batch_id,
-                    calls: calls.into_iter().map(|c| atomcode_core::turn::event::ToolBatchCall {
-                        id: c.id,
-                        name: c.name,
-                        arguments: c.arguments,
-                    }).collect(),
-                });
-            }
-            KEv::ToolBatchCompleted { batch_id, ok, total, elapsed_ms } => {
-                self.emit(CoreEv::ToolBatchCompleted { batch_id, ok, total, elapsed_ms });
             }
             KEv::Request { id, kind, payload } if kind == APPROVAL_KIND => {
                 // --dangerously-skip-permissions: auto-approve WITHOUT prompting,
@@ -1392,14 +1321,6 @@ impl Bridge {
                     .commands
                     .send(KCmd::Respond { id, value: serde_json::Value::Null });
             }
-            KEv::Usage(meta) => {
-                self.stats.rounds += 1;
-                self.stats.total_tokens +=
-                    (meta.tokens.prompt + meta.tokens.completion) as usize;
-                self.emit(CoreEv::TokenUsage(convert::usage_to_core(&meta.tokens)));
-                self.last_usage = Some(meta);
-                self.emit_context_stats();
-            }
             KEv::Snapshot { snapshot } => {
                 if let Some(reason) = self.pending_finish.take() {
                     let messages: Vec<atomcode_core::conversation::message::Message> =
@@ -1424,11 +1345,6 @@ impl Bridge {
                         snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
                     });
                 }
-            }
-            KEv::Warning(w) => self.emit(CoreEv::Warning(w)),
-            KEv::Error { message, http_status, .. } => {
-                let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
-                self.emit(CoreEv::Error { error, snapshot: ConversationSnapshot::default() });
             }
             // A manual `/compact` may make a slow one-shot LLM summary call; announce it
             // so the user sees a progress line while it runs (v1 streamed the same
@@ -1484,7 +1400,19 @@ impl Bridge {
                 self.pending_finish = Some(reason);
                 let _ = self.handle.commands.send(KCmd::Snapshot);
             }
-            _ => {}
+            // STREAM events (text / reasoning / tool stream + result / batches /
+            // usage / warning / error) go through the unit-tested translation seam.
+            other => {
+                for cev in translate::translate_event(
+                    other,
+                    &mut self.live_tools,
+                    &mut self.stats,
+                    &mut self.last_usage,
+                    &self.coding_cfg,
+                ) {
+                    self.emit(cev);
+                }
+            }
         }
     }
 }
@@ -1919,7 +1847,7 @@ pub fn build_provider(
 /// Non-atomgit gateways (a user's own `sk-…` key) keep the verbatim message:
 /// `/login` is the wrong advice there — the developer needs the real diagnostic
 /// to fix their key/endpoint.
-fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: &str) -> String {
+pub(crate) fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: &str) -> String {
     if http_status == Some(401)
         && atomcode_core::coding_plan::crypto::is_atomgit_gateway(base_url)
     {
@@ -2009,7 +1937,7 @@ fn fmt_k_tokens(t: usize) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {

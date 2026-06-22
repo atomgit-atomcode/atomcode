@@ -22,5 +22,6 @@
 pub mod convert;
 mod runtime;
 mod sign;
+mod translate;
 
 pub use runtime::{build_provider, coding_config, spawn_bridged_runtime, BridgeConfig};
