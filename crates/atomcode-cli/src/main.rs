@@ -2808,17 +2808,80 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
             Ok(())
         }
         PluginCli::Install { spec } => {
-            let (plugin, mp) = parse_plugin_spec(&spec)?;
-            let info = installer::install(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
-                .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
-            println!("  installed `{}@{}`", info.plugin, info.marketplace);
+            match parse_plugin_spec(&spec)? {
+                PluginSpec::Qualified { plugin, marketplace: mp } => {
+                    let info = installer::install(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
+                        .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
+                    println!("  installed `{}@{}`", info.plugin, info.marketplace);
+                }
+                PluginSpec::Bare { plugin } => {
+                    match installer::resolve_plugin_marketplace(&plugin)
+                        .map_err(|e| anyhow::anyhow!("resolve: {:#}", e))?
+                    {
+                        matches if matches.len() == 1 => {
+                            let m = &matches[0];
+                            let mp = m.marketplace.clone();
+                            let resolved_plugin = m.plugin.clone();
+                            let info = installer::install(&resolved_plugin, &mp, atomcode_core::plugin::InstallScope::User)
+                                .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
+                            println!("  installed `{}@{}`", info.plugin, info.marketplace);
+                        }
+                        matches if matches.len() > 1 => {
+                            let mut msg = format!(
+                                "plugin `{}` found in multiple marketplaces, please specify:\n",
+                                plugin
+                            );
+                            for m in &matches {
+                                msg.push_str(&format!("  atomcode plugin install {}@{}\n", m.plugin, m.marketplace));
+                            }
+                            anyhow::bail!(msg.trim().to_string());
+                        }
+                        _ => {
+                            anyhow::bail!("plugin `{}` not found in any marketplace", plugin);
+                        }
+                    }
+                }
+            }
             Ok(())
         }
         PluginCli::Uninstall { spec } => {
-            let (plugin, mp) = parse_plugin_spec(&spec)?;
-            installer::uninstall(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
-                .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
-            println!("  uninstalled `{}@{}`", plugin, mp);
+            match parse_plugin_spec(&spec)? {
+                PluginSpec::Qualified { plugin, marketplace: mp } => {
+                    installer::uninstall(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
+                        .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
+                    println!("  uninstalled `{}@{}`", plugin, mp);
+                }
+                PluginSpec::Bare { plugin } => {
+                    let installed = installer::list_installed().unwrap_or_default();
+                    let matches: Vec<_> = installed
+                        .into_iter()
+                        .filter(|p| {
+                            p.plugin == plugin
+                                || p.plugin
+                                    == atomcode_core::plugin::marketplace::sanitize_name(&plugin)
+                        })
+                        .collect();
+                    match matches.len() {
+                        0 => anyhow::bail!("plugin `{}` is not installed", plugin),
+                        1 => {
+                            let p = &matches[0];
+                            installer::uninstall(&p.plugin, &p.marketplace, p.scope.clone())
+                                .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
+                            println!("  uninstalled `{}@{}`", p.plugin, p.marketplace);
+                        }
+                        _ => {
+                            let mut msg = format!(
+                                "plugin `{}` installed from multiple marketplaces, please specify:\n",
+                                plugin
+                            );
+                            for p in &matches {
+                                msg.push_str(&format!("  atomcode plugin uninstall {}@{}\n", p.plugin, p.marketplace));
+                            }
+                            anyhow::bail!(msg.trim().to_string());
+                        }
+                    }
+                }
+            }
             Ok(())
         }
         PluginCli::List => {
@@ -2835,17 +2898,36 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
     }
 }
 
-/// Split `<plugin>@<marketplace>` into its two parts. Reject empty halves
-/// up front so we surface a single clean error instead of letting the
-/// installer reject `""` later with a confusing "not found" message.
-fn parse_plugin_spec(s: &str) -> Result<(String, String)> {
-    let (plugin, mp) = s
-        .split_once('@')
-        .ok_or_else(|| anyhow::anyhow!("expected <plugin>@<marketplace>, got `{}`", s))?;
-    if plugin.trim().is_empty() || mp.trim().is_empty() {
-        anyhow::bail!("plugin/marketplace name must not be empty in `{}`", s);
+/// Parsed argument for `atomcode plugin install/uninstall`.
+/// Supports both `plugin@marketplace` (fully qualified) and bare
+/// `plugin` (resolved across all marketplaces).
+enum PluginSpec {
+    /// Explicit `plugin@marketplace` — use as-is.
+    Qualified { plugin: String, marketplace: String },
+    /// Bare plugin name — needs marketplace resolution.
+    Bare { plugin: String },
+}
+
+/// Parse a plugin spec string. Accepts both `plugin@marketplace` and
+/// bare `plugin` (resolved across all registered marketplaces).
+fn parse_plugin_spec(s: &str) -> Result<PluginSpec> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("expected <plugin> or <plugin>@<marketplace>, got empty string");
     }
-    Ok((plugin.trim().to_string(), mp.trim().to_string()))
+    if let Some((plugin, mp)) = s.split_once('@') {
+        if plugin.trim().is_empty() || mp.trim().is_empty() {
+            anyhow::bail!("plugin/marketplace name must not be empty in `{}`", s);
+        }
+        Ok(PluginSpec::Qualified {
+            plugin: plugin.trim().to_string(),
+            marketplace: mp.trim().to_string(),
+        })
+    } else {
+        Ok(PluginSpec::Bare {
+            plugin: s.to_string(),
+        })
+    }
 }
 
 /// CLI (non-TUI) upgrade driver — prints progress to stdout and
