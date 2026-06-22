@@ -6455,7 +6455,10 @@ fn handle_streaming_key(
 /// sending it `AgentCommand::Cancel` is a no-op. Outside sync mode the local
 /// agent remains the owner and keeps the existing command-channel path.
 fn cancel_active_turn(ctx: &LoopCtx) -> bool {
-    if let Some(session) = &ctx.sync_session {
+    if ctx.sync_forwarder.is_some() {
+        let Some(session) = atomcode_daemon::current_live_session() else {
+            return false;
+        };
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(session.cancel_current_turn())
         })

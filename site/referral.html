@@ -28,8 +28,9 @@
   .aurora{position:fixed;inset:0;z-index:9000;pointer-events:none;background:radial-gradient(circle 360px at var(--mx,-200px) var(--my,-200px),rgba(232,160,80,.18) 0%,rgba(232,160,80,.06) 30%,rgba(232,160,80,0) 60%);mix-blend-mode:screen}
   .ripple{position:fixed;left:0;top:0;width:8px;height:8px;border-radius:50%;pointer-events:none;z-index:9100;background:rgba(232,160,80,.55);transform:translate(-50%,-50%);animation:rip .65s cubic-bezier(.22,1,.36,1) forwards}
   @keyframes rip{0%{width:6px;height:6px;background:rgba(232,160,80,.85)}100%{width:160px;height:160px;background:rgba(232,160,80,0)}}
-  .toast{position:fixed;top:100px;left:50%;transform:translateX(-50%);z-index:2000;padding:12px 24px;font-size:13px;letter-spacing:1px;background:#000;color:#f6f3ec;border:1px solid var(--accent);border-radius:6px;font-family:var(--mono);opacity:0;transition:opacity .2s,transform .2s;white-space:nowrap}
+  .toast{position:fixed;top:100px;left:50%;transform:translateX(-50%);z-index:6000;max-width:min(680px,calc(100vw - 32px));padding:12px 24px;font-size:13px;line-height:1.5;letter-spacing:.5px;text-align:center;overflow-wrap:anywhere;background:#000;color:#f6f3ec;border:1px solid var(--accent);border-radius:6px;font-family:var(--mono);opacity:0;transition:opacity .2s,transform .2s;white-space:normal}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(6px)}
+  .toast.error{border-color:var(--red)}
   [data-magnetic]{transition:transform .35s cubic-bezier(.22,1,.36,1);will-change:transform}
 
   /* ---------- header ---------- */
@@ -200,6 +201,7 @@
   html.light .rank-table tr.me td{background:rgba(47,140,255,.12)}html.light .rank-table tr.blocked td{background:rgba(255,110,110,.18)}
   html.light .coding-reward{color:#805210;border-color:rgba(160,100,20,.65);background:rgba(160,100,20,.24);box-shadow:0 0 14px rgba(160,100,20,.18)}
   html.light .toast{background:rgba(255,255,255,.98);color:#0d0d0d;border-color:#c87618;box-shadow:0 14px 36px rgba(0,0,0,.16)}
+  html.light .toast.error{border-color:#d83d3d}
   html.light .mb-drawer{background:rgba(246,243,236,.97)}html.light .mb-drawer a{color:rgba(0,0,0,.72);border-color:rgba(0,0,0,.08)}html.light .mb-drawer a:hover{color:#0d0d0d}
   html.light .mb-drawer a.cp{color:#c87618}html.light .mb-drawer a.cta{background:#c87618;color:#fff}
 
@@ -254,6 +256,8 @@
   .modal-input:disabled{opacity:.55;cursor:not-allowed}
   .field-error{margin-top:5px;font-size:11px;color:var(--red);display:none}
   .field-error.show{display:block}
+  .form-error{display:none;margin:0 0 14px;padding:10px 12px;border:1px solid rgba(255,110,110,.3);border-radius:6px;background:rgba(255,110,110,.1);color:var(--red);font-size:12px;line-height:1.5}
+  .form-error.show{display:block}
   .modal-actions{display:flex;gap:10px;margin-top:4px}
   .modal-btn{flex:1;padding:10px;border-radius:6px;font-size:12px;font-weight:600;letter-spacing:.5px;cursor:pointer;text-align:center;transition:all .2s}
   .modal-btn-cancel{background:rgba(255,255,255,.06);color:#fff;border:1px solid rgba(255,255,255,.15)}
@@ -423,7 +427,7 @@
     </div>
   </div>
 </main>
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
 // env=local → local platform, env=test → test platform, env=pre → pre-release platform, default → production
@@ -539,6 +543,11 @@ const T = {
   'payment.saving': { zh: '保存中...', en: 'Saving...' },
   'payment.hint': { zh: '京东E卡卡密将通过短信下发，请确认姓名及手机号无误并留意查收', en: 'JD E-Card codes will be sent via SMS. Please verify your name and phone number are correct.' },
   'payment.saved': { zh: '收款信息已保存', en: 'Payment info saved.' },
+  'payment.error.bad_request': { zh: '收款信息有误，请检查后重试', en: 'Please check the payment information and try again.' },
+  'payment.error.auth': { zh: '登录已过期，请重新登录后再试', en: 'Your session has expired. Please sign in again.' },
+  'payment.error.network': { zh: '网络连接失败，请检查网络后重试', en: 'Network connection failed. Please check your connection and try again.' },
+  'payment.error.server': { zh: '服务暂时不可用，请稍后重试', en: 'The service is temporarily unavailable. Please try again later.' },
+  'payment.error.unknown': { zh: '保存失败，请稍后重试', en: 'Unable to save. Please try again later.' },
 };
 function t(key) { const item = T[key]; return item ? (item[LANG] || item.zh || key) : key; }
 function applyI18n() {
@@ -578,12 +587,19 @@ function copyText(text){
 }
 
 /* ========== toast ========== */
-function showToast(message) {
+let toastTimer = null;
+function showToast(message, type = 'info') {
   const toast = document.getElementById('toast');
   if (!toast) return;
+  if (toastTimer) clearTimeout(toastTimer);
   toast.textContent = message;
+  toast.classList.toggle('error', type === 'error');
   toast.classList.add('show');
-  setTimeout(() => toast.classList.remove('show'), 1600);
+  const duration = type === 'error' ? 4200 : 1600;
+  toastTimer = setTimeout(() => {
+    toast.classList.remove('show');
+    toastTimer = null;
+  }, duration);
 }
 
 // ── Invite link ──
@@ -1192,27 +1208,47 @@ function switchToEditMode() {
 function clearFieldErrors() {
   document.querySelectorAll('.field-error').forEach(el => el.classList.remove('show'));
   document.querySelectorAll('.modal-input.error').forEach(el => el.classList.remove('error'));
+  const formError = document.getElementById('payment-form-error');
+  formError.classList.remove('show');
+  formError.textContent = '';
 }
 
-function showFieldError(inputId, errId) {
+function showFieldError(inputId, errId, message) {
   document.getElementById(inputId).classList.add('error');
-  document.getElementById(errId).classList.add('show');
+  const error = document.getElementById(errId);
+  if (message) error.textContent = message;
+  error.classList.add('show');
+}
+
+function showPaymentFormError(message) {
+  const error = document.getElementById('payment-form-error');
+  error.textContent = message;
+  error.classList.add('show');
 }
 
 function isValidPhone(phone) {
   return /^1[3-9]\d{9}$/.test(phone) || /^\+[1-9]\d{6,14}$/.test(phone);
 }
 
-function updatePaymentFormState() {
+function updatePaymentFormState(preserveSubmissionError = false) {
   const nameInput = document.getElementById('input-real-name');
   const phoneInput = document.getElementById('input-phone');
   const saveBtn = document.getElementById('save-payment-btn');
   const phone = phoneInput.value.trim();
 
-  phoneInput.classList.remove('error');
-  document.getElementById('err-phone').classList.remove('show');
-  if (phone && !isValidPhone(phone)) {
-    showFieldError('input-phone', 'err-phone');
+  if (!preserveSubmissionError) {
+    const formError = document.getElementById('payment-form-error');
+    formError.classList.remove('show');
+    formError.textContent = '';
+    if (nameInput.value.trim()) {
+      nameInput.classList.remove('error');
+      document.getElementById('err-real-name').classList.remove('show');
+    }
+    phoneInput.classList.remove('error');
+    document.getElementById('err-phone').classList.remove('show');
+    if (phone && !isValidPhone(phone)) {
+      showFieldError('input-phone', 'err-phone');
+    }
   }
 
   saveBtn.disabled = !nameInput.value.trim() || !isValidPhone(phone);
@@ -1225,6 +1261,56 @@ function updatePaymentButtons() {
     btn.textContent = t(filled ? 'payment.filled' : 'payment.fill');
     btn.classList.toggle('filled', filled);
   });
+}
+
+async function paymentResponseError(resp) {
+  const raw = await resp.text();
+  let data = null;
+  if (raw) {
+    try { data = JSON.parse(raw); } catch (e) {}
+  }
+  const description = data && typeof data.error_description === 'string' ? data.error_description
+    : data && typeof data.message === 'string' ? data.message
+    : raw && !raw.trim().startsWith('<') ? raw.trim()
+    : '';
+  const error = new Error(description);
+  error.status = resp.status;
+  error.code = data && typeof data.error === 'string' ? data.error : '';
+  return error;
+}
+
+function handlePaymentError(error) {
+  const status = Number(error && error.status) || 0;
+  const detail = String(error && error.message || '');
+  const normalized = detail.toLowerCase();
+
+  if ((status === 400 || status === 422) && normalized.includes('phone')) {
+    showFieldError('input-phone', 'err-phone', t('payment.phone.invalid'));
+    document.getElementById('input-phone').focus();
+    return;
+  }
+  if ((status === 400 || status === 422) && (normalized.includes('real_name') || normalized.includes('real name'))) {
+    showFieldError('input-real-name', 'err-real-name', t('payment.name.required'));
+    document.getElementById('input-real-name').focus();
+    return;
+  }
+  if (status === 401 || status === 403) {
+    showPaymentFormError(t('payment.error.auth'));
+    return;
+  }
+  if (status >= 500) {
+    showPaymentFormError(t('payment.error.server'));
+    return;
+  }
+  if (!status && error instanceof TypeError) {
+    showPaymentFormError(t('payment.error.network'));
+    return;
+  }
+  if (status === 400 || status === 422) {
+    showPaymentFormError(t('payment.error.bad_request'));
+    return;
+  }
+  showPaymentFormError(t('payment.error.unknown'));
 }
 
 async function savePaymentInfo() {
@@ -1249,8 +1335,7 @@ async function savePaymentInfo() {
       body: JSON.stringify({ real_name: realName, phone: phone })
     });
     if (!resp.ok) {
-      const msg = await resp.text();
-      throw new Error(msg || 'HTTP ' + resp.status);
+      throw await paymentResponseError(resp);
     }
     paymentInfo = { real_name: realName, phone: phone };
     updatePaymentButtons();
@@ -1261,10 +1346,10 @@ async function savePaymentInfo() {
     showToast(t('payment.saved'));
     closePaymentModal();
   } catch (e) {
-    showToast(e.message || '保存失败');
+    handlePaymentError(e);
   } finally {
     saveBtn.textContent = t('payment.save');
-    updatePaymentFormState();
+    updatePaymentFormState(true);
   }
 }
 
@@ -1315,6 +1400,7 @@ initPage();
           <input class="modal-input" id="input-phone" type="tel" inputmode="tel" maxlength="16" autocomplete="tel" data-i18n-placeholder="payment.phone.placeholder" placeholder="大陆手机号或 +国家码手机号" oninput="updatePaymentFormState()">
           <div class="field-error" id="err-phone" data-i18n="payment.phone.invalid">请输入有效的大陆手机号，或以 +国家码 开头的国际手机号</div>
         </div>
+        <div class="form-error" id="payment-form-error" role="alert" aria-live="assertive"></div>
         <div class="modal-actions">
           <button class="modal-btn modal-btn-cancel" onclick="closePaymentModal()" data-i18n="payment.cancel">取消</button>
           <button class="modal-btn modal-btn-primary" id="save-payment-btn" onclick="savePaymentInfo()" data-i18n="payment.save">保存</button>
