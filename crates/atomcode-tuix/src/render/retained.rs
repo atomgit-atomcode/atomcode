@@ -1613,6 +1613,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         let menu_top = bot_rule_row + 1 + attachment_rows;
+        // Invalidate prev_cells for the menu rows so the next render_diff
+        // emits explicit patches for EVERY cell (including blank padding at
+        // the right edge). Without this, a CJK character from a prior frame's
+        // skill description whose display cells transition to ASCII spaces can
+        // leave the right-half of its glyph visible on some terminals (iTerm2
+        // per-cell patch coalescing). `pad_row_to_width` on the individual row
+        // already fills the buffer with blanks from content-end to screen edge,
+        // but the diff/serialize mechanism may not fully overwrite the right
+        // half of a 2-cell-wide glyph because the continuation cell at (c+1)
+        // is compared against the new (non-continuation) blank cell — the patch
+        // IS generated, yet the physical glyph remnant survives on iTerm2.
+        // Sentinel prev forces every column through the diff, blanks included.
+        self.screen.invalidate_rows_from(menu_top);
         for (i, r) in menu_cells.into_iter().enumerate() {
             let mut padded = r;
             Self::pad_row_to_width(&mut padded, w);
