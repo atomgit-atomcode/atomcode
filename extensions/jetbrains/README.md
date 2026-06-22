@@ -65,6 +65,17 @@ the account ...` is an IDE entitlement problem, not a plugin build failure.
 
 The packaged plugin zip is written to `build/distributions/`.
 
+For an official release containing the private signer and bundled daemons for
+all supported platforms, run this from the repository root:
+
+```bash
+./build-official-jetbrains.sh [branch]
+```
+
+The script writes the plugin zip, daemon binaries, and checksums to
+`dist/v<workspace-version>/`. Use `./build-official-jetbrains.sh clean` to
+restore the public stub files after an interrupted build.
+
 The build optionally bundles `atomcode-daemon` into `resources/bin/<platform>`.
 Local development builds automatically include the current platform daemon from
 `target/release` or `target/debug` when present. Marketplace/release builds can

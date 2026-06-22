@@ -9,10 +9,14 @@ import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.util.ui.UIUtil
+import org.cef.browser.CefBrowser
+import org.cef.browser.CefFrame
+import org.cef.handler.CefLoadHandlerAdapter
 import java.awt.BorderLayout
 import javax.swing.BorderFactory
 import javax.swing.JLabel
 import javax.swing.JPanel
+import javax.swing.SwingUtilities
 import javax.swing.Timer
 
 /**
@@ -21,7 +25,7 @@ import javax.swing.Timer
  * 架构：
  * - Kotlin → JS: browser.cefBrowser.executeJavaScript()
  * - JS → Kotlin: JBCefJSQuery 注入回调，JS 扫描 window 获取
- * - 如果 JBCefJSQuery 回调未就绪（API 废弃/兼容问题），2 秒后自动切为强制模式
+ * - JBCefJSQuery 通知页面脚本就绪，主 frame 的 load-end 事件作为兼容兜底
  */
 class JBCefMessageView : JPanel(BorderLayout()) {
     private val gson = Gson()
@@ -31,7 +35,6 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     private var jsQuery: JBCefJSQuery? = null
 
     @Volatile private var jsReady = false
-    @Volatile private var forceReady = false
     private val pendingCalls = mutableListOf<String>()
     private var initialized = false
 
@@ -84,27 +87,21 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         q.addHandler { message ->
             when {
                 message == "js:ready" -> {
-                    jsReady = true
-                    executeJs("setTheme(${isDarkTheme()})")
-                    flushPending()
+                    markJsReady()
                     null
                 }
                 else -> null
             }
         }
 
-        b.loadHTML(buildChatHtml())
-
-        // 兜底：2 秒后如果 JS 仍未就绪，强制开始发送消息。
-        Timer(2000) {
-            if (!jsReady && !forceReady) {
-                forceReady = true
-                flushPending()
+        b.jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
+            override fun onLoadEnd(browser: CefBrowser?, frame: CefFrame?, httpStatusCode: Int) {
+                if (frame?.isMain == true) {
+                    markJsReady()
+                }
             }
-        }.apply {
-            isRepeats = false
-            start()
-        }
+        }, b.cefBrowser)
+        b.loadHTML(buildChatHtml())
     }
 
     private fun showBrowserUnavailable() {
@@ -168,7 +165,7 @@ class JBCefMessageView : JPanel(BorderLayout()) {
                 .replace("\n", "\\n").replace("\r", "\\r") + "\""
         }
         val call = "$fn($escaped)"
-        if (jsReady || forceReady) {
+        if (jsReady) {
             executeJs(call)
         } else {
             pendingCalls.add(call)
@@ -176,11 +173,23 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     }
 
     private fun sendRawJs(call: String) {
-        if (jsReady || forceReady) {
+        if (jsReady) {
             executeJs(call)
         } else {
             pendingCalls.add(call)
         }
+    }
+
+    private fun markJsReady() {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater(::markJsReady)
+            return
+        }
+        if (browser == null) return
+        if (jsReady) return
+        jsReady = true
+        executeJs("setTheme(${isDarkTheme()})")
+        flushPending()
     }
 
     private fun flushPending() {

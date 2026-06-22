@@ -280,6 +280,38 @@ fn structural_mask(chars: &[char]) -> Vec<bool> {
     mask
 }
 
+fn escape_unescaped_control_chars_in_strings(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let chars: Vec<char> = s.chars().collect();
+    let mask = structural_mask(&chars);
+    let mut escaped = String::with_capacity(s.len());
+
+    for (i, c) in chars.into_iter().enumerate() {
+        if mask[i] {
+            escaped.push(c);
+            continue;
+        }
+
+        match c {
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\u{000c}' => escaped.push_str("\\f"),
+            '\r' => escaped.push_str("\\r"),
+            '\u{0000}'..='\u{001f}' => {
+                let byte = c as usize;
+                escaped.push_str("\\u00");
+                escaped.push(HEX[byte >> 4] as char);
+                escaped.push(HEX[byte & 0x0f] as char);
+            }
+            _ => escaped.push(c),
+        }
+    }
+
+    escaped
+}
+
 /// Attempt to repair common JSON issues from LLM output:
 /// - Trailing commas before } or ]
 /// - Single quotes instead of double quotes (outside of string values)
@@ -322,6 +354,11 @@ pub fn repair_json(s: &str) -> String {
         }
     }
     result = fixed;
+
+    // JSON forbids literal control characters inside quoted values. Preserve
+    // structural whitespace while escaping only characters inside strings, so
+    // nested arrays and objects remain intact for the normal parser.
+    result = escape_unescaped_control_chars_in_strings(&result);
 
     // Remove leading/trailing whitespace and any markdown code fences
     result = result.trim().to_string();
@@ -804,6 +841,15 @@ mod tests {
         assert_eq!(parsed["key"], "value");
     }
 
+    #[test]
+    fn repair_json_escapes_unescaped_newline_inside_string() {
+        let input = "{\n\"instruction\":\"line 1\nline 2\"\n}";
+        let repaired = repair_json(input);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("should escape the literal newline");
+        assert_eq!(parsed["instruction"], "line 1\nline 2");
+    }
+
     // --- extract_json_fields tests ---
 
     #[test]
@@ -875,6 +921,25 @@ mod tests {
         // Empty `{}` is valid JSON — we must not paper over it by inventing fields.
         // Callers surface it as a user-visible error instead.
         assert_eq!(repair_tool_args("write_file", "{}"), "{}");
+    }
+
+    #[test]
+    fn repair_tool_args_parallel_edit_preserves_files_with_unescaped_newline() {
+        let input = concat!(
+            r#"{"files":[{"path":"a.rs","instruction":"line 1"#,
+            "\n",
+            r#"line 2"},{"path":"b.rs","instruction":"change b"}]}"#
+        );
+        let repaired = repair_tool_args("parallel_edit_files", input);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("should preserve the files array");
+        assert_eq!(
+            parsed["files"],
+            serde_json::json!([
+                {"path": "a.rs", "instruction": "line 1\nline 2"},
+                {"path": "b.rs", "instruction": "change b"}
+            ])
+        );
     }
 
     #[test]
