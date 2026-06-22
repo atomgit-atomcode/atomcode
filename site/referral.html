@@ -529,8 +529,9 @@ const T = {
   'payment.name.placeholder': { zh: '请输入真实姓名', en: 'Enter your full name' },
   'payment.name.required': { zh: '请输入真实姓名', en: 'Please enter your full name' },
   'payment.phone': { zh: '手机号', en: 'Phone Number' },
-  'payment.phone.placeholder': { zh: '请输入手机号', en: 'Enter your phone number' },
+  'payment.phone.placeholder': { zh: '大陆手机号或 +国家码手机号', en: 'Mainland China number or +country code' },
   'payment.phone.required': { zh: '请输入手机号', en: 'Please enter your phone number' },
+  'payment.phone.invalid': { zh: '请输入有效的大陆手机号，或以 +国家码 开头的国际手机号', en: 'Enter a valid mainland China number or an international number starting with +country code' },
   'payment.close': { zh: '关闭', en: 'Close' },
   'payment.cancel': { zh: '取消', en: 'Cancel' },
   'payment.edit': { zh: '修改', en: 'Edit' },
@@ -1160,6 +1161,7 @@ function openPaymentModal() {
     clearFieldErrors();
     document.getElementById('payment-view-mode').style.display = 'none';
     document.getElementById('payment-edit-mode').style.display = 'block';
+    updatePaymentFormState();
   }
   overlay.classList.add('open');
   document.body.style.overflow = 'hidden';
@@ -1184,6 +1186,7 @@ function switchToEditMode() {
   clearFieldErrors();
   document.getElementById('payment-view-mode').style.display = 'none';
   document.getElementById('payment-edit-mode').style.display = 'block';
+  updatePaymentFormState();
 }
 
 function clearFieldErrors() {
@@ -1194,6 +1197,25 @@ function clearFieldErrors() {
 function showFieldError(inputId, errId) {
   document.getElementById(inputId).classList.add('error');
   document.getElementById(errId).classList.add('show');
+}
+
+function isValidPhone(phone) {
+  return /^1[3-9]\d{9}$/.test(phone) || /^\+[1-9]\d{6,14}$/.test(phone);
+}
+
+function updatePaymentFormState() {
+  const nameInput = document.getElementById('input-real-name');
+  const phoneInput = document.getElementById('input-phone');
+  const saveBtn = document.getElementById('save-payment-btn');
+  const phone = phoneInput.value.trim();
+
+  phoneInput.classList.remove('error');
+  document.getElementById('err-phone').classList.remove('show');
+  if (phone && !isValidPhone(phone)) {
+    showFieldError('input-phone', 'err-phone');
+  }
+
+  saveBtn.disabled = !nameInput.value.trim() || !isValidPhone(phone);
 }
 
 function updatePaymentButtons() {
@@ -1215,6 +1237,7 @@ async function savePaymentInfo() {
   if (!realName) { showFieldError('input-real-name', 'err-real-name'); valid = false; }
   const phone = phoneInput.value.trim();
   if (!phone) { showFieldError('input-phone', 'err-phone'); valid = false; }
+  else if (!isValidPhone(phone)) { showFieldError('input-phone', 'err-phone'); valid = false; }
   if (!valid) return;
 
   saveBtn.disabled = true;
@@ -1240,8 +1263,8 @@ async function savePaymentInfo() {
   } catch (e) {
     showToast(e.message || '保存失败');
   } finally {
-    saveBtn.disabled = false;
     saveBtn.textContent = t('payment.save');
+    updatePaymentFormState();
   }
 }
 
@@ -1284,13 +1307,13 @@ initPage();
       <div id="payment-edit-mode" style="display:none">
         <div class="modal-field">
           <label class="modal-label" for="input-real-name"><span data-i18n="payment.name">真实姓名</span> <span class="req">*</span></label>
-          <input class="modal-input" id="input-real-name" type="text" maxlength="60" autocomplete="name" data-i18n-placeholder="payment.name.placeholder" placeholder="请输入真实姓名">
+          <input class="modal-input" id="input-real-name" type="text" maxlength="60" autocomplete="name" data-i18n-placeholder="payment.name.placeholder" placeholder="请输入真实姓名" oninput="updatePaymentFormState()">
           <div class="field-error" id="err-real-name" data-i18n="payment.name.required">请输入真实姓名</div>
         </div>
         <div class="modal-field">
           <label class="modal-label" for="input-phone"><span data-i18n="payment.phone">手机号</span> <span class="req">*</span></label>
-          <input class="modal-input" id="input-phone" type="text" maxlength="30" autocomplete="tel" data-i18n-placeholder="payment.phone.placeholder" placeholder="请输入手机号">
-          <div class="field-error" id="err-phone" data-i18n="payment.phone.required">请输入手机号</div>
+          <input class="modal-input" id="input-phone" type="tel" inputmode="tel" maxlength="16" autocomplete="tel" data-i18n-placeholder="payment.phone.placeholder" placeholder="大陆手机号或 +国家码手机号" oninput="updatePaymentFormState()">
+          <div class="field-error" id="err-phone" data-i18n="payment.phone.invalid">请输入有效的大陆手机号，或以 +国家码 开头的国际手机号</div>
         </div>
         <div class="modal-actions">
           <button class="modal-btn modal-btn-cancel" onclick="closePaymentModal()" data-i18n="payment.cancel">取消</button>
