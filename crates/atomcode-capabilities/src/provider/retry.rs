@@ -52,9 +52,16 @@ pub(crate) fn is_retryable_status(code: u16) -> bool {
     matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
-/// Transient transport errors worth retrying (connect / timeout).
+/// Transient transport errors worth retrying. All arise on the OPEN
+/// (`req.send()`), before any response byte is consumed, so retrying is always
+/// safe (see module note).
+///
+/// `is_request` covers the "error sending request for url" class — a connection
+/// dropped while sending the request or awaiting the response head. `is_connect`
+/// (connect-phase only) and `is_timeout` MISS it, so such a blip used to fail a
+/// whole review without a single retry.
 pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
+    err.is_timeout() || err.is_connect() || err.is_request()
 }
 
 /// Parse `Retry-After` as integer seconds. `None` for absent / malformed / HTTP-date.
@@ -140,5 +147,28 @@ mod tests {
         let a1 = compute_backoff(1, &policy);
         let a5 = compute_backoff(5, &policy);
         assert!(a5 > a1, "backoff should grow: a1={a1:?} a5={a5:?}");
+    }
+
+    /// `reqwest::Error` cannot be hand-constructed, so trigger a real OPEN-phase
+    /// failure (connect to a port nobody listens on) and assert it is retryable.
+    /// Locks the "transport send failure → retry" contract against regression
+    /// (the `is_request` arm that covers `error sending request for url`).
+    #[tokio::test]
+    async fn transport_open_failure_is_retryable() {
+        // no_proxy: bypass any ambient HTTP proxy so we hit a real transport
+        // failure (connect refused) instead of the proxy answering.
+        let err = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client build")
+            .post("http://127.0.0.1:1/")
+            .body("x")
+            .send()
+            .await
+            .expect_err("connect to port 1 must fail");
+        assert!(
+            is_retryable_reqwest_error(&err),
+            "transport open failure must be retryable, got {err:?}"
+        );
     }
 }
