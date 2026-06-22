@@ -1520,6 +1520,15 @@ pub(crate) async fn live_message(
     Json(serde_json::json!({ "accepted": ok }))
 }
 
+/// POST /live/stop — cancel the turn shared by the TUI and synchronized webui tabs.
+pub(crate) async fn live_stop() -> impl IntoResponse {
+    let accepted = match current_live_session() {
+        Some(session) => session.cancel_current_turn().await,
+        None => false,
+    };
+    Json(serde_json::json!({ "accepted": accepted }))
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct LiveProviderReq {
     pub provider: String,
