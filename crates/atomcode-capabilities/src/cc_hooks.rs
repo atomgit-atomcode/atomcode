@@ -163,16 +163,47 @@ pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
     out
 }
 
-/// Tool-name matcher: `None`/`"*"` = all; trailing `*` = prefix; else exact.
+/// Tool-name matcher. `None`/empty/`"*"` = all. Otherwise a `|`-separated list of
+/// alternatives, each a glob where `*` matches any run of chars (incl. empty) and every
+/// other char is literal — covering the patterns real hooks use: exact (`Bash`),
+/// alternation (`Edit|Write`), and wildcards (`mcp__github__*`, `Notebook*`). Stays
+/// zero-dependency and backward compatible with the legacy trailing-`*` form
+/// (`edit_*` still matches `edit_file`). Full regex (`.`, `[...]`, `()`) is NOT
+/// supported — such a matcher is treated literally and simply won't match.
 fn matches_tool(matcher: &Option<String>, tool_name: &str) -> bool {
-    match matcher {
-        None => true,
-        Some(p) if p == "*" => true,
-        Some(p) => match p.strip_suffix('*') {
-            Some(prefix) => tool_name.starts_with(prefix),
-            None => p == tool_name,
-        },
+    let Some(pat) = matcher.as_deref() else { return true };
+    if pat.is_empty() || pat == "*" {
+        return true;
     }
+    pat.split('|').any(|alt| glob_match(alt.trim(), tool_name))
+}
+
+/// Glob match where `*` matches any run (including empty) and every other byte is
+/// literal. Linear two-pointer scan with a star-backtrack mark — no exponential blowup.
+fn glob_match(pat: &str, s: &str) -> bool {
+    let (pb, sb) = (pat.as_bytes(), s.as_bytes());
+    let (mut p, mut si) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while si < sb.len() {
+        if p < pb.len() && pb[p] == b'*' {
+            star = Some(p);
+            mark = si;
+            p += 1;
+        } else if p < pb.len() && pb[p] == sb[si] {
+            p += 1;
+            si += 1;
+        } else if let Some(sp) = star {
+            p = sp + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pb.len() && pb[p] == b'*' {
+        p += 1;
+    }
+    p == pb.len()
 }
 
 // ───────────────────────────── command exec ─────────────────────────────
@@ -216,10 +247,14 @@ async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(Option
     let fut = async {
         let mut child = cmd.spawn().ok()?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(stdin_json.as_bytes()).await.ok()?;
+            // BEST-EFFORT delivery: a hook that ignores its stdin (echo, a simple exit,
+            // an observation-only PostToolUse hook) may ALREADY have exited, so this
+            // write races the child and can fail with EPIPE. That is expected — it must
+            // NOT discard the hook's real exit code / stdout, so swallow the result.
+            let _ = stdin.write_all(stdin_json.as_bytes()).await;
             // Explicit shutdown so a `read`/`json.load(sys.stdin)` returns now
             // rather than blocking until our timeout fires.
-            stdin.shutdown().await.ok();
+            let _ = stdin.shutdown().await;
             drop(stdin);
         }
         let out = child.wait_with_output().await.ok()?;
@@ -369,18 +404,23 @@ impl LifecycleHooks for CCExternalHooks {
             "cwd": self.cwd,
         })
         .to_string();
-        for hook in self.matching(HookEvent::SessionStart, None) {
-            if let Some((_code, stdout)) = run_command_hook(hook, &payload).await {
-                // SessionStart: stdout (plain or hookSpecificOutput.additionalContext)
-                // is injected as context. CC cannot block here.
-                let ctx = last_json_line(&stdout)
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value::<Decision>(v.clone()).ok())
-                    .and_then(|d| d.additional_context().map(str::to_owned))
-                    .unwrap_or_else(|| stdout.trim().to_string());
-                if !ctx.is_empty() {
-                    convo.push(Message::user(crate::reminder::system_reminder(&ctx)));
-                }
+        // Run matching hooks CONCURRENTLY (the payload is built once; SessionStart can't
+        // block and only appends context), then push their output in config order so the
+        // injected context stays deterministic. A single slow hook no longer serializes
+        // the rest.
+        let matched = self.matching(HookEvent::SessionStart, None);
+        let outs =
+            futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
+        for (_code, stdout) in outs.into_iter().flatten() {
+            // SessionStart: stdout (plain or hookSpecificOutput.additionalContext)
+            // is injected as context. CC cannot block here.
+            let ctx = last_json_line(&stdout)
+                .as_ref()
+                .and_then(|v| serde_json::from_value::<Decision>(v.clone()).ok())
+                .and_then(|d| d.additional_context().map(str::to_owned))
+                .unwrap_or_else(|| stdout.trim().to_string());
+            if !ctx.is_empty() {
+                convo.push(Message::user(crate::reminder::system_reminder(&ctx)));
             }
         }
     }
@@ -393,9 +433,17 @@ impl LifecycleHooks for CCExternalHooks {
             "cwd": self.cwd,
         })
         .to_string();
+        // Run matching hooks CONCURRENTLY — the payload is built once (every hook sees the
+        // same original prompt), so there is no feed-forward between them. Fold the results
+        // in config order: the first block (a `block` decision or a bare exit 2) wins; the
+        // rest contribute injected context. (CC likewise runs UserPromptSubmit hooks in
+        // parallel and aggregates.)
+        let matched = self.matching(HookEvent::UserPromptSubmit, None);
+        let outs =
+            futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
         let mut injected: Vec<String> = Vec::new();
-        for hook in self.matching(HookEvent::UserPromptSubmit, None) {
-            let Some((exit_code, stdout)) = run_command_hook(hook, &payload).await else {
+        for out in outs {
+            let Some((exit_code, stdout)) = out else {
                 continue; // timeout / spawn failure → silent continue.
             };
             let decided = last_json_line(&stdout)
@@ -448,10 +496,9 @@ impl LifecycleHooks for CCExternalHooks {
             "cwd": self.cwd,
         })
         .to_string();
-        for hook in self.matching(HookEvent::SessionEnd, None) {
-            // Observation only — fire and ignore output.
-            let _ = run_command_hook(hook, &payload).await;
-        }
+        // Observation only — fire all matching hooks concurrently and ignore output.
+        let matched = self.matching(HookEvent::SessionEnd, None);
+        futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
     }
 }
 
@@ -477,7 +524,10 @@ impl ToolMiddleware for CCExternalHooks {
         .to_string();
 
         // Fold across matching hooks: most-restrictive gate wins
-        // (Deny > Ask > Allow > Proceed); arg rewrites apply cumulatively.
+        // (Deny > Ask > Allow > Proceed); the last `updatedInput` rewrite of `call.arguments`
+        // wins. SEQUENTIAL (unlike the fire-and-forget session_* events) so the gate can
+        // SHORT-CIRCUIT on the first Deny — a denied call must not keep spawning the
+        // remaining hooks — and so the rewrite order is deterministic.
         let mut gate = BeforeOutcome::Proceed;
         for hook in self.matching(HookEvent::PreToolUse, Some(&call.name)) {
             let Some((exit_code, stdout)) = run_command_hook(hook, &payload).await else {
@@ -571,6 +621,9 @@ impl ToolMiddleware for CCExternalHooks {
             "cwd": self.cwd,
         })
         .to_string();
+        // SEQUENTIAL so the last `updatedToolOutput` rewrite of `result.content` wins
+        // deterministically (the per-tool path typically has 0-1 PostToolUse hooks, so
+        // there is little to gain from the session_*-style concurrency here).
         let mut outcome = AfterOutcome::Proceed;
         for hook in self.hooks.iter().filter(|h| {
             h.event == HookEvent::PostToolUse
@@ -628,10 +681,27 @@ mod tests {
     fn matcher_semantics() {
         assert!(matches_tool(&None, "bash"));
         assert!(matches_tool(&Some("*".into()), "bash"));
-        assert!(matches_tool(&Some("edit_*".into()), "edit_file"));
+        assert!(matches_tool(&Some(String::new()), "bash")); // empty = all
+        assert!(matches_tool(&Some("edit_*".into()), "edit_file")); // legacy trailing-* glob
         assert!(!matches_tool(&Some("edit_*".into()), "write_file"));
         assert!(matches_tool(&Some("bash".into()), "bash"));
         assert!(!matches_tool(&Some("bash".into()), "grep"));
+    }
+
+    #[test]
+    fn matcher_alternation_and_glob() {
+        // F5: `|`-separated alternatives (the common CC form).
+        assert!(matches_tool(&Some("Edit|Write".into()), "Edit"));
+        assert!(matches_tool(&Some("Edit|Write".into()), "Write"));
+        assert!(!matches_tool(&Some("Edit|Write".into()), "Bash"));
+        // Whitespace around alternatives is tolerated.
+        assert!(matches_tool(&Some("Edit | Write".into()), "Write"));
+        // `*` is a wildcard anywhere, not just trailing.
+        assert!(matches_tool(&Some("mcp__github__*".into()), "mcp__github__get_issue"));
+        assert!(!matches_tool(&Some("mcp__github__*".into()), "mcp__gitlab__get_issue"));
+        assert!(matches_tool(&Some("*_file".into()), "edit_file"));
+        // Exact stays exact (no accidental substring match).
+        assert!(!matches_tool(&Some("Edit".into()), "MultiEdit"));
     }
 
     #[test]
@@ -859,5 +929,30 @@ mod tests {
         let mut text = "hi".to_string();
         assert!(cc.user_prompt_submit(&mut text).await.is_ok());
         assert!(text.contains("MATCHED"), "session_id must reach the payload: {text}");
+    }
+
+    fn prompt_hook(cmd: &str) -> HookConfig {
+        HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            matcher: None,
+            command: cmd.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        }
+    }
+
+    /// F6: parallelizing UserPromptSubmit (via `join_all`) must keep the injected context
+    /// in CONFIG order. A single `echo` is a shell builtin (no extra process), so this is
+    /// robust under the parallel test harness; concurrency itself is guaranteed
+    /// structurally by `join_all`, not asserted via flaky wall-clock timing.
+    #[tokio::test]
+    async fn user_prompt_aggregates_multiple_hooks_in_order() {
+        let cc = CCExternalHooks::new(vec![prompt_hook("echo AAA"), prompt_hook("echo BBB")], "/tmp");
+        let mut text = "hi".to_string();
+        cc.user_prompt_submit(&mut text).await.unwrap();
+        let (a, b) = (text.find("AAA"), text.find("BBB"));
+        assert!(a.is_some() && b.is_some(), "both contexts injected: {text}");
+        assert!(a < b, "context kept in config order: {text}");
+        assert!(text.starts_with("hi"), "original prompt preserved: {text}");
     }
 }
