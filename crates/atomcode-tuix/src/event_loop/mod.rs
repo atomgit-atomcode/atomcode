@@ -2662,6 +2662,17 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_parallel_edit_files_repairs_unescaped_instruction_newline() {
+        let args = concat!(
+            r#"{"files":[{"path":"a.rs","instruction":"line 1"#,
+            "\n",
+            r#"line 2"},{"path":"b.rs","instruction":"change b"}]}"#
+        );
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "a.rs, b.rs");
+    }
+
+    #[test]
     fn format_tool_detail_parallel_edit_files_empty_files_array() {
         let args = r#"{"files":[]}"#;
         let out = format_tool_detail("parallel_edit_files", args);
