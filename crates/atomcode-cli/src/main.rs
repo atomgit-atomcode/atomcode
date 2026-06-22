@@ -61,14 +61,22 @@ static HEADLESS_MODE: AtomicBool = AtomicBool::new(false);
 ///
 /// TUI mode (v4.23.2+) runs entirely in the primary screen via the
 /// append-only RetainedRenderer — we never emit `\x1b[?1049h`, so there
-/// is no `LeaveAlternateScreen` counterpart to issue here. Mouse mode,
-/// cursor visibility, autowrap and DECSTBM are restored by
-/// `RetainedRenderer::Drop` / `shutdown()`; this hook only owns the
-/// raw-mode toggle.
+/// is no `LeaveAlternateScreen` counterpart to issue here.
+///
+/// On the GRACEFUL path mouse mode, cursor visibility, autowrap, DECSTBM
+/// and the Kitty keyboard protocol are restored by `RetainedRenderer` /
+/// `TerminalGuard` Drops. But the release profile sets `panic = "abort"`,
+/// so on a crash NO destructor unwinds and none of those Drops run —
+/// this hook is the only cleanup that executes. Disabling raw mode alone
+/// left the Kitty protocol armed, so the parent shell echoed every
+/// post-crash keypress as a literal `[27u` / `[99;5u` CSI-u report. We
+/// therefore emit the full panic-safe restore sequence (idempotent on
+/// the graceful path) before dropping raw mode.
 fn restore_terminal_if_tui() {
     if HEADLESS_MODE.load(Ordering::Relaxed) {
         return;
     }
+    atomcode_tuix::panic_restore_terminal();
     let _ = crossterm::terminal::disable_raw_mode();
 }
 
