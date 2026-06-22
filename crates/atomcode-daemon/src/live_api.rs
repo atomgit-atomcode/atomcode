@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::message::ImagePart;
-use atomcode_core::conversation::Conversation;
+use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::live::{LiveEvent, TurnExecutor, TurnState, UserInput};
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
@@ -44,6 +45,11 @@ static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
 /// 因此在 sync/live 模式下切换模型才能对下一轮生效（执行器是 Arc<dyn> 不可变，故用进程级覆盖）。
 static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
 
+/// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
+/// live_message / live_stream 端点写入；DaemonTurnExecutor::run_turn 读取后设置
+/// CurrentContext.mode，确保 live 路径发出的遥测事件携带正确的 client 来源。
+static LIVE_MODE: StdMutex<Option<atomcode_telemetry::SessionMode>> = StdMutex::new(None);
+
 /// 设置当前 LiveSession 选中的 provider（None 时不覆盖，保留既有选择）。
 fn set_live_provider(provider: Option<String>) {
     if let Some(p) = provider {
@@ -71,13 +77,15 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
     }
 }
 
-/// 把「切到指定项目的指定会话」广播给所有视图。同进程 sync 模式下的 TUI live
-/// 转发器据此 cd（如需）并**恢复**该会话（加载历史，而非开新会话）。手机 App
-/// 点开历史对话（POST /cd 带 session_id）时走这里。无活动 LiveSession 时静默
-/// 跳过（headless daemon 场景由 GET /live?session_id= 自行换播种，见 live_stream）。
-pub fn live_switch_session(dir: std::path::PathBuf, session_id: String) {
+/// 把新会话创建事件广播给所有视图。webui 新建对话时调用，让同进程 TUI 跟随
+/// 切换到新会话。无活动 LiveSession 时静默跳过。
+/// 注意：不更新 LIVE_SESSION_ID——该变量由 ensure_live_session_global 在
+/// 实际创建/替换 LiveSession 时更新；提前更新会导致 ensure_live_session_global
+/// 误判旧 LiveSession 已匹配新 session_id 而复用它。
+pub fn live_switch_session(session_id: atomcode_core::session::SessionId) {
+    let id_str = session_id.to_string();
     if let Some(s) = current_live_session() {
-        s.notify_session_switched(dir, session_id);
+        s.notify_session_switched(id_str);
     }
 }
 
@@ -132,7 +140,7 @@ pub fn ensure_live_session(
         live_mcp_cache(),
         telemetry,
         session_id,
-        move || initial_messages,
+        move || (initial_messages, Vec::new()),
     )
 }
 
@@ -140,7 +148,7 @@ pub fn ensure_live_session(
 ///
 /// `session_id`：若提供且与现有 LiveSession 不同，则替换（解决 #561：TUI/WebUI
 /// 切换到新会话后 sync 应跟随）。None 时复用已有 LiveSession 或新建。
-/// `initial_messages`：**惰性**闭包，仅在确实要新建/替换 LiveSession 时（持锁内）
+/// `initial_session`：**惰性**闭包，仅在确实要新建/替换 LiveSession 时（持锁内）
 /// 求值。复用既有会话时根本不会调用，从而避免 webui 每条消息都为被丢弃的历史读盘。
 pub(crate) fn ensure_live_session_global(
     working_dir: std::path::PathBuf,
@@ -151,7 +159,10 @@ pub(crate) fn ensure_live_session_global(
     >,
     telemetry: Arc<atomcode_telemetry::Telemetry>,
     session_id: Option<atomcode_core::session::SessionId>,
-    initial_messages: impl FnOnce() -> Vec<atomcode_core::conversation::message::Message>,
+    initial_session: impl FnOnce() -> (
+        Vec<atomcode_core::conversation::message::Message>,
+        Vec<String>,
+    ),
 ) -> Arc<atomcode_core::live::LiveSession> {
     let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     // 若已有 LiveSession 且 session_id 匹配（或调用方未指定），直接复用。
@@ -171,17 +182,33 @@ pub(crate) fn ensure_live_session_global(
     let session_id = session_id.unwrap_or_default();
     // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
     *LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
-    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(DaemonTurnExecutor {
-        working_dir,
-        provider_name: None,
-        mcp_cache,
-        telemetry,
-        auto_approve: false,
-        session_id,
-    });
+    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = if live_engine_v2() {
+        eprintln!("[engine v2] daemon live turns on the new stack");
+        Arc::new(KernelTurnExecutor::new(
+            working_dir,
+            None,
+            false,
+            session_id,
+            telemetry,
+        ))
+    } else {
+        Arc::new(DaemonTurnExecutor {
+            working_dir,
+            provider_name: None,
+            mcp_cache,
+            telemetry,
+            auto_approve: false,
+            session_id,
+        })
+    };
     // 历史在锁内、确认要建会话后才求值——既省掉无谓读盘，也避免「锁外判定、锁内已被
     // 别的请求替换」的 TOCTOU：是否新建与用什么历史新建是同一临界区里的决定。
-    let session = atomcode_core::live::LiveSession::new(executor, initial_messages());
+    let (initial_messages, cold_summaries) = initial_session();
+    let session = atomcode_core::live::LiveSession::new_with_cold_summaries(
+        executor,
+        initial_messages,
+        cold_summaries,
+    );
     *g = Some(session.clone());
     session
 }
@@ -274,7 +301,7 @@ pub(crate) async fn build_turn_parts(
         tool_registry.register_sync(Box::new(ListDirTool));
     }
     if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool));
+        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
     }
     if enabled("web_fetch") {
         tool_registry.register_sync(Box::new(WebFetchTool));
@@ -509,7 +536,43 @@ impl TurnExecutor for DaemonTurnExecutor {
 
         {
             let mut c = conv.lock().await;
+            // 设置 telemetry mode：取 live_message 端点在 LIVE_MODE 写入的 client 来源，
+            // 使本轮 turn 内 TurnRunner 发出的遥测事件携带正确的 envelope.mode。
+            let live_mode = *LIVE_MODE.lock().unwrap_or_else(|e| e.into_inner());
+            let scope_ctx = atomcode_telemetry::CurrentContext {
+                mode: live_mode,
+                session_id: uuid::Uuid::parse_str(self.session_id.as_str()).ok(),
+                ..atomcode_telemetry::CurrentContext::current()
+            };
+            atomcode_telemetry::CurrentContext::scope(scope_ctx, || async {
             loop {
+                // ── Context compression check before each turn ──
+                {
+                    let task_hint = c
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|m| matches!(m.role, atomcode_core::conversation::message::Role::User) && !m.synthetic)
+                        .and_then(|m| m.text())
+                        .map(|text| {
+                            if text.chars().count() > 200 {
+                                format!("TASK: {}...", text.chars().take(197).collect::<String>())
+                            } else {
+                                format!("TASK: {}", text)
+                            }
+                        });
+                    let state_hint = task_hint.as_deref();
+                    atomcode_core::agent::compression::maybe_compress_history(
+                        &*runner.ctx,
+                        &mut c,
+                        &*runner.provider,
+                        &runner.tools,
+                        &parts.system_prompt,
+                        state_hint,
+                    )
+                    .await;
+                }
+
                 let result = runner
                     .run(&mut c, &parts.system_prompt, &turn_tx, cancel.clone())
                     .await;
@@ -522,11 +585,372 @@ impl TurnExecutor for DaemonTurnExecutor {
                     }
                 }
             }
+            }).await;
         }
         drop(turn_tx);
         let _ = forward.await;
 
         // 每轮结束后持久化会话（稳定 id → 覆盖同一文件，一会话=一条记录）。
+        // 加载已有 session 以保留 turn_stats 等累积字段，而非每轮 Session::new()
+        // 重置为空。process_chat_request 采用相同模式复用 session 对象。
+        {
+            use atomcode_core::session::{Session, SessionManager};
+            let conv_guard = conv.lock().await;
+            let manager = SessionManager::new(&self.working_dir);
+            let mut session = manager
+                .load(&self.session_id)
+                .unwrap_or_else(|_| Session::new(self.working_dir.clone()));
+            session.id = self.session_id.clone();
+            session.update_from_conversation(&conv_guard);
+            session.auto_name_from_messages();
+            session.touch();
+            if let Err(e) = manager.save(&session) {
+                eprintln!("Warning: failed to save live session: {e}");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Engine v2: kernel-backed TurnExecutor (via atomcode-bridge)
+// ============================================================================
+
+/// True when the daemon should run live turns on the NEW stack (kernel +
+/// capabilities + coding) via atomcode-bridge. The new stack is the DEFAULT now
+/// (same strangler flip as the cli); opt OUT to the legacy `DaemonTurnExecutor`
+/// with `$ATOMCODE_ENGINE=v1` (or `legacy`/`old`).
+pub(crate) fn live_engine_v2() -> bool {
+    !matches!(
+        std::env::var("ATOMCODE_ENGINE").ok().as_deref(),
+        Some("v1" | "1" | "legacy" | "old")
+    )
+}
+
+/// `TurnExecutor` backed by the new stack, presented through atomcode-bridge's
+/// legacy channel protocol. ONE bridge runtime per LiveSession (persistent across
+/// turns) so MCP/memory are prepared once, not per message. `conv` stays the
+/// source of truth: the bridge is seeded from it on the first turn, then each turn
+/// sends only the new user message and the engine's resulting snapshot is written
+/// back.
+pub(crate) struct KernelTurnExecutor {
+    working_dir: PathBuf,
+    provider_name: Option<String>,
+    /// Phase-2 default false (interactive); the approver slot is wired to the
+    /// bridge's ApproveTool/DenyTool exactly as the legacy executor wires it to
+    /// the PermissionDecider.
+    auto_approve: bool,
+    session_id: atomcode_core::session::SessionId,
+    telemetry: Arc<Telemetry>,
+    /// Persistent bridge runtime; built lazily on the first turn.
+    bridge: Mutex<Option<BridgeState>>,
+}
+
+struct BridgeState {
+    client: AgentClient,
+    events: mpsc::UnboundedReceiver<AgentEvent>,
+    /// Whether the pre-existing history has been seeded into the bridge.
+    seeded: bool,
+    /// The provider name used to build this bridge. Compared against
+    /// `LIVE_PROVIDER` on each `run_turn` to detect model switches
+    /// that require a `ReloadConfig` to the bridge runtime.
+    provider_name: String,
+}
+
+impl KernelTurnExecutor {
+    pub(crate) fn new(
+        working_dir: PathBuf,
+        provider_name: Option<String>,
+        auto_approve: bool,
+        session_id: atomcode_core::session::SessionId,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
+        Self {
+            working_dir,
+            provider_name,
+            auto_approve,
+            session_id,
+            telemetry,
+            bridge: Mutex::new(None),
+        }
+    }
+
+    /// Resolve the currently active provider name using the same precedence as
+    /// `bridge_config`: LIVE_PROVIDER → executor default → config default.
+    fn resolve_provider_name(&self) -> String {
+        let live = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        live.or_else(|| self.provider_name.clone())
+            .unwrap_or_else(|| {
+                Config::load(&Config::default_path())
+                    .map(|c| c.default_provider)
+                    .unwrap_or_default()
+            })
+    }
+
+    /// Resolve the bridge config from the live provider selection + on-disk config.
+    /// Mirrors `build_turn_parts`' provider resolution (LIVE_PROVIDER → executor
+    /// default → config default).
+    fn bridge_config(&self) -> Option<atomcode_bridge::BridgeConfig> {
+        let config = Config::load(&Config::default_path()).ok()?;
+        let name = self.resolve_provider_name();
+        let p = config.providers.get(&name)?;
+        Some(atomcode_bridge::BridgeConfig {
+            api_key: p.api_key.clone().unwrap_or_default(),
+            base_url: p.base_url.clone().unwrap_or_default(),
+            model: p.model.clone(),
+            working_dir: self.working_dir.clone(),
+            context_window: p.context_window as u32,
+            mcp: true,
+            telemetry: Some(self.telemetry.clone()),
+            reasoning_history: p.reasoning_history.clone(),
+            reasoning_effort: p.reasoning_effort.clone(),
+            provider_type: p.provider_type.clone(),
+            thinking_enabled: p.thinking_enabled,
+            thinking_type: p.thinking_type.clone(),
+            thinking_keep: p.thinking_keep.clone(),
+            // The daemon answers approvals at its OWN driver seam (the `/live`
+            // BypassAll decider / `/chat` interactive perm_rx), so the bridge must
+            // NOT auto-approve — keep the round-trip and the daemon decides.
+            dangerously_skip_permissions: false,
+            // Keep the fail-closed approval timeout for the daemon (current behavior); the
+            // interactive PARK behavior is wired for the cli TUI path for now.
+            interactive: false,
+        })
+    }
+}
+
+/// Pull the text + images out of the just-appended user message.
+fn extract_user_input(
+    m: &atomcode_core::conversation::message::Message,
+) -> (String, Vec<ImagePart>) {
+    use atomcode_core::conversation::message::MessageContent;
+    match &m.content {
+        MessageContent::Text(t) => (t.clone(), Vec::new()),
+        MessageContent::MultiPart { text, images } => {
+            (text.clone().unwrap_or_default(), images.clone())
+        }
+        _ => (String::new(), Vec::new()),
+    }
+}
+
+#[async_trait]
+impl TurnExecutor for KernelTurnExecutor {
+    async fn preprocess_input(&self, input: UserInput) -> UserInput {
+        if input.images.is_empty() {
+            return input;
+        }
+        let live_provider = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
+        let original_text = input.text.clone();
+        let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
+        // VL 预处理成功后（text 发生了变化），图片已被转成文字，清空 images
+        // 以免 kernel 的 provider adapter 把原图发给不支持视觉的模型（导致 400 错误）
+        let images = if text != original_text {
+            Vec::new()
+        } else {
+            input.images
+        };
+        UserInput { text, images }
+    }
+
+    async fn run_turn(
+        &self,
+        conv: &Arc<Mutex<Conversation>>,
+        events: broadcast::Sender<LiveEvent>,
+        approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+        cancel: CancellationToken,
+    ) {
+        let emit = |te: TurnEvent| {
+            let _ = events.send(LiveEvent::Turn(te));
+        };
+
+        // Lazily build the persistent bridge for this LiveSession.
+        let mut guard = self.bridge.lock().await;
+        if guard.is_none() {
+            let Some(cfg) = self.bridge_config() else {
+                emit(TurnEvent::Error("engine v2：provider 未配置".into()));
+                return;
+            };
+            let provider_name = self.resolve_provider_name();
+            let (client, rx) = atomcode_bridge::spawn_bridged_runtime(cfg);
+            *guard = Some(BridgeState { client, events: rx, seeded: false, provider_name });
+        }
+
+        // Detect model switch: if LIVE_PROVIDER changed since this bridge was built,
+        // send ReloadConfig so the bridge runtime updates its system prompt, provider,
+        // and context strategy. Without this, a webui dropdown switch updates
+        // LIVE_PROVIDER but the bridge's frozen system prompt still carries the old
+        // model name — the agent mis-identifies itself (issue #659).
+        let current_provider = self.resolve_provider_name();
+        let state = guard.as_mut().unwrap();
+        if current_provider != state.provider_name {
+            if let Ok(new_config) = Config::load(&Config::default_path()) {
+                let _ = state.client.cmd_tx.send(
+                    atomcode_core::agent::AgentCommand::ReloadConfig(new_config),
+                );
+            }
+            state.provider_name = current_provider;
+        }
+
+        let client = state.client.clone();
+
+        // `conv` already has the just-typed user message appended (coordinator).
+        // Split it off: the prefix seeds the bridge (first turn only), the last
+        // message is sent as this turn's input.
+        let (prefix, user_text, user_images) = {
+            let c = conv.lock().await;
+            let mut msgs = c.messages.clone();
+            let last = msgs.pop();
+            let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
+            (msgs, text, images)
+        };
+
+        // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
+        // （非视觉模型的 provider adapter 会因原图而报 400 错误）
+        let user_images = if user_text.contains("[图片内容（由") || user_text.contains("[图片识别失败]") {
+            Vec::new()
+        } else {
+            user_images
+        };
+
+        if !state.seeded {
+            let _ = client.cmd_tx.send(AgentCommand::SetConversation(ConversationSnapshot {
+                messages: prefix,
+                cold_summaries: vec![],
+            }));
+            state.seeded = true;
+        }
+        let _ = client.cmd_tx.send(AgentCommand::SendMessage {
+            text: user_text,
+            images: user_images,
+            image_markers: Vec::new(),
+        });
+
+        // Interactive approval: register the response sender so any view's
+        // `LiveSession.approve()` delivers the decision here.
+        let mut perm_rx = if self.auto_approve {
+            None
+        } else {
+            let (tx, rx) = mpsc::unbounded_channel::<PermissionDecision>();
+            *approver.lock().await = Some(tx);
+            Some(rx)
+        };
+
+        let mut cancelled = false;
+        let mut bridge_dead = false;
+        let final_messages = loop {
+            let ev = tokio::select! {
+                _ = cancel.cancelled(), if !cancelled => {
+                    cancelled = true;
+                    let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                    continue;
+                }
+                ev = state.events.recv() => ev,
+            };
+            let Some(ev) = ev else {
+                // Bridge task exited (channel closed). Drop it after the loop so the
+                // next turn respawns instead of no-op'ing on a dead bridge forever.
+                bridge_dead = true;
+                break None;
+            };
+            match ev {
+                AgentEvent::TextDelta(t) => emit(TurnEvent::TextDelta(t)),
+                AgentEvent::ReasoningDelta(t) => emit(TurnEvent::ReasoningDelta(t)),
+                AgentEvent::ToolCallStreaming { name, hint } => {
+                    emit(TurnEvent::ToolCallStreaming { name, hint })
+                }
+                AgentEvent::ToolCallStarted { id, name, arguments } => {
+                    emit(TurnEvent::ToolCallStarted { id, name, arguments })
+                }
+                AgentEvent::ToolOutputChunk { call_id, chunk } => {
+                    emit(TurnEvent::ToolOutputChunk { call_id, chunk })
+                }
+                AgentEvent::ToolCallResult { call_id, name, output, success, duration } => emit(
+                    TurnEvent::ToolCallResult { call_id, name, output, success, duration },
+                ),
+                AgentEvent::TokenUsage(u) => emit(TurnEvent::TokenUsage {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    total_tokens: u.prompt_tokens + u.completion_tokens,
+                    cached_tokens: u.cached_tokens,
+                }),
+                AgentEvent::ContextStats {
+                    system_tokens,
+                    sent_tokens,
+                    dropped_tokens,
+                    working_set_tokens,
+                    total_messages,
+                    ..
+                } => emit(TurnEvent::ContextStats {
+                    system_tokens,
+                    sent_tokens,
+                    dropped_tokens,
+                    working_set_tokens,
+                    total_messages,
+                }),
+                AgentEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
+                AgentEvent::Warning(w) => emit(TurnEvent::Warning(w)),
+                AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot } => {
+                    emit(TurnEvent::ApprovalRequested {
+                        tool_name,
+                        reason,
+                        call,
+                        snapshot,
+                    });
+                    let decision = match &mut perm_rx {
+                        // auto-approve (no interactive channel): allow.
+                        None => PermissionDecision::Allow,
+                        Some(rx) => {
+                            tokio::select! {
+                                _ = cancel.cancelled(), if !cancelled => {
+                                    cancelled = true;
+                                    // Deny this tool AND stop the turn — without the
+                                    // Cancel the outer cancel branch is now disabled
+                                    // (`if !cancelled`) so the turn would otherwise run
+                                    // on after a single denied tool.
+                                    let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                                    PermissionDecision::Deny
+                                }
+                                d = rx.recv() => d.unwrap_or(PermissionDecision::Deny),
+                            }
+                        }
+                    };
+                    let cmd = match decision {
+                        PermissionDecision::Allow => AgentCommand::ApproveTool,
+                        PermissionDecision::AllowAlways => AgentCommand::ApproveToolAlways,
+                        PermissionDecision::Ask(_) | PermissionDecision::Deny => {
+                            AgentCommand::DenyTool
+                        }
+                    };
+                    let _ = client.cmd_tx.send(cmd);
+                }
+                AgentEvent::Error { error, .. } => {
+                    // NON-terminal. The bridge forwards the kernel error HERE and then
+                    // still emits a terminal TurnComplete/TurnCancelled (or closes the
+                    // channel). Breaking now would (a) write back the bridge's empty
+                    // `messages` and WIPE the conversation + on-disk session, and (b)
+                    // leave the bridge's later terminal events to be mis-read by the
+                    // NEXT turn. Surface the error and keep draining to the real end.
+                    emit(TurnEvent::Error(error));
+                }
+                AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
+                AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
+                _ => {}
+            }
+        };
+
+        // The approval slot is per-turn; clear it so a stale sender can't leak.
+        *approver.lock().await = None;
+
+        // Writeback: the engine's snapshot becomes the conversation of record.
+        // (Empty/None never reaches here for a real turn — Error is non-terminal and
+        // channel-close breaks with None — so this never clobbers `conv`.)
+        if let Some(msgs) = final_messages {
+            let mut c = conv.lock().await;
+            c.messages = msgs;
+        }
+
+        // Persist (stable session id → one file per session). Mirrors the legacy
+        // executor so /resume sees the conversation after a quit.
         {
             use atomcode_core::session::{Session, SessionManager};
             let conv_guard = conv.lock().await;
@@ -536,15 +960,194 @@ impl TurnExecutor for DaemonTurnExecutor {
             session.auto_name_from_messages();
             session.touch();
             if let Err(e) = SessionManager::new(&self.working_dir).save(&session) {
-                eprintln!("Warning: failed to save live session: {e}");
+                eprintln!("Warning: failed to save live session (v2): {e}");
             }
+        }
+
+        // A dead bridge can't serve another turn — drop it so the next run_turn
+        // rebuilds a fresh one (see the `guard.is_none()` lazy-init above).
+        if bridge_dead {
+            *guard = None;
         }
     }
 }
 
+/// Simple 1:1 `AgentEvent` → `TurnEvent` translations (the streaming surface both
+/// the `/live` executor and the `/chat` v2 producer forward). Returns `None` for
+/// events the caller handles specially (approval, turn terminals) or ignores.
+pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
+    Some(match ev {
+        AgentEvent::TextDelta(t) => TurnEvent::TextDelta(t),
+        AgentEvent::ReasoningDelta(t) => TurnEvent::ReasoningDelta(t),
+        AgentEvent::ToolCallStreaming { name, hint } => {
+            TurnEvent::ToolCallStreaming { name, hint }
+        }
+        AgentEvent::ToolCallStarted { id, name, arguments } => {
+            TurnEvent::ToolCallStarted { id, name, arguments }
+        }
+        AgentEvent::ToolOutputChunk { call_id, chunk } => {
+            TurnEvent::ToolOutputChunk { call_id, chunk }
+        }
+        AgentEvent::ToolCallResult { call_id, name, output, success, duration } => {
+            TurnEvent::ToolCallResult { call_id, name, output, success, duration }
+        }
+        AgentEvent::TokenUsage(u) => TurnEvent::TokenUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.prompt_tokens + u.completion_tokens,
+            cached_tokens: u.cached_tokens,
+        },
+        AgentEvent::ContextStats {
+            system_tokens,
+            sent_tokens,
+            dropped_tokens,
+            working_set_tokens,
+            total_messages,
+            ..
+        } => TurnEvent::ContextStats {
+            system_tokens,
+            sent_tokens,
+            dropped_tokens,
+            working_set_tokens,
+            total_messages,
+        },
+        AgentEvent::WorkingDirChanged(p) => TurnEvent::WorkingDirChanged(p),
+        AgentEvent::Warning(w) => TurnEvent::Warning(w),
+        _ => return None,
+    })
+}
+
+/// Derive the bridge config for a `/chat` request from the resolved provider.
+pub(crate) fn chat_bridge_config(
+    config: &Config,
+    provider_name: &str,
+    working_dir: &Path,
+    telemetry: Arc<Telemetry>,
+) -> atomcode_bridge::BridgeConfig {
+    let p = config.providers.get(provider_name);
+    atomcode_bridge::BridgeConfig {
+        api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
+        base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+        model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        working_dir: working_dir.to_path_buf(),
+        context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
+        mcp: true,
+        telemetry: Some(telemetry),
+        reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
+        reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
+        provider_type: p.map(|p| p.provider_type.clone()).unwrap_or_else(|| "openai".into()),
+        thinking_enabled: p.and_then(|p| p.thinking_enabled),
+        thinking_type: p.and_then(|p| p.thinking_type.clone()),
+        thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
+        // The daemon answers `/chat` approvals at its own seam (interactive perm_rx),
+        // so the bridge must keep the round-trip rather than auto-approving here.
+        dangerously_skip_permissions: false,
+        // Keep the fail-closed approval timeout for the daemon (current behavior).
+        interactive: false,
+    }
+}
+
+/// The engine-v2 producer for `/chat`: drive a bridged agent over `conv` and forward
+/// its events as `TurnEvent`s on `turn_tx` (which the shared `/chat` consumer turns
+/// into SSE). `perm_rx` carries interactive approval decisions from `/chat/permission`
+/// (`None` = auto-approve / standalone). The kernel snapshot is written back to `conv`
+/// so the caller persists the completed turn. Mirrors the `/live` KernelTurnExecutor.
+pub(crate) async fn run_chat_turn_v2(
+    conv: Arc<Mutex<Conversation>>,
+    turn_tx: mpsc::UnboundedSender<TurnEvent>,
+    cancel: CancellationToken,
+    bridge_cfg: atomcode_bridge::BridgeConfig,
+    mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
+) {
+    let (client, mut events) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
+
+    // Seed the bridge from conv (which already has the just-sent user message), then
+    // send that message to actually run the turn.
+    let (prefix, user_text, user_images) = {
+        let c = conv.lock().await;
+        let mut msgs = c.messages.clone();
+        let last = msgs.pop();
+        let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
+        (msgs, text, images)
+    };
+    // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
+    // （非视觉模型的 provider adapter 会因原图而报 400 错误）
+    let user_images = if user_text.contains("[图片内容（由") || user_text.contains("[图片识别失败]") {
+        Vec::new()
+    } else {
+        user_images
+    };
+    let _ = client.cmd_tx.send(AgentCommand::SetConversation(ConversationSnapshot {
+        messages: prefix,
+        cold_summaries: vec![],
+    }));
+    let _ = client.cmd_tx.send(AgentCommand::SendMessage {
+        text: user_text,
+        images: user_images,
+        image_markers: Vec::new(),
+    });
+
+    let mut cancelled = false;
+    let final_messages = loop {
+        let ev = tokio::select! {
+            _ = cancel.cancelled(), if !cancelled => {
+                cancelled = true;
+                let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                continue;
+            }
+            ev = events.recv() => ev,
+        };
+        let Some(ev) = ev else { break None };
+        match ev {
+            AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot } => {
+                let _ = turn_tx.send(TurnEvent::ApprovalRequested {
+                    tool_name,
+                    reason,
+                    call,
+                    snapshot,
+                });
+                let decision = match &mut perm_rx {
+                    None => PermissionDecision::Allow,
+                    Some(rx) => tokio::select! {
+                        _ = cancel.cancelled(), if !cancelled => {
+                            cancelled = true;
+                            let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                            PermissionDecision::Deny
+                        }
+                        d = rx.recv() => d.unwrap_or(PermissionDecision::Deny),
+                    },
+                };
+                let cmd = match decision {
+                    PermissionDecision::Allow => AgentCommand::ApproveTool,
+                    PermissionDecision::AllowAlways => AgentCommand::ApproveToolAlways,
+                    _ => AgentCommand::DenyTool,
+                };
+                let _ = client.cmd_tx.send(cmd);
+            }
+            AgentEvent::Error { error, .. } => {
+                // Non-terminal: forward, keep draining to the real terminal.
+                let _ = turn_tx.send(TurnEvent::Error(error));
+            }
+            AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
+            AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
+            other => {
+                if let Some(te) = agent_to_turn(other) {
+                    let _ = turn_tx.send(te);
+                }
+            }
+        }
+    };
+    if let Some(msgs) = final_messages {
+        let mut c = conv.lock().await;
+        c.messages = msgs;
+    }
+    // Dropping turn_tx here closes the consumer loop (its `turn_rx.recv()` returns
+    // None), which then persists conv and sends Done.
+}
+
 use crate::AppState;
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json,
@@ -615,6 +1218,8 @@ pub(crate) enum LiveWireEvent {
         call_id: String,
         arguments: String,
     },
+    #[serde(rename = "session_switched")]
+    SessionSwitched { session_id: String },
 }
 
 /// Map one LiveEvent → 0/1 wire events (variants the frontend doesn't need → None).
@@ -639,10 +1244,8 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
         // sync-mode TUI follows it directly via the in-process LiveEvent. Skip
         // the SSE wire (would need a dedicated LiveWireEvent + frontend handler).
         LiveEvent::WorkingDirChanged(_) => return None,
-        // Same as above: the session switch is followed in-process by the
-        // sync-mode TUI; the requesting client (mobile app) reconnects /live
-        // with the session_id itself, so nothing to push on the wire.
-        LiveEvent::SessionSwitched { .. } => return None,
+        // 会话切换：通知所有 webui tab 跟随切换到新会话。
+        LiveEvent::SessionSwitched(session_id) => LiveWireEvent::SessionSwitched { session_id },
         // 仅进程内：由 TUI 执行，结果走 CommandOutput 回来。
         LiveEvent::RemoteCommand(_) => return None,
         LiveEvent::CommandOutput(text) => LiveWireEvent::CommandOutput { text },
@@ -711,7 +1314,7 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
 // ============================================================================
 
 /// 把前端传来的 session_id 字符串解析为 `SessionId`（None/空字符串 → None）。
-/// 仅做解析、不读盘——历史加载留给 `load_session_messages`，且仅在 LiveSession
+/// 仅做解析、不读盘——历史加载留给 `load_session_seed`，且仅在 LiveSession
 /// 确实要新建/替换时经惰性闭包触发（见 ensure_live_session_global）。
 fn parse_session_id(session_id_str: Option<String>) -> Option<atomcode_core::session::SessionId> {
     let id_str = session_id_str?;
@@ -721,15 +1324,18 @@ fn parse_session_id(session_id_str: Option<String>) -> Option<atomcode_core::ses
     Some(atomcode_core::session::SessionId::from_string(id_str))
 }
 
-/// 从 SessionManager 加载指定会话的历史消息作为 LiveSession 种子；
+/// 从 SessionManager 加载指定会话的历史作为 LiveSession 种子；
 /// 加载失败时降级为空历史（不阻断）。
-fn load_session_messages(
+fn load_session_seed(
     working_dir: &std::path::Path,
     sid: &atomcode_core::session::SessionId,
-) -> Vec<atomcode_core::conversation::message::Message> {
+) -> (
+    Vec<atomcode_core::conversation::message::Message>,
+    Vec<String>,
+) {
     atomcode_core::session::SessionManager::new(working_dir)
         .load(sid)
-        .map(|s| s.messages)
+        .map(|s| (s.messages, s.cold_summaries))
         .unwrap_or_default()
 }
 
@@ -757,8 +1363,8 @@ pub(crate) async fn live_stream(
         state.telemetry.clone(),
         sid,
         move || match load_sid {
-            Some(s) => load_session_messages(&load_dir, &s),
-            None => Vec::new(),
+            Some(s) => load_session_seed(&load_dir, &s),
+            None => (Vec::new(), Vec::new()),
         },
     );
     let (snapshot, replay, mut rx) = session.join_with_replay().await;
@@ -871,8 +1477,11 @@ async fn preprocess_live_caption(
 
 pub(crate) async fn live_message(
     State(state): State<AppState>,
+    Extension(client_mode): Extension<atomcode_telemetry::SessionMode>,
     Json(req): Json<LiveMessageReq>,
 ) -> impl IntoResponse {
+    // 更新进程级 live mode，使 DaemonTurnExecutor::run_turn 能用它设置 telemetry envelope mode。
+    *LIVE_MODE.lock().unwrap() = Some(client_mode);
     let working_dir = { state.project.read().await.working_dir.clone() };
     // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
     set_live_provider(req.provider);
@@ -887,8 +1496,8 @@ pub(crate) async fn live_message(
         state.telemetry.clone(),
         sid,
         move || match load_sid {
-            Some(s) => load_session_messages(&load_dir, &s),
-            None => Vec::new(),
+            Some(s) => load_session_seed(&load_dir, &s),
+            None => (Vec::new(), Vec::new()),
         },
     );
     // 视觉预处理在 coordinator 经 executor.preprocess_input 统一做（TUI / webui 共享），

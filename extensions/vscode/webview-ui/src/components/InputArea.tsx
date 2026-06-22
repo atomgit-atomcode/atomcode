@@ -4,6 +4,7 @@ import { formatTokenCount } from '../utils/format';
 import { SlashPicker } from './SlashPicker';
 import { ModelSelector } from './ModelSelector';
 import { postMessage } from '../vscode';
+import { ImageData, SkillInfo } from '../state/types';
 
 interface WorkspaceFile {
   path: string;
@@ -11,18 +12,53 @@ interface WorkspaceFile {
   relativePath: string;
 }
 
+const MAX_IMAGES = 6;
+const MAX_IMAGE_MB = 2;
+const MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024;
+
+function fileToImageData(file: File): Promise<ImageData | null> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onerror = () => resolve(null);
+    reader.onload = () => {
+      const value = typeof reader.result === 'string' ? reader.result : '';
+      const comma = value.indexOf(',');
+      if (comma < 0) {
+        resolve(null);
+        return;
+      }
+      resolve({
+        media_type: file.type || 'image/png',
+        data: value.slice(comma + 1),
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function imageDataUrl(img: ImageData): string {
+  return `data:${img.media_type};base64,${img.data}`;
+}
+
 export function InputArea() {
   const { state, send, stop, dispatch } = useChatContext();
   const [text, setText] = useState('');
   const [showSlash, setShowSlash] = useState(false);
   const [slashFilter, setSlashFilter] = useState('');
+  const [slashSkills, setSlashSkills] = useState<SkillInfo[] | null>(null);
+  const [slashLoading, setSlashLoading] = useState(false);
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [fileQuery, setFileQuery] = useState('');
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
+  const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const inputBoxRef = useRef<HTMLDivElement>(null);
+  const attachMenuRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileSearchRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -37,11 +73,16 @@ export function InputArea() {
       if (e.data?.type === 'workspaceFiles') {
         setWorkspaceFiles(e.data.files || []);
       }
+      if (e.data?.type === 'skills') {
+        setSlashSkills(e.data.skills || []);
+        setSlashLoading(false);
+      }
       if (e.data?.type === 'setDraft') setText(e.data.text);
+      if (e.data?.type === 'insertText') insertAtCursor(e.data.text);
     }
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, []);
+  }, [text]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -68,7 +109,7 @@ export function InputArea() {
   // Close pickers when clicking outside their relevant areas
   // Capture phase so no child handler can stop this from firing
   useEffect(() => {
-    if (!showFilePicker && !showSlash) return;
+    if (!showFilePicker && !showSlash && !showAttachMenu) return;
     if (showFilePicker) {
       requestAnimationFrame(() => fileSearchRef.current?.focus());
     }
@@ -90,10 +131,19 @@ export function InputArea() {
       if (showSlash && inputBoxRef.current && !inputBoxRef.current.contains(target)) {
         setShowSlash(false);
       }
+      if (showAttachMenu && attachMenuRef.current && !attachMenuRef.current.contains(target)) {
+        setShowAttachMenu(false);
+      }
     }
     document.addEventListener('mousedown', closePickers, true);
     return () => document.removeEventListener('mousedown', closePickers, true);
-  }, [showFilePicker, showSlash]);
+  }, [showAttachMenu, showFilePicker, showSlash]);
+
+  const ensureSlashSkills = useCallback(() => {
+    if (slashSkills !== null || slashLoading) return;
+    setSlashLoading(true);
+    postMessage({ type: 'getSkills' });
+  }, [slashLoading, slashSkills]);
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
@@ -101,18 +151,49 @@ export function InputArea() {
     if (/^\/\S*$/.test(val)) {
       setSlashFilter(val.slice(1).split(/\s/)[0]);
       setShowSlash(true);
+      ensureSlashSkills();
     } else {
       setShowSlash(false);
     }
+  }, [ensureSlashSkills]);
+
+  const insertAtCursor = useCallback((value: string) => {
+    const el = textareaRef.current;
+    const start = el?.selectionStart ?? text.length;
+    const end = el?.selectionEnd ?? text.length;
+    const next = text.slice(0, start) + value + text.slice(end);
+    setText(next);
+    requestAnimationFrame(() => {
+      const current = textareaRef.current;
+      if (!current) return;
+      const pos = start + value.length;
+      current.focus();
+      current.setSelectionRange(pos, pos);
+    });
+  }, [text]);
+
+  const addImageFiles = useCallback(async (files: File[] | FileList) => {
+    const images = Array.from(files).filter((file) => file.type.startsWith('image/'));
+    if (images.length === 0) return;
+    const oversized = images.some((file) => file.size > MAX_IMAGE_BYTES);
+    setAttachError(oversized ? `Images must be under ${MAX_IMAGE_MB} MB.` : null);
+    const allowed = images.filter((file) => file.size <= MAX_IMAGE_BYTES);
+    if (allowed.length === 0) return;
+    const parsed = (await Promise.all(allowed.map(fileToImageData))).filter(
+      (img): img is ImageData => img !== null,
+    );
+    setPendingImages((prev) => [...prev, ...parsed].slice(0, MAX_IMAGES));
   }, []);
 
   const handleSend = useCallback(() => {
     const trimmed = text.trim();
-    if (!trimmed) return;
-    send(trimmed);
+    if (!trimmed && pendingImages.length === 0) return;
+    send(trimmed, pendingImages.length > 0 ? pendingImages : undefined);
     setText('');
+    setPendingImages([]);
+    setAttachError(null);
     setShowSlash(false);
-  }, [text, send]);
+  }, [pendingImages, text, send]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -138,24 +219,40 @@ export function InputArea() {
       if (open) { setText(''); return false; }
       setText('/');
       setSlashFilter('');
+      ensureSlashSkills();
       return true;
     });
     textareaRef.current?.focus();
-  }, []);
+  }, [ensureSlashSkills]);
 
   // ── File picker ──────────────────────────────────────────────
 
   const handleAttachClick = useCallback(() => {
-    setShowFilePicker((prev) => {
-      const next = !prev;
-      if (next) {
-        setShowSlash(false);
-        postMessage({ type: 'searchWorkspaceFiles', query: '' });
-      } else {
-        setFileQuery('');
-      }
-      return next;
-    });
+    setShowAttachMenu((prev) => !prev);
+    setShowSlash(false);
+    setShowFilePicker(false);
+  }, []);
+
+  const openFilePicker = useCallback(() => {
+    setShowAttachMenu(false);
+    setShowFilePicker(true);
+    setShowSlash(false);
+    postMessage({ type: 'searchWorkspaceFiles', query: '' });
+  }, []);
+
+  const pickPath = useCallback(() => {
+    setShowAttachMenu(false);
+    postMessage({ type: 'pickPathForInsert' });
+  }, []);
+
+  const pickContextFile = useCallback(() => {
+    setShowAttachMenu(false);
+    postMessage({ type: 'pickContextFile' });
+  }, []);
+
+  const openImagePicker = useCallback(() => {
+    setShowAttachMenu(false);
+    imageInputRef.current?.click();
   }, []);
 
   const handleFileSearch = useCallback((query: string) => {
@@ -170,13 +267,54 @@ export function InputArea() {
     textareaRef.current?.focus();
   }, []);
 
-  const hasText = Boolean(text.trim());
+  const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (const item of Array.from(items)) {
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length > 0) {
+      e.preventDefault();
+      void addImageFiles(files);
+    }
+  }, [addImageFiles]);
+
+  const hasText = Boolean(text.trim() || pendingImages.length > 0);
 
   return (
     <div className="input-container" ref={containerRef}>
       <div className="input-box" ref={inputBoxRef}>
         {showSlash && (
-          <SlashPicker filter={slashFilter} onSelect={handleSlashSelect} onClose={() => setShowSlash(false)} />
+          <SlashPicker
+            filter={slashFilter}
+            skills={slashSkills ?? []}
+            onSelect={handleSlashSelect}
+            onClose={() => setShowSlash(false)}
+          />
+        )}
+        {showAttachMenu && (
+          <div className="attach-menu-popover" ref={attachMenuRef}>
+            <button type="button" className="attach-menu-item" onClick={pickPath}>
+              <span className="attach-menu-icon">#</span>
+              <span>Insert path</span>
+            </button>
+            <button type="button" className="attach-menu-item" onClick={pickContextFile}>
+              <span className="attach-menu-icon">+</span>
+              <span>Choose file</span>
+            </button>
+            <button type="button" className="attach-menu-item" onClick={openFilePicker}>
+              <span className="attach-menu-icon">@</span>
+              <span>Search workspace</span>
+            </button>
+            <button type="button" className="attach-menu-item" onClick={openImagePicker}>
+              <span className="attach-menu-icon">□</span>
+              <span>Upload image</span>
+            </button>
+          </div>
         )}
         {showFilePicker && (
           <div className="file-picker">
@@ -212,6 +350,29 @@ export function InputArea() {
             </div>
           </div>
         )}
+        {attachError && (
+          <div className="input-attach-error" role="alert">
+            <span>{attachError}</span>
+            <button type="button" onClick={() => setAttachError(null)} aria-label="Dismiss">×</button>
+          </div>
+        )}
+        {pendingImages.length > 0 && (
+          <div className="input-image-previews">
+            {pendingImages.map((img, index) => (
+              <div className="input-image-preview" key={`${img.media_type}-${index}`}>
+                <img src={imageDataUrl(img)} alt="" />
+                <button
+                  type="button"
+                  aria-label="Remove image"
+                  title="Remove image"
+                  onClick={() => setPendingImages((prev) => prev.filter((_, i) => i !== index))}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         {state.contextFiles.length > 0 && (
           <div className="attached-files">
             {state.contextFiles.map((f) => (
@@ -242,8 +403,20 @@ export function InputArea() {
           value={text}
           onChange={handleChange}
           onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
           placeholder="Type a message..."
           rows={1}
+        />
+        <input
+          ref={imageInputRef}
+          className="hidden-file-input"
+          type="file"
+          accept="image/*"
+          multiple
+          onChange={(e) => {
+            if (e.currentTarget.files) void addImageFiles(e.currentTarget.files);
+            e.currentTarget.value = '';
+          }}
         />
         <div className="input-footer">
           <button className="footer-slash-btn" onClick={handleSlashButton} title="Commands">

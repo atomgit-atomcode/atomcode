@@ -1,0 +1,130 @@
+[package]
+name = "atomcode-capabilities"
+version = "0.0.0"
+edition = "2021"
+description = "L1 capabilities layered on atomcode-kernel (L0): real provider adapters, tools, mcp, skills. Depends ONLY on the kernel."
+publish = false
+
+[dependencies]
+# L0 only. NEVER add atomcode-core or any L2/L3 crate here (layering is compile-enforced).
+atomcode-kernel = { path = "../atomcode-kernel" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# `provider` capability deps (HTTP + SSE). Optional so a downstream embedder that
+# only wants other capabilities does not pull in the TLS/HTTP stack.
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false, optional = true }
+bytes = { version = "1", optional = true }
+async-stream = { version = "0.3", optional = true }
+# `tools` capability deps. gitignore-aware file walking (grep/glob), regex (grep),
+# glob matching (glob). Optional so a provider-only embedder skips them.
+ignore = { version = "0.4", optional = true }
+regex = { version = "1", optional = true }
+globset = { version = "0.4", optional = true }
+# `codeintel` capability deps (tree-sitter symbol extraction). Heavy C compilation, so
+# opt-in (NOT in default) — an embedder that wants only provider/tools skips all grammars.
+tree-sitter = { version = "0.26", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
+tree-sitter-html = { version = "0.23", optional = true }
+tree-sitter-php = { version = "0.24", optional = true }
+# `lsp` capability deps: detect whether a language server is installed + file:// URIs.
+which = { version = "7", optional = true }
+url = { version = "2", optional = true }
+# `mcp` capability deps: connect external MCP servers (stdio/HTTP/OAuth). `anyhow` is the
+# ported transport/registry/oauth internal Result type (never leaks past the Tool adapter,
+# which maps it to ToolResult{is_error}); sha2/base64/uuid are the OAuth PKCE primitives;
+# dirs replaces core's home-dir helper. Optional — a non-MCP embedder pulls none of this.
+anyhow = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+dirs = { version = "6", optional = true }
+toml = { version = "0.8", optional = true }
+# `session` capability deps: chrono for epoch↔ISO + local-time date math (transcript
+# timestamps, current-date injection, recall date filtering). dirs (already optional)
+# resolves $ATOMCODE_HOME/sessions. Matches production's chrono pin.
+chrono = { version = "0.4", optional = true }
+
+[features]
+default = ["provider", "tools"]
+# Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …). `dirs` resolves the
+# wire-dump output dir (config_dir()/wire-dump) for the byte-level ATOMCODE_WIRE_DUMP.
+provider = ["dep:reqwest", "dep:bytes", "dep:async-stream", "dep:dirs"]
+# Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
+# approval middleware. Pulls fs/process/io tokio features + the search stack.
+tools = ["dep:ignore", "dep:regex", "dep:globset", "tokio/fs", "tokio/process", "tokio/io-util"]
+# Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
+# (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
+# that wants no network egress skips it.
+web = ["tools", "dep:reqwest", "dep:url", "tokio/net"]
+# AtomGit REST tools (atomgit_repo / atomgit_pr / atomgit_issue). Opt-in on top of
+# `tools`; pulls the async HTTP stack (reqwest). NOT in default — an embedder that
+# wants no AtomGit egress skips it.
+atomgit = ["tools", "dep:reqwest"]
+# Code-intelligence tools (tree-sitter symbol extraction): list_symbols / read_symbol.
+# Opt-in (NOT default) — pulls 12 tree-sitter grammar crates (heavy C compilation).
+codeintel = [
+    "dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript", "dep:tree-sitter-typescript", "dep:tree-sitter-go",
+    "dep:tree-sitter-java", "dep:tree-sitter-c", "dep:tree-sitter-cpp",
+    "dep:tree-sitter-c-sharp", "dep:tree-sitter-html", "dep:tree-sitter-php",
+    # the cross-file graph layer (build_graph) walks the repo gitignore-aware
+    "dep:ignore",
+]
+# LSP diagnostics (spawns external language servers, JSON-RPC over stdio). Opt-in on top
+# of codeintel; needs the language servers installed (graceful "not available" if not).
+lsp = ["codeintel", "dep:which", "dep:url", "tokio/process", "tokio/io-util", "tokio/fs"]
+# Real-server LSP e2e (needs rust-analyzer etc. installed) — default-off, on demand.
+lsp-e2e = ["lsp"]
+# Skills: markdown/frontmatter skill loader + use_skill / list_skills tools. No new deps.
+skills = []
+# E2E tests that hit a REAL provider (network + API key). Separate from the default
+# suite; run on demand: `cargo test -p atomcode-capabilities --features e2e --test e2e`.
+e2e = ["provider"]
+# MCP client: connect external MCP servers (stdio/HTTP/OAuth) + surface their tools as
+# kernel Tools. Opt-in (NOT default). `reqwest/blocking` powers the one-shot OAuth
+# login/refresh flow; transport_http uses the async reqwest client. OAuth's callback
+# listener is std::net (no tokio/net needed).
+mcp = [
+    "dep:anyhow", "dep:sha2", "dep:base64", "dep:uuid", "dep:dirs", "dep:toml",
+    "dep:reqwest", "reqwest/blocking", "dep:url",
+    "tokio/process", "tokio/io-util",
+]
+# Session persistence + cross-session recall: two-tier on-disk store
+# ($ATOMCODE_HOME/sessions/<project_hash>/ — same scheme as production so old/new
+# coexist) — a per-turn compacted <id>.snapshot for RESUME + an append-only,
+# never-compacted <id>.jsonl transcript for RECALL — plus the SnapshotHook /
+# TranscriptHook / recall tool / current-date hook that drive it. Opt-in (NOT default).
+session = ["dep:dirs", "dep:chrono"]
+# User-driven persistent memory: the production memory.md store (global
+# $ATOMCODE_HOME/memory.md + per-project <root>/.atomcode/memory.md, same files so
+# old/new coexist) + a MemoryHook that injects the merged entries at session_start.
+# v1 is USER-driven only (driver slash-commands write the store); no model-facing
+# remember/forget tools. Opt-in (NOT default).
+memory = ["dep:dirs"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }
+# Local mock HTTP server for deterministic provider tests (retry / multi-round).
+wiremock = "0.6"
+# Temp dirs for the tool tests; cancellation token construction in tests.
+tempfile = "3"
+tokio-util = "0.7"
+
+# In-tree stdio MCP server used as a deterministic fixture by the `mcp` integration
+# tests (tests/mcp.rs). Built only with the `mcp` feature; the test spawns it via the
+# CARGO_BIN_EXE_mcp-test-server path Cargo injects.
+[[bin]]
+name = "mcp-test-server"
+path = "src/bin/mcp-test-server.rs"
+required-features = ["mcp"]

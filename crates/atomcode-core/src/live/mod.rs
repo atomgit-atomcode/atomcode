@@ -50,14 +50,9 @@ pub enum LiveEvent {
     /// 会切到新目录并开一个全新 session（见 event_loop/live_sync 转发）。仅广播
     /// 路径，不触碰 turn 状态。
     WorkingDirChanged(std::path::PathBuf),
-    /// 任一视图（手机 App 点开历史会话）要求切到指定项目的**指定会话**。与
-    /// [`LiveEvent::WorkingDirChanged`]（切项目+开新会话）不同，跟随方应 cd 到
-    /// `dir`（如不同）并**恢复** `session_id` 对应的会话（加载历史，而非新建）。
-    /// 仅进程内广播，不上 /live SSE 线（见 daemon to_wire）。
-    SessionSwitched {
-        dir: std::path::PathBuf,
-        session_id: String,
-    },
+    /// 任一视图（webui）创建了新会话并切换到它。其余视图据此同步创建新会话。
+    /// 参数为新会话 ID。
+    SessionSwitched(String),
     /// 手机 App 请求在桌面 TUI 执行一条斜杠命令（如 `/status`）。仅进程内广播
     /// （to_wire 跳过）；TUI 侧白名单校验后执行，输出经
     /// [`LiveEvent::CommandOutput`] 广播回所有视图。
@@ -117,10 +112,16 @@ pub struct LiveSession {
 impl LiveSession {
     /// 用注入的执行器与初始消息建会话，并 spawn 协调器任务。返回 `Arc` 以便多视图共享。
     pub fn new(executor: Arc<dyn TurnExecutor>, initial: Vec<Message>) -> Arc<Self> {
+        Self::new_with_cold_summaries(executor, initial, Vec::new())
+    }
+
+    pub fn new_with_cold_summaries(
+        executor: Arc<dyn TurnExecutor>,
+        initial: Vec<Message>,
+        cold_summaries: Vec<String>,
+    ) -> Arc<Self> {
         let conversation = Arc::new(Mutex::new({
-            let mut c = Conversation::new();
-            c.messages = initial.clone();
-            c
+            Conversation::from_messages_and_cold_summaries(initial.clone(), cold_summaries)
         }));
         let snapshot = Arc::new(Mutex::new(initial));
         let (events, _rx) = broadcast::channel(BROADCAST_CAPACITY);
@@ -223,13 +224,10 @@ impl LiveSession {
         self.events.send(LiveEvent::WorkingDirChanged(dir)).is_ok()
     }
 
-    /// 广播「切到指定项目的指定会话」给所有视图（不触碰 turn 状态）。手机 App
-    /// 点开历史会话（/cd 带 session_id）时调用，让同进程 TUI 跟随 cd 并恢复该
-    /// 会话。返回 false 表示当前无订阅者（无妨）。
-    pub fn notify_session_switched(&self, dir: std::path::PathBuf, session_id: String) -> bool {
-        self.events
-            .send(LiveEvent::SessionSwitched { dir, session_id })
-            .is_ok()
+    /// 广播一次会话切换给所有视图（不触碰 turn 状态）。webui 新建对话时调用，
+    /// 让同进程 TUI 跟随切换到新会话。返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_session_switched(&self, session_id: String) -> bool {
+        self.events.send(LiveEvent::SessionSwitched(session_id)).is_ok()
     }
 
     /// 广播「请在桌面 TUI 执行这条斜杠命令」（手机 App 发起）。返回 false 表示

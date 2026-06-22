@@ -45,18 +45,30 @@ pub enum ReasoningPolicy {
     Exclude,
 }
 
-/// Sentinel emitted on outbound `reasoning_content` when we have nothing to
-/// echo (cross-provider handoff, pre-fix session, non-thinking model that
-/// still tool-called) but the receiving API requires the field to be
-/// non-empty (DeepSeek V4 thinking mode rejects empty strings).
+/// Sentinel emitted on outbound `reasoning_content` when we have nothing real
+/// to echo (cross-provider handoff, pre-fix session, non-thinking model that
+/// still tool-called, or a thinking model that emitted no reasoning this turn)
+/// but the receiving API requires the field present and non-empty: DeepSeek V4
+/// thinking mode rejects an empty string, and 400s the "second prompt" if a
+/// tool-call turn's final-text message omits it entirely.
 ///
-/// `TurnRunner::Done` checks reasoning_buf against this exact value and
-/// refuses to promote it back into the assistant text channel — without that
-/// gate, a buggy gateway echoing our placeholder caused silent
-/// `Nailed it · 0 tok` mid-task stops (user reported `(no reasoning
-/// recorded)` showing up as the only assistant output after 17 reading
-/// rounds).
-pub const REASONING_PLACEHOLDER: &str = "(no reasoning recorded)";
+/// MUST NOT be fluent natural language. DeepSeek V4 Flash is a thinking model;
+/// at high context (~200K) a history full of an English placeholder *sentence*
+/// made it MIMIC the repeated phrase back as its own output — surfacing
+/// `(no reasoning recorded)` as the only assistant text and stalling the turn
+/// (`Nailed it · 0 tok`; user reported it as the only output after 17 reading
+/// rounds). A single non-prose glyph satisfies the non-empty contract while
+/// giving the model no natural-language pattern to reproduce. `c61bfd07`
+/// already preserves *real* reasoning, so this sentinel only fires when the
+/// model genuinely emitted none — this keeps that residual filler invisible.
+///
+/// `TurnRunner::Done` strips this exact value (`is_only_placeholder_filler`)
+/// and refuses to promote a buffer that is only copies of it into the
+/// assistant text channel — without that gate a gateway echoing it back caused
+/// the silent mid-task stops above. Both send sites (`format_messages`) and
+/// that guard route through this one constant, so the value can change here
+/// without desyncing them.
+pub const REASONING_PLACEHOLDER: &str = "·";
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -115,6 +127,12 @@ pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool
         // SSE-level idle timeout (openai.rs, 120 s) catches dead streams
         // before the request-level timeout.
         .timeout(std::time::Duration::from_secs(1800))
+        // Drop idle keep-alive connections (default 90s) before the gateway LB
+        // closes them (≈60s) — otherwise we reuse a server-closed socket and
+        // hit "error sending request" / ConnectionReset. Only reaps *idle*
+        // connections; active streams are untouched. Pairs with the broadened
+        // retry classifier in `retry::is_retryable_error` as a backstop.
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
         .user_agent(ua);
 
     if skip_tls_verify {

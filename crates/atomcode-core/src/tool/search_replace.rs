@@ -90,12 +90,12 @@ impl Tool for SearchReplaceTool {
     }
 
     fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
-        // Same merge contract as edit.rs::approval_with_context: when
-        // the per-path workspace check defers (in-workspace AutoApprove)
-        // but the sensitivity check fired in `approval()`, upgrade to
-        // RequireApprovalAlways so a prior [A] on search_replace cannot
-        // bypass the sensitive-scope guard. Out-of-workspace writes are
-        // already RequireApprovalAlways from `approval_for_path` itself.
+        // Scope any prompt to the exact target file (see
+        // `scoped_write_approval`): the sensitivity check from `approval()`
+        // and the out-of-workspace boundary check both route through a
+        // per-file `RequireApprovalScoped`, so a session [A] remembers THAT
+        // file (re-running on it stops re-prompting) while a tool-wide grant
+        // can't bypass a sensitive bulk replace.
         let base = self.approval(args);
         let parsed = match serde_json::from_str::<SearchReplaceArgs>(args) {
             Ok(parsed) => parsed,
@@ -106,26 +106,7 @@ impl Tool for SearchReplaceTool {
             Err(_) => return base,
         };
         let raw_path = parsed.path.as_deref().unwrap_or(".");
-        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Write) {
-            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => {
-                ApprovalRequirement::RequireApprovalAlways(reason)
-            }
-            Ok(ApprovalRequirement::RequireApproval(reason)) => {
-                ApprovalRequirement::RequireApproval(reason)
-            }
-            // Writes never path-scope; treat a scoped result (the Write action
-            // doesn't produce one today) as the strictest always-ask.
-            Ok(ApprovalRequirement::RequireApprovalScoped { reason, .. }) => {
-                ApprovalRequirement::RequireApprovalAlways(reason)
-            }
-            Ok(ApprovalRequirement::AutoApprove) => match base {
-                ApprovalRequirement::RequireApproval(reason) => {
-                    ApprovalRequirement::RequireApprovalAlways(reason)
-                }
-                other => other,
-            },
-            Err(_) => base,
-        }
+        super::scoped_write_approval(raw_path, &working_dir, base)
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
@@ -366,11 +347,11 @@ mod tests {
     }
 
     /// Regression: sensitive in-workspace path must return
-    /// RequireApprovalAlways so a prior session [A] on search_replace
-    /// cannot disarm the guard for `.env` / `id_rsa` / `*.pem` etc.
-    /// Mirrors the edit.rs P1 fix.
+    /// RequireApprovalScoped so a tool-wide session [A] on search_replace
+    /// cannot disarm the guard for `.env` / `id_rsa` / `*.pem` etc., while a
+    /// per-file [A] is remembered for that exact file. Mirrors the edit.rs fix.
     #[test]
-    fn search_replace_sensitive_in_workspace_path_returns_always() {
+    fn search_replace_sensitive_in_workspace_path_returns_scoped() {
         let workspace = tempfile::TempDir::new().unwrap();
         // is_sensitive_input_path matches SECRET_FILE_NAMES by file_name
         // anywhere on disk. `.env` is the canonical example.
@@ -384,8 +365,8 @@ mod tests {
         let ctx = ToolContext::new(workspace.path().to_path_buf());
         let approval = SearchReplaceTool.approval_with_context(&args, &ctx);
         assert!(
-            matches!(approval, ApprovalRequirement::RequireApprovalAlways(_)),
-            "sensitive in-workspace path (.env) must require Always",
+            matches!(approval, ApprovalRequirement::RequireApprovalScoped { .. }),
+            "sensitive in-workspace path (.env) must require a per-file scoped prompt",
         );
     }
 

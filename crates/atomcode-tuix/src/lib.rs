@@ -1,10 +1,15 @@
 // crates/atomcode-tuix/src/lib.rs
 
 pub mod commands;
+pub mod custom_commands;
 pub mod event_loop;
+pub mod git;
 pub mod highlight;
 pub mod i18n;
+pub mod init;
 pub mod input;
+pub mod pricing;
+pub mod version_check;
 pub mod markdown;
 pub mod modals;
 pub mod platform;
@@ -34,6 +39,7 @@ use tokio::sync::mpsc;
 
 use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
+pub use crate::event_loop::RuntimeSpawnOverride;
 use crate::input::history::History;
 use crate::input::reader;
 use crate::render::{
@@ -50,6 +56,18 @@ struct TerminalGuard {
     /// pushed. Guards the matching pop in Drop so we don't send a stray
     /// pop sequence on terminals that rejected the push.
     kbd_flags_pushed: bool,
+}
+
+/// Whether to push the Kitty keyboard protocol (CSI u progressive
+/// enhancement) for this terminal. True only on a real non-Windows TTY
+/// that is not JediTerm. Windows has no `CSI u` decoder and JediTerm
+/// mis-frames mouse reports as kitty key events once the protocol is
+/// armed — both leak raw bytes into the input box (see the call site for
+/// the full rationale). Pure so it can be unit-tested without touching
+/// the real stdout. Mirrored by the resume-path gate in
+/// `RetainedRenderer::resume_after_external`.
+pub(crate) fn should_enable_kitty_keyboard(caps: &TerminalCaps) -> bool {
+    caps.tty && !cfg!(windows) && !caps.jediterm
 }
 
 impl TerminalGuard {
@@ -95,7 +113,33 @@ impl TerminalGuard {
         // to pop. Terminals that support DISAMBIGUATE but not
         // REPORT_EVENT_TYPES ignore the extra bit silently — this never
         // makes things worse than before.
-        let kbd_enhanced = caps.tty
+        //
+        // WINDOWS EXCLUSION: never push on Windows. crossterm's Windows
+        // input backend reads Win32 console KEY_EVENT records (not an ANSI
+        // parser), so it already reports Shift+Enter modifiers and autorepeat
+        // (Press/Repeat/Release) natively — the two things this push buys on
+        // Unix — making the protocol pure downside here. Worse, it has no
+        // `CSI u` decoder at all, so once a terminal honours the push and
+        // starts encoding KEYPAD keys as functional codes (numpad 1 →
+        // `ESC[57400u`), ConPTY (VSCode integrated terminal, Windows Terminal)
+        // delivers the un-decoded bytes as the literal characters `[57400u`
+        // straight into the input box. Unix crossterm decodes 57400 → '1';
+        // Windows can't, so we simply don't ask the terminal to use it.
+        //
+        // JEDITERM EXCLUSION: same failure class on JetBrains' JediTerm (the
+        // terminal inside DevEco Studio, IDEA, Android Studio, …). Recent
+        // JediTerm advertises the Kitty protocol but mis-implements it: while
+        // the progressive-enhancement flags are active it re-frames the
+        // terminal's mouse-tracking reports as `CSI <n> u` key events, so a
+        // bare mouse *move* over the panel floods stdin with kitty key
+        // sequences. crossterm faithfully decodes each `<n>` codepoint to a
+        // `Char`, which lands in the input box as a stream of coordinate
+        // gibberish (`#B'#B(#@)…`). The push buys nothing here either — the
+        // IDE terminals deliver Shift+Enter usably without it — so, exactly
+        // like Windows, we don't arm the protocol. Detection reuses
+        // `caps.jediterm` (`TERMINAL_EMULATOR=JetBrains-JediTerm`, with the
+        // `ATOMCODE_JEDITERM` override for launchers that drop the env var).
+        let kbd_enhanced = should_enable_kitty_keyboard(&caps)
             && execute!(
                 io::stdout(),
                 PushKeyboardEnhancementFlags(
@@ -171,6 +215,7 @@ pub async fn run(
     model_name: String,
     agent_handle: AgentHandle,
     runtime_factory: AgentRuntimeFactory,
+    runtime_spawn_override: Option<RuntimeSpawnOverride>,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
@@ -417,7 +462,7 @@ pub async fn run(
         let wake = wake_tx.clone();
         tokio::spawn(async move {
             let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-            if let Some(latest) = atomcode_core::version_check::check_latest(&current).await {
+            if let Some(latest) = crate::version_check::check_latest(&current).await {
                 if let Ok(mut g) = slot.lock() {
                     *g = Some(latest);
                 }
@@ -462,7 +507,7 @@ pub async fn run(
         dirs
     };
 
-    let custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
+    let custom_commands = crate::custom_commands::CustomCommandRegistry::load(&working_dir);
     // Same Arc the agent loop holds — reload() calls there propagate
     // here automatically, so the slash menu reflects newly-installed
     // skills without re-plumbing.
@@ -532,6 +577,7 @@ pub async fn run(
         model_name,
         agent: agent_client,
         runtime_factory,
+        runtime_spawn_override,
         bg_manager,
         foreground_runtime_id,
         runtime_event_tx,

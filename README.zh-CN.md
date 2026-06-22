@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.3-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -56,6 +56,13 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **循环检测** —— 识别并打破重复调用同一工具的死循环
 - **三层 JSON 修复** —— 修复畸形工具调用参数
 - **Turn 级 datalog** —— 结构化记录每一轮工具调用，便于回放、调试和评测
+
+### 模式与自主
+
+- **Plan / Build 模式** —— `/plan` 切换到只读探索模式（agent 只调研、不改文件），`/build` 切回完整执行
+- **目标模式** —— `/goal <目标>` 设定完成条件后，agent 会一轮接一轮自动循环执行，直到目标达成
+- **代码审查** —— `/review` 审查当前改动，`/review staged` 审查暂存区，`/review <base>` 对比某个基准 ref
+- **后台会话** —— `/bg` 把任务放到分离的槽位执行，长任务进行时你仍可继续使用 TUI
 
 ### 内置工具
 
@@ -314,30 +321,96 @@ atomcode --prompt-file task.md
 
 ### 斜杠命令
 
+在 TUI 中输入 `/` 即可浏览完整列表并实时补全；`/help` 会列出命令与快捷键。
+
+**会话与工作区**
+
 | 命令 | 动作 |
 |---------|--------|
 | `/resume` | 恢复或切换会话 |
 | `/session` | 创建新会话 |
+| `/rename <名称>` | 重命名当前会话 |
+| `/clear` | 开始新对话（清空上下文与屏幕） |
 | `/bg` | 将当前会话放到后台；子命令：`/bg list`、`/bg <N>`、`/bg drop <N>`、`/bg help` |
 | `/background <task>` | 兼容入口：在 `/bg` 槽位中启动一次性后台任务 |
-| `/provider` | 管理 provider |
-| `/model` | 切换模型 / provider |
-| `/login` | 通过 AtomGit OAuth 登录 |
 | `/cd` | 切换工作目录 |
-| `/paste` | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
-| `/undo` | 撤销上一轮的文件编辑 |
-| `/diff` | 显示当前修改的 git diff |
-| `/cost` | 显示本次会话的 token 消耗 |
-| `/copy` | 复制 AI 的最后一条回复 |
-| `/clear` | 清空对话 |
-| `/issue` | 在 AtomGit 上创建 issue |
-| `/config` | 编辑配置文件 |
-| `/status` | 查看登录状态和模型信息 |
-| `/logout` | 退出 AtomGit 登录 |
-| `/think` | 控制深度思考（on/off/budget N） |
+| `/worktree` | Git worktree 隔离（`create` / `list` / `done` / `cleanup`） |
+| `/webui` | 启动浏览器 webui（子命令：`stop`、`lan`、`--host <地址>`） |
+| `/sync` | 连接到实时 webui 会话（`/sync off` 断开） |
+
+**模式、自主与审查**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/plan` | 切换到 Plan 模式（只读探索） |
+| `/build` | 切换到 Build 模式（完整执行） |
+| `/goal <目标>` | 设置完成目标——agent 自动循环执行直到条件满足 |
+| `/review` | 代码审查当前改动（`/review` · `/review staged` · `/review <base>`） |
+| `/think` | 控制深度思考（on / off / budget N） |
 | `/effort` | DeepSeek 推理努力控制（high / max / off） |
+
+**Provider 与账号**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/model` | 切换模型 / provider |
+| `/provider` | 管理 provider（添加 / 编辑 / 删除） |
+| `/login` | 通过 AtomGit OAuth 登录 |
+| `/logout` | 退出 AtomGit 登录 |
+| `/whoami` | 查看当前登录用户 |
+| `/status` | 查看登录状态和模型信息 |
+
+**文件、编辑与上下文**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/diff` | 显示当前修改的 git diff |
+| `/undo` | 撤销某一轮的文件编辑（`/undo` 或 `/undo N`） |
+| `/view <文件路径>` | 在浮层窗口中查看文件内容 |
+| `/paste` | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
+| `/cost` | 显示本次会话的 token 消耗 |
+| `/context` | 查看上下文预算占用明细 |
+| `/compact` | 压缩对话历史 |
+
+**记忆**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/remember <事实>` | 保存一条记忆（`--global` 对所有项目生效） |
+| `/forget <关键词>` | 删除匹配的记忆 |
+| `/memory` | 查看所有已保存的记忆 |
+
+**扩展**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/mcp` | MCP 服务状态（子命令：`reload`、`tools`、`login`、`logout`） |
+| `/plugin` | 插件市场（`marketplace` / `install` / `uninstall` / `list`） |
+| `/skills` | 浏览已加载的 skills |
+
+**项目与系统**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/init` | 根据工作目录生成 `.atomcode.md` 项目指令 |
+| `/config` | 显示配置文件路径 |
+| `/reload` | 从磁盘重新加载 `~/.atomcode/config.toml` |
+| `/upgrade` | 升级 atomcode 到最新版（子命令：`rollback`） |
+| `/setup` | 首次运行：安装推荐 skill 并执行 |
+| `/welcome` | 重新运行引导向导 |
+| `/language` | 切换显示语言 |
+| `/issue` | 反馈 bug / 提交功能需求（交互式向导） |
+| `/guide <问题>` | 向 atomcode-guide 询问使用方式 |
+| `/keys` | 查看键盘快捷键 |
 | `/help` | 查看命令与快捷键 |
-| `/quit` | 退出程序（或连按 Ctrl+C） |
+| `/quit`、`/exit` | 退出 AtomCode（或连按 Ctrl+C） |
+
+> **插件命令**：除了上面的内置命令，插件还能注册自己的斜杠命令。例如安装官方频道插件后即可使用 `/wechat`（显示 AtomCode 微信用户群二维码）：
+>
+> ```text
+> /plugin marketplace add https://atomgit.com/atomgit_atomcode/AtomCode-Channel
+> /plugin install weixin@atomcode-channel
+> ```
 
 ## 架构
 

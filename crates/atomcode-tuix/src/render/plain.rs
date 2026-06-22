@@ -123,6 +123,17 @@ impl<W: Write + Send> PlainRenderer<W> {
             self.transient_active = false;
         }
     }
+
+    fn render_user(&mut self, text: &str, attachments: &[usize]) {
+        self.drop_transient();
+        if !self.interactive_terminal {
+            let chev = self.caps.prompt_chevron();
+            let _ = writeln!(self.out, "{}{}", chev, scrub_controls(text));
+        }
+        for n in attachments {
+            let _ = writeln!(self.out, "  └ [Image #{}]", n);
+        }
+    }
 }
 
 impl<W: Write + Send> Renderer for PlainRenderer<W> {
@@ -138,21 +149,16 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 );
             }
             UiLine::User(text) => {
-                self.drop_transient();
-                if !self.interactive_terminal {
-                    // Pipe / CI / dumb: kernel didn't echo the user's
-                    // input, so we render it here as the only source of
-                    // input visibility for log readers correlating
-                    // request ↔ response.
-                    let chev = self.caps.prompt_chevron();
-                    let _ = writeln!(self.out, "{}{}", chev, scrub_controls(&text));
-                }
+                self.render_user(&text, &[]);
                 // Interactive force_plain (JediTerm / legacy conhost /
                 // ATOMCODE_PLAIN=1 on a real TTY): cooked-mode kernel
                 // already echoed the user's keystrokes inline after the
                 // `❯ ` prefix that InputPrompt printed. Rendering
                 // `❯ {text}\n` here would produce the duplicate
                 // `❯ 你好` / `❯ 你好` pair that real-world users hit.
+            }
+            UiLine::UserWithAttachments { text, attachments } => {
+                self.render_user(&text, &attachments);
             }
             UiLine::AssistantText(text) => {
                 self.drop_transient();
@@ -396,6 +402,12 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 let _ = writeln!(self.out, "  {}  {}", msg, model);
                 let _ = writeln!(self.out);
             }
+            UiLine::ModalOverlay { .. } => {
+                // No overlay rendering in plain mode.
+            }
+            UiLine::ModalOverlayClear => {
+                // No-op in plain mode.
+            }
         }
     }
 
@@ -449,6 +461,7 @@ mod tests {
             scroll_region: false,
             unicode_symbols: false,
             legacy_conhost: false,
+            jediterm: false,
         }
     }
 
@@ -466,6 +479,7 @@ mod tests {
             scroll_region: false,
             unicode_symbols: true,
             legacy_conhost: false,
+            jediterm: true,
         }
     }
 

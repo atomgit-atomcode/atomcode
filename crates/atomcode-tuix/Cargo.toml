@@ -17,6 +17,9 @@ crossterm = "0.29"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Async HTTPS client for the passive version_check latest.json fetch
+# (moved here from atomcode-core along with the version_check module).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 toml = "0.8"
 unicode-width = "0.2"
 unicode-segmentation = "1"
@@ -60,3 +63,5 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 [dev-dependencies]
 tempfile = "3"
 vte = "0.15.0"
+# Serialize env-var-mutating custom_commands tests (moved from atomcode-core).
+serial_test = "3"

@@ -82,6 +82,10 @@ impl Default for SubAgentConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub default_provider: String,
+    /// Optional provider key for /goal evaluator (fast model like Haiku).
+    /// Falls back to `default_provider` when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluator_provider: Option<String>,
     /// Default working directory. Saved on /cd, restored on startup.
     pub default_workdir: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
@@ -150,6 +154,39 @@ pub struct Config {
     /// plugins track the binary.
     #[serde(default)]
     pub plugin: PluginConfig,
+    /// Web search backend. Missing from older configs → defaults to the
+    /// `exa` provider (reachable without a VPN, returns LLM-ready result
+    /// text). Set `provider = "duckduckgo"` to restore the legacy
+    /// HTML-scraping backend.
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
+}
+
+/// Web search backend configuration. Persisted as the `[web_search]` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchConfig {
+    /// Search backend: `"exa"` (default — MCP API at mcp.exa.ai, reachable
+    /// without a VPN and returns LLM-ready result text) or `"duckduckgo"`
+    /// (legacy HTML scraping of html.duckduckgo.com, blocked in some regions).
+    #[serde(default = "default_search_provider")]
+    pub provider: String,
+    /// Optional Exa API key. Also read from the `EXA_API_KEY` env var, which
+    /// takes precedence. When unset, Exa runs in its keyless tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+fn default_search_provider() -> String {
+    "exa".to_string()
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_search_provider(),
+            api_key: None,
+        }
+    }
 }
 
 /// Plugin / marketplace bootstrap configuration. Persisted as the
@@ -241,6 +278,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             default_provider: String::new(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
             datalog: Default::default(),
@@ -254,6 +292,7 @@ impl Default for Config {
             language: None,
             ui: UiConfig::default(),
             plugin: PluginConfig::default(),
+            web_search: WebSearchConfig::default(),
         }
     }
 }
@@ -740,6 +779,7 @@ mod tests {
     fn blank_config_with_lsp(lsp: LspConfig) -> Config {
         Config {
             default_provider: "x".into(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: Default::default(),
             datalog: Default::default(),
@@ -753,6 +793,7 @@ mod tests {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         }
     }
 
@@ -901,6 +942,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("atomcode_cfg_rt_{}.toml", std::process::id()));
         let mut cfg = Config {
             default_provider: "p".to_string(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
             datalog: DatalogConfig {
@@ -917,6 +959,7 @@ mod tests {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1118,6 +1161,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut cfg = Config {
             default_provider: "p".to_string(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
             datalog: DatalogConfig::default(),
@@ -1131,6 +1175,7 @@ mod tests {
             language: Some(crate::locale::Locale::ZhCn),
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1221,6 +1266,7 @@ mod tests {
         );
         Config {
             default_provider: "active".into(),
+            evaluator_provider: None,
             default_workdir: None,
             providers,
             datalog: Default::default(),
@@ -1234,6 +1280,7 @@ mod tests {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         }
     }
 

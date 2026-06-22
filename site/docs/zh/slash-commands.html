@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.25.0</span>
+    <span class="dhdr-ver">v4.25.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -100,8 +100,11 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
+          <tr><td><code>/view &lt;文件路径&gt;</code></td><td>以只读浮层打开文件内容（支持方向键翻页、PageUp/Down、g/G 跳转到首/末行）</td></tr>
           <tr><td><code>/undo</code> · <code>/undo N</code></td><td>把对话记忆回退到上一轮(或第 N 轮)之前,并把那一轮的 prompt 还原回输入框;只回退记忆,不恢复磁盘文件</td></tr>
           <tr><td><code>/diff</code></td><td>显示当前工作目录未提交改动的 git diff</td></tr>
+          <tr><td><code>/review</code></td><td>对当前改动做代码审查:<code>/review</code> 审查未提交改动,<code>/review staged</code> 审查暂存区,<code>/review &lt;base&gt;</code> 对比某个基准 ref</td></tr>
+          <tr><td><code>/paste</code></td><td>从剪贴板粘贴图片(Windows 下 <code>Ctrl+V</code> 被终端拦截时的备用入口)</td></tr>
           <tr><td><code>/cost</code></td><td>展示当前会话输出 token 数。不支持 usage 报告的 API 会自动估算</td></tr>
           <tr><td><code>/context</code></td><td>显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用</td></tr>
           <tr><td><code>/compact</code></td><td>压缩历史消息,把早期对话压缩成摘要以腾出上下文预算</td></tr>
@@ -121,8 +124,10 @@
         <tbody>
           <tr><td><code>/plan</code></td><td>切到 <strong>Plan 模式</strong>:只读探索,模型可以调用 <code>read_file</code> / <code>grep</code> / <code>list_directory</code> 等不写盘的工具,但 <code>edit_file</code> / <code>bash</code> 等会被屏蔽。适合在动手之前让模型先理清方案</td></tr>
           <tr><td><code>/build</code></td><td>切回 <strong>Build 模式</strong>(默认):全部工具可用,可以读、写、执行。<code>/plan</code> 和 <code>/build</code> 之间可随时来回切</td></tr>
+          <tr><td><code>/goal &lt;目标&gt;</code></td><td>设定一个完成目标,让 agent <strong>自动循环</strong>——一轮接一轮——直到目标达成。<code>/goal</code>(无参数)查看当前目标与轮数,<code>/goal clear</code> 停止</td></tr>
           <tr><td><code>/think on</code> / <code>off</code></td><td>开关 extended thinking(对支持的模型 — Claude / DeepSeek-R1 / GLM-4.5 等)。开启后模型会输出推理过程,代价是更慢更费 token</td></tr>
           <tr><td><code>/think budget &lt;N&gt;</code></td><td>给 thinking 设个 token 预算上限(对 Claude 系列生效),控制推理长度</td></tr>
+          <tr><td><code>/effort &lt;high|max|off&gt;</code></td><td>DeepSeek 推理努力控制——在 DeepSeek 模型上用更多延迟/token 换取更深的推理</td></tr>
         </tbody>
       </table>
 
@@ -157,6 +162,9 @@
         </tbody>
       </table>
       <p>详细配置与使用见 <a href="./skills.html">Skills 扩展</a> 和 <a href="./plugins.html">Plugin 系统</a>。</p>
+      <p>插件可以注册自己的斜杠命令。例如官方频道插件会新增 <code>/wechat</code>(显示 AtomCode 微信用户群二维码):</p>
+      <pre><code>/plugin marketplace add https://atomgit.com/atomgit_atomcode/AtomCode-Channel
+/plugin install weixin@atomcode-channel</code></pre>
 
       <h2>MCP 集成</h2>
       <table>
@@ -203,7 +211,7 @@
           <tr><td><code>/guide</code></td><td>内置上手向导:<code>/guide</code> 列出可问的主题(快速开始、换模型、MCP、Skills、记忆、后台任务、上下文、快捷键、配置),<code>/guide &lt;主题&gt;</code> 直接在对话里讲解(首次会自动安装 <code>atomcode-skills</code> 插件)</td></tr>
           <tr><td><code>/help</code></td><td>展示所有可用斜杠命令的列表</td></tr>
           <tr><td><code>/keys</code></td><td>展示键盘快捷键参考(分组列出输入 / 历史 / 会话 / 弹层导航,并标注 <code>Shift+Enter</code>、<code>Alt+Enter</code> 在不同终端的兼容性)。详见 <a href="./keybindings.html">键盘快捷键</a></td></tr>
-          <tr><td><code>/quit</code></td><td>退出 atomcode(也可以连按两次 <code>Ctrl+C</code>)</td></tr>
+          <tr><td><code>/quit</code> · <code>/exit</code></td><td>退出 atomcode(也可以连按两次 <code>Ctrl+C</code>)</td></tr>
         </tbody>
       </table>
 

@@ -154,7 +154,7 @@ pub fn is_atomgit_gateway(base_url: &str) -> bool {
     }
     matches!(
         url.host_str(),
-        Some("llm-api.atomgit.com") | Some("api-ai.gitcode.com")
+        Some("llm-api.atomgit.com") | Some("pre-llm-api-cce.atomgit.com") | Some("api-ai.gitcode.com")
     )
 }
 
@@ -214,6 +214,8 @@ mod tests {
 
     #[test]
     fn is_atomgit_gateway_matches_official_host() {
+        assert!(is_atomgit_gateway("https://llm-api.atomgit.com/v1"));
+        assert!(is_atomgit_gateway("https://llm-api.atomgit.com/v1/chat/completions"));
         assert!(is_atomgit_gateway("https://pre-llm-api-cce.atomgit.com/v1"));
         assert!(is_atomgit_gateway("https://pre-llm-api-cce.atomgit.com/v1/chat/completions"));
     }

@@ -420,7 +420,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 审批提示 ──
         Msg::ApprovalPromptAlt { tool, detail } =>
-            format!("允许 {}（{}）？[Y]是 / [N]否 / [A]总是", tool, detail).into(),
+            format!("允许 {}（{}）？[Y]是=回车 / [N]否 / [A]总是", tool, detail).into(),
         Msg::ApprovalWaitingLabel =>
             "▶ 等待审批：".into(),
         Msg::ApprovalAllow => " 允许  ".into(),
@@ -800,6 +800,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
         Msg::CmdDescGuide => "向 atomcode-guide 提问使用方法".into(),
+        Msg::CmdDescView => "在浮层窗口中查看文件内容".into(),
+        Msg::ViewUsage => "用法：/view <文件路径>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
         Msg::GuideMenuTopics => "常用话题：".into(),
         Msg::GuideMenuGettingStarted => "怎么开始使用          首次安装、登录、配置".into(),
@@ -866,10 +868,14 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdWelcomeDescription => "重新运行 onboarding 向导".into(),
         Msg::VisionPreprocessSuccess { char_count } =>
             format!("✓ VL 识别图片成功，返回 {char_count} chars").into(),
-        Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✓ {done} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {total_tokens} tokens").into(),
+        Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens, cached_pct } =>
+            format!(
+                "✓ {done} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens{}",
+                super::fmt_tokens(total_tokens),
+                cached_pct.map(|p| format!(" · {p}% cached")).unwrap_or_default(),
+            ).into(),
         Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✗ 已中断 · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {total_tokens} tokens").into(),
+            format!("✗ 已中断 · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
         Msg::LoginQrHeader =>
             "  登录 AtomGit — 使用微信扫描下方二维码：\n\n".into(),
         Msg::LoginUrlAfterQr =>
@@ -901,6 +907,25 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("（无需压缩 — 压缩后不会节省 token：{} → {}）\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } =>
             format!("（已压缩 — 丢弃 {} 条消息，{} → {} tokens）\n", messages, before, after).into(),
+        Msg::GoalHelp =>
+            "  /goal — 朝着设定的条件自主进行多轮工作。\n  \
+             用法：\n  \
+             \u{20}\u{20}/goal <条件>          设定新目标；智能体循环执行直到评估器判定达成\n  \
+             \u{20}\u{20}/goal                 显示当前目标状态\n  \
+             \u{20}\u{20}/goal status          同上\n  \
+             \u{20}\u{20}/goal clear           停止当前目标（别名：stop、off、reset、none、cancel）\n  \
+             \u{20}\u{20}/goal help            显示本帮助\n  \
+             说明：\n  \
+             \u{20}\u{20}- 每轮由一个快速模型评估；通过 ~/.atomcode/config.toml 中的 [providers] +\n  \
+             \u{20}\u{20}\u{20}\u{20}evaluator_provider 配置。\n  \
+             \u{20}\u{20}- 没有内置的轮次 / 时间上限——请在条件文本中自行表达预算\n  \
+             \u{20}\u{20}\u{20}\u{20}（例如 \"或在 20 轮后停止\"）。Claude Code 的 /goal 也是这样工作的。\n  \
+             \u{20}\u{20}- 随时可用 Esc / Ctrl+C 停止目标。\n".into(),
+        Msg::GoalStatus { condition, round, mins, secs } =>
+            format!("  ◎ 目标：{}\n  轮次：{}\n  已用时：{}分 {}秒\n", condition, round, mins, secs).into(),
+        Msg::GoalNoActive =>
+            "  当前没有进行中的目标。\n  用法：/goal <条件>   |   /goal help\n".into(),
+        Msg::GoalCleared => "  已清除目标。\n".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "当前模型 \"{}\" 不支持图片输入，且未配置 vision_preprocessor_provider。\
              请用 /model 切换到支持视觉的模型，或在配置中设置 vision_preprocessor_provider。",
@@ -964,6 +989,86 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("错误：{error}").into(),
         Msg::BgTaskCancelled => "已取消。".into(),
         Msg::BgTaskNoSummary => "任务完成（无摘要文本）。".into(),
+        // ── CLI atomcode --help i18n ──
+        Msg::CliAbout => "终端中的 AI 编程助手".into(),
+        Msg::CliAboutLogin => "通过 AtomGit OAuth 登录并领取 CodingPlan 模型".into(),
+        Msg::CliAboutLogout => "退出 AtomCode 登录".into(),
+        Msg::CliAboutStatus => "查看当前登录状态".into(),
+        Msg::CliAboutUpgrade => "就地升级 atomcode 到最新发布版本".into(),
+        Msg::CliAboutRollback => "回退到上一个版本（与 .bak 交换）".into(),
+        Msg::CliAboutFixissue => "获取分配给你的 AtomGit issue 并让 agent 修复".into(),
+        Msg::CliAboutMcp => "管理 .mcp.json 中的 MCP 服务器配置".into(),
+        Msg::CliAboutDaemon => "启动用于 IDE 集成的 HTTP 守护进程".into(),
+        Msg::CliAboutWebui => "启动本地浏览器 webui".into(),
+        Msg::CliAboutTelemetry => "遥测控制".into(),
+        Msg::CliAboutPlugin => "管理技能/命令插件".into(),
+        Msg::CliAboutUninstall => "卸载 AtomCode：移除二进制文件、PATH 编辑和数据".into(),
+        Msg::CliAboutSetup => "安装种子文件（技能/命令/钩子/MCP）到 ~/.atomcode/".into(),
+        Msg::CliAboutHooks => "管理钩子（列表、测试、启用/禁用）".into(),
+        Msg::CliAboutHooksList => "列出所有已加载钩子及其状态".into(),
+        Msg::CliAboutHooksTest => "按名称测试指定钩子".into(),
+        Msg::CliAboutHooksPaths => "显示钩子配置路径".into(),
+        Msg::CliAboutPluginMarketplace => "市场注册操作".into(),
+        Msg::CliAboutPluginInstall => "从已注册的市场安装插件".into(),
+        Msg::CliAboutPluginUninstall => "卸载已安装的插件".into(),
+        Msg::CliAboutPluginList => "列出已安装的插件".into(),
+        Msg::CliAboutMarketplaceAdd => "克隆市场 git 仓库并在本地注册".into(),
+        Msg::CliAboutMarketplaceRemove => "删除已注册的市场".into(),
+        Msg::CliAboutMarketplaceUpdate => "重新拉取已注册的市场并刷新插件索引".into(),
+        Msg::CliAboutMarketplaceList => "列出已注册的市场".into(),
+        Msg::CliAboutMcpAdd => "添加或替换 stdio MCP 服务器".into(),
+        Msg::CliAboutMcpAddGithubOauth => "使用 OAuth 添加 GitHub 远程 MCP 服务器".into(),
+        Msg::CliAboutMcpLogin => "完成远程 MCP 服务器的 OAuth 登录".into(),
+        Msg::CliAboutMcpLogout => "删除远程 MCP 服务器的已保存 OAuth 凭证".into(),
+        Msg::CliAboutTelemetryStatus => "查看当前遥测状态和队列统计".into(),
+        Msg::CliAboutTelemetryEnable => "启用遥测".into(),
+        Msg::CliAboutTelemetryDisable => "禁用遥测".into(),
+        Msg::CliAboutTelemetryDump => "打印待发送的队列事件".into(),
+        Msg::CliAboutTelemetryClear => "清除队列事件".into(),
+        Msg::CliHelpContinue => "继续上一次会话而不是启动新会话".into(),
+        Msg::CliHelpProvider => "指定使用的 Provider（覆盖配置默认值）".into(),
+        Msg::CliHelpModel => "指定使用的模型（覆盖配置中的 Provider 模型）".into(),
+        Msg::CliHelpLang => "设置界面语言（如 en、zh-CN、zh）".into(),
+        Msg::CliHelpConfig => "配置文件路径".into(),
+        Msg::CliHelpDir => "工作目录（默认为当前目录）".into(),
+        Msg::CliHelpPrompt => "在无头（非交互）模式下运行的提示".into(),
+        Msg::CliHelpPromptFile => "从文件读取提示".into(),
+        Msg::CliHelpVerbose => "在 stderr 上显示工具调用、token 用量和回合摘要".into(),
+        Msg::CliHelpMaxTurns => "agent 循环强制停止前的最大 LLM 回合数".into(),
+        Msg::CliHelpDev => "禁用本次启动的自动更新".into(),
+        Msg::CliHelpDisableTools => "要从注册表中排除的工具名称列表（逗号分隔）".into(),
+        Msg::CliHelpNoTelemetry => "禁用本次调用的遥测".into(),
+        Msg::CliHelpDangerouslySkipPermissions => "跳过所有权限提示 -- 自动批准每个工具调用".into(),
+        Msg::CliHelpForce => "即使已是最新版本也重新安装".into(),
+        Msg::CliHelpPortDaemon => "监听端口（默认：13456）".into(),
+        Msg::CliHelpClient => "遥测客户端标识".into(),
+        Msg::CliHelpIdleTimeout => "空闲关闭超时（秒）；0 禁用".into(),
+        Msg::CliHelpPortWebui => "端口（默认：13457）".into(),
+        Msg::CliHelpHost => "绑定地址（默认：127.0.0.1）".into(),
+        Msg::CliHelpFixissueUrl => "完整的 issue URL".into(),
+        Msg::CliHelpUninstallYes => "跳过提示；使用每组的默认决定".into(),
+        Msg::CliHelpUninstallPurge => "完全清除 ~/.atomcode/".into(),
+        Msg::CliHelpUninstallKeepData => "完全保留 ~/.atomcode/".into(),
+        Msg::CliHelpUninstallDryRun => "仅打印计划；不执行操作".into(),
+        Msg::CliHelpMcpGlobal => "写入 ~/.atomcode/mcp.json 而非 <dir>/.mcp.json".into(),
+        Msg::CliHelpMcpDir => "项目 .mcp.json 的目录".into(),
+        Msg::CliHelpMcpName => "服务器键名".into(),
+        Msg::CliHelpHooksTestName => "要测试的钩子名称".into(),
+        Msg::CliHelpPluginSpec => "如 plugin@marketplace".into(),
+        Msg::CliHelpMarketplaceUrl => "市场仓库的 Git URL".into(),
+        Msg::CliHelpMarketplaceName => "市场名称".into(),
+        Msg::CliAboutHelp => "打印帮助信息".into(),
+        Msg::CliHelpMcpCommand => "可执行文件及参数".into(),
+
+        // ── engine v2 provider init (atomcode-bridge) ──
+        Msg::ProviderInitFailed { detail } =>
+            format!("模型初始化失败：{detail}").into(),
+        Msg::GatewayAuthUnavailable { base_url } =>
+            format!(
+                "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\
+                 或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
+            ).into(),
+        Msg::StreamStalled => "响应较慢 · esc 取消".into(),
     }
 }
 

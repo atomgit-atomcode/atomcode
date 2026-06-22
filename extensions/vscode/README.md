@@ -75,7 +75,7 @@ AtomCode 提供面向开发流程的辅助能力，包括代码理解、上下�
 
 输入框键入 `/` 打开命令菜单：
 
-`/explain` · `/fix` · `/test` · `/refactor` · `/docs` · `/review` · `/login` · `/codingplan`
+`/login` · `/logout` · `/whoami` · `/status` · `/config` · `/reload`
 
 ---
 

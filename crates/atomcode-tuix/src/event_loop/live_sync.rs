@@ -26,10 +26,13 @@ pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
                 cached_tokens,
             }),
         // TurnEvent::Error is a tuple variant Error(String)
-        TurnEvent::Error(e) => AgentEvent::Error { error: e, messages: Vec::new() },
+        TurnEvent::Error(e) => AgentEvent::Error {
+            error: e,
+            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+        },
         TurnEvent::Warning(w) => AgentEvent::Warning(w),
-        TurnEvent::ApprovalRequested { tool_name, reason, call, messages } =>
-            AgentEvent::ApprovalNeeded { tool_name, reason, call, messages },
+        TurnEvent::ApprovalRequested { tool_name, reason, call, snapshot } =>
+            AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot },
         // 不需要的：忽略
         TurnEvent::ToolCallStreaming { .. }
         | TurnEvent::ToolBatchStarted { .. }
@@ -93,14 +96,10 @@ pub(crate) fn spawn_live_forwarder(
                         break;
                     }
                 }
-                // 手机 App 点开历史对话（/cd 带 session_id）→ 跟随：cd（如需）
-                // 并恢复该会话（加载历史，而非开新会话）。
-                Ok(LiveEvent::SessionSwitched { dir, session_id }) => {
+                // webui 新建对话 → follow it: TUI 切换到新会话。
+                Ok(LiveEvent::SessionSwitched(session_id)) => {
                     if fan_tx
-                        .send(RuntimeEvent {
-                            runtime_id,
-                            event: AgentEvent::SessionSwitched { dir, session_id },
-                        })
+                        .send(RuntimeEvent { runtime_id, event: AgentEvent::SessionSwitched(session_id) })
                         .is_err()
                     {
                         break;

@@ -10,6 +10,69 @@ marked.setOptions({
 });
 
 const renderer = new marked.Renderer();
+const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
+const ANSI_FG_CLASSES: Record<number, string> = {
+  30: 'ansi-fg-black',
+  31: 'ansi-fg-red',
+  32: 'ansi-fg-green',
+  33: 'ansi-fg-yellow',
+  34: 'ansi-fg-blue',
+  35: 'ansi-fg-magenta',
+  36: 'ansi-fg-cyan',
+  37: 'ansi-fg-white',
+  90: 'ansi-fg-bright-black',
+  91: 'ansi-fg-bright-red',
+  92: 'ansi-fg-bright-green',
+  93: 'ansi-fg-bright-yellow',
+  94: 'ansi-fg-bright-blue',
+  95: 'ansi-fg-bright-magenta',
+  96: 'ansi-fg-bright-cyan',
+  97: 'ansi-fg-bright-white',
+};
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function ansiCodeToHtml(code: string): string {
+  let output = '';
+  let lastIndex = 0;
+  let currentClass: string | null = null;
+  ANSI_PATTERN.lastIndex = 0;
+
+  const closeSpan = () => {
+    if (currentClass) {
+      output += '</span>';
+      currentClass = null;
+    }
+  };
+
+  for (const match of code.matchAll(ANSI_PATTERN)) {
+    output += escapeHtml(code.slice(lastIndex, match.index));
+    lastIndex = (match.index ?? 0) + match[0].length;
+
+    const rawCodes = match[0].slice(2, -1);
+    const codes = rawCodes.length > 0 ? rawCodes.split(';').map((value) => Number(value) || 0) : [0];
+    for (const sgr of codes) {
+      if (sgr === 0 || sgr === 39) {
+        closeSpan();
+      } else if (ANSI_FG_CLASSES[sgr]) {
+        closeSpan();
+        currentClass = ANSI_FG_CLASSES[sgr];
+        output += `<span class="${currentClass}">`;
+      }
+    }
+  }
+
+  output += escapeHtml(code.slice(lastIndex));
+  closeSpan();
+  return output;
+}
 
 renderer.code = function (code: string, infostring?: string) {
   const text = code ?? '';
@@ -18,9 +81,13 @@ renderer.code = function (code: string, infostring?: string) {
   }
   const lang = (infostring ?? '').split(/\s+/)[0] ?? '';
   const language = lang && hljs.getLanguage(lang) ? lang : '';
-  const highlighted = language
-    ? hljs.highlight(text, { language }).value
-    : hljs.highlightAuto(text).value;
+  const hasAnsi = ANSI_PATTERN.test(text);
+  ANSI_PATTERN.lastIndex = 0;
+  const highlighted = hasAnsi
+    ? ansiCodeToHtml(text)
+    : language
+      ? hljs.highlight(text, { language }).value
+      : hljs.highlightAuto(text).value;
   const id = `cb-${Math.random().toString(36).slice(2, 8)}`;
   return (
     `<div class="code-block-wrapper" data-code-id="${id}">` +

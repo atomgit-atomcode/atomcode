@@ -21,6 +21,7 @@ pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
 use commands::execute_slash_command;
+use commands::attach_live_session;
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
@@ -226,6 +227,42 @@ fn cache_write_image(cache_dir: &std::path::Path, img: &atomcode_core::conversat
 /// input box. Mirror of the post-submit echo (`UiLine::ImageAttachment`)
 /// — same visual treatment so users see the attachment status pre-
 /// AND post-submit identically.
+/// Extract every `[Image #N]` marker number from `text`, in first-occurrence
+/// order, de-duped. Unlike `compute_input_attachments` this does NOT filter
+/// against pending state — it re-derives the markers purely from the text, used
+/// to render the `└ [Image #N]` echoes for a user message that arrives via
+/// `UserEcho` (sync mode), where the local submit path intentionally skipped
+/// them (the user row itself is also re-rendered from the echo, so emitting the
+/// echoes locally at submit time would orphan them ABOVE the later user row).
+fn image_markers_in_order(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let needle = b"[Image #";
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + needle.len() < bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let mut j = i + needle.len();
+            let mut n: usize = 0;
+            let mut had_digit = false;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n.saturating_mul(10).saturating_add((bytes[j] - b'0') as usize);
+                j += 1;
+                had_digit = true;
+            }
+            if had_digit && j < bytes.len() && bytes[j] == b']' {
+                if seen.insert(n) {
+                    out.push(n);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 pub(crate) fn compute_input_attachments(
     state: &crate::state::UiState,
     buf_text: &str,
@@ -649,12 +686,27 @@ pub struct McpReloadProgress {
     pub started_at: std::time::Instant,
 }
 
+/// Optional override for spawning agent runtimes. `None` ⇒ use
+/// `runtime_factory.spawn_runtime` (the v1 engine). When set, in-TUI session
+/// switches (`/session`, `/bg`, disk `/resume`) spawn through it instead — the
+/// cli injects the engine-v2 bridge here. It receives the CURRENT config +
+/// working dir (so it tracks `/model` / `/provider` / `/cd`) and returns the same
+/// `(client, event_rx)` pair the factory does.
+pub type RuntimeSpawnOverride = std::sync::Arc<
+    dyn Fn(&Config, &std::path::Path) -> (AgentClient, mpsc::UnboundedReceiver<AgentEvent>)
+        + Send
+        + Sync,
+>;
+
 /// Bag of handles passed into the loop.
 pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
     pub agent: AgentClient,
     pub runtime_factory: AgentRuntimeFactory,
+    /// Optional engine-v2 spawner; `None` ⇒ the v1 `runtime_factory`. See
+    /// [`RuntimeSpawnOverride`].
+    pub runtime_spawn_override: Option<RuntimeSpawnOverride>,
     pub bg_manager: bg_runtime::BgRuntimeManager,
     pub foreground_runtime_id: bg_runtime::RuntimeId,
     pub runtime_event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
@@ -802,7 +854,7 @@ pub struct LoopCtx {
     /// `<project>/.atomcode/commands/`. Queried by the slash-command
     /// dispatcher as a fallback when the entered name doesn't match a
     /// built-in command.
-    pub custom_commands: atomcode_core::commands::CustomCommandRegistry,
+    pub custom_commands: crate::custom_commands::CustomCommandRegistry,
     /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). Same `Arc`
     /// the agent loop holds, so `reload(...)` there is visible here
     /// without extra plumbing. Used by the slash-command palette to
@@ -817,7 +869,7 @@ pub struct LoopCtx {
     pub caps: crate::terminal::TerminalCaps,
     /// Session loaded by the CLI auto-continue path (`atomcode -c` /
     /// `--continue`). Replayed into scrollback AND restored into the
-    /// agent's model context via `AgentCommand::SetMessages` on first
+    /// agent's model context via `AgentCommand::SetConversation` on first
     /// `run_loop` entry, then dropped — matching `/resume` behaviour.
     pub replay_on_start: Option<atomcode_core::session::Session>,
     /// Lazy file/dir index for `@`-mention popup. Built on first `@`
@@ -970,6 +1022,20 @@ impl Buffer {
         self.text = text;
         self.history_idx = None;
         self.menu_suppressed = true;
+    }
+
+    /// Restore a cancelled prompt for edit-and-resend, PRESERVING any draft the
+    /// user typed while the turn was running. When the buffer already holds a
+    /// non-blank draft, the cancelled prompt is prepended on its own line
+    /// instead of clobbering it; an empty/whitespace buffer just gets the
+    /// prompt (same as `set_restored_text`). Cursor lands at the end.
+    pub fn restore_cancelled_text(&mut self, prompt: String) {
+        let merged = if self.text.trim().is_empty() {
+            prompt
+        } else {
+            format!("{}\n{}", prompt, self.text)
+        };
+        self.set_restored_text(merged);
     }
 
     /// True while the user is scrolling input history (Up/Down on an
@@ -1362,6 +1428,24 @@ mod buffer_tests {
     use super::*;
 
     #[test]
+    fn spinner_label_surfaces_network_stall_hint_then_clears_on_activity() {
+        // End-to-end on the REAL spinner renderer: a model stream silent past the
+        // threshold must put the localized "network may be down · esc" hint into the
+        // footer label; a fresh chunk (note_stream_activity) must clear it.
+        let mut s = UiState::new();
+        s.on_submit(); // phase=Streaming, spinner = a thinking label
+        s.last_stream_activity =
+            Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT * 2);
+        let hint = crate::i18n::t(crate::i18n::Msg::StreamStalled);
+        let stalled = format_spinner_label(&s, 0, None);
+        assert!(stalled.contains(&*hint), "stalled spinner must show the hint, got {stalled:?}");
+
+        s.note_stream_activity(); // a byte arrived → stream is alive again
+        let live = format_spinner_label(&s, 0, None);
+        assert!(!live.contains(&*hint), "live stream must not show the hint, got {live:?}");
+    }
+
+    #[test]
     fn small_paste_inserts_inline() {
         let mut b = Buffer::new();
         b.insert_paste("hi\n".to_string());
@@ -1392,6 +1476,25 @@ mod buffer_tests {
     fn expand_pastes_is_noop_without_placeholders() {
         let b = Buffer::new();
         assert_eq!(b.expand_pastes("plain text"), "plain text");
+    }
+
+    #[test]
+    fn slash_command_arg_expands_folded_paste() {
+        // Regression: `/goal <pasted body>` must hand the command the
+        // real pasted text, not the literal `[Pasted #N …]` placeholder.
+        // The submit path now expands the slash arg before dispatch; this
+        // mirrors that expansion on the `arg` slice of the committed line.
+        let mut b = Buffer::new();
+        let body = "do the thing\n".repeat(69);
+        b.insert_paste(body.clone());
+        // Buffer now looks like the user typed `/goal ` then pasted.
+        let line = format!("/goal {}", b.text);
+        let (cmd, arg) = parse_slash_line(&line).expect("recognised as slash line");
+        assert_eq!(cmd, "goal");
+        assert!(arg.contains("[Pasted #1"), "arg still folded pre-expansion: {arg:?}");
+        let expanded = b.expand_pastes(arg);
+        assert_eq!(expanded, body, "slash arg must expand to the pasted body");
+        assert!(!expanded.contains("[Pasted #"), "no placeholder should survive");
     }
 
     #[test]
@@ -1510,6 +1613,39 @@ mod buffer_tests {
     }
 
     #[test]
+    fn restore_cancelled_text_prepends_before_existing_draft() {
+        let mut b = Buffer::new();
+        // User started typing a new message while the previous turn ran.
+        b.text = "my new draft".to_string();
+        b.cursor = b.text.len();
+        // Then cancelled the previous request → its prompt comes back, but
+        // the draft must be preserved (prompt prepended on its own line).
+        b.restore_cancelled_text("original prompt".to_string());
+        assert_eq!(b.text, "original prompt\nmy new draft");
+        assert_eq!(b.cursor, b.text.len(), "cursor at end for edit-and-resend");
+        assert!(b.menu_suppressed(), "restored /command must not pop the menu");
+    }
+
+    #[test]
+    fn restore_cancelled_text_replaces_when_draft_empty() {
+        let mut b = Buffer::new();
+        // No draft typed → behaves exactly like the old restore (just the prompt).
+        b.restore_cancelled_text("original prompt".to_string());
+        assert_eq!(b.text, "original prompt");
+        assert_eq!(b.cursor, "original prompt".len());
+    }
+
+    #[test]
+    fn restore_cancelled_text_ignores_whitespace_only_draft() {
+        let mut b = Buffer::new();
+        b.text = "   \n".to_string();
+        b.cursor = b.text.len();
+        // A draft that's only whitespace isn't worth preserving — treat as empty.
+        b.restore_cancelled_text("original prompt".to_string());
+        assert_eq!(b.text, "original prompt");
+    }
+
+    #[test]
     fn restored_menu_suppression_lifts_on_next_key() {
         let reg = CommandRegistry::builtin();
         let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
@@ -1569,7 +1705,7 @@ mod buffer_tests {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
-    use atomcode_core::commands::CustomCommandRegistry;
+    use crate::custom_commands::CustomCommandRegistry;
 
     #[test]
     fn non_slash_input_returns_no_menu() {
@@ -1685,10 +1821,12 @@ mod menu_tests {
 
         let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("/skills (with space) must list skills");
-        assert!(items.iter().any(|(n, _)| n == "skills:brainstorming"));
-        assert!(items.iter().any(|(n, _)| n == "skills:web-access"));
+        // Sub-mode lists BARE names (the dispatcher re-qualifies to `skills:<name>` on
+        // submit) — matches build_skill_menu_items_lists_unique_bare_names + the documented design.
+        assert!(items.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "web-access"));
         for (n, _) in &items {
-            assert!(n.contains(':'), "sub-mode names must be qualified: {}", n);
+            assert!(!n.contains(':'), "sub-mode names are bare: {}", n);
         }
     }
 
@@ -1706,12 +1844,12 @@ mod menu_tests {
         let bra = build_menu_items("/skills bra", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(bra.len(), 1);
-        assert_eq!(bra[0].0, "skills:brainstorming");
+        assert_eq!(bra[0].0, "brainstorming");
 
         let web = build_menu_items("/skills web", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(web.len(), 1);
-        assert_eq!(web[0].0, "skills:web-access");
+        assert_eq!(web[0].0, "web-access");
 
         assert!(build_menu_items("/skills zz", 0, &reg, &custom, Some(&lock), None).is_none());
     }
@@ -1742,9 +1880,9 @@ mod menu_tests {
 
         let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("at least one visible skill should produce a menu");
-        assert!(items.iter().any(|(n, _)| n == "skills:visible"));
+        assert!(items.iter().any(|(n, _)| n == "visible"));
         assert!(
-            !items.iter().any(|(n, _)| n == "skills:hidden"),
+            !items.iter().any(|(n, _)| n == "hidden"),
             "user_invocable=false skill leaked into sub-menu"
         );
     }
@@ -2400,6 +2538,22 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_edit_file_omits_old_string_preview() {
+        let args = r#"{"file_path":"/abs/path/to/test.txt","old_string":"4","new_string":"1888"}"#;
+        assert_eq!(format_tool_detail("edit_file", args), "test.txt");
+    }
+
+    #[test]
+    fn format_tool_detail_edit_file_repairs_unescaped_newline() {
+        let args = concat!(
+            r#"{"file_path":"/abs/path/to/test.txt","old_string":"old","new_string":"line 1"#,
+            "\n",
+            r#"line 2"}"#
+        );
+        assert_eq!(format_tool_detail("edit_file", args), "test.txt");
+    }
+
+    #[test]
     fn format_tool_detail_read_symbol_combines_symbol_and_file() {
         let args = r#"{"symbol":"parse","file_path":"src/lexer.rs"}"#;
         assert_eq!(format_tool_detail("read_symbol", args), "parse in lexer.rs");
@@ -2506,6 +2660,17 @@ mod tool_format_tests {
     #[test]
     fn format_tool_detail_parallel_edit_files_two_files() {
         let args = r#"{"files":[{"path":"a.rs","instruction":"add X"},{"path":"b.rs","instruction":"wire X"}]}"#;
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "a.rs, b.rs");
+    }
+
+    #[test]
+    fn format_tool_detail_parallel_edit_files_repairs_unescaped_instruction_newline() {
+        let args = concat!(
+            r#"{"files":[{"path":"a.rs","instruction":"line 1"#,
+            "\n",
+            r#"line 2"},{"path":"b.rs","instruction":"change b"}]}"#
+        );
         let out = format_tool_detail("parallel_edit_files", args);
         assert_eq!(out, "a.rs, b.rs");
     }
@@ -2645,6 +2810,26 @@ mod tool_format_tests {
     #[test]
     fn summarise_single_line_returned_as_is() {
         assert_eq!(summarise("ok"), "ok");
+    }
+
+    #[test]
+    fn plan_mode_block_reason_detects_gate_blocks() {
+        // A PlanModeGate block → calm hint (reason without the `blocked: ` prefix).
+        assert_eq!(
+            plan_mode_block_reason(
+                "blocked: plan mode is active — `write_file` would modify the workspace",
+                false
+            ),
+            Some("plan mode is active — `write_file` would modify the workspace")
+        );
+        // Successes, non-block failures, and OTHER middleware blocks (e.g. approval
+        // deny) are NOT plan-mode hints → normal ✗ result render.
+        assert_eq!(plan_mode_block_reason("ok", true), None);
+        assert_eq!(plan_mode_block_reason("Error: file not found", false), None);
+        assert_eq!(
+            plan_mode_block_reason("blocked: denied by approval policy: bash", false),
+            None
+        );
     }
 
     #[test]
@@ -2953,14 +3138,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // working dir (via `atomcode -c` / `--continue`), replay its messages
     // into scrollback AND restore the agent's model context so follow-up
     // questions can reference prior conversation. This mirrors the `/resume`
-    // slash command's behaviour: visual replay + AgentCommand::SetMessages.
+    // slash command's behaviour: visual replay + AgentCommand::SetConversation.
     if let Some(session) = ctx.replay_on_start.take() {
         if !session.messages.is_empty() {
             crate::modals::session_picker::replay_session(renderer, &session, false);
             // Sync messages into the agent loop so the LLM has full context.
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SetMessages(session.messages.clone()))
+                .send(AgentCommand::SetConversation(
+                    session.to_conversation_snapshot(),
+                ))
                 .ok();
             // Continue accumulating into the same session file — future
             // TurnComplete saves overwrite it instead of creating a new one.
@@ -3477,9 +3664,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                 live.send_input(UserInput { text: queued.text, images: queued.images });
                                 app.state.on_submit();
                             } else {
-                                // —— 原有逻辑，原样保留 ——
-                                renderer.render(UiLine::User(queued.text.clone()));
-                                renderer.flush();
                                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
                                     text: queued.text,
                                     images: queued.images,
@@ -3868,9 +4052,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                 live.send_input(UserInput { text: queued.text, images: queued.images });
                                 app.state.on_submit();
                             } else {
-                                // —— 原有逻辑，原样保留 ——
-                                renderer.render(UiLine::User(queued.text.clone()));
-                                renderer.flush();
                                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
                                     text: queued.text,
                                     images: queued.images,
@@ -4058,7 +4239,6 @@ fn attach_image_to_input(
 fn attach_typed_image_paths(
     app: &mut App,
     ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
     text: &mut String,
     images: &mut Vec<ImagePart>,
     kept_markers: &mut Vec<usize>,
@@ -4081,7 +4261,9 @@ fn attach_typed_image_paths(
         app.state.session_image_count += 1;
         let n = app.state.session_image_count;
         *text = text.replacen(&tok, &format!("[Image #{}]", n), 1);
-        renderer.render(UiLine::ImageAttachment(n));
+        // No render here: the caller groups the collected `kept_markers` into a
+        // single `UiLine::UserWithAttachments` echo (the viewport-overflow fix),
+        // so this helper only collects.
         images.push(img);
         kept_markers.push(n);
     }
@@ -4189,6 +4371,13 @@ fn handle_input(
                 }
             }
             renderer.on_resize(cols, rows);
+            // A resize invalidates any open modal's cached overlay
+            // geometry (it was built for the old size). Rebuild it now so
+            // the window re-centres at the new dimensions instead of
+            // lingering stale / mispositioned until the next keypress.
+            if let Some(m) = app.active_modal.as_ref() {
+                m.draw(&app.buf, &app.state, ctx, renderer);
+            }
             for ev in deferred {
                 handle_input(app, ctx, renderer, ev)?;
             }
@@ -4628,7 +4817,7 @@ fn build_menu_items(
     buf: &str,
     cursor: usize,
     commands: &CommandRegistry,
-    custom: &atomcode_core::commands::CustomCommandRegistry,
+    custom: &crate::custom_commands::CustomCommandRegistry,
     skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
     file_index: Option<&file_index::FileIndex>,
 ) -> Option<Vec<(String, String)>> {
@@ -4768,6 +4957,30 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
+    // so the TUI can legitimately sit in Idle while the agent keeps looping
+    // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
+    // they never reach the cancel path (that lives in `handle_streaming_key`),
+    // which is why a goal felt uninterruptible. When a goal is active, route
+    // Ctrl+C and a bare Esc (empty buffer — don't steal Esc from clearing a
+    // draft the user is editing to nudge the goal) to `Cancel`: the bridge
+    // turns that into "clear the goal + cancel the running turn", and the
+    // follow-up GoalUpdate(active=false) resets the local goal state. Belt and
+    // suspenders alongside `on_thinking` keeping the TUI in Streaming.
+    if app.state.goal_condition.is_some() {
+        let is_ctrl_c = code == KeyCode::Char('c')
+            && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+        let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
+        if is_ctrl_c || is_bare_esc {
+            ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+            crate::tuix_trace!(
+                "KEY",
+                "idle goal-active {} -> Cancel",
+                if is_ctrl_c { "Ctrl+C" } else { "Esc" }
+            );
+            return Ok(());
+        }
+    }
     // If the menu is active (buf starts with '/'), intercept navigation keys.
     // Suppress while scrolling history / right after a restore (see
     // `menu_for_display`) — otherwise a recalled `/se…` immediately re-pops.
@@ -5328,7 +5541,12 @@ fn handle_idle_key(
             // "Unknown command: /foo" dead-end.
             let as_slash = parse_slash_line(&line).filter(|(cmd, _)| {
                 ctx.commands.find(cmd).is_some()
-                    || ctx.custom_commands.get(&cmd.to_ascii_lowercase()).is_some()
+                    // Use `resolve()` (not exact-key `get()`) so a plugin
+                    // command keyed `plugin:name` is recognised when typed as
+                    // the bare `/name` — matching how dispatch renders it.
+                    // Otherwise `/wechat` (keyed `weixin:wechat`) fails the
+                    // gate and falls through to the agent as plain text.
+                    || ctx.custom_commands.resolve(cmd).is_some()
                     || ctx
                         .skill_registry
                         .read()
@@ -5372,9 +5590,17 @@ fn handle_idle_key(
                     // hand it `&mut app.buf`.
                     handle_paste_command(app, ctx, renderer)?;
                 } else {
+                    // Expand `[Pasted #N …]` placeholders in the argument
+                    // before dispatch, exactly like the regular-message
+                    // path below. Without this, `/goal <pasted body>`
+                    // hands the command the literal placeholder string
+                    // (e.g. "[Pasted #1 +69 lines]") instead of the real
+                    // pasted text. The paste registry is still live here —
+                    // it's cleared a few lines down, after dispatch.
+                    let arg = app.buf.expand_pastes(arg);
                     execute_slash_command(
                         cmd,
-                        arg,
+                        &arg,
                         &mut app.state,
                         ctx,
                         renderer,
@@ -5418,11 +5644,6 @@ fn handle_idle_key(
                 for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir) {
                     renderer.render(UiLine::Warning(n));
                 }
-                // 同步模式：不在本地渲染用户行；等 LiveEvent::UserMessage →
-                // AgentEvent::UserEcho 回灌，保证两端一致。非同步模式原样渲染。
-                if ctx.sync_session.is_none() {
-                    renderer.render(UiLine::User(line.clone()));
-                }
                 let mut expanded = app.buf.expand_pastes(&line);
                 // Pastes have now been substituted into `expanded`;
                 // safe to drop the registry. Doing it any earlier
@@ -5458,7 +5679,6 @@ fn handle_idle_key(
                     .zip(pending_hashes.into_iter())
                 {
                     if line.contains(&format!("[Image #{}]", n)) {
-                        renderer.render(UiLine::ImageAttachment(n));
                         kept_refs.push(crate::input::history::HistoryImageRef {
                             hash: format!("{:016x}", hash),
                             mt: img.media_type.clone(),
@@ -5478,11 +5698,17 @@ fn handle_idle_key(
                 attach_typed_image_paths(
                     app,
                     ctx,
-                    renderer,
                     &mut expanded,
                     &mut images,
                     &mut kept_markers,
                 );
+                if ctx.sync_session.is_none() {
+                    renderer.render(UiLine::UserWithAttachments {
+                        text: line.clone(),
+                        attachments: kept_markers.clone(),
+                    });
+                }
+                renderer.flush();
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: line.clone(),
                     images: kept_refs,
@@ -5694,6 +5920,54 @@ mod parse_already_latest_versions_tests {
     }
 }
 
+#[cfg(test)]
+mod image_marker_tests {
+    use super::image_markers_in_order as marks;
+
+    #[test]
+    fn extracts_markers_in_order_deduped() {
+        assert_eq!(marks("[Image #1] hi"), vec![1]);
+        assert_eq!(marks("[Image #2] and [Image #5] and [Image #2]"), vec![2, 5]);
+        assert_eq!(marks("no images here"), Vec::<usize>::new());
+        // Malformed markers are ignored.
+        assert_eq!(marks("[Image #] [Image #x] [Image #3]"), vec![3]);
+    }
+}
+
+#[cfg(test)]
+mod streaming_slash_tests {
+    use super::streaming_executable_slash as exec;
+
+    #[test]
+    fn goal_halt_subcommands_run_mid_stream() {
+        // The whole point: `/goal clear` (and its aliases) must execute while a
+        // turn is running, because a server-driven goal keeps the TUI in
+        // Streaming where commands are otherwise blocked.
+        for sub in ["clear", "stop", "off", "reset", "none", "cancel"] {
+            let got = exec(&format!("/goal {sub}"));
+            assert_eq!(got, Some(("goal".to_string(), sub.to_string())), "sub={sub}");
+        }
+    }
+
+    #[test]
+    fn bg_no_arg_runs_but_setting_a_goal_does_not() {
+        assert_eq!(exec("/bg"), Some(("bg".to_string(), String::new())));
+        // Backgrounding a NEW message and SETTING a new goal must NOT run mid-stream.
+        assert_eq!(exec("/bg go do a thing"), None);
+        assert_eq!(exec("/goal write all the tests"), None);
+        assert_eq!(exec("/goal"), None); // bare /goal = status, not whitelisted
+    }
+
+    #[test]
+    fn unrelated_commands_and_non_slash_are_blocked() {
+        assert_eq!(exec("/model"), None);
+        assert_eq!(exec("/clear"), None);
+        assert_eq!(exec("just a message"), None);
+        // Case-insensitive command + sub.
+        assert_eq!(exec("/GOAL Clear"), Some(("goal".to_string(), "Clear".to_string())));
+    }
+}
+
 /// Redraw after running a slash command. If the command installed a
 /// modal, delegate the draw to it so the modal's menu appears; otherwise
 /// fall through to the plain idle prompt.
@@ -5737,7 +6011,7 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
         warnings = guard.reload(&ctx.working_dir);
         loaded = guard.all().count();
     }
-    ctx.custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&ctx.working_dir);
+    ctx.custom_commands = crate::custom_commands::CustomCommandRegistry::load(&ctx.working_dir);
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal
     // so plugin-contributed hooks (especially UserPromptSubmit) fire on the
     // next user message rather than waiting for /cd or restart.
@@ -5779,7 +6053,9 @@ fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, 
     if let Some(msg) = app.state.last_submitted_message.take() {
         // Cursor at the end (edit-and-resend), but suppress the slash menu
         // for one frame so a restored `/command` doesn't re-pop the list.
-        app.buf.set_restored_text(msg);
+        // Preserve any draft the user typed while the turn was running —
+        // prepend the cancelled prompt instead of clobbering the draft.
+        app.buf.restore_cancelled_text(msg);
         app.menu.selected = 0;
         // Force an immediate StreamingBox repaint so the restored
         // text shows in the input box on this frame, not the next
@@ -5795,6 +6071,37 @@ fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, 
     }
 }
 
+/// Slash commands allowed to EXECUTE while a turn is running. Everything else is
+/// blocked with the "disabled while a turn is running" hint. Returns the
+/// `(command, args)` to run, or `None` to fall through to the block/queue.
+///
+/// Minimal whitelist:
+///   - `/bg` (no args) — background the current turn.
+///   - `/goal clear|stop|off|reset|none|cancel` — halt a server-driven `/goal`
+///     loop. Load-bearing: a goal keeps the TUI in Streaming (see `on_thinking`)
+///     where commands are otherwise blocked, so without this a typed
+///     `/goal clear` never reaches the bridge and the goal is uninterruptible by
+///     command (Esc/Ctrl+C bypass the command system; a typed command does not).
+///
+/// A NEW goal (`/goal <condition>`) and `/goal status` are intentionally NOT
+/// whitelisted — only the halt sub-commands.
+fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
+    let (cmd, arg) = parse_slash_line(line)?;
+    if cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty() {
+        return Some(("bg".to_string(), String::new()));
+    }
+    if cmd.eq_ignore_ascii_case("goal") {
+        let head = arg.trim().split_whitespace().next().unwrap_or("");
+        if matches!(
+            head.to_ascii_lowercase().as_str(),
+            "clear" | "stop" | "off" | "reset" | "none" | "cancel"
+        ) {
+            return Some(("goal".to_string(), arg.trim().to_string()));
+        }
+    }
+    None
+}
+
 fn handle_streaming_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -5806,12 +6113,20 @@ fn handle_streaming_key(
     if code == KeyCode::Char('o') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         app.state.toggle_tool_output();
         // Show feedback to the user about the current state
-        let status = if app.state.show_tool_output {
-            "  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+O to hide)\n"
+        // Use muted style matching ToolResult's summary_style:
+        // light theme → SGR 90 (DarkGrey), dark theme → SGR 2 (faint)
+        let reset = "\x1b[0m";
+        let mute = if crate::highlight::theme::is_light_for_render() {
+            "\x1b[90m"
         } else {
-            "  ○ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
+            "\x1b[2m"
         };
-        renderer.render(UiLine::CommandOutput(status.to_string()));
+        let status = if app.state.show_tool_output {
+            format!("{mute}  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+o to hide){reset}\n")
+        } else {
+            format!("{mute}  ○ Verbose mode disabled (Ctrl+o to show tool output + reasoning){reset}\n")
+        };
+        renderer.render(UiLine::CommandOutput(status));
         renderer.flush();
         draw_spinner_now(
             &mut app.state,
@@ -5976,13 +6291,16 @@ fn handle_streaming_key(
             // leave the buf alone. Gate strictly on *registered*
             // commands; unrecognised `/foo …` falls through to the
             // type-ahead queue as a regular message.
-            let bg_background_current = parse_slash_line(&line)
-                .map(|(cmd, arg)| cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty())
-                .unwrap_or(false);
-            if bg_background_current {
+            //
+            // EXCEPT a small whitelist that must RUN mid-stream (see
+            // `streaming_executable_slash`): `/bg` (background the current turn)
+            // and `/goal`'s halt sub-commands — a server-driven `/goal` keeps the
+            // TUI in Streaming, so without this a typed `/goal clear` could never
+            // reach the bridge and the goal was uninterruptible by command.
+            if let Some((cmd, arg)) = streaming_executable_slash(&line) {
                 commands::execute_slash_command(
-                    "bg",
-                    "",
+                    &cmd,
+                    &arg,
                     &mut app.state,
                     ctx,
                     renderer,
@@ -6049,7 +6367,6 @@ fn handle_streaming_key(
                 .zip(pending_hashes.into_iter())
             {
                 if line.contains(&format!("[Image #{}]", n)) {
-                    renderer.render(UiLine::ImageAttachment(n));
                     q_refs.push(crate::input::history::HistoryImageRef {
                         hash: format!("{:016x}", hash),
                         mt: img.media_type.clone(),
@@ -6058,6 +6375,12 @@ fn handle_streaming_key(
                     q_images.push(img);
                     q_markers.push(n);
                 }
+            }
+            if ctx.sync_session.is_none() {
+                renderer.render(UiLine::UserWithAttachments {
+                    text: line.clone(),
+                    attachments: q_markers.clone(),
+                });
             }
             ctx.history.push(crate::input::history::HistoryEntry {
                 text: line.clone(),
@@ -6143,7 +6466,9 @@ fn handle_approval_key(
         if armed {
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         } else {
-            // First Ctrl+C: deny the tool and arm the exit confirmation
+            // First Ctrl+C: deny the current tool and arm the exit confirmation.
+            // The goal (if any) continues; Claude Code's /goal works the same way.
+            // A second Ctrl+C within the window triggers Shutdown above.
             app.exit_pending = Some(now);
             renderer.pop_approval_prompt();
             deliver_approval(ctx, AgentCommand::DenyTool);
@@ -6169,6 +6494,11 @@ fn handle_approval_key(
     // responded — without this, the prompt stays in scrollback next to
     // the tool result, creating visual noise.
     renderer.pop_approval_prompt();
+    // Per Claude Code semantics, denying a tool does NOT stop the active
+    // /goal — the evaluator will see the user's refusal on the next round
+    // and either change tactics or judge the goal complete. The user can
+    // explicitly halt with `/goal clear` or by pressing Esc outside this
+    // approval prompt (inside the prompt, Esc denies the tool instead).
     deliver_approval(ctx, cmd);
     app.state.on_approval_resolved();
     Ok(())
@@ -6429,6 +6759,154 @@ pub(super) fn handle_upgrade_event(
     renderer.flush();
 }
 
+/// Flush a buffered turn-end separator. `as_goal_end=true` is used when the
+/// caller is about to render (or just rendered) a `✓ Goal met` / `⚠ Goal
+/// stopped` banner immediately above; in that case the separator drops the
+/// `↻ goal round N` / `✓ done · N rounds` prefix and shows just the stats —
+/// the verdict banner already told the user what happened, the line below
+/// only needs the cost & duration. No-op when no separator is pending.
+/// Normal (non-goal) turn-end separator label — i18n, and Error-aware
+/// (✗ "stopped" on an errored turn vs the celebratory ✓ "done" otherwise).
+/// Shared by the immediate-render path (no active goal) and the deferred
+/// `flush_pending_separator` path so both stay localized and consistent.
+fn turn_summary_label(
+    state: &mut UiState,
+    errored: bool,
+    turn_count: usize,
+    tool_call_count: usize,
+    total_tokens: usize,
+    cached_pct: Option<u8>,
+    dur: &str,
+) -> String {
+    if errored {
+        // An errored turn already rendered a red Error line just above; a
+        // celebratory "✓ Nailed it" under it is contradictory, and we don't
+        // burn a DONE_LABELS rotation slot on a failure.
+        crate::i18n::t(crate::i18n::Msg::TurnSummaryError {
+            turn_count,
+            tool_call_count,
+            duration: dur,
+            total_tokens,
+        })
+        .into_owned()
+    } else {
+        let done = state.next_done_label();
+        crate::i18n::t(crate::i18n::Msg::TurnSummary {
+            done,
+            turn_count,
+            tool_call_count,
+            duration: dur,
+            total_tokens,
+            cached_pct,
+        })
+        .into_owned()
+    }
+}
+
+fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_goal_end: bool) {
+    let Some(ps) = state.pending_separator.take() else { return };
+    let dur = crate::render::fmt_dur(ps.duration);
+    let cached = ps
+        .cached_pct
+        .map(|p| format!(" · {p}% cached"))
+        .unwrap_or_default();
+    let label = if as_goal_end {
+        format!(
+            "{} tools · {} · {} tokens{}",
+            ps.tool_call_count,
+            dur,
+            crate::i18n::fmt_tokens(ps.total_tokens),
+            cached,
+        )
+    } else if ps.was_goal_round {
+        format!(
+            "↻ goal round {} · {} tools · {} · {} tokens{}",
+            state.goal_round.max(1),
+            ps.tool_call_count,
+            dur,
+            crate::i18n::fmt_tokens(ps.total_tokens),
+            cached,
+        )
+    } else {
+        // Reached only if a non-goal turn was ever buffered (today they
+        // render immediately). Kept as a correct fallback either way.
+        turn_summary_label(
+            state,
+            ps.errored,
+            ps.turn_count,
+            ps.tool_call_count,
+            ps.total_tokens,
+            ps.cached_pct,
+            &dur,
+        )
+    };
+    renderer.render(UiLine::TurnSeparator { label });
+    renderer.flush();
+}
+
+/// If an approval prompt is still showing when the agent moves on (a tool result arrives,
+/// the turn ends), the approval was resolved WITHOUT a user keypress — a headless timeout
+/// fail-close, a displaced second approval, or a cancel. Retract the orphaned "Waiting for
+/// approval" body row with the SAME cleanup the Y/A/N keypath does (`pop_approval_prompt` +
+/// `on_approval_resolved`), so it can't linger above the result. Returns false (no-op) when
+/// no approval is pending — the normal path, where the keypress already cleared it.
+fn retract_stale_approval(state: &mut UiState, renderer: &mut dyn Renderer) -> bool {
+    if matches!(state.phase, UiPhase::Approval) {
+        renderer.pop_approval_prompt();
+        state.on_approval_resolved();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod approval_retract_tests {
+    use super::retract_stale_approval;
+    use crate::render::{Renderer, UiLine};
+    use crate::state::{UiPhase, UiState};
+
+    #[derive(Default)]
+    struct CountingRenderer {
+        pops: usize,
+    }
+    impl Renderer for CountingRenderer {
+        fn render(&mut self, _line: UiLine) {}
+        fn flush(&mut self) {}
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+        fn pop_approval_prompt(&mut self) {
+            self.pops += 1;
+        }
+    }
+
+    #[test]
+    fn retracts_orphaned_approval_when_resolved_without_keypress() {
+        let mut state = UiState::new();
+        state.on_approval_needed("EditFile");
+        assert!(matches!(state.phase, UiPhase::Approval));
+        let mut r = CountingRenderer::default();
+        // A result/cancel arriving while the prompt is still up = resolved without a keypress.
+        let retracted = retract_stale_approval(&mut state, &mut r);
+        assert!(retracted, "a still-pending approval must be retracted");
+        assert_eq!(r.pops, 1, "the orphaned 'Waiting for approval' body row must be popped");
+        assert!(!matches!(state.phase, UiPhase::Approval), "phase must leave Approval");
+    }
+
+    #[test]
+    fn noop_when_no_approval_pending() {
+        let mut state = UiState::new(); // not in Approval phase
+        let mut r = CountingRenderer::default();
+        let retracted = retract_stale_approval(&mut state, &mut r);
+        assert!(!retracted, "nothing to retract when no prompt is up");
+        assert_eq!(r.pops, 0, "must not pop when no approval prompt is showing");
+    }
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -6442,6 +6920,42 @@ fn handle_agent_event(
     reasoning_buffer: &mut String,
     buf: &mut Buffer,
 ) {
+    // Any foreground event means the stream is alive — refresh the stall clock so
+    // the spinner only warns "network may be down" after genuine silence.
+    state.note_stream_activity();
+
+    // Whitelist which events should flush a buffered turn-end separator
+    // BEFORE we handle them. The buffered separator was deferred at
+    // `TurnComplete` precisely so that — if the goal is about to end —
+    // the `✓ Goal met` banner can render ABOVE the line. So we only
+    // flush on events that signal "a new action is starting" (next round
+    // beginning, next tool call, next user-bound stream, etc.). Passive
+    // events like `PhaseChange(Idle)` / `TokenUsage` come right after
+    // `TurnComplete` but BEFORE the wrapper's `GoalUpdate(active=false)`;
+    // flushing on them would render the line above the banner — the bug
+    // this whitelist exists to prevent.
+    //
+    // `GoalUpdate(active=false)` is intentionally absent here — its
+    // handler renders the banner and then flushes the separator itself
+    // (with a stripped, stats-only label).
+    let should_flush_now = matches!(
+        &ev,
+        AgentEvent::TextDelta(_)
+            | AgentEvent::ReasoningDelta(_)
+            | AgentEvent::ToolCallStreaming { .. }
+            | AgentEvent::ToolCallStarted { .. }
+            | AgentEvent::ApprovalNeeded { .. }
+            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::Thinking)
+            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::CallingTool(_))
+            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::WaitingApproval)
+            | AgentEvent::GoalUpdate { active: true, .. }
+            | AgentEvent::TurnCancelled { .. }
+            | AgentEvent::Error { .. }
+    );
+    if should_flush_now {
+        flush_pending_separator(state, renderer, /* as_goal_end */ false);
+    }
+
     match ev {
         AgentEvent::TextDelta(text) => {
             let visible = think.feed(&text);
@@ -6495,6 +7009,18 @@ fn handle_agent_event(
                 return;
             }
 
+            // The v2 kernel asks for approval from middleware BEFORE it emits
+            // ToolStarted. ApprovalNeeded may therefore have already rendered the
+            // static `● Tool(detail)` row for this same call id. In that case the
+            // started event is only a state transition: rendering a fresh
+            // ToolCallInFlight row would duplicate the tool line.
+            if let Some((stored_display, stored_detail, true)) = pending_tools.get_mut(&id) {
+                *stored_display = display.clone();
+                *stored_detail = detail.clone();
+                state.on_tool_call_started(&display);
+                return;
+            }
+
             // Emit the ▸ line immediately so users can see what command
             // is running, especially for long-running bash commands.
             renderer.render(UiLine::AssistantLineBreak);
@@ -6527,6 +7053,11 @@ fn handle_agent_event(
             success,
             ..
         } => {
+            // A result for this call arrived while an approval prompt is still up ⇒ the
+            // approval was resolved WITHOUT the user answering (headless timeout fail-close,
+            // a displaced second approval, or a cancel). Retract the orphaned "Waiting for
+            // approval" row first so it doesn't linger above the result.
+            retract_stale_approval(state, renderer);
             // If this call belongs to an active batch, the group header
             // already accounts for it; emit a single-line `  ↳ ✓ / ✗`
             // child completion and skip the full ▸ + ⎿ body render.
@@ -6631,8 +7162,15 @@ fn handle_agent_event(
                 });
             }
             if !suppress_body_echo {
-                let summary = summarise(&output);
-                renderer.render(UiLine::ToolResult { success, summary });
+                // A plan-mode interception isn't a failure — render it as a calm `○`
+                // hint (with the gate's reason) instead of a ✗ error, so the user
+                // sees WHY the tool didn't run and that they should review the plan.
+                if let Some(reason) = plan_mode_block_reason(&output, success) {
+                    renderer.render(UiLine::CommandOutput(format!("  ○ {reason}\n")));
+                } else {
+                    let summary = summarise(&output);
+                    renderer.render(UiLine::ToolResult { success, summary });
+                }
             }
             // Collect diff lines into a single batch — N individual
             // DiffLine renders each trigger a full footer redraw and
@@ -6708,12 +7246,12 @@ fn handle_agent_event(
             let _ = name;
         }
         AgentEvent::ApprovalNeeded {
-            tool_name, call, messages, ..
+            tool_name, call, snapshot, ..
         } => {
             // Persist mid-turn messages to session so /bg can recover
             // the conversation even when the turn hasn't finished yet.
-            if !messages.is_empty() {
-                apply_session_messages(&mut ctx.current_session, messages);
+            if !snapshot.messages.is_empty() {
+                apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone());
             }
@@ -6802,7 +7340,7 @@ fn handle_agent_event(
             turn_count,
             tool_call_count,
             stop_reason,
-            messages,
+            snapshot,
         } => {
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
@@ -6819,31 +7357,54 @@ fn handle_agent_event(
             );
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
-            let dur = crate::render::fmt_dur(duration);
-            // An errored turn already rendered a red Error line just above;
-            // showing a celebratory "✓ Nailed it" separator under it is
-            // contradictory. Use the ✗ "stopped" summary instead, and don't
-            // burn a DONE_LABELS rotation slot on a failure.
-            let label = if matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error) {
-                crate::i18n::t(crate::i18n::Msg::TurnSummaryError {
-                    turn_count,
-                    tool_call_count,
-                    duration: &dur,
-                    total_tokens,
-                })
-                .into_owned()
+            let errored = matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error);
+            // Footer token count: bill output + UNCACHED input (re-reading the
+            // cached prefix each round is near-free). The event's `total_tokens`
+            // is the v2 gross sum (prompt+completion per round) which overstates
+            // usage ~10-100× on long multi-round turns — recompute from the
+            // per-turn tallies instead. Falls back to the event value if no
+            // per-round usage arrived (turn_prompt 0).
+            let (total_tokens, cached_pct) = if state.turn_prompt_tokens > 0 {
+                crate::state::turn_token_summary(
+                    state.turn_prompt_tokens,
+                    state.turn_completion_tokens,
+                    state.turn_cached_tokens,
+                )
             } else {
-                let done = state.next_done_label();
-                crate::i18n::t(crate::i18n::Msg::TurnSummary {
-                    done,
+                (total_tokens, None)
+            };
+            if state.goal_condition.is_some() {
+                // A /goal is active: DEFER the separator so the next event can
+                // choose its form — a `✓ Goal met` banner ABOVE a stats-only
+                // line when the goal ends (GoalUpdate active=false), or the
+                // `↻ goal round N` banner mid-goal (flushed by should_flush_now).
+                // `errored` rides along as a defensive fallback.
+                state.pending_separator = Some(crate::state::PendingSeparator {
+                    duration,
                     turn_count,
                     tool_call_count,
-                    duration: &dur,
                     total_tokens,
-                })
-                .into_owned()
-            };
-            renderer.render(UiLine::TurnSeparator { label });
+                    was_goal_round: true,
+                    errored,
+                    cached_pct,
+                });
+            } else {
+                // No active goal: render the turn summary immediately, exactly
+                // as before the /goal merge — the line lands at the bottom of
+                // the turn that just finished instead of waiting for the next
+                // event. Same i18n + Error-aware label as the deferred path.
+                let dur = crate::render::fmt_dur(duration);
+                let label = turn_summary_label(
+                    state,
+                    errored,
+                    turn_count,
+                    tool_call_count,
+                    total_tokens,
+                    cached_pct,
+                    &dur,
+                );
+                renderer.render(UiLine::TurnSeparator { label });
+            }
             renderer.flush();
             state.on_turn_complete();
 
@@ -6864,7 +7425,7 @@ fn handle_agent_event(
             // sessions persist only `messages`, so without this the per-turn
             // token/duration numbers are lost on reload and turns butt together.
             ctx.current_session.turn_stats.push(atomcode_core::session::TurnStat {
-                after_message: messages.len(),
+                after_message: snapshot.messages.len(),
                 turn_count,
                 tool_call_count,
                 duration_ms: duration.as_millis() as u64,
@@ -6873,7 +7434,7 @@ fn handle_agent_event(
             });
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
-            persist_current_session(ctx, messages, renderer);
+            persist_current_session(ctx, snapshot, renderer);
 
             // CodingPlan usage refresh — fire after each completed turn
             // (with cooldown) so the right-aligned hint reflects the
@@ -6936,7 +7497,7 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
-        AgentEvent::TurnCancelled { messages } => {
+        AgentEvent::TurnCancelled { snapshot } => {
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
                 atomcode_core::notify::NotificationEvent::TurnFinished(
@@ -6983,19 +7544,19 @@ fn handle_agent_event(
             think.reset();
             // Save what we did have — a user who Ctrl+C'd mid-stream
             // should still be able to /resume the cleaned conversation.
-            persist_current_session(ctx, messages, renderer);
+            persist_current_session(ctx, snapshot, renderer);
         }
         AgentEvent::ConversationTruncated {
-            messages,
+            snapshot,
             restored_prompt,
             target_n,
             prompts_before,
         } => {
-            let new_len = messages.len();
+            let new_len = snapshot.messages.len();
             // Persist the truncated conversation: messages + prune stale
             // per-turn dividers (anchored by message-count) so /resume won't
             // replay dividers for removed turns.
-            ctx.current_session.messages = messages.clone();
+            ctx.current_session.update_from_conversation_snapshot(snapshot);
             ctx.current_session
                 .turn_stats
                 .retain(|s| s.after_message <= new_len);
@@ -7039,7 +7600,7 @@ fn handle_agent_event(
             renderer.render(UiLine::CommandOutput(line));
             renderer.flush();
         }
-        AgentEvent::Error { error, messages } => {
+        AgentEvent::Error { error, snapshot } => {
             renderer.render(UiLine::Error(error));
             renderer.flush();
             fixissue_pending.take();
@@ -7056,7 +7617,7 @@ fn handle_agent_event(
             // nothing for that conversation. Empty `messages` from
             // the streaming-error forwarder is treated as a no-op
             // by persist_current_session.
-            persist_current_session(ctx, messages, renderer);
+            persist_current_session(ctx, snapshot, renderer);
         }
         AgentEvent::Warning(w) => {
             // Non-fatal — flush a yellow advisory line and let the turn
@@ -7088,11 +7649,18 @@ fn handle_agent_event(
         AgentEvent::RestorePendingImages { images, markers } => {
             // VL preprocessing failed — re-attach the user's images to
             // the input state so they can retry without re-pasting from
-            // clipboard. The `[Image #N]` text marker is gone (lives in
-            // the conversation history echo at this point), so the user
-            // typically UP-recalls or retypes the caption + Enter to
-            // resubmit. The attached image bytes ride along automatically
-            // with the next submit.
+            // clipboard.
+            //
+            // Restore the full original message text (including the text
+            // between [Image #N] markers) from `last_submitted_message`.
+            // Without this, only markers get re-inserted into the cleared
+            // buffer and the user's caption text is silently lost — the
+            // user sees blank space where their text should be (bug report:
+            // "多张图片发送后丢失文字，只保留了最后一张").
+            if let Some(restore) = state.last_submitted_message.take() {
+                buf.text = restore;
+                buf.cursor = buf.text.len();
+            }
             //
             // Hash table is rebuilt as best-effort: we hash the base64
             // payload (not raw RGBA), which means a fresh clipboard copy
@@ -7110,6 +7678,15 @@ fn handle_agent_event(
                 state.pending_image_hashes.push(h);
                 state.pending_images.push(img);
                 state.pending_image_markers.push(marker);
+                // Only insert the marker if it's NOT already in the
+                // restored message text — `last_submitted_message` above
+                // already carries the original markers in the correct
+                // positions alongside the user's text.
+                let marker_text = format!("[Image #{}]", marker);
+                if !buf.text.contains(&marker_text) {
+                    buf.text.insert_str(buf.cursor, &marker_text);
+                    buf.cursor += marker_text.len();
+                }
             }
             // Don't redraw — TUI is in Streaming phase here (turn isn't
             // over yet); the next idle/streaming redraw picks up the new
@@ -7120,6 +7697,11 @@ fn handle_agent_event(
             state.completion_tokens += u.completion_tokens;
             state.cached_tokens += u.cached_tokens;
             state.total_tokens += u.completion_tokens;
+            // Per-turn tallies for the footer's billable count + cache annotation
+            // (reset in on_turn_complete / on_turn_cancelled).
+            state.turn_prompt_tokens += u.prompt_tokens;
+            state.turn_completion_tokens += u.completion_tokens;
+            state.turn_cached_tokens += u.cached_tokens;
         }
         AgentEvent::WorkingDirChanged(new_dir) => {
             // Fires when a tool (change_dir / bash cd) or an AgentCommand::ChangeDir
@@ -7149,27 +7731,6 @@ fn handle_agent_event(
                 // /resume 与手机端项目列表都会在错误的项目下看到它。
                 ctx.session_manager = atomcode_core::session::SessionManager::new(&new_dir);
                 commands::reset_to_new_session(ctx, state, renderer);
-            }
-        }
-        AgentEvent::SessionSwitched { dir, session_id } => {
-            // 手机 App 点开了（可能属于另一个项目的）历史对话：cd 过去（如需）
-            // 并**恢复**那条会话，而不是开新会话 —— 与 ProjectSwitched 的关键
-            // 区别。已在该会话上时跳过，避免冗余广播触发重复回放。
-            let already = ctx.working_dir == dir
-                && ctx.current_session.id.to_string() == session_id;
-            if !already {
-                if ctx.working_dir != dir {
-                    commands::apply_cd(ctx, dir.clone());
-                    // 同 ProjectSwitched：恢复/续写的会话必须落在目标项目的目录。
-                    ctx.session_manager =
-                        atomcode_core::session::SessionManager::new(&dir);
-                }
-                let sid = atomcode_core::session::SessionId::from_string(session_id);
-                if !commands::resume_session_here(ctx, state, renderer, sid) {
-                    // 会话文件缺失/损坏：退化为该项目下的全新会话（与切项目一致），
-                    // 至少目录是对的，不至于停在旧项目。
-                    commands::reset_to_new_session(ctx, state, renderer);
-                }
             }
         }
         AgentEvent::RemoteSlashCommand(line) => {
@@ -7354,6 +7915,54 @@ fn handle_agent_event(
                 batch_id.clone(),
                 crate::state::ActiveToolBatch { call_ids },
             );
+            // Anchor the spinner clock to the batch start. The interleaved
+            // per-tool events that follow won't reset it (they no-op the reset
+            // while a batch is active), so the elapsed-ms ticks steadily instead
+            // of flickering 0→N→0.
+            state.on_tool_batch_started();
+        }
+        AgentEvent::GoalUpdate { active, round, condition, last_reason, .. } => {
+            if active {
+                state.goal_condition = Some(condition);
+                state.goal_round = round;
+                if state.goal_started_at.is_none() {
+                    state.goal_started_at = Some(std::time::Instant::now());
+                }
+            } else {
+                // Goal ended. Render order: banner (CommandOutput, bypasses
+                // markdown) ABOVE a stats-only separator. The user wanted
+                // the verdict to read top-down: assistant output → ✓ Goal
+                // met → quiet horizontal line with timing. The earlier
+                // TurnComplete buffered its stats into `pending_separator`
+                // precisely so we could re-render them in this stripped
+                // form here.
+                if state.goal_condition.is_some() {
+                    if let Some(reason) = last_reason.as_deref() {
+                        let banner = if reason.contains("cancelled") {
+                            // Cancel already gets its own UiLine via
+                            // TurnCancelled — skip to avoid double banner.
+                            None
+                        } else if reason.contains("evaluator unavailable")
+                            || reason.contains("cleared by user")
+                        {
+                            Some(format!("  ⚠ Goal stopped: {reason}\n"))
+                        } else {
+                            Some(format!("  ✓ Goal met: {reason}\n"))
+                        };
+                        if let Some(line) = banner {
+                            renderer.render(UiLine::CommandOutput(line));
+                            renderer.flush();
+                        }
+                    }
+                }
+                state.goal_condition = None;
+                state.goal_round = 0;
+                state.goal_started_at = None;
+                // Now flush the buffered separator as a stats-only line —
+                // the verdict above already conveys what happened, the
+                // separator just visually closes the turn.
+                flush_pending_separator(state, renderer, /* as_goal_end */ true);
+            }
         }
         AgentEvent::ToolBatchCompleted {
             batch_id,
@@ -7487,19 +8096,22 @@ fn handle_agent_event(
             }
             renderer.flush();
         }
-        AgentEvent::MessagesSync { messages } => {
+        AgentEvent::MessagesSync { snapshot } => {
             // Response to AgentCommand::SyncMessages. Persist the
             // snapshot to the current session so /bg can recover
             // the conversation state.
-            if !messages.is_empty() {
-                apply_session_messages(&mut ctx.current_session, messages);
+            if !snapshot.messages.is_empty() {
+                apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone());
             }
         }
         AgentEvent::UserEcho(text) => {
-            // Live-sync: render the peer's user message as a user bubble.
-            renderer.render(UiLine::User(text));
+            let markers = image_markers_in_order(&text);
+            renderer.render(UiLine::UserWithAttachments {
+                text,
+                attachments: markers,
+            });
             renderer.flush();
         }
         AgentEvent::PeerBusy(running) => {
@@ -7547,6 +8159,53 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
+        AgentEvent::SessionSwitched(session_id) => {
+            // webui 新建对话，TUI 跟随切换到新会话。与 ProjectSwitched 不同，
+            // 这里不切目录，只切换到指定 session_id 的新会话。
+            let sid = atomcode_core::session::SessionId::from_string(session_id);
+            // 清除当前对话、重置到新 session，但用 webui 指定的 session_id
+            // 以确保三端（TUI / webui / 磁盘）落到同一个文件。
+            ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+            ctx.current_session_id = None;
+            state.total_tokens = 0;
+            state.prompt_tokens = 0;
+            state.completion_tokens = 0;
+            state.cached_tokens = 0;
+            state.last_context = None;
+            state.pending_context_render = None;
+            state.thinking_idx = 0;
+            state.on_turn_complete();
+            // 使用 webui 指定的 session_id 创建新 session，保证三端一致。
+            let mut new_session =
+                atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+            new_session.id = sid;
+            ctx.current_session = new_session;
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone());
+            commands::bind_telemetry_to_session(ctx, &ctx.current_session);
+            // 如果在同步模式，重新附着 LiveSession 以绑定新 session_id。
+            if ctx.sync_session.is_some() {
+                let session = atomcode_daemon::ensure_live_session(
+                    ctx.working_dir.clone(),
+                    ctx.telemetry.clone(),
+                    Some(ctx.current_session.id.clone()),
+                    Vec::new(),
+                );
+                attach_live_session(ctx, renderer, session, false);
+            }
+            renderer.begin_sync();
+            renderer.reset();
+            let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+            renderer.render(UiLine::Welcome {
+                model: ctx.model_name.clone(),
+                working_dir: dir_display,
+            });
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
+            ));
+            renderer.flush();
+            renderer.end_sync();
+        }
     }
 }
 
@@ -7557,13 +8216,13 @@ fn handle_agent_event(
 /// conversation is empty (don't save a blank session).
 fn persist_current_session(
     ctx: &mut LoopCtx,
-    messages: Vec<atomcode_core::conversation::message::Message>,
+    snapshot: atomcode_core::conversation::ConversationSnapshot,
     renderer: &mut dyn Renderer,
 ) {
-    if messages.is_empty() {
+    if snapshot.messages.is_empty() {
         return;
     }
-    apply_session_messages(&mut ctx.current_session, messages);
+    apply_session_snapshot(&mut ctx.current_session, snapshot);
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
     // Surface save failures instead of silently swallowing them.
@@ -7580,14 +8239,14 @@ fn persist_current_session(
     }
 }
 
-pub(crate) fn apply_session_messages(
+pub(crate) fn apply_session_snapshot(
     session: &mut atomcode_core::session::Session,
-    messages: Vec<atomcode_core::conversation::message::Message>,
+    snapshot: atomcode_core::conversation::ConversationSnapshot,
 ) {
-    if messages.is_empty() {
+    if snapshot.messages.is_empty() {
         return;
     }
-    session.messages = messages;
+    session.update_from_conversation_snapshot(snapshot);
     session.touch();
     // Triggers for renaming:
     //   * `default` / `session-<ts>` — never renamed yet
@@ -7635,10 +8294,10 @@ fn is_synthetic_user_text(text: &str) -> bool {
 
 #[cfg(test)]
 mod session_naming_tests {
-    use super::{apply_session_messages, is_synthetic_user_text};
+    use super::{apply_session_snapshot, is_synthetic_user_text};
 
     #[test]
-    fn apply_session_messages_renames_from_first_real_user() {
+    fn apply_session_snapshot_renames_from_first_real_user() {
         use atomcode_core::conversation::message::{Message, Role};
         let mut session = atomcode_core::session::Session::default_session(
             std::path::PathBuf::from("/tmp/project"),
@@ -7648,23 +8307,56 @@ mod session_naming_tests {
             Message::new(Role::User, "implement background sessions\nwith tests"),
         ];
 
-        apply_session_messages(&mut session, messages);
+        apply_session_snapshot(
+            &mut session,
+            atomcode_core::conversation::ConversationSnapshot {
+                messages,
+                cold_summaries: Vec::new(),
+            },
+        );
 
         assert_eq!(session.name, "implement background sessions");
         assert_eq!(session.messages.len(), 2);
     }
 
     #[test]
-    fn apply_session_messages_preserves_custom_name() {
+    fn apply_session_snapshot_preserves_custom_name() {
         use atomcode_core::conversation::message::{Message, Role};
         let mut session = atomcode_core::session::Session::default_session(
             std::path::PathBuf::from("/tmp/project"),
         );
         session.name = "manual name".to_string();
 
-        apply_session_messages(&mut session, vec![Message::new(Role::User, "new task")]);
+        apply_session_snapshot(
+            &mut session,
+            atomcode_core::conversation::ConversationSnapshot {
+                messages: vec![Message::new(Role::User, "new task")],
+                cold_summaries: Vec::new(),
+            },
+        );
 
         assert_eq!(session.name, "manual name");
+    }
+
+    #[test]
+    fn apply_session_snapshot_preserves_cold_summaries() {
+        use atomcode_core::conversation::{
+            message::{Message, Role},
+            ConversationSnapshot,
+        };
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+
+        apply_session_snapshot(
+            &mut session,
+            ConversationSnapshot {
+                messages: vec![Message::new(Role::User, "new task")],
+                cold_summaries: vec!["compressed context".to_string()],
+            },
+        );
+
+        assert_eq!(session.cold_summaries, vec!["compressed context"]);
     }
 
     #[test]
@@ -7868,6 +8560,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         None
     };
+    // Active /goal → the dedicated footer goal row (width-truncated by the
+    // renderer). Carries the condition text so the user can SEE what the goal
+    // is, not just that one is running.
+    let goal = state.goal_condition.as_ref().map(|cond| crate::render::GoalStatus {
+        condition: cond.clone(),
+        // Display 1-based: the engine's round is 0 on the first attempt.
+        round: state.goal_round + 1,
+        elapsed_secs: state.goal_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+    });
     crate::render::StatusLine {
         model,
         cwd,
@@ -7882,6 +8583,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             None
         },
         session_name,
+        goal,
     }
 }
 
@@ -7962,6 +8664,14 @@ fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Opt
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
     }
+    // Network-stall warning: a streaming response that's gone silent past the
+    // threshold (e.g. mid-stream network drop) reads as a freeze with no feedback.
+    // Surface a hint that it isn't frozen and esc cancels. Static text, placed
+    // BEFORE the ticking elapsed so its width never jitters the segments after it.
+    if state.stream_stalled() {
+        out.push_str(" · ");
+        out.push_str(&crate::i18n::t(crate::i18n::Msg::StreamStalled));
+    }
     // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
     // `Running ReadFile… 4s`. CC behaviour: timer resets on every phase
     // transition so the user reads "this thing has been running for N
@@ -8035,7 +8745,8 @@ pub fn display_tool_name_short(snake: &str) -> String {
 }
 
 pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
+    let repaired_args = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired_args) else {
         return String::new();
     };
     let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
@@ -8079,8 +8790,19 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
         "web_search" => get_str("query")
             .map(|q| crate::width::truncate_with_ellipsis(&q, 100))
             .unwrap_or_default(),
-        "find_references" | "trace_callees" | "trace_callers" | "trace_chain" => {
+        "find_references" | "trace_callees" | "trace_callers" => {
             get_str("symbol").unwrap_or_default()
+        }
+        "trace_chain" => {
+            // trace_chain takes `from`/`to`, not `symbol` — keep this branch
+            // separate so the detail isn't blank. See trace_chain.rs Args.
+            let from = get_str("from").unwrap_or_default();
+            let to = get_str("to").unwrap_or_default();
+            if from.is_empty() || to.is_empty() {
+                String::new()
+            } else {
+                format!("{} → {}", from, to)
+            }
         }
         "blast_radius" | "file_dependencies" => {
             // Same as above: basename for single-call; batch disambiguation
@@ -8371,6 +9093,22 @@ pub(crate) fn summarise(output: &str) -> String {
     } else {
         trimmed
     }
+}
+
+/// A plan-mode interception surfaces as a failed tool result whose body is
+/// `blocked: plan mode …` — the kernel prefixes every middleware block with `blocked: `,
+/// and `PlanModeGate`'s reason starts with `plan mode is active`. Returns the human reason
+/// (sans the `blocked: ` prefix) when the result is such a block, so the UI can render a
+/// calm `○` hint instead of a ✗ error — plan-mode enforcement is EXPECTED, not a failure.
+/// The model still receives the full `blocked: …` ToolResult via the conversation. The link
+/// to the gate's wording is by string; if it ever drifts this returns `None` and the normal
+/// ✗ result render is used (a harmless fallback, never a panic).
+pub(crate) fn plan_mode_block_reason(output: &str, success: bool) -> Option<&str> {
+    if success {
+        return None;
+    }
+    let reason = output.strip_prefix("blocked: ")?;
+    reason.starts_with("plan mode").then_some(reason)
 }
 
 // SessionPicker tests moved alongside the struct in

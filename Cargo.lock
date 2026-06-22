@@ -146,6 +146,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -158,10 +180,11 @@ dependencies = [
 
 [[package]]
 name = "atomcode"
-version = "4.25.0"
+version = "4.25.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "atomcode-bridge",
  "atomcode-core",
  "atomcode-daemon",
  "atomcode-telemetry",
@@ -176,6 +199,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serial_test",
+ "sysinfo",
  "tempfile",
  "tokio",
  "toml 0.8.23",
@@ -184,7 +209,103 @@ dependencies = [
  "uuid",
  "which",
  "windows-sys 0.61.2",
+ "winreg",
  "winresource",
+]
+
+[[package]]
+name = "atomcode-bridge"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atomcode-capabilities",
+ "atomcode-coding",
+ "atomcode-core",
+ "atomcode-kernel",
+ "atomcode-telemetry",
+ "getrandom 0.2.17",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
+name = "atomcode-capabilities"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "atomcode-kernel",
+ "base64",
+ "bytes",
+ "chrono",
+ "dirs 6.0.0",
+ "futures",
+ "globset",
+ "ignore",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.23",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-html",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "url",
+ "uuid",
+ "which",
+ "wiremock",
+]
+
+[[package]]
+name = "atomcode-clix"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atomcode-capabilities",
+ "atomcode-coding",
+ "atomcode-kernel",
+ "atomcode-review",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "atomcode-coding"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "atomcode-capabilities",
+ "atomcode-kernel",
+ "atomcode-review",
+ "atomcode-telemetry",
+ "dirs 6.0.0",
+ "futures",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -200,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-core"
-version = "4.25.0"
+version = "4.25.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -257,10 +378,11 @@ dependencies = [
 
 [[package]]
 name = "atomcode-daemon"
-version = "4.25.0"
+version = "4.25.3"
 dependencies = [
  "anyhow",
  "async-trait",
+ "atomcode-bridge",
  "atomcode-core",
  "atomcode-telemetry",
  "axum",
@@ -272,6 +394,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -282,8 +405,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-kernel"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "atomcode-review"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "atomcode-capabilities",
+ "atomcode-kernel",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "atomcode-telemetry"
-version = "4.25.0"
+version = "4.25.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -304,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-tuix"
-version = "4.25.0"
+version = "4.25.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -320,8 +469,10 @@ dependencies = [
  "objc2-foundation",
  "png 0.17.16",
  "qrcode",
+ "reqwest",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
  "tokio",
  "toml 0.8.23",

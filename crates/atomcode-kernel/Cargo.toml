@@ -1,0 +1,19 @@
+[package]
+name = "atomcode-kernel"
+version = "0.0.0"
+edition = "2021"
+description = "Spike: neutral agent kernel (Phase A0 — design validation, throwaway internals)"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` so the provider-retry
+# backoff (3/6/9s) advances on VIRTUAL time — the retry tests stay instant.
+tokio = { version = "1", features = ["test-util"] }

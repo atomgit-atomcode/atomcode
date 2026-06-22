@@ -241,9 +241,33 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Strip the Windows extended-length / UNC verbatim prefix (`\\?\`, `\\?\UNC\`)
+/// from a path string.
+///
+/// `std::fs::canonicalize()` returns verbatim paths on Windows (`\\?\D:\foo`),
+/// while the TUI's `current_dir()` yields plain paths (`D:\foo`). Left
+/// unnormalized the two forms hash to different session buckets, so webui and
+/// TUI sessions for the same project never reconcile. Call this on any path that
+/// may have passed through `canonicalize()` before storing, persisting, or
+/// hashing it. No-op for paths without the prefix (incl. all POSIX paths).
+pub fn strip_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        std::borrow::Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
+/// [`strip_verbatim_prefix`] for `Path` callers; allocates a fresh `PathBuf`.
+pub fn strip_verbatim_prefix_path(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(strip_verbatim_prefix(&path.to_string_lossy()).as_ref())
+}
+
 fn is_windows_sensitive_path(path: &str) -> bool {
     let normalized = path.replace('/', "\\");
-    let normalized = normalized.strip_prefix(r"\\?\").unwrap_or(&normalized);
+    let normalized = strip_verbatim_prefix(&normalized);
     let lowercase = normalized.to_ascii_lowercase();
     let sensitive_roots = [
         r"\windows",
@@ -673,7 +697,15 @@ pub fn approval_for_path(
                     scope: access.path.to_string_lossy().into_owned(),
                 }
             } else {
-                ApprovalRequirement::AutoApprove
+                // Enumerating (listing/searching) a non-sensitive path outside
+                // the workspace still requires confirmation -- without an OS-level
+                // sandbox to constrain the process (#220), any filesystem access
+                // to unauthorised paths risks information leakage and wastes time
+                // on irrelevant directories.  Users can grant per-session approval
+                // with [A] if the access is intentional.
+                ApprovalRequirement::RequireApproval(format!(
+                    "{base_reason}. Enumerating paths outside the workspace requires confirmation."
+                ))
             }
         }
         ExternalPathAction::Read => {
@@ -698,6 +730,61 @@ pub fn approval_for_path(
             base_reason
         )),
     })
+}
+
+/// Resolve the approval requirement for a single-file mutating tool
+/// (`edit_file`, `write_file`, `search_replace`), scoping any prompt to the
+/// exact target file.
+///
+/// This is the fix for "pressing [A]/Always doesn't stick across repeated
+/// edits of the same file". Writes used to collapse to
+/// `RequireApprovalAlways`, which [`PermissionStore::check`] routes to `Ask`
+/// unconditionally — so the recorded session grant was dead and every edit
+/// re-prompted. By emitting [`ApprovalRequirement::RequireApprovalScoped`]
+/// keyed on the canonical file path (exactly what sensitive *reads* already
+/// do), a session `[A]` lands in `session_scope_grants` and remembers THAT
+/// file: re-editing it stops re-prompting, while every other sensitive /
+/// out-of-workspace file still prompts, and a tool-wide grant never
+/// blanket-unlocks sensitive writes.
+///
+/// `base` is the tool's own path-sensitivity verdict (`RequireApproval` for a
+/// sensitive system path, else `AutoApprove`); `raw_path` is the
+/// model-supplied target, canonicalised to a stable scope key.
+pub fn scoped_write_approval(
+    raw_path: &str,
+    working_dir: &Path,
+    base: ApprovalRequirement,
+) -> ApprovalRequirement {
+    // Stable per-file scope key — the same canonical form sensitive reads use,
+    // so repeated edits of one file hash to one key. Fall back to the raw path
+    // if canonicalisation fails (e.g. a not-yet-created parent) so the key is
+    // still consistent across calls.
+    let scope = inspect_path_access(raw_path, working_dir)
+        .map(|r| r.path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| raw_path.to_string());
+
+    match approval_for_path(raw_path, working_dir, ExternalPathAction::Write) {
+        // Out-of-workspace write: prompt once, then remember this exact file
+        // for the session. (`approval_for_path` returns the tool-wide
+        // `RequireApprovalAlways` today; scope it here.)
+        Ok(ApprovalRequirement::RequireApprovalAlways(reason))
+        | Ok(ApprovalRequirement::RequireApproval(reason)) => {
+            ApprovalRequirement::RequireApprovalScoped { reason, scope }
+        }
+        Ok(ApprovalRequirement::RequireApprovalScoped { reason, .. }) => {
+            ApprovalRequirement::RequireApprovalScoped { reason, scope }
+        }
+        // In-workspace: the boundary check auto-approves. If the tool's base
+        // verdict flagged a sensitive in-workspace target (e.g. `.env`), scope
+        // the prompt to that file rather than the whole tool.
+        Ok(ApprovalRequirement::AutoApprove) => match base {
+            ApprovalRequirement::RequireApproval(reason) => {
+                ApprovalRequirement::RequireApprovalScoped { reason, scope }
+            }
+            other => other,
+        },
+        Err(_) => base,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -730,6 +817,7 @@ pub struct ToolCallBuffer {
     pub hint_sent: bool,
 }
 
+#[derive(Debug, Clone)]
 pub enum ApprovalRequirement {
     AutoApprove,
     RequireApproval(String),
@@ -1517,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_for_non_sensitive_enumeration_outside_workspace_is_auto() {
+    fn approval_for_non_sensitive_enumeration_outside_workspace_requires_confirmation() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
 
@@ -1527,8 +1615,67 @@ mod tests {
             ExternalPathAction::Enumerate,
         )
         .unwrap();
-        assert!(matches!(approval, ApprovalRequirement::AutoApprove));
+        // #220: enumerating paths outside the workspace requires confirmation
+        // even when non-sensitive, because there is no OS-level sandbox.
+        assert!(matches!(approval, ApprovalRequirement::RequireApproval(_)));
     }
+
+    // Regression (#220): Enumerate action on external paths must require confirmation.
+    // Before the fix, non-sensitive external paths were AutoApprove,
+    // so find/ls on unauthorised paths ran without prompts.
+    #[test]
+    fn enumerate_outside_workspace_can_be_granted_by_session() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let approval = approval_for_path(
+            &outside.path().to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Enumerate,
+        )
+        .unwrap();
+
+        // RequireApproval can be granted by a session grant (user pressed [A]),
+        // so repeated operations on the same tool do not re-prompt.
+        let mut store = PermissionStore::new();
+        let decision = store.check("bash", &approval);
+        assert!(matches!(decision, PermissionDecision::Ask(_)));
+
+        store.grant_session("bash");
+        let decision_again = store.check("bash", &approval);
+        assert!(matches!(decision_again, PermissionDecision::Allow));
+    }
+
+    // #220: Enumerate is NOT scoped -- it uses RequireApproval, not RequireApprovalScoped.
+    // A tool-wide [A] grant on bash can cover this,
+    // but sensitive paths (._ssh, /etc) still use RequireApprovalScoped
+    // and cannot be bypassed by a tool-wide grant.
+    #[test]
+    fn enumerate_outside_workspace_is_not_scoped() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let approval = approval_for_path(
+            &outside.path().to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Enumerate,
+        )
+        .unwrap();
+
+        // Non-scoped: matches RequireApproval, not RequireApprovalScoped
+        assert!(
+            matches!(approval, ApprovalRequirement::RequireApproval(_)),
+            "non-sensitive external enumeration should use RequireApproval"
+        );
+
+        // A tool-wide session grant should cover RequireApproval,
+        // but NOT RequireApprovalScoped (sensitive paths).
+        let mut store = PermissionStore::new();
+        store.grant_session("bash");
+        let decision = store.check("bash", &approval);
+        assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
 
     #[test]
     fn approval_for_non_sensitive_read_outside_workspace_requires_confirmation() {
@@ -1754,10 +1901,22 @@ mod tests {
             target.display()
         );
 
-        assert!(matches!(
-            tool.approval_with_context(&args, &ctx),
-            ApprovalRequirement::RequireApprovalAlways(_)
-        ));
+        // Out-of-workspace edit prompts, but scoped to this exact file so a
+        // session [A] remembers it (re-editing the same file stops
+        // re-prompting) — not a tool-wide blanket grant.
+        let approval = tool.approval_with_context(&args, &ctx);
+        let scope = match &approval {
+            ApprovalRequirement::RequireApprovalScoped { scope, .. } => scope.clone(),
+            other => panic!("expected scoped approval for workspace escape, got {other:?}"),
+        };
+        let mut store = PermissionStore::new();
+        assert!(matches!(store.check("edit_file", &approval), PermissionDecision::Ask(_)));
+        store.grant_session_scope(&scope); // user pressed [A]
+        let again = tool.approval_with_context(&args, &ctx);
+        assert!(
+            matches!(store.check("edit_file", &again), PermissionDecision::Allow),
+            "[A] on an out-of-workspace file must stop re-prompting for that same file",
+        );
     }
 
     // PermissionStore tests

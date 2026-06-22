@@ -27,6 +27,7 @@ node_modules/
 **/node_modules/
 package-lock.json
 !extensions/vscode/package-lock.json
+!tools/weixin-bridge/package-lock.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -83,6 +84,15 @@ dist/
 docs/superpowers
 .mcp.json
 
+# v2 (kernel-spike) local design specs / backlog — working docs kept on disk for
+# the contributor, NEVER committed (turn-end auto-commit would otherwise sweep them).
+docs/c1-assembly-spec.md
+docs/mcp-capability-spec.md
+docs/overflow-compaction-spec.md
+docs/session-persistence-recall-spec.md
+docs/system-prompt-parity-spec.md
+docs/v2-port-backlog.md
+
 # Superpowers plugin state
 .superpowers/
 .plan_docs
@@ -94,6 +104,14 @@ crates/atomcode-codingplan-crypto/
 scripts/build-official.sh
 build-official.sh
 build-official-vscode.sh
+build-official-jetbrains.sh
 
 # git worktrees
 .worktrees/
+
+extensions/vscode/webview/webview.css
+extensions/vscode/webview/webview.css.map
+extensions/vscode/webview/webview.js
+extensions/vscode/webview/webview.js.map
+.hooks.json
+extensions/jetbrains/.spec_docs

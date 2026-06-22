@@ -509,6 +509,7 @@ mod validate_args_tests {
     fn blank_config() -> Config {
         Config {
             default_provider: String::new(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: std::collections::HashMap::new(),
             datalog: Default::default(),
@@ -522,6 +523,7 @@ mod validate_args_tests {
             language: None,
             ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
         }
     }
 

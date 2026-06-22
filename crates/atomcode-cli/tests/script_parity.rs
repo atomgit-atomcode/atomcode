@@ -1,8 +1,8 @@
 //! CI gate: scripts/uninstall.{sh,ps1} hardcode a path manifest that MUST
-//! match crates/atomcode-core/src/uninstall/paths.rs::uninstall_manifest().
+//! match crates/atomcode-cli/src/uninstall/paths.rs::uninstall_manifest().
 //! Any drift breaks symmetry between the subcommand and fallback scripts.
 
-use atomcode_core::uninstall::paths::uninstall_manifest;
+use atomcode::uninstall::paths::uninstall_manifest;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 

@@ -577,39 +577,67 @@ impl SkillRegistry {
         if !dir.is_dir() {
             return;
         }
-        // CC array layout: the directory itself is a skill directory.
+        // CC array / hybrid layout: the passed directory may itself be a skill.
         let self_md = dir.join("SKILL.md");
         if self_md.exists() {
-            match parse_skill_dir(dir, &self_md, namespace) {
-                Ok(skill) => {
-                    self.skills.insert(skill.name.clone(), skill);
-                }
-                Err(e) => {
-                    warnings.push(format!("[skill] skipping {}: {}", dir.display(), e));
-                }
-            }
+            self.try_load_skill(dir, &self_md, namespace, warnings);
         }
-        // AtomCode / parent-directory layout: each subdirectory with a SKILL.md.
+        // AtomCode / parent-directory layout: scan subdirectories. A subdir
+        // that contains a SKILL.md is a skill; one that does not is treated as
+        // a grouping directory and recursed into, so nested skills such as
+        // `skills/B-SKILLS/SUB-SKILL/SKILL.md` are still discovered.
+        self.scan_skill_children(dir, namespace, warnings, 0);
+    }
+
+    /// Recursively scan the subdirectories of `dir` for skills. Each subdir
+    /// holding a `SKILL.md` is loaded (and not descended into — its own
+    /// children are skill resources, not sub-skills); a subdir without one is
+    /// a grouping directory whose nested skills are discovered recursively.
+    /// `depth` is bounded to guard against symlink cycles.
+    fn scan_skill_children(
+        &mut self,
+        dir: &Path,
+        namespace: Option<&str>,
+        warnings: &mut Vec<String>,
+        depth: usize,
+    ) {
+        const MAX_DEPTH: usize = 8;
+        if depth > MAX_DEPTH {
+            return;
+        }
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
         };
         for entry in entries.flatten() {
-            let skill_dir = entry.path();
-            if !skill_dir.is_dir() {
+            let child = entry.path();
+            if !child.is_dir() {
                 continue;
             }
-            let skill_md = skill_dir.join("SKILL.md");
-            if !skill_md.exists() {
-                continue;
+            let skill_md = child.join("SKILL.md");
+            if skill_md.exists() {
+                self.try_load_skill(&child, &skill_md, namespace, warnings);
+            } else {
+                self.scan_skill_children(&child, namespace, warnings, depth + 1);
             }
-            match parse_skill_dir(&skill_dir, &skill_md, namespace) {
-                Ok(skill) => {
-                    self.skills.insert(skill.name.clone(), skill);
-                }
-                Err(e) => {
-                    warnings.push(format!("[skill] skipping {}: {}", skill_dir.display(), e));
-                }
+        }
+    }
+
+    /// Parse and register a single skill directory, recording a diagnostic on
+    /// failure instead of aborting the surrounding scan.
+    fn try_load_skill(
+        &mut self,
+        dir: &Path,
+        skill_md: &Path,
+        namespace: Option<&str>,
+        warnings: &mut Vec<String>,
+    ) {
+        match parse_skill_dir(dir, skill_md, namespace) {
+            Ok(skill) => {
+                self.skills.insert(skill.name.clone(), skill);
+            }
+            Err(e) => {
+                warnings.push(format!("[skill] skipping {}: {}", dir.display(), e));
             }
         }
     }
@@ -1026,6 +1054,42 @@ mod tests {
 
         assert!(reg.get("test:hybrid").is_some(), "self SKILL.md should load");
         assert!(reg.get("test:sub-skill").is_some(), "subdirectory SKILL.md should load");
+    }
+
+    /// A grouping directory without its own SKILL.md should still have its
+    /// nested skills discovered (e.g. `skills/B-SKILLS/SUB-SKILL/SKILL.md`).
+    /// Regression: previously only one level of subdirectory was scanned.
+    #[test]
+    fn test_load_skills_dir_nested_grouping() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Top-level skill (depth 1) — the case that already worked.
+        let flat = tmp.path().join("a-skill");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(
+            flat.join("SKILL.md"),
+            "---\nname: a-skill\ndescription: flat\n---\nflat body",
+        )
+        .unwrap();
+
+        // Grouping dir with NO SKILL.md of its own, holding a nested skill (depth 2).
+        let nested = tmp.path().join("b-skills/sub-skill");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: sub-skill\ndescription: nested\n---\nnested body",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        reg.load_skills_dir(tmp.path(), Some("test"), &mut warnings);
+
+        assert!(reg.get("test:a-skill").is_some(), "depth-1 skill should load");
+        assert!(
+            reg.get("test:sub-skill").is_some(),
+            "nested skill under a grouping directory should load"
+        );
     }
 
     /// Regression test for the full plugin install path with CC-style

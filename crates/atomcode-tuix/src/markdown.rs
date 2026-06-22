@@ -396,12 +396,14 @@ pub fn flush_aligned_table_with_width(
         return render_flat_table(&parsed, caps);
     }
 
-    // Bright-black / DarkGrey (SGR 90) — table borders are chrome,
-    // not content. Cyan (SGR 96) made them collide with the input
-    // box separator and the inline-code colour, collapsing the
-    // visual hierarchy. Gray reads as quiet structure and lets
-    // header text + cell content carry the visual weight.
-    let border_on = if caps.colors { theme::MD_MUTED_OPEN } else { "" };
+    // Gray chrome — table borders are structure, not content (cyan made
+    // them collide with the input-box separator and inline-code colour).
+    // But the shade must be theme-aware: a fixed SGR 90 (DarkGrey) maps to
+    // ~#3F3F3F on dark themes, ~3:1 against the bg, so the whole grid went
+    // invisible until a selection highlight revealed it. `md_border_open`
+    // keeps SGR 90 on light and switches to SGR 37 (soft light-gray) on
+    // dark — quiet structure that stays visible on both.
+    let border_on = if caps.colors { theme::md_border_open() } else { "" };
     let border_off = if caps.colors { theme::MD_MUTED_CLOSE } else { "" };
 
     // Draw a horizontal rule row with given connector characters.
@@ -941,6 +943,33 @@ mod tests {
             "expected exactly 3 box-drawing bars (left border + 1 sep + right border); \
              got {} in {:?}",
             box_bar_count, body_line,
+        );
+    }
+
+    #[test]
+    fn flush_aligned_table_with_emoji_symbol_keeps_rows_aligned() {
+        // ☀ (U+2600) is a legacy-block pictographic emoji that GUI terminals
+        // paint at 2 cells. The renderer must SIZE and PAD the column with the
+        // same width metric (crate::width::display_width) so every row's
+        // border lands in the same column. Regression for the emoji-symbol
+        // table-misalignment bug (stray `│` shifted right of "☀ 晴").
+        let rows = vec![
+            "| 时段 | 天气 |".to_string(),
+            "| --- | --- |".to_string(),
+            "| 早上 | ☀ 晴 |".to_string(),
+            "| 中午 | 多云 |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "every table row must share one display width; got {:?} for\n{}",
+            widths,
+            out
         );
     }
 
