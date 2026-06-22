@@ -51,6 +51,12 @@ pub fn build_review_agent_with(
         .tools(tools)
         .persona(persona)
         .working_dir(cfg.working_dir.clone())
+        // Confine read-only tools to the repo: a model `grep /` / read outside the
+        // repo is blocked before it runs (prevents whole-container scans → OOM, and
+        // out-of-repo reads). Review-agent only; other specializations are untouched.
+        .middleware(Arc::new(crate::confine::PathConfineMiddleware::new(
+            cfg.working_dir.clone(),
+        )))
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout);
     // Round fuse is opt-in: only bound rounds when the caller asked for it (keeps a bare

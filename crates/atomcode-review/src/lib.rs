@@ -35,6 +35,7 @@ pub mod persona;
 pub mod rules;
 
 mod assemble;
+mod confine;
 mod review_tool;
 
 pub use assemble::{build_review_agent, build_review_agent_with};
