@@ -121,23 +121,50 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
     Some(Duration::from_secs(secs))
 }
 
-/// Exponential backoff with ±25% jitter, capped at `max_delay`. `attempt` is 1-based.
+/// Exponential backoff with real ±25% jitter, capped at `max_delay`. `attempt`
+/// is 1-based.
+///
+/// Jitter exists to DECORRELATE retry timing across concurrent clients so a
+/// shared upstream (the gateway) doesn't see a synchronized retry storm after
+/// an outage — so the production jitter MUST vary per call. The pure math
+/// lives in [`compute_backoff_jittered`] with the jitter position injected,
+/// keeping unit tests reproducible WITHOUT making production deterministic (a
+/// deterministic seed would defeat the anti-thundering-herd purpose).
 pub(crate) fn compute_backoff(attempt: u32, policy: &RetryPolicy) -> Duration {
+    compute_backoff_jittered(attempt, policy, random_jitter_fraction())
+}
+
+/// Pure backoff math. `jitter` is the position inside the ±25% window, in
+/// `[0.0, 1.0)`: `0.0` → −25% (earliest), `0.5` → exactly `capped`, `~1.0` →
+/// +25% (latest). Injected so production passes real randomness while tests
+/// pass fixed fractions and assert exact bounds.
+fn compute_backoff_jittered(attempt: u32, policy: &RetryPolicy, jitter: f64) -> Duration {
     let exp = policy
         .base_delay
         .saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
     let capped = exp.min(policy.max_delay);
 
-    // Pseudo-jitter from wall-clock subsec nanos (no rng dependency). Timing jitter
-    // is not part of any cache prefix or eval determinism, so this is fine here.
+    // ±25% window centered on `capped`: total span = 50% of `capped`.
+    // Integer-ms math; for sub-2ms delays the window rounds to 0 (jitter is
+    // meaningless at that scale) and we just return `capped` — never underflow.
+    let capped_ms = capped.as_millis() as u64;
+    let window_ms = capped_ms / 2;
+    let jitter = jitter.clamp(0.0, 1.0 - f64::EPSILON);
+    let offset_ms = (jitter * window_ms as f64) as u64;
+    let floor_ms = capped_ms.saturating_sub(window_ms / 2);
+    Duration::from_millis(floor_ms + offset_ms)
+}
+
+/// Real per-call jitter source for production. Wall-clock subsec nanos give
+/// cross-process/cross-call decorrelation (the anti-thundering-herd property
+/// jitter exists for) with no `rand` dependency. Returns a fraction in
+/// `[0.0, 1.0)`. Tests bypass this entirely via [`compute_backoff_jittered`].
+fn random_jitter_fraction() -> f64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let range = (capped.as_millis() / 2) as u64; // total ±25% window
-    let jitter_ms = if range > 0 { (nanos as u64) % range } else { 0 };
-    let floor = capped.saturating_sub(Duration::from_millis(range / 2));
-    floor + Duration::from_millis(jitter_ms)
+    f64::from(nanos) / 1_000_000_000.0
 }
 
 #[cfg(test)]
@@ -197,6 +224,85 @@ mod tests {
         let a1 = compute_backoff(1, &policy);
         let a5 = compute_backoff(5, &policy);
         assert!(a5 > a1, "backoff should grow: a1={a1:?} a5={a5:?}");
+    }
+
+    // Jitter-math tests against the pure `compute_backoff_jittered` (jitter
+    // position injected) — reproducible WITHOUT making production jitter
+    // deterministic, which would defeat the anti-thundering-herd purpose.
+
+    #[test]
+    fn backoff_jitter_spans_plus_minus_25_percent() {
+        // attempt 1 → capped = base = 1000ms. floor = 750ms, center = 1000ms,
+        // max < 1250ms (±25% centered on capped).
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            base_delay: Duration::from_millis(1000),
+            max_delay: Duration::from_secs(10),
+        };
+        assert_eq!(compute_backoff_jittered(1, &policy, 0.0), Duration::from_millis(750));
+        assert_eq!(compute_backoff_jittered(1, &policy, 0.5), Duration::from_millis(1000));
+        let hi = compute_backoff_jittered(1, &policy, 0.999);
+        assert!(
+            (Duration::from_millis(1240)..Duration::from_millis(1250)).contains(&hi),
+            "near-1.0 jitter must approach +25% without reaching it: {hi:?}"
+        );
+    }
+
+    #[test]
+    fn backoff_jittered_is_pure() {
+        let p = RetryPolicy::default_policy();
+        assert_eq!(
+            compute_backoff_jittered(2, &p, 0.3),
+            compute_backoff_jittered(2, &p, 0.3),
+            "same inputs + same jitter must be reproducible"
+        );
+    }
+
+    #[test]
+    fn backoff_grows_with_attempts_at_fixed_jitter() {
+        // Hold jitter fixed so the EXPONENTIAL base — not jitter — drives
+        // monotonicity, regardless of saturation.
+        let p = RetryPolicy::default_policy();
+        let d1 = compute_backoff_jittered(1, &p, 0.5);
+        let d2 = compute_backoff_jittered(2, &p, 0.5);
+        let d3 = compute_backoff_jittered(3, &p, 0.5);
+        assert!(d1 < d2 && d2 < d3, "backoff must grow: {d1:?} {d2:?} {d3:?}");
+    }
+
+    #[test]
+    fn backoff_small_delay_is_safe() {
+        // base 1ms → capped 1ms; ±25% window rounds to 0 but must never
+        // underflow, panic, or yield a zero delay regardless of jitter.
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+        };
+        for jitter in [0.0, 0.5, 0.999] {
+            let d = compute_backoff_jittered(1, &policy, jitter);
+            assert!(
+                (Duration::from_millis(1)..=Duration::from_millis(2)).contains(&d),
+                "small delay out of range at jitter={jitter}: {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_random_source_stays_within_window() {
+        // Production wrapper draws real randomness; the result must always
+        // stay inside the ±25% window (bounds hold → not flaky).
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            base_delay: Duration::from_millis(1000),
+            max_delay: Duration::from_secs(10),
+        };
+        for _ in 0..1000 {
+            let d = compute_backoff(1, &policy);
+            assert!(
+                (Duration::from_millis(750)..Duration::from_millis(1250)).contains(&d),
+                "random jitter escaped ±25% window: {d:?}"
+            );
+        }
     }
 
     // A two-level error chain `outer -> io::Error(kind)`, mirroring how a
