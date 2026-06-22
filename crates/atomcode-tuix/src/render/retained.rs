@@ -1288,15 +1288,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // segments with ".../" and keeps only the last segment.
         let model_str = if !status.model.is_empty() {
             let mut s = scrub_controls(&status.model);
-            if status.vision {
-                let fallback = t(Msg::StatusVisionIndicator);
-                let glyph = if self.caps.unicode_symbols {
-                    "\u{f06e}"
-                } else {
-                    fallback.as_ref()
-                };
-                s = format!("{} · {} ", s, glyph);
-            }
             if let Some(ref effort) = status.reasoning_effort {
                 use std::fmt::Write;
                 let _ = write!(s, " [{}]", effort);
@@ -1305,7 +1296,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             String::new()
         };
-        let ctx_str = if status.ctx_window > 0 {
+        let ctx_str = if status.ctx_used > 0 {
             format_ctx_usage(status.ctx_used, status.ctx_window)
         } else {
             String::new()
@@ -4917,8 +4908,6 @@ mod tests {
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
-            goal_indicator: None,
-            vision: false,
             goal: None,
         }
     }
@@ -4944,8 +4933,6 @@ mod tests {
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
-            goal_indicator: None,
-            vision: false,
             goal: None,
         };
         let row = r.build_status_row(&status, 60);
@@ -5000,8 +4987,6 @@ mod tests {
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
             reasoning_effort: None,
-            goal_indicator: None,
-            vision: false,
             goal: None,
         };
         let row = r.build_status_row(&status, 60);
@@ -5048,8 +5033,6 @@ mod tests {
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
             reasoning_effort: None,
-            goal_indicator: None,
-            vision: false,
             goal: None,
         };
         let row = r.build_status_row(&status, 60);

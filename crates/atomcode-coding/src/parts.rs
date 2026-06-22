@@ -20,7 +20,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use atomcode_capabilities::cc_hooks::CCExternalHooks;
+use atomcode_capabilities::cc_hooks::{CCExternalHooks, HookConfig};
 use atomcode_capabilities::codeintel::register_codeintel_tools;
 use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
@@ -146,6 +146,20 @@ pub struct CodingParts {
 /// (`SessionMode::Resume` whose snapshot can't be read); everything optional
 /// degrades gracefully (no `.mcp.json` → no MCP tools; empty skill dirs → none).
 pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Result<CodingParts> {
+    prepare_with_plugin_hooks(cfg, opts, Vec::new()).await
+}
+
+/// Like [`prepare`], plus `plugin_cc_hooks` — CC hooks contributed INLINE by installed
+/// plugins, which the DRIVER resolves (the plugin loader lives in `atomcode-core`, which
+/// neither this crate nor L1 may depend on) and threads in here. They are merged with the
+/// user/project `hooks.json` into the one [`CCExternalHooks`] runner. Drivers without a
+/// plugin system (or with none installed) pass an empty vec and get the same result as
+/// [`prepare`].
+pub async fn prepare_with_plugin_hooks(
+    cfg: &CodingAgentConfig,
+    opts: PrepareOptions,
+    plugin_cc_hooks: Vec<HookConfig>,
+) -> io::Result<CodingParts> {
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
 
@@ -284,17 +298,17 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
     // is skipped — see StatusReminderHook — to avoid a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
     hooks.push(Arc::new(VerifyCadenceHook::new()));
-    // CC external hooks (hooks.json): user/project commands on the kernel seams — the
-    // port of core's CC-parity hook engine onto the v2 engine. ONE instance serves both
-    // seams: pushed here for its LifecycleHooks side (session_start / user_prompt_submit /
-    // session_end) and stored in `cc_external_hooks` for its ToolMiddleware side (assemble
-    // registers it before approval). Only when hooks actually exist — an empty hooks.json
-    // (or none) registers nothing, so the no-hooks path stays free. Its session_start
-    // context append sits after the built-in context/status hooks (later = appended after),
-    // and it implements no offer_continuation, so VerifyCadenceHook's "first Some wins"
-    // contract is untouched by being earlier in the chain.
+    // CC external hooks: user/project `hooks.json` + plugin-contributed inline hooks
+    // (`plugin_cc_hooks`, resolved by the driver) on the kernel seams — the port of core's
+    // CC-parity hook engine onto the v2 engine. ONE instance serves both seams: pushed here
+    // for its LifecycleHooks side (session_start / user_prompt_submit / session_end) and
+    // stored in `cc_external_hooks` for its ToolMiddleware side (assemble registers it
+    // before approval). Only when hooks actually exist — no hooks at all registers nothing,
+    // so the no-hooks path stays free. Its session_start context append sits after the
+    // built-in context/status hooks (later = appended after), and it implements no
+    // offer_continuation, so VerifyCadenceHook's "first Some wins" contract is untouched.
     let cc_external = {
-        let mut cc = CCExternalHooks::load(&cfg.working_dir);
+        let mut cc = CCExternalHooks::load_with_extra(&cfg.working_dir, plugin_cc_hooks);
         // Stamp the persistent session id into every CC payload (CC `session_id`), so a
         // hook can correlate its events with the session. Empty for non-persistent runs.
         if let Some(b) = &session {

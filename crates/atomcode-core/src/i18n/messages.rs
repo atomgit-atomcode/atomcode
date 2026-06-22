@@ -134,15 +134,10 @@ pub enum Msg<'a> {
     /// user to fall back on the `/paste` slash command, which works
     /// in every terminal regardless of host keybinds.
     StatusClipboardImageHintSlash,
-    /// macOS variant: "Image in clipboard · ⌘V to paste". Uses the ⌘
-    /// symbol because Ctrl+V is rarely the chord macOS users reach for.
-    StatusClipboardImageHintMac,
     /// Lowest-priority status-row fallback: nudge the user toward the
     /// `/webui` command (browser UI) when no higher-priority hint
     /// (warnings / usage / upgrade) is competing for the slot.
     StatusWebuiHint,
-    /// Status bar vision indicator for non-Nerd-Font terminals.
-    StatusVisionIndicator,
 
     // ── /status command body ──
     StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },

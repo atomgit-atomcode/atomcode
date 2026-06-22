@@ -453,13 +453,6 @@ pub struct StatusLine {
     /// Current reasoning_effort for the active provider's model.
     /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
-    /// When an autonomous `/goal` loop is active, this carries a compact
-    /// progress label like `"◎ /goal (round 3, 1m 42s)"`. Rendered in
-    /// the status row between the left info and the right-aligned hint.
-    pub goal_indicator: Option<String>,
-    /// Whether the active model supports vision. When true the status
-    /// bar appends a  glyph after the model name.
-    pub vision: bool,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
     /// status row). `None` ⇒ no goal running, row omitted. Previously this was

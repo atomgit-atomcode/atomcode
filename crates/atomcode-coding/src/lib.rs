@@ -42,5 +42,13 @@ pub use config::CodingAgentConfig;
 pub use discipline::VerifyCadenceHook;
 pub use plan_mode::PlanModeGate;
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
-pub use parts::{assemble, prepare, CodingParts, PrepareOptions, SessionBinding, SessionMode};
+pub use parts::{
+    assemble, prepare, prepare_with_plugin_hooks, CodingParts, PrepareOptions, SessionBinding,
+    SessionMode,
+};
 pub use persona::coding_persona;
+
+/// Re-export the CC external-hooks types so drivers (e.g. the bridge) that resolve
+/// plugin-contributed hooks can name [`cc_hooks::HookConfig`] without a direct
+/// `atomcode-capabilities` dependency or its feature flag.
+pub use atomcode_capabilities::cc_hooks;

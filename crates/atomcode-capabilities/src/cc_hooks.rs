@@ -93,6 +93,31 @@ pub struct HookConfig {
     pub plugin_root: Option<PathBuf>,
 }
 
+impl HookConfig {
+    /// Build a config from a Claude-Code plugin's INLINE manifest hook (a `plugin.json`
+    /// `hooks` entry). The driver resolves these from installed plugins — which L1 cannot
+    /// reach — and feeds them in via [`CCExternalHooks::load_with_extra`]. `event_name` is
+    /// CC PascalCase (or the legacy snake_case); `timeout_secs` is CC's SECONDS (converted
+    /// to ms, default 10s). Returns `None` for an unsupported event (the caller skips it).
+    pub fn from_plugin_spec(
+        event_name: &str,
+        matcher: Option<String>,
+        command: String,
+        timeout_secs: Option<u64>,
+        plugin_root: PathBuf,
+    ) -> Option<HookConfig> {
+        Some(HookConfig {
+            event: HookEvent::parse(event_name)?,
+            matcher,
+            command,
+            timeout_ms: timeout_secs
+                .map(|s| s.saturating_mul(1000))
+                .unwrap_or_else(default_timeout_ms),
+            plugin_root: Some(plugin_root),
+        })
+    }
+}
+
 fn default_timeout_ms() -> u64 {
     10_000
 }
@@ -361,6 +386,17 @@ impl CCExternalHooks {
     /// Load user + project `hooks.json` for `project_dir`.
     pub fn load(project_dir: &Path) -> Self {
         Self::new(load_hooks_config(project_dir), project_dir.to_string_lossy().into_owned())
+    }
+
+    /// Like [`load`](Self::load), but APPEND `extra` hooks the driver resolved out of band
+    /// — e.g. plugin-contributed inline hooks ([`HookConfig::from_plugin_spec`]), which
+    /// live behind the plugin loader that L1 cannot depend on. File hooks come first, then
+    /// the extras (order only affects context-injection order; the gate fold is
+    /// order-independent). An empty `extra` makes this identical to `load`.
+    pub fn load_with_extra(project_dir: &Path, extra: Vec<HookConfig>) -> Self {
+        let mut hooks = load_hooks_config(project_dir);
+        hooks.extend(extra);
+        Self::new(hooks, project_dir.to_string_lossy().into_owned())
     }
 
     /// Stamp the CC `session_id` sent in every payload (the agent's persistent session
@@ -702,6 +738,35 @@ mod tests {
         assert!(matches_tool(&Some("*_file".into()), "edit_file"));
         // Exact stays exact (no accidental substring match).
         assert!(!matches_tool(&Some("Edit".into()), "MultiEdit"));
+    }
+
+    #[test]
+    fn from_plugin_spec_maps_event_timeout_and_root() {
+        let h = HookConfig::from_plugin_spec(
+            "PreToolUse",
+            Some("Bash".into()),
+            "echo hi".into(),
+            Some(3), // CC seconds → 3000 ms
+            PathBuf::from("/plugins/foo"),
+        )
+        .unwrap();
+        assert_eq!(h.event, HookEvent::PreToolUse);
+        assert_eq!(h.matcher.as_deref(), Some("Bash"));
+        assert_eq!(h.timeout_ms, 3_000);
+        assert_eq!(h.plugin_root.as_deref(), Some(Path::new("/plugins/foo")));
+
+        // Omitted timeout → default; legacy snake_case event still parses.
+        let h2 =
+            HookConfig::from_plugin_spec("post_tool_use", None, "x".into(), None, "/p".into())
+                .unwrap();
+        assert_eq!(h2.event, HookEvent::PostToolUse);
+        assert_eq!(h2.timeout_ms, 10_000);
+
+        // Unsupported event → None (caller skips it).
+        assert!(
+            HookConfig::from_plugin_spec("PreCompact", None, "x".into(), None, "/p".into())
+                .is_none()
+        );
     }
 
     #[test]

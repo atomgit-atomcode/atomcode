@@ -326,7 +326,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atomcode-codingplan-crypto",
- "atomcode-kernel",
  "atomcode-telemetry",
  "base64",
  "bincode",

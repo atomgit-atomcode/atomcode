@@ -9,7 +9,6 @@ zstd = "0.13"
 tar = "0.4"
 
 [dependencies]
-atomcode-kernel = { path = "../atomcode-kernel" }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

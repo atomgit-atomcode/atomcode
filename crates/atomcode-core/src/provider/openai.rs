@@ -139,6 +139,12 @@ pub struct OpenAiProvider {
     reasoning_history_override: Option<ReasoningPolicy>,
     /// DeepSeek V4 reasoning effort control (high / max / off).
     reasoning_effort: Option<String>,
+    /// Whether the active model accepts image inputs. Drives `MultiPart`
+    /// serialisation: vision-capable → OpenAI image_url schema, text-only
+    /// → flat string. Computed once from `ProviderConfig::accepts_images()`
+    /// at construction; a `/model` switch rebuilds the provider so this
+    /// stays in sync with the live config.
+    supports_vision: bool,
     /// Stable per-conversation id, set once via `set_session_id` after the
     /// owning agent generates it. Sent as the `x-atomcode-session-id` header
     /// on every request so a forwarding gateway (LiteLLM) can pin the
@@ -197,11 +203,12 @@ impl OpenAiProvider {
             // with zero visible output. CC uses fixed 16-32K, not proportional.
             max_tokens: config
                 .max_tokens
-                .unwrap_or((config.context_window / 4).clamp(8_000, 131_072)),
+                .unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
             reasoning_effort,
+            supports_vision: config.accepts_images(),
             session_id: std::sync::Arc::new(std::sync::RwLock::new(String::new())),
         })
     }
@@ -463,25 +470,6 @@ impl OpenAiProvider {
             })
             .collect()
     }
-
-    /// Strip `image_url` content blocks from a single serialised message
-    /// value in-place. Called in `chat_stream` as defence-in-depth: when the
-    /// current model doesn't support vision, we strip any residual image_url
-    /// blocks that might remain after a `/model` switch from a vision-capable
-    /// provider. The `format_messages` MultiPart branch handles the common case;
-    /// this catches any edge case it misses.
-    fn strip_image_url(msg: &mut serde_json::Value) {
-        if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-            content.retain(|block| {
-                block.get("type").and_then(|t| t.as_str()) != Some("image_url")
-            });
-            // If every block was image_url, the array is now empty.
-            // Some providers reject [] with 400; degrade to plain text.
-            if content.is_empty() {
-                msg["content"] = serde_json::Value::String(String::new());
-            }
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -569,21 +557,11 @@ impl LlmProvider for OpenAiProvider {
         let url = normalize_base_url(&self.base_url);
         let mut body = json!({
             "model": self.model,
-            "messages": Self::format_messages(messages, self.reasoning_history_policy(), super::model_name_suggests_vision(&self.model)),
+            "messages": Self::format_messages(messages, self.reasoning_history_policy(), self.supports_vision),
             "stream": true,
             "stream_options": { "include_usage": true },
             "max_tokens": self.max_tokens,
         });
-
-        // Defence-in-depth: strip residual image_url blocks after /model
-        // switches from a vision-capable provider.
-        if !super::model_name_suggests_vision(&self.model) {
-            if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-                for msg in msgs {
-                    Self::strip_image_url(msg);
-                }
-            }
-        }
 
         if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {

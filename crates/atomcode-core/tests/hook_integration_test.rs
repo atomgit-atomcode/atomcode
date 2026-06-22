@@ -189,7 +189,6 @@ fn test_config() -> Config {
     );
     Config {
         default_provider: "mock".to_string(),
-        evaluator_provider: None,
         default_workdir: None,
         providers,
         datalog: Default::default(),

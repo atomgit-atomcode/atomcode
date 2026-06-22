@@ -45,6 +45,56 @@ impl InstalledPluginAssets {
     }
 }
 
+/// A single CC hook contributed INLINE by an installed plugin's `plugin.json`, in a
+/// neutral (engine-agnostic) shape. The legacy engine maps these via
+/// `crate::hook::json_config::cc_hooks_to_atomcode`; the new (kernel) stack — which
+/// cannot depend on this crate's manifest types — consumes this DTO through the bridge
+/// and maps it onto `atomcode_capabilities::cc_hooks::HookConfig`.
+#[derive(Debug, Clone)]
+pub struct PluginCcHook {
+    /// CC PascalCase event name (`PreToolUse`, `UserPromptSubmit`, ...).
+    pub event: String,
+    /// Optional tool-name matcher for `PreToolUse`/`PostToolUse`.
+    pub matcher: Option<String>,
+    /// The shell command to run.
+    pub command: String,
+    /// CC timeout in SECONDS (the consumer converts to ms; `None` ⇒ its default).
+    pub timeout_secs: Option<u64>,
+    /// Plugin install dir — exported as `CLAUDE_PLUGIN_ROOT`/`ATOMCODE_PLUGIN_ROOT`.
+    pub plugin_root: PathBuf,
+}
+
+/// Flatten every installed plugin's INLINE CC hooks (`plugin.json` `hooks` blocks) into
+/// neutral [`PluginCcHook`] specs. Only `type: "command"` specs are returned. Plugins
+/// that ship a legacy hooks.json file (rather than inline hooks) are NOT included here —
+/// the legacy engine handles those separately. Empty when no plugin contributes inline
+/// hooks, so the caller can skip wiring entirely.
+pub fn installed_plugin_cc_hooks() -> Vec<PluginCcHook> {
+    let mut out = Vec::new();
+    for assets in iter_installed_plugin_assets() {
+        let Some(cc_map) = assets.manifest.inline_cc_hooks() else {
+            continue;
+        };
+        for (event, groups) in cc_map {
+            for group in groups {
+                for spec in &group.hooks {
+                    if spec.kind != "command" {
+                        continue;
+                    }
+                    out.push(PluginCcHook {
+                        event: event.clone(),
+                        matcher: group.matcher.clone(),
+                        command: spec.command.clone(),
+                        timeout_secs: spec.timeout,
+                        plugin_root: assets.plugin_dir.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Iterate over every installed plugin across all scopes. Returns empty Vec when state file is
 /// missing or the plugin home is not configured. Skips entries whose
 /// plugin_dir does not exist on disk (keeps reload resilient to deletions).

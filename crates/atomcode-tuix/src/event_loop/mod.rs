@@ -79,26 +79,11 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     // those shapes from the clipboard ourselves.
     let mut clipboard = arboard::Clipboard::new().ok()?;
 
-    // Tier 0 (macOS only): file URL first. Finder Cmd+C puts both a
-    // low-res thumbnail (arboard sees it as RGBA pixels) and the real
-    // file path (public.file-url) on the pasteboard. Checking file-url
-    // first guarantees we read the original file instead of sending
-    // a tiny icon to the VL model.
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(path) = read_macos_clipboard_file_url() {
-            if let Some(result) = try_attach_image_from_path(&path) {
-                return Some(result);
-            }
-        }
-    }
-
     // Tier 1: raw bytes (NSPasteboardTypePNG / TIFF / NSImage).
     //   Sources: Cmd+Shift+Ctrl+4 screenshot, Preview "Copy", browser
     //   "Copy image", any app's Edit-menu Copy on a bitmap. arboard's
     //   get_image decodes these into RGBA.
     if let Ok(img) = clipboard.get_image() {
-        crate::tuix_trace!("IMG", "Tier1 arboard {}x{} px", img.width, img.height);
         let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
         let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
@@ -124,6 +109,19 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
             if let Some(result) = try_attach_image_from_path(&decoded) {
                 return Some(result);
             }
+        }
+    }
+
+    // Tier 3 (macOS only): read NSPasteboard's `public.file-url` type
+    // directly. This is the case Finder `Cmd+C` on an image file
+    // produces — there are NO image bytes and the text type is
+    // typically NOT auto-populated. iTerm2's Cmd+V handles this by
+    // querying the file-URL type and writing the temp path to the
+    // PTY; we read the same type via AppKit so Ctrl+V matches.
+    #[cfg(target_os = "macos")]
+    if let Some(path) = read_macos_clipboard_file_url() {
+        if let Some(result) = try_attach_image_from_path(&path) {
+            return Some(result);
         }
     }
 
@@ -163,65 +161,7 @@ fn read_macos_clipboard_file_url() -> Option<String> {
     let raw = unsafe { pb.stringForType(NSPasteboardTypeFileURL) }?.to_string();
     let stripped = raw.strip_prefix("file://").unwrap_or(&raw);
     let decoded = urlencoding::decode(stripped).ok()?;
-    let path = decoded.into_owned();
-    // macOS may return a file-reference URL (/.file/id=…) instead of a
-    // standard POSIX path. Resolve through canonicalize().
-    if path.starts_with("/.file/id=") {
-        if let Some(resolved) = resolve_macos_file_ref_url(&path) {
-            return Some(resolved);
-        }
-        // canonicalize() can fail (NAS, permissions). Fall through —
-        // try_attach_image_from_path has magic-byte detection.
-    }
-    Some(path)
-}
-
-#[cfg(target_os = "macos")]
-fn resolve_macos_file_ref_url(raw: &str) -> Option<String> {
-    // macOS kernel resolves /.file/id=… paths natively — canonicalize()
-    // turns them into the standard /Users/… or /Volumes/… POSIX path.
-    std::fs::canonicalize(raw).ok()?.to_str().map(|s| s.to_owned())
-}
-
-#[cfg(target_os = "macos")]
-fn unescape_shell_escapes(raw: &str) -> String {
-    // iTerm2 emits backslash-escaped metacharacters ( \  \( \) \[ \] ) in
-    // pasted file paths. Any \X where X is non-alphanumeric → just X.
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(next) = chars.next() {
-                if !next.is_alphanumeric() { out.push(next); continue; }
-                out.push('\\');
-                out.push(next);
-            } else {
-                // Trailing backslash — nothing follows, preserve it verbatim.
-                out.push('\\');
-            }
-        } else { out.push(c); }
-    }
-    out
-}
-
-#[cfg(not(target_os = "macos"))]
-fn unescape_shell_escapes(raw: &str) -> String {
-    raw.replace("\\ ", " ")
-}
-
-/// Detect image type from file header magic bytes.
-fn detect_image_type_from_path(path: &std::path::Path) -> Option<&'static str> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut header = [0u8; 12];
-    let n = f.read(&mut header).ok()?;
-    // Match on actual bytes read so truncated/corrupt tiny files
-    // aren't silently discarded (read_exact would return UnexpectedEof).
-    if n >= 8 && header.starts_with(b"\x89PNG\r\n\x1a\n") { return Some("image/png"); }
-    if n >= 3 && header.starts_with(b"\xff\xd8\xff") { return Some("image/jpeg"); }
-    if n >= 4 && header.starts_with(b"GIF8") { return Some("image/gif"); }
-    if n >= 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP" { return Some("image/webp"); }
-    None
+    Some(decoded.into_owned())
 }
 
 /// Map an `ImagePart::media_type` to a cache filename extension.
@@ -472,32 +412,27 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
     } else {
         trimmed
     };
-    let unescaped = unescape_shell_escapes(unquoted);
+    // Unescape shell-escaped spaces (iTerm2 / drag-and-drop emit
+    // `/path/with\ space.png`). Backslash before any other char is left
+    // alone — no other shell-escape forms occur in real-world drag
+    // pastes.
+    let unescaped = unquoted.replace("\\ ", " ");
     let candidate = unescaped.trim();
     let path = std::path::Path::new(candidate);
     if !path.is_absolute() {
         return None;
     }
-    let media_type = if candidate.starts_with("/.file/id=") {
-        detect_image_type_from_path(path)?
-    } else {
-        match path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("png") => "image/png",
-            Some("jpg") | Some("jpeg") => "image/jpeg",
-            Some("gif") => "image/gif",
-            Some("webp") => "image/webp",
-            _ => {
-                // Fallback: magic-byte detection for paths without
-                // recognisable extensions, e.g. macOS tmp files
-                // resolved from /.file/id=… references.
-                detect_image_type_from_path(path)?
-            },
-        }
+    let media_type = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => return None,
     };
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_PATH_IMAGE_BYTES {
@@ -3110,17 +3045,6 @@ pub enum ExitReason {
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
 
-    // Seed the context window from the active provider config so the
-    // status bar shows "0/128k tok" (etc.) from the very beginning
-    // instead of waiting for the first LLM turn to populate it.
-    let initial_ctx_window = ctx
-        .config
-        .providers
-        .get(&ctx.config.default_provider)
-        .map(|p| p.context_window)
-        .unwrap_or(128_000);
-    app.state.on_context_stats(0, 0, 0, 0, 0, initial_ctx_window, "", "");
-
     crate::tuix_trace!(
         "SES",
         "run_loop start model={} cwd={}",
@@ -4340,40 +4264,14 @@ fn attach_typed_image_paths(
     if !ctx.config.can_handle_attached_images() {
         return;
     }
-    // Quote-aware token extraction: iTerm2 wraps paths with spaces/parens/CJK
-    // in single quotes (`'/Volumes/Data/default (18).jpeg'`). Plain
-    // split_whitespace shatters them into two non-path tokens. Extract quoted
-    // segments whole, AND process the unquoted text between/around quotes
-    // so that bare paths like `/tmp/a.png` aren't discarded.
-    let tokens: Vec<String> = {
-        let mut v: Vec<String> = Vec::new();
-        let mut remaining = text.as_str();
-        while let Some(start) = remaining.find(|c| c == '\'' || c == '"') {
-            // Text BEFORE this quote — split normally for bare paths.
-            for t in remaining[..start].split_whitespace() {
-                if t.contains('/') || t.contains('\\') {
-                    v.push(t.to_string());
-                }
-            }
-            let quote = remaining.as_bytes()[start];
-            let Some(end) = remaining[start + 1..].find(quote as char) else {
-                // unmatched quote — skip it so the post-loop doesn't reprocess text
-                remaining = &remaining[start + 1..]; break;
-            };
-            let quoted = &remaining[start + 1..start + 1 + end];
-            if quoted.contains('/') || quoted.contains('\\') {
-                v.push(quoted.to_string());
-            }
-            remaining = &remaining[start + 2 + end..];
-        }
-        // Remainder after the last quote.
-        for t in remaining.split_whitespace() {
-            if t.contains('/') || t.contains('\\') {
-                v.push(t.to_string());
-            }
-        }
-        v
-    };
+    // Snapshot tokens before mutating `text`. The `/` `\` pre-filter avoids a
+    // filesystem stat on every word of a long message — an absolute path
+    // always carries a separator.
+    let tokens: Vec<String> = text
+        .split_whitespace()
+        .filter(|t| t.contains('/') || t.contains('\\'))
+        .map(str::to_string)
+        .collect();
     for tok in tokens {
         let Some((img, _hash)) = try_attach_image_from_path(&tok) else {
             continue;
@@ -4381,20 +4279,9 @@ fn attach_typed_image_paths(
         app.state.session_image_count += 1;
         let n = app.state.session_image_count;
         *text = text.replacen(&tok, &format!("[Image #{}]", n), 1);
-        // The token is the UNQUOTED path extracted by the quote-aware
-        // scanner. But the original text may carry the path wrapped in
-        // single / double quotes. If the bare replace didn't match (text
-        // unchanged), retry with the quoted forms so the marker replaces
-        // the original text including the wrapping quotes.
-        if !text.contains(&format!("[Image #{}]", n)) {
-            for q in ["'", "\""] {
-                let quoted = format!("{}{}{}", q, tok, q);
-                *text = text.replacen(&quoted, &format!("[Image #{}]", n), 1);
-                if text.contains(&format!("[Image #{}]", n)) {
-                    break;
-                }
-            }
-        }
+        // No render here: the caller groups the collected `kept_markers` into a
+        // single `UiLine::UserWithAttachments` echo (the viewport-overflow fix),
+        // so this helper only collects.
         images.push(img);
         kept_markers.push(n);
     }
@@ -8640,8 +8527,6 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         // the snappier keybind hint.
         let hint_msg = if cfg!(target_os = "windows") {
             crate::i18n::Msg::StatusClipboardImageHintSlash
-        } else if cfg!(target_os = "macos") {
-            crate::i18n::Msg::StatusClipboardImageHintMac
         } else {
             crate::i18n::Msg::StatusClipboardImageHint
         };
@@ -8739,8 +8624,6 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             None
         },
         session_name,
-        goal_indicator: None,
-        vision: ctx.config.can_handle_attached_images(),
         goal,
     }
 }

@@ -260,16 +260,8 @@ impl LlmProvider for OpenAiCompatProvider {
 // Request building (pure, deterministic)
 // ---------------------------------------------------------------------------
 
-/// Delegates to `atomcode_kernel::provider::model_name_suggests_vision`
-/// — the single source of truth.  When adding a new vision model, update
-/// the kernel function.
-fn suggests_vision(model: &str) -> bool {
-    atomcode_kernel::provider::model_name_suggests_vision(model)
-}
-
 /// Map kernel `Message`s onto OpenAI-compatible wire `messages[]`.
-fn format_messages(messages: &[Message], policy: ReasoningPolicy, model: &str) -> Vec<Value> {
-    let vision = suggests_vision(model);
+fn format_messages(messages: &[Message], policy: ReasoningPolicy) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m.role {
@@ -277,8 +269,8 @@ fn format_messages(messages: &[Message], policy: ReasoningPolicy, model: &str) -
             // OpenAI-compatible models accept only a single system message.
             Role::System => super::push_system_coalesced(&mut out, &m.text),
             Role::User => {
-                if m.images.is_empty() || !vision {
-                    // Text-only or model doesn't support vision — keep content as STRING
+                if m.images.is_empty() {
+                    // Text-only: `content` stays a STRING — byte-identical to the prior
                     // path, so a no-image conversation's prefix cache is unperturbed.
                     out.push(json!({ "role": "user", "content": m.text }));
                 } else {
@@ -380,7 +372,7 @@ fn build_request_body(
 ) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
-    body.insert("messages".into(), json!(format_messages(messages, policy, model)));
+    body.insert("messages".into(), json!(format_messages(messages, policy)));
     body.insert("stream".into(), json!(true));
     body.insert("stream_options".into(), json!({ "include_usage": true }));
 
@@ -813,7 +805,7 @@ mod tests {
             Message::assistant("ans", vec![]),
             Message::tool_result("call_1", "result text", false),
         ];
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude, "test-model");
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude);
         assert_eq!(out[0], json!({"role":"system","content":"sys"}));
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         assert_eq!(out[2]["role"], "assistant");
@@ -834,7 +826,7 @@ mod tests {
             Message::system("MEMORY\n- fact"),
             Message::user("hi"),
         ];
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude, "test-model");
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude);
         let systems = out.iter().filter(|v| v["role"] == "system").count();
         assert_eq!(systems, 1, "consecutive system messages must coalesce to one: {out:?}");
         assert_eq!(out[0], json!({"role":"system","content":"persona\n\nMEMORY\n- fact"}));
@@ -846,7 +838,7 @@ mod tests {
     fn user_without_images_stays_a_content_string() {
         // Byte-identical to the pre-multimodal path → a no-image conversation's prefix
         // cache is unperturbed.
-        let out = format_messages(&[Message::user("hi")], ReasoningPolicy::Exclude, "test-model");
+        let out = format_messages(&[Message::user("hi")], ReasoningPolicy::Exclude);
         assert_eq!(out[0], json!({"role":"user","content":"hi"}));
     }
 
@@ -857,23 +849,12 @@ mod tests {
             "look",
             vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, "gpt-4o");
+        let out = format_messages(&[m], ReasoningPolicy::Exclude);
         let c = &out[0]["content"];
         assert!(c.is_array(), "multimodal content must be an array: {c}");
         assert_eq!(c[0], json!({"type":"text","text":"look"}));
         assert_eq!(c[1]["type"], "image_url");
         assert_eq!(c[1]["image_url"]["url"], "data:image/png;base64,QUJD");
-    }
-
-    #[test]
-    fn user_with_images_degraded_when_model_is_text_only() {
-        use atomcode_kernel::message::ImageContent;
-        let m = Message::user_with_images(
-            "look",
-            vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
-        );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, "test-model");
-        assert_eq!(out[0], json!({"role":"user","content":"look"}));
     }
 
     #[test]
@@ -883,7 +864,7 @@ mod tests {
             "",
             vec![ImageContent { media_type: "image/jpeg".into(), data: "eHl6".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, "gpt-4o");
+        let out = format_messages(&[m], ReasoningPolicy::Exclude);
         let c = out[0]["content"].as_array().unwrap();
         assert_eq!(c.len(), 1, "no text part when text is empty");
         assert_eq!(c[0]["type"], "image_url");
@@ -898,7 +879,7 @@ mod tests {
             "",
             vec![ImageContent { media_type: "image/png".into(), data: "".into() }],
         );
-        assert_eq!(format_messages(&[m], ReasoningPolicy::Exclude, "test-model")[0], json!({"role":"user","content":""}));
+        assert_eq!(format_messages(&[m], ReasoningPolicy::Exclude)[0], json!({"role":"user","content":""}));
     }
 
     #[test]
@@ -908,7 +889,7 @@ mod tests {
             "x",
             vec![ImageContent { media_type: "".into(), data: "QUJD".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, "gpt-4o");
+        let out = format_messages(&[m], ReasoningPolicy::Exclude);
         assert_eq!(out[0]["content"][1]["image_url"]["url"], "data:application/octet-stream;base64,QUJD");
     }
 
@@ -922,7 +903,7 @@ mod tests {
                 arguments: "{\"path\":\"a\"}".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, "test-model");
+        let out = format_messages(&[m], ReasoningPolicy::Exclude);
         let a = &out[0];
         assert_eq!(a["role"], "assistant");
         assert_eq!(a["content"], ""); // present even when empty
@@ -937,7 +918,7 @@ mod tests {
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning = Some("because".into());
         let no = Message::assistant("ans2", vec![]);
-        let out = format_messages(&[with, no], ReasoningPolicy::Include, "test-model");
+        let out = format_messages(&[with, no], ReasoningPolicy::Include);
         assert_eq!(out[0]["reasoning_content"], "because");
         assert_eq!(out[1]["reasoning_content"], REASONING_PLACEHOLDER);
     }
@@ -946,7 +927,7 @@ mod tests {
     fn reasoning_exclude_never_echoes() {
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning = Some("because".into());
-        let out = format_messages(&[with], ReasoningPolicy::Exclude, "test-model");
+        let out = format_messages(&[with], ReasoningPolicy::Exclude);
         assert!(out[0].get("reasoning_content").is_none());
     }
 
@@ -1041,8 +1022,8 @@ mod tests {
         let h1 = vec![Message::system("s"), Message::user("u1")];
         let mut h2 = h1.clone();
         h2.push(Message::assistant("a1", vec![]));
-        let f1 = format_messages(&h1, ReasoningPolicy::Exclude, "test-model");
-        let f2 = format_messages(&h2, ReasoningPolicy::Exclude, "test-model");
+        let f1 = format_messages(&h1, ReasoningPolicy::Exclude);
+        let f2 = format_messages(&h2, ReasoningPolicy::Exclude);
         for i in 0..f1.len() {
             assert_eq!(
                 serde_json::to_string(&f1[i]).unwrap(),
@@ -1321,36 +1302,5 @@ mod tests {
         // no [DONE]; the network loop calls finish() on EOF
         ev.extend(d.finish());
         assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
-    }
-
-    #[test]
-    /// Golden-set regression: every pattern in `suggests_vision` must have
-    /// at least one positive test case below. Copy the same assertion to
-    /// `crates/atomcode-core/src/provider/mod.rs` tests as well.
-    #[test]
-    fn suggests_vision_golden_set() {
-        // Generic patterns
-        assert!(suggests_vision("gpt-4o"));           // starts_with gpt-4o
-        assert!(suggests_vision("Qwen2-VL-7B"));      // -vl
-        assert!(suggests_vision("llava-1.6"));        // llava
-        assert!(suggests_vision("MonkeyOCR-v1"));     // ocr
-        assert!(suggests_vision("Phi-4v"));           // -4v
-        assert!(suggests_vision("gpt-4.1v"));         // -4.1v
-        assert!(suggests_vision("Gemini-2.0-Flash")); // gemini
-        assert!(suggests_vision("pixtral-12b"));      // pixtral
-        assert!(suggests_vision("qvq-72b-preview"));  // qvq
-        // Claude 3+ (not claude-2/2.1)
-        assert!(suggests_vision("claude-3-5-sonnet"));
-        assert!(suggests_vision("claude-sonnet-4-6"));
-        assert!(suggests_vision("claude-opus-3"));
-        assert!(suggests_vision("claude-haiku-3-5"));
-        // Kimi K2 vision variants
-        assert!(suggests_vision("kimi-k2.5"));
-        assert!(suggests_vision("kimi-k2.6"));
-        // Must reject
-        for m in ["deepseek-v4-pro","deepseek-chat","gpt-3.5-turbo",
-                  "kimi-k2","kimi-k2-thinking","claude-2.1","claude-2"] {
-            assert!(!suggests_vision(m), "{m} must not be vision");
-        }
     }
 }

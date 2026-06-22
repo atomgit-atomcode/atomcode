@@ -659,11 +659,35 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
 /// OpenAI-compatible `image_url` schema and are first-class candidates
 /// for the vision-preprocessor role.
 ///
-/// Delegates to `atomcode_kernel::provider::model_name_suggests_vision`
-/// — the single source of truth for vision-model name detection.
-/// When adding a new vision model, update the kernel function.
+/// Conservative — only matches well-known vision/OCR patterns.
+/// False-negatives are safe: extend this list when a new vision/OCR model
+/// ships rather than threading a per-provider config knob (no
+/// user-discoverable opt-in exists). False-positives waste a turn on
+/// a 400, so when in doubt this returns false.
 pub fn model_name_suggests_vision(name: &str) -> bool {
-    atomcode_kernel::provider::model_name_suggests_vision(name)
+    let n = name.to_lowercase();
+    n.contains("vision")
+        || n.contains("-vl")
+        || n.contains("vl-")
+        || n.contains("ocr")
+        || n.contains("-4v")
+        || n.contains("-4.1v")
+        || n.starts_with("gpt-4o")
+        // Claude 3 onwards is vision-capable. Anthropic uses two naming
+        // forms: the legacy `claude-<gen>-<variant>` (claude-3-5-sonnet)
+        // and the newer `claude-<variant>-<gen>-<rev>` (claude-sonnet-4-6).
+        || n.starts_with("claude-3")
+        || n.starts_with("claude-4")
+        || n.starts_with("claude-5")
+        || n.starts_with("claude-6")
+        || n.starts_with("claude-7")
+        || n.starts_with("claude-sonnet")
+        || n.starts_with("claude-opus")
+        || n.starts_with("claude-haiku")
+        || n.starts_with("gemini")
+        || n.starts_with("pixtral")
+        || n.contains("llava")
+        || n.contains("qvq")
 }
 
 #[cfg(test)]
@@ -812,9 +836,6 @@ mod tests {
         assert!(model_name_suggests_vision("pixtral-12b"));
         assert!(model_name_suggests_vision("llava-1.6"));
         assert!(model_name_suggests_vision("qvq-72b-preview"));
-        // Kimi K2 series — only 2.5 / 2.6 support vision.
-        assert!(model_name_suggests_vision("kimi-k2.5"));
-        assert!(model_name_suggests_vision("kimi-k2.6"));
     }
 
     /// Regression for the user's exact failure: pasting an image while
@@ -829,7 +850,7 @@ mod tests {
         assert!(!model_name_suggests_vision("deepseek-v4-flash"));
         assert!(!model_name_suggests_vision("Qwen/Qwen3.6-35B-A3B"));
         assert!(!model_name_suggests_vision("gpt-4-turbo")); // text-only base
-        assert!(!model_name_suggests_vision("kimi-k2-thinking")); // K2 base / thinking not vision
+        assert!(!model_name_suggests_vision("kimi-k2-thinking"));
         assert!(!model_name_suggests_vision("o1-preview")); // not a vision tag
         assert!(!model_name_suggests_vision(""));
     }
