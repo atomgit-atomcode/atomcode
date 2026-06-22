@@ -27,6 +27,12 @@ atomcode-bridge = { path = "../atomcode-bridge" }
 atomcode-tuix = { path = "../atomcode-tuix" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 atomcode-daemon = { path = "../atomcode-daemon" }
+# Native v2 stack for the headless (`-p`) path: run_headless_native drives
+# CodingRuntime + kernel AgentEvents directly (no bridge membrane). The TUI path
+# still uses the bridge handle until tuix is migrated.
+atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-coding = { path = "../atomcode-coding" }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"

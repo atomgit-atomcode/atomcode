@@ -1625,7 +1625,9 @@ async fn run() -> Result<i32> {
     if engine_v1 {
         eprintln!("[engine v1] legacy stack active (opt-out via --engine v1)");
     }
-    let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if engine_v2 {
+    // Headless (`-p`) drives a NATIVE CodingRuntime (built in the headless branch
+    // below), so the bridge handle is built only for the interactive TUI path.
+    let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if engine_v2 && !is_headless {
         let bridge_cfg = bridge_config_from(
             &config,
             &working_dir,
@@ -1761,25 +1763,61 @@ async fn run() -> Result<i32> {
             // *after* the flush. Engine v2 routes through the bridged handle
             // (engine_loop = None); the legacy engine still spawns its AgentLoop.
             let notifications_cfg = config.notifications.clone();
-            let (engine_loop, engine_handle) = if engine_v2 {
-                (None, v2_handle.take().expect("v2 handle built above"))
+            let headless_result = if engine_v2 {
+                // NATIVE headless: a fresh CodingRuntime drives this turn (no bridge
+                // membrane). coding_config + build_provider are the bridge's shared
+                // helpers; the TUI path still uses the bridge handle (until tuix migrates).
+                let bcfg = bridge_config_from(
+                    &config,
+                    &working_dir,
+                    cli.provider.as_deref(),
+                    Some(telemetry.clone()),
+                    cli.dangerously_skip_permissions,
+                    false, // headless ⇒ keep the fail-closed approval timeout
+                );
+                let coding_cfg = atomcode_bridge::coding_config(&bcfg);
+                let opts = atomcode_coding::PrepareOptions {
+                    session: atomcode_coding::SessionMode::Fresh,
+                    skill_dirs: None,
+                    mcp: true,
+                    memory: true,
+                    web: true,
+                    review: true,
+                };
+                let factory: atomcode_coding::ProviderFactory =
+                    Box::new(|c| atomcode_bridge::build_provider(c).map_err(|e| e.to_string()));
+                match atomcode_coding::CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory)
+                    .await
+                {
+                    Ok(rt) => {
+                        run_headless_native(
+                            rt,
+                            prompt,
+                            verbose,
+                            capture,
+                            cli.dangerously_skip_permissions,
+                            is_admin,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(anyhow::anyhow!("engine v2 启动失败：{e}")),
+                }
             } else {
-                (Some(agent_loop), agent_handle)
+                run_headless(
+                    Some(agent_loop),
+                    notifications_cfg,
+                    agent_handle,
+                    prompt,
+                    cli.provider.as_deref(),
+                    verbose,
+                    capture,
+                    working_dir.clone(),
+                    cli.dangerously_skip_permissions,
+                    is_admin,
+                )
+                .await
             };
-            match run_headless(
-                engine_loop,
-                notifications_cfg,
-                engine_handle,
-                prompt,
-                cli.provider.as_deref(),
-                verbose,
-                capture,
-                working_dir.clone(),
-                cli.dangerously_skip_permissions,
-                is_admin,
-            )
-            .await
-            {
+            match headless_result {
                 Err(e) => Err(e),
                 Ok((ec, captured)) => {
                     // Post-run side effects for fixissue: only on clean completion
@@ -2422,6 +2460,236 @@ async fn run_headless(
         exit_code = 2;
     }
 
+    Ok((exit_code, captured))
+}
+
+/// NATIVE headless driver (engine v2): drive a [`CodingRuntime`] + kernel `AgentEvent`s
+/// directly, no bridge membrane. Renders to stdout/stderr in the SAME format as
+/// [`run_headless`] and returns the SAME exit codes (0 natural / 1 error / 2 denial /
+/// 130 cancel). The kernel `TurnComplete` carries only `reason`, so the `[done]` line's
+/// figures are synthesized here (the TurnStats the bridge used to build); a tool result
+/// recovers its name+duration from a `live_tools` map (kernel results carry neither).
+///
+/// NOTE: the desktop turn-finished notification is intentionally NOT wired here yet
+/// (it needs a kernel→core StopReason mapping) — a follow-up. Exit-code / capture /
+/// output behavior should be confirmed with a real `-p` run before CI relies on it.
+async fn run_headless_native(
+    mut rt: atomcode_coding::CodingRuntime,
+    prompt: String,
+    verbose: bool,
+    capture: bool,
+    skip_permissions: bool,
+    is_admin: bool,
+) -> Result<(i32, Option<String>)> {
+    use atomcode_kernel::event::{AgentCommand as KCmd, AgentEvent as KE, StopReason};
+
+    HEADLESS_MODE.store(true, Ordering::Relaxed);
+    if skip_permissions {
+        eprintln!("{}", atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless));
+    }
+    if is_admin {
+        eprintln!("{}", atomcode_core::i18n::t(atomcode_core::i18n::Msg::AdminWarningHeadless));
+    }
+
+    let commands = rt.handle().commands.clone();
+    let mut exit_code: i32 = 0;
+    if commands.send(KCmd::SendMessage { text: prompt, images: vec![] }).is_err() {
+        exit_code = 1;
+    }
+
+    let mut had_denial = false;
+    let mut last_text_ended_with_newline = true;
+    let mut thinking_line_open = false;
+    let mut captured: Option<String> = if capture { Some(String::new()) } else { None };
+    // TurnStats synthesis (the kernel TurnComplete carries only `reason`).
+    let start = std::time::Instant::now();
+    let mut total_tokens = 0usize;
+    let mut turn_count = 0usize;
+    let mut tool_call_count = 0usize;
+    let mut live_tools: std::collections::HashMap<String, (String, std::time::Instant)> =
+        std::collections::HashMap::new();
+
+    fn close_thinking_line(open: &mut bool) {
+        let mut buf = String::new();
+        close_thinking_chunk(&mut buf, open);
+        if !buf.is_empty() {
+            eprint!("{}", buf);
+            let _ = io::stderr().flush();
+        }
+    }
+
+    while let Some(event) = rt.handle().events.recv().await {
+        match event {
+            KE::TextDelta(text) => {
+                close_thinking_line(&mut thinking_line_open);
+                if !text.is_empty() {
+                    last_text_ended_with_newline = text.ends_with('\n');
+                }
+                if let Some(buf) = captured.as_mut() {
+                    buf.push_str(&text);
+                }
+                print!("{}", text);
+                io::stdout().flush()?;
+            }
+            KE::Reasoning(text) => {
+                if verbose && !text.is_empty() {
+                    let mut buf = String::new();
+                    format_thinking_chunk(&mut buf, &mut thinking_line_open, &text);
+                    eprint!("{}", buf);
+                    let _ = io::stderr().flush();
+                }
+            }
+            KE::ToolCallStreaming { name, arguments, .. } => {
+                if verbose {
+                    close_thinking_line(&mut thinking_line_open);
+                    let name = name.unwrap_or_default();
+                    let hint = truncate_log_line(&arguments, 80);
+                    let detail = if hint.is_empty() { String::new() } else { format!(" → {}", hint) };
+                    eprintln!("[tool-streaming← {}{}]", name, detail);
+                }
+            }
+            KE::ToolStarted { call } => {
+                tool_call_count += 1;
+                live_tools.insert(call.id.clone(), (call.name.clone(), std::time::Instant::now()));
+                if verbose {
+                    close_thinking_line(&mut thinking_line_open);
+                    let args = truncate_log_line(&call.arguments, 200);
+                    eprintln!("[tool→ {} args={}]", call.name, args);
+                }
+            }
+            KE::ToolProgress { message, .. } => {
+                if verbose {
+                    close_thinking_line(&mut thinking_line_open);
+                    eprint!("{}", message);
+                    let _ = io::stderr().flush();
+                }
+            }
+            KE::ToolResult { result } => {
+                let (name, started) = live_tools
+                    .remove(&result.call_id)
+                    .unwrap_or_else(|| ("tool".to_string(), std::time::Instant::now()));
+                if verbose {
+                    close_thinking_line(&mut thinking_line_open);
+                    let status = if result.is_error { "FAILED" } else { "OK" };
+                    let dur_ms = started.elapsed().as_millis();
+                    let trimmed = result.content.trim_end();
+                    if trimmed.is_empty() {
+                        eprintln!("[tool← {} {} {}ms]", name, status, dur_ms);
+                    } else {
+                        let snippet = truncate_log_line(trimmed, 500);
+                        eprintln!("[tool← {} {} {}ms] {}", name, status, dur_ms, snippet);
+                    }
+                }
+            }
+            KE::Request { id, kind, payload }
+                if kind == atomcode_capabilities::tools::APPROVAL_KIND =>
+            {
+                close_thinking_line(&mut thinking_line_open);
+                let req: Option<atomcode_capabilities::tools::ApprovalRequest> =
+                    serde_json::from_value(payload).ok();
+                let tool_name = req.as_ref().map(|r| r.tool.clone()).unwrap_or_default();
+                use atomcode_capabilities::tools::ApprovalResponse;
+                let (resp, denied) = if skip_permissions {
+                    eprintln!("[headless] auto-approved {}", tool_name);
+                    (ApprovalResponse::allow(), false)
+                } else if tool_name == "bash" {
+                    eprintln!("[headless] auto-approved bash");
+                    (ApprovalResponse::allow(), false)
+                } else {
+                    eprintln!("[approval-denied] tool={}", tool_name);
+                    (ApprovalResponse::deny(), true)
+                };
+                if denied {
+                    had_denial = true;
+                }
+                let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
+                let _ = commands.send(KCmd::Respond { id, value });
+            }
+            KE::Request { id, .. } => {
+                // Unknown request kind: fail closed.
+                let _ = commands.send(KCmd::Respond { id, value: serde_json::Value::Null });
+            }
+            KE::Usage(meta) => {
+                turn_count += 1;
+                total_tokens += (meta.tokens.prompt + meta.tokens.completion) as usize;
+                if verbose {
+                    close_thinking_line(&mut thinking_line_open);
+                    if meta.tokens.cached > 0 {
+                        eprintln!(
+                            "[tokens] prompt={} completion={} cached={} ({:.0}% hit)",
+                            meta.tokens.prompt,
+                            meta.tokens.completion,
+                            meta.tokens.cached,
+                            if meta.tokens.prompt > 0 {
+                                meta.tokens.cached as f64 / meta.tokens.prompt as f64 * 100.0
+                            } else {
+                                0.0
+                            }
+                        );
+                    } else {
+                        eprintln!(
+                            "[tokens] prompt={} completion={}",
+                            meta.tokens.prompt, meta.tokens.completion
+                        );
+                    }
+                }
+            }
+            KE::Warning(w) => {
+                eprintln!("[warning] {}", w);
+            }
+            KE::Error { message, .. } => {
+                close_thinking_line(&mut thinking_line_open);
+                eprintln!("[error] {}", message);
+                exit_code = 1;
+                break;
+            }
+            KE::TurnComplete { reason } => {
+                close_thinking_line(&mut thinking_line_open);
+                if matches!(reason, StopReason::Cancelled) {
+                    eprintln!("[cancelled]");
+                    exit_code = 130;
+                    break;
+                }
+                if !last_text_ended_with_newline {
+                    println!();
+                    io::stdout().flush()?;
+                }
+                if verbose {
+                    let suffix = match reason {
+                        StopReason::Stopped => String::new(),
+                        StopReason::MaxRounds => " stopped=max_rounds".to_string(),
+                        StopReason::MaxContinuations => " stopped=max_continuations".to_string(),
+                        StopReason::ProviderError => " stopped=provider_error".to_string(),
+                        StopReason::Timeout => " stopped=timeout".to_string(),
+                        StopReason::PromptRejected => " stopped=prompt_rejected".to_string(),
+                        StopReason::Cancelled => String::new(),
+                        // `StopReason` is #[non_exhaustive]: a future reason → no tag.
+                        _ => String::new(),
+                    };
+                    eprintln!(
+                        "[done] {:.1}s tokens={} turns={} tool_calls={}{}",
+                        start.elapsed().as_secs_f64(),
+                        atomcode_core::i18n::fmt_tokens(total_tokens),
+                        turn_count,
+                        tool_call_count,
+                        suffix
+                    );
+                }
+                break;
+            }
+            // Snapshot / Cancelled / TurnStarted / Compaction* / batches — not surfaced
+            // by the headless renderer (the bridge logged some of these; headless ignored
+            // all of them or treated them as no-ops).
+            _ => {}
+        }
+    }
+
+    rt.shutdown().await;
+
+    // Priority: Error(1) > Denial(2) > 0; cancel(130) is absolute (set above).
+    if exit_code == 0 && had_denial {
+        exit_code = 2;
+    }
     Ok((exit_code, captured))
 }
 
