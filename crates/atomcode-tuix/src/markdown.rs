@@ -372,6 +372,21 @@ pub fn flush_aligned_table_with_width(
     // chopped real content out of cells and made wide tables in narrow
     // terminals unreadable. Instead, if the natural table doesn't fit, the
     // flat-mode fallback below renders every cell in full.
+    //
+    // However, when the border dash glyph `─` occupies more than 1 cell
+    // (CJK mode: `ATOMCODE_CJK_WIDTH=1` makes East Asian Ambiguous
+    // codepoints width-2), the number of dashes we push per column is
+    // `ceil((w + 2) / dash_w)`, and their *actual* rendered width is
+    // `ceil((w + 2) / dash_w) * dash_w` — which may exceed `w + 2` when
+    // `dash_w > 1` and `w + 2` isn't a multiple of `dash_w`. That makes
+    // the border rows wider than the data rows and the `│` borders
+    // mis-align.
+    //
+    // Fix: round each column width UP so that `w + 2` is a multiple of
+    // `dash_w`. This adds at most `dash_w - 1` cells of extra padding per
+    // column — a minor cosmetic cost that guarantees every row (border or
+    // data) has exactly the same display width.
+    let dash_w = crate::width::cell_char_width('─').unwrap_or(1).max(1);
     let mut col_widths = vec![0usize; ncols];
     for row in &parsed {
         if is_sep(row) {
@@ -386,12 +401,28 @@ pub fn flush_aligned_table_with_width(
             col_widths[j] = col_widths[j].max(w);
         }
     }
+    // Round up each column width so (w + 2) is a multiple of dash_w.
+    // For dash_w == 1 (default, non-CJK), this is a no-op.
+    if dash_w > 1 {
+        for w in &mut col_widths {
+            let budget = *w + 2;
+            let rounded = budget.div_ceil(dash_w) * dash_w;
+            *w = rounded.saturating_sub(2);
+        }
+    }
 
     // Total width of one rendered row at natural widths:
     //   `│` + per-col ` cell ` + `│` between/after each col
-    //   = 1 + sum(w + 3 for w in col_widths)
+    // In CJK mode, `│` (U+2502) is East Asian Ambiguous and occupies 2
+    // cells, so the per-border contribution is `bar_w`, not a hardcoded 1.
+    //   = bar_w + sum(w + 2 + bar_w for w in col_widths)
+    // where the per-column budget is: 1 leading space + w content + pad +
+    // 1 trailing space + bar_w for the following `│`.
+    //
     // If this exceeds the terminal budget, switch to flat mode.
-    let natural_row_width: usize = 1 + col_widths.iter().map(|w| w + 3).sum::<usize>();
+    let bar_w = crate::width::cell_char_width('│').unwrap_or(1).max(1);
+    let natural_row_width: usize =
+        bar_w + col_widths.iter().map(|w| w + 2 + bar_w).sum::<usize>();
     if max_width > 0 && natural_row_width > max_width {
         return render_flat_table(&parsed, caps);
     }
@@ -413,15 +444,17 @@ pub fn flush_aligned_table_with_width(
     // + w cells of content/padding + 1 trailing space) so border, content
     // and separators align column-by-column.
     //
-    // The dash glyph `─` (U+2500) is East Asian Ambiguous. With
-    // `cell_char_width('─') == 2` (i.e. `ATOMCODE_CJK_WIDTH=1`), each char
-    // we push occupies 2 cells, so naively pushing `(w + 2)` chars would
-    // paint `2 * (w + 2)` cells per column — borders drawn way past the
-    // content's right edge. Push `ceil((w + 2) / dash_w)` chars instead;
-    // for `dash_w == 1` (default) this is unchanged, for `dash_w == 2`
-    // odd widths overshoot by 1 cell — minor cosmetic, far better than
-    // a 2x stretch.
-    let dash_w = crate::width::cell_char_width('─').unwrap_or(1).max(1);
+    // Box-drawing glyphs are East Asian Ambiguous. With
+    // `cell_char_width('─') == 2` (i.e. `ATOMCODE_CJK_WIDTH=1`), each
+    // dash we push occupies 2 cells. Column widths have already been
+    // rounded so that `w + 2` is a multiple of `dash_w` (see above),
+    // so `ceil((w + 2) / dash_w) * dash_w == w + 2` exactly — the
+    // border row fills precisely the same number of cells as the data
+    // row's ` <body><pad> ` budget.
+    //
+    // Junction glyphs (┬ ┼ ┤ etc.) occupy `bar_w` cells each in CJK
+    // mode, matching the `│` in the data row. The left/right corner
+    // glyphs (┌ ┐ ├ ┤ └ ┘) also occupy `bar_w` cells each.
     let rule = |left: char, mid: char, right: char| -> String {
         let mut s = String::new();
         s.push_str(border_on);
@@ -968,6 +1001,95 @@ mod tests {
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
             "every table row must share one display width; got {:?} for\n{}",
+            widths,
+            out
+        );
+    }
+
+    /// Regression for issue #708: Markdown tables with CJK characters must
+    /// have aligned borders regardless of whether East Asian Ambiguous
+    /// box-drawing glyphs (`│` `─` `┌` etc.) render at width 1 or 2.
+    /// The fix rounds column widths so `(w + 2)` is a multiple of the
+    /// dash width, preventing border rows from overshooting data rows.
+    ///
+    /// This test uses the exact example from the issue: a 6-column
+    /// weather table with CJK content.
+    #[test]
+    fn cjk_table_borders_align_with_mixed_width_cells() {
+        let rows = vec![
+            "| 日期 | 天气 | 温度 | 降水总量 | 降水概率 | 最大风速 |".to_string(),
+            "|------|------|------|----------|----------|----------|".to_string(),
+            "| 6/22（今天） | 强雷暴伴冰雹 | 23.3 ~ 31°C | 33.2 mm | 98% | 17 km/h |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 120);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "every table row must share one display width (issue #708); got {:?} for\n{}",
+            widths,
+            out
+        );
+    }
+
+    /// Regression for issue #708 extended: weather table with emoji + CJK
+    /// content. The user reported that rows containing emoji like 🌤 and 🌡
+    /// had their right border `│` shifted right compared to rows without
+    /// emoji. The root cause is that `display_width` (used for column-width
+    /// and padding computation) and the actual rendered width of the cell
+    /// diverge when the cell content contains emoji that are wider than
+    /// `unicode-width` reports, or when `strip_md_for_width` and
+    /// `render_inline` disagree on the visible width.
+    #[test]
+    fn emoji_cjk_weather_table_borders_aligned() {
+        let rows = vec![
+            "| 项目 | 信息 |".to_string(),
+            "|------|------|".to_string(),
+            "| 📅 日期 | 2026年06月22日 |".to_string(),
+            "| 🌤 天气状况 | 大雨 💧 |".to_string(),
+            "| 🌡 气温范围 | 24℃ ~ 30℃ |".to_string(),
+            "| 🍃 风向风力 | 西北风 3级 |".to_string(),
+            "| 💧 相对湿度 | 96% |".to_string(),
+            "| ☀  紫外线 | 最弱 |".to_string(),
+            "| 🍃 空气质量 | 优 (AQI 28) |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "every row in emoji+CJK weather table must share one display width; got {:?} for\n{}",
+            widths,
+            out
+        );
+    }
+
+    /// Companion: a simpler 2-column CJK table that also verifies
+    /// border alignment. This is the minimal repro — even a table
+    /// with only CJK header cells must have consistent row widths.
+    #[test]
+    fn cjk_table_simple_two_column_aligned() {
+        let rows = vec![
+            "| 项目 | 状态 |".to_string(),
+            "|------|------|".to_string(),
+            "| 开发 | 进行中 |".to_string(),
+            "| 测试 | 已完成 |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "simple CJK table rows must be aligned; got {:?} for\n{}",
             widths,
             out
         );

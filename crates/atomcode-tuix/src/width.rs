@@ -66,10 +66,21 @@ pub(crate) fn cell_char_width(ch: char) -> Option<usize> {
     // Widen to 2 to match the host, but only when the base width is 1 (never
     // shrink an already-wide glyph or a 0-width combining mark) and only when
     // the terminal is one we expect to paint emoji wide (see
-    // `emoji_wide_enabled` — opt-out for emoji-incapable consoles). Emoji at
-    // U+1F000+ are already width-2 in `unicode-width`, so the table below only
-    // covers the symbol-block gap.
+    // `emoji_wide_enabled` — opt-out for emoji-incapable consoles).
+    //
+    // The legacy symbol block gap is handled by `is_wide_emoji_symbol` below.
+    //
+    // Emoji at U+1F000+ are *supposed* to be width-2 in `unicode-width`
+    // (East Asian Width = W), but ~759 codepoints in that range have EA=N
+    // (e.g. 🌤 U+1F324, 🌡 U+1F321, 🎖 U+1F396, 🧿 U+1F9FF, …) and
+    // `unicode-width` reports width 1 for them. Every GUI terminal still
+    // renders them as 2-cell colour emoji, so we widen them here too.
+    // The gate `base == Some(1) && emoji_wide_enabled()` ensures we only
+    // widen when the host actually paints emoji wide.
     if base == Some(1) && emoji_wide_enabled() && is_wide_emoji_symbol(ch) {
+        return Some(2);
+    }
+    if base == Some(1) && emoji_wide_enabled() && is_narrow_emoji_1f000(ch) {
         return Some(2);
     }
     base
@@ -145,6 +156,99 @@ fn is_wide_emoji_symbol(ch: char) -> bool {
         (0x2934, 0x2935), (0x2B05, 0x2B07), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50),
         (0x2B55, 0x2B55), (0x3030, 0x3030), (0x303D, 0x303D), (0x3297, 0x3297),
         (0x3299, 0x3299),
+    ];
+    RANGES
+        .binary_search_by(|&(lo, hi)| {
+            if hi < c {
+                std::cmp::Ordering::Less
+            } else if lo > c {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// Whether `ch` is an emoji in the U+1F000+ range that `unicode-width`
+/// reports as width 1 (East Asian Width = N) but GUI terminals paint as a
+/// 2-cell colour emoji.
+///
+/// `unicode-width` assigns width 2 to most U+1F000+ emoji (those with
+/// East Asian Width = W), but ~1021 codepoints in this range have EA=N and
+/// get width 1 — yet every modern GUI terminal (iTerm2, WezTerm, kitty,
+/// VSCode, macOS Terminal.app, Windows Terminal) renders them as a 2-cell
+/// colour glyph. That undercount is what makes markdown-table borders
+/// mis-align by 1 col per such emoji (issue #708).
+///
+/// The gate in `cell_char_width` (`base == Some(1) && emoji_wide_enabled()`)
+/// ensures we only widen when the host terminal actually paints emoji wide,
+/// so this is a no-op on bare legacy consoles.
+///
+/// Regional Indicator Symbols (U+1F1E6..=U+1F1FF) are **excluded** here:
+/// they are used in pairs to form flag emoji (e.g. 🇺🇸), and `cluster_width`
+/// already handles the pair-as-one-emoji case. Widening individual RI
+/// codepoints in `cell_char_width` would cause `cluster_width` to compute
+/// width 4 for a flag instead of 2.
+fn is_narrow_emoji_1f000(ch: char) -> bool {
+    let c = ch as u32;
+    if !(0x1F000..=0x1FA6D).contains(&c) {
+        return false;
+    }
+    // Sorted, non-overlapping inclusive ranges → binary search.
+    // Generated from Unicode 15.0: all Category=So codepoints in
+    // U+1F000..=U+1FA6D with East_Asian_Width=N, minus Regional
+    // Indicator Symbols (U+1F1E6..=U+1F1FF).
+    const RANGES: &[(u32, u32)] = &[
+        (0x1F000, 0x1F003),
+        (0x1F005, 0x1F02B),
+        (0x1F030, 0x1F093),
+        (0x1F0A0, 0x1F0AE),
+        (0x1F0B1, 0x1F0BF),
+        (0x1F0C1, 0x1F0CE),
+        (0x1F0D1, 0x1F0F5),
+        (0x1F10D, 0x1F10F),
+        (0x1F12E, 0x1F12F),
+        (0x1F16A, 0x1F16F),
+        (0x1F1AD, 0x1F1AD),
+        // 0x1F1E6..=0x1F1FF (Regional Indicator) excluded — handled
+        // by cluster_width's has_emoji_marker path instead.
+        (0x1F321, 0x1F32C),
+        (0x1F336, 0x1F336),
+        (0x1F37D, 0x1F37D),
+        (0x1F394, 0x1F39F),
+        (0x1F3CB, 0x1F3CE),
+        (0x1F3D4, 0x1F3DF),
+        (0x1F3F1, 0x1F3F3),
+        (0x1F3F5, 0x1F3F7),
+        (0x1F43F, 0x1F43F),
+        (0x1F441, 0x1F441),
+        (0x1F4FD, 0x1F4FE),
+        (0x1F53E, 0x1F54A),
+        (0x1F54F, 0x1F54F),
+        (0x1F568, 0x1F579),
+        (0x1F57B, 0x1F594),
+        (0x1F597, 0x1F5A3),
+        (0x1F5A5, 0x1F5FA),
+        (0x1F650, 0x1F67F),
+        (0x1F6C6, 0x1F6CB),
+        (0x1F6CD, 0x1F6CF),
+        (0x1F6D3, 0x1F6D4),
+        (0x1F6E0, 0x1F6EA),
+        (0x1F6F0, 0x1F6F3),
+        (0x1F700, 0x1F776),
+        (0x1F77B, 0x1F7D9),
+        (0x1F800, 0x1F80B),
+        (0x1F810, 0x1F847),
+        (0x1F850, 0x1F859),
+        (0x1F860, 0x1F887),
+        (0x1F890, 0x1F8AD),
+        (0x1F8B0, 0x1F8B1),
+        (0x1F900, 0x1F90B),
+        (0x1F93B, 0x1F93B),
+        (0x1F946, 0x1F946),
+        (0x1FA00, 0x1FA53),
+        (0x1FA60, 0x1FA6D),
     ];
     RANGES
         .binary_search_by(|&(lo, hi)| {
@@ -531,6 +635,36 @@ mod tests {
         // Ambiguous-but-not-emoji content is never widened by this path.
         assert_eq!(display_width("✓"), 1);
         assert_eq!(display_width("20°C"), 4);
+    }
+
+    #[test]
+    fn narrow_emoji_1f000_predicate() {
+        // U+1F000+ emoji with EA=N that `unicode-width` undercounts as 1.
+        assert!(is_narrow_emoji_1f000('\u{1F324}')); // 🌤 sun behind small cloud
+        assert!(is_narrow_emoji_1f000('\u{1F321}')); // 🌡 thermometer
+        assert!(is_narrow_emoji_1f000('\u{1F396}')); // 🎖 military medal
+        assert!(is_narrow_emoji_1f000('\u{1F5FA}')); // 🗺 world map
+        assert!(is_narrow_emoji_1f000('\u{1F700}')); // 🜀 alchemical symbol
+        // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
+        assert!(!is_narrow_emoji_1f000('\u{1F1E6}')); // 🇦 Regional Indicator A
+        assert!(!is_narrow_emoji_1f000('\u{1F1FF}')); // 🇿 Regional Indicator Z
+        // Wide emoji (EA=W) are NOT in this set — they're already width 2.
+        assert!(!is_narrow_emoji_1f000('\u{1F4C5}')); // 📅 calendar (EA=W)
+        assert!(!is_narrow_emoji_1f000('\u{1F4A7}')); // 💧 droplet (EA=W)
+        // Outside range.
+        assert!(!is_narrow_emoji_1f000('a'));
+        assert!(!is_narrow_emoji_1f000('你'));
+    }
+
+    #[test]
+    fn narrow_emoji_1f000_display_width() {
+        // On emoji-capable terminals (default), narrow U+1F000+ emoji
+        // should report display_width == 2, matching terminal rendering.
+        if emoji_wide_enabled() {
+            assert_eq!(display_width("\u{1F324}"), 2); // 🌤
+            assert_eq!(display_width("\u{1F321}"), 2); // 🌡
+            assert_eq!(display_width("\u{1F324} 天气"), 7); // emoji(2) + space(1) + 天(2) + 气(2)
+        }
     }
 
     #[test]
