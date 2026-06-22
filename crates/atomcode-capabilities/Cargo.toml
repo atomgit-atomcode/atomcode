@@ -88,6 +88,10 @@ lsp = ["codeintel", "dep:which", "dep:url", "tokio/process", "tokio/io-util", "t
 lsp-e2e = ["lsp"]
 # Skills: markdown/frontmatter skill loader + use_skill / list_skills tools. No new deps.
 skills = []
+# CC-compatible external hooks: run the user's hooks.json commands on the kernel
+# seams (LifecycleHooks + ToolMiddleware). Spawns subprocesses, so it pulls the
+# process/io tokio features; `dirs` resolves $ATOMCODE_HOME. Opt-in (NOT default).
+cc-hooks = ["dep:dirs", "tokio/process", "tokio/io-util"]
 # E2E tests that hit a REAL provider (network + API key). Separate from the default
 # suite; run on demand: `cargo test -p atomcode-capabilities --features e2e --test e2e`.
 e2e = ["provider"]
