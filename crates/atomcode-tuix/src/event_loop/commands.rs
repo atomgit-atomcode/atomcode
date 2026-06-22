@@ -353,6 +353,37 @@ pub(super) fn execute_slash_command(
         "quit" | "exit" => {
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
+        "copy" => {
+            // Copy a fenced code block from the most recent assistant reply to
+            // the system clipboard, VERBATIM — terminal-native selection copies
+            // the hard-wrapped + PAD-indented body cells, which breaks long
+            // commands; this reads the original markdown instead.
+            //   /copy        → the last code block (the command just shown)
+            //   /copy N      → the Nth code block (1-based)
+            //   /copy all    → every code block, blank-line separated
+            match resolve_copy(&state.last_assistant_response, arg) {
+                CopyResolve::NoBlocks => {
+                    renderer.render(UiLine::Warning(t(Msg::CopyNoCodeBlock).into_owned()));
+                }
+                CopyResolve::BadIndex(count) => {
+                    renderer.render(UiLine::Warning(
+                        t(Msg::CopyBadIndex { count }).into_owned(),
+                    ));
+                }
+                CopyResolve::Text(payload) => {
+                    let lines = payload.lines().count().max(1);
+                    let chars = payload.chars().count();
+                    if copy_text_to_clipboard(&payload) {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::CopyOk { lines, chars }).into_owned(),
+                        ));
+                    } else {
+                        renderer.render(UiLine::Error(t(Msg::CopyFailed).into_owned()));
+                    }
+                }
+            }
+            renderer.flush();
+        }
         "help" => {
             if arg.trim() == "commands" {
                 let config_dir = Config::config_dir();
@@ -3434,6 +3465,90 @@ fn decide_qr_style(
     Some(QrStyle::Dense1x2)
 }
 
+/// Extract the verbatim bodies of fenced (```` ``` ```` / `~~~`) code blocks
+/// from markdown, in document order. Used by `/copy` to recover the ORIGINAL
+/// unwrapped command text — never the rendered body cells, which are already
+/// hard-wrapped + PAD-indented and would corrupt a pasted command.
+///
+/// A fence opens on a line whose trimmed form starts with three or more of the
+/// fence char (an info string like ```` ```bash ```` is fine) and closes on a
+/// line that is ONLY fence chars of the same kind. Inner lines are kept
+/// verbatim (their own indentation preserved). An unterminated fence (a reply
+/// truncated mid-stream) still yields what was captured.
+fn extract_code_blocks(md: &str) -> Vec<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut inner: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    let mut fence_char = '`';
+    for line in md.lines() {
+        let t = line.trim();
+        if !in_block {
+            let c = if t.starts_with("```") {
+                Some('`')
+            } else if t.starts_with("~~~") {
+                Some('~')
+            } else {
+                None
+            };
+            if let Some(c) = c {
+                in_block = true;
+                fence_char = c;
+                inner.clear();
+            }
+        } else if t.len() >= 3 && t.chars().all(|ch| ch == fence_char) {
+            blocks.push(inner.join("\n"));
+            in_block = false;
+        } else {
+            inner.push(line);
+        }
+    }
+    if in_block {
+        blocks.push(inner.join("\n"));
+    }
+    blocks
+}
+
+/// Outcome of resolving a `/copy [arg]` request against a reply's markdown.
+enum CopyResolve {
+    /// The text to place on the clipboard.
+    Text(String),
+    /// The reply has no fenced code block (or there's no reply yet).
+    NoBlocks,
+    /// `/copy N` referenced an out-of-range index; carries the block count.
+    BadIndex(usize),
+}
+
+/// Map `/copy [arg]` to the text to copy. `""` → last block (the common
+/// "copy the command just shown" case); `all` → every block joined by a blank
+/// line; `N` (1-based) → the Nth block.
+fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
+    let blocks = extract_code_blocks(md);
+    if blocks.is_empty() {
+        return CopyResolve::NoBlocks;
+    }
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return CopyResolve::Text(blocks.last().cloned().unwrap_or_default());
+    }
+    if arg.eq_ignore_ascii_case("all") {
+        return CopyResolve::Text(blocks.join("\n\n"));
+    }
+    match arg.parse::<usize>() {
+        Ok(n) if (1..=blocks.len()).contains(&n) => CopyResolve::Text(blocks[n - 1].clone()),
+        _ => CopyResolve::BadIndex(blocks.len()),
+    }
+}
+
+/// Write `text` to the system clipboard via arboard (NSPasteboard / Win32 /
+/// X11-Wayland). Returns `false` when arboard can't open the clipboard
+/// (headless / some SSH sessions) — an OSC 52 fallback for those is a future
+/// enhancement; the interactive desktop path this targets is covered.
+fn copy_text_to_clipboard(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text.to_string()))
+        .is_ok()
+}
+
 #[cfg(test)]
 mod qr_style_tests {
     use super::*;
@@ -3814,6 +3929,91 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     renderer.render(UiLine::CommandOutput(report.render()));
     renderer.flush();
     Ok(())
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::{extract_code_blocks, resolve_copy, CopyResolve};
+
+    const REPLY: &str = "Run cmake + build:\n\
+        ```\n\
+        cmake D:\\proj -DBUILD=ON -DLONG=\"a very long windows path here\"\n\
+        ```\n\
+        then:\n\
+        ```bash\n\
+        cmake --build . --target demo -j4\n\
+        ```";
+
+    #[test]
+    fn extracts_blocks_verbatim_in_order() {
+        let blocks = extract_code_blocks(REPLY);
+        assert_eq!(blocks.len(), 2);
+        // No hard-wrap, no PAD indent — the command is one logical line.
+        assert_eq!(
+            blocks[0],
+            "cmake D:\\proj -DBUILD=ON -DLONG=\"a very long windows path here\""
+        );
+        assert_eq!(blocks[1], "cmake --build . --target demo -j4");
+    }
+
+    #[test]
+    fn multiline_block_preserves_inner_newlines_and_indent() {
+        let md = "```\nline1\n  indented2\nline3\n```";
+        let blocks = extract_code_blocks(md);
+        assert_eq!(blocks, vec!["line1\n  indented2\nline3".to_string()]);
+    }
+
+    #[test]
+    fn unterminated_fence_still_yields_partial() {
+        // A reply truncated mid-stream — still copyable.
+        let md = "```\nhalf a command";
+        assert_eq!(extract_code_blocks(md), vec!["half a command".to_string()]);
+    }
+
+    #[test]
+    fn no_fence_yields_nothing() {
+        assert!(extract_code_blocks("just prose, `inline code` only").is_empty());
+    }
+
+    #[test]
+    fn resolve_default_picks_last_block() {
+        match resolve_copy(REPLY, "") {
+            CopyResolve::Text(t) => assert_eq!(t, "cmake --build . --target demo -j4"),
+            _ => panic!("default should resolve to the last block"),
+        }
+    }
+
+    #[test]
+    fn resolve_index_is_one_based() {
+        match resolve_copy(REPLY, "1") {
+            CopyResolve::Text(t) => assert!(t.starts_with("cmake D:\\proj")),
+            _ => panic!("/copy 1 should pick the first block"),
+        }
+    }
+
+    #[test]
+    fn resolve_all_joins_every_block() {
+        match resolve_copy(REPLY, "all") {
+            CopyResolve::Text(t) => {
+                assert!(t.contains("-DBUILD=ON"));
+                assert!(t.contains("--build ."));
+            }
+            _ => panic!("/copy all should join blocks"),
+        }
+    }
+
+    #[test]
+    fn resolve_bad_index_reports_count() {
+        assert!(matches!(resolve_copy(REPLY, "9"), CopyResolve::BadIndex(2)));
+        assert!(matches!(resolve_copy(REPLY, "0"), CopyResolve::BadIndex(2)));
+        assert!(matches!(resolve_copy(REPLY, "x"), CopyResolve::BadIndex(2)));
+    }
+
+    #[test]
+    fn resolve_no_blocks_when_reply_has_none() {
+        assert!(matches!(resolve_copy("plain reply", ""), CopyResolve::NoBlocks));
+        assert!(matches!(resolve_copy("", ""), CopyResolve::NoBlocks));
+    }
 }
 
 #[cfg(test)]

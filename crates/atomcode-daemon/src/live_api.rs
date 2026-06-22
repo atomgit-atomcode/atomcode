@@ -1215,6 +1215,10 @@ pub(crate) enum LiveWireEvent {
     State { running: bool },
     #[serde(rename = "error")]
     Error { message: String },
+    /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
+    /// `Error` so a client can render it as a muted notice instead of a red error.
+    #[serde(rename = "warning")]
+    Warning { message: String },
     #[serde(rename = "permission_request")]
     PermissionRequest {
         tool_name: String,
@@ -1287,9 +1291,10 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 total: total_tokens,
             },
             TE::Error(message) => LiveWireEvent::Error { message },
-            TE::Warning(w) => LiveWireEvent::Error {
-                message: format!("[warning] {w}"),
-            },
+            // Non-fatal advisory (e.g. "conversation compacted") — its OWN wire type so
+            // the webui renders it as a muted notice, NOT a red "[错误: …]" error glued
+            // into the assistant bubble. No "[warning]" prefix: the type conveys severity.
+            TE::Warning(w) => LiveWireEvent::Warning { message: w },
             TE::ApprovalRequested {
                 tool_name,
                 reason,
@@ -1676,5 +1681,25 @@ mod tests {
     async fn preprocess_live_caption_is_passthrough_without_images() {
         let out = preprocess_live_caption("看下这个图片", &[], None).await;
         assert_eq!(out, "看下这个图片");
+    }
+
+    // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，
+    // 不能被当成 error —— webui 会把 error 渲染成红色「[错误: …]」并塞进回复气泡，
+    // 让一条善意提示看起来像任务出错（用户实测报的 bug）。
+    #[test]
+    fn turn_warning_maps_to_its_own_wire_event_not_error() {
+        let wire = to_wire(LiveEvent::Turn(TurnEvent::Warning(
+            "conversation compacted".into(),
+        )))
+        .expect("a warning must produce a wire event");
+        let json = serde_json::to_string(&wire).unwrap();
+        // Its own severity type — NOT error.
+        assert!(json.contains(r#""type":"warning""#), "wire type must be warning: {json}");
+        assert!(!json.contains(r#""type":"error""#), "warning must not be sent as error: {json}");
+        // The type conveys severity; no "[warning]" string prefix smuggled into the message.
+        assert_eq!(
+            json,
+            r#"{"type":"warning","message":"conversation compacted"}"#
+        );
     }
 }

@@ -7368,6 +7368,9 @@ fn handle_agent_event(
             stop_reason,
             snapshot,
         } => {
+            // Seal the assistant-reply buffer so `/copy` reads this completed
+            // reply until the next turn's first delta starts a fresh one.
+            state.response_finalized = true;
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
                 atomcode_core::notify::NotificationEvent::TurnFinished(
@@ -7524,6 +7527,8 @@ fn handle_agent_event(
             }
         }
         AgentEvent::TurnCancelled { snapshot } => {
+            // Seal the reply buffer (partial reply still copyable via `/copy`).
+            state.response_finalized = true;
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
                 atomcode_core::notify::NotificationEvent::TurnFinished(
@@ -7627,6 +7632,9 @@ fn handle_agent_event(
             renderer.flush();
         }
         AgentEvent::Error { error, snapshot } => {
+            // Seal the reply buffer (any text streamed before the error stays
+            // copyable via `/copy`).
+            state.response_finalized = true;
             renderer.render(UiLine::Error(error));
             renderer.flush();
             fixissue_pending.take();

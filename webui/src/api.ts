@@ -26,7 +26,8 @@ export type SSEEvent =
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string }
   | { type: 'stopped' }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  | { type: 'warning'; message: string };
 
 export interface ModelInfo {
   provider: string;
@@ -479,6 +480,7 @@ export type LiveWireEvent =
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'state'; running: boolean }
   | { type: 'error'; message: string }
+  | { type: 'warning'; message: string }
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'session_switched'; session_id: string };
 
