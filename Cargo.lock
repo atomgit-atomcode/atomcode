@@ -278,11 +278,14 @@ name = "atomcode-clix"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "atomcode-capabilities",
  "atomcode-coding",
  "atomcode-kernel",
  "atomcode-review",
+ "atomcode-telemetry",
  "clap",
+ "futures",
  "serde",
  "serde_json",
  "tempfile",

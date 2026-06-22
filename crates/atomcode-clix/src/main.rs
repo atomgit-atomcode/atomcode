@@ -12,11 +12,12 @@
 //! (some gateways need none).
 
 mod code;
+mod tel;
 
 use anyhow::{bail, Context, Result};
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
-use atomcode_review::{build_review_agent, Finding, ReviewAgentConfig};
+use atomcode_review::{build_review_agent_with, Finding, ReviewAgentConfig};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -75,6 +76,9 @@ struct ReviewArgs {
     /// Config file path (default: ~/.atomcode/config.toml).
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Disable anonymous usage telemetry for this invocation.
+    #[arg(long = "no-telemetry")]
+    no_telemetry: bool,
     /// FULLY override the reviewer system prompt with this text (replaces the built-in
     /// persona entirely — you must then tell the model about its tools + report_finding).
     #[arg(long)]
@@ -262,12 +266,23 @@ async fn review(args: ReviewArgs) -> Result<()> {
         (None, u) => u,
     };
     let model_label = cfg.model.clone();
-    let (agent, report) = build_review_agent(cfg).map_err(|e| anyhow::anyhow!(e))?;
+
+    // Telemetry: the standalone reviewer runs its own kernel loop with NO turn-level
+    // TelemetryHook, so we wrap its provider with a metering decorator — otherwise its LLM
+    // rounds (the review's whole token spend) are invisible. A disabled sink no-ops; flushed
+    // to disk after the run.
+    let telemetry = tel::build_sink(args.config.as_deref(), args.no_telemetry);
+    tel::maybe_show_notice(telemetry.is_enabled());
+    let provider = tel::build_review_provider(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+    let provider = tel::meter_provider(provider, &telemetry, &cfg.base_url, &cfg.model);
+    let (agent, report) = build_review_agent_with(&cfg, provider);
 
     // Live trace on stderr (stdout stays clean for findings / --json). The run is one LLM
     // turn loop — without this the terminal looks frozen while the model thinks + calls tools.
     eprintln!("Running {trace_label} with {model_label} …");
     let run = run_review_streaming(agent, task).await;
+    // All per-round LlmChat events were emitted during the run; drain them to disk before exit.
+    telemetry.shutdown(tel::FLUSH_TIMEOUT).await;
 
     // Trace summary: tool-usage profile + token spend — exactly what you need to optimize.
     if run.tool_calls > 0 {
