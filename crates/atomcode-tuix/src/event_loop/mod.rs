@@ -3754,7 +3754,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     // running turn (matching keyboard-path behaviour)
                     // rather than shut down the whole application.
                     crate::tuix_trace!("KEY", "windows ctrl_c signal -> Cancel (streaming)");
-                    ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+                    cancel_active_turn(&ctx);
                     restore_cancelled_message_to_buf(&mut app, renderer, &ctx);
                 } else {
                     crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
@@ -4990,7 +4990,7 @@ fn handle_idle_key(
             && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
         let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
         if is_ctrl_c || is_bare_esc {
-            ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+            cancel_active_turn(ctx);
             crate::tuix_trace!(
                 "KEY",
                 "idle goal-active {} -> Cancel",
@@ -5977,6 +5977,13 @@ mod streaming_slash_tests {
     }
 
     #[test]
+    fn quit_and_exit_run_mid_stream() {
+        assert_eq!(exec("/quit"), Some(("quit".to_string(), String::new())));
+        assert_eq!(exec("/exit"), Some(("exit".to_string(), String::new())));
+        assert_eq!(exec("/quit now"), None);
+    }
+
+    #[test]
     fn unrelated_commands_and_non_slash_are_blocked() {
         assert_eq!(exec("/model"), None);
         assert_eq!(exec("/clear"), None);
@@ -6095,6 +6102,7 @@ fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, 
 ///
 /// Minimal whitelist:
 ///   - `/bg` (no args) — background the current turn.
+///   - `/quit` and `/exit` — cancel the current turn, then shut down the TUI.
 ///   - `/goal clear|stop|off|reset|none|cancel` — halt a server-driven `/goal`
 ///     loop. Load-bearing: a goal keeps the TUI in Streaming (see `on_thinking`)
 ///     where commands are otherwise blocked, so without this a typed
@@ -6107,6 +6115,9 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
     let (cmd, arg) = parse_slash_line(line)?;
     if cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty() {
         return Some(("bg".to_string(), String::new()));
+    }
+    if matches!(cmd.to_ascii_lowercase().as_str(), "quit" | "exit") && arg.trim().is_empty() {
+        return Some((cmd.to_ascii_lowercase(), String::new()));
     }
     if cmd.eq_ignore_ascii_case("goal") {
         let head = arg.trim().split_whitespace().next().unwrap_or("");
@@ -6162,11 +6173,11 @@ fn handle_streaming_key(
     // the type-ahead queue: a user yanking the escape cord doesn't
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-        let send_res = ctx.agent.cmd_tx.send(AgentCommand::Cancel);
+        let send_ok = cancel_active_turn(ctx);
         crate::tuix_trace!(
             "KEY",
             "streaming Ctrl+C -> Cancel send_ok={} spinner={:?}",
-            send_res.is_ok(),
+            send_ok,
             app.state.spinner_label
         );
         restore_cancelled_message_to_buf(app, renderer, ctx);
@@ -6178,11 +6189,11 @@ fn handle_streaming_key(
     // stream — mid-stream the higher-value action is "stop the agent",
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
-        let send_res = ctx.agent.cmd_tx.send(AgentCommand::Cancel);
+        let send_ok = cancel_active_turn(ctx);
         crate::tuix_trace!(
             "KEY",
             "streaming Esc -> Cancel send_ok={} spinner={:?}",
-            send_res.is_ok(),
+            send_ok,
             app.state.spinner_label
         );
         restore_cancelled_message_to_buf(app, renderer, ctx);
@@ -6316,6 +6327,9 @@ fn handle_streaming_key(
             // TUI in Streaming, so without this a typed `/goal clear` could never
             // reach the bridge and the goal was uninterruptible by command.
             if let Some((cmd, arg)) = streaming_executable_slash(&line) {
+                if matches!(cmd.as_str(), "quit" | "exit") {
+                    cancel_active_turn(ctx);
+                }
                 commands::execute_slash_command(
                     &cmd,
                     &arg,
@@ -6428,11 +6442,26 @@ fn handle_streaming_key(
         BufferResult::Exit => {
             // Ctrl+C on empty buf during streaming — treat as cancel
             // (consistent with the explicit Ctrl+C branch above).
-            ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+            cancel_active_turn(ctx);
             restore_cancelled_message_to_buf(app, renderer, ctx);
         }
     }
     Ok(())
+}
+
+/// Cancel the executor that owns the foreground turn.
+///
+/// In sync mode the turn belongs to `LiveSession`; the local agent is idle and
+/// sending it `AgentCommand::Cancel` is a no-op. Outside sync mode the local
+/// agent remains the owner and keeps the existing command-channel path.
+fn cancel_active_turn(ctx: &LoopCtx) -> bool {
+    if let Some(session) = &ctx.sync_session {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(session.cancel_current_turn())
+        })
+    } else {
+        ctx.agent.cmd_tx.send(AgentCommand::Cancel).is_ok()
+    }
 }
 
 /// Deliver a tool-approval decision to whichever turn is actually waiting.

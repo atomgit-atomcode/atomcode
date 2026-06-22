@@ -55,9 +55,19 @@ export interface ImageData {
 export interface StreamChatBody {
   message: string;
   session_id?: string;
+  request_id?: string;
   working_dir?: string;
   provider?: string;
   images?: ImageData[];
+}
+
+export async function stopChat(requestId: string): Promise<void> {
+  const resp = await fetch('/chat/stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ session_id: requestId }),
+  });
+  if (!resp.ok) throw new Error(`stop chat failed: ${resp.status}`);
 }
 
 export async function streamChat(
@@ -527,6 +537,14 @@ export async function postLiveMessage(
       ...(sessionId ? { session_id: sessionId } : {}),
     }),
   });
+}
+
+export async function postLiveStop(): Promise<void> {
+  const resp = await fetch('/live/stop', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`stop live chat failed: ${resp.status}`);
 }
 
 /** Sync-mode model switch: notify the daemon immediately when the dropdown

@@ -3,7 +3,7 @@
 
 import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -302,6 +302,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -857,11 +858,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     const controller = new AbortController();
     abortRef.current = controller;
+    const requestId = crypto.randomUUID();
+    requestIdRef.current = requestId;
 
     try {
       const body = {
         message: text,
         ...(sessionId ? { session_id: sessionId } : {}),
+        request_id: requestId,
         ...(cwd ? { working_dir: cwd } : {}),
         ...(provider ? { provider } : {}),
         ...(images.length ? { images } : {}),
@@ -882,6 +886,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       onPermissionResolved?.(null);
     } finally {
       abortRef.current = null;
+      if (requestIdRef.current === requestId) requestIdRef.current = null;
     }
   }
 
@@ -976,8 +981,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
   }
 
-  function handleStop() {
-    abortRef.current?.abort();
+  async function handleStop() {
+    try {
+      if (sync) {
+        await postLiveStop();
+      } else if (requestIdRef.current) {
+        await stopChat(requestIdRef.current);
+      }
+    } catch {
+      // If the cancellation endpoint itself is unavailable, at least restore
+      // the local UI instead of leaving the stop button stuck indefinitely.
+      abortRef.current?.abort();
+      setBusy(false);
+      setQueued([]);
+      onPermissionResolved?.(null);
+    }
   }
 
   // 从光标前的 / 替换为选中的技能名。
