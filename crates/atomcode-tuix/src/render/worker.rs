@@ -75,6 +75,9 @@ enum RenderCmd {
     /// `Flush`, exactly as `replay_session` issues them.
     BeginSync,
     EndSync,
+    /// Suppress / restore automatic clipboard copy during history replay
+    /// (issue #699 P1-1). Fire-and-forget.
+    SetSuppressAutoCopy(bool),
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -172,6 +175,10 @@ impl Renderer for TaskRenderer {
 
     fn end_sync(&mut self) {
         let _ = self.cmd_tx.send(RenderCmd::EndSync);
+    }
+
+    fn set_suppress_auto_copy(&mut self, suppress: bool) {
+        let _ = self.cmd_tx.send(RenderCmd::SetSuppressAutoCopy(suppress));
     }
 
     fn suspend_for_external(&mut self) {
@@ -306,6 +313,9 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             }
             RenderCmd::EndSync => {
                 inner.end_sync();
+            }
+            RenderCmd::SetSuppressAutoCopy(suppress) => {
+                inner.set_suppress_auto_copy(suppress);
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();

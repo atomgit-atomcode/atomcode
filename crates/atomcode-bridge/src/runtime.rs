@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
+use atomcode_coding::{
+    assemble, prepare, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
+};
 use atomcode_core::agent::{
     AgentClient, AgentCommand as CoreCmd, AgentEvent as CoreEv, AgentPhase, TurnStopReason,
 };
@@ -32,6 +34,11 @@ pub struct BridgeConfig {
     pub model: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
+    /// User-configured per-response output cap (`provider.max_tokens`). `None` ⇒ the engine
+    /// derives a fallback from the context window in `build_provider`. Threaded so v2 honors
+    /// the same per-provider knob the legacy engine reads (previously dropped → the gateway's
+    /// hidden default truncated long replies with `finish_reason=length`).
+    pub max_tokens: Option<u32>,
     /// Disable MCP connection (mirrors the legacy `--no-mcp` style switches).
     pub mcp: bool,
     /// Telemetry sink forwarded to the coding assembly (→ a `LlmChat`-emitting
@@ -110,9 +117,33 @@ struct TurnStats {
     total_tokens: usize,
 }
 
+/// Resolve CC hooks contributed INLINE by installed plugins into the kernel-stack hook
+/// config. The bridge is the one driver that may depend on `atomcode-core`'s plugin loader
+/// (L1 / `atomcode-coding` cannot), so this mapping lives here: core hands back neutral
+/// [`PluginCcHook`](atomcode_core::plugin::loader::PluginCcHook) specs and we lift each into
+/// an `atomcode_coding::cc_hooks::HookConfig`. Gathered once per bridge (it reads installed
+/// plugin manifests from disk) and reused across respawns.
+fn gather_plugin_cc_hooks() -> Vec<atomcode_coding::cc_hooks::HookConfig> {
+    atomcode_core::plugin::loader::installed_plugin_cc_hooks()
+        .into_iter()
+        .filter_map(|h| {
+            atomcode_coding::cc_hooks::HookConfig::from_plugin_spec(
+                &h.event,
+                h.matcher,
+                h.command,
+                h.timeout_secs,
+                h.plugin_root,
+            )
+        })
+        .collect()
+}
+
 struct Bridge {
     coding_cfg: CodingAgentConfig,
     opts_template: PrepareOptions,
+    /// Plugin-contributed inline CC hooks, resolved once and threaded into every
+    /// `prepare` (initial + respawns) so plugin hooks survive a model swap / reload.
+    plugin_cc_hooks: Vec<atomcode_coding::cc_hooks::HookConfig>,
     parts: atomcode_coding::CodingParts,
     handle: atomcode_kernel::agent::AgentHandle,
     ev_tx: mpsc::UnboundedSender<CoreEv>,
@@ -189,6 +220,9 @@ impl Bridge {
             &cfg.working_dir,
         );
         coding_cfg.context_window = cfg.context_window;
+        // User-configured per-call output cap (parity with `apply_reload_provider`); `None` ⇒
+        // the per-provider fallback in `build_provider` applies.
+        coding_cfg.chat_options.max_tokens = cfg.max_tokens;
         coding_cfg.telemetry = cfg.telemetry.clone();
         coding_cfg.reasoning_history = cfg.reasoning_history.clone();
         // `/effort`: thread the per-provider reasoning_effort into the per-call ChatOptions
@@ -218,8 +252,17 @@ impl Bridge {
             // command + model self-invocation). Reuses this agent's signed provider.
             review: true,
         };
+        // Inline CC hooks from installed plugins (resolved here — only the bridge can reach
+        // the core plugin loader). Reused across respawns via the Bridge struct below.
+        let plugin_cc_hooks = gather_plugin_cc_hooks();
 
-        let mut parts = match prepare(&coding_cfg, opts_template.clone()).await {
+        let mut parts = match prepare_with_plugin_hooks(
+            &coding_cfg,
+            opts_template.clone(),
+            plugin_cc_hooks.clone(),
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 let _ = ev_tx.send(CoreEv::Error {
@@ -267,6 +310,7 @@ impl Bridge {
         let mut bridge = Bridge {
             coding_cfg,
             opts_template,
+            plugin_cc_hooks,
             parts,
             handle,
             ev_tx,
@@ -725,26 +769,7 @@ impl Bridge {
                     self.settle_in_flight_turn().await;
                 }
                 if let Some(p) = config.providers.get(&config.default_provider) {
-                    self.coding_cfg.model = p.model.clone();
-                    if let Some(b) = &p.base_url {
-                        self.coding_cfg.base_url = b.clone();
-                    }
-                    if let Some(k) = &p.api_key {
-                        self.coding_cfg.api_key = k.clone();
-                    }
-                    // `/effort` / `/think` write the provider config then ReloadConfig: pick
-                    // up the (possibly changed) reasoning_effort so the respawned agent's
-                    // ChatOptions reflect it. (`reasoning_history` is a model-property, set
-                    // once at construction; effort is the knob users flip mid-session.)
-                    self.coding_cfg.chat_options.reasoning_effort =
-                        atomcode_kernel::provider::ReasoningEffort::from_config(p.reasoning_effort.as_deref());
-                    // A /model swap can change the adapter kind + per-provider knobs entirely
-                    // — refresh them all so the rebuilt provider matches the new config.
-                    self.coding_cfg.provider_type = p.provider_type.clone();
-                    self.coding_cfg.reasoning_history = p.reasoning_history.clone();
-                    self.coding_cfg.thinking_enabled = p.thinking_enabled;
-                    self.coding_cfg.thinking_type = p.thinking_type.clone();
-                    self.coding_cfg.thinking_keep = p.thinking_keep.clone();
+                    apply_reload_provider(&mut self.coding_cfg, p);
                     match build_provider(&self.coding_cfg) {
                         Ok(provider) => {
                             // Assemble BEFORE tearing down the old handle — if
@@ -1017,7 +1042,13 @@ impl Bridge {
         // Try the requested session mode first; if that fails (e.g. Resume could
         // not find the snapshot), fall back to Fresh before giving up entirely.
         // This prevents a broken snapshot from crashing the whole bridge.
-        let mut parts = match prepare(&self.coding_cfg, opts.clone()).await {
+        let mut parts = match prepare_with_plugin_hooks(
+            &self.coding_cfg,
+            opts.clone(),
+            self.plugin_cc_hooks.clone(),
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 // Don't retry Fresh if the caller already asked for Fresh — that
@@ -1032,7 +1063,13 @@ impl Bridge {
                     return;
                 }
                 opts.session = SessionMode::Fresh;
-                match prepare(&self.coding_cfg, opts).await {
+                match prepare_with_plugin_hooks(
+                    &self.coding_cfg,
+                    opts,
+                    self.plugin_cc_hooks.clone(),
+                )
+                .await
+                {
                     Ok(p) => p,
                     Err(e2) => {
                         self.emit(CoreEv::Error {
@@ -1394,8 +1431,9 @@ impl Bridge {
                 }
             }
             KEv::Warning(w) => self.emit(CoreEv::Warning(w)),
-            KEv::Error { message, .. } => {
-                self.emit(CoreEv::Error { error: message, snapshot: ConversationSnapshot::default() });
+            KEv::Error { message, http_status, .. } => {
+                let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
+                self.emit(CoreEv::Error { error, snapshot: ConversationSnapshot::default() });
             }
             // A manual `/compact` may make a slow one-shot LLM summary call; announce it
             // so the user sees a progress line while it runs (v1 streamed the same
@@ -1782,6 +1820,46 @@ fn compute_undo(
     }
 }
 
+fn apply_reload_provider(
+    cfg: &mut CodingAgentConfig,
+    provider: &atomcode_core::config::provider::ProviderConfig,
+) {
+    cfg.model = provider.model.clone();
+    if let Some(base_url) = &provider.base_url {
+        cfg.base_url = base_url.clone();
+    }
+    if let Some(api_key) = &provider.api_key {
+        cfg.api_key = api_key.clone();
+    }
+    cfg.context_window = provider.context_window as u32;
+    // A user-configured `max_tokens` is the per-call output cap; thread it into ChatOptions
+    // so v2 forwards it (the provider's `options.max_tokens.or(cfg.max_tokens)` then honors it).
+    // `None` ⇒ leave it to the provider-config fallback derived in `build_provider`.
+    cfg.chat_options.max_tokens = provider.max_tokens.map(|m| m as u32);
+    // `/effort` / `/think` write the provider config then ReloadConfig: pick
+    // up the (possibly changed) reasoning_effort so the respawned agent's
+    // ChatOptions reflect it. (`reasoning_history` is a model-property, set
+    // once at construction; effort is the knob users flip mid-session.)
+    cfg.chat_options.reasoning_effort =
+        atomcode_kernel::provider::ReasoningEffort::from_config(provider.reasoning_effort.as_deref());
+    // A /model swap can change the adapter kind + per-provider knobs entirely
+    // — refresh them all so the rebuilt provider matches the new config.
+    cfg.provider_type = provider.provider_type.clone();
+    cfg.reasoning_history = provider.reasoning_history.clone();
+    cfg.thinking_enabled = provider.thinking_enabled;
+    cfg.thinking_type = provider.thinking_type.clone();
+    cfg.thinking_keep = provider.thinking_keep.clone();
+}
+
+/// Provider-config fallback output cap when neither the per-call `ChatOptions` nor an explicit
+/// user setting provides one. Mirrors the legacy v1 engine (`core::provider::{openai,claude}`):
+/// a quarter of the context window, clamped to `[8_000, 16_384]`. Without this, v2 sent NO
+/// `max_tokens` for OpenAI-compat (the gateway then applied its own small hidden cap →
+/// frequent `finish_reason=length` truncation) and a flat 4096 for Anthropic.
+fn default_max_tokens(context_window: u32) -> u32 {
+    (context_window / 4).clamp(8_000, 16_384)
+}
+
 fn build_provider(
     cfg: &CodingAgentConfig,
 ) -> anyhow::Result<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
@@ -1797,6 +1875,9 @@ fn build_provider(
         "claude" | "anthropic" => {
             let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             ac.context_window = cfg.context_window;
+            // Fallback output cap (the per-call `chat_options.max_tokens` still wins). Replaces
+            // the flat 4096 default so a large context window gets a proportionate cap.
+            ac.max_tokens = default_max_tokens(cfg.context_window);
             // `/think on` → adaptive extended thinking. (v2 uses adaptive, so v1's
             // thinking_budget has no direct mapping — intentionally dropped.)
             ac.thinking = cfg.thinking_enabled.unwrap_or(false);
@@ -1808,6 +1889,8 @@ fn build_provider(
             let mut oc = OllamaConfig::new(&cfg.base_url, &cfg.model);
             oc.api_key = cfg.api_key.clone();
             oc.context_window = cfg.context_window;
+            // Fallback `num_predict` cap (the per-call `chat_options.max_tokens` still wins).
+            oc.max_tokens = Some(default_max_tokens(cfg.context_window));
             oc.think = cfg.thinking_enabled.unwrap_or(false);
             Ok(Arc::new(
                 OllamaProvider::new(oc).map_err(|e| anyhow::anyhow!(e.message))?,
@@ -1817,6 +1900,9 @@ fn build_provider(
         _ => {
             let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             pc.context_window = cfg.context_window;
+            // Fallback `max_tokens` (the per-call `chat_options.max_tokens` still wins). Without
+            // this v2 sent NO max_tokens and the gateway's hidden default truncated long replies.
+            pc.max_tokens = Some(default_max_tokens(cfg.context_window));
             // Honor the provider's `reasoning_history` override; unset ⇒ leave `None` so the
             // adapter auto-detects by model. A typo fails fast (parity with the legacy engine).
             pc.reasoning_policy = ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
@@ -1845,6 +1931,27 @@ fn build_provider(
             ))
         }
     }
+}
+
+/// Map a raw provider error to a user-actionable one before it reaches the UI.
+///
+/// An atomgit-gateway **401** means the free-quota token was rejected or
+/// expired. The upstream string ("Gitcode auth: token rejected (status=401)")
+/// tells the user nothing they can act on, so swap it for the i18n hint that
+/// points at `/login` — the actual fix. This restores v1 parity: the legacy
+/// engine does the identical swap in `core/provider/openai.rs` (gated on
+/// `is_atomgit_gateway`), and v2 dropped it, leaking the raw 401 to the chat.
+///
+/// Non-atomgit gateways (a user's own `sk-…` key) keep the verbatim message:
+/// `/login` is the wrong advice there — the developer needs the real diagnostic
+/// to fix their key/endpoint.
+fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: &str) -> String {
+    if http_status == Some(401)
+        && atomcode_core::coding_plan::crypto::is_atomgit_gateway(base_url)
+    {
+        return atomcode_core::i18n::t(atomcode_core::i18n::Msg::ChatAuthExpired).to_string();
+    }
+    message
 }
 
 /// Terse one-line advisory for an AUTO / OVERFLOW compaction.
@@ -1975,11 +2082,48 @@ mod goal_summary_tests {
 #[cfg(test)]
 mod undo_tests {
     use super::{
-        build_provider, compaction_advisory, compute_undo, estimate_after_tokens, fmt_k_tokens,
+        apply_reload_provider, build_provider, compaction_advisory, compute_undo,
+        default_max_tokens, estimate_after_tokens, fmt_k_tokens, friendly_provider_error,
         manual_compact_result,
     };
+    use atomcode_core::config::provider::ProviderConfig;
     use atomcode_coding::CodingAgentConfig;
     use atomcode_kernel::message::{CompactTrigger, Message};
+    use atomcode_kernel::provider::ReasoningEffort;
+
+    #[test]
+    fn atomgit_gateway_401_swaps_for_login_hint() {
+        // An atomgit-gateway 401 (rejected/expired free-quota token) must NOT leak
+        // the raw upstream diagnostic; it's swapped for the actionable /login hint.
+        let raw = "HTTP 401: [auth_error/401] Authentication Error, \
+                   Gitcode auth: token rejected (status=401)"
+            .to_string();
+        let out = friendly_provider_error(
+            raw.clone(),
+            Some(401),
+            "https://api-ai.gitcode.com/v1",
+        );
+        assert_ne!(out, raw, "raw 401 must not reach the UI verbatim");
+        assert!(out.contains("/login"), "hint must point the user at /login: {out:?}");
+    }
+
+    #[test]
+    fn non_atomgit_401_keeps_verbatim_diagnostic() {
+        // A user-supplied sk-… gateway keeps the real message — /login is the wrong
+        // advice; the developer needs the diagnostic to fix their own key/endpoint.
+        let raw = "HTTP 401: invalid api key".to_string();
+        let out = friendly_provider_error(raw.clone(), Some(401), "https://api.openai.com/v1");
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn non_401_atomgit_error_keeps_verbatim_diagnostic() {
+        // Only 401 is an auth-expiry signal; a 500 from the same gateway is a real
+        // server fault and must surface as-is, not be masked by a login hint.
+        let raw = "HTTP 500: upstream overloaded".to_string();
+        let out = friendly_provider_error(raw.clone(), Some(500), "https://api-ai.gitcode.com/v1");
+        assert_eq!(out, raw);
+    }
 
     #[test]
     fn compaction_advisory_announces_committed_auto_overflow_and_ignores_manual() {
@@ -2078,6 +2222,63 @@ mod undo_tests {
         assert!(res.is_err(), "a reasoning_history typo must fail provider construction");
         let err = res.err().unwrap().to_string();
         assert!(err.contains("reasoning_history"), "expected a reasoning_history error, got: {err}");
+    }
+
+    #[test]
+    fn default_max_tokens_mirrors_v1_clamp() {
+        // Parity with the legacy core engine (openai.rs / claude.rs): a quarter of the
+        // context window, clamped to [8_000, 16_384]. v2 previously sent NO max_tokens for
+        // OpenAI-compat (gateway applied its own small hidden cap → finish_reason=length).
+        assert_eq!(default_max_tokens(16_000), 8_000); // 4_000 → floor
+        assert_eq!(default_max_tokens(64_000), 16_000); // in range
+        assert_eq!(default_max_tokens(128_000), 16_384); // 32_000 → ceil
+        assert_eq!(default_max_tokens(1_000_000), 16_384); // huge window → ceil
+    }
+
+    #[test]
+    fn reload_provider_refreshes_context_window_and_provider_knobs() {
+        let mut cfg = CodingAgentConfig::new("old-key", "https://old.example.com/v1", "old-model", "/tmp");
+        cfg.context_window = 16_000;
+        cfg.provider_type = "openai".into();
+        cfg.reasoning_history = Some("exclude".into());
+        cfg.thinking_enabled = Some(false);
+        cfg.thinking_type = Some("disabled".into());
+        cfg.thinking_keep = Some("none".into());
+
+        let provider = ProviderConfig {
+            provider_type: "claude".into(),
+            api_key: Some("new-key".into()),
+            model: "new-model".into(),
+            base_url: Some("https://new.example.com/v1".into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 64_000,
+            max_tokens: Some(5_000),
+            thinking_type: Some("enabled".into()),
+            thinking_keep: Some("all".into()),
+            reasoning_history: Some("include".into()),
+            reasoning_effort: Some("max".into()),
+            thinking_enabled: Some(true),
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        };
+
+        apply_reload_provider(&mut cfg, &provider);
+
+        assert_eq!(cfg.model, "new-model");
+        assert_eq!(cfg.base_url, "https://new.example.com/v1");
+        assert_eq!(cfg.api_key, "new-key");
+        assert_eq!(cfg.context_window, 64_000);
+        // A user-configured `max_tokens` must thread into the per-call ChatOptions so v2
+        // actually sends it (previously dropped → gateway applied its own hidden output cap).
+        assert_eq!(cfg.chat_options.max_tokens, Some(5_000));
+        assert_eq!(cfg.provider_type, "claude");
+        assert_eq!(cfg.reasoning_history.as_deref(), Some("include"));
+        assert_eq!(cfg.chat_options.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(cfg.thinking_enabled, Some(true));
+        assert_eq!(cfg.thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(cfg.thinking_keep.as_deref(), Some("all"));
     }
 
     fn convo() -> Vec<Message> {

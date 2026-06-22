@@ -3,7 +3,7 @@
 
 import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -217,6 +217,19 @@ function formatToolDetail(name: string, argsJson: string): string {
         .filter((x): x is string => x !== null)
         .join(', ');
     }
+    case 'todo': {
+      const action = getStr('action');
+      if (action === 'add') return getStr('content');
+      if (action === 'update') {
+        const id = typeof v.id === 'number' ? v.id : '';
+        const status = getStr('status');
+        if (id && status) return `#${id} → ${status}`;
+        if (id) return `#${id}`;
+        return status;
+      }
+      if (action === 'list') return 'list all';
+      return '';
+    }
     case 'use_skill':
       return getStr('name');
     default: {
@@ -289,6 +302,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -535,6 +549,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'error': return { type: 'error', message: e.message };
+      case 'warning': return { type: 'warning', message: e.message };
       default: return null;
     }
   }
@@ -668,6 +683,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     });
   }
 
+  // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
+  // never styled as an error). Mirrors appendToLastAssistant's last-assistant guard.
+  function pushNoticeToLastAssistant(text: string) {
+    setMessages((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      if (last.role !== 'assistant') return prev;
+      const parts: MsgPart[] = [...last.parts, { kind: 'notice', text }];
+      return [...prev.slice(0, -1), { ...last, parts }];
+    });
+  }
+
   function updateToolInLastAssistant(
     id: string,
     update: Partial<ToolRow>,
@@ -791,6 +818,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         onPermissionResolved?.(null);
         break;
 
+      case 'warning':
+        // 非致命提示（如"已自动压缩上下文"）：渲染成淡色 notice 行 —— 不染红、不并进
+        // 回复文本、不结束回合（任务继续）。对齐 TUI 的黄色 "!" 提示。
+        pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }));
+        break;
+
       default:
         // Ignore tool_batch, artifact_*, etc.
         break;
@@ -825,11 +858,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     const controller = new AbortController();
     abortRef.current = controller;
+    const requestId = crypto.randomUUID();
+    requestIdRef.current = requestId;
 
     try {
       const body = {
         message: text,
         ...(sessionId ? { session_id: sessionId } : {}),
+        request_id: requestId,
         ...(cwd ? { working_dir: cwd } : {}),
         ...(provider ? { provider } : {}),
         ...(images.length ? { images } : {}),
@@ -850,6 +886,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       onPermissionResolved?.(null);
     } finally {
       abortRef.current = null;
+      if (requestIdRef.current === requestId) requestIdRef.current = null;
     }
   }
 
@@ -944,8 +981,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
   }
 
-  function handleStop() {
-    abortRef.current?.abort();
+  async function handleStop() {
+    try {
+      if (sync) {
+        await postLiveStop();
+      } else if (requestIdRef.current) {
+        await stopChat(requestIdRef.current);
+      }
+    } catch {
+      // If the cancellation endpoint itself is unavailable, at least restore
+      // the local UI instead of leaving the stop button stuck indefinitely.
+      abortRef.current?.abort();
+      setBusy(false);
+      setQueued([]);
+      onPermissionResolved?.(null);
+    }
   }
 
   // 从光标前的 / 替换为选中的技能名。
@@ -1457,6 +1507,13 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
           ))}
         </div>,
       );
+    } else if (p.kind === 'notice') {
+      out.push(
+        <div class="msg-notice" key={`nt-${i}`}>
+          {p.text}
+        </div>,
+      );
+      i++;
     } else {
       if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} />);
       i++;

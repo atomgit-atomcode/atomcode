@@ -432,27 +432,32 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
 }
 
 /// An [`LlmProvider`] decorator that records one [`Event::LlmChat`] for each call made
-/// THROUGH it. Its job: count the [`OverflowCompaction`] tier-2 summary LLM call, which
-/// otherwise bypasses the turn-level [`TelemetryHook`] entirely — it is an INTERNAL
-/// capability call (history summarization), not an agent round, so `on_request` /
-/// `on_model_response` never fire for it and its token spend was invisible. This is the
-/// v2 port of core's `run_llm_summary` telemetry (`c58427a3`).
+/// THROUGH it. Its job: meter LLM calls that run OUTSIDE the instrumented host agent
+/// loop, where the turn-level [`TelemetryHook`] (which fires on `on_request` /
+/// `on_model_response`) never sees them and their token spend would be invisible. Three
+/// such call sites wrap their provider with this:
+///   - the [`OverflowCompaction`] tier-2 summary call (history summarization — the v2
+///     port of core's `run_llm_summary` telemetry, `c58427a3`);
+///   - the in-session `code_review` sub-agent (assembled in [`assemble`](crate::assemble));
+///   - the standalone `atomcodex review` agent (wrapped by the clix driver).
+///
+/// The latter two run their own kernel loop with no telemetry hooks of their own.
 ///
 /// The emitted event is a plain `LlmChat` (the telemetry `Event` enum has no
-/// compaction-specific variant) carrying the call's REAL token usage (folded from the
+/// sub-agent-specific variant) carrying the call's REAL token usage (folded from the
 /// stream's [`StreamEvent::Usage`] events) and wall-clock duration. The per-zone
-/// breakdown is folded into the message zone (an internal summary call has no
-/// system/tool zones) so zones still sum to the prompt total. Wrapping is opt-in at
-/// assembly — only when a telemetry sink is configured — so a telemetry-free embedder
-/// keeps a zero-telemetry kernel AND an undecorated summary provider.
+/// breakdown is folded into the message zone (these out-of-loop calls have no
+/// separately-measured system/tool zones) so zones still sum to the prompt total.
+/// Wrapping is opt-in at assembly — only when a telemetry sink is configured — so a
+/// telemetry-free embedder keeps a zero-telemetry kernel AND an undecorated provider.
 ///
 /// [`OverflowCompaction`]: atomcode_capabilities::compaction::OverflowCompaction
-pub struct CompactionTelemetryProvider {
+pub struct MeteredProvider {
     inner: Arc<dyn LlmProvider>,
     attr: Arc<Attribution>,
 }
 
-impl CompactionTelemetryProvider {
+impl MeteredProvider {
     pub fn new(
         inner: Arc<dyn LlmProvider>,
         telemetry: Arc<Telemetry>,
@@ -466,7 +471,7 @@ impl CompactionTelemetryProvider {
 }
 
 #[async_trait]
-impl LlmProvider for CompactionTelemetryProvider {
+impl LlmProvider for MeteredProvider {
     fn model_name(&self) -> &str {
         self.inner.model_name()
     }
@@ -840,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_provider_records_summary_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let dec = CompactionTelemetryProvider::new(
+        let dec = MeteredProvider::new(
             Arc::new(CannedSummary { fail: false }),
             tel,
             "openai",
@@ -879,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_provider_marks_had_error_on_stream_error() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let dec = CompactionTelemetryProvider::new(
+        let dec = MeteredProvider::new(
             Arc::new(CannedSummary { fail: true }),
             tel,
             "openai",

@@ -864,7 +864,7 @@ pub(crate) async fn run_shell(
                                 crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stdout_buf.extend_from_slice(&buf[..n]);
                             has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
-                            chunk_cb(&chunk);
+                            chunk_cb(&sanitize_terminal_output(&chunk));
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
@@ -885,7 +885,7 @@ pub(crate) async fn run_shell(
                                 crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stderr_buf.extend_from_slice(&buf[..n]);
                             has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
-                            chunk_cb(&format!("[stderr] {}", chunk));
+                            chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {

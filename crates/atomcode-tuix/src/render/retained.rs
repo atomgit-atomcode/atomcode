@@ -20,8 +20,8 @@ use std::fs::File;
 use std::io::{BufWriter, Stdout, Write};
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, EnableBracketedPaste, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 
@@ -33,6 +33,19 @@ use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use crossterm::style::Color;
+
+/// When `ATOMCODE_AUTO_COPY=0` or `=false`, the renderer skips automatic
+/// clipboard copy after code-block flushes. Default is on (enabled).
+/// Result is cached in a `OnceLock` — environment is read once per process.
+fn auto_copy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ATOMCODE_AUTO_COPY")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
 
 const PAD_COL: usize = 2;
 
@@ -388,6 +401,11 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// of a turn gets a new mark; subsequent chunks within the same assistant turn are silent.
     /// Cleared whenever a User / ToolCall / ToolCallInFlight / TurnSeparator fires.
     last_mark_was_assistant: bool,
+    /// Set by `set_suppress_auto_copy(true)` before history replay
+    /// (`/resume`, `/undo`, `atomcode -c`). Suppresses clipboard writes
+    /// and "Copied" hint lines so replay doesn't overwrite the user's
+    /// clipboard or inject stale annotations (issue #699).
+    suppress_auto_copy: bool,
     /// Line-buffer for streaming assistant text — chunks accumulate
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
@@ -618,6 +636,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             body_lines: Vec::new(),
             message_marks: Vec::new(),
             last_mark_was_assistant: false,
+            suppress_auto_copy: false,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
             dirty: false,
@@ -884,7 +903,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else {
                 format!("{}{}", name, meta)
             };
-            return self.build_prefixed_rows(prefix, prefix_style, &body, name_style);
+            return self.build_prefixed_rows(prefix, prefix_style, &body, name_style, None);
         }
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
         if w == 0 {
@@ -1613,6 +1632,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         let menu_top = bot_rule_row + 1 + attachment_rows;
+        // Invalidate prev_cells for the menu rows so the next render_diff
+        // emits explicit patches for EVERY cell (including blank padding at
+        // the right edge). Without this, a CJK character from a prior frame's
+        // skill description whose display cells transition to ASCII spaces can
+        // leave the right-half of its glyph visible on some terminals (iTerm2
+        // per-cell patch coalescing). `pad_row_to_width` on the individual row
+        // already fills the buffer with blanks from content-end to screen edge,
+        // but the diff/serialize mechanism may not fully overwrite the right
+        // half of a 2-cell-wide glyph because the continuation cell at (c+1)
+        // is compared against the new (non-continuation) blank cell — the patch
+        // IS generated, yet the physical glyph remnant survives on iTerm2.
+        // Sentinel prev forces every column through the diff, blanks included.
+        self.screen.invalidate_rows_from(menu_top);
         for (i, r) in menu_cells.into_iter().enumerate() {
             let mut padded = r;
             Self::pad_row_to_width(&mut padded, w);
@@ -2544,26 +2576,47 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body: &str,
         body_style: &CellStyle,
     ) {
-        let rows = self.build_prefixed_rows(prefix, prefix_style, body, body_style);
+        let rows = self.build_prefixed_rows(prefix, prefix_style, body, body_style, None);
+        for row in rows {
+            self.push_body_row(row);
+        }
+    }
+
+    /// Like `push_body_prefixed` but continuation rows carry `cont_prefix`
+    /// (e.g. a coloured `▎` left bar) instead of a blank pad, so a multi-line
+    /// block reads as one unit with a full-height left marker. `cont_prefix`
+    /// MUST be the same display width as `prefix` so the body stays aligned.
+    fn push_body_prefixed_cont(
+        &mut self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        cont_prefix: &str,
+        cont_style: &CellStyle,
+        body: &str,
+        body_style: &CellStyle,
+    ) {
+        let rows =
+            self.build_prefixed_rows(prefix, prefix_style, body, body_style, Some((cont_prefix, cont_style)));
         for row in rows {
             self.push_body_row(row);
         }
     }
 
     /// Symbol-anchored row builder. Wraps `body` to `screen_width − PAD_COL`,
-    /// emits the leading row with `prefix`, continuation rows with a blank
-    /// pad of equal display width. Pure: no side effects on `body_lines`
-    /// or terminal output. Used by `push_body_prefixed` (which appends each
-    /// row via push_body_row) and `render_inflight_tool` (which writes
-    /// in-place over previously-rendered inflight rows during spinner
-    /// ticks — see that fn's doc comment for the scrollback-leak bug
-    /// this split addresses).
+    /// emits the leading row with `prefix`; continuation rows use `cont`'s
+    /// `(prefix, style)` when given, else a blank pad of equal display width.
+    /// Pure: no side effects on `body_lines` or terminal output. Used by
+    /// `push_body_prefixed` / `push_body_prefixed_cont` (which append each row
+    /// via push_body_row) and `render_inflight_tool` (which writes in-place
+    /// over previously-rendered inflight rows during spinner ticks — see that
+    /// fn's doc comment for the scrollback-leak bug this split addresses).
     fn build_prefixed_rows(
         &self,
         prefix: &str,
         prefix_style: &CellStyle,
         body: &str,
         body_style: &CellStyle,
+        cont: Option<(&str, &CellStyle)>,
     ) -> Vec<Vec<Cell>> {
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
         if w == 0 {
@@ -2571,7 +2624,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let prefix_w = crate::width::display_width(prefix);
         let first_budget = w.saturating_sub(prefix_w);
-        let cont_pad: String = " ".repeat(prefix_w);
+        let blank_pad: String = " ".repeat(prefix_w);
+        let pad_style = CellStyle::default();
         let mut rows = Vec::new();
         let mut first_emitted = false;
         for phys in body.split('\n') {
@@ -2581,12 +2635,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .collect();
             for chunk in &chunks {
                 let mut row = Vec::new();
-                let pad = CellStyle::default();
                 if !first_emitted {
                     push_str_cells(&mut row, prefix, prefix_style);
                     first_emitted = true;
                 } else {
-                    push_str_cells(&mut row, &cont_pad, &pad);
+                    let (cp, cs) = cont.unwrap_or((blank_pad.as_str(), &pad_style));
+                    push_str_cells(&mut row, cp, cs);
                 }
                 push_str_cells(&mut row, chunk.as_str(), body_style);
                 rows.push(row);
@@ -2616,6 +2670,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             ) {
                 completed.push(rendered);
             }
+            // Auto-copy code block to clipboard when the close fence just
+            // flushed (issue #699). Delegates to `maybe_auto_copy_hint`.
+            if let Some(hint) = self.maybe_auto_copy_hint() {
+                completed.push(hint);
+            }
         }
         for rendered in completed {
             self.push_markdown_body(&rendered);
@@ -2644,6 +2703,51 @@ impl<W: Write + Send> RetainedRenderer<W> {
         {
             self.push_markdown_body(&block);
         }
+        // finalize_with_width may have flushed an unclosed code block
+        // (stream ended without close fence). Same auto-copy logic as
+        // flush_assistant_lines (issue #699).
+        if let Some(hint) = self.maybe_auto_copy_hint() {
+            self.push_markdown_body(&hint);
+        }
+    }
+
+    /// If the markdown parser just finished a code block, copy its raw
+    /// source to the system clipboard and return a muted hint line for
+    /// display. Returns `None` when no block was finished or auto-copy
+    /// is disabled (see [`auto_copy_enabled`]).
+    fn maybe_auto_copy_hint(&mut self) -> Option<String> {
+        // Never auto-copy during history replay (/resume, /undo, atomcode -c).
+        // The markdown events are identical to live streaming, but we
+        // must not overwrite the user's clipboard or inject stale
+        // "Copied" hints into replayed output (issue #699 P1).
+        if self.suppress_auto_copy {
+            return None;
+        }
+        let source = self.md_state.last_code_block_source.take()?;
+        if !auto_copy_enabled() || source.trim().is_empty() {
+            return None;
+        }
+        // Write through `self.out` so the escape sequence stays ordered
+        // with buffered body-content writes — avoids raw-stdout interleave
+        // with the retained renderer's BufWriter.
+        let ok = crate::event_loop::commands::copy_text_to_clipboard_osc52_via(
+            &mut self.out,
+            &source,
+        );
+        // Only show the hint when the clipboard write actually succeeded
+        // — a misleading "Copied" is worse than no hint (issue #699 P2).
+        if !ok {
+            return None;
+        }
+        // Leading `\n` gives the hint a blank line of separation from the
+        // code block body, so it reads as a standalone annotation rather
+        // than trailing the last code line.
+        Some(format!(
+            "\n{}{}{}",
+            crate::highlight::theme::MD_MUTED_OPEN,
+            t(Msg::CodeBlockCopied),
+            crate::highlight::theme::MD_MUTED_CLOSE
+        ))
     }
 
     /// Parse a markdown-rendered string (ANSI-tinted) into cells
@@ -2997,9 +3101,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.mark_message(crate::render::MarkKind::User);
         self.last_mark_was_assistant = false;
         let safe = scrub_controls(text);
+        // The coloured marker (Accent / cyan) flags "this is the user's input" —
+        // the same role opencode gives its coloured left border. The first row
+        // gets the `❯` chevron; continuation rows of a multi-line message get a
+        // full-height `▎` bar so the block reads as one unit. The message text
+        // itself stays the terminal's DEFAULT foreground (like opencode's
+        // `<text fg={theme.text}>`); colouring the whole sentence read as too
+        // vivid. Colour on the marker, not the text.
         let accent = self.style_bold(Role::Accent);
-        let plain = CellStyle::default();
-        self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &plain);
+        let text_style = CellStyle::default();
+        self.push_body_prefixed_cont(
+            self.caps.prompt_chevron(),
+            &accent,
+            self.caps.prompt_continuation_bar(),
+            &accent,
+            &safe,
+            &text_style,
+        );
         let muted = self.style_for(Role::Muted);
         for n in attachments {
             self.push_body_text(&format!("└ [Image #{}]", n), &muted);
@@ -3671,7 +3789,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let mut prefixed_rows = if detail.is_empty() {
                     // No detail: "▶ Waiting for approval: tool:"
                     let body = format!("{}: ", safe_tool);
-                    self.build_prefixed_rows(&waiting, &warn, &body, &tool_name_style)
+                    self.build_prefixed_rows(&waiting, &warn, &body, &tool_name_style, None)
                 } else {
                     // Build rows with mixed styling: yellow prefix, bold tool, fg detail
                     let detail_suffix = format!("({}): ", safe_detail);
@@ -4136,6 +4254,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
     }
 
+    fn set_suppress_auto_copy(&mut self, suppress: bool) {
+        self.suppress_auto_copy = suppress;
+    }
+
     fn clear_screen(&mut self) {
         // Same as reset for retained mode — Screen IS our model, so
         // wiping the terminal requires wiping the model too. The
@@ -4203,10 +4325,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Re-push Kitty keyboard enhancement flags (mirror of the pop in
         // suspend_for_external, and the initial push in TerminalGuard).
         // Without this, post-OAuth the terminal is in a different
-        // key-reporting mode than we initialised with — autorepeat stops
-        // coming as `Repeat`, Shift+Enter stops carrying SHIFT, and any
-        // other logic that depended on CSI u event types silently
-        // degrades. Same flag set as `TerminalGuard::activate`.
+        // key-reporting mode than we initialised with and Shift+Enter stops
+        // carrying SHIFT. Same flag set as `TerminalGuard::activate`; in
+        // particular, it excludes REPORT_EVENT_TYPES so release CSI-u reports
+        // cannot leak into the input box when their leading ESC is split.
         //
         // Windows and JediTerm are excluded for the same reason as the
         // initial push: Windows' Win32 console backend can't decode `CSI u`
@@ -4219,10 +4341,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if crate::should_enable_kitty_keyboard(&self.caps) {
             let _ = execute!(
                 self.out,
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
+                PushKeyboardEnhancementFlags(crate::kitty_keyboard_flags())
             );
         }
         // Wipe terminal + invalidate Screen + reset region state so
@@ -9371,6 +9490,96 @@ mod tests {
         }
     }
 
+    /// User-message text stays the terminal's default foreground (no fixed
+    /// colour) — the colour lives only on the `❯` Accent marker, mirroring
+    /// opencode (`<text fg={theme.text}>` + a coloured left border). The old
+    /// `!267` styling painted the whole sentence bright magenta, which read as
+    /// too vivid; this locks the text back to default fg.
+    #[test]
+    fn retained_user_message_text_is_default_fg() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::User("hello".into()));
+
+        let mut found = false;
+        for row in &r.body_lines {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if !text.contains("hello") {
+                continue;
+            }
+            found = true;
+            // The text glyphs (the alphabetic cells; the chevron is a glyph/space)
+            // must carry NO fixed fg — they inherit the terminal default.
+            for cell in row {
+                if cell.ch.is_alphabetic() {
+                    assert_eq!(
+                        cell.style.fg, None,
+                        "user text cell '{}' must be default fg (None), got {:?}",
+                        cell.ch, cell.style.fg,
+                    );
+                }
+            }
+            break;
+        }
+        assert!(found, "no row containing the user text 'hello' found");
+    }
+
+    /// A multi-line user message gets a full-height left marker: the `❯` chevron
+    /// on the first row, then a coloured `▎` bar (Accent) on every continuation
+    /// row — so the block reads as one unit (opencode's `┃` border, fg-only).
+    #[test]
+    fn retained_multiline_user_message_has_full_height_bar() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::User("first line\nsecond line".into()));
+
+        let mut saw_chevron = false;
+        let mut saw_bar = false;
+        for row in &r.body_lines {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if text.contains("first line") {
+                saw_chevron = true;
+                assert_eq!(
+                    row.first().map(|c| c.ch),
+                    Some('\u{276f}'),
+                    "first row must start with the ❯ chevron, got {:?}",
+                    text
+                );
+            }
+            if text.contains("second line") {
+                saw_bar = true;
+                let bar = row.first().expect("continuation row must not be empty");
+                assert_eq!(bar.ch, '\u{258e}', "continuation must start with a ▎ bar");
+                assert_eq!(
+                    bar.style.fg,
+                    Some(Color::Cyan),
+                    "the bar must be Accent (cyan), got {:?}",
+                    bar.style.fg
+                );
+            }
+        }
+        assert!(saw_chevron && saw_bar, "expected a chevron row and a bar continuation row");
+    }
+
+    /// Windows / no-unicode-font terminals: the continuation bar falls back to an
+    /// ASCII `|` (2 display cols, same as `❯`→`>`), so layout stays identical and
+    /// no tofu glyph appears.
+    #[test]
+    fn retained_multiline_user_bar_ascii_fallback() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.unicode_symbols = false; // Windows legacy conhost / no-unicode font
+        r.render(UiLine::User("first line\nsecond line".into()));
+
+        let mut saw_bar = false;
+        for row in &r.body_lines {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if text.contains("second line") {
+                saw_bar = true;
+                let bar = row.first().expect("continuation row must not be empty");
+                assert_eq!(bar.ch, '|', "ascii fallback bar must be '|', got {:?}", bar.ch);
+            }
+        }
+        assert!(saw_bar, "expected a continuation row");
+    }
+
     /// Regression: after approving a bash tool call, the `● Bash(cmd)` row
     /// and the `└ [elapsed: …]` result row should be adjacent with no
     /// blank line between them. User reported a visible blank gap after
@@ -9839,6 +10048,24 @@ mod tests {
             !s.contains("\x1b[?1006h"),
             "resume must NOT re-enable SGR mouse coords — defer to terminal: {:?}",
             s
+        );
+    }
+
+    #[test]
+    fn retained_resume_does_not_request_keyboard_release_events() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        r.suspend_for_external();
+        buf.lock().unwrap().clear();
+
+        r.resume_from_external();
+
+        let bytes = buf.lock().unwrap().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(
+            output.contains("\x1b[>1u") && !output.contains("\x1b[>3u"),
+            "resume must enable disambiguation without release reports: {output:?}"
         );
     }
 
@@ -11494,6 +11721,7 @@ mod tests {
         // content doesn't matter for the cold-start assertion — we
         // just need to reach `flush_deferred → paint_frame →
         // render_diff` so the first post-reset diff actually runs.
+        r.set_suppress_auto_copy(true);
         r.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -11590,6 +11818,7 @@ mod tests {
         // (`flush_deferred` after each row, mimicking the worker) runs —
         // the exact multi-envelope failure mode.
         r.begin_sync();
+        r.set_suppress_auto_copy(true);
         r.reset();
         for i in 0..16 {
             r.render(UiLine::AssistantText(format!("replay row {i}\n")));

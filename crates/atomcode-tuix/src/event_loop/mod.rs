@@ -1476,6 +1476,25 @@ mod buffer_tests {
     }
 
     #[test]
+    fn slash_command_arg_expands_folded_paste() {
+        // Regression: `/goal <pasted body>` must hand the command the
+        // real pasted text, not the literal `[Pasted #N …]` placeholder.
+        // The submit path now expands the slash arg before dispatch; this
+        // mirrors that expansion on the `arg` slice of the committed line.
+        let mut b = Buffer::new();
+        let body = "do the thing\n".repeat(69);
+        b.insert_paste(body.clone());
+        // Buffer now looks like the user typed `/goal ` then pasted.
+        let line = format!("/goal {}", b.text);
+        let (cmd, arg) = parse_slash_line(&line).expect("recognised as slash line");
+        assert_eq!(cmd, "goal");
+        assert!(arg.contains("[Pasted #1"), "arg still folded pre-expansion: {arg:?}");
+        let expanded = b.expand_pastes(arg);
+        assert_eq!(expanded, body, "slash arg must expand to the pasted body");
+        assert!(!expanded.contains("[Pasted #"), "no placeholder should survive");
+    }
+
+    #[test]
     fn expanded_text_recovers_folded_paste() {
         // Modals (e.g. the provider Template step) read `expanded_text()`
         // instead of `text`, so a folded multi-line paste is seen in full
@@ -2522,6 +2541,16 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_edit_file_repairs_unescaped_newline() {
+        let args = concat!(
+            r#"{"file_path":"/abs/path/to/test.txt","old_string":"old","new_string":"line 1"#,
+            "\n",
+            r#"line 2"}"#
+        );
+        assert_eq!(format_tool_detail("edit_file", args), "test.txt");
+    }
+
+    #[test]
     fn format_tool_detail_read_symbol_combines_symbol_and_file() {
         let args = r#"{"symbol":"parse","file_path":"src/lexer.rs"}"#;
         assert_eq!(format_tool_detail("read_symbol", args), "parse in lexer.rs");
@@ -2561,6 +2590,27 @@ mod tool_format_tests {
     fn format_tool_detail_invalid_json_returns_empty() {
         let out = format_tool_detail("read_file", "not json");
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn format_tool_detail_todo_add_shows_content() {
+        let args = r#"{"action":"add","content":"Write tests"}"#;
+        let out = format_tool_detail("todo", args);
+        assert_eq!(out, "Write tests");
+    }
+
+    #[test]
+    fn format_tool_detail_todo_update_shows_id_and_status() {
+        let args = r#"{"action":"update","id":2,"status":"completed"}"#;
+        let out = format_tool_detail("todo", args);
+        assert_eq!(out, "#2 → completed");
+    }
+
+    #[test]
+    fn format_tool_detail_todo_list_shows_list_all() {
+        let args = r#"{"action":"list"}"#;
+        let out = format_tool_detail("todo", args);
+        assert_eq!(out, "list all");
     }
 
     #[test]
@@ -2628,6 +2678,17 @@ mod tool_format_tests {
     #[test]
     fn format_tool_detail_parallel_edit_files_two_files() {
         let args = r#"{"files":[{"path":"a.rs","instruction":"add X"},{"path":"b.rs","instruction":"wire X"}]}"#;
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "a.rs, b.rs");
+    }
+
+    #[test]
+    fn format_tool_detail_parallel_edit_files_repairs_unescaped_instruction_newline() {
+        let args = concat!(
+            r#"{"files":[{"path":"a.rs","instruction":"line 1"#,
+            "\n",
+            r#"line 2"},{"path":"b.rs","instruction":"change b"}]}"#
+        );
         let out = format_tool_detail("parallel_edit_files", args);
         assert_eq!(out, "a.rs, b.rs");
     }
@@ -3693,7 +3754,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     // running turn (matching keyboard-path behaviour)
                     // rather than shut down the whole application.
                     crate::tuix_trace!("KEY", "windows ctrl_c signal -> Cancel (streaming)");
-                    ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+                    cancel_active_turn(&ctx);
                     restore_cancelled_message_to_buf(&mut app, renderer, &ctx);
                 } else {
                     crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
@@ -4741,7 +4802,7 @@ fn build_skill_menu_items(
                     .unwrap_or(skill.name.as_str());
                 let full_lower = skill.name.to_ascii_lowercase();
                 let bare_lower = bare.to_ascii_lowercase();
-                if bare_lower.starts_with(prefix_lower) || full_lower.starts_with(prefix_lower) {
+                if bare_lower.contains(prefix_lower) || full_lower.contains(prefix_lower) {
                     let bare_is_unique = skills.iter().all(|other| {
                         other.name == skill.name
                             || other
@@ -4929,7 +4990,7 @@ fn handle_idle_key(
             && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
         let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
         if is_ctrl_c || is_bare_esc {
-            ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+            cancel_active_turn(ctx);
             crate::tuix_trace!(
                 "KEY",
                 "idle goal-active {} -> Cancel",
@@ -5547,9 +5608,17 @@ fn handle_idle_key(
                     // hand it `&mut app.buf`.
                     handle_paste_command(app, ctx, renderer)?;
                 } else {
+                    // Expand `[Pasted #N …]` placeholders in the argument
+                    // before dispatch, exactly like the regular-message
+                    // path below. Without this, `/goal <pasted body>`
+                    // hands the command the literal placeholder string
+                    // (e.g. "[Pasted #1 +69 lines]") instead of the real
+                    // pasted text. The paste registry is still live here —
+                    // it's cleared a few lines down, after dispatch.
+                    let arg = app.buf.expand_pastes(arg);
                     execute_slash_command(
                         cmd,
-                        arg,
+                        &arg,
                         &mut app.state,
                         ctx,
                         renderer,
@@ -5908,6 +5977,13 @@ mod streaming_slash_tests {
     }
 
     #[test]
+    fn quit_and_exit_run_mid_stream() {
+        assert_eq!(exec("/quit"), Some(("quit".to_string(), String::new())));
+        assert_eq!(exec("/exit"), Some(("exit".to_string(), String::new())));
+        assert_eq!(exec("/quit now"), None);
+    }
+
+    #[test]
     fn unrelated_commands_and_non_slash_are_blocked() {
         assert_eq!(exec("/model"), None);
         assert_eq!(exec("/clear"), None);
@@ -6026,6 +6102,7 @@ fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, 
 ///
 /// Minimal whitelist:
 ///   - `/bg` (no args) — background the current turn.
+///   - `/quit` and `/exit` — cancel the current turn, then shut down the TUI.
 ///   - `/goal clear|stop|off|reset|none|cancel` — halt a server-driven `/goal`
 ///     loop. Load-bearing: a goal keeps the TUI in Streaming (see `on_thinking`)
 ///     where commands are otherwise blocked, so without this a typed
@@ -6038,6 +6115,9 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
     let (cmd, arg) = parse_slash_line(line)?;
     if cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty() {
         return Some(("bg".to_string(), String::new()));
+    }
+    if matches!(cmd.to_ascii_lowercase().as_str(), "quit" | "exit") && arg.trim().is_empty() {
+        return Some((cmd.to_ascii_lowercase(), String::new()));
     }
     if cmd.eq_ignore_ascii_case("goal") {
         let head = arg.trim().split_whitespace().next().unwrap_or("");
@@ -6093,11 +6173,11 @@ fn handle_streaming_key(
     // the type-ahead queue: a user yanking the escape cord doesn't
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-        let send_res = ctx.agent.cmd_tx.send(AgentCommand::Cancel);
+        let send_ok = cancel_active_turn(ctx);
         crate::tuix_trace!(
             "KEY",
             "streaming Ctrl+C -> Cancel send_ok={} spinner={:?}",
-            send_res.is_ok(),
+            send_ok,
             app.state.spinner_label
         );
         restore_cancelled_message_to_buf(app, renderer, ctx);
@@ -6109,11 +6189,11 @@ fn handle_streaming_key(
     // stream — mid-stream the higher-value action is "stop the agent",
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
-        let send_res = ctx.agent.cmd_tx.send(AgentCommand::Cancel);
+        let send_ok = cancel_active_turn(ctx);
         crate::tuix_trace!(
             "KEY",
             "streaming Esc -> Cancel send_ok={} spinner={:?}",
-            send_res.is_ok(),
+            send_ok,
             app.state.spinner_label
         );
         restore_cancelled_message_to_buf(app, renderer, ctx);
@@ -6247,6 +6327,9 @@ fn handle_streaming_key(
             // TUI in Streaming, so without this a typed `/goal clear` could never
             // reach the bridge and the goal was uninterruptible by command.
             if let Some((cmd, arg)) = streaming_executable_slash(&line) {
+                if matches!(cmd.as_str(), "quit" | "exit") {
+                    cancel_active_turn(ctx);
+                }
                 commands::execute_slash_command(
                     &cmd,
                     &arg,
@@ -6359,11 +6442,29 @@ fn handle_streaming_key(
         BufferResult::Exit => {
             // Ctrl+C on empty buf during streaming — treat as cancel
             // (consistent with the explicit Ctrl+C branch above).
-            ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+            cancel_active_turn(ctx);
             restore_cancelled_message_to_buf(app, renderer, ctx);
         }
     }
     Ok(())
+}
+
+/// Cancel the executor that owns the foreground turn.
+///
+/// In sync mode the turn belongs to `LiveSession`; the local agent is idle and
+/// sending it `AgentCommand::Cancel` is a no-op. Outside sync mode the local
+/// agent remains the owner and keeps the existing command-channel path.
+fn cancel_active_turn(ctx: &LoopCtx) -> bool {
+    if ctx.sync_forwarder.is_some() {
+        let Some(session) = atomcode_daemon::current_live_session() else {
+            return false;
+        };
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(session.cancel_current_turn())
+        })
+    } else {
+        ctx.agent.cmd_tx.send(AgentCommand::Cancel).is_ok()
+    }
 }
 
 /// Deliver a tool-approval decision to whichever turn is actually waiting.
@@ -6909,6 +7010,14 @@ fn handle_agent_event(
         AgentEvent::TextDelta(text) => {
             let visible = think.feed(&text);
             if !visible.is_empty() {
+                // Keep the raw reply markdown for `/copy`. Clear-on-finalize:
+                // the first delta of a new turn wipes the sealed prior reply,
+                // so between turns the buffer still holds the last reply.
+                if state.response_finalized {
+                    state.last_assistant_response.clear();
+                    state.response_finalized = false;
+                }
+                state.last_assistant_response.push_str(&visible);
                 if fixissue_pending.is_some() {
                     fixissue_buffer.push_str(&visible);
                 }
@@ -7291,6 +7400,9 @@ fn handle_agent_event(
             stop_reason,
             snapshot,
         } => {
+            // Seal the assistant-reply buffer so `/copy` reads this completed
+            // reply until the next turn's first delta starts a fresh one.
+            state.response_finalized = true;
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
                 atomcode_core::notify::NotificationEvent::TurnFinished(
@@ -7447,6 +7559,8 @@ fn handle_agent_event(
             }
         }
         AgentEvent::TurnCancelled { snapshot } => {
+            // Seal the reply buffer (partial reply still copyable via `/copy`).
+            state.response_finalized = true;
             atomcode_core::notify::notify(
                 &ctx.config.notifications,
                 atomcode_core::notify::NotificationEvent::TurnFinished(
@@ -7550,6 +7664,9 @@ fn handle_agent_event(
             renderer.flush();
         }
         AgentEvent::Error { error, snapshot } => {
+            // Seal the reply buffer (any text streamed before the error stays
+            // copyable via `/copy`).
+            state.response_finalized = true;
             renderer.render(UiLine::Error(error));
             renderer.flush();
             fixissue_pending.take();
@@ -7791,9 +7908,32 @@ fn handle_agent_event(
                 &calls.iter().map(|c| c.arguments.as_str()).collect::<Vec<_>>(),
                 &raw_details,
             );
-            let children: Vec<crate::render::ToolGroupChild> = calls
+            // For todo add calls, prepend batch-sequential task numbers
+            // (#1, #2, …) so users can see task ids at a glance in the
+            // parallel batch display (issue #697).
+            let mut todo_add_counter: usize = 0;
+            let final_details: Vec<String> = calls
                 .iter()
                 .zip(disambiguated.iter())
+                .map(|(c, detail)| {
+                    if c.name == "todo" {
+                        // Parse the action from arguments JSON rather than
+                        // string-matching, because model-generated JSON may
+                        // contain whitespace around colons/commas.
+                        let action = serde_json::from_str::<serde_json::Value>(&c.arguments)
+                            .ok()
+                            .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string));
+                        if action.as_deref() == Some("add") {
+                            todo_add_counter += 1;
+                            return format!("#{} {}", todo_add_counter, detail);
+                        }
+                    }
+                    detail.clone()
+                })
+                .collect();
+            let children: Vec<crate::render::ToolGroupChild> = calls
+                .iter()
+                .zip(final_details.iter())
                 .map(|(c, detail)| crate::render::ToolGroupChild {
                     call_id: c.id.clone(),
                     text: format!(
@@ -7818,13 +7958,15 @@ fn handle_agent_event(
                     .call_id_to_batch
                     .insert(cid.clone(), batch_id.clone());
             }
-            // Pre-populate `pending_tools` with the disambiguated detail
-            // so that subsequent ToolCallStarted / ApprovalNeeded events
-            // use the disambiguated path (e.g. "a/SKILL.md") instead of
-            // the raw basename ("SKILL.md"). Without this, parallel batch
-            // approvals show identical "ReadFile(SKILL.md)" prompts and
-            // the user can't tell which file they're approving (issue #439).
-            for (c, detail) in calls.iter().zip(disambiguated.iter()) {
+            // Pre-populate `pending_tools` with the final (potentially
+            // todo-numbered) detail so that subsequent ToolCallStarted /
+            // ApprovalNeeded events use the disambiguated / numbered
+            // path (e.g. "a/SKILL.md", "#1 创建demo3") instead of the
+            // raw basename ("SKILL.md", "创建demo3"). Without this,
+            // parallel batch approvals show identical "ReadFile(SKILL.md)"
+            // prompts and the user can't tell which file they're
+            // approving (issue #439 / #697).
+            for (c, detail) in calls.iter().zip(final_details.iter()) {
                 pending_tools.insert(
                     c.id.clone(),
                     (display_tool_name_short(&c.name), detail.clone(), true),
@@ -8073,6 +8215,10 @@ fn handle_agent_event(
                     .get(&provider)
                     .map(|p| p.model.clone())
                     .unwrap_or(provider);
+                // Footer context window follows the mirrored switch too (see
+                // model_picker) — otherwise the denominator lags a turn behind
+                // a webui-driven model change.
+                state.on_model_window_changed(ctx.config.default_context_window());
                 ctx.runtime_factory.set_config(ctx.config.clone());
                 let _ = ctx
                     .agent
@@ -8087,7 +8233,7 @@ fn handle_agent_event(
         AgentEvent::SessionSwitched(session_id) => {
             // webui 新建对话，TUI 跟随切换到新会话。与 ProjectSwitched 不同，
             // 这里不切目录，只切换到指定 session_id 的新会话。
-            eprintln!("[DEBUG TUI] SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
+            crate::tuix_trace!("TUI", "SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
             let sid = atomcode_core::session::SessionId::from_string(session_id);
             // 清除当前对话、重置到新 session，但用 webui 指定的 session_id
             // 以确保三端（TUI / webui / 磁盘）落到同一个文件。
@@ -8117,7 +8263,7 @@ fn handle_agent_event(
                     Some(ctx.current_session.id.clone()),
                     Vec::new(),
                 );
-                eprintln!("[DEBUG TUI] SessionSwitched: attaching new LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
+                crate::tuix_trace!("TUI", "SessionSwitched: attaching new LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
                 attach_live_session(ctx, renderer, session, false);
             }
             renderer.begin_sync();
@@ -8672,7 +8818,8 @@ pub fn display_tool_name_short(snake: &str) -> String {
 }
 
 pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
+    let repaired_args = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired_args) else {
         return String::new();
     };
     let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
@@ -8784,6 +8931,28 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 crate::width::truncate_with_ellipsis(&detail, 200)
             } else {
                 String::new()
+            }
+        }
+        "todo" => {
+            // Show the task description (add) or id+status (update) so the
+            // user can see WHAT the agent is tracking without expanding the row.
+            let action = get_str("action").unwrap_or_default();
+            match action.as_str() {
+                "add" => get_str("content")
+                    .map(|c| crate::width::truncate_with_ellipsis(&c, 100))
+                    .unwrap_or_default(),
+                "update" => {
+                    let id = v.get("id").and_then(|x| x.as_u64());
+                    let status = get_str("status").unwrap_or_default();
+                    match (id, status.as_str()) {
+                        (Some(i), s) if !s.is_empty() => format!("#{} → {}", i, s),
+                        (Some(i), _) => format!("#{}", i),
+                        (None, s) if !s.is_empty() => s.to_string(),
+                        _ => String::new(),
+                    }
+                }
+                "list" => "list all".to_string(),
+                _ => String::new(),
             }
         }
         "use_skill" => get_str("name").unwrap_or_default(),

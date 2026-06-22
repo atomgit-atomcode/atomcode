@@ -27,6 +27,8 @@ use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
+use crate::markdown::{fence_start, is_closing_fence};
+
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
 
@@ -353,6 +355,37 @@ pub(super) fn execute_slash_command(
         "quit" | "exit" => {
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
+        "copy" => {
+            // Copy a fenced code block from the most recent assistant reply to
+            // the system clipboard, VERBATIM — terminal-native selection copies
+            // the hard-wrapped + PAD-indented body cells, which breaks long
+            // commands; this reads the original markdown instead.
+            //   /copy        → the last code block (the command just shown)
+            //   /copy N      → the Nth code block (1-based)
+            //   /copy all    → every code block, blank-line separated
+            match resolve_copy(&state.last_assistant_response, arg) {
+                CopyResolve::NoBlocks => {
+                    renderer.render(UiLine::Warning(t(Msg::CopyNoCodeBlock).into_owned()));
+                }
+                CopyResolve::BadIndex(count) => {
+                    renderer.render(UiLine::Warning(
+                        t(Msg::CopyBadIndex { count }).into_owned(),
+                    ));
+                }
+                CopyResolve::Text(payload) => {
+                    let lines = payload.lines().count().max(1);
+                    let chars = payload.chars().count();
+                    if copy_text_to_clipboard_osc52(&payload) {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::CopyOk { lines, chars }).into_owned(),
+                        ));
+                    } else {
+                        renderer.render(UiLine::Error(t(Msg::CopyFailed).into_owned()));
+                    }
+                }
+            }
+            renderer.flush();
+        }
         "help" => {
             if arg.trim() == "commands" {
                 let config_dir = Config::config_dir();
@@ -593,6 +626,10 @@ pub(super) fn execute_slash_command(
                     ctx.config = new_cfg.clone();
                     ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
+                    // Refresh the footer context window now (see model_picker
+                    // Enter handler) — no turn fires here either, so the cached
+                    // snapshot's denominator would otherwise stay on the old model.
+                    state.on_model_window_changed(ctx.config.default_context_window());
                     ctx.agent
                         .cmd_tx
                         .send(AgentCommand::ReloadConfig(new_cfg))
@@ -3430,6 +3467,137 @@ fn decide_qr_style(
     Some(QrStyle::Dense1x2)
 }
 
+/// Extract the verbatim bodies of fenced (```` ``` ```` / `~~~`) code blocks
+/// from markdown, in document order. Used by `/copy` to recover the ORIGINAL
+/// unwrapped command text — never the rendered body cells, which are already
+/// hard-wrapped + PAD-indented and would corrupt a pasted command.
+///
+/// A fence opens on a line whose trimmed form starts with three or more of the
+/// fence char (an info string like ```` ```bash ```` is fine) and closes on a
+/// line that is ONLY fence chars of the same kind. Inner lines are kept
+/// verbatim (their own indentation preserved). An unterminated fence (a reply
+/// truncated mid-stream) still yields what was captured.
+fn extract_code_blocks(md: &str) -> Vec<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut inner: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    let mut fence_char = '`';
+    let mut fence_len = 3;
+    for line in md.lines() {
+        let t = line.trim();
+        if !in_block {
+            if let Some((c, len)) = fence_start(t) {
+                in_block = true;
+                fence_char = c;
+                fence_len = len;
+                inner.clear();
+            }
+        } else if is_closing_fence(t, fence_char, fence_len) {
+            blocks.push(inner.join("\n"));
+            in_block = false;
+        } else {
+            inner.push(line);
+        }
+    }
+    if in_block {
+        blocks.push(inner.join("\n"));
+    }
+    blocks
+}
+
+/// Outcome of resolving a `/copy [arg]` request against a reply's markdown.
+enum CopyResolve {
+    /// The text to place on the clipboard.
+    Text(String),
+    /// The reply has no fenced code block (or there's no reply yet).
+    NoBlocks,
+    /// `/copy N` referenced an out-of-range index; carries the block count.
+    BadIndex(usize),
+}
+
+/// Map `/copy [arg]` to the text to copy. `""` → last block (the common
+/// "copy the command just shown" case); `all` → every block joined by a blank
+/// line; `N` (1-based) → the Nth block.
+fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
+    let blocks = extract_code_blocks(md);
+    if blocks.is_empty() {
+        return CopyResolve::NoBlocks;
+    }
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return CopyResolve::Text(blocks.last().cloned().unwrap_or_default());
+    }
+    if arg.eq_ignore_ascii_case("all") {
+        return CopyResolve::Text(blocks.join("\n\n"));
+    }
+    match arg.parse::<usize>() {
+        Ok(n) if (1..=blocks.len()).contains(&n) => CopyResolve::Text(blocks[n - 1].clone()),
+        _ => CopyResolve::BadIndex(blocks.len()),
+    }
+}
+
+/// Write `text` to the system clipboard. Tries arboard (system clipboard
+/// API) first; falls back to OSC 52 emitted to `stdout` for headless / SSH
+/// sessions where no windowing system is available.
+///
+/// OSC 52 format: `\x1b]52;c;<base64>\x1b\\`
+///
+/// This is the public entry-point used by both the `/copy` command and the
+/// retained renderer's auto-copy path (issue #699).
+pub(crate) fn copy_text_to_clipboard_osc52(text: &str) -> bool {
+    // Tier 1: system clipboard via arboard (desktop)
+    if try_arboard_clipboard(text) {
+        return true;
+    }
+    // Tier 2: OSC 52 escape sequence. Only emit when stdout is a real
+    // terminal — piping OSC bytes into a file or another process is
+    // meaningless (issue #699 P4).
+    use std::io::IsTerminal as _;
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    write_osc52_clipboard_to(&mut std::io::stdout(), text)
+}
+
+/// Variant of [`copy_text_to_clipboard_osc52`] that emits the OSC 52
+/// fallback through `writer` instead of raw stdout.  Retained-mode
+/// renderers should use this with their own `BufWriter<Stdout>` so the
+/// escape sequence stays ordered with buffered body/content writes.
+pub(crate) fn copy_text_to_clipboard_osc52_via(
+    writer: &mut impl std::io::Write,
+    text: &str,
+) -> bool {
+    if try_arboard_clipboard(text) {
+        return true;
+    }
+    write_osc52_clipboard_to(writer, text)
+}
+
+fn try_arboard_clipboard(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text.to_string()))
+        .is_ok()
+}
+
+/// Emit an OSC 52 escape sequence through `writer`.
+fn write_osc52_clipboard_to(writer: &mut impl std::io::Write, text: &str) -> bool {
+    let seq = encode_osc52("c", text);
+    writer.write_all(seq.as_bytes()).is_ok() && writer.flush().is_ok()
+}
+
+/// Build an OSC 52 escape sequence: `ESC ]52;<buffer>;<base64> ST`.
+/// `buffer` is typically `"c"` (clipboard) or `"p"` (primary selection).
+///
+/// Note: some terminals cap OSC payloads at ~4096 bytes. For code blocks
+/// longer than ~3 KB the OSC 52 path may be silently truncated; the arboard
+/// desktop path (tier 1) has no such limit and will succeed first on any
+/// machine with a windowing system.
+pub(crate) fn encode_osc52(buffer: &str, text: &str) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;{};{}\x1b\\", buffer, b64)
+}
+
 #[cfg(test)]
 mod qr_style_tests {
     use super::*;
@@ -3787,6 +3955,10 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
             ctx.model_name = p.model.clone();
         }
+        // NOTE: the footer context window is NOT refreshed here — `run_login_flow`
+        // has no `UiState` handle. The post-login window self-corrects on the
+        // first turn's ContextStats; threading state through just for this rare
+        // path isn't worth it. The /model picker + reload paths do refresh it.
         // Clear any stale drift warning now that we've just
         // re-synced. Also reset the cooldown so the next
         // pre-turn trigger (if conditions change) can fire
@@ -3806,6 +3978,106 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     renderer.render(UiLine::CommandOutput(report.render()));
     renderer.flush();
     Ok(())
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::{extract_code_blocks, resolve_copy, CopyResolve};
+
+    const REPLY: &str = "Run cmake + build:\n\
+        ```\n\
+        cmake D:\\proj -DBUILD=ON -DLONG=\"a very long windows path here\"\n\
+        ```\n\
+        then:\n\
+        ```bash\n\
+        cmake --build . --target demo -j4\n\
+        ```";
+
+    #[test]
+    fn extracts_blocks_verbatim_in_order() {
+        let blocks = extract_code_blocks(REPLY);
+        assert_eq!(blocks.len(), 2);
+        // No hard-wrap, no PAD indent — the command is one logical line.
+        assert_eq!(
+            blocks[0],
+            "cmake D:\\proj -DBUILD=ON -DLONG=\"a very long windows path here\""
+        );
+        assert_eq!(blocks[1], "cmake --build . --target demo -j4");
+    }
+
+    #[test]
+    fn multiline_block_preserves_inner_newlines_and_indent() {
+        let md = "```\nline1\n  indented2\nline3\n```";
+        let blocks = extract_code_blocks(md);
+        assert_eq!(blocks, vec!["line1\n  indented2\nline3".to_string()]);
+    }
+
+    #[test]
+    fn unterminated_fence_still_yields_partial() {
+        // A reply truncated mid-stream — still copyable.
+        let md = "```\nhalf a command";
+        assert_eq!(extract_code_blocks(md), vec!["half a command".to_string()]);
+    }
+
+    #[test]
+    fn no_fence_yields_nothing() {
+        assert!(extract_code_blocks("just prose, `inline code` only").is_empty());
+    }
+
+    #[test]
+    fn longer_fence_can_contain_a_shorter_fence() {
+        let md = "````markdown\n```rust\nfn main() {}\n```\n````";
+        assert_eq!(
+            extract_code_blocks(md),
+            vec!["```rust\nfn main() {}\n```".to_string()]
+        );
+    }
+
+    #[test]
+    fn tilde_fence_requires_a_matching_marker() {
+        let md = "~~~text\n```\nstill inside\n~~~";
+        assert_eq!(extract_code_blocks(md), vec!["```\nstill inside".to_string()]);
+    }
+
+    #[test]
+    fn resolve_default_picks_last_block() {
+        match resolve_copy(REPLY, "") {
+            CopyResolve::Text(t) => assert_eq!(t, "cmake --build . --target demo -j4"),
+            _ => panic!("default should resolve to the last block"),
+        }
+    }
+
+    #[test]
+    fn resolve_index_is_one_based() {
+        match resolve_copy(REPLY, "1") {
+            CopyResolve::Text(t) => assert!(t.starts_with("cmake D:\\proj")),
+            _ => panic!("/copy 1 should pick the first block"),
+        }
+    }
+
+    #[test]
+    fn resolve_all_joins_every_block() {
+        match resolve_copy(REPLY, "all") {
+            CopyResolve::Text(t) => {
+                assert!(t.contains("-DBUILD=ON"));
+                assert!(t.contains("--build ."));
+            }
+            _ => panic!("/copy all should join blocks"),
+        }
+    }
+
+    #[test]
+    fn resolve_bad_index_reports_count() {
+        assert!(matches!(resolve_copy(REPLY, "9"), CopyResolve::BadIndex(2)));
+        assert!(matches!(resolve_copy(REPLY, "0"), CopyResolve::BadIndex(2)));
+        assert!(matches!(resolve_copy(REPLY, "x"), CopyResolve::BadIndex(2)));
+    }
+
+    #[test]
+    fn resolve_no_blocks_when_reply_has_none() {
+        assert!(matches!(resolve_copy("plain reply", ""), CopyResolve::NoBlocks));
+        assert!(matches!(resolve_copy("", ""), CopyResolve::NoBlocks));
+    }
 }
 
 #[cfg(test)]

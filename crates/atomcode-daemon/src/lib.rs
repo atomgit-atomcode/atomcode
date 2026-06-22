@@ -1806,6 +1806,10 @@ pub struct ChatRequest {
     /// Session ID to continue (optional, creates new if not provided)
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Per-request cancellation key supplied by the webui. Unlike `session_id`,
+    /// this is available during the first turn of a brand-new conversation.
+    #[serde(default)]
+    pub request_id: Option<String>,
     /// Attached images (base64). Empty = text-only. When the active model is
     /// not vision-capable, these are routed through the configured VL model
     /// (vision_preprocessor) and turned into text, mirroring the TUI.
@@ -1901,6 +1905,10 @@ pub enum ChatEvent {
     /// Error occurred
     #[serde(rename = "error")]
     Error { message: String },
+    /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
+    /// `Error` so clients render a muted notice instead of a red error.
+    #[serde(rename = "warning")]
+    Warning { message: String },
 }
 
 /// Artifact detector for code blocks and HTML in streaming text
@@ -2159,15 +2167,18 @@ async fn chat_stream(
     // Create cancellation token for this chat
     let cancel_token = CancellationToken::new();
 
-    // Register this chat task if we have a session_id
-    let session_id = req.session_id.clone();
-    if let Some(ref sid) = session_id {
-        state
-            .chat_tasks
-            .write()
-            .await
-            .insert(sid.clone(), cancel_token.clone());
-    }
+    // New chats do not have a session id until completion, so use a browser-known
+    // request id when available to keep their first turn cancellable too.
+    let cancellation_key = req
+        .request_id
+        .clone()
+        .or_else(|| req.session_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    state
+        .chat_tasks
+        .write()
+        .await
+        .insert(cancellation_key.clone(), cancel_token.clone());
 
     // Clone state for the spawned task
     let chat_tasks = state.chat_tasks.clone();
@@ -2200,6 +2211,7 @@ async fn chat_stream(
                 req,
                 tx.clone(),
                 cancel_token,
+                cancellation_key.clone(),
                 stopped_sessions.clone(),
                 mcp_cache,
                 telemetry,
@@ -2214,9 +2226,7 @@ async fn chat_stream(
             }
 
             // Cleanup: remove from chat_tasks
-            if let Some(sid) = session_id {
-                chat_tasks.write().await.remove(&sid);
-            }
+            chat_tasks.write().await.remove(&cancellation_key);
         })
         .await;
     });
@@ -2253,6 +2263,7 @@ async fn process_chat_request(
     req: ChatRequest,
     event_tx: mpsc::UnboundedSender<ChatEvent>,
     cancel_token: CancellationToken,
+    cancellation_key: String,
     stopped_sessions: StoppedSessionsStore,
     mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     telemetry: Arc<Telemetry>,
@@ -2593,11 +2604,10 @@ async fn process_chat_request(
     // Check if session was stopped before we started the turn loop.
     // If so, save the current conversation (session messages + user message)
     // and return so the user can resume from this point later.
-    let session_id_str = req.session_id.clone().unwrap_or_default();
     if stopped_sessions
         .write()
         .await
-        .take(&session_id_str)
+        .take(&cancellation_key)
         .is_some()
     {
         // Save what we have — align with TUI behaviour: a stopped
@@ -2841,15 +2851,11 @@ async fn process_chat_request(
                 let _ = event_tx.send(ChatEvent::Error { message: e });
             }
             TurnEvent::Warning(w) => {
-                // Non-fatal advisory — surface as an Error-shaped event
-                // for now (HTTP API clients only need to see it; we're
-                // not adding a dedicated `Warning` event variant on the
-                // wire until a consumer asks for it). Prefix makes the
-                // advisory nature explicit in case a client renders the
-                // string verbatim.
-                let _ = event_tx.send(ChatEvent::Error {
-                    message: format!("[warning] {}", w),
-                });
+                // Non-fatal advisory (e.g. "conversation compacted") — send it as its
+                // OWN `warning` event so clients render a muted notice rather than a red
+                // error. (Previously coerced to an Error-shaped event with a "[warning]"
+                // prefix, which the webui painted red as "[错误: …]" inside the reply.)
+                let _ = event_tx.send(ChatEvent::Warning { message: w });
             }
             TurnEvent::ContextStats { .. } => {
                 // Ignore context stats in API mode
@@ -2901,8 +2907,7 @@ async fn process_chat_request(
     // If the session was stopped mid-turn, clean up the partial conversation
     // and save it so the user can /resume from this point — same behaviour as
     // the TUI (persist_current_session on TurnCancelled).
-    let session_id_str = req.session_id.clone().unwrap_or_default();
-    let was_stopped = stopped_sessions.read().await.contains(&session_id_str);
+    let was_stopped = stopped_sessions.read().await.contains(&cancellation_key);
 
     {
         let mut conv = conversation.lock().await;
@@ -2919,7 +2924,8 @@ async fn process_chat_request(
 
     // Clean up stopped sessions marker if present
     if was_stopped {
-        stopped_sessions.write().await.remove(&session_id_str);
+        stopped_sessions.write().await.remove(&cancellation_key);
+        let _ = event_tx.send(ChatEvent::Stopped);
     }
 
     // Send done event
@@ -4089,6 +4095,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Live session API (阶段②)
         .route("/live", get(live_api::live_stream))
         .route("/live/message", post(live_api::live_message))
+        .route("/live/stop", post(live_api::live_stop))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/provider", post(live_api::live_provider))
         .route(
@@ -4319,6 +4326,21 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发，而不是 error。
+    // webui 的 /api/chat 消费 ChatEvent；旧实现把 Warning 当成 error-shaped 事件，
+    // 被前端染成红色「[错误: …]」并塞进回复气泡。
+    #[test]
+    fn chat_warning_serializes_as_its_own_type_not_error() {
+        let json = serde_json::to_string(&ChatEvent::Warning {
+            message: "conversation compacted".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"warning","message":"conversation compacted"}"#
+        );
+    }
 
     #[test]
     fn first_query_value_extracts_token() {

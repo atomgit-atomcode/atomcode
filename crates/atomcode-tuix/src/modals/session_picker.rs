@@ -459,6 +459,9 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
     // final frame inside the envelope and closes it. No-op on renderers
     // without synchronized output (plain/pipe mode).
     renderer.begin_sync();
+    // Suppress auto-copy during replay so we don't overwrite the user's
+    // clipboard or inject stale "Copied" hints (issue #699 P1).
+    renderer.set_suppress_auto_copy(true);
     if reset {
         renderer.reset();
     }
@@ -544,6 +547,7 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
         label: resumed,
     });
     renderer.flush();
+    renderer.set_suppress_auto_copy(false);
     renderer.end_sync();
 }
 
