@@ -19,7 +19,8 @@
 //!
 //! GRACEFUL BY DESIGN: a hook that times out, fails to spawn, or emits garbage is a
 //! silent continue — a broken hook never wedges the turn. Only an explicit `deny` /
-//! `block` (or a non-zero exit with no parseable decision) stops a tool / prompt.
+//! `block` (or a bare exit code `2`, per CC's contract) stops a tool / prompt; any
+//! other non-zero exit is a non-blocking error and the turn proceeds.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -194,9 +195,10 @@ fn shell_command(command: &str) -> tokio::process::Command {
 }
 
 /// Run one hook: pipe `stdin_json` to it (CC's `json.load(sys.stdin)` contract),
-/// honor the timeout, and return `(exit_ok, stdout)`. `None` on
-/// timeout/spawn-failure → the caller treats it as a silent continue.
-async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(bool, String)> {
+/// honor the timeout, and return `(exit_code, stdout)`. `exit_code` is the process
+/// exit status — `None` when the child was killed by a signal. The OUTER `None`
+/// (timeout / spawn-failure) → the caller treats it as a silent continue.
+async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(Option<i32>, String)> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
@@ -221,10 +223,20 @@ async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(bool, 
             drop(stdin);
         }
         let out = child.wait_with_output().await.ok()?;
-        Some((out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned()))
+        Some((out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned()))
     };
 
     (tokio::time::timeout(Duration::from_millis(hook.timeout_ms), fut).await).ok().flatten()
+}
+
+/// CC's exit-code contract: exit **2** (and only 2) requests a BLOCK — stop the tool
+/// or prompt. Every other code, INCLUDING other non-zero codes (a hook crash, a
+/// generic error), is a NON-blocking signal: the tool/prompt proceeds. Matching this
+/// exactly is what keeps the module's promise that a merely-broken hook (one that runs
+/// but exits non-zero) never wedges the turn — only an explicit `2` or a parsed
+/// `deny`/`block` decision stops anything.
+fn exit_requests_block(code: Option<i32>) -> bool {
+    code == Some(2)
 }
 
 /// The last non-empty line of stdout parsed as JSON (CC emits its decision as the
@@ -325,7 +337,7 @@ impl LifecycleHooks for CCExternalHooks {
         })
         .to_string();
         for hook in self.matching(HookEvent::SessionStart, None) {
-            if let Some((_ok, stdout)) = run_command_hook(hook, &payload).await {
+            if let Some((_code, stdout)) = run_command_hook(hook, &payload).await {
                 // SessionStart: stdout (plain or hookSpecificOutput.additionalContext)
                 // is injected as context. CC cannot block here.
                 let ctx = last_json_line(&stdout)
@@ -350,7 +362,7 @@ impl LifecycleHooks for CCExternalHooks {
         .to_string();
         let mut injected: Vec<String> = Vec::new();
         for hook in self.matching(HookEvent::UserPromptSubmit, None) {
-            let Some((exit_ok, stdout)) = run_command_hook(hook, &payload).await else {
+            let Some((exit_code, stdout)) = run_command_hook(hook, &payload).await else {
                 continue; // timeout / spawn failure → silent continue.
             };
             let decided = last_json_line(&stdout)
@@ -371,14 +383,18 @@ impl LifecycleHooks for CCExternalHooks {
                     continue;
                 }
             }
-            // Non-zero exit with no explicit block decision: surface stderr-less
-            // intent as a block (CC: exit 2 blocks). Other non-zero → continue.
-            if !exit_ok && decided.is_none() {
-                // Conservative: a hard failure does not block the prompt (only an
-                // explicit decision does), matching the legacy "treat as context"
-                // fallback — append any stdout as context instead of wedging input.
-            }
+            // No parsed decision: CC's exit-code contract takes over. Exit 2 blocks the
+            // prompt even without a JSON decision; any other code is non-blocking, so its
+            // stdout is treated as injected context (a broken hook never wedges input).
             if decided.is_none() {
+                if exit_requests_block(exit_code) {
+                    let trimmed = stdout.trim();
+                    return Err(if trimmed.is_empty() {
+                        "prompt blocked by hook (exit 2)".to_string()
+                    } else {
+                        trimmed.to_string()
+                    });
+                }
                 let trimmed = stdout.trim();
                 if !trimmed.is_empty() {
                     injected.push(trimmed.to_string());
@@ -431,7 +447,7 @@ impl ToolMiddleware for CCExternalHooks {
         // (Deny > Ask > Allow > Proceed); arg rewrites apply cumulatively.
         let mut gate = BeforeOutcome::Proceed;
         for hook in self.matching(HookEvent::PreToolUse, Some(&call.name)) {
-            let Some((exit_ok, stdout)) = run_command_hook(hook, &payload).await else {
+            let Some((exit_code, stdout)) = run_command_hook(hook, &payload).await else {
                 continue;
             };
             let decided = last_json_line(&stdout)
@@ -477,12 +493,13 @@ impl ToolMiddleware for CCExternalHooks {
                     _ => BeforeOutcome::Proceed,
                 };
                 gate = stronger(gate, this);
-            } else if !exit_ok {
-                // Non-zero exit, no parseable decision → CC treats exit 2 as a
-                // block. Be conservative and block with the trimmed stdout/reason.
+            } else if exit_requests_block(exit_code) {
+                // CC exit-code contract: exit 2 (and ONLY 2) blocks. Other non-zero
+                // codes are non-blocking errors → the tool proceeds (a broken hook must
+                // not wedge the turn — the spawn/timeout paths already continue).
                 let trimmed = stdout.trim();
                 let reason = if trimmed.is_empty() {
-                    format!("hook blocked {} (non-zero exit)", call.name)
+                    format!("hook blocked {} (exit 2)", call.name)
                 } else {
                     trimmed.to_string()
                 };
@@ -513,7 +530,7 @@ impl ToolMiddleware for CCExternalHooks {
             h.event == HookEvent::PostToolUse
                 && matches!(h.matcher.as_deref(), None | Some("*"))
         }) {
-            let Some((_ok, stdout)) = run_command_hook(hook, &payload).await else {
+            let Some((_code, stdout)) = run_command_hook(hook, &payload).await else {
                 continue;
             };
             if let Some(d) = last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok()) {
@@ -660,5 +677,81 @@ mod tests {
         assert!(cc.user_prompt_submit(&mut text).await.is_ok());
         assert!(text.contains("hi"), "original prompt preserved");
         assert!(text.contains("CTX"), "context appended: {text}");
+    }
+
+    #[test]
+    fn exit_code_block_contract_is_exit_2_only() {
+        assert!(exit_requests_block(Some(2)));
+        assert!(!exit_requests_block(Some(0)));
+        assert!(!exit_requests_block(Some(1)));
+        assert!(!exit_requests_block(Some(127)));
+        assert!(!exit_requests_block(None)); // killed by signal → non-blocking
+    }
+
+    /// A PreToolUse hook that runs but exits NON-2 (a crash / generic error) with no
+    /// JSON decision must NOT block — a merely-broken hook can't wedge every tool call.
+    #[tokio::test]
+    async fn before_non2_exit_does_not_block() {
+        let hook = HookConfig {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: "exit 1".into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![hook], "/tmp");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
+        let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
+        let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
+        let out = cc.before(&mut call, &tool, &rt).await;
+        assert!(matches!(out, BeforeOutcome::Proceed), "exit 1 must NOT block: {out:?}");
+    }
+
+    /// Exit 2 with no JSON decision DOES block (CC's bare exit-2 contract).
+    #[tokio::test]
+    async fn before_exit_2_blocks() {
+        let hook = HookConfig {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: "exit 2".into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![hook], "/tmp");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
+        let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
+        let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
+        let out = cc.before(&mut call, &tool, &rt).await;
+        assert!(out.is_deny(), "exit 2 must block: {out:?}");
+    }
+
+    /// UserPromptSubmit mirrors `before`: exit 2 blocks the prompt (Err), other non-zero
+    /// does not (the prompt proceeds).
+    #[tokio::test]
+    async fn user_prompt_exit_code_contract() {
+        let block = HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            matcher: None,
+            command: "exit 2".into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![block], "/tmp");
+        let mut text = "hi".to_string();
+        assert!(cc.user_prompt_submit(&mut text).await.is_err(), "exit 2 blocks the prompt");
+
+        let ok = HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            matcher: None,
+            command: "exit 1".into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![ok], "/tmp");
+        let mut text = "hi".to_string();
+        assert!(cc.user_prompt_submit(&mut text).await.is_ok(), "exit 1 must NOT block");
+        assert_eq!(text, "hi", "no stdout ⇒ prompt unchanged");
     }
 }
