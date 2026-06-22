@@ -401,20 +401,14 @@ pub fn assemble(
         }
     }
 
-    // Fill the `code_review` tool's provider slot with the host provider (the tool was
-    // built in `prepare` before the provider existed). A model-swap respawn re-runs assemble
-    // and updates it, so the reviewer always uses the current provider.
-    if let Some(slot) = &parts.review_provider {
-        if let Ok(mut g) = slot.write() {
-            *g = Some(provider.clone());
-        }
-    }
-
-    // Tier-2 overflow summary uses the same provider. When telemetry is on, decorate it so
-    // the summary LLM call (which bypasses the turn-level TelemetryHook — it's an internal
-    // capability call, not an agent round) still records an LlmChat with its token spend.
-    let summary_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
-        Some(tel) => Arc::new(crate::telemetry::CompactionTelemetryProvider::new(
+    // A telemetry-metering decorator over the host provider. Calls made OUTSIDE the host
+    // agent loop — the tier-2 overflow summary AND the `code_review` sub-agent's rounds —
+    // never reach the turn-level TelemetryHook (which fires on this loop's on_request /
+    // on_model_response), so without this their token spend is invisible. The host loop's
+    // PRIMARY provider stays bare below: the TelemetryHook already meters it, and wrapping
+    // it too would double-count. `None` ⇒ telemetry off ⇒ the bare provider (zero overhead).
+    let metered_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
+        Some(tel) => Arc::new(crate::telemetry::MeteredProvider::new(
             provider.clone(),
             tel.clone(),
             cfg.provider_type.as_str(),
@@ -424,6 +418,21 @@ pub fn assemble(
         )),
         None => provider.clone(),
     };
+
+    // Fill the `code_review` tool's provider slot (the tool was built in `prepare` before
+    // the provider existed). Hand it the METERED provider so the reviewer's LLM rounds emit
+    // LlmChat token telemetry — the review sub-agent runs its own kernel loop with no
+    // TelemetryHook of its own. A model-swap respawn re-runs assemble and updates it, so the
+    // reviewer always uses the current (metered) provider.
+    if let Some(slot) = &parts.review_provider {
+        if let Ok(mut g) = slot.write() {
+            *g = Some(metered_provider.clone());
+        }
+    }
+
+    // Tier-2 overflow summary uses the same metered provider so its summary LLM call is
+    // likewise counted.
+    let summary_provider = metered_provider;
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
@@ -656,6 +665,85 @@ mod tests {
             parts.hooks.len(),
             baseline_hooks + 1,
             "the CC runner is also pushed onto the lifecycle hook chain"
+        );
+
+        std::env::remove_var("ATOMCODE_HOME");
+    }
+
+    /// A canned provider that reports usage then ends — enough for a telemetry
+    /// decorator to fold a `TokenUsage` and emit one `LlmChat`.
+    struct CannedProvider;
+    #[async_trait::async_trait]
+    impl LlmProvider for CannedProvider {
+        fn model_name(&self) -> &str {
+            "m"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            use atomcode_kernel::stream::{StreamEvent, TokenUsage};
+            let evs = vec![
+                StreamEvent::TextDelta("looks good".into()),
+                StreamEvent::Usage(TokenUsage { prompt: 500, completion: 30, cached: 0 }),
+                StreamEvent::Done { truncated: false },
+            ];
+            Ok(Box::pin(futures::stream::iter(evs)))
+        }
+    }
+
+    /// The `code_review` sub-agent runs its OWN kernel loop with no turn-level
+    /// `TelemetryHook`, so its LLM rounds bypass the host's metering entirely. To keep
+    /// review token spend visible, the provider placed in the review slot at `assemble`
+    /// must be a metered decorator (when a telemetry sink is configured). This drives one
+    /// round through that provider and asserts the `LlmChat` lands.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn review_subagent_provider_is_metered_for_token_telemetry() {
+        use futures::stream::StreamExt;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+
+        let (tel, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+        let proj = tempfile::tempdir().unwrap();
+        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "m", proj.path());
+        cfg.telemetry = Some(tel);
+
+        let mut opts = io_free_opts();
+        opts.review = true;
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
+
+        let slot = parts.review_provider.clone().expect("review enabled ⇒ slot present");
+        let review_provider =
+            slot.read().unwrap().clone().expect("slot filled at assemble");
+        let mut stream = review_provider
+            .chat_stream(
+                &[Message::user("review this")],
+                &[],
+                &atomcode_kernel::provider::ChatOptions::default(),
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let llm_chats = captured
+            .lock()
+            .await
+            .iter()
+            .filter(|r| matches!(r.event, atomcode_telemetry::Event::LlmChat { .. }))
+            .count();
+        assert_eq!(
+            llm_chats, 1,
+            "review sub-agent LLM round must emit one LlmChat token event"
         );
 
         std::env::remove_var("ATOMCODE_HOME");
