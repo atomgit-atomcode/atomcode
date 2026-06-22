@@ -4802,7 +4802,7 @@ fn build_skill_menu_items(
                     .unwrap_or(skill.name.as_str());
                 let full_lower = skill.name.to_ascii_lowercase();
                 let bare_lower = bare.to_ascii_lowercase();
-                if bare_lower.starts_with(prefix_lower) || full_lower.starts_with(prefix_lower) {
+                if bare_lower.contains(prefix_lower) || full_lower.contains(prefix_lower) {
                     let bare_is_unique = skills.iter().all(|other| {
                         other.name == skill.name
                             || other
