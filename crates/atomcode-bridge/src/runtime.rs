@@ -1375,8 +1375,9 @@ impl Bridge {
                 }
             }
             KEv::Warning(w) => self.emit(CoreEv::Warning(w)),
-            KEv::Error { message, .. } => {
-                self.emit(CoreEv::Error { error: message, snapshot: ConversationSnapshot::default() });
+            KEv::Error { message, http_status, .. } => {
+                let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
+                self.emit(CoreEv::Error { error, snapshot: ConversationSnapshot::default() });
             }
             // A manual `/compact` may make a slow one-shot LLM summary call; announce it
             // so the user sees a progress line while it runs (v1 streamed the same
@@ -1855,6 +1856,27 @@ fn build_provider(
     }
 }
 
+/// Map a raw provider error to a user-actionable one before it reaches the UI.
+///
+/// An atomgit-gateway **401** means the free-quota token was rejected or
+/// expired. The upstream string ("Gitcode auth: token rejected (status=401)")
+/// tells the user nothing they can act on, so swap it for the i18n hint that
+/// points at `/login` — the actual fix. This restores v1 parity: the legacy
+/// engine does the identical swap in `core/provider/openai.rs` (gated on
+/// `is_atomgit_gateway`), and v2 dropped it, leaking the raw 401 to the chat.
+///
+/// Non-atomgit gateways (a user's own `sk-…` key) keep the verbatim message:
+/// `/login` is the wrong advice there — the developer needs the real diagnostic
+/// to fix their key/endpoint.
+fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: &str) -> String {
+    if http_status == Some(401)
+        && atomcode_core::coding_plan::crypto::is_atomgit_gateway(base_url)
+    {
+        return atomcode_core::i18n::t(atomcode_core::i18n::Msg::ChatAuthExpired).to_string();
+    }
+    message
+}
+
 /// Terse one-line advisory for an AUTO / OVERFLOW compaction.
 ///
 /// A manual `/compact` is handled by the richer streaming path
@@ -1984,12 +2006,46 @@ mod goal_summary_tests {
 mod undo_tests {
     use super::{
         apply_reload_provider, build_provider, compaction_advisory, compute_undo,
-        estimate_after_tokens, fmt_k_tokens, manual_compact_result,
+        estimate_after_tokens, fmt_k_tokens, friendly_provider_error, manual_compact_result,
     };
     use atomcode_core::config::provider::ProviderConfig;
     use atomcode_coding::CodingAgentConfig;
     use atomcode_kernel::message::{CompactTrigger, Message};
     use atomcode_kernel::provider::ReasoningEffort;
+
+    #[test]
+    fn atomgit_gateway_401_swaps_for_login_hint() {
+        // An atomgit-gateway 401 (rejected/expired free-quota token) must NOT leak
+        // the raw upstream diagnostic; it's swapped for the actionable /login hint.
+        let raw = "HTTP 401: [auth_error/401] Authentication Error, \
+                   Gitcode auth: token rejected (status=401)"
+            .to_string();
+        let out = friendly_provider_error(
+            raw.clone(),
+            Some(401),
+            "https://api-ai.gitcode.com/v1",
+        );
+        assert_ne!(out, raw, "raw 401 must not reach the UI verbatim");
+        assert!(out.contains("/login"), "hint must point the user at /login: {out:?}");
+    }
+
+    #[test]
+    fn non_atomgit_401_keeps_verbatim_diagnostic() {
+        // A user-supplied sk-… gateway keeps the real message — /login is the wrong
+        // advice; the developer needs the diagnostic to fix their own key/endpoint.
+        let raw = "HTTP 401: invalid api key".to_string();
+        let out = friendly_provider_error(raw.clone(), Some(401), "https://api.openai.com/v1");
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn non_401_atomgit_error_keeps_verbatim_diagnostic() {
+        // Only 401 is an auth-expiry signal; a 500 from the same gateway is a real
+        // server fault and must surface as-is, not be masked by a login hint.
+        let raw = "HTTP 500: upstream overloaded".to_string();
+        let out = friendly_provider_error(raw.clone(), Some(500), "https://api-ai.gitcode.com/v1");
+        assert_eq!(out, raw);
+    }
 
     #[test]
     fn compaction_advisory_announces_committed_auto_overflow_and_ignores_manual() {
