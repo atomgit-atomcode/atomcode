@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
+use atomcode_coding::{
+    assemble, prepare, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
+};
 use atomcode_core::agent::{
     AgentClient, AgentCommand as CoreCmd, AgentEvent as CoreEv, AgentPhase, TurnStopReason,
 };
@@ -110,9 +112,33 @@ struct TurnStats {
     total_tokens: usize,
 }
 
+/// Resolve CC hooks contributed INLINE by installed plugins into the kernel-stack hook
+/// config. The bridge is the one driver that may depend on `atomcode-core`'s plugin loader
+/// (L1 / `atomcode-coding` cannot), so this mapping lives here: core hands back neutral
+/// [`PluginCcHook`](atomcode_core::plugin::loader::PluginCcHook) specs and we lift each into
+/// an `atomcode_coding::cc_hooks::HookConfig`. Gathered once per bridge (it reads installed
+/// plugin manifests from disk) and reused across respawns.
+fn gather_plugin_cc_hooks() -> Vec<atomcode_coding::cc_hooks::HookConfig> {
+    atomcode_core::plugin::loader::installed_plugin_cc_hooks()
+        .into_iter()
+        .filter_map(|h| {
+            atomcode_coding::cc_hooks::HookConfig::from_plugin_spec(
+                &h.event,
+                h.matcher,
+                h.command,
+                h.timeout_secs,
+                h.plugin_root,
+            )
+        })
+        .collect()
+}
+
 struct Bridge {
     coding_cfg: CodingAgentConfig,
     opts_template: PrepareOptions,
+    /// Plugin-contributed inline CC hooks, resolved once and threaded into every
+    /// `prepare` (initial + respawns) so plugin hooks survive a model swap / reload.
+    plugin_cc_hooks: Vec<atomcode_coding::cc_hooks::HookConfig>,
     parts: atomcode_coding::CodingParts,
     handle: atomcode_kernel::agent::AgentHandle,
     ev_tx: mpsc::UnboundedSender<CoreEv>,
@@ -218,8 +244,17 @@ impl Bridge {
             // command + model self-invocation). Reuses this agent's signed provider.
             review: true,
         };
+        // Inline CC hooks from installed plugins (resolved here — only the bridge can reach
+        // the core plugin loader). Reused across respawns via the Bridge struct below.
+        let plugin_cc_hooks = gather_plugin_cc_hooks();
 
-        let mut parts = match prepare(&coding_cfg, opts_template.clone()).await {
+        let mut parts = match prepare_with_plugin_hooks(
+            &coding_cfg,
+            opts_template.clone(),
+            plugin_cc_hooks.clone(),
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 let _ = ev_tx.send(CoreEv::Error {
@@ -267,6 +302,7 @@ impl Bridge {
         let mut bridge = Bridge {
             coding_cfg,
             opts_template,
+            plugin_cc_hooks,
             parts,
             handle,
             ev_tx,
@@ -998,7 +1034,13 @@ impl Bridge {
         // Try the requested session mode first; if that fails (e.g. Resume could
         // not find the snapshot), fall back to Fresh before giving up entirely.
         // This prevents a broken snapshot from crashing the whole bridge.
-        let mut parts = match prepare(&self.coding_cfg, opts.clone()).await {
+        let mut parts = match prepare_with_plugin_hooks(
+            &self.coding_cfg,
+            opts.clone(),
+            self.plugin_cc_hooks.clone(),
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 // Don't retry Fresh if the caller already asked for Fresh — that
@@ -1013,7 +1055,13 @@ impl Bridge {
                     return;
                 }
                 opts.session = SessionMode::Fresh;
-                match prepare(&self.coding_cfg, opts).await {
+                match prepare_with_plugin_hooks(
+                    &self.coding_cfg,
+                    opts,
+                    self.plugin_cc_hooks.clone(),
+                )
+                .await
+                {
                     Ok(p) => p,
                     Err(e2) => {
                         self.emit(CoreEv::Error {
