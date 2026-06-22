@@ -14,9 +14,8 @@ const SGR_BOLD_YELLOW: &str = "\x1b[1;33m";
 const SGR_GREEN: &str = "\x1b[32m";
 const SGR_CYAN: &str = "\x1b[36m";
 // Prompt chevron = Accent (bold bright cyan, SGR 96) — matches the retained
-// renderer's `style_bold(Role::Accent)`. The user text uses Brand below.
+// renderer's `style_bold(Role::Accent)`. The user text itself stays default fg.
 const SGR_BOLD_CYAN: &str = "\x1b[1;96m";
-const SGR_BOLD_MAGENTA: &str = "\x1b[1;95m";
 const SGR_DIM: &str = "\x1b[2m";
 
 /// Plain-text renderer for pipes, CI, dumb terminals, and the
@@ -133,17 +132,16 @@ impl<W: Write + Send> PlainRenderer<W> {
         if !self.interactive_terminal {
             let chev = self.caps.prompt_chevron();
             if self.caps.colors {
-                // Chevron in Accent (bold cyan), text in Brand (bold magenta) —
-                // matches the retained renderer, which brands only the text.
+                // Chevron is the coloured Accent marker (bold cyan); the text
+                // stays the terminal default fg — matches the retained renderer
+                // and opencode (colour on the marker, not the text).
                 let _ = writeln!(
                     self.out,
-                    "{}{}{}{}{}{}",
+                    "{}{}{}{}",
                     SGR_BOLD_CYAN,
                     chev,
                     SGR_RESET,
-                    SGR_BOLD_MAGENTA,
-                    scrub_controls(text),
-                    SGR_RESET
+                    scrub_controls(text)
                 );
             } else {
                 let _ = writeln!(self.out, "{}{}", chev, scrub_controls(text));
@@ -682,12 +680,12 @@ mod tests {
         );
     }
 
-    /// Pipe / CI with colours: the chevron is Accent (bold bright cyan) and the
-    /// user text is Brand (bold bright magenta) — matching the retained renderer,
-    /// which colours ONLY the text brand and keeps the chevron accent. The old
-    /// code wrapped the whole line in magenta (chevron included).
+    /// Pipe / CI with colours: the chevron is the coloured Accent marker (bold
+    /// bright cyan) and the user text stays the terminal's default foreground —
+    /// matching opencode (`<text fg={theme.text}>`), where the colour lives on the
+    /// marker, not the text. No magenta anywhere.
     #[test]
-    fn user_echo_chevron_is_accent_text_is_brand() {
+    fn user_echo_chevron_is_accent_text_is_plain() {
         let mut buf = Vec::new();
         let mut r = PlainRenderer::with_writer_caps_and_interactive(
             &mut buf,
@@ -697,17 +695,23 @@ mod tests {
         r.render(UiLine::User("hello".into()));
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        // Chevron carries bold bright cyan (Accent) — NOT magenta.
+        // Chevron carries bold bright cyan (Accent).
         assert!(
             s.contains("\x1b[1;96m"),
             "chevron must be bold bright cyan (accent). got: {:?}",
             s
         );
-        // Text glyphs follow a bold bright magenta (Brand) open, with no chevron
-        // sitting between the SGR and the text.
+        // Text is NOT coloured — no magenta SGR is emitted at all.
         assert!(
-            s.contains("\x1b[1;95mhello"),
-            "user text must open with bold bright magenta. got: {:?}",
+            !s.contains("95m"),
+            "user text must stay default fg — no magenta SGR. got: {:?}",
+            s
+        );
+        // The chevron's colour is reset before the text, so the text inherits
+        // the terminal default rather than the cyan.
+        assert!(
+            s.contains(&format!("{}hello", SGR_RESET)) || s.contains("\x1b[0mhello"),
+            "user text must follow a reset (default fg). got: {:?}",
             s
         );
     }

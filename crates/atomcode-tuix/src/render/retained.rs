@@ -3079,11 +3079,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.mark_message(crate::render::MarkKind::User);
         self.last_mark_was_assistant = false;
         let safe = scrub_controls(text);
+        // The `❯` chevron is the coloured marker (Accent / cyan) that flags
+        // "this is the user's input" — the same role opencode gives its coloured
+        // left border. The message text itself stays the terminal's DEFAULT
+        // foreground (like opencode's `<text fg={theme.text}>`); colouring the
+        // whole sentence read as too vivid. Colour on the marker, not the text.
         let accent = self.style_bold(Role::Accent);
-        // 用户消息文本使用 Brand Bold（品红加粗），与 assistant 回答中
-        // 的 Cyan 重点颜色（代码高亮、边框等）区分开，深色/浅色主题均醒目。
-        let user_bold = self.style_bold(Role::Brand);
-        self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &user_bold);
+        let text_style = CellStyle::default();
+        self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &text_style);
         let muted = self.style_for(Role::Muted);
         for n in attachments {
             self.push_body_text(&format!("└ [Image #{}]", n), &muted);
@@ -9456,11 +9459,13 @@ mod tests {
         }
     }
 
-    /// User-message text is rendered in Brand (bright magenta) + bold so it
-    /// stands out from the assistant's Accent (cyan). The chevron prefix stays
-    /// Accent. Locks the `!267 change-userprompt-style` styling against regression.
+    /// User-message text stays the terminal's default foreground (no fixed
+    /// colour) — the colour lives only on the `❯` Accent marker, mirroring
+    /// opencode (`<text fg={theme.text}>` + a coloured left border). The old
+    /// `!267` styling painted the whole sentence bright magenta, which read as
+    /// too vivid; this locks the text back to default fg.
     #[test]
-    fn retained_user_message_text_is_brand_bold() {
+    fn retained_user_message_text_is_default_fg() {
         let (mut r, _buf) = new_capturing(80, 24);
         r.render(UiLine::User("hello".into()));
 
@@ -9471,18 +9476,15 @@ mod tests {
                 continue;
             }
             found = true;
-            // The text glyphs (the only alphabetic cells in the row; the chevron
-            // is a glyph/space) must be Brand magenta + bold.
+            // The text glyphs (the alphabetic cells; the chevron is a glyph/space)
+            // must carry NO fixed fg — they inherit the terminal default.
             for cell in row {
                 if cell.ch.is_alphabetic() {
                     assert_eq!(
-                        cell.style.fg,
-                        Some(Color::Magenta),
-                        "user text cell '{}' must be Brand magenta, got {:?}",
-                        cell.ch,
-                        cell.style.fg,
+                        cell.style.fg, None,
+                        "user text cell '{}' must be default fg (None), got {:?}",
+                        cell.ch, cell.style.fg,
                     );
-                    assert!(cell.style.bold, "user text cell '{}' must be bold", cell.ch);
                 }
             }
             break;
