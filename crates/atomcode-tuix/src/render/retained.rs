@@ -903,7 +903,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else {
                 format!("{}{}", name, meta)
             };
-            return self.build_prefixed_rows(prefix, prefix_style, &body, name_style);
+            return self.build_prefixed_rows(prefix, prefix_style, &body, name_style, None);
         }
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
         if w == 0 {
@@ -2576,26 +2576,47 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body: &str,
         body_style: &CellStyle,
     ) {
-        let rows = self.build_prefixed_rows(prefix, prefix_style, body, body_style);
+        let rows = self.build_prefixed_rows(prefix, prefix_style, body, body_style, None);
+        for row in rows {
+            self.push_body_row(row);
+        }
+    }
+
+    /// Like `push_body_prefixed` but continuation rows carry `cont_prefix`
+    /// (e.g. a coloured `▎` left bar) instead of a blank pad, so a multi-line
+    /// block reads as one unit with a full-height left marker. `cont_prefix`
+    /// MUST be the same display width as `prefix` so the body stays aligned.
+    fn push_body_prefixed_cont(
+        &mut self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        cont_prefix: &str,
+        cont_style: &CellStyle,
+        body: &str,
+        body_style: &CellStyle,
+    ) {
+        let rows =
+            self.build_prefixed_rows(prefix, prefix_style, body, body_style, Some((cont_prefix, cont_style)));
         for row in rows {
             self.push_body_row(row);
         }
     }
 
     /// Symbol-anchored row builder. Wraps `body` to `screen_width − PAD_COL`,
-    /// emits the leading row with `prefix`, continuation rows with a blank
-    /// pad of equal display width. Pure: no side effects on `body_lines`
-    /// or terminal output. Used by `push_body_prefixed` (which appends each
-    /// row via push_body_row) and `render_inflight_tool` (which writes
-    /// in-place over previously-rendered inflight rows during spinner
-    /// ticks — see that fn's doc comment for the scrollback-leak bug
-    /// this split addresses).
+    /// emits the leading row with `prefix`; continuation rows use `cont`'s
+    /// `(prefix, style)` when given, else a blank pad of equal display width.
+    /// Pure: no side effects on `body_lines` or terminal output. Used by
+    /// `push_body_prefixed` / `push_body_prefixed_cont` (which append each row
+    /// via push_body_row) and `render_inflight_tool` (which writes in-place
+    /// over previously-rendered inflight rows during spinner ticks — see that
+    /// fn's doc comment for the scrollback-leak bug this split addresses).
     fn build_prefixed_rows(
         &self,
         prefix: &str,
         prefix_style: &CellStyle,
         body: &str,
         body_style: &CellStyle,
+        cont: Option<(&str, &CellStyle)>,
     ) -> Vec<Vec<Cell>> {
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
         if w == 0 {
@@ -2603,7 +2624,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let prefix_w = crate::width::display_width(prefix);
         let first_budget = w.saturating_sub(prefix_w);
-        let cont_pad: String = " ".repeat(prefix_w);
+        let blank_pad: String = " ".repeat(prefix_w);
+        let pad_style = CellStyle::default();
         let mut rows = Vec::new();
         let mut first_emitted = false;
         for phys in body.split('\n') {
@@ -2613,12 +2635,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .collect();
             for chunk in &chunks {
                 let mut row = Vec::new();
-                let pad = CellStyle::default();
                 if !first_emitted {
                     push_str_cells(&mut row, prefix, prefix_style);
                     first_emitted = true;
                 } else {
-                    push_str_cells(&mut row, &cont_pad, &pad);
+                    let (cp, cs) = cont.unwrap_or((blank_pad.as_str(), &pad_style));
+                    push_str_cells(&mut row, cp, cs);
                 }
                 push_str_cells(&mut row, chunk.as_str(), body_style);
                 rows.push(row);
@@ -3079,14 +3101,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.mark_message(crate::render::MarkKind::User);
         self.last_mark_was_assistant = false;
         let safe = scrub_controls(text);
-        // The `❯` chevron is the coloured marker (Accent / cyan) that flags
-        // "this is the user's input" — the same role opencode gives its coloured
-        // left border. The message text itself stays the terminal's DEFAULT
-        // foreground (like opencode's `<text fg={theme.text}>`); colouring the
-        // whole sentence read as too vivid. Colour on the marker, not the text.
+        // The coloured marker (Accent / cyan) flags "this is the user's input" —
+        // the same role opencode gives its coloured left border. The first row
+        // gets the `❯` chevron; continuation rows of a multi-line message get a
+        // full-height `▎` bar so the block reads as one unit. The message text
+        // itself stays the terminal's DEFAULT foreground (like opencode's
+        // `<text fg={theme.text}>`); colouring the whole sentence read as too
+        // vivid. Colour on the marker, not the text.
         let accent = self.style_bold(Role::Accent);
         let text_style = CellStyle::default();
-        self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &text_style);
+        self.push_body_prefixed_cont(
+            self.caps.prompt_chevron(),
+            &accent,
+            self.caps.prompt_continuation_bar(),
+            &accent,
+            &safe,
+            &text_style,
+        );
         let muted = self.style_for(Role::Muted);
         for n in attachments {
             self.push_body_text(&format!("└ [Image #{}]", n), &muted);
@@ -3758,7 +3789,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let mut prefixed_rows = if detail.is_empty() {
                     // No detail: "▶ Waiting for approval: tool:"
                     let body = format!("{}: ", safe_tool);
-                    self.build_prefixed_rows(&waiting, &warn, &body, &tool_name_style)
+                    self.build_prefixed_rows(&waiting, &warn, &body, &tool_name_style, None)
                 } else {
                     // Build rows with mixed styling: yellow prefix, bold tool, fg detail
                     let detail_suffix = format!("({}): ", safe_detail);
@@ -9490,6 +9521,63 @@ mod tests {
             break;
         }
         assert!(found, "no row containing the user text 'hello' found");
+    }
+
+    /// A multi-line user message gets a full-height left marker: the `❯` chevron
+    /// on the first row, then a coloured `▎` bar (Accent) on every continuation
+    /// row — so the block reads as one unit (opencode's `┃` border, fg-only).
+    #[test]
+    fn retained_multiline_user_message_has_full_height_bar() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::User("first line\nsecond line".into()));
+
+        let mut saw_chevron = false;
+        let mut saw_bar = false;
+        for row in &r.body_lines {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if text.contains("first line") {
+                saw_chevron = true;
+                assert_eq!(
+                    row.first().map(|c| c.ch),
+                    Some('\u{276f}'),
+                    "first row must start with the ❯ chevron, got {:?}",
+                    text
+                );
+            }
+            if text.contains("second line") {
+                saw_bar = true;
+                let bar = row.first().expect("continuation row must not be empty");
+                assert_eq!(bar.ch, '\u{258e}', "continuation must start with a ▎ bar");
+                assert_eq!(
+                    bar.style.fg,
+                    Some(Color::Cyan),
+                    "the bar must be Accent (cyan), got {:?}",
+                    bar.style.fg
+                );
+            }
+        }
+        assert!(saw_chevron && saw_bar, "expected a chevron row and a bar continuation row");
+    }
+
+    /// Windows / no-unicode-font terminals: the continuation bar falls back to an
+    /// ASCII `|` (2 display cols, same as `❯`→`>`), so layout stays identical and
+    /// no tofu glyph appears.
+    #[test]
+    fn retained_multiline_user_bar_ascii_fallback() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.unicode_symbols = false; // Windows legacy conhost / no-unicode font
+        r.render(UiLine::User("first line\nsecond line".into()));
+
+        let mut saw_bar = false;
+        for row in &r.body_lines {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if text.contains("second line") {
+                saw_bar = true;
+                let bar = row.first().expect("continuation row must not be empty");
+                assert_eq!(bar.ch, '|', "ascii fallback bar must be '|', got {:?}", bar.ch);
+            }
+        }
+        assert!(saw_bar, "expected a continuation row");
     }
 
     /// Regression: after approving a bash tool call, the `● Bash(cmd)` row
