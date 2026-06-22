@@ -72,6 +72,7 @@ const zh = {
   'chat.queued': '排队中',
   'chat.removeQueued': '移除',
   'chat.error': '[错误: {msg}]',
+  'chat.warning': '⚠ {msg}',
   'chat.connError': '[连接错误: {msg}]',
 
   // Input attach (+) menu
@@ -265,6 +266,7 @@ const en: Record<MsgKey, string> = {
   'chat.queued': 'Queued',
   'chat.removeQueued': 'Remove',
   'chat.error': '[Error: {msg}]',
+  'chat.warning': '⚠ {msg}',
   'chat.connError': '[Connection error: {msg}]',
 
   'attach.menu': 'Add',

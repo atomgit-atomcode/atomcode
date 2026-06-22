@@ -175,13 +175,17 @@ pub(crate) fn ensure_live_session_global(
             None => true,
         };
         if dominated {
-            eprintln!("[DEBUG ensure_live_session_global] REUSE existing session, dominated=true, req_id={:?} live_id={:?}", session_id, LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
+            // Diagnostics via core's `ctrace!` (file sink, gated by
+            // ATOMCODE_TRACE), never eprintln: under /webui the embedded
+            // HTTP server runs in the TUI process, so stderr lands on the
+            // raw-mode terminal and corrupts the display. See core trace.rs.
+            atomcode_core::ctrace!("LIVE", "ensure_global REUSE existing session, dominated=true, req_id={:?} live_id={:?}", session_id, LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
             return s.clone();
         }
         // session_id 不匹配 → 当前 LiveSession 属于旧会话，需要替换。
-        eprintln!("[DEBUG ensure_live_session_global] REPLACE old session, dominated=false, req_id={:?} live_id={:?}", session_id, LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
+        atomcode_core::ctrace!("LIVE", "ensure_global REPLACE old session, dominated=false, req_id={:?} live_id={:?}", session_id, LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
     } else {
-        eprintln!("[DEBUG ensure_live_session_global] CREATE new session, no existing, req_id={:?}", session_id);
+        atomcode_core::ctrace!("LIVE", "ensure_global CREATE new session, no existing, req_id={:?}", session_id);
     }
     let session_id = session_id.unwrap_or_default();
     // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
@@ -1211,6 +1215,10 @@ pub(crate) enum LiveWireEvent {
     State { running: bool },
     #[serde(rename = "error")]
     Error { message: String },
+    /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
+    /// `Error` so a client can render it as a muted notice instead of a red error.
+    #[serde(rename = "warning")]
+    Warning { message: String },
     #[serde(rename = "permission_request")]
     PermissionRequest {
         tool_name: String,
@@ -1283,9 +1291,10 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 total: total_tokens,
             },
             TE::Error(message) => LiveWireEvent::Error { message },
-            TE::Warning(w) => LiveWireEvent::Error {
-                message: format!("[warning] {w}"),
-            },
+            // Non-fatal advisory (e.g. "conversation compacted") — its OWN wire type so
+            // the webui renders it as a muted notice, NOT a red "[错误: …]" error glued
+            // into the assistant bubble. No "[warning]" prefix: the type conveys severity.
+            TE::Warning(w) => LiveWireEvent::Warning { message: w },
             TE::ApprovalRequested {
                 tool_name,
                 reason,
@@ -1479,7 +1488,7 @@ pub(crate) async fn live_message(
     let req_session_id = req.session_id.clone();
     let sid = parse_session_id(req.session_id);
     let current_live_id = LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    eprintln!("[DEBUG live_message] req.session_id={:?} parsed_sid={:?} current_LIVE_SESSION_ID={:?}", req_session_id, sid, current_live_id);
+    atomcode_core::ctrace!("LIVE", "live_message req.session_id={:?} parsed_sid={:?} current_LIVE_SESSION_ID={:?}", req_session_id, sid, current_live_id);
     let load_dir = working_dir.clone();
     let load_sid = sid.clone();
     let session = ensure_live_session_global(
@@ -1493,7 +1502,7 @@ pub(crate) async fn live_message(
         },
     );
     let after_live_id = LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    eprintln!("[DEBUG live_message] after ensure: LIVE_SESSION_ID={:?} session_ptr={:p}", after_live_id, Arc::as_ptr(&session));
+    atomcode_core::ctrace!("LIVE", "live_message after ensure: LIVE_SESSION_ID={:?} session_ptr={:p}", after_live_id, Arc::as_ptr(&session));
     // 视觉预处理在 coordinator 经 executor.preprocess_input 统一做（TUI / webui 共享），
     // 此处只负责投递原始输入。
     let ok = session.send_input(UserInput {
@@ -1507,7 +1516,7 @@ pub(crate) async fn live_message(
             })
             .collect(),
     });
-    eprintln!("[DEBUG live_message] send_input accepted={}", ok);
+    atomcode_core::ctrace!("LIVE", "live_message send_input accepted={}", ok);
     Json(serde_json::json!({ "accepted": ok }))
 }
 
@@ -1672,5 +1681,25 @@ mod tests {
     async fn preprocess_live_caption_is_passthrough_without_images() {
         let out = preprocess_live_caption("看下这个图片", &[], None).await;
         assert_eq!(out, "看下这个图片");
+    }
+
+    // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，
+    // 不能被当成 error —— webui 会把 error 渲染成红色「[错误: …]」并塞进回复气泡，
+    // 让一条善意提示看起来像任务出错（用户实测报的 bug）。
+    #[test]
+    fn turn_warning_maps_to_its_own_wire_event_not_error() {
+        let wire = to_wire(LiveEvent::Turn(TurnEvent::Warning(
+            "conversation compacted".into(),
+        )))
+        .expect("a warning must produce a wire event");
+        let json = serde_json::to_string(&wire).unwrap();
+        // Its own severity type — NOT error.
+        assert!(json.contains(r#""type":"warning""#), "wire type must be warning: {json}");
+        assert!(!json.contains(r#""type":"error""#), "warning must not be sent as error: {json}");
+        // The type conveys severity; no "[warning]" string prefix smuggled into the message.
+        assert_eq!(
+            json,
+            r#"{"type":"warning","message":"conversation compacted"}"#
+        );
     }
 }
