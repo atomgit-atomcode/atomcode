@@ -817,6 +817,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CopyNoCodeBlock => "No code block in the last reply to copy".into(),
         Msg::CopyBadIndex { count } => format!("No such code block — the last reply has {count} (use /copy N, 1..={count})").into(),
         Msg::CopyFailed => "Clipboard unavailable — could not copy".into(),
+        Msg::CodeBlockCopied => "📋 Copied code block to clipboard".into(),
         Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
         Msg::CmdDescView => "View file content in an overlay modal".into(),
         Msg::ViewUsage => "Usage: /view <filepath>".into(),

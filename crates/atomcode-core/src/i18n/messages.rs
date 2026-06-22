@@ -609,6 +609,8 @@ pub enum Msg<'a> {
     CopyBadIndex { count: usize },
     /// `/copy`: the clipboard write failed (no arboard backend — headless/SSH).
     CopyFailed,
+    /// Hint shown after a code block is auto-copied to clipboard (issue #699).
+    CodeBlockCopied,
     /// Description for the `/guide` slash command — asks atomcode-guide a question.
     CmdDescGuide,
     /// Description for the `/view` slash command — opens an overlay modal showing file content.

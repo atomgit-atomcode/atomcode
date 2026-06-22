@@ -12,9 +12,16 @@ use crate::highlight::theme;
 use crate::terminal::TerminalCaps;
 
 /// Parser state maintained across lines of a streamed response.
-#[derive(Default)]
 pub struct MdState {
     pub in_code_block: bool,
+    /// The fence character that opened the current block (`'`' or `'~'`).
+    /// Used so that `~~~` inside a backtick block is not mistaken for a
+    /// close fence (issue #699).
+    fence_char: char,
+    /// Number of consecutive markers in the opening fence. A close fence
+    /// must have at least this many markers so that ```` ``` ```` (4-backtick
+    /// block) can safely contain ```` ``` ```` (3-backtick inner blocks).
+    fence_len: usize,
     /// Accumulates consecutive `|…|` rows; flushed as an aligned block
     /// when a non-table line arrives.
     pub table_buf: Vec<String>,
@@ -23,16 +30,53 @@ pub struct MdState {
     /// the code block appears in one chunk at fence close rather than
     /// streaming line-by-line.
     pub code_buf: Vec<String>,
+    /// Raw source of the most recently closed code block (the original
+    /// lines joined with `\n`, before the 2-space indent from
+    /// `highlight_block`). Set on close-fence and unclosed-finalize
+    /// paths. Callers take the value via `Option::take()` and push it
+    /// to the system clipboard via arboard / OSC 52 so the user can
+    /// paste the unwrapped original instead of selecting wrapped display
+    /// lines (issue #699). `None` means no code block was flushed this
+    /// tick.
+    ///
+    /// Held until the next close fence or explicit `take()` — for very
+    /// large single-block replies the peak memory is `O(source size)`
+    /// which matches the existing `code_buf` behaviour.
+    pub last_code_block_source: Option<String>,
+}
+
+/// Manual impl so `fence_char` / `fence_len` start at realistic sentinel
+/// values instead of `\0` / `0` (what `#[derive(Default)]` would give).
+/// These fields are only read when `in_code_block` is true, which always
+/// follows an explicit set in the OPEN-fence branch, but explicit defaults
+/// make the invariant visible and protect against future refactors.
+impl Default for MdState {
+    fn default() -> Self {
+        Self {
+            in_code_block: false,
+            fence_char: '`',
+            fence_len: 3,
+            table_buf: Vec::new(),
+            code_buf: Vec::new(),
+            last_code_block_source: None,
+        }
+    }
 }
 
 impl MdState {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Reset all fields to their initial state.  Keep in sync with
+    /// [`Default::default()`] — any new field added to `MdState` must
+    /// be cleared here too.
     pub fn reset(&mut self) {
         self.in_code_block = false;
+        self.fence_char = '`';
+        self.fence_len = 3;
         self.table_buf.clear();
         self.code_buf.clear();
+        self.last_code_block_source = None;
     }
 }
 
@@ -97,27 +141,27 @@ pub fn render_line_with_width(
 
     // Fenced code block fence (``` or ~~~).
     //
-    // OPEN fence: capture the language tag (e.g., `rust` in ```rust),
-    // start buffering body lines into `state.code_buf`. We don't emit
-    // anything for the body until close fence — the syntax highlighter
-    // needs the whole block at once to classify multi-line strings /
-    // block comments correctly.
+    // Two separate checks — the close fence must match the opening
+    // marker character and be at least as long, so a 4-backtick block
+    // can safely contain a 3-backtick inner block, and `~~~` inside a
+    // backtick block is NOT mistaken for a close fence (issue #699 P1-2).
     //
-    // CLOSE fence: flush the buffered block through `highlight::highlight_block`,
-    // which under plan-0 unconditionally emits 2-space-indented plain text
-    // (no per-token colour — see that function's doc for the rationale).
-    if is_fence(trimmed) {
-        if state.in_code_block {
-            // CLOSE
-            let source = state.code_buf.join("\n");
-            let highlighted = crate::highlight::highlight_block(&source);
-            state.in_code_block = false;
-            state.code_buf.clear();
-            return Some(prepend(highlighted));
-        } else {
-            // OPEN — language tag on the fence is ignored under plan-0
-            // (the highlighter is colour-free regardless of language).
+    // CLOSE fence: flush the buffered block through `highlight::highlight_block`.
+    if state.in_code_block && is_closing_fence(trimmed, state.fence_char, state.fence_len) {
+        let source = state.code_buf.join("\n");
+        let highlighted = crate::highlight::highlight_block(&source);
+        state.last_code_block_source = Some(source);
+        state.in_code_block = false;
+        state.code_buf.clear();
+        return Some(prepend(highlighted));
+    }
+    // OPEN fence: at least 3 consecutive backticks or tildes, captured
+    // so the close check above can match the marker and count.
+    if !state.in_code_block {
+        if let Some((c, len)) = fence_start(trimmed) {
             state.in_code_block = true;
+            state.fence_char = c;
+            state.fence_len = len;
             state.code_buf.clear();
             return prefix_only();
         }
@@ -208,6 +252,7 @@ pub fn finalize_with_width(
     let code_part = if state.in_code_block && !state.code_buf.is_empty() {
         let source = state.code_buf.join("\n");
         let highlighted = crate::highlight::highlight_block(&source);
+        state.last_code_block_source = Some(source);
         state.in_code_block = false;
         state.code_buf.clear();
         Some(highlighted)
@@ -768,17 +813,29 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
     out
 }
 
-fn is_fence(trimmed: &str) -> bool {
-    let mut chars = trimmed.chars();
-    match chars.next() {
-        Some('`') => {
-            trimmed.len() >= 3 && trimmed.as_bytes()[1] == b'`' && trimmed.as_bytes()[2] == b'`'
-        }
-        Some('~') => {
-            trimmed.len() >= 3 && trimmed.as_bytes()[1] == b'~' && trimmed.as_bytes()[2] == b'~'
-        }
-        _ => false,
+/// Return the marker and marker width for a fenced-code opening line.
+/// Requires at least 3 consecutive backticks or tildes.
+///
+/// Shared with `event_loop/commands::extract_code_blocks` so the render
+/// pipeline and the `/copy` command agree on fence parsing (issue #699).
+pub(crate) fn fence_start(line: &str) -> Option<(char, usize)> {
+    let marker = line.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
     }
+    let len = line.chars().take_while(|&ch| ch == marker).count();
+    (len >= 3).then_some((marker, len))
+}
+
+/// A closing fence must use the opening marker and be at least as long.
+/// This keeps a ```` `````` (4-backtick) block from being closed by an
+/// inner ```` ``` ```` (3-backtick) line, and prevents `~~~` from closing a
+/// backtick block (issue #699).
+///
+/// Shared with `event_loop/commands::extract_code_blocks`.
+pub(crate) fn is_closing_fence(line: &str, marker: char, opening_len: usize) -> bool {
+    let len = line.chars().take_while(|&ch| ch == marker).count();
+    len >= opening_len && line.chars().skip(len).all(char::is_whitespace)
 }
 
 fn is_hrule(trimmed: &str) -> bool {

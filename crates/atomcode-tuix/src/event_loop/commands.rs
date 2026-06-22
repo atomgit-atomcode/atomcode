@@ -27,6 +27,8 @@ use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
+use crate::markdown::{fence_start, is_closing_fence};
+
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
 
@@ -373,7 +375,7 @@ pub(super) fn execute_slash_command(
                 CopyResolve::Text(payload) => {
                     let lines = payload.lines().count().max(1);
                     let chars = payload.chars().count();
-                    if copy_text_to_clipboard(&payload) {
+                    if copy_text_to_clipboard_osc52(&payload) {
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::CopyOk { lines, chars }).into_owned(),
                         ));
@@ -3480,22 +3482,17 @@ fn extract_code_blocks(md: &str) -> Vec<String> {
     let mut inner: Vec<&str> = Vec::new();
     let mut in_block = false;
     let mut fence_char = '`';
+    let mut fence_len = 3;
     for line in md.lines() {
         let t = line.trim();
         if !in_block {
-            let c = if t.starts_with("```") {
-                Some('`')
-            } else if t.starts_with("~~~") {
-                Some('~')
-            } else {
-                None
-            };
-            if let Some(c) = c {
+            if let Some((c, len)) = fence_start(t) {
                 in_block = true;
                 fence_char = c;
+                fence_len = len;
                 inner.clear();
             }
-        } else if t.len() >= 3 && t.chars().all(|ch| ch == fence_char) {
+        } else if is_closing_fence(t, fence_char, fence_len) {
             blocks.push(inner.join("\n"));
             in_block = false;
         } else {
@@ -3539,14 +3536,66 @@ fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
     }
 }
 
-/// Write `text` to the system clipboard via arboard (NSPasteboard / Win32 /
-/// X11-Wayland). Returns `false` when arboard can't open the clipboard
-/// (headless / some SSH sessions) — an OSC 52 fallback for those is a future
-/// enhancement; the interactive desktop path this targets is covered.
-fn copy_text_to_clipboard(text: &str) -> bool {
+/// Write `text` to the system clipboard. Tries arboard (system clipboard
+/// API) first; falls back to OSC 52 emitted to `stdout` for headless / SSH
+/// sessions where no windowing system is available.
+///
+/// OSC 52 format: `\x1b]52;c;<base64>\x1b\\`
+///
+/// This is the public entry-point used by both the `/copy` command and the
+/// retained renderer's auto-copy path (issue #699).
+pub(crate) fn copy_text_to_clipboard_osc52(text: &str) -> bool {
+    // Tier 1: system clipboard via arboard (desktop)
+    if try_arboard_clipboard(text) {
+        return true;
+    }
+    // Tier 2: OSC 52 escape sequence. Only emit when stdout is a real
+    // terminal — piping OSC bytes into a file or another process is
+    // meaningless (issue #699 P4).
+    use std::io::IsTerminal as _;
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    write_osc52_clipboard_to(&mut std::io::stdout(), text)
+}
+
+/// Variant of [`copy_text_to_clipboard_osc52`] that emits the OSC 52
+/// fallback through `writer` instead of raw stdout.  Retained-mode
+/// renderers should use this with their own `BufWriter<Stdout>` so the
+/// escape sequence stays ordered with buffered body/content writes.
+pub(crate) fn copy_text_to_clipboard_osc52_via(
+    writer: &mut impl std::io::Write,
+    text: &str,
+) -> bool {
+    if try_arboard_clipboard(text) {
+        return true;
+    }
+    write_osc52_clipboard_to(writer, text)
+}
+
+fn try_arboard_clipboard(text: &str) -> bool {
     arboard::Clipboard::new()
         .and_then(|mut c| c.set_text(text.to_string()))
         .is_ok()
+}
+
+/// Emit an OSC 52 escape sequence through `writer`.
+fn write_osc52_clipboard_to(writer: &mut impl std::io::Write, text: &str) -> bool {
+    let seq = encode_osc52("c", text);
+    writer.write_all(seq.as_bytes()).is_ok() && writer.flush().is_ok()
+}
+
+/// Build an OSC 52 escape sequence: `ESC ]52;<buffer>;<base64> ST`.
+/// `buffer` is typically `"c"` (clipboard) or `"p"` (primary selection).
+///
+/// Note: some terminals cap OSC payloads at ~4096 bytes. For code blocks
+/// longer than ~3 KB the OSC 52 path may be silently truncated; the arboard
+/// desktop path (tier 1) has no such limit and will succeed first on any
+/// machine with a windowing system.
+pub(crate) fn encode_osc52(buffer: &str, text: &str) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;{};{}\x1b\\", buffer, b64)
 }
 
 #[cfg(test)]
@@ -3973,6 +4022,21 @@ mod copy_tests {
     #[test]
     fn no_fence_yields_nothing() {
         assert!(extract_code_blocks("just prose, `inline code` only").is_empty());
+    }
+
+    #[test]
+    fn longer_fence_can_contain_a_shorter_fence() {
+        let md = "````markdown\n```rust\nfn main() {}\n```\n````";
+        assert_eq!(
+            extract_code_blocks(md),
+            vec!["```rust\nfn main() {}\n```".to_string()]
+        );
+    }
+
+    #[test]
+    fn tilde_fence_requires_a_matching_marker() {
+        let md = "~~~text\n```\nstill inside\n~~~";
+        assert_eq!(extract_code_blocks(md), vec!["```\nstill inside".to_string()]);
     }
 
     #[test]

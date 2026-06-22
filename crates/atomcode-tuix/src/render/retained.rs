@@ -34,6 +34,19 @@ use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use crossterm::style::Color;
 
+/// When `ATOMCODE_AUTO_COPY=0` or `=false`, the renderer skips automatic
+/// clipboard copy after code-block flushes. Default is on (enabled).
+/// Result is cached in a `OnceLock` — environment is read once per process.
+fn auto_copy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ATOMCODE_AUTO_COPY")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
+
 const PAD_COL: usize = 2;
 
 /// Max body_lines kept in the in-app scrollback buffer (matches alt-screen).
@@ -388,6 +401,11 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// of a turn gets a new mark; subsequent chunks within the same assistant turn are silent.
     /// Cleared whenever a User / ToolCall / ToolCallInFlight / TurnSeparator fires.
     last_mark_was_assistant: bool,
+    /// Set by `set_suppress_auto_copy(true)` before history replay
+    /// (`/resume`, `/undo`, `atomcode -c`). Suppresses clipboard writes
+    /// and "Copied" hint lines so replay doesn't overwrite the user's
+    /// clipboard or inject stale annotations (issue #699).
+    suppress_auto_copy: bool,
     /// Line-buffer for streaming assistant text — chunks accumulate
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
@@ -618,6 +636,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             body_lines: Vec::new(),
             message_marks: Vec::new(),
             last_mark_was_assistant: false,
+            suppress_auto_copy: false,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
             dirty: false,
@@ -2629,6 +2648,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             ) {
                 completed.push(rendered);
             }
+            // Auto-copy code block to clipboard when the close fence just
+            // flushed (issue #699). Delegates to `maybe_auto_copy_hint`.
+            if let Some(hint) = self.maybe_auto_copy_hint() {
+                completed.push(hint);
+            }
         }
         for rendered in completed {
             self.push_markdown_body(&rendered);
@@ -2657,6 +2681,51 @@ impl<W: Write + Send> RetainedRenderer<W> {
         {
             self.push_markdown_body(&block);
         }
+        // finalize_with_width may have flushed an unclosed code block
+        // (stream ended without close fence). Same auto-copy logic as
+        // flush_assistant_lines (issue #699).
+        if let Some(hint) = self.maybe_auto_copy_hint() {
+            self.push_markdown_body(&hint);
+        }
+    }
+
+    /// If the markdown parser just finished a code block, copy its raw
+    /// source to the system clipboard and return a muted hint line for
+    /// display. Returns `None` when no block was finished or auto-copy
+    /// is disabled (see [`auto_copy_enabled`]).
+    fn maybe_auto_copy_hint(&mut self) -> Option<String> {
+        // Never auto-copy during history replay (/resume, /undo, atomcode -c).
+        // The markdown events are identical to live streaming, but we
+        // must not overwrite the user's clipboard or inject stale
+        // "Copied" hints into replayed output (issue #699 P1).
+        if self.suppress_auto_copy {
+            return None;
+        }
+        let source = self.md_state.last_code_block_source.take()?;
+        if !auto_copy_enabled() || source.trim().is_empty() {
+            return None;
+        }
+        // Write through `self.out` so the escape sequence stays ordered
+        // with buffered body-content writes — avoids raw-stdout interleave
+        // with the retained renderer's BufWriter.
+        let ok = crate::event_loop::commands::copy_text_to_clipboard_osc52_via(
+            &mut self.out,
+            &source,
+        );
+        // Only show the hint when the clipboard write actually succeeded
+        // — a misleading "Copied" is worse than no hint (issue #699 P2).
+        if !ok {
+            return None;
+        }
+        // Leading `\n` gives the hint a blank line of separation from the
+        // code block body, so it reads as a standalone annotation rather
+        // than trailing the last code line.
+        Some(format!(
+            "\n{}{}{}",
+            crate::highlight::theme::MD_MUTED_OPEN,
+            t(Msg::CodeBlockCopied),
+            crate::highlight::theme::MD_MUTED_CLOSE
+        ))
     }
 
     /// Parse a markdown-rendered string (ANSI-tinted) into cells
@@ -4147,6 +4216,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // SSH) saw the writes immediately — no worse than before.
         let _ = self.out.write_all(b"\x1b[?2026l");
         let _ = self.out.flush();
+    }
+
+    fn set_suppress_auto_copy(&mut self, suppress: bool) {
+        self.suppress_auto_copy = suppress;
     }
 
     fn clear_screen(&mut self) {
@@ -11522,6 +11595,7 @@ mod tests {
         // content doesn't matter for the cold-start assertion — we
         // just need to reach `flush_deferred → paint_frame →
         // render_diff` so the first post-reset diff actually runs.
+        r.set_suppress_auto_copy(true);
         r.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -11618,6 +11692,7 @@ mod tests {
         // (`flush_deferred` after each row, mimicking the worker) runs —
         // the exact multi-envelope failure mode.
         r.begin_sync();
+        r.set_suppress_auto_copy(true);
         r.reset();
         for i in 0..16 {
             r.render(UiLine::AssistantText(format!("replay row {i}\n")));
