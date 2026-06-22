@@ -13,6 +13,7 @@ const SGR_RED: &str = "\x1b[31m";
 const SGR_BOLD_YELLOW: &str = "\x1b[1;33m";
 const SGR_GREEN: &str = "\x1b[32m";
 const SGR_CYAN: &str = "\x1b[36m";
+const SGR_BOLD_MAGENTA: &str = "\x1b[1;95m";
 const SGR_DIM: &str = "\x1b[2m";
 
 /// Plain-text renderer for pipes, CI, dumb terminals, and the
@@ -129,8 +130,8 @@ impl<W: Write + Send> PlainRenderer<W> {
         if !self.interactive_terminal {
             let chev = self.caps.prompt_chevron();
             if self.caps.colors {
-                // \x1b[1;95m = Bold + Bright Magenta，与 retained 渲染器的 Brand Bold 对齐。
-                let _ = writeln!(self.out, "\x1b[1;95m{}{}\x1b[0m", chev, scrub_controls(text));
+                // Bold Magenta，与 retained 渲染器的 Brand Bold 对齐。
+                let _ = writeln!(self.out, "{}{}{}{}", SGR_BOLD_MAGENTA, chev, scrub_controls(text), SGR_RESET);
             } else {
                 let _ = writeln!(self.out, "{}{}", chev, scrub_controls(text));
             }
