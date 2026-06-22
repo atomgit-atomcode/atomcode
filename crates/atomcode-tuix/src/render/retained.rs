@@ -9456,6 +9456,40 @@ mod tests {
         }
     }
 
+    /// User-message text is rendered in Brand (bright magenta) + bold so it
+    /// stands out from the assistant's Accent (cyan). The chevron prefix stays
+    /// Accent. Locks the `!267 change-userprompt-style` styling against regression.
+    #[test]
+    fn retained_user_message_text_is_brand_bold() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::User("hello".into()));
+
+        let mut found = false;
+        for row in &r.body_lines {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if !text.contains("hello") {
+                continue;
+            }
+            found = true;
+            // The text glyphs (the only alphabetic cells in the row; the chevron
+            // is a glyph/space) must be Brand magenta + bold.
+            for cell in row {
+                if cell.ch.is_alphabetic() {
+                    assert_eq!(
+                        cell.style.fg,
+                        Some(Color::Magenta),
+                        "user text cell '{}' must be Brand magenta, got {:?}",
+                        cell.ch,
+                        cell.style.fg,
+                    );
+                    assert!(cell.style.bold, "user text cell '{}' must be bold", cell.ch);
+                }
+            }
+            break;
+        }
+        assert!(found, "no row containing the user text 'hello' found");
+    }
+
     /// Regression: after approving a bash tool call, the `● Bash(cmd)` row
     /// and the `└ [elapsed: …]` result row should be adjacent with no
     /// blank line between them. User reported a visible blank gap after
