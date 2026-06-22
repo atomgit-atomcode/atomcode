@@ -503,6 +503,51 @@ fn run(
             continue;
         }
 
+        // Bracketed-paste coalescing. Windows Terminal / conhost deliver a
+        // large bracketed paste as MULTIPLE `Event::Paste` records with the
+        // same 5-12 ms inter-chunk gaps the char-burst detector above bridges
+        // for the no-bracketed-paste fallback. Forwarded one-by-one, each
+        // record folds into its own `[Pasted #N]` placeholder downstream — a
+        // single Ctrl+V of a long file showed as 29 placeholders (Windows bug
+        // report). Concatenate consecutive `Event::Paste` records that arrive
+        // within the ACTIVE bridging window into one payload so the buffer
+        // folds them into a single placeholder.
+        //
+        // An EMPTY paste is the image-clipboard signal (the terminal wrapped a
+        // bracketed paste with no text because the clipboard holds image
+        // bytes); it's a lone event the loop resolves via arboard, so pass it
+        // straight through without burning the bridging window on it.
+        if let Event::Paste(first) = ev {
+            if first.is_empty() {
+                if tx.send(InputEvent::Paste(first)).is_err() {
+                    return;
+                }
+                continue;
+            }
+            // 16 MiB ceiling: a pathologically large paste that keeps arriving
+            // can't wedge the reader indefinitely; we ship what we have.
+            const PASTE_CAP: usize = 16 * 1024 * 1024;
+            let (payload, trailing) = coalesce_paste(first, PASTE_CAP, || {
+                match event::poll(Duration::from_millis(BURST_ACTIVE_TIMEOUT_MS)) {
+                    Ok(true) => event::read().ok(),
+                    _ => None,
+                }
+            });
+            crate::tuix_trace!("RD", "paste-coalesce len={}", payload.len());
+            if tx.send(InputEvent::Paste(payload)).is_err() {
+                return;
+            }
+            // Dispatch the non-paste event that terminated the run (if any).
+            if let Some(ev) = trailing {
+                if let Some(msg) = to_input_event(ev) {
+                    if tx.send(msg).is_err() {
+                        return;
+                    }
+                }
+            }
+            continue;
+        }
+
         let msg = match ev {
             Event::Key(k) => {
                 crate::tuix_trace!("RD", "key {:?} {:?}", k.kind, k.code);
@@ -555,9 +600,121 @@ fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
     }
 }
 
+/// Translate a crossterm `Event` into the `InputEvent` the loop consumes,
+/// applying the focus-tracking side effects. Returns `None` for events that
+/// carry no input (focus changes, unmapped mouse kinds). Used to dispatch
+/// the non-paste event that terminates a coalesced paste run.
+fn to_input_event(ev: Event) -> Option<InputEvent> {
+    match ev {
+        Event::Key(k) => Some(InputEvent::Key(k)),
+        Event::Paste(p) => Some(InputEvent::Paste(p)),
+        Event::Resize(w, h) => Some(InputEvent::Resize(w, h)),
+        Event::Mouse(m) => mouse_input_event(m),
+        Event::FocusGained => {
+            atomcode_core::notify::set_terminal_focus_state(Some(true));
+            None
+        }
+        Event::FocusLost => {
+            atomcode_core::notify::set_terminal_focus_state(Some(false));
+            None
+        }
+    }
+}
+
+/// Concatenate `first` with every consecutive `Event::Paste` payload that
+/// `next` yields, until `next` returns a non-paste event (handed back as the
+/// trailing event for the caller to dispatch), returns `None` (the bridging
+/// window closed / EOF), or the accumulated length reaches `cap`.
+///
+/// Pulled out of the reader loop so the coalescing rule is unit-testable
+/// without driving a real terminal: the reader supplies a `next` that polls
+/// crossterm within the ACTIVE bridging window; tests supply a vec iterator.
+///
+/// Why this exists: Windows Terminal / conhost split one bracketed paste into
+/// MULTIPLE `Event::Paste` records with 5-12 ms gaps. Forwarded individually,
+/// each record folds into its own `[Pasted #N]` placeholder, so one Ctrl+V of
+/// a long file rendered as 29 placeholders (Windows bug report). This is the
+/// `Event::Paste` analogue of the char-by-char paste-burst detector above.
+fn coalesce_paste(
+    first: String,
+    cap: usize,
+    mut next: impl FnMut() -> Option<Event>,
+) -> (String, Option<Event>) {
+    let mut payload = first;
+    let mut trailing = None;
+    while payload.len() < cap {
+        match next() {
+            Some(Event::Paste(p)) => payload.push_str(&p),
+            Some(other) => {
+                trailing = Some(other);
+                break;
+            }
+            None => break,
+        }
+    }
+    (payload, trailing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long bracketed paste arriving as several `Event::Paste` chunks (the
+    /// Windows Terminal / conhost behaviour) collapses into ONE payload — so
+    /// the buffer folds it into a single `[Pasted #N]` instead of 29 of them.
+    #[test]
+    fn coalesces_consecutive_paste_chunks() {
+        let mut chunks = vec![
+            Event::Paste("b\nc\n".to_string()),
+            Event::Paste("d\ne\n".to_string()),
+        ]
+        .into_iter();
+        let (out, trailing) =
+            coalesce_paste("a\n".to_string(), 1 << 20, || chunks.next());
+        assert_eq!(out, "a\nb\nc\nd\ne\n");
+        assert!(trailing.is_none());
+    }
+
+    /// A non-paste event terminates the run and is handed back as `trailing`
+    /// so the caller still dispatches it (e.g. a trailing Enter); paste chunks
+    /// after the break are NOT swallowed into this payload.
+    #[test]
+    fn paste_coalesce_stops_at_non_paste_and_returns_trailing() {
+        let mut evs = vec![
+            Event::Paste("more".to_string()),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Event::Paste("never".to_string()),
+        ]
+        .into_iter();
+        let (out, trailing) =
+            coalesce_paste("start".to_string(), 1 << 20, || evs.next());
+        assert_eq!(out, "startmore");
+        assert!(matches!(trailing, Some(Event::Key(_))));
+    }
+
+    /// Once the accumulated length reaches `cap` the loop stops without
+    /// polling again, so a pathological never-ending paste can't wedge the
+    /// reader.
+    #[test]
+    fn paste_coalesce_respects_cap() {
+        let mut polled = 0usize;
+        let (out, trailing) = coalesce_paste("aaaa".to_string(), 2, || {
+            polled += 1;
+            Some(Event::Paste("x".to_string()))
+        });
+        assert_eq!(out, "aaaa");
+        assert_eq!(polled, 0, "cap already reached; must not poll");
+        assert!(trailing.is_none());
+    }
+
+    /// `next` yielding `None` (the bridging window closed with nothing more
+    /// queued — the common single-chunk paste) ends the run cleanly.
+    #[test]
+    fn paste_coalesce_ends_when_window_closes() {
+        let (out, trailing) = coalesce_paste("solo".to_string(), 1 << 20, || None);
+        assert_eq!(out, "solo");
+        assert!(trailing.is_none());
+    }
 
     /// Pause/Resume round trip without touching crossterm — feeds commands
     /// directly into the `run` worker via an in-memory channel pair. This
