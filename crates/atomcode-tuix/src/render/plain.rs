@@ -128,7 +128,12 @@ impl<W: Write + Send> PlainRenderer<W> {
         self.drop_transient();
         if !self.interactive_terminal {
             let chev = self.caps.prompt_chevron();
-            let _ = writeln!(self.out, "{}{}", chev, scrub_controls(text));
+            if self.caps.colors {
+                // \x1b[1;95m = Bold + Bright Magenta，与 retained 渲染器的 Brand Bold 对齐。
+                let _ = writeln!(self.out, "\x1b[1;95m{}{}\x1b[0m", chev, scrub_controls(text));
+            } else {
+                let _ = writeln!(self.out, "{}{}", chev, scrub_controls(text));
+            }
         }
         for n in attachments {
             let _ = writeln!(self.out, "  └ [Image #{}]", n);

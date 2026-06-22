@@ -2998,8 +2998,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.last_mark_was_assistant = false;
         let safe = scrub_controls(text);
         let accent = self.style_bold(Role::Accent);
-        let plain = CellStyle::default();
-        self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &plain);
+        // 用户消息文本使用 Brand Bold（品红加粗），与 assistant 回答中
+        // 的 Cyan 重点颜色（代码高亮、边框等）区分开，深色/浅色主题均醒目。
+        let user_bold = self.style_bold(Role::Brand);
+        self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &user_bold);
         let muted = self.style_for(Role::Muted);
         for n in attachments {
             self.push_body_text(&format!("└ [Image #{}]", n), &muted);
