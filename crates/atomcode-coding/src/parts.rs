@@ -294,7 +294,12 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
     // and it implements no offer_continuation, so VerifyCadenceHook's "first Some wins"
     // contract is untouched by being earlier in the chain.
     let cc_external = {
-        let cc = CCExternalHooks::load(&cfg.working_dir);
+        let mut cc = CCExternalHooks::load(&cfg.working_dir);
+        // Stamp the persistent session id into every CC payload (CC `session_id`), so a
+        // hook can correlate its events with the session. Empty for non-persistent runs.
+        if let Some(b) = &session {
+            cc = cc.with_session_id(b.id.as_str());
+        }
         if cc.is_empty() {
             None
         } else {

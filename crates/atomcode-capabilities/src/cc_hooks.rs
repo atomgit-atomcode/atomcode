@@ -22,9 +22,9 @@
 //! `block` (or a bare exit code `2`, per CC's contract) stops a tool / prompt; any
 //! other non-zero exit is a non-blocking error and the turn proceeds.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -292,25 +292,48 @@ impl Decision {
 
 // ───────────────────────────── the producer ─────────────────────────────
 
-/// CC external-hook runner. Holds the resolved config + the cwd used to build CC
-/// payloads. Clone-cheap is not needed (registered once behind `Arc`).
+/// CC external-hook runner. Holds the resolved config + the cwd / session id used to
+/// build CC payloads. Clone-cheap is not needed (registered once behind `Arc`).
 pub struct CCExternalHooks {
     hooks: Vec<HookConfig>,
     cwd: String,
+    /// CC `session_id` stamped into every payload. Empty when the agent has no
+    /// persistent session (the driver supplies it via [`with_session_id`]).
+    session_id: String,
+    /// Whether any PostToolUse hook is configured — gates the call→tool bookkeeping
+    /// below so the (common) no-PostToolUse path allocates nothing.
+    has_post_tool_hooks: bool,
+    /// `tool_call_id → tool_name`, populated by `before` so PostToolUse `after` (which
+    /// the kernel does not hand a tool name) can honor tool-name matchers. An entry is
+    /// recorded only for a call that will RUN (gate ≠ Deny) and removed by `after`, so
+    /// the map never outlives a turn's in-flight calls.
+    call_tools: Mutex<HashMap<String, String>>,
 }
 
 impl CCExternalHooks {
     /// Build from an explicit hook list (used by tests + a future plugin source).
     pub fn new(hooks: Vec<HookConfig>, cwd: impl Into<String>) -> Self {
-        Self { hooks, cwd: cwd.into() }
+        let has_post_tool_hooks = hooks.iter().any(|h| h.event == HookEvent::PostToolUse);
+        Self {
+            hooks,
+            cwd: cwd.into(),
+            session_id: String::new(),
+            has_post_tool_hooks,
+            call_tools: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Load user + project `hooks.json` for `project_dir`.
     pub fn load(project_dir: &Path) -> Self {
-        Self {
-            hooks: load_hooks_config(project_dir),
-            cwd: project_dir.to_string_lossy().into_owned(),
-        }
+        Self::new(load_hooks_config(project_dir), project_dir.to_string_lossy().into_owned())
+    }
+
+    /// Stamp the CC `session_id` sent in every payload (the agent's persistent session
+    /// id). Builder-style so callers can chain off [`load`]; leave unset for one-shot
+    /// runs (the payload then carries an empty `session_id`, as before).
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = id.into();
+        self
     }
 
     /// True when no hooks are configured — callers skip registration so the
@@ -327,11 +350,21 @@ impl CCExternalHooks {
     }
 }
 
+/// PostToolUse matcher resolution: when we know the tool name (the usual case — `before`
+/// recorded it) honor it like any other matcher; when we DON'T (the call was denied or
+/// never reached our `before`), only an all-tools matcher (`None`/`"*"`) may fire.
+fn post_tool_matches(matcher: &Option<String>, tool_name: Option<&str>) -> bool {
+    match tool_name {
+        Some(name) => matches_tool(matcher, name),
+        None => matches!(matcher.as_deref(), None | Some("*")),
+    }
+}
+
 #[async_trait]
 impl LifecycleHooks for CCExternalHooks {
     async fn session_start(&self, convo: &mut Conversation, _resumed: bool) {
         let payload = serde_json::json!({
-            "session_id": "",
+            "session_id": self.session_id,
             "hook_event_name": HookEvent::SessionStart.cc_name(),
             "cwd": self.cwd,
         })
@@ -354,7 +387,7 @@ impl LifecycleHooks for CCExternalHooks {
 
     async fn user_prompt_submit(&self, text: &mut String) -> Result<(), String> {
         let payload = serde_json::json!({
-            "session_id": "",
+            "session_id": self.session_id,
             "hook_event_name": HookEvent::UserPromptSubmit.cc_name(),
             "prompt": &*text,
             "cwd": self.cwd,
@@ -410,7 +443,7 @@ impl LifecycleHooks for CCExternalHooks {
 
     async fn session_end(&self, _convo: &Conversation) {
         let payload = serde_json::json!({
-            "session_id": "",
+            "session_id": self.session_id,
             "hook_event_name": HookEvent::SessionEnd.cc_name(),
             "cwd": self.cwd,
         })
@@ -435,7 +468,7 @@ impl ToolMiddleware for CCExternalHooks {
         let tool_input: Value =
             serde_json::from_str(&call.arguments).unwrap_or_else(|_| Value::String(call.arguments.clone()));
         let payload = serde_json::json!({
-            "session_id": "",
+            "session_id": self.session_id,
             "hook_event_name": HookEvent::PreToolUse.cc_name(),
             "tool_name": call.name,
             "tool_input": tool_input,
@@ -510,17 +543,30 @@ impl ToolMiddleware for CCExternalHooks {
                 break; // deny is final.
             }
         }
+        // Remember this call's tool name for PostToolUse `after` (kernel hands it no tool
+        // name), but ONLY for a call that will actually run — a Deny here means the tool is
+        // blocked, so its PostToolUse must not fire. `after` removes the entry.
+        if self.has_post_tool_hooks && !matches!(gate, BeforeOutcome::Deny { .. }) {
+            if let Ok(mut m) = self.call_tools.lock() {
+                m.insert(call.id.clone(), call.name.clone());
+            }
+        }
         gate
     }
 
     async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
-        // PostToolUse: tool identity is the result's call_id; CC's full
-        // tool_name/tool_input are not threaded to `after` in this slice, so we
-        // match PostToolUse hooks with NO tool filter (matcher `None`/`*` only).
-        // Targeted PostToolUse matchers land with the call-context plumbing (M2b).
+        // Recover the tool name `before` stashed for this call_id (kernel doesn't thread
+        // it into `after`), so PostToolUse tool-name matchers are honored. Absent ⇒ the
+        // call never ran our `before` (e.g. denied earlier) ⇒ only all-tools hooks fire.
+        let tool_name = self
+            .call_tools
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(&result.call_id));
         let payload = serde_json::json!({
-            "session_id": "",
+            "session_id": self.session_id,
             "hook_event_name": HookEvent::PostToolUse.cc_name(),
+            "tool_name": tool_name,
             "tool_response": result.content,
             "cwd": self.cwd,
         })
@@ -528,7 +574,7 @@ impl ToolMiddleware for CCExternalHooks {
         let mut outcome = AfterOutcome::Proceed;
         for hook in self.hooks.iter().filter(|h| {
             h.event == HookEvent::PostToolUse
-                && matches!(h.matcher.as_deref(), None | Some("*"))
+                && post_tool_matches(&h.matcher, tool_name.as_deref())
         }) {
             let Some((_code, stdout)) = run_command_hook(hook, &payload).await else {
                 continue;
@@ -753,5 +799,65 @@ mod tests {
         let mut text = "hi".to_string();
         assert!(cc.user_prompt_submit(&mut text).await.is_ok(), "exit 1 must NOT block");
         assert_eq!(text, "hi", "no stdout ⇒ prompt unchanged");
+    }
+
+    #[test]
+    fn post_tool_matcher_resolution() {
+        // Known tool name ⇒ honored like any matcher.
+        assert!(post_tool_matches(&Some("bash".into()), Some("bash")));
+        assert!(!post_tool_matches(&Some("bash".into()), Some("grep")));
+        assert!(post_tool_matches(&Some("edit_*".into()), Some("edit_file")));
+        // Unknown tool name ⇒ only an all-tools matcher may fire.
+        assert!(post_tool_matches(&None, None));
+        assert!(post_tool_matches(&Some("*".into()), None));
+        assert!(!post_tool_matches(&Some("bash".into()), None));
+    }
+
+    /// F3: a PostToolUse hook with a tool-name matcher now fires for the matching tool
+    /// (the name `before` recorded for the call_id) and is skipped for a non-match.
+    #[tokio::test]
+    async fn post_tool_use_honors_matcher() {
+        let hook = HookConfig {
+            event: HookEvent::PostToolUse,
+            matcher: Some("bash".into()),
+            command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"REWRITTEN"}}'"#.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![hook], "/tmp");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
+        let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
+
+        // before() records call_id "1" → "bash"; after() then matches matcher "bash".
+        let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
+        let _ = cc.before(&mut call, &tool, &rt).await;
+        let mut result = ToolResult { call_id: "1".into(), content: "orig".into(), is_error: false };
+        cc.after(&mut result).await;
+        assert_eq!(result.content, "REWRITTEN", "matcher 'bash' must fire for tool bash");
+
+        // A different tool ("grep") does NOT match matcher "bash" → output untouched.
+        let mut call = ToolCall { id: "2".into(), name: "grep".into(), arguments: "{}".into() };
+        let _ = cc.before(&mut call, &tool, &rt).await;
+        let mut result = ToolResult { call_id: "2".into(), content: "orig".into(), is_error: false };
+        cc.after(&mut result).await;
+        assert_eq!(result.content, "orig", "matcher 'bash' must NOT fire for tool grep");
+    }
+
+    /// F4: the configured session_id is threaded into the CC payload (the hook greps its
+    /// own stdin for it and only emits context on a match).
+    #[tokio::test]
+    async fn session_id_is_threaded_into_payload() {
+        let hook = HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            matcher: None,
+            command: r#"grep -q '"session_id":"sess-xyz"' && echo MATCHED"#.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![hook], "/tmp").with_session_id("sess-xyz");
+        let mut text = "hi".to_string();
+        assert!(cc.user_prompt_submit(&mut text).await.is_ok());
+        assert!(text.contains("MATCHED"), "session_id must reach the payload: {text}");
     }
 }
