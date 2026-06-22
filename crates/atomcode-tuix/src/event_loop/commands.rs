@@ -593,6 +593,10 @@ pub(super) fn execute_slash_command(
                     ctx.config = new_cfg.clone();
                     ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
+                    // Refresh the footer context window now (see model_picker
+                    // Enter handler) — no turn fires here either, so the cached
+                    // snapshot's denominator would otherwise stay on the old model.
+                    state.on_model_window_changed(ctx.config.default_context_window());
                     ctx.agent
                         .cmd_tx
                         .send(AgentCommand::ReloadConfig(new_cfg))
@@ -3787,6 +3791,10 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
             ctx.model_name = p.model.clone();
         }
+        // NOTE: the footer context window is NOT refreshed here — `run_login_flow`
+        // has no `UiState` handle. The post-login window self-corrects on the
+        // first turn's ContextStats; threading state through just for this rare
+        // path isn't worth it. The /model picker + reload paths do refresh it.
         // Clear any stale drift warning now that we've just
         // re-synced. Also reset the cooldown so the next
         // pre-turn trigger (if conditions change) can fire

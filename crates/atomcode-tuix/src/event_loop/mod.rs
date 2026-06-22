@@ -6978,6 +6978,14 @@ fn handle_agent_event(
         AgentEvent::TextDelta(text) => {
             let visible = think.feed(&text);
             if !visible.is_empty() {
+                // Keep the raw reply markdown for `/copy`. Clear-on-finalize:
+                // the first delta of a new turn wipes the sealed prior reply,
+                // so between turns the buffer still holds the last reply.
+                if state.response_finalized {
+                    state.last_assistant_response.clear();
+                    state.response_finalized = false;
+                }
+                state.last_assistant_response.push_str(&visible);
                 if fixissue_pending.is_some() {
                     fixissue_buffer.push_str(&visible);
                 }
@@ -8167,6 +8175,10 @@ fn handle_agent_event(
                     .get(&provider)
                     .map(|p| p.model.clone())
                     .unwrap_or(provider);
+                // Footer context window follows the mirrored switch too (see
+                // model_picker) — otherwise the denominator lags a turn behind
+                // a webui-driven model change.
+                state.on_model_window_changed(ctx.config.default_context_window());
                 ctx.runtime_factory.set_config(ctx.config.clone());
                 let _ = ctx
                     .agent
