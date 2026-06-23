@@ -964,7 +964,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "\u{26a0} BYPASS".into(),
 
         Msg::AdminWarningBanner =>
-            "\x1b[33m\u{26a0} Warning: Running with Administrator privileges.\n   The model may have access to system files.\n   Use \"Trusted Directories\" in /codingplan to restrict file access.\x1b[39m\n".into(),
+            "\x1b[33m\u{26a0} Warning: Running with Administrator privileges.\n   The model may have access to system files.\n   Consider running without elevation, inside a scoped working directory.\x1b[39m\n".into(),
         Msg::AdminWarningHeadless =>
             "[warning] Running with Administrator privileges — model may have access to system files.".into(),
 
