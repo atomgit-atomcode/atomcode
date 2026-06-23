@@ -8,7 +8,7 @@ You can override any built-in rule at runtime without rebuilding by placing a fi
 
 ## Programming Languages
 
-| Language         | Rule       | File Patterns t                                    |
+| Language         | Rule       | File Patterns                                       |
 | ---------------- | ---------- | -------------------------------------------------- |
 | ArkTS            | `arkts`    | `*.ets`                                            |
 | C                | `c`        | `*.c`, `*.h`                                       |
