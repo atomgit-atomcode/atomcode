@@ -490,6 +490,13 @@ pub struct AgentLoop {
     /// TurnRunner owns the provider, tools, and context.
     pub turn_runner: TurnRunner,
     pub permission_store: std::sync::Arc<std::sync::RwLock<PermissionStore>>,
+    /// `--dangerously-skip-permissions` / `-y`: auto-approve every tool without
+    /// prompting. Stored here (not just on the decider) so `AgentRuntimeFactory`
+    /// can read it back via `from_initial_loop` and propagate the bypass to every
+    /// runtime it re-spawns (/session, /resume, /bg). Without it, a re-spawned
+    /// runtime silently re-enabled approval prompts while the ⚠ BYPASS badge
+    /// stayed on (issue #714).
+    pub dangerously_skip_permissions: bool,
     pub config: Config,
     /// Context construction strategy for the active provider. Selected
     /// at construction via `ctx::for_provider` and rebuilt on
@@ -703,6 +710,9 @@ pub struct AgentRuntimeFactory {
     pub shared_tools: std::sync::Arc<ToolRegistry>,
     pub skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
     pub max_turns: Option<usize>,
+    /// Propagated to every runtime this factory spawns so a `/session` /
+    /// `/resume` / `/bg` re-spawn inherits the launch-time `-y` bypass (issue #714).
+    pub dangerously_skip_permissions: bool,
     runtime_counter: std::sync::Arc<AtomicU64>,
 }
 
@@ -752,7 +762,7 @@ impl AgentRuntimeFactory {
         ));
         tool_context.lsp = self.lsp.clone();
 
-        let (mut loop_, handle) = AgentLoop::new_with_shared_parts(
+        let (mut loop_, handle) = AgentLoop::new_with_shared_parts_skip(
             self.config.clone(),
             provider,
             self.shared_tools.clone(),
@@ -760,6 +770,7 @@ impl AgentRuntimeFactory {
             Some(runtime_label),
             tool_context,
             conversation,
+            self.dangerously_skip_permissions,
         );
         loop_.set_max_turns(self.max_turns);
 
@@ -788,6 +799,7 @@ impl AgentRuntimeFactory {
             shared_tools: agent_loop.tool_registry.clone(),
             skill_registry: agent_loop.skill_registry.clone(),
             max_turns,
+            dangerously_skip_permissions: agent_loop.dangerously_skip_permissions,
             runtime_counter: std::sync::Arc::new(AtomicU64::new(1)),
         }
     }
@@ -807,6 +819,7 @@ impl AgentRuntimeFactory {
             shared_tools,
             skill_registry,
             max_turns: None,
+            dangerously_skip_permissions: false,
             runtime_counter: std::sync::Arc::new(AtomicU64::new(1)),
         }
     }
@@ -928,7 +941,7 @@ impl AgentLoop {
         tool_context: ToolContext,
         conversation: Conversation,
     ) -> (Self, AgentHandle) {
-        Self::new_from_shared_bootstrap(
+        Self::new_with_shared_parts_skip(
             config,
             provider,
             shared_tools,
@@ -937,6 +950,34 @@ impl AgentLoop {
             tool_context,
             conversation,
             false,
+        )
+    }
+
+    /// Same as [`new_with_shared_parts`] but carries the
+    /// `--dangerously-skip-permissions` / `-y` bypass. Used by
+    /// [`AgentRuntimeFactory::spawn_runtime`] so a runtime re-spawned for
+    /// `/session` / `/resume` / `/bg` keeps the launch-time bypass instead of
+    /// silently re-enabling approval prompts (issue #714).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_shared_parts_skip(
+        config: Config,
+        provider: Box<dyn LlmProvider>,
+        shared_tools: std::sync::Arc<ToolRegistry>,
+        skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
+        runtime_label: Option<String>,
+        tool_context: ToolContext,
+        conversation: Conversation,
+        skip_permissions: bool,
+    ) -> (Self, AgentHandle) {
+        Self::new_from_shared_bootstrap(
+            config,
+            provider,
+            shared_tools,
+            skill_registry,
+            runtime_label,
+            tool_context,
+            conversation,
+            skip_permissions,
         )
     }
 
@@ -1074,6 +1115,7 @@ impl AgentLoop {
             tool_registry: shared_tools.clone(),
             turn_runner,
             permission_store,
+            dangerously_skip_permissions: skip_permissions,
             config,
             ctx,
             env_snapshot,
@@ -4383,6 +4425,64 @@ mod agent_handle_tests {
 
         assert_eq!(factory.config.default_provider, "fresh");
         assert_eq!(factory.working_dir, std::path::PathBuf::from("/tmp/new"));
+    }
+
+    /// Issue #714: launching with `-y` / `--dangerously-skip-permissions` must
+    /// keep the bypass across runtime re-spawns (/session, /resume, /bg). The
+    /// factory is built from the initial loop, so it must read the flag back
+    /// and a runtime it spawns must inherit it — otherwise approval prompts
+    /// silently return while the ⚠ BYPASS badge stays on.
+    #[test]
+    fn factory_propagates_skip_permissions_from_initial_loop() {
+        let mut config = crate::config::Config::default();
+        config.providers.clear();
+        let tool_context = crate::tool::ToolContext::new(std::path::PathBuf::from("/tmp/p714"));
+
+        // Initial loop launched WITH the bypass (mirrors `atomcode -y`).
+        let (loop_, _handle) = super::AgentLoop::new_with_skip_permissions(
+            config,
+            crate::provider::unavailable_provider("test"),
+            crate::tool::ToolRegistry::new(),
+            tool_context,
+            crate::conversation::Conversation::new(),
+            true,
+        );
+        assert!(
+            loop_.dangerously_skip_permissions,
+            "the initial loop must record the launch-time -y bypass"
+        );
+
+        // The factory built from that loop must carry the flag forward...
+        let factory = AgentRuntimeFactory::from_initial_loop(&loop_, None);
+        assert!(
+            factory.dangerously_skip_permissions,
+            "factory must inherit the bypass so re-spawns honor -y (issue #714)"
+        );
+
+        // ...and the runtime it constructs must, too. `will_auto_approve` is the
+        // observable signal: under bypass it returns true for a normally-gated call.
+        let (spawned, _h) = super::AgentLoop::new_with_shared_parts_skip(
+            factory.config.clone(),
+            factory.build_provider(),
+            factory.shared_tools.clone(),
+            factory.skill_registry.clone(),
+            Some("runtime-1".to_string()),
+            crate::tool::ToolContext::new(factory.working_dir.clone()),
+            crate::conversation::Conversation::new(),
+            factory.dangerously_skip_permissions,
+        );
+        let call = crate::tool::ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        assert!(
+            spawned.turn_runner.permission.will_auto_approve(
+                &call,
+                &crate::tool::ApprovalRequirement::RequireApprovalAlways("sudo".into()),
+            ),
+            "a factory-spawned runtime must auto-approve under -y, even RequireApprovalAlways"
+        );
     }
 
     /// Part-2 regression (system-prompt prefix-cache stability): the system
