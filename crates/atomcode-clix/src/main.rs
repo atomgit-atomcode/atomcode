@@ -425,7 +425,10 @@ impl ReviewRun {
                 self.error = Some(message);
             }
             AgentEvent::Warning(w) => eprintln!("    [warn] {w}"),
-            AgentEvent::TurnComplete { .. } => return false,
+AgentEvent::TurnComplete { reason } => {
+    self.stop = reason;
+    return false;
+}
             _ => {}
         }
         true
