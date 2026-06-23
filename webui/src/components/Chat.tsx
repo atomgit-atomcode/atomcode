@@ -1315,7 +1315,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           aria-label={t('sync.toggle')}
           aria-pressed={sync}
         >
-          ⇄
+          {/* lucide `arrow-left-right` — matches the pencil design's sync icon. */}
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M8 3 4 7l4 4" />
+            <path d="M4 7h16" />
+            <path d="m16 21 4-4-4-4" />
+            <path d="M20 17H4" />
+          </svg>
         </button>
         <span class="footer-spacer" />
         {tokens && (
@@ -1657,6 +1673,144 @@ function UserMessageView({ msg }: { msg: Message }) {
   );
 }
 
+// Map a tool's wire name to a leading line-icon category (mirrors the inline
+// design: file / search / edit / terminal / globe / folder …).
+function toolCategory(name: string): string {
+  if (name.startsWith('mcp__')) return 'mcp';
+  switch (name) {
+    case 'read_file':
+    case 'read_symbol':
+    case 'list_symbols':
+    case 'file_dependencies':
+      return 'file';
+    case 'edit_file':
+    case 'write_file':
+    case 'create_file':
+    case 'search_replace':
+    case 'parallel_edit_files':
+      return 'edit';
+    case 'grep':
+    case 'glob':
+    case 'find_references':
+    case 'trace_callees':
+    case 'trace_callers':
+    case 'trace_chain':
+    case 'blast_radius':
+      return 'search';
+    case 'bash':
+      return 'terminal';
+    case 'web_fetch':
+    case 'web_search':
+      return 'globe';
+    case 'list_directory':
+    case 'change_dir':
+      return 'folder';
+    case 'use_skill':
+      return 'skill';
+    case 'todo':
+      return 'todo';
+    default:
+      return 'default';
+  }
+}
+
+const TOOL_ICON_PATHS: Record<string, VNode> = {
+  file: (
+    <>
+      <path d="M9 1.75H4.5A1.5 1.5 0 0 0 3 3.25v9.5a1.5 1.5 0 0 0 1.5 1.5h7a1.5 1.5 0 0 0 1.5-1.5V5.75L9 1.75Z" />
+      <path d="M9 1.75v4h4" />
+    </>
+  ),
+  edit: <path d="M11.4 2.6l2 2L6 12l-2.6.6L4 10l7.4-7.4Z" />,
+  search: (
+    <>
+      <circle cx="7" cy="7" r="4.25" />
+      <path d="M10.2 10.2 14 14" />
+    </>
+  ),
+  terminal: (
+    <>
+      <rect x="2" y="3" width="12" height="10" rx="1.5" />
+      <path d="M4.5 6.5 7 8.5 4.5 10.5" />
+      <path d="M8.5 10.5h3" />
+    </>
+  ),
+  globe: (
+    <>
+      <circle cx="8" cy="8" r="6" />
+      <path d="M2 8h12" />
+      <path d="M8 2c2.2 2.2 2.2 9.8 0 12-2.2-2.2-2.2-9.8 0-12Z" />
+    </>
+  ),
+  folder: (
+    <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.5l1.3 1.6h5.2A1.5 1.5 0 0 1 14 6.1v5.9a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12V4.5Z" />
+  ),
+  skill: <path d="M9 1.5 3.5 9H7.5L7 14.5 12.5 7H8.5L9 1.5Z" />,
+  todo: (
+    <>
+      <path d="M6.5 4.5H13M6.5 8H13M6.5 11.5H13" />
+      <path d="M2.5 4.4l.8.8 1.5-1.7" />
+      <circle cx="3.3" cy="8" r="0.5" fill="currentColor" stroke="none" />
+      <circle cx="3.3" cy="11.5" r="0.5" fill="currentColor" stroke="none" />
+    </>
+  ),
+  mcp: (
+    <>
+      <rect x="3" y="3" width="4.5" height="4.5" rx="1" />
+      <rect x="8.5" y="8.5" width="4.5" height="4.5" rx="1" />
+      <path d="M7.5 5.25h2A1.5 1.5 0 0 1 11 6.75v1.75" />
+    </>
+  ),
+  default: <circle cx="8" cy="8" r="2.5" />,
+};
+
+function ToolTypeIcon({ name }: { name: string }) {
+  return (
+    <svg
+      class="tool-type-icon"
+      width="14"
+      height="14"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.4"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      {TOOL_ICON_PATHS[toolCategory(name)] ?? TOOL_ICON_PATHS.default}
+    </svg>
+  );
+}
+
+// Status glyph: a check when done, a cross on error, otherwise a spinner that
+// animates while the call is pending / awaiting approval.
+function ToolStatusIcon({ cls }: { cls: string }) {
+  const spin = cls === 'pending' || cls === 'waiting';
+  return (
+    <svg
+      class={'tool-status-icon' + (spin ? ' spin' : '')}
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.6"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      {cls === 'success' ? (
+        <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
+      ) : cls === 'error' ? (
+        <path d="M4 4l8 8M12 4l-8 8" />
+      ) : (
+        <path d="M8 2.5a5.5 5.5 0 1 1-5.18 3.65" />
+      )}
+    </svg>
+  );
+}
+
 function ToolRowView({ tool }: { tool: ToolRow }) {
   const t = useT();
   const [expanded, setExpanded] = useState(false);
@@ -1679,10 +1833,14 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
   return (
     <div class="tool-body">
       <div class="tool-header" onClick={() => setExpanded((e) => !e)}>
+        <ToolTypeIcon name={tool.name} />
         <span class="tool-name">{displayToolName(tool.name)}</span>
         <span class="tool-name-secondary">{abbreviateArgs(formatToolDetail(tool.name, tool.args))}</span>
         {annotation && (
-          <span class={'tool-annotation ' + annotation.cls}>{annotation.label}</span>
+          <span class={'tool-annotation ' + annotation.cls}>
+            <ToolStatusIcon cls={annotation.cls} />
+            {annotation.label}
+          </span>
         )}
         {hasDetail && (
           <span class={'tool-chevron' + (expanded ? ' expanded' : '')}>▾</span>
