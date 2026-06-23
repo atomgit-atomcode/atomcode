@@ -1326,71 +1326,9 @@ impl TurnRunner {
         // ghost inflight rows in scrollback). When we reach here the
         // call has already cleared that guard exactly once.
 
-        // Check permission via the injected PermissionDecider.
-        // AutoApprove tools execute immediately; RequireApproval tools go through
-        // the decider which handles interactive prompts or automatic policy.
-        let approval = tool.approval_with_context(&call.arguments, &self.context);
-        if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
-        | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason)
-        | crate::tool::ApprovalRequirement::RequireApprovalScoped { ref reason, .. } = approval
-        {
-            // Only emit the ApprovalRequested event (which triggers the
-            // TUI approval prompt) when the decider actually needs user
-            // input.  If the PermissionStore already has a session grant
-            // or override (e.g. the user pressed [A] on a prior call of
-            // the same tool in this batch), `will_auto_approve` returns
-            // true and we skip the event — the subsequent `decide()` call
-            // will return Allow without blocking.  Without this guard,
-            // parallel MCP calls show N redundant "Waiting for approval"
-            // prompts even though all but the first are auto-resolved.
-            let needs_prompt = !self.permission.will_auto_approve(call, &approval);
-            if needs_prompt {
-                // Emit an informational event carrying a snapshot of
-                // conversation state so the TUI can persist mid-turn
-                // session state (e.g. for `/bg`). Only clone here
-                // (lazily, when approval is actually needed) instead
-                // of per-tool-call — avoids O(N) full message-list
-                // clones for batch turns with many tools.
-                let _ = event_tx.send(TurnEvent::ApprovalRequested {
-                    tool_name: call.name.clone(),
-                    reason: reason.clone(),
-                    call: call.clone(),
-                    snapshot: conversation.snapshot(),
-                });
-            }
-
-            let decision = self.permission.decide(call, &approval).await;
-            if !matches!(decision, PermissionDecision::Allow) {
-                let output = format!("Tool '{}' was denied by the user.", call.name);
-                let _ = event_tx.send(TurnEvent::ToolCallResult {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    output: output.clone(),
-                    success: false,
-                    duration: std::time::Duration::ZERO,
-                });
-            self.context.telemetry.track(TelemetryEvent::ToolCall {
-                name: corrected_name.clone(),
-                success: false,
-                duration_ms: 0,
-                error_kind: Some(ToolErrorKind::DeniedByUser),
-                error_data: Some(serde_json::json!({
-                    "tool_name": corrected_name,
-                    "duration_ms": 0,
-                    "args_summary": build_args_summary(&corrected_name, &call.arguments),
-                    "approval_reason": reason,
-                    "reason": "User denied tool execution",
-                }).to_string()),
-            });
-                return ToolResult {
-                    call_id: call.id.clone(),
-                    output,
-                    success: false,
-                };
-            }
-        }
-
-        // --- 统一 PreToolUse Hook ---
+        // --- 统一 PreToolUse Hook (before approval — Issue #512) ---
+        // PreToolUse hooks run BEFORE the approval check so that an explicit
+        // "allow" from a hook can skip the ApprovalPrompt entirely.
         let working_dir = self.context.working_dir.read().await.clone();
         let pr_hook_ctx = HookCtx::new(
             call.name.clone(),
@@ -1408,11 +1346,15 @@ impl TurnRunner {
         self.hook_engine.trigger_on_tool_call_start(&tc_start_ctx).await;
 
         let mut final_args = call.arguments.clone();
+        let mut hook_explicitly_allowed = false;
         match self.hook_engine.trigger_pre_tool_use(&pr_hook_ctx).await {
-            Ok(Some(new_args)) => {
+            Ok((Some(new_args), allowed)) => {
                 final_args = new_args;
+                hook_explicitly_allowed = allowed;
             }
-            Ok(None) => {}
+            Ok((None, allowed)) => {
+                hook_explicitly_allowed = allowed;
+            }
             Err(reason) => {
                 let output = format!("Tool '{}' was blocked by hook: {}", call.name, reason);
                 let _ = event_tx.send(TurnEvent::ToolCallResult {
@@ -1440,6 +1382,74 @@ impl TurnRunner {
                     output,
                     success: false,
                 };
+            }
+        }
+
+        // Check permission via the injected PermissionDecider.
+        // AutoApprove tools execute immediately; RequireApproval tools go through
+        // the decider which handles interactive prompts or automatic policy.
+        // Skip approval entirely when a PreToolUse hook explicitly allowed
+        // the tool call (Issue #512).
+        if !hook_explicitly_allowed {
+            let approval = tool.approval_with_context(&final_args, &self.context);
+            if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
+            | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason)
+            | crate::tool::ApprovalRequirement::RequireApprovalScoped { ref reason, .. } = approval
+            {
+                // Only emit the ApprovalRequested event (which triggers the
+                // TUI approval prompt) when the decider actually needs user
+                // input.  If the PermissionStore already has a session grant
+                // or override (e.g. the user pressed [A] on a prior call of
+                // the same tool in this batch), `will_auto_approve` returns
+                // true and we skip the event — the subsequent `decide()` call
+                // will return Allow without blocking.  Without this guard,
+                // parallel MCP calls show N redundant "Waiting for approval"
+                // prompts even though all but the first are auto-resolved.
+                let needs_prompt = !self.permission.will_auto_approve(call, &approval);
+                if needs_prompt {
+                    // Emit an informational event carrying a snapshot of
+                    // conversation state so the TUI can persist mid-turn
+                    // session state (e.g. for `/bg`). Only clone here
+                    // (lazily, when approval is actually needed) instead
+                    // of per-tool-call — avoids O(N) full message-list
+                    // clones for batch turns with many tools.
+                    let _ = event_tx.send(TurnEvent::ApprovalRequested {
+                        tool_name: call.name.clone(),
+                        reason: reason.clone(),
+                        call: call.clone(),
+                        snapshot: conversation.snapshot(),
+                    });
+                }
+
+                let decision = self.permission.decide(call, &approval).await;
+                if !matches!(decision, PermissionDecision::Allow) {
+                    let output = format!("Tool '{}' was denied by the user.", call.name);
+                    let _ = event_tx.send(TurnEvent::ToolCallResult {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        output: output.clone(),
+                        success: false,
+                        duration: std::time::Duration::ZERO,
+                    });
+                self.context.telemetry.track(TelemetryEvent::ToolCall {
+                    name: corrected_name.clone(),
+                    success: false,
+                    duration_ms: 0,
+                    error_kind: Some(ToolErrorKind::DeniedByUser),
+                    error_data: Some(serde_json::json!({
+                        "tool_name": corrected_name,
+                        "duration_ms": 0,
+                        "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                        "approval_reason": reason,
+                        "reason": "User denied tool execution",
+                    }).to_string()),
+                });
+                    return ToolResult {
+                        call_id: call.id.clone(),
+                        output,
+                        success: false,
+                    };
+                }
             }
         }
 
