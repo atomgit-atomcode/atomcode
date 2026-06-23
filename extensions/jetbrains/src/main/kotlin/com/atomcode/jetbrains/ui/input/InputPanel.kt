@@ -4,14 +4,20 @@ import com.atomcode.jetbrains.ui.ChatContextItem
 import com.intellij.ui.JBColor
 import java.awt.BorderLayout
 import java.awt.CardLayout
+import java.awt.Component
+import java.awt.Cursor
 import java.awt.Dimension
-import java.awt.FlowLayout
 import java.awt.Insets
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
 import javax.swing.BoxLayout
 import javax.swing.AbstractAction
 import javax.swing.BorderFactory
 import javax.swing.JButton
 import javax.swing.JLabel
+import javax.swing.JMenuItem
+import javax.swing.MenuElement
+import javax.swing.MenuSelectionManager
 import javax.swing.JPanel
 import javax.swing.JPopupMenu
 import javax.swing.JScrollPane
@@ -35,6 +41,7 @@ class InputPanel(
 ) : JPanel(BorderLayout()) {
 
     private var slashTriggerConsumed = false
+    private var commandPopup: JPopupMenu? = null
 
     private val inputArea = JTextArea().apply {
         rows = 3
@@ -81,11 +88,20 @@ class InputPanel(
 
     private val modelLabel = JLabel("GPT-4o ▾").apply {
         font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 2f)
-        // JBColor(亮色, 暗色)
-        foreground = JBColor(0x2D8A6E, 0x4EC9B0)
-        cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
-        addMouseListener(object : java.awt.event.MouseAdapter() {
-            override fun mouseClicked(e: java.awt.event.MouseEvent) = onModelSelect()
+        foreground = MODEL_FG
+        background = CLICKABLE_BG
+        border = clickableBorder(horizontal = 10)
+        isOpaque = true
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) = onModelSelect()
+            override fun mouseEntered(e: MouseEvent) {
+                background = CLICKABLE_HOVER_BG
+            }
+
+            override fun mouseExited(e: MouseEvent) {
+                background = CLICKABLE_BG
+            }
         })
     }
 
@@ -123,24 +139,33 @@ class InputPanel(
             verticalScrollBarPolicy = JScrollPane.VERTICAL_SCROLLBAR_NEVER
         }
 
+        val attachButton = makeToolButton("附件", onAttach)
+        val commandButton = makeToolButton("/ 命令") { showSlashCommandsFromButton() }
+
         // 工具栏与输入框放在同一个 composer 容器内，状态切换时布局保持稳定。
-        val toolbar = JPanel(BorderLayout()).apply {
+        val toolbar = object : JPanel(null) {
+            override fun doLayout() {
+                layoutToolbar(
+                    this,
+                    attachButton,
+                    commandButton,
+                    shortcutLabel,
+                    tokenLabel,
+                    modelLabel,
+                    actionPanel,
+                )
+            }
+        }.apply {
             isOpaque = false
             border = BorderFactory.createEmptyBorder(5, 2, 1, 2)
-            val left = JPanel(FlowLayout(FlowLayout.LEFT, 2, 0)).apply {
-                isOpaque = false
-                add(makeToolButton("附件", onAttach))
-                add(makeToolButton("/ 命令", onSlashCommand))
-            }
-            val right = JPanel(FlowLayout(FlowLayout.RIGHT, 10, 0)).apply {
-                isOpaque = false
-                add(shortcutLabel)
-                add(tokenLabel)
-                add(modelLabel)
-                add(actionPanel)
-            }
-            add(left, BorderLayout.WEST)
-            add(right, BorderLayout.EAST)
+            preferredSize = Dimension(200, 36)
+            minimumSize = Dimension(0, 36)
+            add(attachButton)
+            add(commandButton)
+            add(shortcutLabel)
+            add(tokenLabel)
+            add(modelLabel)
+            add(actionPanel)
         }
 
         val composer = JPanel(BorderLayout()).apply {
@@ -182,7 +207,14 @@ class InputPanel(
     }
 
     fun showCommandPopup(menu: JPopupMenu) {
+        commandPopup?.isVisible = false
+        commandPopup = menu
+        menu.isFocusable = false
+        menu.components.forEach { it.isFocusable = false }
         menu.show(inputArea, 0, -menu.preferredSize.height)
+        filterCommandPopup(commandPrefix())
+        selectCommandMenuItem(0)
+        inputArea.requestFocusInWindow()
     }
 
     fun setGenerating(generating: Boolean) {
@@ -199,10 +231,12 @@ class InputPanel(
 
     fun setModelName(name: String) {
         modelLabel.text = "$name ▾"
+        modelLabel.parent?.revalidate()
     }
 
     fun setTokenCount(current: Int, max: Int) {
         tokenLabel.text = if (max > 0) "$current/$max" else ""
+        tokenLabel.parent?.revalidate()
     }
 
     fun clearInput() {
@@ -212,6 +246,8 @@ class InputPanel(
     fun installKeyBindings(sendWithCtrlEnter: Boolean) {
         val enterAction = "atomcode-input-enter"
         val ctrlEnterAction = "atomcode-input-ctrl-enter"
+        val shiftEnterAction = "atomcode-input-shift-enter"
+        val tabAction = "atomcode-command-tab"
 
         shortcutLabel.text = if (sendWithCtrlEnter) {
             "Ctrl+Enter 发送 · Enter 换行"
@@ -219,14 +255,56 @@ class InputPanel(
             "Enter 发送 · Shift+Enter 换行"
         }
 
+        inputArea.inputMap.put(KeyStroke.getKeyStroke("UP"), "atomcode-command-up")
+        inputArea.actionMap.put("atomcode-command-up", object : AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                if (!moveCommandSelection(-1)) {
+                    inputArea.transferFocusBackward()
+                }
+            }
+        })
+
+        inputArea.inputMap.put(KeyStroke.getKeyStroke("DOWN"), "atomcode-command-down")
+        inputArea.actionMap.put("atomcode-command-down", object : AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                if (!moveCommandSelection(1)) {
+                    inputArea.transferFocus()
+                }
+            }
+        })
+
+        inputArea.inputMap.put(KeyStroke.getKeyStroke("ESCAPE"), "atomcode-command-escape")
+        inputArea.actionMap.put("atomcode-command-escape", object : AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                hideCommandPopup()
+            }
+        })
+
+        inputArea.inputMap.put(KeyStroke.getKeyStroke("TAB"), tabAction)
+        inputArea.actionMap.put(tabAction, object : AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                if (!activateSelectedCommand()) {
+                    inputArea.transferFocus()
+                }
+            }
+        })
+
         inputArea.inputMap.put(KeyStroke.getKeyStroke("ENTER"), enterAction)
         inputArea.actionMap.put(enterAction, object : AbstractAction() {
             override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                if (activateSelectedCommand()) return
                 if (sendWithCtrlEnter) {
-                    inputArea.append("\n")
+                    insertNewline()
                 } else {
                     fireSend()
                 }
+            }
+        })
+
+        inputArea.inputMap.put(KeyStroke.getKeyStroke("shift ENTER"), shiftEnterAction)
+        inputArea.actionMap.put(shiftEnterAction, object : AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                insertNewline()
             }
         })
 
@@ -236,10 +314,24 @@ class InputPanel(
                 if (sendWithCtrlEnter) {
                     fireSend()
                 } else {
-                    inputArea.append("\n")
+                    insertNewline()
                 }
             }
         })
+    }
+
+    private fun insertNewline() {
+        inputArea.replaceSelection("\n")
+    }
+
+    private fun showSlashCommandsFromButton() {
+        if (commandPrefix() == null) {
+            slashTriggerConsumed = true
+            inputArea.text = "/"
+            inputArea.caretPosition = inputArea.document.length
+        }
+        onSlashCommand()
+        inputArea.requestFocusInWindow()
     }
 
     private fun fireSend() {
@@ -250,31 +342,188 @@ class InputPanel(
         }
     }
 
+    private fun hideCommandPopup() {
+        commandPopup?.isVisible = false
+        MenuSelectionManager.defaultManager().clearSelectedPath()
+        inputArea.requestFocusInWindow()
+    }
+
     private fun handleSlashTrigger() {
-        val isSlashOnly = inputArea.text.trim() == "/"
-        if (!isSlashOnly) {
+        val prefix = commandPrefix()
+        if (prefix == null) {
             slashTriggerConsumed = false
+            commandPopup?.isVisible = false
             return
         }
+
+        if (commandPopup?.isVisible == true) {
+            filterCommandPopup(prefix)
+            return
+        }
+
         if (slashTriggerConsumed) return
 
         slashTriggerConsumed = true
         SwingUtilities.invokeLater {
-            if (inputArea.text.trim() == "/") onSlashCommand()
+            val currentPrefix = commandPrefix()
+            if (currentPrefix != null) {
+                onSlashCommand()
+                SwingUtilities.invokeLater {
+                    filterCommandPopup(currentPrefix)
+                    selectCommandMenuItem(0)
+                }
+            }
         }
+    }
+
+    private fun commandPrefix(): String? {
+        return slashCommandPrefix(inputArea.text)
+    }
+
+    private fun commandItems(): List<JMenuItem> =
+        commandPopup
+            ?.components
+            ?.filterIsInstance<JMenuItem>()
+            .orEmpty()
+
+    private fun visibleCommandItems(): List<JMenuItem> =
+        commandItems().filter { it.isVisible }
+
+    private fun filterCommandPopup(prefix: String?) {
+        val popup = commandPopup?.takeIf { it.isVisible } ?: return
+        val normalizedPrefix = prefix.orEmpty().lowercase()
+        val items = commandItems()
+        items.forEach { item ->
+            item.isVisible = normalizedPrefix.isBlank() ||
+                item.text.lowercase().startsWith(normalizedPrefix)
+        }
+        popup.pack()
+        if (items.any { it.isVisible }) {
+            selectCommandMenuItem(0)
+        } else {
+            MenuSelectionManager.defaultManager().clearSelectedPath()
+        }
+    }
+
+    private fun selectedCommandIndex(items: List<JMenuItem>): Int {
+        val selected = MenuSelectionManager.defaultManager().selectedPath.lastOrNull() as? JMenuItem
+        val selectedIndex = items.indexOf(selected)
+        return selectedIndex.takeIf { it >= 0 } ?: 0
+    }
+
+    private fun selectCommandMenuItem(index: Int): Boolean {
+        val popup = commandPopup?.takeIf { it.isVisible } ?: return false
+        val items = visibleCommandItems()
+        if (items.isEmpty()) return false
+        val selected = index.coerceIn(items.indices)
+        MenuSelectionManager.defaultManager().selectedPath = arrayOf<MenuElement>(popup, items[selected])
+        return true
+    }
+
+    private fun moveCommandSelection(delta: Int): Boolean {
+        val popup = commandPopup?.takeIf { it.isVisible } ?: return false
+        val items = visibleCommandItems()
+        if (items.isEmpty()) return false
+        val next = (selectedCommandIndex(items) + delta).floorMod(items.size)
+        MenuSelectionManager.defaultManager().selectedPath = arrayOf<MenuElement>(popup, items[next])
+        return true
+    }
+
+    private fun activateSelectedCommand(): Boolean {
+        val popup = commandPopup?.takeIf { it.isVisible } ?: return false
+        val items = visibleCommandItems()
+        if (items.isEmpty()) return false
+        val selected = items[selectedCommandIndex(items)]
+        selected.doClick(0)
+        hideCommandPopup()
+        return true
+    }
+
+    private fun Int.floorMod(divisor: Int): Int =
+        ((this % divisor) + divisor) % divisor
+
+    private fun layoutToolbar(
+        toolbar: JPanel,
+        attach: Component,
+        command: Component,
+        shortcut: Component,
+        token: Component,
+        model: Component,
+        action: Component,
+    ) {
+        val available = toolbar.width.takeIf { it > 0 } ?: return
+        val insets = toolbar.insets
+        val left = insets.left
+        val right = available - insets.right
+        val top = insets.top
+        val height = (toolbar.height - insets.top - insets.bottom).coerceAtLeast(0)
+        val gap = 8
+
+        listOf(attach, command, shortcut, token, model, action).forEach { it.isVisible = false }
+
+        val actionSize = action.preferredSize
+        val actionWidth = actionSize.width.coerceAtMost((right - left).coerceAtLeast(0))
+        val actionX = right - actionWidth
+        action.setBounds(actionX, top + ((height - actionSize.height) / 2).coerceAtLeast(0), actionWidth, actionSize.height)
+        action.isVisible = actionWidth > 0
+
+        var leftX = left
+        val leftLimit = actionX - gap
+        fun placeLeft(component: Component) {
+            val size = component.preferredSize
+            if (leftX + size.width > leftLimit) return
+            component.setBounds(leftX, top + ((height - size.height) / 2).coerceAtLeast(0), size.width, size.height)
+            component.isVisible = true
+            leftX += size.width + gap
+        }
+        placeLeft(attach)
+        placeLeft(command)
+
+        var rightX = actionX - gap
+        val rightLimit = leftX + gap
+        fun placeRight(component: Component) {
+            val size = component.preferredSize
+            if (size.width <= 0) return
+            val x = rightX - size.width
+            if (x < rightLimit) return
+            component.setBounds(x, top + ((height - size.height) / 2).coerceAtLeast(0), size.width, size.height)
+            component.isVisible = true
+            rightX = x - gap
+        }
+        placeRight(model)
+        placeRight(token)
+        placeRight(shortcut)
     }
 
     private fun makeToolButton(text: String, action: () -> Unit): JButton =
         JButton(text).apply {
             font = font.deriveFont(font.size2D - 2f)
-            isContentAreaFilled = false
-            isBorderPainted = false
+            foreground = CLICKABLE_FG
+            background = CLICKABLE_BG
+            border = clickableBorder(horizontal = 12)
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            isContentAreaFilled = true
+            isBorderPainted = true
             isFocusPainted = false
-            margin = Insets(2, 5, 2, 5)
-            // JBColor(亮色, 暗色)
-            foreground = JBColor(0x666666, 0x999999)
+            isOpaque = true
+            margin = Insets(0, 0, 0, 0)
+            preferredSize = Dimension(preferredSize.width.coerceAtLeast(62), 30)
             addActionListener { action() }
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseEntered(e: MouseEvent) {
+                    background = CLICKABLE_HOVER_BG
+                }
+
+                override fun mouseExited(e: MouseEvent) {
+                    background = CLICKABLE_BG
+                }
+            })
         }
+
+    private fun clickableBorder(horizontal: Int) = BorderFactory.createCompoundBorder(
+        BorderFactory.createLineBorder(CLICKABLE_BORDER, 1, true),
+        BorderFactory.createEmptyBorder(5, horizontal, 5, horizontal),
+    )
 
     companion object {
         // JBColor(亮色, 暗色)
@@ -282,10 +531,21 @@ class InputPanel(
         private val INPUT_FG = JBColor(0x333333, 0xD4D4D4)
         private val COMPOSER_BORDER = JBColor(0xC9C9C9, 0x454545)
         private val SECONDARY_FG = JBColor(0x8A8A8A, 0x707070)
+        private val CLICKABLE_BG = JBColor(0xF7F7F7, 0x333333)
+        private val CLICKABLE_HOVER_BG = JBColor(0xECECEC, 0x3D3D3D)
+        private val CLICKABLE_BORDER = JBColor(0xD4D4D4, 0x4A4A4A)
+        private val CLICKABLE_FG = JBColor(0x555555, 0xB8B8B8)
+        private val MODEL_FG = JBColor(0x157A61, 0x56D6BF)
         private val SEND_BG = JBColor(0x0078D4, 0x0E639C)
         private val STOP_BG = JBColor(0xF4DEDE, 0x4A2424)
         private val STOP_FG = JBColor(0xA52D2D, 0xF48771)
         private const val SEND_CARD = "send"
         private const val STOP_CARD = "stop"
     }
+}
+
+internal fun slashCommandPrefix(text: String): String? {
+    if (!text.startsWith("/")) return null
+    if (text.any { it.isWhitespace() }) return null
+    return text
 }

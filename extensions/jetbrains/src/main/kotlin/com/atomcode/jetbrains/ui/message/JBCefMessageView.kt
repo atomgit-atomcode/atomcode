@@ -256,14 +256,16 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 	.am .parts{display:flex;flex-direction:column;gap:6px;align-items:stretch;width:100%;padding-left:25px}
 	.am .b{color:$afg;padding:0;max-width:100%;white-space:normal;word-break:break-word}
 	.am .b:empty{display:none}
-	.am .b h1,.am .b h2,.am .b h3,.am .b h4{margin:12px 0 6px;line-height:1.3}
-	.am .b h1{font-size:1.45em}.am .b h2{font-size:1.3em}.am .b h3{font-size:1.15em}
-	.am .b p{margin:5px 0}
-	.am .b ul,.am .b ol{margin:6px 0;padding-left:24px}
+	.am .b h1,.am .b h2,.am .b h3,.am .b h4{margin:10px 0 6px;line-height:1.28}
+	.am .b h1{font-size:1.22em}.am .b h2{font-size:1.14em}.am .b h3{font-size:1.06em}.am .b h4{font-size:1em}
+	.am .b p{margin:4px 0}
+	.am .b ul,.am .b ol{margin:5px 0;padding-left:22px}
+	.am .b li{margin:2px 0}
+	.am .b li>p{margin:2px 0}
 	.am .b blockquote{margin:8px 0;padding-left:10px;border-left:3px solid $cbo;color:$sfg}
-	.am .b code{font:12px 'JetBrains Mono','Consolas',monospace;background:$cbg;border-radius:3px;padding:1px 4px}
-	.am .b pre{margin:8px 0;padding:10px 12px;overflow-x:auto;white-space:pre;background:$cbg;border:1px solid $cbo;border-radius:6px}
-	.am .b pre code{padding:0;background:transparent}
+	.am .b code{font:12px 'JetBrains Mono','Consolas',monospace;background:$cbg;border-radius:3px;padding:1px 4px;word-break:normal}
+	.am .b pre{margin:7px 0;padding:9px 11px;overflow:auto;white-space:pre;background:$cbg;border:1px solid $cbo;border-radius:6px;max-width:100%}
+	.am .b pre code{display:block;padding:0;background:transparent;white-space:pre;word-break:normal}
 	.am .b table{border-collapse:collapse;margin:8px 0;max-width:100%;display:block;overflow-x:auto}
 	.am .b th,.am .b td{border:1px solid $cbo;padding:5px 8px;text-align:left}
 	.am .b a{color:$chf}
@@ -341,8 +343,8 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 		function finishAssistantTurn(){cv=false;removeStreamingCursors();removeThinkingIndicator();removeReasoningBlock();sd()}
 	function addCodeBlock(l,c,f){var d=document.createElement('div');d.className='cm';d.innerHTML='<div class="h">📄 '+h(f||l||'Code')+'</div><pre>'+h(c)+'</pre>';parts().appendChild(d);sd()}
 	function toolTone(s){s=String(s||'').toLowerCase();return s.indexOf('error')>=0||s.indexOf('fail')>=0?'error':s.indexOf('running')>=0||s.indexOf('queued')>=0?'running':s.indexOf('done')>=0||s.indexOf('success')>=0||s.indexOf('complete')>=0?'success':'idle'}
-	function toolHtml(n,s,d,a){var row='<summary><span class="chev">›</span><span class="tool-dot"></span><span class="tool-name">'+h(n)+'</span><span class="tool-summary">'+h(a||'')+'</span><span class="tool-status">'+h(s)+'</span></summary>';return '<details>'+row+(d?'<pre>'+h(d)+'</pre>':'')+'</details>'}
-	function setTool(e,n,s,d,a){e.className='tm ts-'+toolTone(s);e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d,a)}
+	function toolHtml(n,s,d,a,o){var row='<summary><span class="chev">›</span><span class="tool-dot"></span><span class="tool-name">'+h(n)+'</span><span class="tool-summary">'+h(a||'')+'</span><span class="tool-status">'+h(s)+'</span></summary>';return '<details'+(o?' open':'')+'>'+row+(d?'<pre>'+h(d)+'</pre>':'')+'</details>'}
+	function setTool(e,n,s,d,a,o){e.className='tm ts-'+toolTone(s);e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d,a,o)}
 	function addToolCall(n,s,d,a){var e=document.createElement('div');setTool(e,n,s,d,a);parts().appendChild(e);sd()}
 		function updateToolCall(n,s,d,a){var ps=parts();var tools=Array.prototype.slice.call(ps.querySelectorAll('.tm')).reverse();var e=tools.find(function(x){return x.getAttribute('data-name')===n})||tools[0];if(e){setTool(e,n,s,d,a);sd()}else addToolCall(n,s,d,a)}
 function addError(t){var d=document.createElement('div');d.className='em';d.innerHTML='⚠️ '+h(t);m.appendChild(d);last=null;sd()}
@@ -356,7 +358,7 @@ function addQueuedMessage(t){var d=document.createElement('div');d.className='qm
 	function addReasoningBlock(t){var p=parts(),th=p.querySelector('.thp');if(th)th.remove();var d=document.createElement('div');d.className='rm reasoning-content';d.innerHTML=reasoningPreview(t);p.insertBefore(d,p.firstChild);sd()}
 	function updateReasoningBlock(t){var p=parts(),d=p.querySelector('.reasoning-content');if(!d){addReasoningBlock(t);return}d.innerHTML=reasoningPreview(t);sd()}
 	function removeReasoningBlock(){var a=currentAssistant();if(!a)return;var blocks=a.querySelectorAll('.reasoning-content');Array.prototype.forEach.call(blocks,function(x){x.remove()})}
-	function renderChatModel(model){clearMessages();(model.messages||[]).forEach(function(x){if(x.text!==undefined&&x.contextSummary!==undefined)addUserMessage(x.text,x.contextSummary||[]);else if(x.markdown!==undefined)addAssistantMessage(x.markdown);else if(x.toolName!==undefined)addSystemMessage('[Permission] '+x.toolName+': '+(x.reason||''));else if(x.name!==undefined&&x.callId!==undefined)addToolCall(x.name,x.status||'',x.output||x.argumentsJson||'');else if(x.text!==undefined)addSystemMessage(x.text)});sd()}
+	function renderChatModel(model){clearMessages();(model.messages||[]).forEach(function(x){if(x.text!==undefined&&x.contextSummary!==undefined)addUserMessage(x.text,x.contextSummary||[]);else if(x.markdown!==undefined)addAssistantMessage(x.markdown);else if(x.toolName!==undefined)addSystemMessage('[Permission] '+x.toolName+': '+(x.reason||''));else if(x.name!==undefined&&x.callId!==undefined){var e=document.createElement('div');setTool(e,x.name,x.status||'',x.output||x.argumentsJson||'', '', false);parts().appendChild(e)}else if(x.text!==undefined)addSystemMessage(x.text)});sd()}
 		function clearMessages(){m.innerHTML='';last=null;active=null;ti=-1;cv=false;nb=true}
 (function find(){for(var k in window){if(k.indexOf('JBCefQuery_')===0&&typeof window[k]==='function'){window[k]('js:ready');return}}setTimeout(find,50)})();
 </script></body></html>""".trimIndent()

@@ -1,10 +1,14 @@
 package com.atomcode.jetbrains.ui
 
+import com.atomcode.jetbrains.ui.input.slashCommandPrefix
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class ChatPanelHelpersTest {
+    private val reviewTemplate = "请审查这段代码，重点关注潜在问题、改进建议和最佳实践。"
+
 
     @Test
     fun `decodeHistoryUserMessage preserves a plain prompt`() {
@@ -114,7 +118,7 @@ def hello():
     @Test
     fun `slashPromptTemplate transforms slash review`() {
         assertEquals(
-            "Please review this code for issues, improvements, and best practices.",
+            reviewTemplate,
             slashPromptTemplate("/review"),
         )
     }
@@ -123,7 +127,7 @@ def hello():
     fun `slashPromptTemplate appends suffix when present`() {
         val result = slashPromptTemplate("/review some specific code")
         assertEquals(
-            "Please review this code for issues, improvements, and best practices.\n\nsome specific code",
+            "$reviewTemplate\n\nsome specific code",
             result,
         )
     }
@@ -142,7 +146,7 @@ def hello():
     fun `slashPromptTemplate handles suffix with extra whitespace`() {
         val result = slashPromptTemplate("/review   \n  multiple words\nhere  \n")
         assertEquals(
-            "Please review this code for issues, improvements, and best practices.\n\nmultiple words\nhere",
+            "$reviewTemplate\n\nmultiple words\nhere",
             result,
         )
     }
@@ -150,8 +154,32 @@ def hello():
     @Test
     fun `slashPromptTemplate is case insensitive for commands`() {
         assertEquals(
-            "Please review this code for issues, improvements, and best practices.",
+            reviewTemplate,
             slashPromptTemplate("/REVIEW"),
+        )
+    }
+
+    @Test
+    fun `slashCommandPrefix returns command while typing`() {
+        assertEquals("/login", slashCommandPrefix("/login"))
+    }
+
+    @Test
+    fun `slashCommandPrefix stops after completed command inserts trailing space`() {
+        assertNull(slashCommandPrefix("/login "))
+    }
+
+    @Test
+    fun `isInternalHistoryUserMessage hides system reminder tails`() {
+        assertTrue(
+            isInternalHistoryUserMessage("<system-reminder>\nCurrent date: today\n</system-reminder>"),
+        )
+    }
+
+    @Test
+    fun `isInternalHistoryUserMessage hides verification nudges`() {
+        assertTrue(
+            isInternalHistoryUserMessage("You made code edits but have not verified them. Run a fast check (`cargo check`)."),
         )
     }
 }

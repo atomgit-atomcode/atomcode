@@ -59,24 +59,24 @@
     <action
       id="atomcode.openChat"
       class="com.atomcode.jetbrains.actions.OpenChatAction"
-      text="AtomCode: Open Chat"
-      description="Open the AtomCode chat tool window">
+      text="AtomCode：打开聊天"
+      description="打开 AtomCode 聊天工具窗口">
       <add-to-group group-id="ToolsMenu" anchor="last" />
     </action>
 
     <action
       id="atomcode.openChatInNewTab"
       class="com.atomcode.jetbrains.actions.OpenChatInNewTabAction"
-      text="AtomCode: Open Chat in New Tab"
-      description="Open a separate AtomCode chat tab in the tool window">
+      text="AtomCode：在新标签页打开聊天"
+      description="在工具窗口中打开独立的 AtomCode 聊天标签页">
       <add-to-group group-id="ToolsMenu" anchor="last" />
     </action>
 
     <action
       id="atomcode.focusInput"
       class="com.atomcode.jetbrains.actions.FocusInputAction"
-      text="AtomCode: Focus Input"
-      description="Open AtomCode and focus the chat input">
+      text="AtomCode：聚焦输入框"
+      description="打开 AtomCode 并聚焦聊天输入框">
       <add-to-group group-id="ToolsMenu" anchor="last" />
       <keyboard-shortcut keymap="$default" first-keystroke="control alt shift I" />
     </action>
@@ -84,8 +84,8 @@
     <action
       id="atomcode.newConversation"
       class="com.atomcode.jetbrains.actions.NewConversationAction"
-      text="AtomCode: New Conversation"
-      description="Start a new AtomCode conversation">
+      text="AtomCode：新建会话"
+      description="开始一个新的 AtomCode 会话">
       <add-to-group group-id="ToolsMenu" anchor="last" />
       <keyboard-shortcut keymap="$default" first-keystroke="control alt shift N" />
     </action>
@@ -93,32 +93,32 @@
     <action
       id="atomcode.stopGeneration"
       class="com.atomcode.jetbrains.actions.StopGenerationAction"
-      text="AtomCode: Stop Generation"
-      description="Stop the active AtomCode generation">
+      text="AtomCode：停止生成"
+      description="停止当前 AtomCode 生成">
       <add-to-group group-id="ToolsMenu" anchor="last" />
     </action>
 
     <action
       id="atomcode.openChanges"
       class="com.atomcode.jetbrains.actions.OpenChangesAction"
-      text="AtomCode: Open Changes"
-      description="Open project changes used by AtomCode">
+      text="AtomCode：打开变更"
+      description="打开 AtomCode 使用的项目变更">
       <add-to-group group-id="ToolsMenu" anchor="last" />
     </action>
 
     <action
       id="atomcode.openSettings"
       class="com.atomcode.jetbrains.actions.OpenSettingsAction"
-      text="AtomCode: Open Settings"
-      description="Open AtomCode plugin settings">
+      text="AtomCode：打开设置"
+      description="打开 AtomCode 插件设置">
       <add-to-group group-id="ToolsMenu" anchor="last" />
     </action>
 
     <action
       id="atomcode.explainSelection"
       class="com.atomcode.jetbrains.actions.ExplainSelectionAction"
-      text="AtomCode: Explain Selection"
-      description="Explain the selected code with AtomCode">
+      text="AtomCode：解释选中内容"
+      description="使用 AtomCode 解释选中的代码">
       <add-to-group group-id="EditorPopupMenu" anchor="last" />
       <keyboard-shortcut keymap="$default" first-keystroke="control alt shift E" />
     </action>
@@ -126,24 +126,24 @@
     <action
       id="atomcode.fixSelection"
       class="com.atomcode.jetbrains.actions.FixSelectionAction"
-      text="AtomCode: Fix Selection"
-      description="Fix the selected code with AtomCode">
+      text="AtomCode：修复选中内容"
+      description="使用 AtomCode 修复选中的代码">
       <add-to-group group-id="EditorPopupMenu" anchor="last" />
     </action>
 
     <action
       id="atomcode.optimizeSelection"
       class="com.atomcode.jetbrains.actions.OptimizeSelectionAction"
-      text="AtomCode: Optimize Selection"
-      description="Optimize the selected code with AtomCode">
+      text="AtomCode：优化选中内容"
+      description="使用 AtomCode 优化选中的代码">
       <add-to-group group-id="EditorPopupMenu" anchor="last" />
     </action>
 
     <action
       id="atomcode.addContext"
       class="com.atomcode.jetbrains.actions.AddContextAction"
-      text="AtomCode: Add Selection/File as Context"
-      description="Attach the current selection or file to the next AtomCode message">
+      text="AtomCode：添加选中内容/文件为上下文"
+      description="将当前选中内容或文件附加到下一条 AtomCode 消息">
       <add-to-group group-id="EditorPopupMenu" anchor="last" />
     </action>
   </actions>

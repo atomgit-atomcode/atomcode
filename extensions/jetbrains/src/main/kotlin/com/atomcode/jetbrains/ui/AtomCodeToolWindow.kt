@@ -12,6 +12,7 @@ import com.intellij.ui.content.Content
 import com.intellij.ui.content.ContentFactory
 import com.intellij.ui.content.ContentManagerEvent
 import com.intellij.ui.content.ContentManagerListener
+import java.awt.Dimension
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.JMenuItem
@@ -22,6 +23,7 @@ import javax.swing.SwingUtilities
 
 const val ATOMCODE_TOOL_WINDOW_ID = "AtomCode"
 private val ATOMCODE_TAB_ID_KEY = Key.create<String>("atomcode.tabId")
+private val ATOMCODE_TOOL_WINDOW_MIN_SIZE = Dimension(360, 300)
 
 fun createAtomCodeChatContent(project: Project, toolWindow: ToolWindow, closeable: Boolean): AtomCodeChatPanel {
     val name = nextChatTabName(toolWindow)
@@ -51,6 +53,7 @@ private fun createAtomCodeChatContent(
     }
     toolWindow.contentManager.addContent(content)
     toolWindow.contentManager.setSelectedContent(content)
+    toolWindow.component.minimumSize = ATOMCODE_TOOL_WINDOW_MIN_SIZE
 
     // 给标签栏安装右键菜单
     installTabPopupMenu(toolWindow, project)

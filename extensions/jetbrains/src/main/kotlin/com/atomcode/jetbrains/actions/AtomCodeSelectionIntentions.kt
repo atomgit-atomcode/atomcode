@@ -29,21 +29,21 @@ abstract class AtomCodeSelectionIntention(
 }
 
 class ExplainSelectionIntention : AtomCodeSelectionIntention(
-    "AtomCode: Explain Selection",
-    "Please explain this code. What does it do, and why?",
+    "AtomCode：解释选中内容",
+    "请解释这段代码。它做了什么，为什么这样实现？",
 )
 
 class FixSelectionIntention : AtomCodeSelectionIntention(
-    "AtomCode: Fix Selection",
-    "Please fix any bugs or issues in this code.",
+    "AtomCode：修复选中内容",
+    "请修复这段代码中的错误或问题。",
 )
 
 class OptimizeSelectionIntention : AtomCodeSelectionIntention(
-    "AtomCode: Optimize Selection",
-    "Please optimize this code for better performance and readability.",
+    "AtomCode：优化选中内容",
+    "请优化这段代码，提升性能和可读性。",
 )
 
 class AddContextIntention : AtomCodeSelectionIntention(
-    "AtomCode: Add Selection/File as Context",
+    "AtomCode：添加选中内容/文件为上下文",
     null,
 )

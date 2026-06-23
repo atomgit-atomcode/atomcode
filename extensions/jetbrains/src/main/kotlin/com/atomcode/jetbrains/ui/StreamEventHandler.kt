@@ -87,7 +87,9 @@ class StreamEventHandler(
     }
 
     fun onArtifactStart(title: String?) {
-        messageView.addAssistantEvent("[Artifact] ${title ?: "untitled"} started")
+        // Artifact lifecycle events mirror content that is already present in
+        // the streamed markdown. Rendering them inline splits the text segment
+        // and causes the next delta to replay the accumulated segment.
     }
 
     fun onArtifactContent(content: String) {
@@ -96,7 +98,7 @@ class StreamEventHandler(
     }
 
     fun onArtifactEnd(id: String) {
-        messageView.addAssistantEvent("[Artifact] $id ended")
+        // See onArtifactStart: keep artifact bookkeeping out of the transcript.
     }
 
     fun onPermissionRequired(event: ChatEvent.PermissionRequest) {

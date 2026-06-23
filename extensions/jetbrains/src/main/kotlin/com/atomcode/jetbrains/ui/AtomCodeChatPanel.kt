@@ -74,6 +74,8 @@ import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
 private const val MAX_ATTACHED_FILE_CHARS = 120_000
+private const val MIN_CHAT_PANEL_WIDTH = 360
+private const val MIN_CHAT_PANEL_HEIGHT = 300
 
 class AtomCodeChatPanel(
     private val project: Project,
@@ -127,7 +129,7 @@ class AtomCodeChatPanel(
     }
 
     init {
-        minimumSize = Dimension(280, 300)
+        minimumSize = Dimension(MIN_CHAT_PANEL_WIDTH, MIN_CHAT_PANEL_HEIGHT)
 
         // ── Assemble 3-zone layout ──
         add(header, BorderLayout.NORTH)
@@ -170,6 +172,12 @@ class AtomCodeChatPanel(
     fun submitPrompt(prompt: String) {
         inputPanel.setInputText(prompt)
         handleSend(prompt)
+    }
+
+    fun composePrompt(prompt: String, context: ChatContextItem? = null) {
+        context?.let(::addContext)
+        inputPanel.setInputText(prompt)
+        focusInput()
     }
 
     fun stopCurrentGeneration() {
@@ -667,25 +675,41 @@ class AtomCodeChatPanel(
 
     private fun renderSession(detail: SessionDetail) {
         messageView.clear()
-        addSystemMessage("Loaded ${detail.name.ifBlank { detail.id.take(8) }}.\n")
-        detail.messages.forEach(::renderHistoryMessage)
+        var assistantGroupOpen = false
+        detail.messages.forEach { message ->
+            val role = message.role.lowercase()
+            when (role) {
+                "user" -> {
+                    if (isInternalHistoryUserMessage(message.content)) return@forEach
+                    val restored = decodeHistoryUserMessage(message.content)
+                    messageView.addUserMessage(restored.text, restored.contextSummary)
+                    assistantGroupOpen = false
+                }
+                "assistant" -> {
+                    if (!assistantGroupOpen) {
+                        messageView.beginAssistantTurn()
+                    }
+                    messageView.addAssistantMessage(message.content)
+                    messageView.finishAssistantTurn()
+                    assistantGroupOpen = true
+                }
+                "tool" -> {
+                    renderHistoryToolMessage(message.content)
+                    assistantGroupOpen = true
+                }
+                "system" -> Unit
+                else -> {
+                    addSystemMessage(message.content)
+                    assistantGroupOpen = false
+                }
+            }
+        }
     }
 
-    private fun renderHistoryMessage(message: MessageInfo) {
-        when (message.role.lowercase()) {
-            "user" -> {
-                val restored = decodeHistoryUserMessage(message.content)
-                messageView.addUserMessage(restored.text, restored.contextSummary)
-            }
-            "assistant" -> {
-                messageView.beginAssistantTurn()
-                messageView.addAssistantMessage(message.content)
-                messageView.finishAssistantTurn()
-            }
-            "tool" -> addSystemMessage("Tool: ${message.content}")
-            "system" -> addSystemMessage(message.content)
-            else -> addSystemMessage(message.content)
-        }
+    private fun renderHistoryToolMessage(content: String) {
+        val detail = content.trim()
+        if (detail.isBlank()) return
+        messageView.addToolCall("tool", "done", detail, "历史工具结果")
     }
 
     // ── Send / Chat streaming ──
@@ -1071,7 +1095,7 @@ class AtomCodeChatPanel(
         menu.add(JMenuItem("🗑 Delete Session").apply { addActionListener { deleteSelectedSession() } })
         menu.add(JMenuItem("🔄 Refresh Sessions").apply { addActionListener { refreshSessionList() } })
         menu.add(JSeparator())
-        menu.add(JMenuItem("📂 Open Changes").apply { addActionListener { openProjectChanges() } })
+        menu.add(JMenuItem("📂 打开变更").apply { addActionListener { openProjectChanges() } })
         menu.add(JMenuItem("🩺 Diagnostics").apply { addActionListener { showDiagnostics() } })
         menu.add(JMenuItem("⚙ Settings...").apply { addActionListener { project.openAtomCodeSettings() } })
         val pointer = java.awt.MouseInfo.getPointerInfo().location; SwingUtilities.convertPointFromScreen(pointer, this); menu.show(this, pointer.x, pointer.y)
@@ -1080,8 +1104,8 @@ class AtomCodeChatPanel(
     private fun showCommandMenu() {
         val menu = JPopupMenu()
         val items = listOf(
-            SlashCommand("/login", "Sign in with AtomGit"),
-            SlashCommand("/review", "Review code"),
+            SlashCommand("/login", "登录 AtomGit"),
+            SlashCommand("/review", "审查代码"),
         )
         items.forEach { command ->
             menu.add(JMenuItem("${command.name} - ${command.description}").apply {
@@ -1142,6 +1166,12 @@ internal fun decodeHistoryUserMessage(content: String): HistoryUserMessage {
     return HistoryUserMessage(question, contextNames)
 }
 
+internal fun isInternalHistoryUserMessage(content: String): Boolean {
+    val trimmed = content.trim()
+    return trimmed.startsWith("<system-reminder>") ||
+        trimmed.startsWith("You made code edits but have not verified them.")
+}
+
 private val HISTORY_CONTEXT_FILE_PATTERN =
     Regex("(?m)^File: (.+?)(?: \\(lines \\d+-\\d+\\))?\\r?\\n```")
 
@@ -1160,7 +1190,7 @@ internal fun slashPromptTemplate(prompt: String): String? {
     val command = parts.firstOrNull()?.lowercase() ?: return null
     val suffix = parts.getOrNull(1)?.trim().orEmpty()
     val template = when (command) {
-        "/review" -> "Please review this code for issues, improvements, and best practices."
+        "/review" -> "请审查这段代码，重点关注潜在问题、改进建议和最佳实践。"
         else -> return null
     }
     return if (suffix.isBlank()) template else "$template\n\n$suffix"
