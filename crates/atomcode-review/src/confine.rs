@@ -91,7 +91,7 @@ fn check_one(root: &Path, raw: &str) -> Result<(), String> {
             "path '{raw}' is outside the review repository; review tools may only access files within the repo"
         ));
     }
-    if let Some(existing) = existing_prefix(&normalized) {
+    if let Some(existing) = existing_prefix(&joined) {
         if let (Ok(canon_root), Ok(canon_existing)) =
             (std::fs::canonicalize(root), std::fs::canonicalize(existing))
         {
