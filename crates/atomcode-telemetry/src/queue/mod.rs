@@ -5,7 +5,7 @@ pub mod roll;
 use crate::event::Record;
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, ErrorKind, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -202,9 +202,7 @@ impl Queue {
         for p in &segs {
             let meta = fs::metadata(p)?;
             total_bytes += meta.len();
-            // Line-count approx via file size / avg_line is avoided here for accuracy:
-            let contents = fs::read_to_string(p).unwrap_or_default();
-            total_events += contents.lines().filter(|l| !l.is_empty()).count() as u64;
+            total_events += count_non_empty_lines(p).unwrap_or_default();
         }
         Ok(QueueStats {
             segment_count: segs.len(),
@@ -240,10 +238,7 @@ impl Queue {
                 break;
             }
             if let Some(oldest) = segs.first() {
-                // Count lines before delete to update dropped.
-                if let Ok(contents) = fs::read_to_string(oldest) {
-                    self.dropped += contents.lines().filter(|l| !l.is_empty()).count() as u64;
-                }
+                self.dropped += count_non_empty_lines(oldest).unwrap_or_default();
                 fs::remove_file(oldest)?;
             } else {
                 break;
@@ -266,6 +261,18 @@ fn ready_path_for_claim(path: &Path) -> Option<PathBuf> {
     let marker_start = name.rfind(SENDING_MARKER)?;
     let ready_name = &name[..marker_start];
     Some(path.with_file_name(ready_name))
+}
+
+fn count_non_empty_lines(path: &Path) -> Result<u64> {
+    let file = File::open(path).with_context(|| format!("opening segment {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut count = 0u64;
+    for line in reader.lines() {
+        if !line?.is_empty() {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// Scan the queue directory for stale artifacts left by a previous process
@@ -511,5 +518,14 @@ mod tests {
             nonempty_partial.exists(),
             "non-empty .partial file should be kept"
         );
+    }
+
+    #[test]
+    fn count_non_empty_lines_ignores_blank_lines() {
+        let d = TempDir::new().unwrap();
+        let path = d.path().join("segment.ndjson");
+        fs::write(&path, b"{\"a\":1}\n\n{\"b\":2}\n\n").unwrap();
+
+        assert_eq!(count_non_empty_lines(&path).unwrap(), 2);
     }
 }
