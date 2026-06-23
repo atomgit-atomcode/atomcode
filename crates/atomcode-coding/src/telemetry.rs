@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message};
-use atomcode_kernel::middleware::ToolMiddleware;
+use atomcode_kernel::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
@@ -389,14 +389,14 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
         call: &mut ToolCall,
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         if let Ok(mut m) = self.inflight.lock() {
             m.insert(call.id.clone(), (call.name.clone(), Instant::now()));
         }
-        Ok(())
+        BeforeOutcome::Proceed
     }
 
-    async fn after(&self, result: &mut ToolResult) {
+    async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
         // No stamp ⇒ this middleware's `before` never ran (a prior middleware blocked
         // the call); nothing to attribute.
         let Some((name, started)) = self
@@ -405,7 +405,7 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
             .ok()
             .and_then(|mut m| m.remove(&result.call_id))
         else {
-            return;
+            return AfterOutcome::Proceed;
         };
         let success = !result.is_error;
         // A middleware block (e.g. approval deny) yields a deterministic
@@ -427,31 +427,37 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
             error_data: None,
         };
         self.attr.emit(event).await;
+        AfterOutcome::Proceed
     }
 }
 
 /// An [`LlmProvider`] decorator that records one [`Event::LlmChat`] for each call made
-/// THROUGH it. Its job: count the [`OverflowCompaction`] tier-2 summary LLM call, which
-/// otherwise bypasses the turn-level [`TelemetryHook`] entirely — it is an INTERNAL
-/// capability call (history summarization), not an agent round, so `on_request` /
-/// `on_model_response` never fire for it and its token spend was invisible. This is the
-/// v2 port of core's `run_llm_summary` telemetry (`c58427a3`).
+/// THROUGH it. Its job: meter LLM calls that run OUTSIDE the instrumented host agent
+/// loop, where the turn-level [`TelemetryHook`] (which fires on `on_request` /
+/// `on_model_response`) never sees them and their token spend would be invisible. Three
+/// such call sites wrap their provider with this:
+///   - the [`OverflowCompaction`] tier-2 summary call (history summarization — the v2
+///     port of core's `run_llm_summary` telemetry, `c58427a3`);
+///   - the in-session `code_review` sub-agent (assembled in [`assemble`](crate::assemble));
+///   - the standalone `atomcodex review` agent (wrapped by the clix driver).
+///
+/// The latter two run their own kernel loop with no telemetry hooks of their own.
 ///
 /// The emitted event is a plain `LlmChat` (the telemetry `Event` enum has no
-/// compaction-specific variant) carrying the call's REAL token usage (folded from the
+/// sub-agent-specific variant) carrying the call's REAL token usage (folded from the
 /// stream's [`StreamEvent::Usage`] events) and wall-clock duration. The per-zone
-/// breakdown is folded into the message zone (an internal summary call has no
-/// system/tool zones) so zones still sum to the prompt total. Wrapping is opt-in at
-/// assembly — only when a telemetry sink is configured — so a telemetry-free embedder
-/// keeps a zero-telemetry kernel AND an undecorated summary provider.
+/// breakdown is folded into the message zone (these out-of-loop calls have no
+/// separately-measured system/tool zones) so zones still sum to the prompt total.
+/// Wrapping is opt-in at assembly — only when a telemetry sink is configured — so a
+/// telemetry-free embedder keeps a zero-telemetry kernel AND an undecorated provider.
 ///
 /// [`OverflowCompaction`]: atomcode_capabilities::compaction::OverflowCompaction
-pub struct CompactionTelemetryProvider {
+pub struct MeteredProvider {
     inner: Arc<dyn LlmProvider>,
     attr: Arc<Attribution>,
 }
 
-impl CompactionTelemetryProvider {
+impl MeteredProvider {
     pub fn new(
         inner: Arc<dyn LlmProvider>,
         telemetry: Arc<Telemetry>,
@@ -465,7 +471,7 @@ impl CompactionTelemetryProvider {
 }
 
 #[async_trait]
-impl LlmProvider for CompactionTelemetryProvider {
+impl LlmProvider for MeteredProvider {
     fn model_name(&self) -> &str {
         self.inner.model_name()
     }
@@ -758,7 +764,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = RequestCtx::new(tx, None);
         let mut call = ToolCall { id: "c9".into(), name: "bash".into(), arguments: "{}".into() };
-        mw.before(&mut call, &tool, &rt).await.unwrap();
+        let _ = mw.before(&mut call, &tool, &rt).await;
         // Approval denied upstream → the kernel hands `after` a "blocked: …" result.
         let mut result =
             ToolResult { call_id: "c9".into(), content: "blocked: user denied".into(), is_error: true };
@@ -787,7 +793,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = RequestCtx::new(tx, None);
         let mut call = ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() };
-        mw.before(&mut call, &tool, &rt).await.unwrap();
+        let _ = mw.before(&mut call, &tool, &rt).await;
         let mut result = ToolResult { call_id: "c1".into(), content: "ok".into(), is_error: false };
         mw.after(&mut result).await;
 
@@ -839,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_provider_records_summary_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let dec = CompactionTelemetryProvider::new(
+        let dec = MeteredProvider::new(
             Arc::new(CannedSummary { fail: false }),
             tel,
             "openai",
@@ -878,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_provider_marks_had_error_on_stream_error() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let dec = CompactionTelemetryProvider::new(
+        let dec = MeteredProvider::new(
             Arc::new(CannedSummary { fail: true }),
             tel,
             "openai",

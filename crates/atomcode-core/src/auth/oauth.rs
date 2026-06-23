@@ -405,10 +405,17 @@ impl LoginSession {
             // (e.g. before scope is entered, or from spawned tasks) inherit it.
             t.set_account_id(Some(auth_info.user.id.to_string()));
             let (invite_code, install_uuid) = pending_invite_for_login();
-            t.track(Event::LoginSuccess {
+            let event = Event::LoginSuccess {
                 invite_code,
                 install_uuid,
-            });
+            };
+            if let Err(e) = t.track_durable_sync(event.clone()) {
+                tracing::warn!(
+                    ?e,
+                    "login_success durable enqueue failed; falling back to async telemetry"
+                );
+                t.track(event);
+            }
         }
 
         Ok(auth_info)

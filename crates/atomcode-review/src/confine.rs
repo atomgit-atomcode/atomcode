@@ -10,7 +10,7 @@
 //! tools deliberately do no path-escape enforcement (their trust model leaves it
 //! to the embedder).
 
-use atomcode_kernel::middleware::ToolMiddleware;
+use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{Tool, ToolCall};
 use async_trait::async_trait;
@@ -46,8 +46,11 @@ impl ToolMiddleware for PathConfineMiddleware {
         call: &mut ToolCall,
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
-    ) -> Result<(), String> {
-        check_arguments(&self.root, &call.arguments)
+    ) -> BeforeOutcome {
+        match check_arguments(&self.root, &call.arguments) {
+            Ok(()) => BeforeOutcome::Proceed,
+            Err(reason) => BeforeOutcome::deny(reason),
+        }
     }
 }
 

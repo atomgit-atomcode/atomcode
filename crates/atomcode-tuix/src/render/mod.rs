@@ -1,6 +1,4 @@
 // crates/atomcode-tuix/src/render/mod.rs
-#[cfg(windows)]
-pub mod conhost;
 pub mod cell;
 pub mod plain;
 pub mod qr;
@@ -41,6 +39,13 @@ pub enum UiLine {
         working_dir: String,
     },
     User(String),
+    /// A user message and its image echoes rendered as one append-only
+    /// group. Retained renderers must not commit a temporary spacer between
+    /// the text and attachments because that scroll cannot be undone.
+    UserWithAttachments {
+        text: String,
+        attachments: Vec<usize>,
+    },
     AssistantText(String),
     /// LLM reasoning/thinking content (displayed in gray/dimmed style)
     ReasoningText(String),
@@ -203,6 +208,18 @@ pub enum UiLine {
     TurnSeparator {
         label: String,
     },
+    /// Overlay modal: a floating window drawn on top of body+footer.
+    /// RetainedRenderer paints this after the normal frame; PlainRenderer ignores it.
+    ModalOverlay {
+        title: String,
+        lines: Vec<String>,
+        scroll: usize,
+        total: usize,
+        win_width: u16,
+        win_height: u16,
+    },
+    /// Clear the overlay modal and restore the underlying frame.
+    ModalOverlayClear,
 }
 
 pub trait Renderer: Send {
@@ -227,6 +244,28 @@ pub trait Renderer: Send {
     /// command after which the footer immediately redraws).
     fn clear_screen(&mut self);
 
+    /// Open a single DECSET 2026 synchronized-output envelope spanning the
+    /// burst of operations up to the matching `end_sync()`. Used by the
+    /// `/resume` replay so the screen wipe + full-transcript re-emit paint
+    /// as ONE atomic update on capable hosts instead of visibly blanking
+    /// and re-scrolling (the flicker). Between the two calls, per-frame
+    /// envelopes are suppressed so they can't end the batch early.
+    ///
+    /// Default no-op: renderers that don't use synchronized output
+    /// (PlainRenderer, pipe mode, tests) just emit their writes as usual.
+    fn begin_sync(&mut self) {}
+
+    /// Close the envelope opened by `begin_sync()` (after landing the final
+    /// frame inside it). Default no-op. Must be paired with `begin_sync()`.
+    fn end_sync(&mut self) {}
+
+    /// Suppress automatic clipboard copy during history replay so that
+    /// `/resume`, `/undo` and `atomcode -c` don't overwrite the user's
+    /// clipboard or inject stale "Copied" hints into the replay output
+    /// (issue #699). Default no-op — only the retained renderer implements
+    /// this.
+    fn set_suppress_auto_copy(&mut self, _suppress: bool) {}
+
     /// Hand the terminal off to a non-TUI child process (blocking OAuth
     /// flow, `/shell`, etc.): disable raw mode + bracketed paste, finish
     /// any pending writes. After this returns, the child is free to use
@@ -249,6 +288,18 @@ pub trait Renderer: Send {
     /// Implementations without throttling (e.g. PlainRenderer) can
     /// treat this as a flush.
     fn flush_deferred(&mut self);
+
+    /// Returns (and clears) whether a body overflow scrolled the whole
+    /// viewport — footer included — up one row since the last call. The
+    /// render worker calls this after each command and, when true, repaints
+    /// the footer immediately via `flush_deferred` instead of waiting for the
+    /// event loop's next ~5ms deferred tick, so the footer doesn't visibly lag
+    /// the scroll on hosts that don't vsync-coalesce (native Win10 conhost /
+    /// pwsh7). Default `false`: only the retained renderer scrolls a viewport;
+    /// plain/pipe and the cross-thread proxy renderer never do.
+    fn take_pending_scroll_flush(&mut self) -> bool {
+        false
+    }
 
     /// Remove the most recent `ApprovalPrompt` body row, if the tail
     /// row is one. Called by the event loop after the user responds
@@ -409,6 +460,28 @@ pub struct StatusLine {
     /// Current reasoning_effort for the active provider's model.
     /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
+    /// When an autonomous `/goal` loop is active, this carries its live status
+    /// for the DEDICATED footer goal row (its own full-width line above the
+    /// status row). `None` ⇒ no goal running, row omitted. Previously this was
+    /// a pre-formatted suffix crammed onto the shared status line, where it was
+    /// the first thing truncated under a hint / narrow terminal and omitted the
+    /// condition text — so users couldn't reliably see the goal while tool
+    /// output scrolled. Its own row fixes that.
+    pub goal: Option<GoalStatus>,
+}
+
+/// Live status of an active autonomous `/goal` loop, rendered on the dedicated
+/// footer goal row. The renderer width-truncates `condition` to fit; `round`
+/// and the elapsed time always survive (see `format_goal_row`).
+#[derive(Debug, Clone)]
+pub struct GoalStatus {
+    /// The goal condition text (truncated with `…` to fit the row width).
+    pub condition: String,
+    /// Round number AS DISPLAYED — 1-based (the first attempt reads `round 1`).
+    /// The caller adds 1 to the engine's 0-based internal round.
+    pub round: u32,
+    /// Wall-clock seconds since the goal was set.
+    pub elapsed_secs: u64,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

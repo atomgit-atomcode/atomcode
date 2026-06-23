@@ -12,7 +12,7 @@
 use atomcode_kernel::conformance::{self, ConformanceReport};
 use atomcode_kernel::hook::{HookChain, LifecycleHooks, NoopHooks};
 use atomcode_kernel::message::{Message, MessageMeta};
-use atomcode_kernel::middleware::ToolMiddleware;
+use atomcode_kernel::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
@@ -216,17 +216,17 @@ async fn middleware_doubles_are_conformant() {
 struct ParkForeverMiddleware;
 #[async_trait]
 impl ToolMiddleware for ParkForeverMiddleware {
-    async fn before(&self, _call: &mut ToolCall, _tool: &Arc<dyn Tool>, _rt: &RequestCtx) -> Result<(), String> {
+    async fn before(&self, _call: &mut ToolCall, _tool: &Arc<dyn Tool>, _rt: &RequestCtx) -> BeforeOutcome {
         // Ignores the RequestCtx timeout and parks — the kernel turn would hang here.
         futures::future::pending::<()>().await;
-        Ok(())
+        BeforeOutcome::Proceed
     }
 }
 
 struct PanicBeforeMiddleware;
 #[async_trait]
 impl ToolMiddleware for PanicBeforeMiddleware {
-    async fn before(&self, _call: &mut ToolCall, _tool: &Arc<dyn Tool>, _rt: &RequestCtx) -> Result<(), String> {
+    async fn before(&self, _call: &mut ToolCall, _tool: &Arc<dyn Tool>, _rt: &RequestCtx) -> BeforeOutcome {
         panic!("before blew up");
     }
 }
@@ -234,7 +234,7 @@ impl ToolMiddleware for PanicBeforeMiddleware {
 struct PanicAfterMiddleware;
 #[async_trait]
 impl ToolMiddleware for PanicAfterMiddleware {
-    async fn after(&self, _result: &mut ToolResult) {
+    async fn after(&self, _result: &mut ToolResult) -> AfterOutcome {
         panic!("after blew up");
     }
 }
@@ -242,8 +242,8 @@ impl ToolMiddleware for PanicAfterMiddleware {
 struct ParkAfterMiddleware;
 #[async_trait]
 impl ToolMiddleware for ParkAfterMiddleware {
-    async fn after(&self, _result: &mut ToolResult) {
-        futures::future::pending::<()>().await;
+    async fn after(&self, _result: &mut ToolResult) -> AfterOutcome {
+        futures::future::pending::<AfterOutcome>().await
     }
 }
 

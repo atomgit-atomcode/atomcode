@@ -1,10 +1,10 @@
-use crate::event::{AgentCommand, AgentEvent, StopReason};
+use crate::event::{AgentCommand, AgentEvent, StopReason, ToolBatchCall};
 use crate::hook::{HookChain, LifecycleHooks, TurnCtx};
 use crate::message::{
     CompactTrigger, CompactionStrategy, CompactionView, Conversation, ImageContent, Message,
     MessageMeta, NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
 };
-use crate::middleware::ToolMiddleware;
+use crate::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use crate::provider::{ChatOptions, LlmProvider};
 use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
@@ -13,6 +13,7 @@ use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Instant;
 use crate::clock::{Clock, SystemClock};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -31,6 +32,46 @@ pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 /// many failed compact-and-retry attempts the kernel surfaces the overflow error rather
 /// than spinning — a genuinely-unrecoverable history (sacred floor alone over the window).
 const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
+
+/// How many times the agent loop re-opens a round after a TRANSIENT provider
+/// failure (`ProviderError::retryable`) before surfacing the error. This is the
+/// SECOND retry tier — the provider's transport layer already did its own fast
+/// backoff (~1.5s) underneath. Mirrors v1's agent-loop budget (3, with 3/6/9s
+/// waits) so the user perceives a retry is happening AND a fresh connection gets
+/// a real chance to recover (the stale keep-alive class). NON-retryable errors
+/// (auth / 400 / balance) never enter this path — they fail fast.
+const MAX_PROVIDER_RETRIES: u32 = 3;
+
+/// How many times the agent loop re-issues a round after the provider returns a
+/// COMPLETELY EMPTY but otherwise-successful completion (a 200 with no text, no
+/// tool calls, no reasoning). This is a DISTINCT tier from `MAX_PROVIDER_RETRIES`
+/// (which only fires on a `retryable` OPEN/stream `Err`): an empty 200 opens fine
+/// and streams a clean `Done`, so it would otherwise be mistaken for the model
+/// choosing to stop. Confirmed transient on the atomgit→DeepSeek path — the SAME
+/// request resent recovers — so it gets MORE attempts and a much SHORTER backoff
+/// than the generic error path (the empty body returns instantly; a long wait is
+/// pure latency). Mirrors v1's `EMPTY_RESPONSE_MAX_RETRIES`.
+const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
+
+/// Short, human reason for the visible "retrying" advisory. Branches on the
+/// STRUCTURED fields (`http_status`) where possible, falling back to a coarse
+/// message sniff for transport errors that carry no status. Mirrors v1's
+/// `public_error_reason` but only for the transient (retryable) classes — the
+/// only ones that reach the retry notice.
+fn retry_reason(e: &crate::stream::ProviderError) -> &'static str {
+    match e.http_status {
+        Some(429) => "请求过于频繁或额度已用尽",
+        Some(500 | 502 | 503 | 504 | 529) => "上游服务暂时不可用",
+        _ => {
+            let m = e.message.to_ascii_lowercase();
+            if m.contains("timeout") || m.contains("timed out") {
+                "模型响应超时"
+            } else {
+                "网络连接失败"
+            }
+        }
+    }
+}
 
 /// Enforce the kernel's tool-result size cap on `result.content`, IN PLACE.
 ///
@@ -408,6 +449,14 @@ impl RunningAgent {
                 utilization,
                 sacred_floor: floor,
             };
+            // Announce BEFORE the (possibly multi-second) LLM summary so a driver can
+            // show a "compacting…" progress line — but ONLY if the strategy will
+            // actually do that slow drain/summarize. A manual `/compact` that turns out
+            // to be a no-op (nothing older than the active turn) must NOT show a
+            // spurious "compacting…" line ahead of "nothing to compact" (v1 parity).
+            if self.compaction.will_summarize(&view) {
+                self.rt.emit(AgentEvent::CompactionStarted { trigger: trigger_for_event.clone() });
+            }
             self.compaction.plan(&view).await
         };
         let report = convo.apply_plan(plan, floor);
@@ -499,7 +548,11 @@ impl RunningAgent {
             };
             match cmd {
                 AgentCommand::Shutdown => break,
-                AgentCommand::Cancel => {}
+                // No turn is running at the top-level loop, but a Cancel that races in
+                // here (turn just returned) must still flush any orphaned parked request
+                // → Null (fail-closed), so a stranded approval oneshot can't linger. A
+                // no-op map (the common case) is harmless.
+                AgentCommand::Cancel => self.rt.cancel_pending(),
                 AgentCommand::Respond { id, value } => self.rt.resolve(id, value),
                 AgentCommand::Snapshot => {
                     self.rt.emit(AgentEvent::Snapshot { snapshot: self.capture_snapshot(&convo) });
@@ -588,6 +641,12 @@ impl RunningAgent {
         if let Some(trigger) = self.should_compact(convo) {
             self.run_compaction(convo, trigger).await;
         }
+        // CANCEL = UNDO: remember the history length BEFORE this turn's user
+        // message is pushed, so a cancelled turn can roll all the way back to here —
+        // the prompt + any partial assistant/tool work leaves NO trace (the TUI
+        // separately restores the prompt to the input box for edit-and-resend).
+        // Captured AFTER the pre-turn compaction above so it indexes current history.
+        let rollback_len = convo.messages.len();
         convo.push(Message::user_with_images(text, images));
         // Per-turn cancellation token: Cancel fires it; run_turn polls it at the
         // stream, between tools, and inside execute. A CLONE also rides into each
@@ -599,7 +658,7 @@ impl RunningAgent {
         let turn_token = self.new_turn_token();
         // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
         // so a middleware blocked on approval can be answered out-of-band.
-        let mut turn = Box::pin(self.run_turn(convo, turn_token.clone()));
+        let mut turn = Box::pin(self.run_turn(convo, turn_token.clone(), rollback_len));
         let mut shutdown = false;
         loop {
             tokio::select! {
@@ -651,6 +710,25 @@ impl RunningAgent {
         self.rt.emit(AgentEvent::TurnComplete { reason });
     }
 
+    /// Terminal for a CANCELLED turn under "cancel = undo" semantics: roll the
+    /// conversation back to `rollback_len` (its length before this turn's user
+    /// message was pushed) so the cancelled prompt + any partial assistant/tool
+    /// work leaves NO trace — a later unrelated message can't see it and it costs
+    /// no tokens. The TUI separately restores the prompt to the input box for
+    /// edit-and-resend. Truncating the whole turn also makes the old
+    /// `backfill_cancelled_tool_results` pairing repair unnecessary (nothing
+    /// dangles when the turn is gone). `truncate` is a safe no-op if a mid-turn
+    /// overflow compaction already shrank history below `rollback_len` (rare, off
+    /// the normal path) — it just leaves that one cancelled turn in place rather
+    /// than risk cutting compacted history at a stale index. Funnels through
+    /// `finish_turn` so the `turn_complete` hook + `TurnComplete` event still fire
+    /// (on the now-clean conversation).
+    async fn finish_cancelled(&self, convo: &mut Conversation, rollback_len: usize, ctx: &TurnCtx) {
+        convo.messages.truncate(rollback_len);
+        self.rt.emit(AgentEvent::Cancelled);
+        self.finish_turn(convo, StopReason::Cancelled, ctx).await;
+    }
+
     /// Snapshot the conversation, stamping the LIVE id counters over the
     /// derive-from-meta defaults: a turn that died before storing any assistant
     /// message is invisible to the derivation, but the counters know it — a resume
@@ -664,7 +742,12 @@ impl RunningAgent {
         snap
     }
 
-    async fn run_turn(&self, convo: &mut Conversation, cancel: tokio_util::sync::CancellationToken) {
+    async fn run_turn(
+        &self,
+        convo: &mut Conversation,
+        cancel: tokio_util::sync::CancellationToken,
+        rollback_len: usize,
+    ) {
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
@@ -681,6 +764,15 @@ impl RunningAgent {
         // OVERFLOW recovery counter for the CURRENT round: incremented each time a hard
         // context-overflow triggers a compact-and-retry; reset to 0 on a successful open.
         let mut overflow_attempt: u8 = 0;
+        // TRANSIENT-failure retry counter for the CURRENT round: incremented on each
+        // visible re-open after a retryable provider error; reset to 0 on a successful
+        // open so every round gets its own fresh budget.
+        let mut provider_retry: u32 = 0;
+        // EMPTY-RESPONSE retry counter for the WHOLE turn: incremented on each re-issue
+        // after a content-free 200. UNLIKE the two above it is NOT reset per round —
+        // the budget is per-turn (mirrors v1's per-user-message `empty_response_retries`)
+        // so a model that keeps returning empty across rounds can't spin forever.
+        let mut empty_retries: u32 = 0;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -740,9 +832,27 @@ impl RunningAgent {
             // no empty-success illusion. The session-level `chat_options` (the
             // neutral SLOT) ride along as a sideband request param — NOT part of
             // `messages`, so they never perturb the append-only wire prefix.
-            let mut stream = match self.provider.chat_stream(&messages, &defs, &self.chat_options).await {
+            // Race the OPEN against cancel — the same checkpoint the consume loop
+            // (below) and the retry backoff (above) already use. `chat_stream`'s
+            // connect / first-byte wait can hang for a long time on a slow / stale /
+            // dead connection (notably right after a /model switch reuses a dead
+            // pooled socket), and a bare `.await` here would ignore Esc / Ctrl+C
+            // until it resolves — the reported "esc can't terminate" freeze, with the
+            // spinner (TurnStarted/Thinking fire BEFORE this) still animating. `biased`
+            // keeps cancel first; on cancel, drop the open future (which aborts the
+            // in-flight request) and finish exactly like the mid-stream cancel arm.
+            let opened = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                    return;
+                }
+                opened = self.provider.chat_stream(&messages, &defs, &self.chat_options) => opened,
+            };
+            let mut stream = match opened {
                 Ok(s) => {
                     overflow_attempt = 0; // a successful open resets the per-round counter
+                    provider_retry = 0; // ditto for the transient-failure budget
                     s
                 }
                 // HARD OVERFLOW recovery (OFF the normal path): the prompt exceeded the
@@ -758,6 +868,36 @@ impl RunningAgent {
                     )));
                     self.run_compaction(convo, CompactTrigger::Overflow { attempt: overflow_attempt }).await;
                     overflow_attempt += 1;
+                    round -= 1; // a RETRY of the same logical round, not a new one
+                    continue;
+                }
+                // TRANSIENT failure (429/5xx/transport — `retryable` is set by the
+                // provider's classifier, incl. `is_retryable_reqwest_error` covering
+                // the stale keep-alive ConnectionReset class). The transport layer
+                // already did its OWN fast retries (~1.5s); this is the SECOND,
+                // user-VISIBLE tier ported from v1's agent loop. Re-opening the SAME
+                // round gives a FRESH connection — the real recovery for a dead pooled
+                // connection — and the Warning tells the user a retry is underway
+                // (silent fast-fail read as "no retry happened at all"). NON-retryable
+                // errors (auth / 400 / balance) skip this and hard-fail below, so we
+                // never spin ~18s on an error that cannot recover.
+                Err(e) if e.retryable && provider_retry < MAX_PROVIDER_RETRIES => {
+                    provider_retry += 1;
+                    let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
+                    self.rt.emit(AgentEvent::Warning(format!(
+                        "API error {}，{wait} 秒后重试({provider_retry}/{MAX_PROVIDER_RETRIES})...",
+                        retry_reason(&e)
+                    )));
+                    // Cancellable backoff: Esc during the wait aborts the turn instead
+                    // of forcing the user to sit through the full delay.
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            return;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                    }
                     round -= 1; // a RETRY of the same logical round, not a new one
                     continue;
                 }
@@ -787,6 +927,13 @@ impl RunningAgent {
             let mut usage = TokenUsage::default();
             let mut truncated = false;
             let mut response_id: Option<String> = None;
+            // Did the provider STREAM any model output this round (text / reasoning /
+            // tool call), BEFORE any hook transform? This — not the post-hook
+            // accumulated text — is the empty-200 discriminator: a hook that redacts
+            // or clears the text still means the PROVIDER produced content (not an
+            // empty 200), so it must NOT be retried as empty. Set true on the raw
+            // arrival in each content arm below.
+            let mut saw_stream_content = false;
             loop {
                 // MID-STREAM cancel checkpoint: cancellation stops stream
                 // consumption immediately. Carried from production runner.rs:420.
@@ -807,8 +954,7 @@ impl RunningAgent {
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
-                        self.rt.emit(AgentEvent::Cancelled);
-                        self.finish_turn(convo, StopReason::Cancelled, &turn_ctx).await;
+                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                         return;
                     }
                     _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
@@ -834,6 +980,10 @@ impl RunningAgent {
                         // the chunk (`delta.clear()`) suppresses it: an empty post-hook
                         // chunk is neither accumulated NOR emitted (no spurious empty
                         // AgentEvent::TextDelta("")).
+                        // The PROVIDER produced output this round — record it BEFORE the
+                        // (possibly clearing) hook, so a redacted/cleared response is
+                        // not misread as an empty 200 and retried.
+                        saw_stream_content = true;
                         self.hooks.on_text_delta(&mut t).await;
                         if !t.is_empty() {
                             assistant_text.push_str(&t);
@@ -851,6 +1001,7 @@ impl RunningAgent {
                         // that CLEARS the chunk suppresses it: an empty post-hook chunk
                         // is neither accumulated NOR emitted (no spurious empty
                         // AgentEvent::Reasoning("")).
+                        saw_stream_content = true; // provider streamed reasoning (see TextDelta)
                         self.hooks.on_reasoning_delta(&mut t).await;
                         if !t.is_empty() {
                             reasoning.push_str(&t);
@@ -867,17 +1018,22 @@ impl RunningAgent {
                     // block (no preceding text) yields an empty-text block. Pure storage
                     // — no live event (the text already streamed via Reasoning above).
                     StreamEvent::ReasoningSignature { opaque, provider } => {
+                        saw_stream_content = true; // provider streamed a (signed) reasoning block
                         reasoning_blocks.push(crate::message::ReasoningBlock {
                             text: std::mem::take(&mut reasoning_block_text),
                             opaque: Some(opaque),
                             provider: Some(provider),
                         });
                     }
-                    StreamEvent::ToolCall(c) => pending_calls.push(c),
+                    StreamEvent::ToolCall(c) => {
+                        saw_stream_content = true;
+                        pending_calls.push(c);
+                    }
                     // Live DISPLAY of a tool call as it streams; the WHOLE call is still
                     // collected via StreamEvent::ToolCall above for execution. Pure
                     // forward — never touches pending_calls or the executed call.
                     StreamEvent::ToolCallDelta { index, id, name, arguments } => {
+                        saw_stream_content = true;
                         self.rt.emit(AgentEvent::ToolCallStreaming { index, id, name, arguments });
                     }
                     // Fold MULTIPLE Usage events in one round field-wise (max), so a
@@ -899,6 +1055,62 @@ impl RunningAgent {
                     }
                 }
             }
+            // EMPTY-RESPONSE FAST RETRY (parity with v1 agent/mod.rs:3027): some
+            // OpenAI-compatible gateways (notably the atomgit→DeepSeek path) sometimes
+            // return a 200 with a COMPLETELY empty completion — the stream opened fine
+            // and ended with no text, no tool calls, and no reasoning. That is NOT the
+            // model choosing to stop (a real stop carries visible text); it is a
+            // transient upstream hiccup that recovers on an immediate resend. WITHOUT
+            // this, the empty round falls into the `pending_calls.is_empty()` branch
+            // below and `finish_turn(Stopped)` ends the turn as a SILENT "natural"
+            // completion — the user perceives the agent as mysteriously giving up
+            // mid-task. So: detect a ZERO-CONTENT completion and re-issue the SAME
+            // round on a dedicated, turn-scoped budget. The signal is whether the
+            // PROVIDER streamed ANY output (`saw_stream_content`) — NOT the post-hook
+            // accumulated text, so a hook that redacts/clears a real response is not
+            // misclassified as empty. A `length` truncation is a real (if cut-off)
+            // response, never empty. The two retry tiers in the `match opened` above
+            // never catch this: an empty 200 OPENS successfully (`Ok`), so it is
+            // neither a retryable `Err` nor a context overflow.
+            let empty_completion = !saw_stream_content && !truncated;
+            if empty_completion {
+                if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
+                    empty_retries += 1;
+                    // Front-loaded short backoff: 1,1,2,2,3s (~9s for all 5) — matches
+                    // v1. The empty body returns instantly, so the generic 3/6/9s tier
+                    // would be pure wasted latency. A VISIBLE Warning tells the user a
+                    // retry is underway (a silent re-open reads as "nothing happened").
+                    let wait = (((empty_retries + 1) / 2).min(3)) as u64;
+                    self.rt.emit(AgentEvent::Warning(format!(
+                        "模型返回空响应，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})..."
+                    )));
+                    // Cancellable backoff: Esc during the wait aborts the turn instead
+                    // of forcing the user to sit through the delay (same shape as the
+                    // retryable-open arm above).
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            return;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                    }
+                    round -= 1; // a RETRY of the same logical round, not a new one
+                    continue;
+                }
+                // Exhausted: a run of empty 200s is an upstream fault, not a clean
+                // finish — surface a clear, non-alarming reason and FAIL the turn
+                // (StopReason::ProviderError) rather than the silent Stopped below. The
+                // snapshot is preserved (finish_turn does not roll back), so the user
+                // can simply resend.
+                let msg = format!(
+                    "模型连续 {EMPTY_RESPONSE_MAX_RETRIES} 次返回空响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。"
+                );
+                self.hooks.on_error(&msg).await;
+                self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
+                self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
+                return;
+            }
             // Truncation is observable via a Warning; the round still finishes
             // normally (continuation is a separate follow-up task).
             if truncated {
@@ -907,7 +1119,19 @@ impl RunningAgent {
                 ));
             }
             let ctx_window = self.provider.context_window();
-            let used_tokens = usage.prompt;
+            // Prefer the provider's EXACT prompt count. FALL BACK to a byte estimate over
+            // the OUTGOING request (`messages`, post-`pre_request`) when the provider omits
+            // usage (`usage.prompt == 0`): an empty 200, or a usage chunk dropped after
+            // `finish_reason` — both observed on some OpenAI-compatible gateways. Without
+            // this, a non-reporting provider records utilization 0.0 forever, so the
+            // task-boundary auto-compaction trigger NEVER fires and context grows unbounded
+            // until a hard overflow or a manual /compact. (`tokens` below keeps the raw
+            // provider report as-is; only the DERIVED pressure is estimated.)
+            let used_tokens = if usage.prompt > 0 {
+                usage.prompt
+            } else {
+                messages.iter().map(|m| m.estimate_tokens()).sum()
+            };
             let utilization = if ctx_window > 0 {
                 used_tokens as f32 / ctx_window as f32
             } else {
@@ -978,6 +1202,46 @@ impl RunningAgent {
                 self.finish_turn(convo, StopReason::Stopped, &turn_ctx).await;
                 return;
             }
+            // ── Batch detection (pre-scan) ──
+            // Count NON-DUPLICATE tool calls using the SAME dedup key as the
+            // execution loop below — `(name, raw_arguments)` — captured BEFORE
+            // any middleware rewrite, matching the loop's `dedup_key` (L1019).
+            // If ≥ 2 non-dup calls, emit ToolBatchStarted so the UI can render
+            // a single grouped block instead of N independent rows. The count
+            // (`total_non_dup`) reflects the REAL calls that will actually
+            // execute — mode-B stub kills (same name+args, new id) are not
+            // counted, matching v1's `non_dup_count` semantics.
+            let total_non_dup: usize = {
+                let mut dedup_set: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                let mut non_dup = 0usize;
+                for c in &pending_calls {
+                    let key = (c.name.clone(), c.arguments.clone());
+                    if dedup_set.insert(key) {
+                        non_dup += 1;
+                    }
+                }
+                non_dup
+            };
+            let batch_start: Option<(String, Instant)> = if total_non_dup >= 2 {
+                let batch_id = format!("batch_{}_{}", self.turn_counter.load(Ordering::Relaxed), round);
+                let batch_calls: Vec<ToolBatchCall> = pending_calls
+                    .iter()
+                    .map(|c| ToolBatchCall {
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                        arguments: c.arguments.clone(),
+                    })
+                    .collect();
+                self.rt.emit(AgentEvent::ToolBatchStarted {
+                    batch_id: batch_id.clone(),
+                    calls: batch_calls,
+                });
+                Some((batch_id, Instant::now()))
+            } else {
+                None
+            };
+            let mut batch_ok: usize = 0;
             // ── Per-batch dedup state (claim 21 / A1 gap ⑨) ──
             // `result_ids` = call_ids that have ALREADY produced a result THIS
             // batch (real, stub, or blocked). `seen_calls` = `(name, arguments)`
@@ -991,13 +1255,21 @@ impl RunningAgent {
                 std::collections::HashSet::new();
             for mut call in pending_calls {
                 // BETWEEN-TOOLS cancel checkpoint: do not dispatch any remaining
-                // tool_call once cancelled. Carried from production runner.rs:916.
-                // The skipped calls (this one + the rest) are paired with synthetic
-                // "(cancelled)" results by backfill on the cancel path below.
+                // tool_call once cancelled. Under "cancel = undo" the whole turn is
+                // rolled back below, so the skipped calls vanish with it — no
+                // "(cancelled)" backfill needed (nothing dangles when the turn's
+                // messages are gone).
                 if cancel.is_cancelled() {
-                    convo.backfill_cancelled_tool_results();
-                    self.rt.emit(AgentEvent::Cancelled);
-                    self.finish_turn(convo, StopReason::Cancelled, &turn_ctx).await;
+                    // Close any active batch so the UI doesn't have a dangling group.
+                    if let Some((batch_id, started_at)) = &batch_start {
+                        self.rt.emit(AgentEvent::ToolBatchCompleted {
+                            batch_id: batch_id.clone(),
+                            ok: batch_ok,
+                            total: total_non_dup,
+                            elapsed_ms: started_at.elapsed().as_millis() as u64,
+                        });
+                    }
+                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                     return;
                 }
 
@@ -1054,14 +1326,27 @@ impl RunningAgent {
                     },
                     Some(tool) => {
                         // ToolMiddleware before-chain: may rewrite the call (&mut),
-                        // round-trip via rt (approval), or block via Err. Runs after
-                        // lookup; ToolStarted fires only for a tool that executes
-                        // (no ghost row for blocked tools).
+                        // round-trip via rt (approval), and returns a BeforeOutcome
+                        // GATE decision. Runs after lookup; ToolStarted fires only for
+                        // a tool that executes (no ghost row for blocked tools).
                         let mut blocked: Option<String> = None;
                         for mw in &self.middlewares {
-                            if let Err(reason) = mw.before(&mut call, &tool, &self.rt).await {
-                                blocked = Some(reason);
-                                break;
+                            match mw.before(&mut call, &tool, &self.rt).await {
+                                BeforeOutcome::Proceed => {}
+                                // `ask` has no kernel-independent prompt yet (the
+                                // approval gate — also a middleware in this chain —
+                                // owns the round-trip), so it defers to the normal
+                                // approval flow. Full force-ask lands with the CC
+                                // bridge producer (M2).
+                                BeforeOutcome::Ask { .. } => {}
+                                // `allow` force-approves: stop the remaining `before`
+                                // gates and execute (CC `permissionDecision: "allow"`
+                                // bypasses the permission system).
+                                BeforeOutcome::Allow { .. } => break,
+                                BeforeOutcome::Deny { reason } => {
+                                    blocked = Some(reason);
+                                    break;
+                                }
                             }
                         }
                         if let Some(reason) = blocked {
@@ -1126,10 +1411,14 @@ impl RunningAgent {
                         }
                     }
                 };
-                // ToolMiddleware after-chain: transform / observe the result.
-                // Middleware sees the RAW (uncapped) result.
+                // ToolMiddleware after-chain: transform / observe the result and
+                // collect any CONTINUATION decision. Middleware sees the RAW
+                // (uncapped) result. The first `Block` reason wins.
+                let mut post_block: Option<String> = None;
                 for mw in &self.middlewares {
-                    mw.after(&mut result).await;
+                    if let AfterOutcome::Block { reason } = mw.after(&mut result).await {
+                        post_block.get_or_insert(reason);
+                    }
                 }
                 // KERNEL TOOL-RESULT SIZE CAP — the kernel's only built-in safety
                 // at this altitude (it cannot sandbox). Applied AFTER the
@@ -1141,9 +1430,19 @@ impl RunningAgent {
                 cap_tool_result(&mut result, self.max_tool_result_bytes);
                 if result.is_error {
                     self.hooks.on_error(&result.content).await;
+                } else if batch_start.is_some() {
+                    batch_ok += 1;
                 }
                 self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
                 convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
+                // CC PostToolUse `decision: "block"`: feed the reason back to the
+                // model so it can course-correct. Hard turn-termination (stop before
+                // the next model call) needs a dedicated StopReason and lands with the
+                // CC-bridge producer (M2); no middleware emits `Block` yet, so this is
+                // currently inert.
+                if let Some(reason) = post_block {
+                    convo.push(Message::user(reason));
+                }
 
                 // (3) Record this id as "resulted" so a later SAME-id call (mode A)
                 // is skipped. Recorded for EVERY path that produces a result —
@@ -1159,6 +1458,15 @@ impl RunningAgent {
                 if executed {
                     seen_calls.insert(dedup_key);
                 }
+            }
+            // ── Close batch (if one was opened) ──
+            if let Some((batch_id, started_at)) = batch_start {
+                self.rt.emit(AgentEvent::ToolBatchCompleted {
+                    batch_id,
+                    ok: batch_ok,
+                    total: total_non_dup,
+                    elapsed_ms: started_at.elapsed().as_millis() as u64,
+                });
             }
         }
     }

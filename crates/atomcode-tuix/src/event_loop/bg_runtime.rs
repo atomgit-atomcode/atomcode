@@ -160,37 +160,37 @@ impl BackgroundSlots {
         }
         let bg = &mut self.slots[slot - 1];
         match event {
-            AgentEvent::TurnComplete { messages, .. } => {
+            AgentEvent::TurnComplete { snapshot, .. } => {
                 bg.state = RuntimeState::Done;
-                super::apply_session_messages(&mut bg.session, messages.clone());
+                super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                 bg.summary = session_summary(&bg.session);
                 true
             }
-            AgentEvent::TurnCancelled { messages } => {
+            AgentEvent::TurnCancelled { snapshot } => {
                 bg.state = RuntimeState::Cancelled;
-                super::apply_session_messages(&mut bg.session, messages.clone());
+                super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                 bg.summary = session_summary(&bg.session);
                 true
             }
-            AgentEvent::ApprovalNeeded { messages, .. } => {
+            AgentEvent::ApprovalNeeded { snapshot, .. } => {
                 // Persist mid-turn messages so /bg <N> can replay the
                 // conversation even while the turn is still in progress.
-                if !messages.is_empty() {
-                    super::apply_session_messages(&mut bg.session, messages.clone());
+                if !snapshot.messages.is_empty() {
+                    super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                     bg.summary = session_summary(&bg.session);
                 }
                 false
             }
-            AgentEvent::Error { messages, .. } => {
+            AgentEvent::Error { snapshot, .. } => {
                 // Persist whatever conversation state we have at error
                 // time so a background session that died mid-turn can
                 // still be `/resume`d to inspect the partial transcript.
-                // Empty `messages` from the streaming-error forwarder
+                // Empty snapshots from the streaming-error forwarder
                 // skips the snapshot (no fresh state to commit). Return
                 // `true` so `apply_background_event` flushes to disk.
-                let did_snapshot = !messages.is_empty();
+                let did_snapshot = !snapshot.messages.is_empty();
                 if did_snapshot {
-                    super::apply_session_messages(&mut bg.session, messages.clone());
+                    super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                     bg.summary = session_summary(&bg.session);
                 }
                 bg.state = RuntimeState::Error;
@@ -653,7 +653,10 @@ mod tests {
     #[test]
     fn background_turn_complete_updates_slot_to_done_and_messages() {
         use atomcode_core::agent::TurnStopReason;
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_core::conversation::{
+            message::{Message, Role},
+            ConversationSnapshot,
+        };
 
         let mut slots = BackgroundSlots::new(16);
         let mut session = Session::default_session(PathBuf::from("/tmp/project"));
@@ -670,7 +673,10 @@ mod tests {
                 turn_count: 1,
                 tool_call_count: 0,
                 stop_reason: TurnStopReason::Natural,
-                messages: vec![Message::new(Role::User, "task")],
+                snapshot: ConversationSnapshot {
+                    messages: vec![Message::new(Role::User, "task")],
+                    cold_summaries: Vec::new(),
+                },
             },
         );
 

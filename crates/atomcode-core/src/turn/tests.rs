@@ -292,6 +292,7 @@ fn test_config() -> Config {
     );
     Config {
         default_provider: "test".to_string(),
+        evaluator_provider: None,
         default_workdir: None,
         providers,
         datalog: Default::default(),
@@ -305,6 +306,7 @@ fn test_config() -> Config {
         language: None,
         ui: Default::default(),
             plugin: Default::default(),
+            web_search: Default::default(),
     }
 }
 

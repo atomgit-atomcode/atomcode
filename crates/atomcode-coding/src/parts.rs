@@ -20,6 +20,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use atomcode_capabilities::cc_hooks::{CCExternalHooks, HookConfig};
 use atomcode_capabilities::codeintel::register_codeintel_tools;
 use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
@@ -29,11 +30,12 @@ use atomcode_capabilities::session::{
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
-    register_coding_tools, ApprovalMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool,
+    register_coding_tools, ApprovalMiddleware, OpenFileWorkspaceGate, SensitivePathGate, WebFetchTool,
+    WebSearchTool, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::hook::LifecycleHooks;
-use atomcode_kernel::message::SessionSnapshot;
+use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, ToolRegistry};
 use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
@@ -131,6 +133,12 @@ pub struct CodingParts {
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
     pub review_provider: Option<SharedReviewProvider>,
+    /// User/project CC external hooks (`$ATOMCODE_HOME/hooks.json` + `<root>/.hooks.json`).
+    /// ONE instance is registered as BOTH a [`LifecycleHooks`] (already pushed into `hooks`)
+    /// and a [`ToolMiddleware`](atomcode_kernel::middleware::ToolMiddleware) (registered by
+    /// [`assemble`], before approval). `None` when no hooks are configured — the common path
+    /// adds zero overhead (no registration at all).
+    pub cc_external_hooks: Option<Arc<CCExternalHooks>>,
 }
 
 /// Phase 1 — gather + connect everything the agent needs (async: MCP connect,
@@ -138,6 +146,20 @@ pub struct CodingParts {
 /// (`SessionMode::Resume` whose snapshot can't be read); everything optional
 /// degrades gracefully (no `.mcp.json` → no MCP tools; empty skill dirs → none).
 pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Result<CodingParts> {
+    prepare_with_plugin_hooks(cfg, opts, Vec::new()).await
+}
+
+/// Like [`prepare`], plus `plugin_cc_hooks` — CC hooks contributed INLINE by installed
+/// plugins, which the DRIVER resolves (the plugin loader lives in `atomcode-core`, which
+/// neither this crate nor L1 may depend on) and threads in here. They are merged with the
+/// user/project `hooks.json` into the one [`CCExternalHooks`] runner. Drivers without a
+/// plugin system (or with none installed) pass an empty vec and get the same result as
+/// [`prepare`].
+pub async fn prepare_with_plugin_hooks(
+    cfg: &CodingAgentConfig,
+    opts: PrepareOptions,
+    plugin_cc_hooks: Vec<HookConfig>,
+) -> io::Result<CodingParts> {
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
 
@@ -179,7 +201,9 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
                 model: cfg.model.clone(),
                 context_window: cfg.context_window,
                 stream_timeout: cfg.stream_timeout,
-                request_timeout: cfg.request_timeout,
+                // The review sub-agent isn't the interactive approval surface; keep a
+                // concrete fail-closed bound even when the main agent parks (None).
+                request_timeout: cfg.request_timeout.unwrap_or_else(|| std::time::Duration::from_secs(300)),
                 rules_dir: None,
             },
         )));
@@ -217,12 +241,23 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
         }),
         SessionMode::Resume(id) => {
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
-            let snap = manager.load_snapshot(id)?;
-            // A version-mismatched snapshot must FAIL here, not fall through to the
-            // kernel's empty-start seam — that would silently fresh-start under the
-            // SAME session id and corrupt the session's on-disk state.
-            check_snapshot_version(&snap)?;
-            Some(SessionBinding { id: id.clone(), manager, resume: Some(snap) })
+            match manager.load_snapshot(id) {
+                Ok(snap) => {
+                    // A version-mismatched snapshot must FAIL here, not fall through
+                    // to the kernel's empty-start seam — that would silently fresh-
+                    // start under the SAME session id and corrupt on-disk state.
+                    check_snapshot_version(&snap)?;
+                    Some(SessionBinding { id: id.clone(), manager, resume: Some(snap) })
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // Snapshot not found (possibly due to a previous save_snapshot
+                    // IO failure that was logged and skipped). Downgrade to Fresh:
+                    // start a new session under a new id rather than crashing.
+                    let fresh_id = uuid::Uuid::new_v4().to_string();
+                    Some(SessionBinding { id: fresh_id, manager, resume: None })
+                }
+                Err(e) => return Err(e),
+            }
         }
     };
 
@@ -263,6 +298,30 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
     // is skipped — see StatusReminderHook — to avoid a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
     hooks.push(Arc::new(VerifyCadenceHook::new()));
+    // CC external hooks: user/project `hooks.json` + plugin-contributed inline hooks
+    // (`plugin_cc_hooks`, resolved by the driver) on the kernel seams — the port of core's
+    // CC-parity hook engine onto the v2 engine. ONE instance serves both seams: pushed here
+    // for its LifecycleHooks side (session_start / user_prompt_submit / session_end) and
+    // stored in `cc_external_hooks` for its ToolMiddleware side (assemble registers it
+    // before approval). Only when hooks actually exist — no hooks at all registers nothing,
+    // so the no-hooks path stays free. Its session_start context append sits after the
+    // built-in context/status hooks (later = appended after), and it implements no
+    // offer_continuation, so VerifyCadenceHook's "first Some wins" contract is untouched.
+    let cc_external = {
+        let mut cc = CCExternalHooks::load_with_extra(&cfg.working_dir, plugin_cc_hooks);
+        // Stamp the persistent session id into every CC payload (CC `session_id`), so a
+        // hook can correlate its events with the session. Empty for non-persistent runs.
+        if let Some(b) = &session {
+            cc = cc.with_session_id(b.id.as_str());
+        }
+        if cc.is_empty() {
+            None
+        } else {
+            let cc = Arc::new(cc);
+            hooks.push(cc.clone() as Arc<dyn LifecycleHooks>);
+            Some(cc)
+        }
+    };
     // 6. TelemetryHook — observation-only (on_request + on_model_response): emits
     //    LlmChat per round. Last in the chain; it mutates nothing, so order is moot.
     //    Only when the driver supplied a telemetry sink (kernel stays zero-telemetry
@@ -291,6 +350,7 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
         mcp_registry,
         mcp_events,
         review_provider,
+        cc_external_hooks: cc_external,
     })
 }
 
@@ -331,8 +391,9 @@ pub fn assemble(
     // yet → NotFound → start empty). Anything else unreadable is a real failure.
     if let Some(b) = &mut parts.session {
         match b.manager.load_snapshot(&b.id) {
-            Ok(snap) => {
+            Ok(mut snap) => {
                 check_snapshot_version(&snap)?;
+                reconcile_coding_persona(&mut snap, &cfg.model);
                 b.resume = Some(snap);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -340,20 +401,14 @@ pub fn assemble(
         }
     }
 
-    // Fill the `code_review` tool's provider slot with the host provider (the tool was
-    // built in `prepare` before the provider existed). A model-swap respawn re-runs assemble
-    // and updates it, so the reviewer always uses the current provider.
-    if let Some(slot) = &parts.review_provider {
-        if let Ok(mut g) = slot.write() {
-            *g = Some(provider.clone());
-        }
-    }
-
-    // Tier-2 overflow summary uses the same provider. When telemetry is on, decorate it so
-    // the summary LLM call (which bypasses the turn-level TelemetryHook — it's an internal
-    // capability call, not an agent round) still records an LlmChat with its token spend.
-    let summary_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
-        Some(tel) => Arc::new(crate::telemetry::CompactionTelemetryProvider::new(
+    // A telemetry-metering decorator over the host provider. Calls made OUTSIDE the host
+    // agent loop — the tier-2 overflow summary AND the `code_review` sub-agent's rounds —
+    // never reach the turn-level TelemetryHook (which fires on this loop's on_request /
+    // on_model_response), so without this their token spend is invisible. The host loop's
+    // PRIMARY provider stays bare below: the TelemetryHook already meters it, and wrapping
+    // it too would double-count. `None` ⇒ telemetry off ⇒ the bare provider (zero overhead).
+    let metered_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
+        Some(tel) => Arc::new(crate::telemetry::MeteredProvider::new(
             provider.clone(),
             tel.clone(),
             cfg.provider_type.as_str(),
@@ -363,15 +418,31 @@ pub fn assemble(
         )),
         None => provider.clone(),
     };
+
+    // Fill the `code_review` tool's provider slot (the tool was built in `prepare` before
+    // the provider existed). Hand it the METERED provider so the reviewer's LLM rounds emit
+    // LlmChat token telemetry — the review sub-agent runs its own kernel loop with no
+    // TelemetryHook of its own. A model-swap respawn re-runs assemble and updates it, so the
+    // reviewer always uses the current (metered) provider.
+    if let Some(slot) = &parts.review_provider {
+        if let Ok(mut g) = slot.write() {
+            *g = Some(metered_provider.clone());
+        }
+    }
+
+    // Tier-2 overflow summary uses the same metered provider so its summary LLM call is
+    // likewise counted.
+    let summary_provider = metered_provider;
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
         .persona(coding_persona(&cfg.model));
-    // Tool telemetry registers BEFORE approval. It is observation-only — it never
-    // rewrites args or blocks — so it does NOT affect the approve-what-runs contract
-    // (which only requires ARG-REWRITING middleware to sit after approval). Going
-    // first means its `before` always stamps the call, so a tool that approval then
-    // DENIES is still recorded (the after-chain runs for every middleware).
+    // Tool telemetry registers FIRST. It is observation-only — it never rewrites args
+    // or blocks — so its position does not affect the approve-what-runs contract (an
+    // ARG-REWRITING gate, e.g. CC PreToolUse `updatedInput`, must instead sit BEFORE
+    // approval so the user approves the POST-rewrite bytes — see the CC hooks block
+    // below). Going first means its `before` always stamps the call, so a tool that
+    // approval then DENIES is still recorded (the after-chain runs for every middleware).
     if let Some(tel) = &cfg.telemetry {
         builder = builder.middleware(Arc::new(crate::telemetry::ToolTelemetryMiddleware::new(
             tel.clone(),
@@ -393,8 +464,35 @@ pub fn assemble(
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
         // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
-        .middleware(Arc::new(SensitivePathGate::new()))
-        // Approval BEFORE any arg-rewriting middleware — the user approves the exact
+        .middleware(Arc::new(SensitivePathGate::new()));
+    // CC external hooks (PreToolUse gate). Runs AFTER the hard PlanMode/SensitivePath gates
+    // (which must stay un-bypassable by a hook `allow`) but BEFORE every auto-approve
+    // convenience gate — OpenFileWorkspaceGate and especially WriteApprovalGate, which
+    // auto-`Allow`s in-workspace writes and would short-circuit the chain before a hook ever
+    // sees the call (so a PreToolUse hook on edit/write would silently never run). This
+    // matches Claude Code, where a PreToolUse hook IS the permission entry point: its
+    // `updatedInput` rewrite lands before WriteApprovalGate inspects the path and before the
+    // user sees approval (so the approved bytes are what run), `allow` short-circuits the
+    // whole approval chain, and `deny` blocks. Registered only when hooks exist (else zero
+    // middleware overhead).
+    if let Some(cc) = &parts.cc_external_hooks {
+        builder = builder.middleware(cc.clone());
+    }
+    let mut builder = builder
+        // open_file is Risky (launches a GUI), so approval would prompt on EVERY preview.
+        // Restore the legacy engine's behavior: auto-approve when the target is inside the
+        // workspace (benign side effect on the user's own files). BEFORE approval so its
+        // `Allow` short-circuits the prompt; out-of-workspace paths fall through and still
+        // prompt. Reads the SAME live cwd handle below, so a /cd moves the boundary.
+        .middleware(Arc::new(OpenFileWorkspaceGate::new(parts.shared_cwd.clone())))
+        // Workspace-aware, per-path approval for the file-mutation tools (v1 granularity):
+        // in-workspace non-sensitive writes auto-approve; sensitive writes always re-prompt
+        // (never remembered); out-of-workspace writes prompt with a PER-PATH "Always". Owns
+        // write-tool approval, so it must sit BEFORE the generic approval gate (its `Allow`
+        // short-circuits the prompt). Reads the SAME live cwd handle, so /cd moves the boundary.
+        .middleware(Arc::new(WriteApprovalGate::new(parts.shared_cwd.clone())))
+        // Approval AFTER the CC PreToolUse gate + the write/open auto-approve gates — every
+        // arg-rewrite (CC `updatedInput`) has already applied, so the user approves the exact
         // bytes that run.
         .middleware(parts.approval.clone())
         // LIVE cwd handle (not the immutable pin): /cd mutates parts.shared_cwd.
@@ -409,8 +507,13 @@ pub fn assemble(
         )))
         .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
-        .request_timeout(cfg.request_timeout)
         .max_continuations(cfg.max_continuations);
+    // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
+    // answered (interactive — a present human must not be auto-denied). The kernel defaults
+    // to unbounded when `.request_timeout` is never set, so None = park.
+    if let Some(d) = cfg.request_timeout {
+        builder = builder.request_timeout(d);
+    }
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
     }
@@ -421,6 +524,31 @@ pub fn assemble(
         }
     }
     Ok(builder.build())
+}
+
+const ATOMCODE_PERSONA_PREFIX: &str =
+    "You are AtomCode, an AI coding agent by AtomGit running the ";
+
+/// Legacy drivers persist conversation history without the separately supplied
+/// system prompt. A v2 resume must restore that prompt, while a model switch must
+/// replace the old model identity instead of retaining or duplicating it.
+fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
+    let persona = coding_persona(model);
+    let is_persona = |message: &Message| {
+        message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
+    };
+    let already_current = snapshot
+        .messages
+        .first()
+        .is_some_and(|message| message.role == Role::System && message.text == persona)
+        && snapshot.messages.iter().skip(1).all(|message| !is_persona(message));
+    if already_current {
+        return;
+    }
+
+    snapshot.messages.retain(|message| !is_persona(message));
+    snapshot.messages.insert(0, Message::system(persona));
+    snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
 }
 
 /// A snapshot from another kernel version must NOT be silently re-bound to its
@@ -440,4 +568,184 @@ fn check_snapshot_version(snap: &SessionSnapshot) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CodingAgentConfig;
+
+    #[test]
+    fn resume_adds_persona_before_legacy_session_context() {
+        let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
+
+        reconcile_coding_persona(&mut snapshot, "deepseek-v4-flash");
+
+        assert!(snapshot.messages[0].text.contains("running the deepseek-v4-flash model"));
+        assert_eq!(snapshot.messages[1].text, "SESSION CONTEXT");
+        assert_eq!(snapshot.cache_epoch, 1);
+    }
+
+    #[test]
+    fn model_switch_replaces_persona_without_duplication() {
+        let mut snapshot = SessionSnapshot::new(vec![
+            Message::system(coding_persona("old-model")),
+            Message::system("SESSION CONTEXT"),
+        ]);
+
+        reconcile_coding_persona(&mut snapshot, "deepseek-v4-flash");
+
+        let personas = snapshot
+            .messages
+            .iter()
+            .filter(|message| message.text.starts_with(ATOMCODE_PERSONA_PREFIX))
+            .count();
+        assert_eq!(personas, 1);
+        assert!(snapshot.messages[0].text.contains("running the deepseek-v4-flash model"));
+        assert!(!snapshot.messages[0].text.contains("old-model"));
+        assert_eq!(snapshot.cache_epoch, 1);
+    }
+
+    #[test]
+    fn current_persona_keeps_snapshot_byte_stable() {
+        let persona = coding_persona("deepseek-v4-flash");
+        let mut snapshot = SessionSnapshot::new(vec![
+            Message::system(persona.clone()),
+            Message::system("SESSION CONTEXT"),
+        ]);
+
+        reconcile_coding_persona(&mut snapshot, "deepseek-v4-flash");
+
+        assert_eq!(snapshot.messages[0].text, persona);
+        assert_eq!(snapshot.cache_epoch, 0);
+    }
+
+    /// `prepare` with all optional capabilities OFF — keeps the call I/O-free (no MCP
+    /// connect, no session/skill/home scans) so the test only exercises CC-hook wiring.
+    fn io_free_opts() -> PrepareOptions {
+        PrepareOptions {
+            session: SessionMode::Disabled,
+            skill_dirs: Some(vec![]),
+            mcp: false,
+            memory: false,
+            web: false,
+            review: false,
+        }
+    }
+
+    /// `prepare` loads a project `.hooks.json` and exposes the runner via
+    /// `cc_external_hooks` (the handle `assemble` registers as a ToolMiddleware) AND
+    /// pushes it onto the lifecycle `hooks`. With no hooks file, neither is registered —
+    /// the zero-overhead common path. ATOMCODE_HOME is pinned to an empty temp dir so the
+    /// user-level lookup can't pick up a real `~/.atomcode/hooks.json` on the dev box.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn prepare_wires_cc_external_hooks_only_when_present() {
+        let home = tempfile::tempdir().unwrap(); // empty → no user-level hooks
+        std::env::set_var("ATOMCODE_HOME", home.path());
+
+        // No project hooks → nothing wired.
+        let bare = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", bare.path());
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        assert!(parts.cc_external_hooks.is_none(), "no hooks.json ⇒ nothing registered");
+        let baseline_hooks = parts.hooks.len();
+
+        // Project .hooks.json present → wired as the middleware handle AND a lifecycle hook.
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proj.path().join(".hooks.json"),
+            r#"{"hooks":{"a":{"event":"PreToolUse","matcher":"bash","command":"echo hi"}}}"#,
+        )
+        .unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", proj.path());
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        assert!(parts.cc_external_hooks.is_some(), "project .hooks.json ⇒ wired");
+        assert_eq!(
+            parts.hooks.len(),
+            baseline_hooks + 1,
+            "the CC runner is also pushed onto the lifecycle hook chain"
+        );
+
+        std::env::remove_var("ATOMCODE_HOME");
+    }
+
+    /// A canned provider that reports usage then ends — enough for a telemetry
+    /// decorator to fold a `TokenUsage` and emit one `LlmChat`.
+    struct CannedProvider;
+    #[async_trait::async_trait]
+    impl LlmProvider for CannedProvider {
+        fn model_name(&self) -> &str {
+            "m"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            use atomcode_kernel::stream::{StreamEvent, TokenUsage};
+            let evs = vec![
+                StreamEvent::TextDelta("looks good".into()),
+                StreamEvent::Usage(TokenUsage { prompt: 500, completion: 30, cached: 0 }),
+                StreamEvent::Done { truncated: false },
+            ];
+            Ok(Box::pin(futures::stream::iter(evs)))
+        }
+    }
+
+    /// The `code_review` sub-agent runs its OWN kernel loop with no turn-level
+    /// `TelemetryHook`, so its LLM rounds bypass the host's metering entirely. To keep
+    /// review token spend visible, the provider placed in the review slot at `assemble`
+    /// must be a metered decorator (when a telemetry sink is configured). This drives one
+    /// round through that provider and asserts the `LlmChat` lands.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn review_subagent_provider_is_metered_for_token_telemetry() {
+        use futures::stream::StreamExt;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+
+        let (tel, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+        let proj = tempfile::tempdir().unwrap();
+        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "m", proj.path());
+        cfg.telemetry = Some(tel);
+
+        let mut opts = io_free_opts();
+        opts.review = true;
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
+
+        let slot = parts.review_provider.clone().expect("review enabled ⇒ slot present");
+        let review_provider =
+            slot.read().unwrap().clone().expect("slot filled at assemble");
+        let mut stream = review_provider
+            .chat_stream(
+                &[Message::user("review this")],
+                &[],
+                &atomcode_kernel::provider::ChatOptions::default(),
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let llm_chats = captured
+            .lock()
+            .await
+            .iter()
+            .filter(|r| matches!(r.event, atomcode_telemetry::Event::LlmChat { .. }))
+            .count();
+        assert_eq!(
+            llm_chats, 1,
+            "review sub-agent LLM round must emit one LlmChat token event"
+        );
+
+        std::env::remove_var("ATOMCODE_HOME");
+    }
 }

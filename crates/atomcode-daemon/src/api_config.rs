@@ -28,6 +28,7 @@ pub(crate) fn load_config() -> Result<Config, String> {
 fn empty_config() -> Config {
     Config {
         default_provider: String::new(),
+        evaluator_provider: None,
         default_workdir: None,
         providers: HashMap::new(),
         datalog: Default::default(),
@@ -41,6 +42,7 @@ fn empty_config() -> Config {
         language: None,
         ui: Default::default(),
         plugin: Default::default(),
+        web_search: Default::default(),
     }
 }
 

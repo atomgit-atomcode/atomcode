@@ -83,15 +83,15 @@ pub enum TurnEvent {
     /// the current cwd without polling the shared `Arc<RwLock<PathBuf>>`.
     WorkingDirChanged(PathBuf),
     /// A tool requires user approval. Carries a snapshot of
-    /// `conversation.messages` so the TUI can persist mid-turn
-    /// session state (e.g. for `/bg`). The approval itself is
+    /// conversation state so the TUI can persist mid-turn session
+    /// state (e.g. for `/bg`). The approval itself is
     /// handled by `PermissionDecider`; this event is purely
     /// informational.
     ApprovalRequested {
         tool_name: String,
         reason: String,
         call: crate::tool::ToolCall,
-        messages: Vec<crate::conversation::message::Message>,
+        snapshot: crate::conversation::ConversationSnapshot,
     },
 }
 

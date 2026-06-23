@@ -25,6 +25,12 @@ pub struct ContextStats {
     pub total_messages: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ConversationSnapshot {
+    pub messages: Vec<Message>,
+    pub cold_summaries: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
@@ -51,6 +57,40 @@ impl Default for Conversation {
 impl Conversation {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_snapshot(snapshot: ConversationSnapshot) -> Self {
+        Self::from_messages_and_cold_summaries(snapshot.messages, snapshot.cold_summaries)
+    }
+
+    pub fn from_messages_and_cold_summaries(
+        messages: Vec<Message>,
+        mut cold_summaries: Vec<String>,
+    ) -> Self {
+        if cold_summaries.len() > 3 {
+            let drop_count = cold_summaries.len() - 3;
+            tracing::warn!(
+                drop_count,
+                total = cold_summaries.len(),
+                "cold_summaries exceeds max (3), dropping oldest"
+            );
+            cold_summaries.drain(..drop_count);
+        }
+        let turn_tracker = TurnTracker::rebuild(&messages);
+        Self {
+            messages,
+            stream_buffer: None,
+            tool_call_buffer: None,
+            turn_tracker,
+            cold_summaries,
+        }
+    }
+
+    pub fn snapshot(&self) -> ConversationSnapshot {
+        ConversationSnapshot {
+            messages: self.messages.clone(),
+            cold_summaries: self.cold_summaries.clone(),
+        }
     }
 
     /// Number of real (non-synthetic) user prompts. This is the maximum `N`
@@ -299,6 +339,51 @@ impl Conversation {
         }
     }
 
+    /// Finalize a no-tool-call assistant turn, PRESERVING any thinking-model
+    /// reasoning. A plain `Text` message can't carry `reasoning_content`, so a
+    /// turn that captured reasoning is stored as `AssistantWithToolCalls` with
+    /// an empty `tool_calls` list — the one representation that holds reasoning
+    /// while behaving like a text turn everywhere else (empty tool_calls expect
+    /// zero ToolResults, so `sanitize_messages` never drops it; `format_messages`
+    /// serialises it as plain assistant text + reasoning_content).
+    ///
+    /// This is what lets the next request echo the REAL reasoning of the final
+    /// answer back — DeepSeek V4's thinking-mode contract requires it (400
+    /// otherwise) — instead of falling back to the "(no reasoning recorded)"
+    /// placeholder, which thinking models (DeepSeek V4 Flash) otherwise mimic
+    /// into their replies and which stalls the turn. Turns with no captured
+    /// reasoning fall back to a plain `Text` message (non-thinking models are
+    /// unaffected).
+    pub fn finalize_stream_with_reasoning(
+        &mut self,
+        reasoning: Option<&str>,
+        thinking_blocks: Vec<crate::conversation::message::ThinkingBlock>,
+    ) {
+        let Some(raw) = self.stream_buffer.take() else {
+            return;
+        };
+        let Some(content) = clean_assistant_text(&raw) else {
+            return;
+        };
+        let has_reasoning = reasoning.map(|r| !r.trim().is_empty()).unwrap_or(false);
+        let idx = self.messages.len();
+        if has_reasoning || !thinking_blocks.is_empty() {
+            self.messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: Some(content),
+                    tool_calls: Vec::new(),
+                    reasoning_content: reasoning.map(|s| s.to_string()),
+                    thinking_blocks,
+                },
+                synthetic: false,
+            });
+        } else {
+            self.messages.push(Message::new(Role::Assistant, content));
+        }
+        self.turn_tracker.on_message_added(idx);
+    }
+
     pub fn add_assistant_tool_calls(
         &mut self,
         text: Option<&str>,
@@ -455,6 +540,15 @@ impl Conversation {
         }
 
         // Add to cold zone (FIFO, max 3)
+        // Detect potential prompt injection in LLM-generated summary
+        let lower = summary.to_lowercase();
+        if lower.contains("ignore all") || lower.contains("from now on") || lower.contains("you are")
+        {
+            tracing::warn!(
+                summary_len = summary.len(),
+                "cold summary contains potential prompt injection patterns"
+            );
+        }
         self.cold_summaries.push(summary);
         while self.cold_summaries.len() > 3 {
             self.cold_summaries.remove(0);
@@ -541,7 +635,15 @@ impl Conversation {
 
             // INVARIANT ENFORCEMENT:
             // Clamp indices to valid range in case of edge cases or corrupted state
+            let unclamped_count = new_count;
             let new_count = new_count.min(new_msg_len.saturating_sub(new_start));
+            debug_assert_eq!(
+                unclamped_count, new_count,
+                "turn tracker invariant violation: start_idx={}, end={}, \
+                 remove_end={}, new_msg_len={}, \
+                 count clamped from {unclamped_count} to {new_count}",
+                turn.start_idx, turn_end, remove_end, new_msg_len
+            );
 
             // Only include turns with at least one message
             if new_count > 0 && new_start < new_msg_len {
@@ -903,6 +1005,46 @@ mod tests {
         let conv = Conversation::new();
         assert!(conv.messages.is_empty());
         assert!(conv.stream_buffer.is_none());
+    }
+
+    #[test]
+    fn finalize_stream_with_reasoning_preserves_reasoning_as_empty_tool_calls() {
+        // A no-tool-call final answer that captured reasoning must keep it,
+        // stored as AssistantWithToolCalls{tool_calls: []} so format_messages can
+        // echo the REAL reasoning instead of the "(no reasoning recorded)"
+        // placeholder. (DeepSeek V4 Flash bug.)
+        let mut c = Conversation::new();
+        c.push_delta("the answer");
+        c.finalize_stream_with_reasoning(Some("my thinking"), Vec::new());
+        assert_eq!(c.messages.len(), 1);
+        match &c.messages[0].content {
+            MessageContent::AssistantWithToolCalls {
+                text,
+                tool_calls,
+                reasoning_content,
+                ..
+            } => {
+                assert!(tool_calls.is_empty(), "no tool calls on a final answer");
+                assert_eq!(text.as_deref(), Some("the answer"));
+                assert_eq!(reasoning_content.as_deref(), Some("my thinking"));
+            }
+            other => panic!("expected AssistantWithToolCalls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_stream_with_reasoning_falls_back_to_text_without_reasoning() {
+        // Non-thinking models capture no reasoning — keep the plain Text shape
+        // so nothing else changes for them.
+        let mut c = Conversation::new();
+        c.push_delta("plain answer");
+        c.finalize_stream_with_reasoning(None, Vec::new());
+        assert_eq!(c.messages.len(), 1);
+        assert!(
+            matches!(&c.messages[0].content, MessageContent::Text(t) if t == "plain answer"),
+            "no reasoning → plain Text, got {:?}",
+            c.messages[0].content
+        );
     }
 
     #[test]

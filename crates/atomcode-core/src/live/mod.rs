@@ -46,6 +46,13 @@ pub enum LiveEvent {
     /// 任一视图（webui 下拉框 / TUI /model）切换了模型。其余视图据此同步显示与选中项。
     /// 仅作显示/状态广播——实际下一轮用哪个 provider 由进程级选择（daemon 侧 LIVE_PROVIDER）决定。
     ProviderChanged(String),
+    /// 任一视图（webui /cd）切换了工作目录/项目。其余视图据此跟随：同进程 TUI
+    /// 会切到新目录并开一个全新 session（见 event_loop/live_sync 转发）。仅广播
+    /// 路径，不触碰 turn 状态。
+    WorkingDirChanged(std::path::PathBuf),
+    /// 任一视图（webui）创建了新会话并切换到它。其余视图据此同步创建新会话。
+    /// 参数为新会话 ID。
+    SessionSwitched(String),
 }
 
 /// turn 执行策略。实现者负责对 `conv` 跑一次完整 turn（含工具循环），并把过程
@@ -79,6 +86,8 @@ pub struct LiveSession {
     events: broadcast::Sender<LiveEvent>,
     input_tx: mpsc::UnboundedSender<UserInput>,
     turn_state: Arc<Mutex<TurnState>>,
+    /// Cancellation token for the turn currently owned by the coordinator.
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     /// 当前 turn 的审批响应通道。执行器在需要交互审批的 turn 开始时注册（经 run_turn
     /// 的 approver 参数）；任一视图调用 `approve` 先到先得地投递决定。
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
@@ -87,15 +96,22 @@ pub struct LiveSession {
 impl LiveSession {
     /// 用注入的执行器与初始消息建会话，并 spawn 协调器任务。返回 `Arc` 以便多视图共享。
     pub fn new(executor: Arc<dyn TurnExecutor>, initial: Vec<Message>) -> Arc<Self> {
+        Self::new_with_cold_summaries(executor, initial, Vec::new())
+    }
+
+    pub fn new_with_cold_summaries(
+        executor: Arc<dyn TurnExecutor>,
+        initial: Vec<Message>,
+        cold_summaries: Vec<String>,
+    ) -> Arc<Self> {
         let conversation = Arc::new(Mutex::new({
-            let mut c = Conversation::new();
-            c.messages = initial.clone();
-            c
+            Conversation::from_messages_and_cold_summaries(initial.clone(), cold_summaries)
         }));
         let snapshot = Arc::new(Mutex::new(initial));
         let (events, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let turn_state = Arc::new(Mutex::new(TurnState::Idle));
+        let current_cancel = Arc::new(Mutex::new(None));
         let approver = Arc::new(Mutex::new(None));
 
         let session = Arc::new(Self {
@@ -103,6 +119,7 @@ impl LiveSession {
             events: events.clone(),
             input_tx,
             turn_state: turn_state.clone(),
+            current_cancel: current_cancel.clone(),
             approver: approver.clone(),
         });
 
@@ -113,6 +130,7 @@ impl LiveSession {
             events,
             input_rx,
             turn_state,
+            current_cancel,
             approver,
         ));
 
@@ -143,6 +161,17 @@ impl LiveSession {
         *self.turn_state.lock().await
     }
 
+    /// Cancel the currently running turn. Returns `false` when the session is idle.
+    pub async fn cancel_current_turn(&self) -> bool {
+        let cancel = self.current_cancel.lock().await.clone();
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     /// 投递一条用户输入。返回 `false` 表示总线已关闭（协调器任务已退出）。
     /// 注意：是否在「运行中」被忽略由协调器判定（见 `coordinator`）。
     pub fn send_input(&self, input: UserInput) -> bool {
@@ -158,6 +187,18 @@ impl LiveSession {
     /// 让另一端的下拉框 / 头部显示实时跟随。返回 false 表示当前无订阅者（无妨）。
     pub fn notify_provider_changed(&self, provider: String) -> bool {
         self.events.send(LiveEvent::ProviderChanged(provider)).is_ok()
+    }
+
+    /// 广播一次工作目录切换给所有视图（不触碰 turn 状态）。webui /cd 时调用，
+    /// 让同进程 TUI 跟随切目录并开一个全新会话。返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_working_dir_changed(&self, dir: std::path::PathBuf) -> bool {
+        self.events.send(LiveEvent::WorkingDirChanged(dir)).is_ok()
+    }
+
+    /// 广播一次会话切换给所有视图（不触碰 turn 状态）。webui 新建对话时调用，
+    /// 让同进程 TUI 跟随切换到新会话。返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_session_switched(&self, session_id: String) -> bool {
+        self.events.send(LiveEvent::SessionSwitched(session_id)).is_ok()
     }
 
     /// 任一视图批准/拒绝，投递决定到执行器持有的审批通道。
@@ -187,13 +228,21 @@ async fn coordinator(
     events: broadcast::Sender<LiveEvent>,
     mut input_rx: mpsc::UnboundedReceiver<UserInput>,
     turn_state: Arc<Mutex<TurnState>>,
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
 ) {
+    // Diagnostics via `ctrace!` (file sink, gated by ATOMCODE_TRACE), never
+    // eprintln: under /webui this coordinator runs in the TUI process, so a
+    // stray stderr write lands on the raw-mode terminal and corrupts the
+    // display (DEC-graphics mojibake / flooding). See trace.rs.
+    crate::ctrace!("LIVE", "coordinator START");
     while let Some(input) = input_rx.recv().await {
+        crate::ctrace!("LIVE", "coordinator received input: {} chars", input.text.len());
         // 单写者守卫：运行中直接忽略本次输入（不排队，避免乱序）。
         {
             let mut st = turn_state.lock().await;
             if *st == TurnState::Running {
+                crate::ctrace!("LIVE", "coordinator REJECTED input: already running");
                 let _ = events.send(LiveEvent::Turn(TurnEvent::Warning(
                     "对方正在对话，已忽略本次输入".to_string(),
                 )));
@@ -201,7 +250,10 @@ async fn coordinator(
             }
             *st = TurnState::Running;
         }
+        crate::ctrace!("LIVE", "coordinator ACCEPTED input, broadcasting StateChanged(Running)");
         let _ = events.send(LiveEvent::StateChanged(TurnState::Running));
+        let cancel = CancellationToken::new();
+        *current_cancel.lock().await = Some(cancel.clone());
 
         // 先即时回显用户消息（原始文本 + 原图），让发送方立刻看到自己的输入，不被随后
         // 可能较慢的 VL 预处理阻塞——否则带图发送会「发出后很久没反应」。
@@ -254,8 +306,10 @@ async fn coordinator(
 
         // 跑一次 turn（执行器内部持 conv 锁修改并广播 Turn 事件）。
         executor
-            .run_turn(&conversation, events.clone(), approver.clone(), CancellationToken::new())
+            .run_turn(&conversation, events.clone(), approver.clone(), cancel)
             .await;
+
+        *current_cancel.lock().await = None;
 
         // turn 结束：清空审批槽（防止旧通道被下一个 turn 误用）。
         *approver.lock().await = None;
@@ -273,8 +327,10 @@ async fn coordinator(
             )));
         }
         *turn_state.lock().await = TurnState::Idle;
+        crate::ctrace!("LIVE", "coordinator turn done, broadcasting StateChanged(Idle)");
         let _ = events.send(LiveEvent::StateChanged(TurnState::Idle));
     }
+    crate::ctrace!("LIVE", "coordinator EXIT (input_rx closed)");
 }
 
 #[cfg(test)]
@@ -289,6 +345,21 @@ mod tests {
         calls: Arc<AtomicUsize>,
         reply: String,
         delay_ms: u64,
+    }
+
+    struct CancellableExecutor;
+
+    #[async_trait]
+    impl TurnExecutor for CancellableExecutor {
+        async fn run_turn(
+            &self,
+            _conv: &Arc<Mutex<Conversation>>,
+            _events: broadcast::Sender<LiveEvent>,
+            _approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+            cancel: CancellationToken,
+        ) {
+            cancel.cancelled().await;
+        }
     }
 
     #[async_trait]
@@ -382,6 +453,26 @@ mod tests {
         assert!(session.send_input(UserInput { text: "third".into(), images: vec![] }));
         let _ = drain_until_idle(&mut rx).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "运行中投的第二条应被丢弃，仅 first+third 执行");
+    }
+
+    #[tokio::test]
+    async fn cancel_current_turn_stops_running_executor() {
+        let session = LiveSession::new(Arc::new(CancellableExecutor), Vec::new());
+        let mut rx = session.subscribe();
+
+        assert!(session.send_input(UserInput { text: "cancel me".into(), images: vec![] }));
+        loop {
+            if let Ok(LiveEvent::StateChanged(TurnState::Running)) = rx.recv().await {
+                break;
+            }
+        }
+
+        assert!(session.cancel_current_turn().await);
+        let events = tokio::time::timeout(std::time::Duration::from_secs(1), drain_until_idle(&mut rx))
+            .await
+            .expect("cancelled turn should become idle promptly");
+        assert!(matches!(events.last(), Some(LiveEvent::StateChanged(TurnState::Idle))));
+        assert!(!session.cancel_current_turn().await);
     }
 
     #[tokio::test]

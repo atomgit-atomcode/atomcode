@@ -578,7 +578,7 @@ impl ShellCommandHook {
             );
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(crate::process_utils::decode_subprocess_output(&output.stdout))
     }
 
     /// 执行 shell 命令并 pipe stdin，返回 (exit_ok, stdout, stderr)。
@@ -611,8 +611,8 @@ impl ShellCommandHook {
             let output = child.wait_with_output().await?;
             anyhow::Ok((
                 output.status.success(),
-                String::from_utf8_lossy(&output.stdout).to_string(),
-                String::from_utf8_lossy(&output.stderr).to_string(),
+                crate::process_utils::decode_subprocess_output(&output.stdout),
+                crate::process_utils::decode_subprocess_output(&output.stderr),
             ))
         };
 

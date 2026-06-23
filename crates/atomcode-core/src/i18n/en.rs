@@ -430,7 +430,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── Approval prompt ──
         Msg::ApprovalPromptAlt { tool, detail } =>
-            format!("Allow {}({})? [Y]es / [N]o / [A]lways", tool, detail).into(),
+            format!("Allow {}({})? [Y]es=Enter / [N]o / [A]lways", tool, detail).into(),
         Msg::ApprovalWaitingLabel =>
             "▶ Waiting for approval: ".into(),
         Msg::ApprovalAllow => " Allow  ".into(),
@@ -735,9 +735,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrHintUrl => "type/paste git URL · ⏎ add · esc cancel".into(),
 Msg::PluginMgrHintPending => "Installing, please wait… · esc back".into(),
 Msg::PluginMgrInstallingLabel => "Installing…".into(),
-        Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…”".into(),
-        Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace.".into(),
-        Msg::PluginMgrEmptyInstalled => "No plugins installed.".into(),
+        Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…” · esc back".into(),
+        Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace · esc back".into(),
+        Msg::PluginMgrEmptyInstalled => "No plugins installed · esc back".into(),
         Msg::PluginMgrCloning => "Cloning marketplace…".into(),
         Msg::PluginMgrInstalling { plugin } => format!("Installing {plugin}…").into(),
         Msg::PluginMgrEscToCancel => "Esc to cancel".into(),
@@ -812,7 +812,15 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescSkills => "Browse loaded skills".into(),
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
+        Msg::CmdDescCopy => "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all)".into(),
+        Msg::CopyOk { lines, chars } => format!("Copied code block to clipboard ({lines} lines, {chars} chars)").into(),
+        Msg::CopyNoCodeBlock => "No code block in the last reply to copy".into(),
+        Msg::CopyBadIndex { count } => format!("No such code block — the last reply has {count} (use /copy N, 1..={count})").into(),
+        Msg::CopyFailed => "Clipboard unavailable — could not copy".into(),
+        Msg::CodeBlockCopied => "📋 Copied code block to clipboard".into(),
         Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
+        Msg::CmdDescView => "View file content in an overlay modal".into(),
+        Msg::ViewUsage => "Usage: /view <filepath>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
         Msg::GuideMenuTopics => "Common topics:".into(),
         Msg::GuideMenuGettingStarted => "Getting started          First install, login, config".into(),
@@ -879,10 +887,14 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdWelcomeDescription => "Re-run the onboarding wizard".into(),
         Msg::VisionPreprocessSuccess { char_count } =>
             format!("✓ VL recognised image, returned {char_count} chars").into(),
-        Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {total_tokens} tokens").into(),
+        Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens, cached_pct } =>
+            format!(
+                "✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens{}",
+                super::fmt_tokens(total_tokens),
+                cached_pct.map(|p| format!(" · {p}% cached")).unwrap_or_default(),
+            ).into(),
         Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✗ Stopped · {turn_count} rounds · {tool_call_count} tools · {duration} · {total_tokens} tokens").into(),
+            format!("✗ Stopped · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
         Msg::LoginQrHeader =>
             "  Sign in to AtomGit — scan the QR code with your WeChat:\n\n".into(),
         Msg::LoginUrlAfterQr =>
@@ -916,6 +928,25 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             let plural = if messages == 1 { "" } else { "s" };
             format!("(compacted — dropped {} message{}, {} → {} tokens)\n", messages, plural, before, after).into()
         }
+        Msg::GoalHelp =>
+            "  /goal — autonomous multi-round work toward a stated condition.\n  \
+             Usage:\n  \
+             \u{20}\u{20}/goal <condition>     set a new goal; agent loops until the evaluator says met\n  \
+             \u{20}\u{20}/goal                 show current goal status\n  \
+             \u{20}\u{20}/goal status          same as above\n  \
+             \u{20}\u{20}/goal clear           stop the active goal (aliases: stop, off, reset, none, cancel)\n  \
+             \u{20}\u{20}/goal help            this help\n  \
+             Notes:\n  \
+             \u{20}\u{20}- A fast model evaluates each round; configure via [providers] +\n  \
+             \u{20}\u{20}\u{20}\u{20}evaluator_provider in ~/.atomcode/config.toml.\n  \
+             \u{20}\u{20}- No built-in round / time cap — express budgets in the condition\n  \
+             \u{20}\u{20}\u{20}\u{20}text itself (e.g. \"or stop after 20 turns\"). CC's /goal works the same way.\n  \
+             \u{20}\u{20}- Esc / Ctrl+C stops the goal at any time.\n".into(),
+        Msg::GoalStatus { condition, round, mins, secs } =>
+            format!("  ◎ Goal: {}\n  Round: {}\n  Elapsed: {}m {}s\n", condition, round, mins, secs).into(),
+        Msg::GoalNoActive =>
+            "  No active goal.\n  Usage: /goal <condition>   |   /goal help\n".into(),
+        Msg::GoalCleared => "  Goal cleared.\n".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "Current model \"{}\" does not support image input and no \
              vision_preprocessor_provider is configured. Use /model to \
@@ -931,6 +962,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "[headless] --dangerously-skip-permissions: all tool calls are auto-approved".into(),
         Msg::BypassBadge =>
             "\u{26a0} BYPASS".into(),
+
+        Msg::AdminWarningBanner =>
+            "\x1b[33m\u{26a0} Warning: Running with Administrator privileges.\n   The model may have access to system files.\n   Consider running without elevation, inside a scoped working directory.\x1b[39m\n".into(),
+        Msg::AdminWarningHeadless =>
+            "[warning] Running with Administrator privileges — model may have access to system files.".into(),
 
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
         Msg::HintMultiLineInput =>
@@ -976,6 +1012,87 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("Error: {error}").into(),
         Msg::BgTaskCancelled => "Cancelled.".into(),
         Msg::BgTaskNoSummary => "Task completed (no summary text).".into(),
+        // -- CLI atomcode --help i18n --
+        Msg::CliAbout => "AI coding assistant in your terminal".into(),
+        Msg::CliAboutLogin => "Sign in with AtomGit OAuth and claim CodingPlan models in one flow".into(),
+        Msg::CliAboutLogout => "Logout from AtomCode".into(),
+        Msg::CliAboutStatus => "Show current login status".into(),
+        Msg::CliAboutUpgrade => "Upgrade atomcode in-place to the latest released version".into(),
+        Msg::CliAboutRollback => "Roll back to the previous version (swap with .bak on disk)".into(),
+        Msg::CliAboutFixissue => "Fetch an AtomGit issue and let the agent fix it in the current project".into(),
+        Msg::CliAboutMcp => "Manage MCP server entries in .mcp.json".into(),
+        Msg::CliAboutDaemon => "Start the HTTP daemon for IDE integration".into(),
+        Msg::CliAboutWebui => "Start the local browser webui".into(),
+        Msg::CliAboutTelemetry => "Telemetry controls".into(),
+        Msg::CliAboutPlugin => "Manage skill/command plugins".into(),
+        Msg::CliAboutUninstall => "Uninstall AtomCode: remove the binary, PATH edit, and data".into(),
+        Msg::CliAboutSetup => "Install seed files (skills/commands/hooks/MCP) to ~/.atomcode/".into(),
+        Msg::CliAboutHooks => "Manage hooks (list, test, enable/disable)".into(),
+        Msg::CliAboutHooksList => "List all loaded hooks with their status".into(),
+        Msg::CliAboutHooksTest => "Test a specific hook by name".into(),
+        Msg::CliAboutHooksPaths => "Show hook configuration paths".into(),
+        Msg::CliAboutPluginMarketplace => "Marketplace registry operations".into(),
+        Msg::CliAboutPluginInstall => "Install a plugin from a registered marketplace".into(),
+        Msg::CliAboutPluginUninstall => "Uninstall a previously-installed plugin".into(),
+        Msg::CliAboutPluginList => "List installed plugins".into(),
+        Msg::CliAboutMarketplaceAdd => "Clone a marketplace git repo and register it locally".into(),
+        Msg::CliAboutMarketplaceRemove => "Drop a registered marketplace".into(),
+        Msg::CliAboutMarketplaceUpdate => "Re-pull a registered marketplace and refresh its plugin index".into(),
+        Msg::CliAboutMarketplaceList => "List registered marketplaces".into(),
+        Msg::CliAboutMcpAdd => "Add or replace a stdio MCP server".into(),
+        Msg::CliAboutMcpAddGithubOauth => "Add GitHub remote MCP server using OAuth".into(),
+        Msg::CliAboutMcpLogin => "Complete OAuth login for a remote MCP server".into(),
+        Msg::CliAboutMcpLogout => "Remove saved OAuth credentials for a remote MCP server".into(),
+        Msg::CliAboutTelemetryStatus => "Show current telemetry state and queue stats".into(),
+        Msg::CliAboutTelemetryEnable => "Enable telemetry".into(),
+        Msg::CliAboutTelemetryDisable => "Disable telemetry".into(),
+        Msg::CliAboutTelemetryDump => "Print pending queued events".into(),
+        Msg::CliAboutTelemetryClear => "Clear queued events".into(),
+        Msg::CliHelpContinue => "Continue the previous session instead of starting a new one".into(),
+        Msg::CliHelpProvider => "Provider to use (overrides config default)".into(),
+        Msg::CliHelpModel => "Model to use (overrides config provider model)".into(),
+        Msg::CliHelpLang => "Set interface language (e.g. en, zh-CN, zh)".into(),
+        Msg::CliHelpConfig => "Path to config file".into(),
+        Msg::CliHelpDir => "Working directory (defaults to current directory)".into(),
+        Msg::CliHelpPrompt => "Prompt to run in headless (non-interactive) mode".into(),
+        Msg::CliHelpPromptFile => "Read the prompt from a file".into(),
+        Msg::CliHelpVerbose => "Show tool calls, token usage, and turn summary on stderr".into(),
+        Msg::CliHelpMaxTurns => "Maximum number of LLM turns before the agent loop is force-stopped".into(),
+        Msg::CliHelpDev => "Disable auto-update for this launch".into(),
+        Msg::CliHelpDisableTools => "Comma-separated list of tool names to exclude from the registry".into(),
+        Msg::CliHelpNoTelemetry => "Disable telemetry for this invocation".into(),
+        Msg::CliHelpDangerouslySkipPermissions => "Skip all permission prompts -- auto-approve every tool call".into(),
+        Msg::CliHelpForce => "Reinstall even when already on the latest version".into(),
+        Msg::CliHelpPortDaemon => "Port to listen on (default: 13456)".into(),
+        Msg::CliHelpClient => "Client identifier for telemetry".into(),
+        Msg::CliHelpIdleTimeout => "Idle-shutdown timeout in seconds; 0 disables".into(),
+        Msg::CliHelpPortWebui => "Port (default: 13457)".into(),
+        Msg::CliHelpHost => "Bind address (default: 127.0.0.1)".into(),
+        Msg::CliHelpFixissueUrl => "Full issue URL".into(),
+        Msg::CliHelpUninstallYes => "Skip prompts; use per-group default decisions".into(),
+        Msg::CliHelpUninstallPurge => "Wipe ~/.atomcode/ entirely".into(),
+        Msg::CliHelpUninstallKeepData => "Keep ~/.atomcode/ entirely".into(),
+        Msg::CliHelpUninstallDryRun => "Print the plan; do nothing".into(),
+        Msg::CliHelpMcpGlobal => "Write ~/.atomcode/mcp.json instead of <dir>/.mcp.json".into(),
+        Msg::CliHelpMcpDir => "Directory for project .mcp.json".into(),
+        Msg::CliHelpMcpName => "Server key".into(),
+        Msg::CliHelpHooksTestName => "Hook name to test".into(),
+        Msg::CliHelpPluginSpec => "e.g. plugin@marketplace".into(),
+        Msg::CliHelpMarketplaceUrl => "Git URL of a marketplace repo".into(),
+        Msg::CliHelpMarketplaceName => "Marketplace name".into(),
+        Msg::CliAboutHelp => "Print this message or the help of the given subcommand(s)".into(),
+        Msg::CliHelpMcpCommand => "Executable and arguments".into(),
+
+        // ── engine v2 provider init (atomcode-bridge) ──
+        Msg::ProviderInitFailed { detail } =>
+            format!("provider init failed: {detail}").into(),
+        Msg::GatewayAuthUnavailable { base_url } =>
+            format!(
+                "provider base_url '{base_url}' is an AtomGit gateway this build can't \
+                 authenticate against. Use the official binary, or point the provider at a \
+                 plain OpenAI-compatible endpoint with an api_key."
+            ).into(),
+        Msg::StreamStalled => "slow response · esc to cancel".into(),
     }
 }
 

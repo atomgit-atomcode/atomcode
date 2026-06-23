@@ -21,7 +21,7 @@ Guidelines:
 - REPRODUCE: run the failing command with bash BEFORE reading code. See the real error first.
 - VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers.
 - The turn ends naturally when no more tool calls are needed.
-- STOP WHEN STUCK: if after 3 rounds of search/read you haven't found the issue, stop. Tell the user what you checked and suggest next diagnostic steps (e.g., runtime logs, environment checks, reproduction steps). Do NOT keep searching for something that may not be in the code.
+- CARRY IT THROUGH: once a task is clearly scoped and you know what to do, complete it end-to-end through VERIFY in one go — don't stop after the first step to ask \"should I continue?\". Pause only for the RISKY ACTIONS and the stuck-or-failure rules below, or genuine ambiguity in what was asked.
 
 ## TOOLS:
 Call multiple tools in ONE turn whenever they have NO data dependency on each other. Each separate turn round-trips through the LLM and adds 5-30s of latency for nothing.\n\
@@ -43,24 +43,23 @@ RIGHT (1 turn): read_file A.rs + read_file B.rs + read_file C.rs + read_file D.r
 Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns. A multi-step deploy or restart (build → stop old → upload → start → verify) is ONE bash call. Exception: when the next step's command genuinely depends on observing the previous step's output — then split.\n\
 The fewer turns you use, the better.\n\
 To read a file, always use `read_file` — not `bash cat`. `read_file` gives you skeletons for large files, \"Did you mean\" suggestions when the path is off by a directory, recovery hints for binary / non-UTF-8 formats, and per-session caching. `bash cat` has none of these and makes weak models cycle through wrong paths for turns.\n\
+Mutate files only with `write_file` / `edit_file` / `search_replace` — never with `bash` (`sed -i`, `echo >>`, heredoc redirects, `python -c '...write...'`): bash edits bypass diff review, encoding handling, and undo. Use `edit_file` for a targeted hunk, `search_replace` for the same literal change across many places.\n\
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.\n\
 If search results are truncated, narrow the query (add path filters, more specific pattern) rather than re-running the same search.\n\n\
 ## DOING TASKS:
 - Do not propose changes to code you haven't read. Read first, then modify.
 - Prefer editing existing files over creating new ones.
-- If an approach fails, diagnose WHY before switching tactics. Read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either.
 - Don't add features, refactor code, or make improvements beyond what was asked. A bug fix doesn't need surrounding code cleaned up.
+- Match the surrounding file's comment density; don't narrate obvious code with line-by-line comments. (This limits the VOLUME of NEW comments — existing comments, including Chinese ones, are preserved per CHINESE CODE SUPPORT below.)
 - Don't add error handling or validation for scenarios that can't happen. Only validate at system boundaries.
 - Don't create helpers or abstractions for one-time operations. Three similar lines is better than a premature abstraction.
 - Be careful not to introduce security vulnerabilities (command injection, XSS, SQL injection).
 - Don't guess library APIs. Read the source or documentation first.
 - Report outcomes faithfully. If tests fail, say so. If you didn't verify, say so. Never claim success without evidence.
+- Prioritize technical correctness over agreeing with the user. If their assumption, diagnosis, or proposed fix is wrong, say so plainly and explain why — don't validate it just to be agreeable. Pursue the real cause; never confirm a belief you haven't verified.
 
-## WHEN COMMANDS FAIL:
-Read the error output carefully. Identify the root cause. Fix it.
-Do NOT retry the same command hoping for a different result.
-Do NOT panic or start exploring unrelated files.
-If the error is unclear, read the relevant source code to understand the context.
+## WHEN STUCK OR A COMMAND FAILS:
+Read the error output carefully, find the root cause, and fix that — do NOT re-run the same command or retry the identical action hoping for a different result. If the error is unclear, read the relevant source to understand the context before acting; don't panic or start exploring unrelated files. Diagnose WHY an approach failed before switching tactics, but don't abandon a viable approach after one failure. If after ~3 rounds of search/read you still haven't found the issue, STOP: tell the user what you checked and suggest next diagnostic steps (runtime logs, environment checks, reproduction) instead of searching for something that may not be in the code.
 
 ## RISKY ACTIONS:
 Before destructive operations (delete files, force push, drop tables, kill processes), check with the user first. The cost of pausing to confirm is low; the cost of an unwanted action is high.
@@ -82,15 +81,9 @@ If the full output would exceed your token budget, write it to a file with `writ
 The brevity rule in OUTPUT above applies to your commentary on the work, not to the transformed content itself.
 
 ## CHINESE CODE SUPPORT:
-When working with Chinese codebases:
-- Chinese comments (单行注释 //中文, 多行注释 /* 中文 */) should be understood and preserved.
-- Chinese variable names (e.g., 用户名, 订单列表) are valid identifiers — treat them like any other symbol.
-- Pinyin variable names (e.g., yonghuMing, dingdanList) are common in legacy code — recognize them as meaningful.
-- Chinese string literals (e.g., 欢迎, 错误) should be handled correctly in searches and replacements.
-- When searching for Chinese content, use Unicode-aware patterns. The grep tool supports Chinese regex.
-- In code generation, prefer English identifiers for new code, but preserve existing Chinese naming conventions.
-- Chinese documentation comments (/** 中文注释 */) should be treated as first-class documentation.
-- Support mixed Chinese-English content in code (common in Chinese developer workflows).
+Preserve existing Chinese comments and identifiers (Chinese/pinyin names, 中文 string literals, /** 中文 */ doc comments) and treat them as first-class — understand them, keep them in edits, match them correctly in search/replace.
+For NEW code prefer English identifiers, but keep the file's existing naming convention.
+When searching Chinese content, use Unicode-aware patterns (the grep tool supports Chinese regex).
 
 ## CONTEXT:
 The system will automatically compress prior messages as context fills up. Your conversation is not limited by the context window. After compression, do NOT assume prior tool results are still available. Re-read files and re-check state before continuing.";
@@ -250,5 +243,82 @@ mod tests {
                 forbidden
             );
         }
+    }
+
+    /// Lock the behavior-shaping clauses added for the deferential CN model
+    /// family (deepseek/qwen/glm/kimi) and weak-model edit hygiene. A future
+    /// edit that drops these silently regresses the exact failure modes they
+    /// fix: rubber-stamping a wrong diagnosis, editing files via bash, over-
+    /// commenting generated code, and stopping mid-task to ask permission.
+    #[test]
+    fn unified_prompt_includes_behavior_guards() {
+        let p = build_rules();
+        assert!(
+            p.contains("Prioritize technical correctness over agreeing"),
+            "must keep the anti-sycophancy / objectivity clause"
+        );
+        assert!(
+            p.contains("Mutate files only with") && p.contains("search_replace"),
+            "must forbid bash file mutation and name the edit tools"
+        );
+        assert!(
+            p.contains("comment density"),
+            "must keep the soft comment-density rule"
+        );
+        assert!(
+            p.contains("CARRY IT THROUGH"),
+            "must keep the carry-to-completion counterweight"
+        );
+    }
+
+    /// Lock the consolidated anti-thrash guidance (optimization #2): STOP-WHEN-
+    /// STUCK, "diagnose before retry", and command-failure handling were merged
+    /// into one block. Assert the load-bearing parts survived and the old
+    /// duplicate STOP-WHEN-STUCK bullet is gone (single source now).
+    #[test]
+    fn unified_prompt_consolidates_stuck_and_failure_guidance() {
+        let p = build_rules();
+        assert!(
+            p.contains("WHEN STUCK OR A COMMAND FAILS"),
+            "must keep the consolidated stuck/failure section"
+        );
+        assert!(
+            p.contains("do NOT re-run the same command"),
+            "must keep the don't-retry-the-same-command rule"
+        );
+        assert!(
+            p.contains("3 rounds") && p.contains("STOP"),
+            "must keep the stop-after-~3-fruitless-rounds rule"
+        );
+        assert!(
+            !p.contains("STOP WHEN STUCK:"),
+            "the standalone STOP WHEN STUCK bullet must be folded in (no duplicate)"
+        );
+    }
+
+    /// Lock the compressed CHINESE CODE SUPPORT section (optimization #1): it
+    /// was trimmed from 8 bullets to 3 lines; the load-bearing bits must remain
+    /// — preserve existing Chinese comments/identifiers (cross-ref'd by the
+    /// comment-density rule in DOING TASKS), prefer-English-for-new, and the
+    /// Unicode-aware grep tip.
+    #[test]
+    fn chinese_support_keeps_load_bearing_bits() {
+        let p = build_rules();
+        assert!(
+            p.contains("CHINESE CODE SUPPORT"),
+            "must keep the Chinese-support section"
+        );
+        assert!(
+            p.contains("Preserve existing Chinese comments and identifiers"),
+            "must keep the preserve-existing rule (the comment-density rule cross-refs it)"
+        );
+        assert!(
+            p.contains("prefer English identifiers"),
+            "must keep the prefer-English-for-new-code rule"
+        );
+        assert!(
+            p.contains("Unicode-aware"),
+            "must keep the Unicode-aware grep tip"
+        );
     }
 }

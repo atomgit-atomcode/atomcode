@@ -8,7 +8,7 @@ use crate::tool::MountedTools;
 use crate::message::{
     CompactionPlan, CompactionStrategy, CompactionView, Conversation, Message,
 };
-use crate::middleware::ToolMiddleware;
+use crate::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use crate::provider::{ChatOptions, LlmProvider};
 use crate::request::RequestCtx;
 use crate::stream::{ProviderError, StreamEvent};
@@ -229,6 +229,41 @@ impl LlmProvider for SilentStreamProvider {
     }
 }
 
+/// Always opens OK and yields the SAME non-empty stop response (`TextDelta(text)`
+/// then `Done`) on EVERY call — a model that produces a normal, CONTENT-BEARING
+/// stop (no tool calls) every round, forever. Distinct from `MockProvider::new(
+/// vec![])` (a CONTENT-FREE `Done`, which the kernel now treats as a transient
+/// empty-200 and RETRIES): this is a legitimate completion, so it exercises the
+/// `offer_continuation` / continuation-fuse paths over many rounds without
+/// tripping the empty-response retry.
+pub struct AlwaysStopProvider {
+    text: String,
+}
+
+impl AlwaysStopProvider {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AlwaysStopProvider {
+    fn model_name(&self) -> &str {
+        "always-stop"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        Ok(Box::pin(futures::stream::iter(vec![
+            StreamEvent::TextDelta(self.text.clone()),
+            StreamEvent::Done { truncated: false },
+        ])))
+    }
+}
+
 /// A safe tool.
 pub struct EchoTool;
 
@@ -401,15 +436,15 @@ impl ToolMiddleware for ApprovalMiddleware {
         call: &mut ToolCall,
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         // Safe call (arg-aware) → no approval.
         if tool.risk(&call.arguments) == RiskLevel::Safe {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         // Session grant cache: an identical risky call already approved-always.
         let key = Self::grant_key(call);
         if self.granted.lock().unwrap().contains(&key) {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         // Round-trip to the driver for a decision.
         let decision = rt
@@ -419,13 +454,13 @@ impl ToolMiddleware for ApprovalMiddleware {
             )
             .await;
         if decision.get("decision").and_then(|d| d.as_str()) != Some("allow") {
-            return Err("denied".to_string());
+            return BeforeOutcome::deny("denied");
         }
         // "remember" → cache the grant so the same command is not asked again.
         if decision.get("remember").and_then(|r| r.as_bool()) == Some(true) {
             self.granted.lock().unwrap().insert(key);
         }
-        Ok(())
+        BeforeOutcome::Proceed
     }
 }
 
@@ -563,9 +598,9 @@ impl ToolMiddleware for ArgRewriteMiddleware {
         call: &mut ToolCall,
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         call.arguments = "{\"rewritten\":true}".to_string();
-        Ok(())
+        BeforeOutcome::Proceed
     }
 }
 
@@ -579,8 +614,8 @@ impl ToolMiddleware for BlockToolMiddleware {
         _call: &mut ToolCall,
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
-    ) -> Result<(), String> {
-        Err("blocked by policy".to_string())
+    ) -> BeforeOutcome {
+        BeforeOutcome::deny("blocked by policy")
     }
 }
 
@@ -599,8 +634,9 @@ pub struct TruncateMiddleware;
 
 #[async_trait]
 impl ToolMiddleware for TruncateMiddleware {
-    async fn after(&self, result: &mut ToolResult) {
+    async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
         result.content = format!("[truncated] {}", result.content);
+        AfterOutcome::Proceed
     }
 }
 
@@ -767,6 +803,12 @@ impl CompactionStrategy for SummarizeOldestStrategy {
             rewrites: vec![],
             resume_note: None,
         }
+    }
+
+    /// Mirrors `plan`: this strategy announces (does slow summary work) iff there is
+    /// something between the protected prefix and the kept tail to drain.
+    fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
+        view.messages.len().saturating_sub(self.keep_recent) > view.sacred_floor
     }
 }
 

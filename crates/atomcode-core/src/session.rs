@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::conversation::message::{Message, Role};
+use crate::conversation::{
+    message::{Message, Role},
+    Conversation, ConversationSnapshot,
+};
 
 /// Unique identifier for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -67,6 +70,15 @@ pub struct TurnStat {
     pub errored: bool,
 }
 
+/// A UI-only message that should be replayed in session history but must not
+/// be included in model context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayMessage {
+    /// Render after this many real conversation messages.
+    pub after_message: usize,
+    pub message: Message,
+}
+
 /// A session represents an independent conversation context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -82,6 +94,12 @@ pub struct Session {
     pub updated_at: u64,
     /// Conversation messages.
     pub messages: Vec<Message>,
+    /// UI-only messages such as locally handled slash command output.
+    #[serde(default)]
+    pub display_messages: Vec<DisplayMessage>,
+    /// Compressed summaries of older conversation history.
+    #[serde(default)]
+    pub cold_summaries: Vec<String>,
     /// True once the user has explicitly run `/rename`. Drives the
     /// session-name badge above the input box: auto-named sessions
     /// (default / session-* / first-message-derived) stay badge-less
@@ -110,6 +128,8 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            display_messages: Vec::new(),
+            cold_summaries: Vec::new(),
             user_renamed: false,
             turn_stats: Vec::new(),
         }
@@ -124,6 +144,8 @@ impl Session {
             created_at: current_timestamp(),
             updated_at: current_timestamp(),
             messages: Vec::new(),
+            display_messages: Vec::new(),
+            cold_summaries: Vec::new(),
             user_renamed: false,
             turn_stats: Vec::new(),
         }
@@ -136,6 +158,26 @@ impl Session {
         self.name = name;
         self.user_renamed = true;
         self.touch();
+    }
+
+    pub fn to_conversation(&self) -> Conversation {
+        Conversation::from_snapshot(self.to_conversation_snapshot())
+    }
+
+    pub fn update_from_conversation(&mut self, conversation: &Conversation) {
+        self.update_from_conversation_snapshot(conversation.snapshot());
+    }
+
+    pub fn to_conversation_snapshot(&self) -> ConversationSnapshot {
+        ConversationSnapshot {
+            messages: self.messages.clone(),
+            cold_summaries: self.cold_summaries.clone(),
+        }
+    }
+
+    pub fn update_from_conversation_snapshot(&mut self, snapshot: ConversationSnapshot) {
+        self.messages = snapshot.messages;
+        self.cold_summaries = snapshot.cold_summaries;
     }
 
     /// Auto-name an untouched session from the first real user message.
@@ -418,7 +460,7 @@ fn hash_path(path: &Path) -> String {
     // 2. Replace backslashes with forward slashes (Windows)
     // 3. Remove trailing slash (but keep root "/" or "C:/")
     // 4. Lowercase on Windows (case-insensitive filesystem)
-    let normalized = path.to_string_lossy();
+    let normalized = crate::tool::strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
     let mut normalized = normalized.replace('\\', "/");
 
     if normalized.len() > 1 && normalized.ends_with('/') {
@@ -495,6 +537,89 @@ mod tests {
         let old = r#"{"id":"abc","name":"x","working_dir":"/tmp/x","created_at":0,"updated_at":0,"messages":[]}"#;
         let loaded: Session = serde_json::from_str(old).unwrap();
         assert!(loaded.turn_stats.is_empty());
+    }
+
+    #[test]
+    fn cold_summaries_round_trip_and_default_empty_for_old_sessions() {
+        let mut s = Session::new(PathBuf::from("/tmp/x"));
+        s.cold_summaries
+            .push("older compressed context".to_string());
+
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cold_summaries, vec!["older compressed context"]);
+
+        let old = r#"{"id":"abc","name":"x","working_dir":"/tmp/x","created_at":0,"updated_at":0,"messages":[]}"#;
+        let loaded: Session = serde_json::from_str(old).unwrap();
+        assert!(loaded.cold_summaries.is_empty());
+    }
+
+    #[test]
+    fn session_conversation_conversion_preserves_cold_summaries() {
+        let mut session = Session::new(PathBuf::from("/tmp/x"));
+        session
+            .messages
+            .push(Message::new(Role::User, "current task"));
+        session
+            .cold_summaries
+            .push("compressed history".to_string());
+
+        let mut conversation = session.to_conversation();
+        conversation
+            .cold_summaries
+            .push("new compressed history".to_string());
+
+        session.update_from_conversation(&conversation);
+
+        assert_eq!(
+            session.cold_summaries,
+            vec!["compressed history", "new compressed history"]
+        );
+    }
+
+    #[test]
+    fn session_reload_preserves_turn_stats_across_saves() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        // Simulate first turn: create + save with turn_stats
+        let mut s = Session::new(wd.clone());
+        s.id = SessionId::from_string("test-turn-accum".to_string());
+        s.messages.push(Message::new(Role::User, "hello"));
+        s.turn_stats.push(TurnStat {
+            after_message: 1,
+            duration_ms: 500,
+            total_tokens: 100,
+            tool_call_count: 0,
+            turn_count: 1,
+            errored: false,
+        });
+        s.touch();
+        manager.save(&s).unwrap();
+
+        // Simulate second turn: load existing, update, save — should keep first turn_stats
+        let mut loaded = manager.load(&s.id).unwrap();
+        assert_eq!(loaded.turn_stats.len(), 1, "first turn_stats must survive load");
+        loaded.messages.push(Message::new(Role::Assistant, "hi back"));
+        loaded.turn_stats.push(TurnStat {
+            after_message: 2,
+            duration_ms: 300,
+            total_tokens: 50,
+            tool_call_count: 1,
+            turn_count: 2,
+            errored: false,
+        });
+        loaded.touch();
+        manager.save(&loaded).unwrap();
+
+        // Reload: both turn_stats must still be there
+        let reloaded = manager.load(&s.id).unwrap();
+        assert_eq!(reloaded.turn_stats.len(), 2, "accumulated turn_stats must survive save/load cycle");
+        assert_eq!(reloaded.turn_stats[0].after_message, 1);
+        assert_eq!(reloaded.turn_stats[1].after_message, 2);
+        assert_eq!(reloaded.messages.len(), 2);
     }
 
     #[test]
@@ -588,6 +713,32 @@ mod tests {
             hash_path(path4),
             hash_path(path5),
             "Backslashes and trailing slash should both be normalized"
+        );
+    }
+
+    #[test]
+    fn test_hash_path_strips_windows_verbatim_prefix() {
+        // Regression: webui's /fs/list ran the chosen dir through
+        // `canonicalize()`, which on Windows yields a `\\?\D:\path` verbatim
+        // path. That round-tripped into the session cwd and hashed into a
+        // different bucket than the TUI's plain `D:\path`, so the two ends
+        // could never see each other's sessions. The verbatim and plain forms
+        // must now hash identically.
+        let verbatim = Path::new(r"\\?\D:\code\project");
+        let plain = Path::new(r"D:\code\project");
+        assert_eq!(
+            hash_path(verbatim),
+            hash_path(plain),
+            r"`\\?\` extended-length prefix must not change the session hash"
+        );
+
+        // UNC verbatim form `\\?\UNC\server\share` collapses to `\\server\share`.
+        let unc_verbatim = Path::new(r"\\?\UNC\server\share\proj");
+        let unc_plain = Path::new(r"\\server\share\proj");
+        assert_eq!(
+            hash_path(unc_verbatim),
+            hash_path(unc_plain),
+            r"`\\?\UNC\` prefix must collapse to a plain UNC path before hashing"
         );
     }
 

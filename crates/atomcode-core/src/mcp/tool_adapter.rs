@@ -54,7 +54,15 @@ impl Tool for McpToolAdapter {
     }
 
     fn approval(&self, args: &str) -> ApprovalRequirement {
-        // MCP tools require approval by default - they are external code.
+        // Whole-server trust (config `trust: true`, hand-set only).
+        if self.registry.is_server_trusted(&self.info.server_name) {
+            return ApprovalRequirement::AutoApprove;
+        }
+        // Per-tool permanent grant (config `autoApprove`, or "永久允许此工具").
+        if self.registry.is_tool_auto_approved(&self.tool_name) {
+            return ApprovalRequirement::AutoApprove;
+        }
+        // Otherwise MCP tools require approval — they are external code.
         ApprovalRequirement::RequireApproval(format!(
             "MCP tool '{}' from server '{}' wants to execute with arguments: {}",
             self.info.tool_name, self.info.server_name, args
@@ -104,5 +112,54 @@ pub async fn register_mcp_tools_async(
     for info in tools {
         let adapter = McpToolAdapter::new(mcp_registry.clone(), info);
         registry.register(Box::new(adapter)).await;
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use crate::mcp::client::McpToolInfo;
+    use crate::mcp::registry::McpRegistry;
+    use crate::tool::Tool;
+    use std::sync::Arc;
+
+    fn info(server: &str) -> McpToolInfo {
+        McpToolInfo {
+            server_name: server.into(),
+            tool_name: "q".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn trusted_server_auto_approves() {
+        let reg = Arc::new(McpRegistry::new());
+        reg.mark_trusted("trusted-srv");
+        let adapter = McpToolAdapter::new(reg, info("trusted-srv"));
+        assert!(matches!(adapter.approval("{}"), ApprovalRequirement::AutoApprove));
+    }
+
+    #[test]
+    fn untrusted_server_requires_approval() {
+        let reg = Arc::new(McpRegistry::new());
+        let adapter = McpToolAdapter::new(reg, info("other-srv"));
+        assert!(matches!(adapter.approval("{}"), ApprovalRequirement::RequireApproval(_)));
+    }
+
+    #[test]
+    fn per_tool_auto_approve_bypasses_only_that_tool() {
+        let reg = Arc::new(McpRegistry::new());
+        reg.mark_tool_auto_approved("mcp__srv__query");
+        let approved = McpToolAdapter::new(reg.clone(), McpToolInfo {
+            server_name: "srv".into(), tool_name: "query".into(),
+            description: String::new(), input_schema: serde_json::json!({}),
+        });
+        assert!(matches!(approved.approval("{}"), ApprovalRequirement::AutoApprove));
+        let other = McpToolAdapter::new(reg, McpToolInfo {
+            server_name: "srv".into(), tool_name: "delete".into(),
+            description: String::new(), input_schema: serde_json::json!({}),
+        });
+        assert!(matches!(other.approval("{}"), ApprovalRequirement::RequireApproval(_)));
     }
 }

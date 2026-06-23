@@ -12,10 +12,11 @@
 //!
 //! [`ApprovalMiddleware`]: super::approval::ApprovalMiddleware
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_kernel::middleware::ToolMiddleware;
+use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall};
 
@@ -61,6 +62,74 @@ pub fn references_sensitive_path(args: &str) -> bool {
     SENSITIVE_MARKERS.iter().any(|m| a.contains(m))
 }
 
+/// The user's real home directory, dependency-free. Used to anchor `~/.ssh` / `~/.aws` /
+/// `~/.gnupg` so a project-local `./.ssh/` (benign) is not treated like the real keys.
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let var = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let var = std::env::var_os("HOME");
+    var.map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+}
+
+/// True iff a RESOLVED (absolute, cwd-joined) `path` is sensitive — a system-protected
+/// location, a credential dir under the real home, or a secret file by name/extension. This is
+/// the PATH-aware companion to [`references_sensitive_path`] (which substring-matches raw JSON
+/// args): it correctly catches a RELATIVE `.ssh/authorized_keys` or a Windows `…\.ssh\…` once
+/// resolved, which the substring form misses. Faithful port of the legacy (v1) `is_sensitive_path`
+/// so write approval inherits the same protected set.
+pub fn path_is_sensitive(path: &Path) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    const SYSTEM_PROTECTED_PREFIXES: &[&str] = &[
+        "/System", "/bin", "/sbin", "/usr", "/var", "/private/etc", "/private/var", "/etc",
+        "/root", "/var/root", "/private/var/root",
+    ];
+    #[cfg(target_os = "windows")]
+    const SYSTEM_PROTECTED_PREFIXES: &[&str] =
+        &[r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)", r"C:\ProgramData", r"C:\PerfLogs"];
+    #[cfg(not(target_os = "windows"))]
+    const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[
+        "/usr/local", "/private/usr/local", "/Applications", "/Library", "/var/folders",
+        "/private/var/folders", "/var/tmp", "/private/var/tmp",
+    ];
+    #[cfg(target_os = "windows")]
+    const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[];
+    const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg"];
+    const SECRET_FILE_NAMES: &[&str] = &[
+        ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".zshenv", ".npmrc", ".pypirc", ".env",
+        ".env.local", "credentials", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    ];
+    const SECRET_EXTS: &[&str] = &["pem", "key", "p12", "pfx", "der", "crt", "cer"];
+
+    let has_protected_prefix =
+        SYSTEM_PROTECTED_PREFIXES.iter().any(|p| path == Path::new(p) || path.starts_with(p));
+    let has_exception_prefix =
+        SYSTEM_PROTECTED_EXCEPTIONS.iter().any(|p| path == Path::new(p) || path.starts_with(p));
+    if has_protected_prefix && !has_exception_prefix {
+        return true;
+    }
+
+    if let Some(home) = home_dir() {
+        for dir in SECRET_HOME_DIRS {
+            if path.starts_with(home.join(dir)) {
+                return true;
+            }
+        }
+        for file in SECRET_FILE_NAMES {
+            if path == home.join(file) {
+                return true;
+            }
+        }
+    }
+
+    if path.file_name().and_then(|n| n.to_str()).is_some_and(|name| SECRET_FILE_NAMES.contains(&name)) {
+        return true;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| SECRET_EXTS.iter().any(|c| ext.eq_ignore_ascii_case(c)))
+}
+
 /// Require approval before an otherwise-`Safe` tool reads a sensitive path.
 pub struct SensitivePathGate {
     store: Arc<dyn PermissionStore>,
@@ -90,33 +159,34 @@ impl ToolMiddleware for SensitivePathGate {
         call: &mut ToolCall,
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         // Only tools that would otherwise SKIP approval need this — a Risky tool already
         // round-trips through ApprovalMiddleware, so gating it here would double-prompt.
         if tool.risk(&call.arguments) != RiskLevel::Safe {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         if !references_sensitive_path(&call.arguments) {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         // Distinct key namespace so a "sensitive-read always" grant never silently widens
         // an ordinary approval grant (and vice versa).
         let key = format!("sensitive::{}::{}", call.name, call.arguments);
         if self.store.is_granted(&key) {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         let payload = serde_json::to_value(ApprovalRequest {
+            call_id: call.id.clone(),
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
         })
         .unwrap_or(serde_json::Value::Null);
         match PermissionDecision::from_value(&rt.request(&self.kind, payload).await) {
-            PermissionDecision::AllowOnce => Ok(()),
+            PermissionDecision::AllowOnce => BeforeOutcome::Proceed,
             PermissionDecision::AllowAlways => {
                 self.store.grant(&key);
-                Ok(())
+                BeforeOutcome::Proceed
             }
-            PermissionDecision::Deny => Err(format!(
+            PermissionDecision::Deny => BeforeOutcome::deny(format!(
                 "reading a sensitive path needs approval and was denied: {} {}",
                 tool.name(),
                 call.arguments
@@ -159,8 +229,8 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool);
         let mut call =
             ToolCall { id: "1".into(), name: "read_file".into(), arguments: r#"{"file_path":"src/main.rs"}"#.into() };
-        // Ordinary path → Ok WITHOUT awaiting the (silent) driver.
-        assert!(gate.before(&mut call, &tool, &silent_rt()).await.is_ok());
+        // Ordinary path → Proceed WITHOUT awaiting the (silent) driver.
+        assert!(!gate.before(&mut call, &tool, &silent_rt()).await.is_deny());
     }
 
     #[tokio::test]
@@ -174,7 +244,7 @@ mod tests {
             name: "write_file".into(),
             arguments: r#"{"file_path":"/home/u/.ssh/authorized_keys","content":"x"}"#.into(),
         };
-        assert!(gate.before(&mut call, &tool, &silent_rt()).await.is_ok());
+        assert!(!gate.before(&mut call, &tool, &silent_rt()).await.is_deny());
     }
 
     #[tokio::test]
@@ -187,7 +257,7 @@ mod tests {
             arguments: r#"{"file_path":"/home/u/.ssh/id_rsa"}"#.into(),
         };
         let res = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(res.is_err(), "a sensitive read with no approval must fail closed");
-        assert!(res.unwrap_err().contains("sensitive path"));
+        assert!(res.is_deny(), "a sensitive read with no approval must fail closed");
+        assert!(res.deny_reason().unwrap().contains("sensitive path"));
     }
 }

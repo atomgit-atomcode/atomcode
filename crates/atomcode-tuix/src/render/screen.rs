@@ -36,7 +36,7 @@
 
 use std::io::Write as _;
 
-use super::cell::{diff_cell_frames, serialize_patches, Cell};
+use super::cell::{diff_cell_frames, serialize_frames_tight, serialize_patches, Cell};
 
 /// Retained W×H cell grid + current/prev frames.
 ///
@@ -72,6 +72,23 @@ pub struct Screen {
     /// Last-emitted cursor visibility (`?25h` / `?25l`).
     /// `None` means "no visibility sequence emitted yet".
     last_cursor_visible: Option<bool>,
+    /// JediTerm (IntelliJ-platform terminal) repaint mode. When set,
+    /// `render_diff` serialises changed rows via
+    /// [`serialize_frames_tight`] — one CUP+EL per changed row, then a
+    /// contiguous run — instead of the per-cell-CUP [`serialize_patches`]
+    /// stream. Defeats the per-`─`-CUP rule fragmentation and stale-tail
+    /// ghosting JediTerm's no-font-fallback paint layer produces. Off by
+    /// default; set via [`Screen::with_jediterm`] from `caps.jediterm`.
+    /// Does NOT change the per-ideograph gap (that's a font artifact).
+    jediterm: bool,
+    /// When set, `render_diff` omits its own per-frame DECSET 2026
+    /// envelope (`?2026h`/`?2026l`) — the caller has opened a single
+    /// OUTER synchronized block spanning many operations (the `/resume`
+    /// replay batch) and owns the open/close. Emitting a nested `?2026l`
+    /// here would end that outer batch early and re-expose the flicker
+    /// the batch exists to hide. Cursor hide/restore still fire (the
+    /// caret must not bounce across the patch walk). Off by default.
+    sync_suppressed: bool,
 }
 
 impl Screen {
@@ -88,7 +105,23 @@ impl Screen {
             physical_dirty: false,
             last_cursor: None,
             last_cursor_visible: None,
+            jediterm: false,
+            sync_suppressed: false,
         }
+    }
+
+    /// Suppress (or restore) `render_diff`'s per-frame DECSET 2026
+    /// envelope. Set to `true` while an outer synchronized batch is open
+    /// (see the `sync_suppressed` field), `false` once it closes.
+    pub fn set_sync_suppressed(&mut self, on: bool) {
+        self.sync_suppressed = on;
+    }
+
+    /// Enable the JediTerm per-row tight-repaint path (see the `jediterm`
+    /// field). Chainable so call sites read `Screen::new(w, h).with_jediterm(caps.jediterm)`.
+    pub fn with_jediterm(mut self, on: bool) -> Self {
+        self.jediterm = on;
+        self
     }
 
     pub fn width(&self) -> u16 {
@@ -216,8 +249,16 @@ impl Screen {
             body.extend_from_slice(b"\x1b[H");
             self.physical_dirty = false;
         }
-        let patches = diff_cell_frames(&self.prev_cells, &self.cells);
-        let patch_bytes = serialize_patches(&patches);
+        // JediTerm: per-row tight repaint (one CUP+EL + contiguous run per
+        // changed row) instead of the per-cell-CUP patch stream. Defeats the
+        // rule fragmentation + stale-tail ghosting its no-font-fallback paint
+        // layer produces. Every other terminal keeps the minimal patch path.
+        let patch_bytes = if self.jediterm {
+            serialize_frames_tight(&self.prev_cells, &self.cells)
+        } else {
+            let patches = diff_cell_frames(&self.prev_cells, &self.cells);
+            serialize_patches(&patches)
+        };
         body.extend_from_slice(&patch_bytes);
         // Anti-flicker wrap around any frame that moves the caret.
         // `serialize_patches` walks the cursor across every changed
@@ -237,7 +278,12 @@ impl Screen {
         let stale_cursor = cold_start || self.cursor != self.last_cursor;
         let mut out = Vec::with_capacity(body.len() + 32);
         if has_visible_work {
-            out.extend_from_slice(b"\x1b[?2026h");
+            // Skip the per-frame BSU when an outer synchronized batch
+            // owns the envelope (see `sync_suppressed`) — a nested one
+            // would let its paired ESU below end the outer batch early.
+            if !self.sync_suppressed {
+                out.extend_from_slice(b"\x1b[?2026h");
+            }
             // Hide the cursor for the patch walk. `serialize_patches`
             // walks the caret across every changed cell, so any frame
             // with patches WILL move it — hide unconditionally here and
@@ -277,7 +323,7 @@ impl Screen {
             }
             self.last_cursor_visible = Some(self.cursor_visible);
         }
-        if has_visible_work {
+        if has_visible_work && !self.sync_suppressed {
             out.extend_from_slice(b"\x1b[?2026l");
         }
         std::mem::swap(&mut self.prev_cells, &mut self.cells);
@@ -415,6 +461,44 @@ mod tests {
         let out = String::from_utf8(bytes).unwrap();
         // Expect exactly the cursor-show sequence, nothing else.
         assert_eq!(out, "\x1b[?25h", "unexpected bytes: {:?}", out);
+    }
+
+    /// JediTerm mode renders a box-drawing rule as one contiguous run
+    /// (single CUP for the row) — the per-`─`-CUP fragmentation the
+    /// default path produces is what visually shatters the rule on
+    /// JediTerm's paint layer.
+    #[test]
+    fn jediterm_renders_rule_as_contiguous_run() {
+        let mut s = Screen::new(6, 2).with_jediterm(true);
+        let mut rule = Vec::new();
+        push_str_cells(&mut rule, "──────", &CellStyle::default());
+        s.draw_row(0, 0, &rule);
+        let out = String::from_utf8(s.render_diff()).unwrap();
+        assert!(out.contains("──────"), "rule must be one contiguous run: {:?}", out);
+        assert_eq!(
+            out.matches("\x1b[1;1H").count(),
+            1,
+            "exactly one CUP for the rule row (no per-dash CUP): {:?}",
+            out
+        );
+    }
+
+    /// Default Screen (no `with_jediterm`) keeps the per-cell-CUP path:
+    /// a rule of non-ASCII dashes emits one CUP per dash. Guards that the
+    /// JediTerm branch is opt-in and the legacy path is byte-unchanged.
+    #[test]
+    fn default_screen_keeps_per_cell_cup_for_rule() {
+        let mut s = Screen::new(5, 1);
+        let mut rule = Vec::new();
+        push_str_cells(&mut rule, "───", &CellStyle::default());
+        s.draw_row(0, 0, &rule);
+        let out = String::from_utf8(s.render_diff()).unwrap();
+        // serialize_patches forces a CUP before every non-ASCII cell → 3.
+        assert!(
+            out.matches('H').count() >= 3,
+            "default path per-dash CUPs, got: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -696,6 +780,33 @@ mod tests {
         let out = String::from_utf8_lossy(&bytes);
         assert!(out.starts_with("\x1b[?2026h\x1b[?25l"), "cold-start frame must open with BSU+hide: {:?}", out);
         assert!(out.ends_with("\x1b[?25h\x1b[?2026l"), "cold-start frame must close with show+ESU: {:?}", out);
+    }
+
+    /// During a multi-operation synchronized batch (e.g. the `/resume`
+    /// replay), the RENDERER opens a single OUTER DECSET 2026 envelope
+    /// around the whole sequence. While that batch is open, each
+    /// per-frame `render_diff` must NOT emit its own nested
+    /// `?2026h`/`?2026l`: a nested ESU (`?2026l`) would prematurely end
+    /// the outer batch and re-expose the intermediate flicker the batch
+    /// exists to hide. The cursor hide/restore still fires so the caret
+    /// doesn't bounce across the patch walk, and the cell content still
+    /// lands — only the envelope is the outer block's responsibility.
+    #[test]
+    fn sync_suppressed_frame_omits_2026_wrap_but_keeps_cursor_hide() {
+        let mut s = Screen::new(10, 3);
+        s.set_sync_suppressed(true);
+        let mut cells = Vec::new();
+        push_str_cells(&mut cells, "x", &CellStyle::default());
+        s.draw_row(0, 0, &cells);
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(!out.contains("\x1b[?2026h"), "suppressed frame must NOT open its own BSU: {:?}", out);
+        assert!(!out.contains("\x1b[?2026l"), "suppressed frame must NOT close its own ESU: {:?}", out);
+        // Cursor still hidden for the patch walk and restored after.
+        assert!(out.contains("\x1b[?25l"), "cursor still hidden during patch walk: {:?}", out);
+        assert!(out.contains("\x1b[?25h"), "cursor visibility restored: {:?}", out);
+        // Cell content still emitted inside the (outer-owned) envelope.
+        assert!(out.contains('x'), "cell write still happens: {:?}", out);
     }
 
     /// REGRESSION: a later frame that emits cell patches but whose logical

@@ -126,6 +126,59 @@ async fn default_kernel_never_compacts() {
     let _ = handle.task.await;
 }
 
+// ── 1b. ESTIMATE FALLBACK WHEN THE PROVIDER OMITS USAGE ──────────────────────
+// A gateway that returns no usage chunk (an empty 200, or a usage payload dropped
+// after finish_reason) leaves usage.prompt == 0. Without a fallback the recorded
+// `meta.utilization` is 0.0 forever, so auto-compaction NEVER fires no matter how
+// large the real context is (the GLM-5.2 "context grows to the wall, must /compact
+// by hand" report). With a byte-estimate fallback over the OUTGOING request, a
+// large prompt still records a high utilization, so the next task boundary compacts.
+#[tokio::test]
+async fn estimates_utilization_when_provider_omits_usage() {
+    // Turn 1 emits text but DELIBERATELY NO StreamEvent::Usage (gateway omitted it).
+    // Turn 2 just stops.
+    let provider = Arc::new(
+        RecordingProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("ok".into()),
+                // NOTE: no StreamEvent::Usage on purpose — usage.prompt stays 0.
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![StreamEvent::TextDelta("second".into()), StreamEvent::Done { truncated: false }],
+        ])
+        .with_ctx_window(100),
+    );
+
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 1 }))
+        .compact_threshold(0.5)
+        .build()
+        .spawn();
+
+    // A long first prompt (~1200 chars ≈ 300 estimated tokens) is far over the
+    // 0.5 * 100 = 50-token threshold — but ONLY if the byte estimate kicks in. With
+    // usage omitted, the buggy path records utilization 0.0 and never compacts.
+    let long_prompt = "fill the context window with a long first user prompt ".repeat(24);
+    let e1 = drive_turn_collect(&mut handle, &long_prompt).await;
+    assert!(
+        compacted_events(&e1).is_empty(),
+        "turn 1 must not compact (no prior pressure recorded yet)"
+    );
+
+    let e2 = drive_turn_collect(&mut handle, "second").await;
+    assert!(
+        !compacted_events(&e2).is_empty(),
+        "turn 2 must auto-compact: the provider omitted usage, so utilization must \
+         fall back to a byte estimate of the large outgoing request"
+    );
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
 // ── 2. INJECTED STRATEGY COMPACTS AT THE TASK BOUNDARY ───────────────────────
 // Inject SummarizeOldestStrategy + a threshold the prior turn exceeds. Turn 1
 // builds history with a high-utilization assistant meta; turn 2 (SendMessage)
@@ -266,6 +319,104 @@ async fn manual_compact_command_triggers_regardless_of_threshold() {
     // Confirm epoch persisted on the conversation.
     let snap = snapshot(&mut handle).await;
     assert_eq!(snap.cache_epoch, 1, "manual compaction bumped the conversation's cache_epoch");
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
+// ── 3b. MANUAL Compact ANNOUNCES (CompactionStarted) BEFORE THE RESULT ───────
+// A `/compact` that WILL summarize drainable history emits `CompactionStarted` (the
+// driver's "compacting…" progress line) BEFORE the terminal `Compacted` — so the UI
+// can show progress during the (real, possibly slow) summary work.
+#[tokio::test]
+async fn manual_compact_emits_started_before_compacted_when_summarizing() {
+    let provider = Arc::new(
+        RecordingProvider::new(vec![vec![
+            StreamEvent::TextDelta("an assistant answer long enough to drain later".into()),
+            StreamEvent::Done { truncated: false },
+        ]])
+        .with_ctx_window(1000),
+    );
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 0 }))
+        .build()
+        .spawn();
+
+    let _ = drive_turn_collect(&mut handle, "the task with several words to drain later").await;
+
+    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    let mut events = Vec::new();
+    while let Some(ev) = handle.events.recv().await {
+        let done = matches!(ev, AgentEvent::Compacted { .. });
+        events.push(ev);
+        if done {
+            break;
+        }
+    }
+
+    let started = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::CompactionStarted { .. }))
+        .expect("a summarizing /compact must emit CompactionStarted");
+    let compacted = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Compacted { .. }))
+        .expect("and a terminal Compacted");
+    assert!(started < compacted, "CompactionStarted must precede Compacted");
+    assert!(
+        matches!(events[compacted], AgentEvent::Compacted { committed: true, .. }),
+        "the strategy shrinks → committed"
+    );
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
+// ── 3c. A NO-OP MANUAL Compact STAYS SILENT (no spurious "compacting…") ───────
+// When the strategy won't summarize (nothing older than the kept tail), the kernel
+// must NOT emit `CompactionStarted` — so a driver never shows "compacting…" ahead of
+// "nothing to compact". This is the fix for the short-conversation divergence.
+#[tokio::test]
+async fn manual_compact_stays_silent_when_nothing_to_summarize() {
+    let provider = Arc::new(
+        RecordingProvider::new(vec![vec![
+            StreamEvent::TextDelta("short".into()),
+            StreamEvent::Done { truncated: false },
+        ]])
+        .with_ctx_window(1000),
+    );
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        // keep_recent huge → nothing drainable → plan is a noop → will_summarize=false.
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 100 }))
+        .build()
+        .spawn();
+
+    let _ = drive_turn_collect(&mut handle, "the task").await;
+
+    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    let mut events = Vec::new();
+    while let Some(ev) = handle.events.recv().await {
+        let done = matches!(ev, AgentEvent::Compacted { .. });
+        events.push(ev);
+        if done {
+            break;
+        }
+    }
+
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::CompactionStarted { .. })),
+        "a no-op /compact must NOT announce 'compacting…'"
+    );
+    assert!(
+        matches!(events.last(), Some(AgentEvent::Compacted { committed: false, .. })),
+        "a no-op /compact still emits a (refused) Compacted"
+    );
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;

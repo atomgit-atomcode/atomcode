@@ -9,33 +9,37 @@ use tokio::sync::mpsc;
 
 use super::InputEvent;
 
-/// Burst-aggregation poll timeout — how long the burst detector waits
-/// for the next event before deciding the burst is over. Picked per-OS
-/// because terminal stdin delivery cadence differs:
+/// Burst-aggregation timeouts — how long the burst detector waits for the
+/// next event before deciding the burst is over. A two-stage state machine
+/// (DeepSeek-TUI's `paste_burst.rs` prior art) keeps lone keystrokes fast
+/// while still coalescing real pastes:
 ///
-/// - **Windows** (PowerShell / Windows Terminal / conhost): bracketed
-///   paste payloads and char-by-char fallback delivery arrive in
-///   chunked stdin batches with 5-12 ms gaps between chunks; the old
-///   2 ms window split one logical Ctrl+V into 5-10 `[Pasted #N]`
-///   placeholders. 15 ms swallows those gaps without meaningfully
-///   extending per-keystroke typing latency — still well below the
-///   ~20 ms human perception floor.
-/// - **macOS / Linux**: bracketed paste arrives as one event in
-///   practice; the timeout only matters for the rare no-bracketed-paste
-///   fallback. 4 ms covers occasional 2-3 ms gaps seen on slow SSH
-///   sessions without adding perceptible typing lag.
-///
-/// Prior art: DeepSeek-TUI's `paste_burst.rs` ships Windows 60 ms /
-/// Unix 8 ms, but those depend on a two-stage state machine
-/// (short pending window → long active window) that gates the long
-/// timeout behind "burst confirmed". atomcode currently runs the
-/// timeout on *every* keystroke, so we keep both values comfortably
-/// below human perception. A follow-up will add the state machine,
-/// after which 60 ms can be safely adopted on Windows.
+/// - **PENDING** — the *first* peek after a candidate char. Normal typing
+///   has human-scale gaps, so this short window expires and the single key
+///   is emitted with near-zero added latency. Previously the full burst
+///   timeout ran on *every* keystroke, which added a flat 15 ms per key on
+///   Windows and read as input lag. A single small value on every OS: 4 ms
+///   is below the ~13-20 ms perception floor, and being non-zero (vs a
+///   strict `poll(0)`) gives a genuinely chunked first record a moment to
+///   surface so a real paste isn't misread as a lone key.
+/// - **ACTIVE** — adopted only *after* a 2nd candidate char confirms a
+///   burst. The longer, per-OS bridging window that spans the gaps a
+///   terminal takes to deliver chunked paste records:
+///   - **Windows** (PowerShell / Windows Terminal / conhost): bracketed
+///     paste payloads and char-by-char fallback arrive in chunked stdin
+///     batches with 5-12 ms gaps; a 2 ms window split one logical Ctrl+V
+///     into 5-10 `[Pasted #N]` placeholders. 15 ms swallows those gaps.
+///     (Now that PENDING protects typing latency, this could be raised
+///     toward the 60 ms prior-art value — left at 15 ms pending real
+///     Windows verification.)
+///   - **macOS / Linux**: bracketed paste arrives as one event in
+///     practice; this only matters for the rare no-bracketed-paste
+///     fallback. 4 ms covers occasional 2-3 ms gaps on slow SSH sessions.
+const BURST_PENDING_TIMEOUT_MS: u64 = 4;
 #[cfg(target_os = "windows")]
-const BURST_POLL_TIMEOUT_MS: u64 = 15;
+const BURST_ACTIVE_TIMEOUT_MS: u64 = 15;
 #[cfg(not(target_os = "windows"))]
-const BURST_POLL_TIMEOUT_MS: u64 = 4;
+const BURST_ACTIVE_TIMEOUT_MS: u64 = 4;
 
 /// If a Key event could plausibly be part of a paste burst, return the
 /// character it contributes. Enter maps to `\n`, Tab to `\t`, Char(c) to
@@ -389,13 +393,26 @@ fn run(
             let mut chars = vec![c0];
             let mut trailing: Option<Event> = None;
             const BATCH_CAP: usize = 8192;
+            // Two-stage burst detection (see BURST_*_TIMEOUT_MS): the first
+            // peek uses the short PENDING window so a lone keystroke — the
+            // common case — is emitted with near-zero latency instead of
+            // blocking the reader for the full per-OS timeout on every key.
+            // Only once a 2nd candidate char confirms a burst do we widen to
+            // the longer ACTIVE window to bridge chunked paste records.
+            let mut burst_confirmed = false;
             while chars.len() < BATCH_CAP {
-                // Bridge the transient gap a terminal takes to translate
-                // each console record into an Event. A paste arriving as
-                // chunked stdin batches gets split into per-record events
-                // and a strict `poll(0)` would miss the burst signature.
-                // See `BURST_POLL_TIMEOUT_MS` for per-OS rationale.
-                match event::poll(Duration::from_millis(BURST_POLL_TIMEOUT_MS)) {
+                let timeout_ms = if burst_confirmed {
+                    BURST_ACTIVE_TIMEOUT_MS
+                } else {
+                    BURST_PENDING_TIMEOUT_MS
+                };
+                // A paste arriving as chunked stdin records gets split into
+                // per-record events; the ACTIVE window bridges the gap a
+                // terminal takes to translate each record. The PENDING
+                // window is non-zero for the same reason — a strict
+                // `poll(0)` first peek would miss a burst whose 2nd record
+                // hasn't landed yet and emit it as a lone key.
+                match event::poll(Duration::from_millis(timeout_ms)) {
                     Ok(true) => {}
                     _ => break,
                 }
@@ -419,6 +436,9 @@ fn run(
                 match paste_candidate_char(&nxt) {
                     Some(c) => {
                         chars.push(c);
+                        // A 2nd back-to-back candidate char: this is a real
+                        // burst, switch to the longer ACTIVE bridging window.
+                        burst_confirmed = true;
                     }
                     None => {
                         trailing = Some(nxt);
@@ -483,6 +503,51 @@ fn run(
             continue;
         }
 
+        // Bracketed-paste coalescing. Windows Terminal / conhost deliver a
+        // large bracketed paste as MULTIPLE `Event::Paste` records with the
+        // same 5-12 ms inter-chunk gaps the char-burst detector above bridges
+        // for the no-bracketed-paste fallback. Forwarded one-by-one, each
+        // record folds into its own `[Pasted #N]` placeholder downstream — a
+        // single Ctrl+V of a long file showed as 29 placeholders (Windows bug
+        // report). Concatenate consecutive `Event::Paste` records that arrive
+        // within the ACTIVE bridging window into one payload so the buffer
+        // folds them into a single placeholder.
+        //
+        // An EMPTY paste is the image-clipboard signal (the terminal wrapped a
+        // bracketed paste with no text because the clipboard holds image
+        // bytes); it's a lone event the loop resolves via arboard, so pass it
+        // straight through without burning the bridging window on it.
+        if let Event::Paste(first) = ev {
+            if first.is_empty() {
+                if tx.send(InputEvent::Paste(first)).is_err() {
+                    return;
+                }
+                continue;
+            }
+            // 16 MiB ceiling: a pathologically large paste that keeps arriving
+            // can't wedge the reader indefinitely; we ship what we have.
+            const PASTE_CAP: usize = 16 * 1024 * 1024;
+            let (payload, trailing) = coalesce_paste(first, PASTE_CAP, || {
+                match event::poll(Duration::from_millis(BURST_ACTIVE_TIMEOUT_MS)) {
+                    Ok(true) => event::read().ok(),
+                    _ => None,
+                }
+            });
+            crate::tuix_trace!("RD", "paste-coalesce len={}", payload.len());
+            if tx.send(InputEvent::Paste(payload)).is_err() {
+                return;
+            }
+            // Dispatch the non-paste event that terminated the run (if any).
+            if let Some(ev) = trailing {
+                if let Some(msg) = to_input_event(ev) {
+                    if tx.send(msg).is_err() {
+                        return;
+                    }
+                }
+            }
+            continue;
+        }
+
         let msg = match ev {
             Event::Key(k) => {
                 crate::tuix_trace!("RD", "key {:?} {:?}", k.kind, k.code);
@@ -535,9 +600,121 @@ fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
     }
 }
 
+/// Translate a crossterm `Event` into the `InputEvent` the loop consumes,
+/// applying the focus-tracking side effects. Returns `None` for events that
+/// carry no input (focus changes, unmapped mouse kinds). Used to dispatch
+/// the non-paste event that terminates a coalesced paste run.
+fn to_input_event(ev: Event) -> Option<InputEvent> {
+    match ev {
+        Event::Key(k) => Some(InputEvent::Key(k)),
+        Event::Paste(p) => Some(InputEvent::Paste(p)),
+        Event::Resize(w, h) => Some(InputEvent::Resize(w, h)),
+        Event::Mouse(m) => mouse_input_event(m),
+        Event::FocusGained => {
+            atomcode_core::notify::set_terminal_focus_state(Some(true));
+            None
+        }
+        Event::FocusLost => {
+            atomcode_core::notify::set_terminal_focus_state(Some(false));
+            None
+        }
+    }
+}
+
+/// Concatenate `first` with every consecutive `Event::Paste` payload that
+/// `next` yields, until `next` returns a non-paste event (handed back as the
+/// trailing event for the caller to dispatch), returns `None` (the bridging
+/// window closed / EOF), or the accumulated length reaches `cap`.
+///
+/// Pulled out of the reader loop so the coalescing rule is unit-testable
+/// without driving a real terminal: the reader supplies a `next` that polls
+/// crossterm within the ACTIVE bridging window; tests supply a vec iterator.
+///
+/// Why this exists: Windows Terminal / conhost split one bracketed paste into
+/// MULTIPLE `Event::Paste` records with 5-12 ms gaps. Forwarded individually,
+/// each record folds into its own `[Pasted #N]` placeholder, so one Ctrl+V of
+/// a long file rendered as 29 placeholders (Windows bug report). This is the
+/// `Event::Paste` analogue of the char-by-char paste-burst detector above.
+fn coalesce_paste(
+    first: String,
+    cap: usize,
+    mut next: impl FnMut() -> Option<Event>,
+) -> (String, Option<Event>) {
+    let mut payload = first;
+    let mut trailing = None;
+    while payload.len() < cap {
+        match next() {
+            Some(Event::Paste(p)) => payload.push_str(&p),
+            Some(other) => {
+                trailing = Some(other);
+                break;
+            }
+            None => break,
+        }
+    }
+    (payload, trailing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long bracketed paste arriving as several `Event::Paste` chunks (the
+    /// Windows Terminal / conhost behaviour) collapses into ONE payload — so
+    /// the buffer folds it into a single `[Pasted #N]` instead of 29 of them.
+    #[test]
+    fn coalesces_consecutive_paste_chunks() {
+        let mut chunks = vec![
+            Event::Paste("b\nc\n".to_string()),
+            Event::Paste("d\ne\n".to_string()),
+        ]
+        .into_iter();
+        let (out, trailing) =
+            coalesce_paste("a\n".to_string(), 1 << 20, || chunks.next());
+        assert_eq!(out, "a\nb\nc\nd\ne\n");
+        assert!(trailing.is_none());
+    }
+
+    /// A non-paste event terminates the run and is handed back as `trailing`
+    /// so the caller still dispatches it (e.g. a trailing Enter); paste chunks
+    /// after the break are NOT swallowed into this payload.
+    #[test]
+    fn paste_coalesce_stops_at_non_paste_and_returns_trailing() {
+        let mut evs = vec![
+            Event::Paste("more".to_string()),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Event::Paste("never".to_string()),
+        ]
+        .into_iter();
+        let (out, trailing) =
+            coalesce_paste("start".to_string(), 1 << 20, || evs.next());
+        assert_eq!(out, "startmore");
+        assert!(matches!(trailing, Some(Event::Key(_))));
+    }
+
+    /// Once the accumulated length reaches `cap` the loop stops without
+    /// polling again, so a pathological never-ending paste can't wedge the
+    /// reader.
+    #[test]
+    fn paste_coalesce_respects_cap() {
+        let mut polled = 0usize;
+        let (out, trailing) = coalesce_paste("aaaa".to_string(), 2, || {
+            polled += 1;
+            Some(Event::Paste("x".to_string()))
+        });
+        assert_eq!(out, "aaaa");
+        assert_eq!(polled, 0, "cap already reached; must not poll");
+        assert!(trailing.is_none());
+    }
+
+    /// `next` yielding `None` (the bridging window closed with nothing more
+    /// queued — the common single-chunk paste) ends the run cleanly.
+    #[test]
+    fn paste_coalesce_ends_when_window_closes() {
+        let (out, trailing) = coalesce_paste("solo".to_string(), 1 << 20, || None);
+        assert_eq!(out, "solo");
+        assert!(trailing.is_none());
+    }
 
     /// Pause/Resume round trip without touching crossterm — feeds commands
     /// directly into the `run` worker via an in-memory channel pair. This
@@ -601,16 +778,17 @@ mod tests {
         );
     }
 
-    /// `BURST_POLL_TIMEOUT_MS` must sit above terminal stdin chunking
-    /// cadence (so paste chunks merge into one burst) but stay well
-    /// below the ~20 ms human input-perception floor (so single
-    /// keystrokes don't accrue per-key lag). The old 2 ms value was
-    /// too tight on Windows — PowerShell stdin delivery has 5-12 ms
-    /// gaps that fragmented one logical Ctrl+V into 5-10 [Pasted #N]
-    /// placeholders.
+    /// `BURST_ACTIVE_TIMEOUT_MS` (the post-confirmation bridging window)
+    /// must sit above terminal stdin chunking cadence so paste chunks
+    /// merge into one burst. It no longer has to stay under the human
+    /// perception floor: only a *confirmed* burst ever waits this long,
+    /// never a lone keystroke (that pays the short PENDING window). The
+    /// old 2 ms value was too tight on Windows — PowerShell stdin
+    /// delivery has 5-12 ms gaps that fragmented one logical Ctrl+V into
+    /// 5-10 [Pasted #N] placeholders.
     #[test]
-    fn burst_poll_timeout_within_safe_envelope() {
-        let t = BURST_POLL_TIMEOUT_MS;
+    fn burst_active_timeout_within_safe_envelope() {
+        let t = BURST_ACTIVE_TIMEOUT_MS;
         assert!(
             t >= 4,
             "{}ms must be >= 4ms — at least the Unix baseline so 2-3ms \
@@ -618,22 +796,48 @@ mod tests {
             t
         );
         assert!(
-            t < 20,
-            "{}ms must stay under the ~20ms human input-perception \
-             floor so per-keystroke typing latency stays invisible",
+            t <= 60,
+            "{}ms must stay at/under the 60ms prior-art ceiling",
             t
         );
     }
 
-    /// Lock the Windows-specific tuned value. PowerShell / Windows
+    /// The PENDING first-peek window decides lone-keystroke latency. It
+    /// must be small (so typing feels instant) but non-zero (so a
+    /// genuinely chunked paste's 2nd record can surface and confirm the
+    /// burst — a strict poll(0) would misread it as a lone key).
+    #[test]
+    fn burst_pending_timeout_is_small_and_nonzero() {
+        assert!(
+            BURST_PENDING_TIMEOUT_MS >= 1,
+            "{}ms must be non-zero so a chunked paste's first record \
+             isn't misread as a lone keystroke",
+            BURST_PENDING_TIMEOUT_MS
+        );
+        assert!(
+            BURST_PENDING_TIMEOUT_MS <= BURST_ACTIVE_TIMEOUT_MS,
+            "PENDING ({}ms) must not exceed ACTIVE ({}ms) — it is the \
+             *short* stage of the two-stage state machine",
+            BURST_PENDING_TIMEOUT_MS,
+            BURST_ACTIVE_TIMEOUT_MS
+        );
+        assert!(
+            BURST_PENDING_TIMEOUT_MS < 13,
+            "{}ms must stay under the human input-perception floor so \
+             per-keystroke typing latency stays invisible",
+            BURST_PENDING_TIMEOUT_MS
+        );
+    }
+
+    /// Lock the Windows-specific tuned ACTIVE value. PowerShell / Windows
     /// Terminal stdin chunks have 5-12 ms gaps; if a future edit
     /// collapses Windows to the Unix baseline (4 ms), the original
     /// Ctrl+V fragmentation bug returns.
     #[cfg(target_os = "windows")]
     #[test]
-    fn burst_poll_timeout_windows_is_tuned_value() {
+    fn burst_active_timeout_windows_is_tuned_value() {
         assert_eq!(
-            BURST_POLL_TIMEOUT_MS, 15,
+            BURST_ACTIVE_TIMEOUT_MS, 15,
             "Windows requires the tuned 15ms value, not the Unix baseline"
         );
     }
@@ -643,9 +847,9 @@ mod tests {
     /// majority where bracketed paste delivers as a single event.
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn burst_poll_timeout_unix_is_baseline() {
+    fn burst_active_timeout_unix_is_baseline() {
         assert_eq!(
-            BURST_POLL_TIMEOUT_MS, 4,
+            BURST_ACTIVE_TIMEOUT_MS, 4,
             "non-Windows targets use the 4ms baseline, not the Windows 15ms"
         );
     }

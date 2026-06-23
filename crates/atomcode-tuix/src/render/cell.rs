@@ -468,6 +468,80 @@ pub fn serialize_patches(patches: &[Patch]) -> Vec<u8> {
     out
 }
 
+/// JediTerm / IntelliJ-terminal repaint: serialise (prev → next) as a
+/// per-changed-row **tight** stream, instead of the per-cell-CUP patch
+/// stream [`serialize_patches`] produces.
+///
+/// Why a separate path: [`serialize_patches`] forces an absolute CUP before
+/// every non-ASCII cell (see its body) so a width-misprediction degrades to
+/// one wrong cell instead of a whole-row bleed. On JediTerm that very
+/// CUP-per-glyph is what makes the terminal's narrow-fallback CJK paint show
+/// a visible 1-col gap after every ideograph, and turns a rule of `─` into N
+/// individually-positioned dashes that paint as a fragmented line.
+///
+/// JediTerm's GRID agrees with our width model (CJK = 2 cells), so we can
+/// safely let the terminal advance its own cursor across a contiguous run.
+/// For each row that changed: emit ONE `CUP(row,1)` + `EL` (erase the whole
+/// line), then stream the row's cells up to its last non-blank column as a
+/// single run — continuation cells skipped, SGR state-machined exactly like
+/// [`serialize_row`]. This keeps box-drawing rules contiguous (symptom #3)
+/// and the `EL` wipes any stale tail JediTerm left behind (symptom #2). It
+/// deliberately does NOT change the per-ideograph gap (symptom #1) — that is
+/// a font-advance artifact no escape sequence can fix.
+///
+/// Right-margin safety: streaming a full-width row writes the last column,
+/// which leaves an xterm-class terminal (JediTerm included) in the *deferred*
+/// "pending wrap" state — NOT an immediate line break. Every row here begins
+/// with an absolute CUP, and `Screen::render_diff` always parks the cursor
+/// with a final CUP after these bytes, so the pending wrap is cancelled
+/// before any further glyph prints. No auto-wrap into the next row.
+pub fn serialize_frames_tight(prev: &[Vec<Cell>], next: &[Vec<Cell>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let blank = Cell::blank();
+    let max_rows = prev.len().max(next.len());
+    for r in 0..max_rows {
+        let p = prev.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let n = next.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let max_cols = p.len().max(n.len());
+        let changed = (0..max_cols).any(|c| p.get(c).unwrap_or(&blank) != n.get(c).unwrap_or(&blank));
+        if !changed {
+            continue;
+        }
+        // CUP to (row, col 1) then EL — erase the whole physical line so any
+        // stale tail (content that used to extend past the new row's end) is
+        // cleared without needing per-column blank patches. 1-indexed.
+        let _ = write!(out, "\x1b[{};1H\x1b[K", r + 1);
+        // Everything past the last non-blank cell was just cleared by EL and
+        // stays blank, so we only re-stream up to there. A row that became
+        // all-blank emits nothing further (the EL already cleared it).
+        if let Some(last) = n.iter().rposition(|c| c != &blank) {
+            let mut current_style: Option<CellStyle> = None;
+            let mut emitted_any_sgr = false;
+            for cell in &n[..=last] {
+                if cell.width == 0 {
+                    // Continuation cell — the wide glyph before it already
+                    // advanced the terminal cursor past this column.
+                    continue;
+                }
+                if current_style.as_ref() != Some(&cell.style) {
+                    let before = out.len();
+                    emit_sgr_transition(&mut out, current_style.as_ref(), &cell.style);
+                    if out.len() > before {
+                        emitted_any_sgr = true;
+                    }
+                    current_style = Some(cell.style.clone());
+                }
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(cell.ch.encode_utf8(&mut buf).as_bytes());
+            }
+            if emitted_any_sgr {
+                out.extend_from_slice(b"\x1b[0m");
+            }
+        }
+    }
+    out
+}
+
 /// Serialise a single row of cells into ANSI bytes **without any cursor
 /// positioning**. Used by the scrollback-push path (write row to stdout
 /// at the current cursor, then let `\n` advance). Skips continuation
@@ -1111,6 +1185,80 @@ mod tests {
             "continuation must not trigger a cursor move: {:?}",
             s
         );
+    }
+
+    // ── serialize_frames_tight (JediTerm per-row tight repaint) ──────
+    //
+    // These pin the byte-stream contract of the JediTerm path: one CUP +
+    // EL per changed row, then a single contiguous run (no per-cell CUP),
+    // continuation cells skipped, stale tails cleared. Contrast with
+    // `serialize_patches` which forces a CUP before every non-ASCII cell.
+
+    #[test]
+    fn tight_emits_rule_as_single_contiguous_run() {
+        // 5 box-drawing dashes (each non-ASCII). serialize_patches would
+        // CUP each (5 cursor moves); tight emits ONE CUP then streams all 5.
+        let mut rule = Vec::new();
+        push_str_cells(&mut rule, "─────", &CellStyle::default());
+        let prev = vec![vec![Cell::blank(); 5]];
+        let next = vec![rule];
+        let s = String::from_utf8(serialize_frames_tight(&prev, &next)).unwrap();
+        assert!(s.starts_with("\x1b[1;1H\x1b[K"), "row opens with CUP+EL: {:?}", s);
+        // 'H' is the final byte of a CUP; exactly one for the whole row.
+        assert_eq!(s.matches('H').count(), 1, "exactly one CUP, got: {:?}", s);
+        assert!(s.contains("─────"), "dashes must be contiguous: {:?}", s);
+    }
+
+    #[test]
+    fn tight_unchanged_row_emits_nothing() {
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "hi", &CellStyle::default());
+        let prev = vec![row.clone()];
+        let next = vec![row];
+        assert!(serialize_frames_tight(&prev, &next).is_empty());
+    }
+
+    #[test]
+    fn tight_clears_tail_when_row_shrinks() {
+        // prev "hello" → next "he": the EL must wipe the "llo" tail and we
+        // re-stream only "he" (never re-emit the stale tail).
+        let prev_row: Vec<Cell> = "hello"
+            .chars()
+            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .collect();
+        let next_row: Vec<Cell> = "he"
+            .chars()
+            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .collect();
+        let s = String::from_utf8(serialize_frames_tight(&vec![prev_row], &vec![next_row])).unwrap();
+        assert!(s.contains("\x1b[1;1H\x1b[K"), "row cleared with EL: {:?}", s);
+        assert!(s.contains("he"));
+        assert!(!s.contains("llo"), "stale tail must not be re-emitted: {:?}", s);
+    }
+
+    #[test]
+    fn tight_skips_continuation_and_emits_cjk_glyph_once() {
+        // "a你b": 你 is width 2 + a width-0 continuation cell that must be
+        // skipped (like serialize_patches) — the run stays "a你b".
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "a你b", &CellStyle::default());
+        let prev = vec![vec![Cell::blank(); row.len()]];
+        let next = vec![row];
+        let s = String::from_utf8(serialize_frames_tight(&prev, &next)).unwrap();
+        assert!(s.contains("a你b"), "glyph emitted once, no phantom cont: {:?}", s);
+        assert_eq!(s.matches('H').count(), 1, "single CUP for the row: {:?}", s);
+    }
+
+    #[test]
+    fn tight_full_blank_row_just_clears() {
+        // Row went from content to all-blank → only CUP+EL, nothing streamed.
+        let prev_row: Vec<Cell> = "xy"
+            .chars()
+            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .collect();
+        let next = vec![vec![Cell::blank(); 2]];
+        let s = String::from_utf8(serialize_frames_tight(&vec![prev_row], &next)).unwrap();
+        assert_eq!(s, "\x1b[1;1H\x1b[K", "blank row emits only the clear: {:?}", s);
     }
 
     /// Reverse: wide→narrow at same cell index. The wide char's

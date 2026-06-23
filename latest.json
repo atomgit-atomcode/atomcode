@@ -1,30 +1,30 @@
 {
-  "version": "v4.24.2",
-  "released_at": "2026-06-03T22:55:36+08:00",
+  "version": "v4.25.5",
+  "released_at": "2026-06-23T12:21:48+08:00",
   "binaries": {
     "darwin-arm64": {
-      "sha256": "354a5b0efa0afca70158dbc370d95b67de03fc54f68e203ae94b7be47820199e",
-      "size": 22539200
+      "sha256": "6bd55f5c1aed34844ad17b1380317f5f1b735c56ad2250c71bdd31df2003298c",
+      "size": 24366768
     },
     "darwin-x64": {
-      "sha256": "74dcfe24e5b32f12ac69262f34e3ecd1eb97f28f41f74a1baeacab92fd915834",
-      "size": 24197408
+      "sha256": "25d5b891d1833df72e318e53c1616d11a1da579e07fbff833053f33f31119223",
+      "size": 26486688
     },
     "linux-arm64": {
-      "sha256": "f3e5d6cff88a12178b363f7f2a5a0cfaaf87c2ed15b041554467317dd02e96d5",
-      "size": 24220504
+      "sha256": "cb433f30abf0543df51a5edb5c455fd7c6ab72040965ba5241bbc2bc2142e806",
+      "size": 26317736
     },
     "linux-x64": {
-      "sha256": "6ec49c6e12a5746b232a4ae24bc2bd0df5a8b10593f67b3528a4c3e9e483ca56",
-      "size": 25715792
+      "sha256": "aabede8376de761431c049c12a31c1c2ff6f2b44c72b5a302904a5e4de21f9d8",
+      "size": 28518576
     },
     "ohos-arm64": {
-      "sha256": "f56b23d826b8183e0dda0bd5809e3a29c18541196469a9fc826e6ae3646c6507",
-      "size": 24209152
+      "sha256": "37c887edf6a0172586b8d121d866b5f34f43be1f545c37b5b0f00e69a7ae9e79",
+      "size": 26646272
     },
     "windows-x64": {
-      "sha256": "90e73a367bd160a2ff0ade953cdea29fac5b4727f90faaf6b868d9c80df27a57",
-      "size": 24168080
+      "sha256": "90f62da5ff73b3c45d34474119ef885c0616da99977f7dfe05e04a86d4b9292d",
+      "size": 26647184
     }
   }
 }

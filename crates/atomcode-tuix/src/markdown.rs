@@ -12,9 +12,16 @@ use crate::highlight::theme;
 use crate::terminal::TerminalCaps;
 
 /// Parser state maintained across lines of a streamed response.
-#[derive(Default)]
 pub struct MdState {
     pub in_code_block: bool,
+    /// The fence character that opened the current block (`'`' or `'~'`).
+    /// Used so that `~~~` inside a backtick block is not mistaken for a
+    /// close fence (issue #699).
+    fence_char: char,
+    /// Number of consecutive markers in the opening fence. A close fence
+    /// must have at least this many markers so that ```` ``` ```` (4-backtick
+    /// block) can safely contain ```` ``` ```` (3-backtick inner blocks).
+    fence_len: usize,
     /// Accumulates consecutive `|…|` rows; flushed as an aligned block
     /// when a non-table line arrives.
     pub table_buf: Vec<String>,
@@ -23,16 +30,53 @@ pub struct MdState {
     /// the code block appears in one chunk at fence close rather than
     /// streaming line-by-line.
     pub code_buf: Vec<String>,
+    /// Raw source of the most recently closed code block (the original
+    /// lines joined with `\n`, before the 2-space indent from
+    /// `highlight_block`). Set on close-fence and unclosed-finalize
+    /// paths. Callers take the value via `Option::take()` and push it
+    /// to the system clipboard via arboard / OSC 52 so the user can
+    /// paste the unwrapped original instead of selecting wrapped display
+    /// lines (issue #699). `None` means no code block was flushed this
+    /// tick.
+    ///
+    /// Held until the next close fence or explicit `take()` — for very
+    /// large single-block replies the peak memory is `O(source size)`
+    /// which matches the existing `code_buf` behaviour.
+    pub last_code_block_source: Option<String>,
+}
+
+/// Manual impl so `fence_char` / `fence_len` start at realistic sentinel
+/// values instead of `\0` / `0` (what `#[derive(Default)]` would give).
+/// These fields are only read when `in_code_block` is true, which always
+/// follows an explicit set in the OPEN-fence branch, but explicit defaults
+/// make the invariant visible and protect against future refactors.
+impl Default for MdState {
+    fn default() -> Self {
+        Self {
+            in_code_block: false,
+            fence_char: '`',
+            fence_len: 3,
+            table_buf: Vec::new(),
+            code_buf: Vec::new(),
+            last_code_block_source: None,
+        }
+    }
 }
 
 impl MdState {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Reset all fields to their initial state.  Keep in sync with
+    /// [`Default::default()`] — any new field added to `MdState` must
+    /// be cleared here too.
     pub fn reset(&mut self) {
         self.in_code_block = false;
+        self.fence_char = '`';
+        self.fence_len = 3;
         self.table_buf.clear();
         self.code_buf.clear();
+        self.last_code_block_source = None;
     }
 }
 
@@ -97,27 +141,27 @@ pub fn render_line_with_width(
 
     // Fenced code block fence (``` or ~~~).
     //
-    // OPEN fence: capture the language tag (e.g., `rust` in ```rust),
-    // start buffering body lines into `state.code_buf`. We don't emit
-    // anything for the body until close fence — the syntax highlighter
-    // needs the whole block at once to classify multi-line strings /
-    // block comments correctly.
+    // Two separate checks — the close fence must match the opening
+    // marker character and be at least as long, so a 4-backtick block
+    // can safely contain a 3-backtick inner block, and `~~~` inside a
+    // backtick block is NOT mistaken for a close fence (issue #699 P1-2).
     //
-    // CLOSE fence: flush the buffered block through `highlight::highlight_block`,
-    // which under plan-0 unconditionally emits 2-space-indented plain text
-    // (no per-token colour — see that function's doc for the rationale).
-    if is_fence(trimmed) {
-        if state.in_code_block {
-            // CLOSE
-            let source = state.code_buf.join("\n");
-            let highlighted = crate::highlight::highlight_block(&source);
-            state.in_code_block = false;
-            state.code_buf.clear();
-            return Some(prepend(highlighted));
-        } else {
-            // OPEN — language tag on the fence is ignored under plan-0
-            // (the highlighter is colour-free regardless of language).
+    // CLOSE fence: flush the buffered block through `highlight::highlight_block`.
+    if state.in_code_block && is_closing_fence(trimmed, state.fence_char, state.fence_len) {
+        let source = state.code_buf.join("\n");
+        let highlighted = crate::highlight::highlight_block(&source);
+        state.last_code_block_source = Some(source);
+        state.in_code_block = false;
+        state.code_buf.clear();
+        return Some(prepend(highlighted));
+    }
+    // OPEN fence: at least 3 consecutive backticks or tildes, captured
+    // so the close check above can match the marker and count.
+    if !state.in_code_block {
+        if let Some((c, len)) = fence_start(trimmed) {
             state.in_code_block = true;
+            state.fence_char = c;
+            state.fence_len = len;
             state.code_buf.clear();
             return prefix_only();
         }
@@ -208,6 +252,7 @@ pub fn finalize_with_width(
     let code_part = if state.in_code_block && !state.code_buf.is_empty() {
         let source = state.code_buf.join("\n");
         let highlighted = crate::highlight::highlight_block(&source);
+        state.last_code_block_source = Some(source);
         state.in_code_block = false;
         state.code_buf.clear();
         Some(highlighted)
@@ -372,6 +417,21 @@ pub fn flush_aligned_table_with_width(
     // chopped real content out of cells and made wide tables in narrow
     // terminals unreadable. Instead, if the natural table doesn't fit, the
     // flat-mode fallback below renders every cell in full.
+    //
+    // However, when the border dash glyph `─` occupies more than 1 cell
+    // (CJK mode: `ATOMCODE_CJK_WIDTH=1` makes East Asian Ambiguous
+    // codepoints width-2), the number of dashes we push per column is
+    // `ceil((w + 2) / dash_w)`, and their *actual* rendered width is
+    // `ceil((w + 2) / dash_w) * dash_w` — which may exceed `w + 2` when
+    // `dash_w > 1` and `w + 2` isn't a multiple of `dash_w`. That makes
+    // the border rows wider than the data rows and the `│` borders
+    // mis-align.
+    //
+    // Fix: round each column width UP so that `w + 2` is a multiple of
+    // `dash_w`. This adds at most `dash_w - 1` cells of extra padding per
+    // column — a minor cosmetic cost that guarantees every row (border or
+    // data) has exactly the same display width.
+    let dash_w = crate::width::cell_char_width('─').unwrap_or(1).max(1);
     let mut col_widths = vec![0usize; ncols];
     for row in &parsed {
         if is_sep(row) {
@@ -386,22 +446,40 @@ pub fn flush_aligned_table_with_width(
             col_widths[j] = col_widths[j].max(w);
         }
     }
+    // Round up each column width so (w + 2) is a multiple of dash_w.
+    // For dash_w == 1 (default, non-CJK), this is a no-op.
+    if dash_w > 1 {
+        for w in &mut col_widths {
+            let budget = *w + 2;
+            let rounded = budget.div_ceil(dash_w) * dash_w;
+            *w = rounded.saturating_sub(2);
+        }
+    }
 
     // Total width of one rendered row at natural widths:
     //   `│` + per-col ` cell ` + `│` between/after each col
-    //   = 1 + sum(w + 3 for w in col_widths)
+    // In CJK mode, `│` (U+2502) is East Asian Ambiguous and occupies 2
+    // cells, so the per-border contribution is `bar_w`, not a hardcoded 1.
+    //   = bar_w + sum(w + 2 + bar_w for w in col_widths)
+    // where the per-column budget is: 1 leading space + w content + pad +
+    // 1 trailing space + bar_w for the following `│`.
+    //
     // If this exceeds the terminal budget, switch to flat mode.
-    let natural_row_width: usize = 1 + col_widths.iter().map(|w| w + 3).sum::<usize>();
+    let bar_w = crate::width::cell_char_width('│').unwrap_or(1).max(1);
+    let natural_row_width: usize =
+        bar_w + col_widths.iter().map(|w| w + 2 + bar_w).sum::<usize>();
     if max_width > 0 && natural_row_width > max_width {
         return render_flat_table(&parsed, caps);
     }
 
-    // Bright-black / DarkGrey (SGR 90) — table borders are chrome,
-    // not content. Cyan (SGR 96) made them collide with the input
-    // box separator and the inline-code colour, collapsing the
-    // visual hierarchy. Gray reads as quiet structure and lets
-    // header text + cell content carry the visual weight.
-    let border_on = if caps.colors { theme::MD_MUTED_OPEN } else { "" };
+    // Gray chrome — table borders are structure, not content (cyan made
+    // them collide with the input-box separator and inline-code colour).
+    // But the shade must be theme-aware: a fixed SGR 90 (DarkGrey) maps to
+    // ~#3F3F3F on dark themes, ~3:1 against the bg, so the whole grid went
+    // invisible until a selection highlight revealed it. `md_border_open`
+    // keeps SGR 90 on light and switches to SGR 37 (soft light-gray) on
+    // dark — quiet structure that stays visible on both.
+    let border_on = if caps.colors { theme::md_border_open() } else { "" };
     let border_off = if caps.colors { theme::MD_MUTED_CLOSE } else { "" };
 
     // Draw a horizontal rule row with given connector characters.
@@ -411,15 +489,17 @@ pub fn flush_aligned_table_with_width(
     // + w cells of content/padding + 1 trailing space) so border, content
     // and separators align column-by-column.
     //
-    // The dash glyph `─` (U+2500) is East Asian Ambiguous. With
-    // `cell_char_width('─') == 2` (i.e. `ATOMCODE_CJK_WIDTH=1`), each char
-    // we push occupies 2 cells, so naively pushing `(w + 2)` chars would
-    // paint `2 * (w + 2)` cells per column — borders drawn way past the
-    // content's right edge. Push `ceil((w + 2) / dash_w)` chars instead;
-    // for `dash_w == 1` (default) this is unchanged, for `dash_w == 2`
-    // odd widths overshoot by 1 cell — minor cosmetic, far better than
-    // a 2x stretch.
-    let dash_w = crate::width::cell_char_width('─').unwrap_or(1).max(1);
+    // Box-drawing glyphs are East Asian Ambiguous. With
+    // `cell_char_width('─') == 2` (i.e. `ATOMCODE_CJK_WIDTH=1`), each
+    // dash we push occupies 2 cells. Column widths have already been
+    // rounded so that `w + 2` is a multiple of `dash_w` (see above),
+    // so `ceil((w + 2) / dash_w) * dash_w == w + 2` exactly — the
+    // border row fills precisely the same number of cells as the data
+    // row's ` <body><pad> ` budget.
+    //
+    // Junction glyphs (┬ ┼ ┤ etc.) occupy `bar_w` cells each in CJK
+    // mode, matching the `│` in the data row. The left/right corner
+    // glyphs (┌ ┐ ├ ┤ └ ┘) also occupy `bar_w` cells each.
     let rule = |left: char, mid: char, right: char| -> String {
         let mut s = String::new();
         s.push_str(border_on);
@@ -733,17 +813,29 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
     out
 }
 
-fn is_fence(trimmed: &str) -> bool {
-    let mut chars = trimmed.chars();
-    match chars.next() {
-        Some('`') => {
-            trimmed.len() >= 3 && trimmed.as_bytes()[1] == b'`' && trimmed.as_bytes()[2] == b'`'
-        }
-        Some('~') => {
-            trimmed.len() >= 3 && trimmed.as_bytes()[1] == b'~' && trimmed.as_bytes()[2] == b'~'
-        }
-        _ => false,
+/// Return the marker and marker width for a fenced-code opening line.
+/// Requires at least 3 consecutive backticks or tildes.
+///
+/// Shared with `event_loop/commands::extract_code_blocks` so the render
+/// pipeline and the `/copy` command agree on fence parsing (issue #699).
+pub(crate) fn fence_start(line: &str) -> Option<(char, usize)> {
+    let marker = line.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
     }
+    let len = line.chars().take_while(|&ch| ch == marker).count();
+    (len >= 3).then_some((marker, len))
+}
+
+/// A closing fence must use the opening marker and be at least as long.
+/// This keeps a ```` `````` (4-backtick) block from being closed by an
+/// inner ```` ``` ```` (3-backtick) line, and prevents `~~~` from closing a
+/// backtick block (issue #699).
+///
+/// Shared with `event_loop/commands::extract_code_blocks`.
+pub(crate) fn is_closing_fence(line: &str, marker: char, opening_len: usize) -> bool {
+    let len = line.chars().take_while(|&ch| ch == marker).count();
+    len >= opening_len && line.chars().skip(len).all(char::is_whitespace)
 }
 
 fn is_hrule(trimmed: &str) -> bool {
@@ -941,6 +1033,122 @@ mod tests {
             "expected exactly 3 box-drawing bars (left border + 1 sep + right border); \
              got {} in {:?}",
             box_bar_count, body_line,
+        );
+    }
+
+    #[test]
+    fn flush_aligned_table_with_emoji_symbol_keeps_rows_aligned() {
+        // ☀ (U+2600) is a legacy-block pictographic emoji that GUI terminals
+        // paint at 2 cells. The renderer must SIZE and PAD the column with the
+        // same width metric (crate::width::display_width) so every row's
+        // border lands in the same column. Regression for the emoji-symbol
+        // table-misalignment bug (stray `│` shifted right of "☀ 晴").
+        let rows = vec![
+            "| 时段 | 天气 |".to_string(),
+            "| --- | --- |".to_string(),
+            "| 早上 | ☀ 晴 |".to_string(),
+            "| 中午 | 多云 |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "every table row must share one display width; got {:?} for\n{}",
+            widths,
+            out
+        );
+    }
+
+    /// Regression for issue #708: Markdown tables with CJK characters must
+    /// have aligned borders regardless of whether East Asian Ambiguous
+    /// box-drawing glyphs (`│` `─` `┌` etc.) render at width 1 or 2.
+    /// The fix rounds column widths so `(w + 2)` is a multiple of the
+    /// dash width, preventing border rows from overshooting data rows.
+    ///
+    /// This test uses the exact example from the issue: a 6-column
+    /// weather table with CJK content.
+    #[test]
+    fn cjk_table_borders_align_with_mixed_width_cells() {
+        let rows = vec![
+            "| 日期 | 天气 | 温度 | 降水总量 | 降水概率 | 最大风速 |".to_string(),
+            "|------|------|------|----------|----------|----------|".to_string(),
+            "| 6/22（今天） | 强雷暴伴冰雹 | 23.3 ~ 31°C | 33.2 mm | 98% | 17 km/h |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 120);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "every table row must share one display width (issue #708); got {:?} for\n{}",
+            widths,
+            out
+        );
+    }
+
+    /// Regression for issue #708 extended: weather table with emoji + CJK
+    /// content. The user reported that rows containing emoji like 🌤 and 🌡
+    /// had their right border `│` shifted right compared to rows without
+    /// emoji. The root cause is that `display_width` (used for column-width
+    /// and padding computation) and the actual rendered width of the cell
+    /// diverge when the cell content contains emoji that are wider than
+    /// `unicode-width` reports, or when `strip_md_for_width` and
+    /// `render_inline` disagree on the visible width.
+    #[test]
+    fn emoji_cjk_weather_table_borders_aligned() {
+        let rows = vec![
+            "| 项目 | 信息 |".to_string(),
+            "|------|------|".to_string(),
+            "| 📅 日期 | 2026年06月22日 |".to_string(),
+            "| 🌤 天气状况 | 大雨 💧 |".to_string(),
+            "| 🌡 气温范围 | 24℃ ~ 30℃ |".to_string(),
+            "| 🍃 风向风力 | 西北风 3级 |".to_string(),
+            "| 💧 相对湿度 | 96% |".to_string(),
+            "| ☀  紫外线 | 最弱 |".to_string(),
+            "| 🍃 空气质量 | 优 (AQI 28) |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "every row in emoji+CJK weather table must share one display width; got {:?} for\n{}",
+            widths,
+            out
+        );
+    }
+
+    /// Companion: a simpler 2-column CJK table that also verifies
+    /// border alignment. This is the minimal repro — even a table
+    /// with only CJK header cells must have consistent row widths.
+    #[test]
+    fn cjk_table_simple_two_column_aligned() {
+        let rows = vec![
+            "| 项目 | 状态 |".to_string(),
+            "|------|------|".to_string(),
+            "| 开发 | 进行中 |".to_string(),
+            "| 测试 | 已完成 |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "simple CJK table rows must be aligned; got {:?} for\n{}",
+            widths,
+            out
         );
     }
 

@@ -58,6 +58,30 @@ struct TerminalGuard {
     kbd_flags_pushed: bool,
 }
 
+/// Whether to push the Kitty keyboard protocol (CSI u progressive
+/// enhancement) for this terminal. True only on a real non-Windows TTY
+/// that is not JediTerm. Windows has no `CSI u` decoder and JediTerm
+/// mis-frames mouse reports as kitty key events once the protocol is
+/// armed — both leak raw bytes into the input box (see the call site for
+/// the full rationale). Pure so it can be unit-tested without touching
+/// the real stdout. Mirrored by the resume-path gate in
+/// `RetainedRenderer::resume_after_external`.
+pub(crate) fn should_enable_kitty_keyboard(caps: &TerminalCaps) -> bool {
+    caps.tty && !cfg!(windows) && !caps.jediterm
+}
+
+/// Kitty keyboard features used by the TUI.
+///
+/// Event-type reporting is deliberately excluded. Some terminals split a
+/// release report such as `ESC [ 101;1:3u` after the ESC byte; crossterm then
+/// treats the lone ESC as a complete key and forwards the remaining bytes as
+/// printable input. Disambiguation alone is enough for Shift+Enter, while the
+/// reader's modifier+Enter deduplication handles terminals that report key
+/// autorepeat as additional presses.
+pub(crate) fn kitty_keyboard_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
 impl TerminalGuard {
     /// Activate terminal capabilities. Returns `(guard, kbd_enhanced)` where
     /// `kbd_enhanced` indicates whether the Kitty keyboard protocol (CSI u)
@@ -85,29 +109,46 @@ impl TerminalGuard {
         // this, crossterm sees `Enter, NONE` on both Enter and Shift+Enter
         // and the input box can't insert a newline.
         //
-        // `REPORT_EVENT_TYPES` is the second bit of the protocol and is what
-        // actually makes OS key autorepeat distinguishable from fresh presses:
-        // without it, every 30ms autorepeat tick reports as `KeyEventKind::Press`,
-        // so holding Shift+Enter for a normal 150ms press-down inserts 5-10
-        // newlines instead of one. With it enabled, autorepeats report as
-        // `KeyEventKind::Repeat`, which `event_loop/mod.rs` treats the same
-        // as `Press` so navigation keys (Left/Right/Backspace) auto-repeat
-        // when held — Submit-on-Enter still fires only once because Submit
-        // transitions phases.
+        // Do not request REPORT_EVENT_TYPES. Release reports are unnecessary
+        // for our input model and can leak into the input box when a terminal
+        // splits the leading ESC from the rest of a CSI-u report. The reader
+        // already deduplicates modifier+Enter autorepeat reported as Press.
         //
         // `execute!` is best-effort — terminals that don't support CSI u
         // (notably Apple Terminal.app, some Linux terminals) ignore the
         // sequence; we just don't set `kbd_flags_pushed` and Drop won't try
-        // to pop. Terminals that support DISAMBIGUATE but not
-        // REPORT_EVENT_TYPES ignore the extra bit silently — this never
-        // makes things worse than before.
-        let kbd_enhanced = caps.tty
+        // to pop. Terminals that don't implement disambiguation ignore the
+        // request, leaving input behavior unchanged.
+        //
+        // WINDOWS EXCLUSION: never push on Windows. crossterm's Windows
+        // input backend reads Win32 console KEY_EVENT records (not an ANSI
+        // parser), so it already reports Shift+Enter modifiers and autorepeat
+        // (Press/Repeat/Release) natively — the two things this push buys on
+        // Unix — making the protocol pure downside here. Worse, it has no
+        // `CSI u` decoder at all, so once a terminal honours the push and
+        // starts encoding KEYPAD keys as functional codes (numpad 1 →
+        // `ESC[57400u`), ConPTY (VSCode integrated terminal, Windows Terminal)
+        // delivers the un-decoded bytes as the literal characters `[57400u`
+        // straight into the input box. Unix crossterm decodes 57400 → '1';
+        // Windows can't, so we simply don't ask the terminal to use it.
+        //
+        // JEDITERM EXCLUSION: same failure class on JetBrains' JediTerm (the
+        // terminal inside DevEco Studio, IDEA, Android Studio, …). Recent
+        // JediTerm advertises the Kitty protocol but mis-implements it: while
+        // the progressive-enhancement flags are active it re-frames the
+        // terminal's mouse-tracking reports as `CSI <n> u` key events, so a
+        // bare mouse *move* over the panel floods stdin with kitty key
+        // sequences. crossterm faithfully decodes each `<n>` codepoint to a
+        // `Char`, which lands in the input box as a stream of coordinate
+        // gibberish (`#B'#B(#@)…`). The push buys nothing here either — the
+        // IDE terminals deliver Shift+Enter usably without it — so, exactly
+        // like Windows, we don't arm the protocol. Detection reuses
+        // `caps.jediterm` (`TERMINAL_EMULATOR=JetBrains-JediTerm`, with the
+        // `ATOMCODE_JEDITERM` override for launchers that drop the env var).
+        let kbd_enhanced = should_enable_kitty_keyboard(&caps)
             && execute!(
                 io::stdout(),
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
+                PushKeyboardEnhancementFlags(kitty_keyboard_flags())
             )
             .is_ok();
         if kbd_enhanced {
@@ -172,6 +213,48 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Byte sequence that fully restores the terminal the TUI armed. Pure
+/// (returns the bytes; no I/O) so the restore *contract* is unit
+/// testable without a real stdout.
+///
+/// This is the same cleanup `TerminalGuard::Drop` and
+/// `RetainedRenderer::Drop` perform on the graceful path — but the
+/// release profile sets `panic = "abort"`, so on a crash NO destructor
+/// unwinds and neither Drop ever runs. The panic hook
+/// (`atomcode-cli::restore_terminal_if_tui`) is then the only code with
+/// a chance to undo the mutations, and it previously only disabled raw
+/// mode — leaving the Kitty keyboard protocol armed, so the parent
+/// shell echoed every post-crash keypress as a literal `[27u` / `[99;5u`
+/// CSI-u report (the reported crash artefact).
+///
+/// Mirrors `RetainedRenderer::Drop` (mouse-mode off, Kitty pop, cursor
+/// show, autowrap on, DECSTBM release) and appends a CRLF so the panic
+/// backtrace prints on a fresh line below the last painted TUI row
+/// instead of on top of it. Every sequence is idempotent, so emitting
+/// it after a graceful shutdown that already sent the same bytes is a
+/// harmless no-op.
+///
+/// The Kitty pop uses the `<` introducer (`\x1b[<1u`), never `>`: `>`
+/// would *arm* the protocol on the way out — the very bug this fixes.
+/// Popping a level we never pushed is a harmless no-op (empty kitty
+/// stack), so this stays unconditional and we needn't thread the
+/// `kbd_flags_pushed` state out of `TerminalGuard`.
+pub(crate) fn panic_restore_sequence() -> &'static [u8] {
+    b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\r\n"
+}
+
+/// Emit [`panic_restore_sequence`] to stdout and flush. Best-effort
+/// (errors swallowed) so it is safe to call from a panic hook. Invoked
+/// by `atomcode-cli`'s panic hook under `panic = "abort"`, where no Drop
+/// runs; see [`panic_restore_sequence`] for the full rationale.
+pub fn panic_restore_terminal() {
+    use std::io::Write as _;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let _ = out.write_all(panic_restore_sequence());
+    let _ = out.flush();
+}
+
 pub async fn run(
     config: Config,
     model_name: String,
@@ -185,6 +268,7 @@ pub async fn run(
     lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     dangerously_skip_permissions: bool,
+    is_admin: bool,
 ) -> Result<()> {
     let mut caps = TerminalCaps::probe();
 
@@ -590,6 +674,7 @@ pub async fn run(
         )),
         is_plain_renderer,
         dangerously_skip_permissions,
+        is_admin,
         pending_guide_topic: None,
         sync_session: None,
         sync_forwarder: None,
@@ -648,4 +733,52 @@ pub async fn run(
     }
 
     result.map(|_| ())
+}
+
+#[cfg(test)]
+mod panic_restore_tests {
+    use super::{kitty_keyboard_flags, panic_restore_sequence};
+    use crossterm::event::KeyboardEnhancementFlags;
+
+    #[test]
+    fn kitty_keyboard_flags_do_not_request_release_events() {
+        assert_eq!(
+            kitty_keyboard_flags(),
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        );
+    }
+
+    /// The panic hook is the ONLY terminal-cleanup that runs under
+    /// `panic = "abort"` — no Drop (TerminalGuard, RetainedRenderer)
+    /// unwinds. So the bytes it emits must single-handedly undo every
+    /// terminal mutation the TUI armed, or the parent shell is left
+    /// echoing CSI-u keypresses as literal `[27u` / `[99;5u` gibberish
+    /// (the reported crash). This pins the exact restore contract.
+    #[test]
+    fn panic_restore_sequence_pops_kitty_keyboard_protocol() {
+        let s = panic_restore_sequence();
+        let text = String::from_utf8_lossy(s);
+        // Kitty keyboard pop — `<` introducer (pop), the fix for the
+        // literal CSI-u echo. Must be present.
+        assert!(
+            text.contains("\x1b[<1u"),
+            "must pop Kitty keyboard flags (CSI < u): {text:?}"
+        );
+        // And must NEVER push (`>` introducer) — re-arming on the way
+        // out leaves the shell in CSI-u mode (the exact bug).
+        assert!(
+            !text.contains("\x1b[>"),
+            "must not re-arm Kitty protocol on exit: {text:?}"
+        );
+    }
+
+    #[test]
+    fn panic_restore_sequence_restores_cursor_autowrap_scroll_and_mouse() {
+        let text = String::from_utf8_lossy(panic_restore_sequence());
+        assert!(text.contains("\x1b[?25h"), "must show cursor (DECTCEM): {text:?}");
+        assert!(text.contains("\x1b[?7h"), "must re-enable autowrap (DECAWM): {text:?}");
+        assert!(text.contains("\x1b[r"), "must release DECSTBM scroll region: {text:?}");
+        assert!(text.contains("\x1b[?1002l"), "must disable button-event mouse: {text:?}");
+        assert!(text.contains("\x1b[?1006l"), "must disable SGR mouse coords: {text:?}");
+    }
 }

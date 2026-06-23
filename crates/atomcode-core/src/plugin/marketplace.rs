@@ -1,13 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use super::manifest::{load_marketplace_manifest, MarketplaceManifest, PluginSource};
 use super::paths;
 use super::state::{load_marketplaces_file, save_marketplaces_file, MarketplaceEntry};
 use super::url::{infer_marketplace_name_from_url, validate_git_url};
 
-/// Sanitize a name into a path-safe segment (CC convention).
 /// Locate the `git` executable on the system.
 ///
 /// Tries the default PATH resolution first, then falls back to a set of
@@ -96,6 +95,7 @@ fn which_git(name: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(name))
 }
 
+/// Sanitize a name into a path-safe segment (CC convention).
 pub fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
@@ -230,17 +230,196 @@ pub(super) fn resolve_marketplace_identity(
     }
 }
 
+/// Build a `git` Command hardened for headless / TUI use: never prompt on the
+/// controlling terminal.
+///
+/// AtomCode runs marketplace `git clone`/`pull` from inside the TUI, which
+/// holds the terminal in raw mode. For a private HTTPS remote, git would
+/// otherwise open `/dev/tty` directly and block on `Username for 'https://…':`
+/// — the same tty the TUI is reading, so keystrokes never reach git and the
+/// whole UI deadlocks (even Ctrl-C barely works). `GIT_TERMINAL_PROMPT=0` makes
+/// git fail fast with a clear error instead; the GCM / SSH-BatchMode guards do
+/// the same for those transports, and stdin is closed as defense in depth.
+/// A real credential helper or stored PAT still authenticates non-interactively
+/// — only the blocking interactive fallback is disabled.
+pub(super) fn git_command(git: &Path) -> Command {
+    let mut cmd = Command::new(git);
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// Build the `Authorization: Basic` header value from credentials. Pure
+/// (creds passed in) so it's unit-testable without touching auth.toml.
+fn basic_auth_header(username: &str, token: &str) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD
+        .encode(format!("{}:{}", username, token));
+    format!("Authorization: Basic {}", b64)
+}
+
+/// `-c` value scoping the auth header to this repo's host only, so git won't
+/// send it on a cross-host redirect. git matches `http.<base-url>.*` by URL
+/// prefix; we scope to `scheme://host` (no path). Falls back to the full URL
+/// if it can't be parsed (caller only reaches here for trusted hosts).
+fn extra_header_config(url: &str, header: &str) -> String {
+    let base = super::url::scheme_host_prefix(url).unwrap_or_else(|| url.to_string());
+    format!("http.{}.extraHeader={}", base, header)
+}
+
+/// Fetch (username, fresh access token) from the stored login, refreshing the
+/// token if expired. None when not logged in or refresh fails.
+fn live_credentials() -> Option<(String, String)> {
+    let auth = crate::auth::get_stored_auth()?;
+    let token = crate::auth::get_valid_token().ok()?;
+    if token.is_empty() {
+        return None;
+    }
+    Some((auth.user.username, token))
+}
+
+/// If `url` is a trusted-host repo and we're logged in, return the
+/// `["-c", "http.<host>.extraHeader=Authorization: Basic ..."]` args to inject
+/// on an authenticated clone/pull retry. Centralizes host-gate + cred fetch +
+/// per-URL scoping. None → caller must NOT inject the token.
+pub(super) fn auth_retry_args(url: &str) -> Option<[String; 2]> {
+    if !super::url::host_is_trusted(url) {
+        return None;
+    }
+    let (username, token) = live_credentials()?;
+    let header = basic_auth_header(&username, &token);
+    Some(["-c".to_string(), extra_header_config(url, &header)])
+}
+
+/// Run `git clone …` built by `add_args`, anonymously first. If it fails with
+/// an auth error on a trusted-host repo while logged in, wipe the partial
+/// `target` and retry once with the per-URL auth header injected. `add_args`
+/// must append the full `clone … <url> <target>` arguments and is called fresh
+/// per attempt. `target` is passed so the failed-attempt dir can be removed
+/// before the authenticated retry (git refuses to clone into a non-empty dir).
+/// User-facing error when an auth failure could NOT be resolved automatically
+/// (no credential was injected). Tailors the hint to the cause so a logged-in
+/// user with a dead token isn't told "just log in" as if they hadn't:
+/// - untrusted host → SSH / configure git creds (the platform token is never
+///   sent to non-allowlisted hosts, so /login wouldn't help);
+/// - trusted host + a stored login present (token expired AND refresh failed) →
+///   re-login;
+/// - trusted host + not logged in → /login (auto-creds) or SSH.
+/// `verb` is 克隆 / 更新. Shared by clone + pull so the wording can't drift.
+fn auth_required_message(verb: &str, url: &str, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if !super::url::host_is_trusted(url) {
+        return format!(
+            "{verb}失败：该仓库需要认证（私有仓库）。请改用 SSH 地址（git@…）\
+             或先用 git 配置好凭证后重试。\n原始错误：{stderr}"
+        );
+    }
+    if crate::auth::get_stored_auth().is_some() {
+        format!(
+            "{verb}失败：登录已过期或凭证无效，请运行 /login 重新登录后重试。\n原始错误：{stderr}"
+        )
+    } else {
+        format!(
+            "{verb}失败：该私有仓库需要认证。请先 /login 登录\
+             （gitcode.com / atomgit.com 登录后可自动使用凭证），或改用 SSH 地址（git@…）。\
+             \n原始错误：{stderr}"
+        )
+    }
+}
+
+pub(super) fn clone_with_optional_auth(
+    git: &Path,
+    url: &str,
+    target: &Path,
+    add_args: impl Fn(&mut Command),
+) -> Result<()> {
+    let run = |extra: Option<&[String]>| -> Result<std::process::Output> {
+        let mut cmd = git_command(git);
+        if let Some(e) = extra {
+            cmd.args(e);
+        }
+        add_args(&mut cmd);
+        cmd.output().context("spawn git clone")
+    };
+
+    let out = run(None)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    if is_git_auth_failure(&stderr) {
+        if let Some(cargs) = auth_retry_args(url) {
+            if target.exists() {
+                std::fs::remove_dir_all(target).ok();
+            }
+            let out2 = run(Some(&cargs))?;
+            if out2.status.success() {
+                return Ok(());
+            }
+            bail!(
+                "克隆失败：使用已登录凭证仍无法访问该私有仓库（可能无权限或登录已过期，\
+                 可 /login 重新登录后重试）。\n原始错误：{}",
+                String::from_utf8_lossy(&out2.stderr).trim()
+            );
+        }
+        bail!("{}", auth_required_message("克隆", url, &stderr));
+    }
+    bail!("git clone failed: {}", stderr);
+}
+
+/// `git pull --ff-only` in `repo`, anonymously first; on auth failure for a
+/// trusted-host `source_url` while logged in, retry once with the injected
+/// header. Symmetric with `clone_with_optional_auth` for the update path.
+pub(super) fn git_pull_ff(repo: &Path, source_url: &str) -> Result<()> {
+    let git = find_git()?;
+    let run = |extra: Option<&[String]>| -> Result<std::process::Output> {
+        let mut cmd = git_command(&git);
+        if let Some(e) = extra {
+            cmd.args(e);
+        }
+        cmd.args(["pull", "--ff-only"]).current_dir(repo);
+        cmd.output().context("spawn git pull")
+    };
+
+    let out = run(None)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if is_git_auth_failure(&stderr) {
+        if let Some(cargs) = auth_retry_args(source_url) {
+            let out2 = run(Some(&cargs))?;
+            if out2.status.success() {
+                return Ok(());
+            }
+            bail!(
+                "更新失败：使用已登录凭证仍无法访问（无权限或登录已过期，可 /login 重新登录）。\
+                 \n原始错误：{}",
+                String::from_utf8_lossy(&out2.stderr).trim()
+            );
+        }
+        bail!("{}", auth_required_message("更新", source_url, &stderr));
+    }
+    bail!("git pull failed: {}", stderr);
+}
+
+/// True when `git`'s stderr indicates it failed because it needed interactive
+/// credentials we deliberately suppressed (private repo, no helper/PAT).
+fn is_git_auth_failure(stderr: &str) -> bool {
+    stderr.contains("terminal prompts disabled")
+        || stderr.contains("could not read Username")
+        || stderr.contains("could not read Password")
+        || stderr.contains("Authentication failed")
+}
+
 pub(super) fn git_clone(url: &str, target: &Path) -> Result<()> {
     let git = find_git()?;
-    let out = Command::new(&git)
-        .args(["clone", "--depth", "1", url])
-        .arg(target)
-        .output()
-        .context("spawn git")?;
-    if !out.status.success() {
-        bail!("git clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
-    Ok(())
+    clone_with_optional_auth(&git, url, target, |cmd| {
+        cmd.args(["clone", "--depth", "1", url]).arg(target);
+    })
 }
 
 fn git_rev_parse(repo: &Path) -> Result<String> {
@@ -306,15 +485,7 @@ pub fn update_marketplace(name: &str) -> Result<MarketplaceInfo> {
         git_clone(&entry.source, &target)
             .with_context(|| format!("re-clone marketplace `{}`", name))?;
     } else {
-        let git = find_git()?;
-        let out = Command::new(&git)
-            .args(["pull", "--ff-only"])
-            .current_dir(&target)
-            .output()
-            .context("spawn git pull")?;
-        if !out.status.success() {
-            bail!("git pull failed: {}", String::from_utf8_lossy(&out.stderr));
-        }
+        git_pull_ff(&target, &entry.source)?;
     }
     let commit = git_rev_parse(&target)?;
     let manifest = load_marketplace_manifest(&target)?;
@@ -374,6 +545,151 @@ mod tests {
         Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
         Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
         repo
+    }
+
+    #[test]
+    fn git_command_runs_noninteractively() {
+        // The whole point of git_command: git must never open the tty for a
+        // credential prompt — that deadlocks the raw-mode TUI (the private-repo
+        // `/plugin marketplace add` freeze). Verify the guard env is present on
+        // every git invocation we build.
+        let cmd = git_command(Path::new("git"));
+        let prompt = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("GIT_TERMINAL_PROMPT"))
+            .map(|(_, v)| v);
+        assert_eq!(
+            prompt,
+            Some(Some(std::ffi::OsStr::new("0"))),
+            "GIT_TERMINAL_PROMPT must be 0 so a private remote fails fast \
+             instead of blocking on a tty prompt"
+        );
+    }
+
+    #[test]
+    fn git_auth_failure_is_detected() {
+        // The non-interactive error git emits when it needs credentials.
+        assert!(is_git_auth_failure(
+            "fatal: could not read Username for 'https://gitcode.com': terminal prompts disabled"
+        ));
+        assert!(is_git_auth_failure(
+            "remote: HTTP Basic: Access denied\nfatal: Authentication failed for 'https://x/y'"
+        ));
+        // Plain not-found / network errors are NOT auth failures — they must
+        // keep their original message, not the credentials hint.
+        assert!(!is_git_auth_failure("fatal: repository 'https://x/y' not found"));
+        assert!(!is_git_auth_failure(
+            "fatal: unable to access 'https://x/y': Could not resolve host"
+        ));
+    }
+
+    #[test]
+    fn basic_auth_header_encodes_user_colon_token() {
+        // base64("alice:tok123") = "YWxpY2U6dG9rMTIz"
+        assert_eq!(
+            basic_auth_header("alice", "tok123"),
+            "Authorization: Basic YWxpY2U6dG9rMTIz"
+        );
+    }
+
+    #[test]
+    fn extra_header_config_is_scoped_to_host() {
+        let cfg = extra_header_config(
+            "https://gitcode.com/owner/repo.git",
+            "Authorization: Basic XYZ",
+        );
+        assert_eq!(
+            cfg,
+            "http.https://gitcode.com.extraHeader=Authorization: Basic XYZ"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_retry_args_none_when_untrusted_host() {
+        // github.com 非白名单 → 永不注入 token，即使已登录
+        assert!(auth_retry_args("https://github.com/owner/repo").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_retry_args_none_when_not_logged_in() {
+        let _home = isolated_home(); // 无 auth.toml
+        assert!(auth_retry_args("https://gitcode.com/owner/repo").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_required_message_untrusted_host_suggests_ssh_not_login() {
+        // Platform token is never sent to non-allowlisted hosts, so /login
+        // wouldn't help — guide to SSH/creds instead.
+        let m = auth_required_message("克隆", "https://github.com/o/r", "fatal: auth");
+        assert!(m.contains("SSH"), "got: {m}");
+        assert!(!m.contains("/login"), "must not suggest /login for untrusted host: {m}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_required_message_trusted_not_logged_in_suggests_login() {
+        let _home = isolated_home(); // no auth.toml under the temp ATOMCODE_HOME
+        let m = auth_required_message("克隆", "https://gitcode.com/o/r", "fatal: auth");
+        assert!(m.contains("/login"), "trusted host + not logged in should guide to /login: {m}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_required_message_trusted_logged_in_says_session_expired() {
+        // Logged in (auth.toml present) but no usable token (expired + refresh
+        // failed) → must say the session expired, not "just log in" as if the
+        // user never had. ATOMCODE_HOME is isolated, so this writes to a
+        // tempdir, never the real ~/.atomcode/auth.toml.
+        let _home = isolated_home();
+        let dir = crate::config::Config::config_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.toml"),
+            "access_token = \"x\"\ntoken_type = \"Bearer\"\n[user]\nid = \"1\"\nusername = \"alice\"\n",
+        )
+        .unwrap();
+        let m = auth_required_message("更新", "https://atomgit.com/o/r", "fatal: auth");
+        assert!(
+            m.contains("登录已过期") || m.contains("重新登录"),
+            "logged-in-but-dead-token should indicate re-login: {m}"
+        );
+    }
+
+    #[test]
+    fn injected_auth_header_is_not_persisted_to_git_config() {
+        // Security invariant lock: we inject the credential via a TOP-LEVEL
+        // `git -c <cfg> clone …` (one-shot, NOT written to the new repo), never
+        // the clone-option form `git clone -c <cfg> …` (which git PERSISTS into
+        // the cloned `.git/config` — a plaintext-token-on-disk leak). Verified
+        // empirically 2026-06-17 that the two forms differ; this test fails if
+        // the arg order ever regresses to the persisting form.
+        let Ok(git) = find_git() else {
+            return; // no git on this machine — skip
+        };
+        let src = make_bare_repo_with_manifest("persist-src", None);
+        let dst = tempfile::tempdir().unwrap();
+        let clone_dir = dst.path().join("clone");
+        let header = basic_auth_header("alice", "tok-SECRET-123");
+        let cfg = extra_header_config("https://gitcode.com/o/r", &header);
+        // EXACT arg order produced by clone_with_optional_auth's run(Some(..)):
+        // git_command base, then `-c <cfg>`, then the `clone …` args.
+        let status = git_command(&git)
+            .args(["-c", &cfg, "clone", "--depth", "1"])
+            .arg(&src)
+            .arg(&clone_dir)
+            .status()
+            .expect("spawn git clone");
+        assert!(status.success(), "local clone should succeed");
+        let config = std::fs::read_to_string(clone_dir.join(".git/config")).unwrap();
+        let lc = config.to_lowercase();
+        assert!(
+            !lc.contains("extraheader") && !config.contains("tok-SECRET-123"),
+            "auth header / token must NOT be persisted to .git/config; got:\n{}",
+            config
+        );
     }
 
     #[test]

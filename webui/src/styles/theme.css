@@ -1,48 +1,55 @@
-/* Browser theme — concrete --app-* values (VSCode design system ported).
+/* Browser theme — concrete --app-* values (claude.ai-inspired palette).
    Dark is the base. Light applies either explicitly (html[data-theme="light"])
    or via prefers-color-scheme when the theme is "system"/unset. An explicit
-   data-theme="dark" keeps dark even on a light OS. */
+   data-theme="dark" keeps dark even on a light OS.
+
+   Accent is Claude "clay/book-cloth" orange (#d97757). Both themes use warm
+   neutrals (claude.ai's warm-ivory light + warm-charcoal dark); radii are
+   softened; fonts add a sans body + a serif display stack (greeting). */
 :root {
-  --app-brand:#7c3aed; --app-brand-button:#6d28d9; --app-brand-ivory:#faf9f5; --app-brand-slate:#141413;
-  --app-primary-foreground:#cccccc; --app-primary-background:#1f1f1f; --app-brand-text:#ffffff;
-  --app-secondary-foreground:#9d9d9d; --app-secondary-background:#1e1e1e;
-  --app-input-foreground:#cccccc; --app-input-background:#2d2d2d; --app-input-border:#3c3c3c;
-  --app-input-active-border:#7c3aed; --app-input-placeholder-foreground:#8a8a8a; --app-input-secondary-background:#252526;
-  --app-button-foreground:#ffffff; --app-button-background:#6d28d9; --app-button-hover-background:#7c3aed; --app-ghost-button-hover-background:#ffffff14;
-  --app-tool-background:#1e1e1e; --app-header-background:#1f1f1f; --app-primary-border-color:#2b2b2b; --app-accent-color:#7c3aed;
-  --app-list-hover-background:#2a2d2e; --app-list-active-background:#37373d; --app-list-active-foreground:#ffffff;
-  --app-menu-background:#252526; --app-menu-border:#454545; --app-menu-foreground:#cccccc; --app-menu-selection-background:#04395e;
+  --app-brand:#d97757; --app-brand-button:#c2613f; --app-brand-ivory:#faf9f5; --app-brand-slate:#141413;
+  --app-primary-foreground:#e8e6df; --app-primary-background:#262624; --app-brand-text:#f5f4ee;
+  --app-secondary-foreground:#b0ada4; --app-secondary-background:#1f1e1d;
+  --app-input-foreground:#e8e6df; --app-input-background:#30302e; --app-input-border:#413f3b;
+  --app-input-active-border:#d97757; --app-input-placeholder-foreground:#8f8c83; --app-input-secondary-background:#2a2927;
+  --app-button-foreground:#ffffff; --app-button-background:#c2613f; --app-button-hover-background:#d97757; --app-ghost-button-hover-background:#ffffff14;
+  --app-tool-background:#1f1e1d; --app-header-background:#262624; --app-primary-border-color:#393633; --app-accent-color:#d97757;
+  --app-list-hover-background:#302f2c; --app-list-active-background:#3b3935; --app-list-active-foreground:#ffffff;
+  --app-menu-background:#30302e; --app-menu-border:#454340; --app-menu-foreground:#e8e6df; --app-menu-selection-background:#3a2f28;
   --app-success-foreground:#74c991; --app-error-foreground:#f14c4c; --app-warning-accent:#e5a54b;
   --app-timeline-end-dot:var(--app-warning-accent); --app-spinner-foreground:var(--app-brand); --app-disabled-foreground:#777777;
   --app-link-color:#4daafc; --app-modal-background:#000000bf; --app-transparent-inner-border:#ffffff1a;
   --app-diff-deletion-foreground:#f14c4c; --app-diff-addition-foreground:#74c991;
   --app-spacing-small:4px; --app-spacing-medium:8px; --app-spacing-large:12px; --app-spacing-xlarge:16px;
-  --corner-radius-small:4px; --corner-radius-medium:6px; --corner-radius-large:8px;
+  --corner-radius-small:6px; --corner-radius-medium:10px; --corner-radius-large:14px;
+  --app-sans-font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+  --app-serif-font-family:'Tiempos Text','Source Serif 4','Songti SC',ui-serif,Georgia,Cambria,'Times New Roman',serif;
   --app-monospace-font-family:ui-monospace,'SFMono-Regular','Menlo','Monaco','Courier New',monospace;
   --app-monospace-font-size:12px; --app-monospace-font-size-small:11px;
 }
-/* Light palette, shared by the explicit-light and system-light selectors. */
+/* Light palette — claude.ai warm ivory paper. Shared by the explicit-light
+   and system-light selectors. Accent (clay) is inherited from :root. */
 :root[data-theme='light'] {
-  --app-primary-foreground:#1f2328; --app-primary-background:#ffffff; --app-brand-text:#000000;
-  --app-secondary-foreground:#57606a; --app-secondary-background:#f6f8fa;
-  --app-input-foreground:#1f2328; --app-input-background:#ffffff; --app-input-border:#e8eaee;
-  --app-input-placeholder-foreground:#8c959f; --app-input-secondary-background:#f6f8fa;
-  --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f6f8fa; --app-header-background:#ffffff;
-  --app-primary-border-color:#e8eaee; --app-list-hover-background:#eef1f4; --app-list-active-background:#dce3ea;
-  --app-menu-background:#ffffff; --app-menu-border:#e8eaee; --app-menu-foreground:#1f2328; --app-menu-selection-background:#ddf4ff;
+  --app-primary-foreground:#1f1e1d; --app-primary-background:#faf9f5; --app-brand-text:#29261f;
+  --app-secondary-foreground:#6b6a63; --app-secondary-background:#f0eee6;
+  --app-input-foreground:#1f1e1d; --app-input-background:#ffffff; --app-input-border:#e6e2d6;
+  --app-input-placeholder-foreground:#9b988e; --app-input-secondary-background:#f0eee6;
+  --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f0eee6; --app-header-background:#faf9f5;
+  --app-primary-border-color:#eae6db; --app-list-hover-background:#efece3; --app-list-active-background:#e6e1d4;
+  --app-menu-background:#ffffff; --app-menu-border:#e6e2d6; --app-menu-foreground:#1f1e1d; --app-menu-selection-background:#f3e7df;
   --app-link-color:#0969da; --app-transparent-inner-border:#00000012;
   --app-spinner-foreground:var(--app-brand-button);
   --app-diff-deletion-foreground:#cf222e;
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme='dark']):not([data-theme='light']) {
-    --app-primary-foreground:#1f2328; --app-primary-background:#ffffff; --app-brand-text:#000000;
-    --app-secondary-foreground:#57606a; --app-secondary-background:#f6f8fa;
-    --app-input-foreground:#1f2328; --app-input-background:#ffffff; --app-input-border:#e8eaee;
-    --app-input-placeholder-foreground:#8c959f; --app-input-secondary-background:#f6f8fa;
-    --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f6f8fa; --app-header-background:#ffffff;
-    --app-primary-border-color:#e8eaee; --app-list-hover-background:#eef1f4; --app-list-active-background:#dce3ea;
-    --app-menu-background:#ffffff; --app-menu-border:#e8eaee; --app-menu-foreground:#1f2328; --app-menu-selection-background:#ddf4ff;
+    --app-primary-foreground:#1f1e1d; --app-primary-background:#faf9f5; --app-brand-text:#29261f;
+    --app-secondary-foreground:#6b6a63; --app-secondary-background:#f0eee6;
+    --app-input-foreground:#1f1e1d; --app-input-background:#ffffff; --app-input-border:#e6e2d6;
+    --app-input-placeholder-foreground:#9b988e; --app-input-secondary-background:#f0eee6;
+    --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f0eee6; --app-header-background:#faf9f5;
+    --app-primary-border-color:#eae6db; --app-list-hover-background:#efece3; --app-list-active-background:#e6e1d4;
+    --app-menu-background:#ffffff; --app-menu-border:#e6e2d6; --app-menu-foreground:#1f1e1d; --app-menu-selection-background:#f3e7df;
     --app-link-color:#0969da; --app-transparent-inner-border:#00000012;
     --app-spinner-foreground:var(--app-brand-button);
     --app-diff-deletion-foreground:#cf222e;

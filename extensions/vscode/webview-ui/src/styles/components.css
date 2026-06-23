@@ -54,6 +54,11 @@
   flex-shrink: 1;
 }
 
+.input-footer .effort-selector {
+  max-width: min(120px, 32%);
+  flex-shrink: 0;
+}
+
 .input-footer .model-selector-trigger {
   height: 22px;
   color: var(--app-secondary-foreground);
@@ -67,6 +72,11 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.effort-prefix {
+  flex-shrink: 0;
+  opacity: 0.7;
 }
 
 .model-selector-trigger:hover { background: var(--app-ghost-button-hover-background); }
@@ -101,6 +111,10 @@
   right: 0;
   transform: none;
   max-width: min(360px, calc(100vw - 32px));
+}
+
+.effort-dropdown {
+  min-width: 130px;
 }
 
 .model-item {

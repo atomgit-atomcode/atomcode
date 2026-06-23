@@ -864,7 +864,7 @@ pub(crate) async fn run_shell(
                                 crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stdout_buf.extend_from_slice(&buf[..n]);
                             has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
-                            chunk_cb(&chunk);
+                            chunk_cb(&sanitize_terminal_output(&chunk));
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
@@ -885,7 +885,7 @@ pub(crate) async fn run_shell(
                                 crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stderr_buf.extend_from_slice(&buf[..n]);
                             has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
-                            chunk_cb(&format!("[stderr] {}", chunk));
+                            chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
@@ -3051,6 +3051,75 @@ mod sanitize_tests {
 
         assert!(approval.is_none());
     }
+
+    // Regression (#220): `find` and `ls` on external paths must require confirmation.
+    // Before the fix, Enumeration actions on non-sensitive external paths were
+    // AutoApprove, so `find /mnt/d/... -name "*.cj`` ran without any prompt.
+    #[test]
+    fn bash_path_guard_find_outside_workspace_requires_confirmation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("src")).unwrap();
+
+        let approval = approval_for_command_paths(
+            &format!("find {} -name '*.cj'", outside.path().display()),
+            workspace.path(),
+        );
+
+        assert!(
+            matches!(approval, Some(ApprovalRequirement::RequireApproval(_))),
+            "find on external path should require confirmation (#220)"
+        );
+    }
+
+    #[test]
+    fn bash_path_guard_ls_outside_workspace_requires_confirmation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let approval = approval_for_command_paths(
+            &format!("ls {}", outside.path().display()),
+            workspace.path(),
+        );
+
+        assert!(
+            matches!(approval, Some(ApprovalRequirement::RequireApproval(_))),
+            "ls on external path should require confirmation (#220)"
+        );
+    }
+
+    #[test]
+    fn bash_path_guard_find_inside_workspace_is_auto() {
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let approval = approval_for_command_paths(
+            &format!("find {} -name '*.rs'", workspace.path().display()),
+            workspace.path(),
+        );
+
+        assert!(
+            approval.is_none(),
+            "find within workspace should remain auto-approved"
+        );
+    }
+
+    #[test]
+    fn bash_path_guard_ls_inside_workspace_is_auto() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let approval = approval_for_command_paths(
+            &format!("ls {}", workspace.path().display()),
+            workspace.path(),
+        );
+
+        assert!(
+            approval.is_none(),
+            "ls within workspace should remain auto-approved"
+        );
+    }
+
 
     // Regression: a single `[A]` (Always Allow for bash) on a safe command
     // (cargo build, ls, git status) must NOT silently disarm the destructive

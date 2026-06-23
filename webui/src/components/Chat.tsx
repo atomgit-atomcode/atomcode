@@ -3,7 +3,7 @@
 
 import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -11,23 +11,7 @@ import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
-
-interface ToolRow {
-  id: string;
-  name: string;
-  args: string;
-  status: 'pending' | 'done' | 'error' | 'waiting_approval';
-  duration_ms?: number;
-  output?: string;
-}
-
-/** One ordered conversation segment: a run of assistant text, or one tool
- *  call. Storing parts in arrival order preserves the chronological
- *  text→tool→text→tool interleaving the LLM produced (matching the TUI),
- *  instead of collapsing every tool to the head of the message. */
-type MsgPart =
-  | { kind: 'text'; text: string }
-  | { kind: 'tool'; tool: ToolRow };
+import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -117,6 +101,8 @@ interface ChatProps {
   activeSession?: SessionMetaWithProject | null;
   /** 刷新后正按 URL 短 id 还原会话；为 true 时抑制新建落地页，避免闪屏。 */
   restoring?: boolean;
+  /** /live turn 完成后通知 App 刷新侧栏列表（session 已落盘，列表需更新）。 */
+  onLiveTurnDone?: () => void;
 }
 
 function formatArgs(args: unknown): string {
@@ -139,6 +125,138 @@ function abbreviateArgs(args: string, maxLen = 1000): string {
   return args.slice(0, maxLen) + '…';
 }
 
+// Mirror of the TUI's `display_tool_name` (event_loop/mod.rs): MCP wire names
+// `mcp__server__tool` render as `mcp · server · tool`; everything else is
+// snake_case → PascalCase (`read_file` → `ReadFile`). Keeps the webui's tool
+// headers identical to the terminal instead of showing raw `mcp__…` names.
+function displayToolName(name: string): string {
+  if (name.startsWith('mcp__')) {
+    const rest = name.slice('mcp__'.length);
+    const i = rest.indexOf('__');
+    if (i >= 0) return `mcp · ${rest.slice(0, i)} · ${rest.slice(i + 2)}`;
+  }
+  return name
+    .split('_')
+    .filter((w) => w.length > 0)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join('');
+}
+
+// Mirror of the TUI's `format_tool_detail`: a compact human-readable summary
+// of a call's arguments (e.g. MCP calls as `key: "value", …` instead of raw
+// JSON). `argsJson` is the stored arguments string; the full raw args stay
+// available by expanding the row. Returns '' when there's nothing useful to
+// show (the header then shows just the name, like the TUI).
+function formatToolDetail(name: string, argsJson: string): string {
+  let v: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(argsJson);
+    if (parsed === null || typeof parsed !== 'object') return '';
+    v = parsed as Record<string, unknown>;
+  } catch {
+    return argsJson; // not JSON — show as-is rather than nothing
+  }
+  const getStr = (k: string): string => (typeof v[k] === 'string' ? (v[k] as string) : '');
+  const basename = (p: string) => p.split('/').pop() || p;
+
+  switch (name) {
+    case 'read_file':
+    case 'edit_file':
+    case 'write_file':
+    case 'create_file':
+    case 'list_symbols':
+      return getStr('file_path') ? basename(getStr('file_path')) : '';
+    case 'read_symbol': {
+      const sym = getStr('symbol');
+      const file = getStr('file_path') ? basename(getStr('file_path')) : '';
+      if (!sym) return file;
+      if (!file) return sym;
+      return `${sym} in ${file}`;
+    }
+    case 'glob':
+    case 'grep':
+      return getStr('pattern');
+    case 'bash':
+      return getStr('command');
+    case 'list_directory':
+    case 'change_dir':
+      return getStr('path') || '.';
+    case 'web_fetch':
+      return getStr('url');
+    case 'web_search':
+      return getStr('query');
+    case 'find_references':
+    case 'trace_callees':
+    case 'trace_callers':
+    case 'trace_chain':
+      return getStr('symbol');
+    case 'blast_radius':
+    case 'file_dependencies':
+      return getStr('file') ? basename(getStr('file')) : '';
+    case 'search_replace': {
+      const s = getStr('search');
+      const r = getStr('replace');
+      if (s && r) {
+        const parts = [`${s} → ${r}`];
+        const glob = getStr('glob');
+        const path = getStr('path');
+        if (glob) parts.push(`glob: ${glob}`);
+        if (path && path !== '.') parts.push(`path: ${basename(path)}`);
+        return parts.join(', ');
+      }
+      return r || s || '';
+    }
+    case 'parallel_edit_files': {
+      const files = Array.isArray(v.files) ? (v.files as unknown[]) : null;
+      if (!files) return '';
+      return files
+        .map((e) => {
+          const p = (e as Record<string, unknown>)?.path;
+          return typeof p === 'string' ? basename(p) : null;
+        })
+        .filter((x): x is string => x !== null)
+        .join(', ');
+    }
+    case 'todo': {
+      const action = getStr('action');
+      if (action === 'add') return getStr('content');
+      if (action === 'update') {
+        const id = typeof v.id === 'number' ? v.id : '';
+        const status = getStr('status');
+        if (id && status) return `#${id} → ${status}`;
+        if (id) return `#${id}`;
+        return status;
+      }
+      if (action === 'list') return 'list all';
+      return '';
+    }
+    case 'use_skill':
+      return getStr('name');
+    default: {
+      // MCP tools (`mcp__server__tool`): render args as `key: "value"` pairs.
+      if (name.startsWith('mcp__')) {
+        const pairs: string[] = [];
+        for (const [k, val] of Object.entries(v)) {
+          let s: string;
+          if (typeof val === 'string') s = val;
+          else if (typeof val === 'number' || typeof val === 'boolean') s = String(val);
+          else if (val && typeof val === 'object') s = JSON.stringify(val);
+          else continue;
+          if (!s) continue;
+          pairs.push(`${k}: "${s.replace(/"/g, '\\"')}"`);
+        }
+        if (pairs.length) return pairs.join(', ');
+      }
+      // Fallback: first present common single-key arg.
+      for (const key of ['file_path', 'path', 'file', 'pattern', 'query', 'url', 'name', 'symbol', 'command']) {
+        const s = getStr(key);
+        if (s) return s;
+      }
+      return '';
+    }
+  }
+}
+
 // 识别「技能/文档型」用户消息：首个非空字符是 markdown 标题、且内容较长。
 // TUI 调用 /skill 时会把整段 SKILL.md 模板塞进用户消息，webui 历史里会把它
 // 渲染成一大坨原文；命中则返回标题文本用作折叠徽章标签，否则返回 null（普通气泡）。
@@ -151,7 +269,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -184,6 +302,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -341,10 +460,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // ── 共享的实时流启/停逻辑 ──
   function startLiveStream() {
+    // Abort any prior stream FIRST. /live is a broadcast channel, so a leaked
+    // subscription would re-deliver every turn event (duplicate tool rows, double
+    // token counts). startLiveStream is reachable from mount, toggleSync, and
+    // session_switched — without this, those overlap into N concurrent streams.
+    liveAbortRef.current?.abort();
     const controller = new AbortController();
     liveAbortRef.current = controller;
     streamLive(onLiveEvent, controller.signal, activeIdRef.current).catch(() => {
-      // Stream ended or errored; turn sync back off
+      // Stream ended or errored; turn sync back off — but NOT when the
+      // stream was deliberately aborted (session switch / manual toggle),
+      // because a new stream is already being (re)started and setting
+      // sync=false here would cause the next user message to go through
+      // /chat instead of /live/message, breaking TUI sync output.
+      if (controller.signal.aborted) return;
       setSync(false);
     });
   }
@@ -420,6 +549,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'error': return { type: 'error', message: e.message };
+      case 'warning': return { type: 'warning', message: e.message };
       default: return null;
     }
   }
@@ -449,6 +579,26 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setProvider(e.provider);
       return;
     }
+    // 会话切换：另一端（webui 新建对话 / TUI /session）创建了新会话，
+    // 本端跟随切换——更新 session id 并重置画布。
+    // 不设置 loadedForRef：让 Chat useEffect 在 activeSession 到位后
+    // 正常走 getSession 加载（空）历史并清除 historyHint；
+    // 否则 loadedForRef 会阻止加载，导致 historyHint 永远不被清除。
+    // 重启 SSE 连接：旧连接订阅的是旧 LiveSession，后续 turn 事件不会到达；
+    // 重新连接后 /live handler 会绑定到新 LiveSession。
+    if (e.type === 'session_switched') {
+      liveSessionIdRef.current = e.session_id;
+      activeIdRef.current = e.session_id;
+      onSessionId(e.session_id);
+      setMessages([]);
+      setTokens(null);
+      setHistoryHint(null);
+      if (sync) {
+        stopLiveStream();
+        startLiveStream();
+      }
+      return;
+    }
 
     // 门控：仅当"当前查看的会话"就是实时会话时，才把实时输出渲染进画布。否则用户
     // 从侧栏打开了另一个历史会话，实时事件不应串进该页面（串进去刷新还会消失）。
@@ -474,7 +624,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setBusy(e.running);
         // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
         // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
-        if (!e.running) setLivePending(null);
+        if (!e.running) {
+          setLivePending(null);
+          // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
+          onLiveTurnDone?.();
+        }
         break;
       }
       case 'permission_request': {
@@ -529,6 +683,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     });
   }
 
+  // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
+  // never styled as an error). Mirrors appendToLastAssistant's last-assistant guard.
+  function pushNoticeToLastAssistant(text: string) {
+    setMessages((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      if (last.role !== 'assistant') return prev;
+      const parts: MsgPart[] = [...last.parts, { kind: 'notice', text }];
+      return [...prev.slice(0, -1), { ...last, parts }];
+    });
+  }
+
   function updateToolInLastAssistant(
     id: string,
     update: Partial<ToolRow>,
@@ -575,10 +741,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (prev.length === 0) return prev;
       const last = prev[prev.length - 1];
       if (last.role !== 'assistant') return prev;
-      return [
-        ...prev.slice(0, -1),
-        { ...last, parts: [...last.parts, { kind: 'tool', tool }] },
-      ];
+      // Dedup by call_id: a tool_start re-delivered (e.g. a leaked /live
+      // subscription replays the turn) must update the existing row, not append
+      // a duplicate. See lib/toolRows.upsertToolPart.
+      return [...prev.slice(0, -1), { ...last, parts: upsertToolPart(last.parts, tool) }];
     });
   }
 
@@ -652,6 +818,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         onPermissionResolved?.(null);
         break;
 
+      case 'warning':
+        // 非致命提示（如"已自动压缩上下文"）：渲染成淡色 notice 行 —— 不染红、不并进
+        // 回复文本、不结束回合（任务继续）。对齐 TUI 的黄色 "!" 提示。
+        pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }));
+        break;
+
       default:
         // Ignore tool_batch, artifact_*, etc.
         break;
@@ -665,11 +837,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       //    event will arrive back via the live stream, keeping all tabs in sync).
       setBusy(true);
       await postLiveMessage(text, images.length ? images : undefined, provider ?? undefined, activeIdRef.current);
+      // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
+      // turn 完成后 state(running=false) 会再刷一次确保更新。
+      setTimeout(() => onLiveTurnDone?.(), 200);
       return;
     }
 
     // ── Normal path ──
     setBusy(true);
+    // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
+    // done 事件中 onSessionId 会再刷一次确保更新。
+    setTimeout(() => onLiveTurnDone?.(), 200);
 
     // Push user message + empty assistant placeholder
     setMessages((prev) => [
@@ -680,11 +858,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     const controller = new AbortController();
     abortRef.current = controller;
+    const requestId = crypto.randomUUID();
+    requestIdRef.current = requestId;
 
     try {
       const body = {
         message: text,
         ...(sessionId ? { session_id: sessionId } : {}),
+        request_id: requestId,
         ...(cwd ? { working_dir: cwd } : {}),
         ...(provider ? { provider } : {}),
         ...(images.length ? { images } : {}),
@@ -705,6 +886,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       onPermissionResolved?.(null);
     } finally {
       abortRef.current = null;
+      if (requestIdRef.current === requestId) requestIdRef.current = null;
     }
   }
 
@@ -799,8 +981,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
   }
 
-  function handleStop() {
-    abortRef.current?.abort();
+  async function handleStop() {
+    try {
+      if (sync) {
+        await postLiveStop();
+      } else if (requestIdRef.current) {
+        await stopChat(requestIdRef.current);
+      }
+    } catch {
+      // If the cancellation endpoint itself is unavailable, at least restore
+      // the local UI instead of leaving the stop button stuck indefinitely.
+      abortRef.current?.abort();
+      setBusy(false);
+      setQueued([]);
+      onPermissionResolved?.(null);
+    }
   }
 
   // 从光标前的 / 替换为选中的技能名。
@@ -1159,7 +1354,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     <PermissionCard
       req={{ session_id: '', tool_name: livePending.tool_name, reason: livePending.reason, call_id: livePending.call_id, arguments: livePending.arguments }}
       onDone={() => setLivePending((cur) => resolvePendingAfterDecision(cur, livePending.call_id))}
-      onDecide={async (decision) => { await postLivePermission(decision); }}
+      onDecide={async (decision, toolName) => { await postLivePermission(decision, toolName); }}
     />
   );
 
@@ -1312,6 +1507,13 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
           ))}
         </div>,
       );
+    } else if (p.kind === 'notice') {
+      out.push(
+        <div class="msg-notice" key={`nt-${i}`}>
+          {p.text}
+        </div>,
+      );
+      i++;
     } else {
       if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} />);
       i++;
@@ -1391,8 +1593,8 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
   return (
     <div class="tool-body">
       <div class="tool-header" onClick={() => setExpanded((e) => !e)}>
-        <span class="tool-name">{tool.name}</span>
-        <span class="tool-name-secondary">{abbreviateArgs(tool.args)}</span>
+        <span class="tool-name">{displayToolName(tool.name)}</span>
+        <span class="tool-name-secondary">{abbreviateArgs(formatToolDetail(tool.name, tool.args))}</span>
         {annotation && (
           <span class={'tool-annotation ' + annotation.cls}>{annotation.label}</span>
         )}

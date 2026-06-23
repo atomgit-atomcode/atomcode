@@ -224,6 +224,10 @@ impl OpenAiProvider {
     ///   message, or the API returns 400 "The `reasoning_content` in the
     ///   thinking mode must be passed back to the API". See
     ///   <https://api-docs.deepseek.com/zh-cn/guides/thinking_mode>.
+    /// - `mimo-*` / base_url contains `xiaomimimo` → Include. MiMo (小米开源)
+    ///   v2.5 / v2.5-pro reuses DeepSeek V4 thinking-mode protocol — gateway
+    ///   returns the identical "The reasoning_content in the thinking mode
+    ///   must be passed back to the API" 400 when the field is stripped.
     /// - Other OpenAI-compatible endpoints → Exclude (safe default; normal
     ///   OpenAI models don't emit reasoning_content, so there's nothing to
     ///   strip, and non-thinking models typically ignore the field).
@@ -243,6 +247,9 @@ impl OpenAiProvider {
             || u.contains("xiaomimimo")
             || u.contains("mimo")
         {
+            return ReasoningPolicy::Include;
+        }
+        if m.starts_with("mimo-") || u.contains("xiaomimimo") {
             return ReasoningPolicy::Include;
         }
         ReasoningPolicy::Exclude
@@ -313,16 +320,20 @@ impl OpenAiProvider {
                         // turn had tool_calls ANYWHERE, ALL reasoning_content from
                         // that turn (including the final-answer text's reasoning)
                         // must be echoed in every subsequent request — 400
-                        // otherwise. Our Text variant doesn't persist per-turn
-                        // reasoning, so emit a placeholder under Include. The
-                        // no-tool-call case (image: 思维链 dropped) is a "may be
-                        // sent, will be ignored" spec, not a rejection — safe to
-                        // always emit. Kimi only validates tool_call messages, so
-                        // the extra key on Text is accepted there too.
+                        // otherwise. A plain `Text` variant can't persist per-turn
+                        // reasoning (c61bfd07 routes final answers that DID capture
+                        // reasoning through AssistantWithToolCalls instead), so by
+                        // the time we land here there is no real reasoning to echo —
+                        // emit the shared non-prose REASONING_PLACEHOLDER under
+                        // Include: present + non-empty for the 400 contract, but
+                        // nothing the thinking model can mimic back as its output
+                        // (the old fluent English sentence got reproduced verbatim
+                        // at high context, stalling the turn). Kimi only validates
+                        // tool_call messages, so the extra key on Text is fine there.
                         if matches!(m.role, Role::Assistant)
                             && matches!(reasoning_policy, ReasoningPolicy::Include)
                         {
-                            obj["reasoning_content"] = json!("(no reasoning recorded)");
+                            obj["reasoning_content"] = json!(super::REASONING_PLACEHOLDER);
                         }
                         Some(obj)
                     }
@@ -346,7 +357,7 @@ impl OpenAiProvider {
                                 let echo = reasoning_content
                                     .as_deref()
                                     .filter(|s| !s.is_empty())
-                                    .unwrap_or("(no reasoning recorded)");
+                                    .unwrap_or(super::REASONING_PLACEHOLDER);
                                 obj["reasoning_content"] = json!(echo);
                             }
                             return Some(obj);
@@ -369,7 +380,7 @@ impl OpenAiProvider {
                             let echo = reasoning_content
                                 .as_deref()
                                 .filter(|s| !s.is_empty())
-                                .unwrap_or("(no reasoning recorded)");
+                                .unwrap_or(super::REASONING_PLACEHOLDER);
                             msg["reasoning_content"] = json!(echo);
                         }
                         msg["tool_calls"] = json!(tool_calls
@@ -894,20 +905,28 @@ impl LlmProvider for OpenAiProvider {
                 // and the truncation detector see real numbers.
                 let mut pending_finish: Option<crate::stream::StreamEvent> = None;
 
+            // Idle timeout: abort only if NO bytes arrive for this long.
+            // Defaults to 300s (override via ATOMCODE_IDLE_TIMEOUT_SECS) to
+            // match the runner's first-token / stream timeout. Thinking models
+            // (DeepSeek V4 Flash etc.) can take >3min to emit the FIRST byte
+            // after a large (~200K) prompt; the old hard-coded 120s guard
+            // preempted that window and killed legitimately-slow requests
+            // mid-prefill, surfacing as "模型响应超时" + a full-context resend
+            // on retry. 300s here no longer undercuts the runner's 300s
+            // first-token allowance.
+            let idle_timeout_secs = std::env::var("ATOMCODE_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300);
+            let idle_timeout = std::time::Duration::from_secs(idle_timeout_secs);
             loop {
-                // 120s idle timeout: if no data arrives for 2 minutes, treat as dead connection.
-                let chunk = match tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
-                    byte_stream.next(),
-                )
-                .await
-                {
+                let chunk = match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break, // stream ended
                     Err(_) => {
-                        let _ = tx.send(Ok(StreamEvent::Error(
-                            "Stream timeout: no data received for 120 seconds".to_string(),
-                        )));
+                        let _ = tx.send(Ok(StreamEvent::Error(format!(
+                            "Stream timeout: no data received for {idle_timeout_secs}s"
+                        ))));
                         return;
                     }
                 };
@@ -1794,6 +1813,28 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_policy_mimo_routes_to_include() {
+        use super::{OpenAiProvider, ReasoningPolicy};
+        // MiMo gateway reuses DeepSeek V4 thinking-mode protocol: returns the
+        // identical 400 "reasoning_content in the thinking mode must be passed
+        // back" when the field is stripped from historical tool_call messages.
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy(
+                "mimo-v2.5-pro",
+                "https://token-plan-cn.xiaomimimo.com/v1"
+            ),
+            ReasoningPolicy::Include,
+        );
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy(
+                "mimo-v2.5",
+                "https://token-plan-cn.xiaomimimo.com/v1"
+            ),
+            ReasoningPolicy::Include,
+        );
+    }
+
+    #[test]
     fn reasoning_history_config_override_wins_over_heuristic() {
         // `reasoning_history = "exclude"` forces Exclude even on a model that
         // the heuristic would route to Include (deepseek-v4-pro).
@@ -1968,6 +2009,34 @@ mod tests {
     }
 
     #[test]
+    fn format_messages_no_tool_call_turn_echoes_real_reasoning_not_placeholder() {
+        // The fix for the DeepSeek V4 Flash "(no reasoning recorded)" bug: a
+        // final-answer (no tool_calls) turn that captured real reasoning is
+        // stored as AssistantWithToolCalls with an empty tool_calls list, so
+        // format_messages echoes the REAL reasoning back (satisfying the
+        // thinking-mode contract) instead of the placeholder that flash mimics.
+        use super::{OpenAiProvider, ReasoningPolicy};
+        use crate::conversation::message::{Message, MessageContent, Role};
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: Some("当前系统时间是 …".into()),
+                tool_calls: Vec::new(), // no tool calls — final answer
+                reasoning_content: Some("用户问时间，直接回答".into()),
+                thinking_blocks: Vec::new(),
+            },
+            synthetic: false,
+        }];
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
+        assert_eq!(out.len(), 1, "must not be dropped");
+        assert!(out[0].get("tool_calls").is_none(), "empty tool_calls omitted");
+        assert_eq!(
+            out[0]["reasoning_content"], "用户问时间，直接回答",
+            "must echo the REAL reasoning, not the placeholder",
+        );
+    }
+
+    #[test]
     fn placeholder_send_side_matches_shared_constant() {
         // `TurnRunner::Done` skips reasoning→text promotion when the
         // accumulated reasoning_buf equals exactly this placeholder.
@@ -1983,6 +2052,31 @@ mod tests {
         assert_eq!(
             out[0]["reasoning_content"].as_str().unwrap(),
             REASONING_PLACEHOLDER,
+        );
+    }
+
+    #[test]
+    fn reasoning_placeholder_is_non_prose_anti_mimicry() {
+        // Regression for the DeepSeek V4 Flash mimicry bug: the outbound
+        // placeholder must satisfy DeepSeek's non-empty reasoning_content
+        // contract WITHOUT being natural language a thinking model can copy
+        // back as its own output (which surfaced "(no reasoning recorded)" as
+        // the only reply and stalled the turn at high context). Pin it as a
+        // short, whitespace-free, non-English sentinel so a future edit can't
+        // silently regress to a mimicable phrase.
+        use crate::provider::REASONING_PLACEHOLDER as P;
+        assert!(!P.is_empty(), "must be non-empty for the 400 contract");
+        assert!(
+            !P.chars().any(|c| c.is_whitespace()),
+            "must not contain whitespace — a multi-word phrase is mimicable: {P:?}"
+        );
+        assert!(
+            P.chars().count() <= 4,
+            "must be a short sentinel, not prose: {P:?}"
+        );
+        assert_ne!(
+            P, "(no reasoning recorded)",
+            "the old fluent English phrase is exactly what the model mimicked"
         );
     }
 
@@ -2008,11 +2102,14 @@ mod tests {
         // DeepSeek V4 tool-call round contract (per official docs): in every
         // subsequent request, ALL reasoning_content from the tool-call turn
         // must be echoed — including the reasoning for the FINAL TEXT answer
-        // (思维链1.3 → 回答1 in the docs diagram). Our Text variant doesn't
-        // persist per-turn reasoning, so under Include we emit a placeholder.
-        // Regression for the "second prompt 400" bug.
+        // (思维链1.3 → 回答1 in the docs diagram). A plain Text variant carries
+        // no reasoning, so under Include we emit the shared non-prose
+        // REASONING_PLACEHOLDER: present + non-empty (the "second prompt 400"
+        // contract) but NOT the old fluent sentence the thinking model mimicked
+        // back as its own output. Regression for both the 400 bug AND mimicry.
         use super::{OpenAiProvider, ReasoningPolicy};
         use crate::conversation::message::{Message, MessageContent, Role};
+        use crate::provider::REASONING_PLACEHOLDER;
         let msgs = vec![Message {
             role: Role::Assistant,
             content: MessageContent::Text("当前系统时间是 …".into()),
@@ -2020,10 +2117,10 @@ mod tests {
         }];
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
-        let rc = out[0]["reasoning_content"].as_str();
-        assert!(
-            rc.map_or(false, |s| !s.is_empty()),
-            "assistant Text under Include must carry a non-empty reasoning_content, got: {}",
+        assert_eq!(
+            out[0]["reasoning_content"].as_str(),
+            Some(REASONING_PLACEHOLDER),
+            "assistant Text under Include must carry the shared placeholder, got: {}",
             out[0]
         );
 

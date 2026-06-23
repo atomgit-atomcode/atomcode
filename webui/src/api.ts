@@ -26,13 +26,19 @@ export type SSEEvent =
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string }
   | { type: 'stopped' }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  | { type: 'warning'; message: string };
 
 export interface ModelInfo {
   provider: string;
   model: string;
   provider_type: string;
   is_default: boolean;
+  /** Whether this model accepts the DeepSeek `reasoning_effort` control
+   *  (deepseek-v4 family). The effort selector is shown only when true. */
+  effort_applicable: boolean;
+  /** Current effort: 'high' | 'max' | null (model default). */
+  reasoning_effort: string | null;
 }
 
 export async function getModels(): Promise<ModelInfo[]> {
@@ -49,9 +55,19 @@ export interface ImageData {
 export interface StreamChatBody {
   message: string;
   session_id?: string;
+  request_id?: string;
   working_dir?: string;
   provider?: string;
   images?: ImageData[];
+}
+
+export async function stopChat(requestId: string): Promise<void> {
+  const resp = await fetch('/chat/stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ session_id: requestId }),
+  });
+  if (!resp.ok) throw new Error(`stop chat failed: ${resp.status}`);
 }
 
 export async function streamChat(
@@ -128,7 +144,8 @@ export async function streamChat(
 
 export async function respondPermission(
   sessionId: string,
-  decision: 'allow' | 'deny' | 'always_allow',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
+  toolName?: string,
 ): Promise<{ success: boolean }> {
   const resp = await fetch('/chat/permission', {
     method: 'POST',
@@ -136,7 +153,7 @@ export async function respondPermission(
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ session_id: sessionId, decision }),
+    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName }),
   });
   return resp.json();
 }
@@ -192,6 +209,27 @@ export interface SessionDetail {
 
 export async function listSessions(): Promise<SessionMetaWithProject[]> {
   const resp = await fetch('/sessions', { headers: authHeaders() });
+  return resp.json();
+}
+
+export interface CreateSessionResponse {
+  id: string;
+  name: string;
+  working_dir: string;
+  project_hash: string;
+  created_at: number;
+}
+
+export async function createSession(workingDir?: string, title?: string): Promise<CreateSessionResponse> {
+  const body: Record<string, string> = {};
+  if (workingDir) body.working_dir = workingDir;
+  if (title) body.title = title;
+  const resp = await fetch('/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw new Error(`create session failed: ${resp.status}`);
   return resp.json();
 }
 
@@ -452,7 +490,9 @@ export type LiveWireEvent =
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'state'; running: boolean }
   | { type: 'error'; message: string }
-  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string };
+  | { type: 'warning'; message: string }
+  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
+  | { type: 'session_switched'; session_id: string };
 
 export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,
@@ -499,6 +539,14 @@ export async function postLiveMessage(
   });
 }
 
+export async function postLiveStop(): Promise<void> {
+  const resp = await fetch('/live/stop', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`stop live chat failed: ${resp.status}`);
+}
+
 /** Sync-mode model switch: notify the daemon immediately when the dropdown
  *  changes (not just on send), so the TUI header and other tabs follow. */
 export async function postLiveProvider(provider: string): Promise<void> {
@@ -509,13 +557,31 @@ export async function postLiveProvider(provider: string): Promise<void> {
   });
 }
 
+/** Set the DeepSeek V4 `reasoning_effort` for a provider. `effort` is
+ *  'high' | 'max' | null (clear → model default). Persists to the provider
+ *  config so the next turn (live or /chat) picks it up. */
+export async function postLiveReasoningEffort(
+  effort: string | null,
+  provider?: string,
+): Promise<void> {
+  await fetch('/live/reasoning_effort', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({
+      reasoning_effort: effort,
+      ...(provider ? { provider } : {}),
+    }),
+  });
+}
+
 export async function postLivePermission(
-  decision: 'allow' | 'deny' | 'always_allow',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
+  toolName?: string,
 ): Promise<{ accepted: boolean }> {
   const resp = await fetch('/live/permission', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ decision }),
+    body: JSON.stringify({ decision, tool_name: toolName }),
   });
   return resp.json();
 }

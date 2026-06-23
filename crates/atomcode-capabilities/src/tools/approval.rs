@@ -13,7 +13,7 @@
 //! ordering contract).
 
 use async_trait::async_trait;
-use atomcode_kernel::middleware::ToolMiddleware;
+use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,10 @@ pub const APPROVAL_KIND: &str = "approval";
 /// `AgentCommand::Respond { value: serde_json::to_value(ApprovalResponse)? }`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
+    /// The originating model tool-call id. Drivers use it to correlate an approval
+    /// prompt with the later started/result events for the same call.
+    #[serde(default)]
+    pub call_id: String,
     /// The tool about to execute.
     pub tool: String,
     /// The EXACT argument bytes that will execute (approve-what-runs contract).
@@ -142,8 +146,13 @@ impl ApprovalMiddleware {
         self.kind = kind.into();
         self
     }
-    fn grant_key(call: &ToolCall) -> String {
-        format!("{}::{}", call.name, call.arguments)
+    /// Key under which an `AllowAlways` grant is cached. The SCOPE comes from the
+    /// tool (`Tool::always_grant_scope`), NOT blindly from the raw args: a
+    /// file-mutation tool reports a tool-wide scope so "Always" covers every later
+    /// edit this session (v1 parity), while `bash` keeps the default per-command
+    /// scope so approving one destructive command never blanket-approves others.
+    fn grant_key(call: &ToolCall, tool: &dyn Tool) -> String {
+        format!("{}::{}", call.name, tool.always_grant_scope(&call.arguments))
     }
 }
 
@@ -154,32 +163,33 @@ impl ToolMiddleware for ApprovalMiddleware {
         call: &mut ToolCall,
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
-    ) -> Result<(), String> {
+    ) -> BeforeOutcome {
         // Arg-aware: a Safe call needs no approval.
         if tool.risk(&call.arguments) == RiskLevel::Safe {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         // Session grant cache: an identical risky call already approved-always.
-        let key = Self::grant_key(call);
+        let key = Self::grant_key(call, tool.as_ref());
         if self.store.is_granted(&key) {
-            return Ok(());
+            return BeforeOutcome::Proceed;
         }
         // Round-trip the driver for a decision (the oneshot lives in the kernel's
         // RequestCtx, never in an event → events stay serializable). Built from the
         // exported typed contract so the wire shape can never drift from it.
         let payload = serde_json::to_value(ApprovalRequest {
+            call_id: call.id.clone(),
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
         })
         .unwrap_or(serde_json::Value::Null);
         match PermissionDecision::from_value(&rt.request(&self.kind, payload).await) {
-            PermissionDecision::AllowOnce => Ok(()),
+            PermissionDecision::AllowOnce => BeforeOutcome::Proceed,
             PermissionDecision::AllowAlways => {
                 self.store.grant(&key);
-                Ok(())
+                BeforeOutcome::Proceed
             }
             PermissionDecision::Deny => {
-                Err(format!("denied by approval policy: {} {}", tool.name(), call.arguments))
+                BeforeOutcome::deny(format!("denied by approval policy: {} {}", tool.name(), call.arguments))
             }
         }
     }
@@ -207,6 +217,53 @@ mod tests {
         ToolCall { id: "2".into(), name: "read_file".into(), arguments: r#"{"file_path":"a.txt"}"#.into() }
     }
 
+    /// REGRESSION: "总是 / Always" must be tool-wide for file-mutation tools (v1
+    /// parity) — approving one edit auto-approves every later edit this session —
+    /// while `bash` stays per-command so approving one destructive command never
+    /// blanket-approves another. The bug: the grant key included the full args, so
+    /// each distinct edit re-prompted ("Always" degraded to "allow once").
+    #[test]
+    fn always_grant_is_tool_wide_for_edits_but_per_command_for_bash() {
+        use crate::tools::bash::BashTool;
+        use crate::tools::edit::EditFileTool;
+
+        // edit_file: two DIFFERENT edits collapse to the SAME grant key.
+        let edit: Arc<dyn Tool> = Arc::new(EditFileTool);
+        let a = ToolCall {
+            id: "1".into(),
+            name: "edit_file".into(),
+            arguments: r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#.into(),
+        };
+        let b = ToolCall {
+            id: "2".into(),
+            name: "edit_file".into(),
+            arguments: r#"{"file_path":"b.rs","old_string":"p","new_string":"q"}"#.into(),
+        };
+        assert_eq!(
+            ApprovalMiddleware::grant_key(&a, edit.as_ref()),
+            ApprovalMiddleware::grant_key(&b, edit.as_ref()),
+            "edit_file 'Always' must grant the whole tool, not just one exact call"
+        );
+
+        // bash: two DIFFERENT destructive commands keep DISTINCT grant keys.
+        let bash: Arc<dyn Tool> = Arc::new(BashTool);
+        let c1 = ToolCall {
+            id: "3".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"rm -rf foo"}"#.into(),
+        };
+        let c2 = ToolCall {
+            id: "4".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"rm -rf bar"}"#.into(),
+        };
+        assert_ne!(
+            ApprovalMiddleware::grant_key(&c1, bash.as_ref()),
+            ApprovalMiddleware::grant_key(&c2, bash.as_ref()),
+            "bash 'Always' must stay per-command so one approval never covers another"
+        );
+    }
+
     #[test]
     fn decision_parsing_fails_closed() {
         use serde_json::json;
@@ -228,8 +285,8 @@ mod tests {
         let mw = ApprovalMiddleware::in_memory();
         let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool);
         let mut call = safe_call();
-        // Safe → Ok without ever awaiting the driver (which never responds here).
-        assert!(mw.before(&mut call, &tool, &rt).await.is_ok());
+        // Safe → Proceed without ever awaiting the driver (which never responds here).
+        assert!(!mw.before(&mut call, &tool, &rt).await.is_deny());
     }
 
     #[tokio::test]
@@ -238,11 +295,11 @@ mod tests {
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
         let store = Arc::new(InMemoryPermissionStore::new());
         let call = risky_call();
-        store.grant(&ApprovalMiddleware::grant_key(&call));
-        let mw = ApprovalMiddleware::new(store);
         let tool: Arc<dyn Tool> = Arc::new(WriteFileTool);
+        store.grant(&ApprovalMiddleware::grant_key(&call, tool.as_ref()));
+        let mw = ApprovalMiddleware::new(store);
         let mut c = call;
-        assert!(mw.before(&mut c, &tool, &rt).await.is_ok());
+        assert!(!mw.before(&mut c, &tool, &rt).await.is_deny());
     }
 
     #[tokio::test]
@@ -255,8 +312,8 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(WriteFileTool);
         let mut call = risky_call();
         let res = mw.before(&mut call, &tool, &rt).await;
-        assert!(res.is_err(), "silent driver must fail closed");
-        assert!(res.unwrap_err().contains("denied"));
+        assert!(res.is_deny(), "silent driver must fail closed");
+        assert!(res.deny_reason().unwrap().contains("denied"));
     }
 
     /// The exported typed contract must stay byte-compatible with the wire shapes
@@ -264,10 +321,23 @@ mod tests {
     #[test]
     fn typed_contract_matches_wire_shapes() {
         // Request side: what the middleware emits parses as ApprovalRequest.
-        let payload =
-            serde_json::to_value(ApprovalRequest { tool: "bash".into(), args: "{\"cmd\":\"ls\"}".into() })
+        let payload = serde_json::to_value(ApprovalRequest {
+            call_id: "call_1".into(),
+            tool: "bash".into(),
+            args: "{\"cmd\":\"ls\"}".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "call_id": "call_1", "tool": "bash", "args": "{\"cmd\":\"ls\"}" })
+        );
+
+        // Older approval payloads without call_id still parse; they simply cannot
+        // correlate a pre-execution prompt with a later ToolStarted row.
+        let legacy: ApprovalRequest =
+            serde_json::from_value(serde_json::json!({ "tool": "bash", "args": "{}" }))
                 .unwrap();
-        assert_eq!(payload, serde_json::json!({ "tool": "bash", "args": "{\"cmd\":\"ls\"}" }));
+        assert_eq!(legacy.call_id, "");
 
         // Response side: each constructor round-trips through from_value exactly.
         let v = serde_json::to_value(ApprovalResponse::allow()).unwrap();

@@ -208,6 +208,34 @@ impl Message {
     pub fn user_with_images(text: impl Into<String>, images: Vec<ImageContent>) -> Self {
         Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images, reasoning_blocks: vec![] }
     }
+
+    /// Approximate token count for this message — a byte heuristic (~4 bytes/token;
+    /// images ≈ 1600 tokens each). Used ONLY as a FALLBACK for context-pressure when
+    /// the provider omits a usage report (e.g. a gateway that returns an empty 200, or
+    /// drops the usage chunk emitted after `finish_reason`). The EXACT prompt total
+    /// always comes from the provider's usage when present; this keeps utilization —
+    /// and thus auto-compaction — tracking when it is absent (without it, a non-
+    /// reporting provider records utilization 0.0 forever and never compacts).
+    /// Mirrors the legacy estimate heuristic (see `atomcode-coding`'s telemetry copy).
+    pub fn estimate_tokens(&self) -> u32 {
+        // Images dominate when present (vision ≈ 1600 tok each).
+        if !self.images.is_empty() {
+            return ((self.text.len() / 4).max(1) + self.images.len() * 1600 + 4) as u32;
+        }
+        let byte_count = if self.role == Role::Tool {
+            self.text.len() + 10 // tool result + small wrapper overhead
+        } else if !self.tool_calls.is_empty() {
+            let calls: usize = self
+                .tool_calls
+                .iter()
+                .map(|tc| tc.name.len() + tc.arguments.len() + 20)
+                .sum();
+            self.text.len() + calls + self.reasoning.as_ref().map_or(0, |r| r.len())
+        } else {
+            self.text.len()
+        };
+        ((byte_count / 4).max(1) + 4) as u32
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -640,6 +668,17 @@ impl CompactionPlan {
 #[async_trait]
 pub trait CompactionStrategy: Send + Sync {
     async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan;
+
+    /// CHEAP, side-effect-free pre-check (NO LLM call): will `plan(view)` perform
+    /// SLOW, user-visible work — i.e. drain old turns into an LLM summary — rather
+    /// than merely no-op or do a fast in-place stub? The kernel calls this to decide
+    /// whether to emit [`AgentEvent::CompactionStarted`] (the "compacting…" progress
+    /// line), so a manual `/compact` that turns out to be a no-op never shows a
+    /// spurious "compacting…" line ahead of "nothing to compact". Default `false`
+    /// (e.g. [`NoCompaction`] and pure-stub policies never summarize).
+    fn will_summarize(&self, _view: &CompactionView<'_>) -> bool {
+        false
+    }
 }
 
 /// The neutral DEFAULT strategy: never compacts (always returns a noop plan).

@@ -88,30 +88,11 @@ impl Tool for WriteFileTool {
             Ok(wd) => wd.clone(),
             Err(_) => return base,
         };
-        match super::approval_for_path(
-            &parsed.file_path,
-            &working_dir,
-            super::ExternalPathAction::Write,
-        ) {
-            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => {
-                ApprovalRequirement::RequireApprovalAlways(reason)
-            }
-            Ok(ApprovalRequirement::RequireApproval(reason)) => {
-                ApprovalRequirement::RequireApproval(reason)
-            }
-            // Writes never path-scope; treat a scoped result (the Write action
-            // doesn't produce one today) as the strictest always-ask.
-            Ok(ApprovalRequirement::RequireApprovalScoped { reason, .. }) => {
-                ApprovalRequirement::RequireApprovalAlways(reason)
-            }
-            Ok(ApprovalRequirement::AutoApprove) => match base {
-                ApprovalRequirement::RequireApproval(reason) => {
-                    ApprovalRequirement::RequireApprovalAlways(reason)
-                }
-                other => other,
-            },
-            Err(_) => base,
-        }
+        // Scope any prompt to the exact target file so a session [A] remembers
+        // THAT file (see `scoped_write_approval`): re-writing the same file
+        // stops re-prompting, while a tool-wide grant can't bypass a sensitive
+        // write.
+        super::scoped_write_approval(&parsed.file_path, &working_dir, base)
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {

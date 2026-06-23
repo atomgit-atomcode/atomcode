@@ -71,6 +71,7 @@ tar = "0.4"
 # default — the stub crate is linked only when this feature is enabled,
 # never in standard `cargo build`.
 atomcode-codingplan-crypto = { path = "../atomcode-codingplan-crypto", optional = true }
+htmd = "0.5.4"
 
 [features]
 default = []
@@ -88,7 +89,7 @@ libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55"
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Foundation"] }
 
 [dev-dependencies]
 tempfile = "3"

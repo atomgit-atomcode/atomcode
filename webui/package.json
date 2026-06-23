@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test"
   },
   "dependencies": {
     "dompurify": "^3.4.7",
@@ -14,6 +15,7 @@
     "preact": "^10.24.0"
   },
   "devDependencies": {
+    "@fontsource/source-serif-4": "^5.2.9",
     "@preact/preset-vite": "^2.10.5",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.47",

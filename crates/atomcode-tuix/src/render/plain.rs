@@ -13,6 +13,9 @@ const SGR_RED: &str = "\x1b[31m";
 const SGR_BOLD_YELLOW: &str = "\x1b[1;33m";
 const SGR_GREEN: &str = "\x1b[32m";
 const SGR_CYAN: &str = "\x1b[36m";
+// Prompt chevron = Accent (bold bright cyan, SGR 96) — matches the retained
+// renderer's `style_bold(Role::Accent)`. The user text itself stays default fg.
+const SGR_BOLD_CYAN: &str = "\x1b[1;96m";
 const SGR_DIM: &str = "\x1b[2m";
 
 /// Plain-text renderer for pipes, CI, dumb terminals, and the
@@ -123,6 +126,31 @@ impl<W: Write + Send> PlainRenderer<W> {
             self.transient_active = false;
         }
     }
+
+    fn render_user(&mut self, text: &str, attachments: &[usize]) {
+        self.drop_transient();
+        if !self.interactive_terminal {
+            let chev = self.caps.prompt_chevron();
+            if self.caps.colors {
+                // Chevron is the coloured Accent marker (bold cyan); the text
+                // stays the terminal default fg — matches the retained renderer
+                // and opencode (colour on the marker, not the text).
+                let _ = writeln!(
+                    self.out,
+                    "{}{}{}{}",
+                    SGR_BOLD_CYAN,
+                    chev,
+                    SGR_RESET,
+                    scrub_controls(text)
+                );
+            } else {
+                let _ = writeln!(self.out, "{}{}", chev, scrub_controls(text));
+            }
+        }
+        for n in attachments {
+            let _ = writeln!(self.out, "  └ [Image #{}]", n);
+        }
+    }
 }
 
 impl<W: Write + Send> Renderer for PlainRenderer<W> {
@@ -138,21 +166,16 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 );
             }
             UiLine::User(text) => {
-                self.drop_transient();
-                if !self.interactive_terminal {
-                    // Pipe / CI / dumb: kernel didn't echo the user's
-                    // input, so we render it here as the only source of
-                    // input visibility for log readers correlating
-                    // request ↔ response.
-                    let chev = self.caps.prompt_chevron();
-                    let _ = writeln!(self.out, "{}{}", chev, scrub_controls(&text));
-                }
+                self.render_user(&text, &[]);
                 // Interactive force_plain (JediTerm / legacy conhost /
                 // ATOMCODE_PLAIN=1 on a real TTY): cooked-mode kernel
                 // already echoed the user's keystrokes inline after the
                 // `❯ ` prefix that InputPrompt printed. Rendering
                 // `❯ {text}\n` here would produce the duplicate
                 // `❯ 你好` / `❯ 你好` pair that real-world users hit.
+            }
+            UiLine::UserWithAttachments { text, attachments } => {
+                self.render_user(&text, &attachments);
             }
             UiLine::AssistantText(text) => {
                 self.drop_transient();
@@ -396,6 +419,12 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 let _ = writeln!(self.out, "  {}  {}", msg, model);
                 let _ = writeln!(self.out);
             }
+            UiLine::ModalOverlay { .. } => {
+                // No overlay rendering in plain mode.
+            }
+            UiLine::ModalOverlayClear => {
+                // No-op in plain mode.
+            }
         }
     }
 
@@ -449,6 +478,7 @@ mod tests {
             scroll_region: false,
             unicode_symbols: false,
             legacy_conhost: false,
+            jediterm: false,
         }
     }
 
@@ -466,6 +496,7 @@ mod tests {
             scroll_region: false,
             unicode_symbols: true,
             legacy_conhost: false,
+            jediterm: true,
         }
     }
 
@@ -645,6 +676,42 @@ mod tests {
         assert!(
             s.contains("hello"),
             "pipe mode must render UiLine::User as the only input echo. got: {:?}",
+            s
+        );
+    }
+
+    /// Pipe / CI with colours: the chevron is the coloured Accent marker (bold
+    /// bright cyan) and the user text stays the terminal's default foreground —
+    /// matching opencode (`<text fg={theme.text}>`), where the colour lives on the
+    /// marker, not the text. No magenta anywhere.
+    #[test]
+    fn user_echo_chevron_is_accent_text_is_plain() {
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_jediterm_ish(), // colours on
+            false,               // non-interactive (pipe)
+        );
+        r.render(UiLine::User("hello".into()));
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        // Chevron carries bold bright cyan (Accent).
+        assert!(
+            s.contains("\x1b[1;96m"),
+            "chevron must be bold bright cyan (accent). got: {:?}",
+            s
+        );
+        // Text is NOT coloured — no magenta SGR is emitted at all.
+        assert!(
+            !s.contains("95m"),
+            "user text must stay default fg — no magenta SGR. got: {:?}",
+            s
+        );
+        // The chevron's colour is reset before the text, so the text inherits
+        // the terminal default rather than the cyan.
+        assert!(
+            s.contains(&format!("{}hello", SGR_RESET)) || s.contains("\x1b[0mhello"),
+            "user text must follow a reset (default fg). got: {:?}",
             s
         );
     }

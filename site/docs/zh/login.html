@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.24.2</span>
+    <span class="dhdr-ver">v4.25.5</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -56,6 +56,7 @@
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
     <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
@@ -85,7 +86,7 @@
           <tr><td>API Key</td><td><code>/provider</code> 或手动编辑配置</td><td>使用自有 OpenAI / Claude / DeepSeek Key 的用户</td></tr>
         </tbody>
       </table>
-      <p class="callout"><em>v4.24.2 起 <code>/codingplan</code> 已折进 <code>/login</code>;旧的「纯 OAuth 不申领额度」入口已移除。</em></p>
+      <p class="callout"><em>v4.25.0 起 <code>/codingplan</code> 已折进 <code>/login</code>;旧的「纯 OAuth 不申领额度」入口已移除。</em></p>
 
       <h2>AtomGit CodingPlan(推荐)</h2>
       <p>AtomGit 是 CSDN / 开放原子开源基金会旗下的开源代码托管平台,AtomCode 原生集成了它的 OAuth 和 CodingPlan。<code>/login</code> 是新用户最省事的入口,一次操作完成登录 → 申领免费 token 额度 → 自动根据额度内的模型列表写好 provider 配置。用完这条命令,直接就能开始聊天。已登录后再跑会幂等地同步最新模型列表,不会重复申领。</p>

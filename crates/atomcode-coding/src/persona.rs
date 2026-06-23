@@ -17,8 +17,10 @@
 pub fn coding_persona(model: &str) -> String {
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
     let mut p = format!(
-        "You are AtomCode, a coding agent (model: {model}) that helps users with \
-software engineering tasks within the current project.\n{RULES}\n\n\
+        "You are AtomCode, an AI coding agent by AtomGit running the {model} model. \
+When asked who or what model you are, identify yourself as AtomCode running {model}. \
+Never claim to be Claude, ChatGPT, or another product, organization, or model. \
+You help users with software engineering tasks within the current project.\n{RULES}\n\n\
 ## GIT COMMITS:\n\
 When you create a git commit on the user's behalf, end the commit message with this \
 trailer (preceded by a blank line) — use a HEREDOC for `git commit -m` so the blank line \
@@ -69,7 +71,12 @@ MANDATORY parallel scenarios (must be ONE turn):
 Sequential is OK ONLY when step N+1's command DEPENDS on step N's output (edit then verify; check error then fix; test then commit).
 Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns.
 To read a file, always use `read_file` — not `bash cat`. `read_file` gives skeletons for large files, \"Did you mean\" suggestions, recovery hints for binary / non-UTF-8 formats, and per-session caching.
+To list directories, use `list_directory` instead of `bash ls` / `find` when a tree view is enough; it is gitignore-aware and skips build/cache directories.
+To find files by path/name, use `glob` instead of `bash find` / `fd` unless you need shell-specific predicates.
+To search file contents, use `grep` instead of `bash grep` / `rg` unless you need shell-specific flags or streaming output.
 To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites.
+The working directory is fixed for the session — there is no directory-switch tool. For one-off work elsewhere, use absolute paths or chain `cd <dir> && <cmds>` inside a single `bash` call; never tell the user you changed the working directory for later tools.
+To open or preview a local file or directory in the GUI, use `open_file` — not `bash open`, not `bash xdg-open`, not `bash start`, and not `bash wslview`.
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.
 Use the code-intelligence tools (list_symbols / read_symbol / find_references / trace_callers / trace_callees / trace_chain / blast_radius / file_dependencies) to understand code structure and impact before editing — they are cheaper and more precise than reading whole files.
 
@@ -95,7 +102,7 @@ Before destructive operations (delete files, force push, drop tables, kill proce
 Operate only within the working directory shown in the session context — do not read, write, scan, or `cd` outside it unless the user explicitly names an external path. AtomCode's own config (skills, commands, memory, hooks) lives under `~/.atomcode` (or `$ATOMCODE_HOME`) globally and `./.atomcode` per-project; read and write it there, never under `~/.claude` (that belongs to a different product).
 
 ## OPENING FILES:
-After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks.
+After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks. When opening local files or directories, call `open_file`; do not shell out to `open`, `xdg-open`, `start`, or `wslview`.
 
 ## OUTPUT:
 When executing tasks: keep text brief and direct. Lead with action, not reasoning.
@@ -117,8 +124,19 @@ mod tests {
     #[test]
     fn persona_carries_model_and_anchors() {
         let p = coding_persona("deepseek-chat");
-        assert!(p.contains("model: deepseek-chat"), "identity must carry the model");
+        assert!(
+            p.contains("running the deepseek-chat model"),
+            "identity must carry the model"
+        );
         assert!(p.starts_with("You are AtomCode"), "identity line first");
+        assert!(
+            p.contains("identify yourself as AtomCode running deepseek-chat"),
+            "identity questions must use the configured model"
+        );
+        assert!(
+            p.contains("Never claim to be Claude"),
+            "identity must not drift to another product"
+        );
         // Discipline anchors the verify hook + tests rely on:
         assert!(p.contains("## WORKFLOW:"));
         assert!(p.contains("VERIFY"));
@@ -126,21 +144,66 @@ mod tests {
         // Every mounted tool the discipline/model relies on must be advertised, so the
         // model knows it exists. edit_file in particular: the verify hook keys on it and
         // the persona tells the model to "prefer editing existing files".
+        // NOTE: `change_dir` is intentionally absent — it is not a mounted
+        // tool (see `persona_does_not_advertise_the_unmounted_change_dir_tool`).
         for tool in [
-            "read_file", "write_file", "edit_file", "grep", "glob", "bash",
-            "list_symbols", "read_symbol", "find_references", "trace_callers",
-            "trace_callees", "trace_chain", "blast_radius", "file_dependencies",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "grep",
+            "glob",
+            "bash",
+            "list_directory",
+            "open_file",
+            "list_symbols",
+            "read_symbol",
+            "find_references",
+            "trace_callers",
+            "trace_callees",
+            "trace_chain",
+            "blast_radius",
+            "file_dependencies",
         ] {
-            assert!(p.contains(tool), "persona must advertise the mounted tool `{tool}`");
+            assert!(
+                p.contains(tool),
+                "persona must advertise the mounted tool `{tool}`"
+            );
         }
+    }
+
+    #[test]
+    fn persona_does_not_advertise_the_unmounted_change_dir_tool() {
+        // `change_dir` is deliberately NOT registered (capabilities `cd.rs`:
+        // weak models loop on it, and the working directory stays fixed for
+        // the session). The system prompt must therefore not tell the model
+        // to use it — otherwise the model obeys, calls an unmounted tool, and
+        // hits "unknown or unmounted tool: change_dir" (the reported
+        // regression), then misleadingly claims `bash cd` switched the dir.
+        let p = coding_persona("m");
+        assert!(
+            !p.contains("change_dir"),
+            "persona must not advertise the unmounted `change_dir` tool"
+        );
+        // Guard the premise: change_dir is unregistered by design. If it ever
+        // gets mounted, restore the directory-switch guidance deliberately.
+        assert!(
+            !atomcode_capabilities::tools::coding_tool_names().contains(&"change_dir"),
+            "change_dir is intentionally unregistered; if that changes, update the persona too"
+        );
     }
 
     #[test]
     fn persona_drops_compaction_claim() {
         // MVP has no compaction — must NOT promise unlimited context.
         let p = coding_persona("m");
-        assert!(!p.contains("not limited by the context window"), "no false compaction promise");
-        assert!(!p.contains("## CONTEXT:"), "CONTEXT section dropped for MVP honesty");
+        assert!(
+            !p.contains("not limited by the context window"),
+            "no false compaction promise"
+        );
+        assert!(
+            !p.contains("## CONTEXT:"),
+            "CONTEXT section dropped for MVP honesty"
+        );
     }
 
     #[test]
@@ -158,7 +221,10 @@ mod tests {
         // The system-reminder section must name the EXACT tag the injectors emit — guard
         // persona ↔ the single-source `SYSTEM_REMINDER_TAG` so they can't drift apart.
         let open = format!("<{}>", atomcode_capabilities::reminder::SYSTEM_REMINDER_TAG);
-        assert!(p.contains(&open), "persona must explain the `{open}` tag the injectors use");
+        assert!(
+            p.contains(&open),
+            "persona must explain the `{open}` tag the injectors use"
+        );
         // The commit trailer carries the model (v1 parity).
         assert!(
             p.contains("Co-Authored-By: AtomCode (deepseek-v4-flash)"),
@@ -168,6 +234,30 @@ mod tests {
         assert!(p.contains("rest unchanged"), "no-placeholder rule present");
         assert!(p.contains("~/.claude"), "scope names the ~/.claude guard");
         // PLATFORM section only on Windows builds.
-        assert_eq!(p.contains("## PLATFORM"), cfg!(windows), "PLATFORM section iff windows");
+        assert_eq!(
+            p.contains("## PLATFORM"),
+            cfg!(windows),
+            "PLATFORM section iff windows"
+        );
+    }
+
+    #[test]
+    fn persona_prefers_builtin_tools_over_shell_equivalents() {
+        let p = coding_persona("m");
+        for phrase in [
+            "not `bash cat`",
+            "instead of `bash ls`",
+            "instead of `bash find`",
+            "instead of `bash grep`",
+            "not `bash open`",
+            "not `bash xdg-open`",
+            "not `bash start`",
+            "not `bash wslview`",
+        ] {
+            assert!(
+                p.contains(phrase),
+                "persona must preserve tool preference: {phrase}"
+            );
+        }
     }
 }

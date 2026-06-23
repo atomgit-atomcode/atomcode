@@ -6,8 +6,29 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
+
+/// How long a completed full-tree index stays "fresh" before the next
+/// `filter()` call kicks a background re-walk. This is what lets files
+/// created mid-session (`touch new.rs`, then `@new`) show up without a
+/// `/cd` or restart. The stale index keeps serving until the re-walk
+/// lands, so the popup never blocks or flickers. Kept short enough to
+/// feel live, long enough that rapid typing doesn't thrash the walker
+/// (at most one re-walk per interval — `built_at` only advances when a
+/// walk completes).
+const STALE_TTL: Duration = Duration::from_secs(3);
+
+/// Hard cap on how many entries a single index walk collects. The `@`-mention
+/// popup only ever shows 30 rows and substring-searches the cache, so any real
+/// project is served fine well below this. Its purpose is a CPU/memory
+/// backstop: the gitignore-aware walk is otherwise unbounded, so launching
+/// atomcode in a giant tree (an accidental `~` / `/`, or a repo with a huge
+/// non-ignored generated dir) used to peg a core at 100% for minutes walking
+/// millions of files (macOS `~/Library` alone). Stopping at this many entries
+/// keeps the worst case sub-second.
+const MAX_INDEX_ENTRIES: usize = 50_000;
 
 // ---------------------------------------------------------------------------
 // Token detection
@@ -111,6 +132,10 @@ pub struct FileIndex {
     /// True once the initial background build has been kicked off, so we
     /// don't spawn a second thread while the first is still running.
     building: RefCell<bool>,
+    /// When the currently-cached *full* index finished walking. `None`
+    /// until the first full walk completes (the shallow warm-up doesn't
+    /// count). Drives the TTL-based background refresh in `maybe_refresh`.
+    built_at: RefCell<Option<Instant>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +154,7 @@ impl FileIndex {
             entries: RefCell::new(None),
             pending: RefCell::new(None),
             building: RefCell::new(false),
+            built_at: RefCell::new(None),
         }
     }
 
@@ -179,32 +205,13 @@ impl FileIndex {
     pub fn filter(&self, scope_dir: &str, filter: &str) -> Vec<Entry> {
         // Kick off background build on first call if not already building/cached.
         self.build_async();
+        // Pick up a completed walk (initial or TTL refresh) if one landed.
+        self.drain_pending();
+        // If the cache has aged past STALE_TTL, kick a background re-walk so
+        // mid-session file creations become discoverable. Serves stale
+        // entries until the fresh walk lands (drained on a later keystroke).
+        self.maybe_refresh();
 
-        // Drain background walk result if available.
-        // Note: entries is never None after build_async (it has a shallow
-        // snapshot), so we check pending instead.
-        if self.pending.borrow().is_some() {
-            let mut pending = self.pending.borrow_mut();
-            if let Some(rx) = pending.as_mut() {
-                match rx.try_recv() {
-                    Ok(walked) => {
-                        *self.entries.borrow_mut() = Some(walked);
-                        *self.building.borrow_mut() = false;
-                        *pending = None;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        // Background walk still in progress — use shallow entries.
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        // Thread panicked or dropped — fall back to synchronous walk.
-                        let walked = Self::walk_inner(self.root.borrow().clone());
-                        *self.entries.borrow_mut() = Some(walked);
-                        *self.building.borrow_mut() = false;
-                        *pending = None;
-                    }
-                }
-            }
-        }
         // entries is guaranteed to be Some (shallow at minimum), but be defensive.
         let entries = self.entries.borrow();
         let entries = match entries.as_ref() {
@@ -252,8 +259,88 @@ impl FileIndex {
         matched
     }
 
+    /// Non-blocking drain of the background walk receiver. When a walk has
+    /// completed, swap its result into the cache, stamp `built_at`, and clear
+    /// the in-flight markers. Shared by the initial build and TTL refreshes.
+    fn drain_pending(&self) {
+        if self.pending.borrow().is_none() {
+            return;
+        }
+        let mut pending = self.pending.borrow_mut();
+        let Some(rx) = pending.as_mut() else { return };
+        match rx.try_recv() {
+            Ok(walked) => {
+                *self.entries.borrow_mut() = Some(walked);
+                *self.built_at.borrow_mut() = Some(Instant::now());
+                *self.building.borrow_mut() = false;
+                *pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Background walk still in progress — keep serving the cache.
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Thread panicked or dropped — fall back to a synchronous walk.
+                let walked = Self::walk_inner(self.root.borrow().clone());
+                *self.entries.borrow_mut() = Some(walked);
+                *self.built_at.borrow_mut() = Some(Instant::now());
+                *self.building.borrow_mut() = false;
+                *pending = None;
+            }
+        }
+    }
+
+    /// Spawn a background re-walk when the cached full index has aged past
+    /// `STALE_TTL` and nothing is already building. The stale cache keeps
+    /// serving until `drain_pending` swaps in the fresh result, so the popup
+    /// never blocks. `built_at == None` means the initial full walk hasn't
+    /// finished yet — `build_async` owns that, so there's nothing to refresh.
+    fn maybe_refresh(&self) {
+        if *self.building.borrow() {
+            return; // a build/refresh is already in flight
+        }
+        let stale = matches!(*self.built_at.borrow(), Some(t) if t.elapsed() >= STALE_TTL);
+        if !stale {
+            return;
+        }
+        *self.building.borrow_mut() = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.pending.borrow_mut() = Some(rx);
+        let root = self.root.borrow().clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::walk_inner(root));
+        });
+    }
+
     fn walk_inner(root: PathBuf) -> Vec<Entry> {
-        Self::walk_with_depth(root, None)
+        // A full recursive index of an entire home directory or filesystem
+        // root is never a useful `@`-mention scope, and traverses millions of
+        // files (macOS `~/Library`, caches, every node_modules outside a repo)
+        // — pegging a core at 100% CPU for minutes. Serve only the top level
+        // there; `MAX_INDEX_ENTRIES` still backstops any other huge tree.
+        if Self::is_home_or_filesystem_root(&root) {
+            return Self::walk_with_depth(root, Some(1), MAX_INDEX_ENTRIES);
+        }
+        Self::walk_with_depth(root, None, MAX_INDEX_ENTRIES)
+    }
+
+    /// True when `root` is a filesystem root (`/`, `C:\`, …) or the user's
+    /// home directory — the two cases where a full recursive walk is both
+    /// pathologically expensive and useless for `@`-mentions.
+    fn is_home_or_filesystem_root(root: &Path) -> bool {
+        // Filesystem roots have no parent component.
+        if root.parent().is_none() {
+            return true;
+        }
+        if let Some(home) = crate::platform::home_dir() {
+            // Prefer canonical comparison (resolves symlinks / trailing
+            // slashes); fall back to a literal match if either path can't be
+            // canonicalised.
+            return match (std::fs::canonicalize(root), std::fs::canonicalize(&home)) {
+                (Ok(rc), Ok(hc)) => rc == hc,
+                _ => root == home,
+            };
+        }
+        false
     }
 
     /// Gitignore-respecting walk shared by the full index (`max_depth = None`)
@@ -262,7 +349,7 @@ impl FileIndex {
     /// shallow and full views apply identical filtering (gitignore, `.git/`,
     /// whitespace), so warm-up results never include entries the full index
     /// later hides.
-    fn walk_with_depth(root: PathBuf, max_depth: Option<usize>) -> Vec<Entry> {
+    fn walk_with_depth(root: PathBuf, max_depth: Option<usize>, max_entries: usize) -> Vec<Entry> {
         let mut out = Vec::new();
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -312,6 +399,13 @@ impl FileIndex {
                 is_dir,
                 depth,
             });
+
+            // CPU/memory backstop: stop the (otherwise unbounded) walk once
+            // we've collected enough. Dropping the `walker` iterator here stops
+            // further filesystem traversal, so a giant tree can't peg a core.
+            if out.len() >= max_entries {
+                break;
+            }
         }
         out
     }
@@ -326,7 +420,7 @@ impl FileIndex {
     /// vanishing once the full walk replaces the cache. Still bounded to one
     /// directory level, so it stays effectively instant.
     fn scan_shallow(root: &Path) -> Vec<Entry> {
-        Self::walk_with_depth(root.to_path_buf(), Some(1))
+        Self::walk_with_depth(root.to_path_buf(), Some(1), MAX_INDEX_ENTRIES)
     }
 
     /// Re-point the index to a new root directory and clear all cached
@@ -340,6 +434,7 @@ impl FileIndex {
         *self.root.borrow_mut() = new_root;
         *self.entries.borrow_mut() = None;
         *self.building.borrow_mut() = false;
+        *self.built_at.borrow_mut() = None;
     }
 
     /// Test-only: construct an index with hand-built entries, bypassing walk.
@@ -350,7 +445,16 @@ impl FileIndex {
             entries: RefCell::new(Some(entries)),
             pending: RefCell::new(None),
             building: RefCell::new(false),
+            built_at: RefCell::new(None),
         }
+    }
+
+    /// Test-only: backdate the cache so the next `filter()` treats it as stale
+    /// and triggers a TTL refresh — without sleeping for the real TTL.
+    #[cfg(test)]
+    fn mark_stale(&self) {
+        *self.built_at.borrow_mut() =
+            Instant::now().checked_sub(STALE_TTL + Duration::from_secs(1));
     }
 }
 
@@ -708,6 +812,42 @@ mod tests {
         assert!(!result.is_empty());
     }
 
+    // Regression: a file created mid-session must become discoverable via the
+    // TTL refresh, without a `/cd` or restart (the v1 "built once per session"
+    // limitation). The cache serves stale until the staleness window elapses,
+    // then a background re-walk picks up the new file.
+    #[test]
+    fn stale_cache_refresh_picks_up_new_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("first.txt"), "x");
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+
+        // Initial full walk sees first.txt only.
+        let r1 = filter_walk(&idx, "", "");
+        let n1: Vec<&str> = r1.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(n1.contains(&"first.txt"), "got: {:?}", n1);
+        assert!(!n1.contains(&"second.txt"), "got: {:?}", n1);
+
+        // Create a file after the index was built.
+        write_file(&tmp.path().join("second.txt"), "y");
+
+        // While the cache is still fresh, the new file stays hidden.
+        let r2 = idx.filter("", "");
+        assert!(
+            !r2.iter().any(|e| e.rel_path == "second.txt"),
+            "fresh cache should not yet show the new file: {:?}",
+            r2.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>()
+        );
+
+        // Once stale, the next filter() kicks a background re-walk that
+        // surfaces the new file.
+        idx.mark_stale();
+        let r3 = filter_walk(&idx, "", "");
+        let n3: Vec<&str> = r3.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(n3.contains(&"second.txt"), "TTL refresh should surface new file: {:?}", n3);
+        assert!(n3.contains(&"first.txt"), "got: {:?}", n3);
+    }
+
     #[test]
     fn filter_returns_results_immediately_via_shallow_scan() {
         let tmp = tempfile::tempdir().unwrap();
@@ -827,6 +967,40 @@ mod tests {
             !names.contains(&"a.txt"),
             "after reset mid-flight should NOT see dir_a files, got: {:?}",
             names
+        );
+    }
+
+    // Regression: the gitignore-aware walk is otherwise unbounded, so a giant
+    // tree (an accidental run in `~` / `/`, a repo with a huge generated dir)
+    // pegged a core at 100% CPU walking millions of files. The walk must stop
+    // once it has collected `max_entries`.
+    #[test]
+    fn walk_with_depth_caps_entry_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            write_file(&tmp.path().join(format!("f{i}.txt")), "x");
+        }
+        let capped = FileIndex::walk_with_depth(tmp.path().to_path_buf(), None, 3);
+        assert!(
+            capped.len() <= 3,
+            "walk must stop at the cap, got {} entries",
+            capped.len()
+        );
+    }
+
+    // The home directory and filesystem roots must be detected so `walk_inner`
+    // serves only the shallow view instead of a full (pathological) recursive
+    // walk. A normal project dir must NOT be flagged.
+    #[test]
+    fn detects_filesystem_root_but_not_a_project_dir() {
+        assert!(
+            FileIndex::is_home_or_filesystem_root(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            "filesystem root must be flagged"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            !FileIndex::is_home_or_filesystem_root(tmp.path()),
+            "a normal project dir must not be flagged"
         );
     }
 

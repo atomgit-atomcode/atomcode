@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::{
-    DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker,
+    DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
@@ -26,6 +26,8 @@ use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::session::{Session, SessionId, SessionManager};
+
+use crate::markdown::{fence_start, is_closing_fence};
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
@@ -230,7 +232,7 @@ fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
 
 /// 把 TUI 附着到指定的 LiveSession（回放快照 + 启动转发器 + 渲染确认）。
 /// 供 `/webui` 自动附着和 `/sync` 手动附着共用，不重复逻辑。
-fn attach_live_session(
+pub(crate) fn attach_live_session(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     session: std::sync::Arc<atomcode_core::live::LiveSession>,
@@ -287,7 +289,7 @@ fn attach_live_session(
                 (Role::Tool, MessageContent::ToolResult(r)) => {
                     renderer.render(UiLine::ToolResult {
                         success: r.success,
-                        summary: super::summarise(&r.output, r.success),
+                        summary: super::summarise(&r.output),
                     });
                 }
                 _ => {}
@@ -352,6 +354,37 @@ pub(super) fn execute_slash_command(
     match cmd {
         "quit" | "exit" => {
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+        }
+        "copy" => {
+            // Copy a fenced code block from the most recent assistant reply to
+            // the system clipboard, VERBATIM — terminal-native selection copies
+            // the hard-wrapped + PAD-indented body cells, which breaks long
+            // commands; this reads the original markdown instead.
+            //   /copy        → the last code block (the command just shown)
+            //   /copy N      → the Nth code block (1-based)
+            //   /copy all    → every code block, blank-line separated
+            match resolve_copy(&state.last_assistant_response, arg) {
+                CopyResolve::NoBlocks => {
+                    renderer.render(UiLine::Warning(t(Msg::CopyNoCodeBlock).into_owned()));
+                }
+                CopyResolve::BadIndex(count) => {
+                    renderer.render(UiLine::Warning(
+                        t(Msg::CopyBadIndex { count }).into_owned(),
+                    ));
+                }
+                CopyResolve::Text(payload) => {
+                    let lines = payload.lines().count().max(1);
+                    let chars = payload.chars().count();
+                    if copy_text_to_clipboard_osc52(&payload) {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::CopyOk { lines, chars }).into_owned(),
+                        ));
+                    } else {
+                        renderer.render(UiLine::Error(t(Msg::CopyFailed).into_owned()));
+                    }
+                }
+            }
+            renderer.flush();
         }
         "help" => {
             if arg.trim() == "commands" {
@@ -479,6 +512,28 @@ pub(super) fn execute_slash_command(
             renderer.render(UiLine::CommandOutput(t(Msg::KeybindingsHelp).into_owned()));
             renderer.flush();
         }
+        "view" => {
+            let trimmed = arg.trim();
+            if trimmed.is_empty() {
+                renderer.render(UiLine::Error(
+                    t(Msg::ViewUsage).into_owned(),
+                ));
+                renderer.flush();
+            } else {
+                let path = ctx.working_dir.join(trimmed);
+                match FileViewer::open(&path) {
+                    Ok(viewer) => {
+                        *active_modal = Some(Box::new(viewer));
+                    }
+                    Err(e) => {
+                        renderer.render(UiLine::Error(
+                            format!("{}", e),
+                        ));
+                        renderer.flush();
+                    }
+                }
+            }
+        }
         "plan" => {
             state.agent_mode = AgentMode::Plan;
             ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(true)).ok();
@@ -571,6 +626,10 @@ pub(super) fn execute_slash_command(
                     ctx.config = new_cfg.clone();
                     ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
+                    // Refresh the footer context window now (see model_picker
+                    // Enter handler) — no turn fires here either, so the cached
+                    // snapshot's denominator would otherwise stay on the old model.
+                    state.on_model_window_changed(ctx.config.default_context_window());
                     ctx.agent
                         .cmd_tx
                         .send(AgentCommand::ReloadConfig(new_cfg))
@@ -593,56 +652,19 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "clear" => {
-            // Physical clear via the renderer (keeps cached footer state
-            // coherent with the terminal). Scrollback is preserved by
-            // most terminals — \x1b[3J would nuke it, which we don't
-            // want; `clear_screen` emits \x1b[2J\x1b[H.
-            renderer.clear_screen();
-            let dir_display = ctx.working_dir.to_string_lossy().to_string();
-            renderer.render(UiLine::Welcome {
-                model: ctx.model_name.clone(),
-                working_dir: dir_display,
-            });
-            renderer.flush();
+            // `/clear` starts a fresh conversation (matches Claude Code and the
+            // common expectation): it was previously a SCREEN-ONLY wipe, so the
+            // engine kept the full history and the model still "remembered"
+            // everything after a clear. Delegate to the same reset `/session`
+            // uses — it sends ClearConversation to the engine AND wipes the
+            // screen + re-renders the welcome banner.
+            reset_to_new_session(ctx, state, renderer);
         }
         "session" => {
-            // Start fresh: tell the agent to drop conversation history,
-            // clear the scrollback + type-ahead queue + UI state, and
-            // redraw the welcome screen so the user sees they're in a
-            // brand-new session. Ports `/session` from the legacy TUI.
-            ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
-            ctx.current_session_id = None;
-            state.total_tokens = 0;
-            state.prompt_tokens = 0;
-            state.completion_tokens = 0;
-            state.cached_tokens = 0;
-            state.last_context = None;
-            state.pending_context_render = None;
-            state.thinking_idx = 0;
-            state.on_turn_complete();
-            // New session = new session file on disk. Old session
-            // (already saved at its last TurnComplete) stays on disk so
-            // it can still be `/resume`d; we just stop writing into it.
-            ctx.current_session =
-                atomcode_core::session::Session::default_session(ctx.working_dir.clone());
-            ctx.bg_manager
-                .set_foreground_session(ctx.current_session.clone());
-            // Bind telemetry + agent session id to the new session's UUID
-            // (the ClearConversation above intentionally leaves the id alone;
-            // this is the single source of truth).
-            bind_telemetry_to_session(ctx, &ctx.current_session);
-            // `reset()` wipes the terminal AND the renderer's cached
-            // footer/stream state, so the next Welcome renders against
-            // a known (row 1, col 1) anchor. This is what makes
-            // /session behave like a fresh launch.
-            renderer.reset();
-            let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-            renderer.render(UiLine::Welcome {
-                model: ctx.model_name.clone(),
-                working_dir: dir_display,
-            });
-            renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
-            renderer.flush();
+            // Start fresh in the current directory. Ports `/session` from the
+            // legacy TUI. Shared with the webui-driven project switch via
+            // `reset_to_new_session`.
+            reset_to_new_session(ctx, state, renderer);
         }
         "model" => {
             if ctx.config.providers.is_empty() {
@@ -1211,6 +1233,11 @@ pub(super) fn execute_slash_command(
                     ctx.current_session = new_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
                     state.on_turn_complete();
+                    // One DECSET 2026 envelope around the wipe + welcome
+                    // re-render so the foreground swap shows no blank frame
+                    // (same anti-flicker as `/resume`). Self-contained: the
+                    // arm has no early return between begin/end_sync.
+                    renderer.begin_sync();
                     renderer.reset();
                     render_welcome(renderer, ctx);
                     renderer.render(UiLine::CommandOutput(
@@ -1222,6 +1249,8 @@ pub(super) fn execute_slash_command(
                         })
                         .into_owned(),
                     ));
+                    renderer.flush();
+                    renderer.end_sync();
                 }
                 bg_runtime::BgCommand::Resume(slot) => {
                     sync_bg_foreground(ctx);
@@ -1847,6 +1876,89 @@ pub(super) fn execute_slash_command(
                         ));
                         renderer.flush();
                     }
+                }
+            }
+        }
+        "goal" => {
+            // Sub-commands aligned with Claude Code's /goal (v2.1.139+):
+            //   /goal <condition>             → set a new goal
+            //   /goal                         → show status (or hint if none)
+            //   /goal status                  → explicit status (same)
+            //   /goal clear|stop|off|reset|none|cancel  → halt the active goal
+            //   /goal help|?|-h|--help        → usage
+            //
+            // CC has no `--max-rounds` flag and no wall-clock cap. Users
+            // express budgets in the condition text instead (e.g. "or stop
+            // after 20 turns"). Esc / Ctrl+C also halts at any time.
+            let trimmed = arg.trim();
+            let (head, _rest) = trimmed
+                .split_once(char::is_whitespace)
+                .map(|(h, r)| (h, r.trim()))
+                .unwrap_or((trimmed, ""));
+            match head {
+                "" | "status" => {
+                    if let Some(ref cond) = state.goal_condition {
+                        // Display 1-based, consistent with the footer goal row.
+                        let round = state.goal_round + 1;
+                        let elapsed = state
+                            .goal_started_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let mins = elapsed / 60;
+                        let secs = elapsed % 60;
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalStatus {
+                                condition: cond.as_str(),
+                                round,
+                                mins,
+                                secs,
+                            })
+                            .into_owned(),
+                        ));
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalNoActive).into_owned(),
+                        ));
+                    }
+                    renderer.flush();
+                }
+                "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
+                    ctx.agent.cmd_tx.send(AgentCommand::ClearGoal).ok();
+                    state.goal_condition = None;
+                    state.goal_round = 0;
+                    state.goal_started_at = None;
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::GoalCleared).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                "help" | "?" | "-h" | "--help" => {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::GoalHelp).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                _ => {
+                    // Treat the entire trimmed input as the condition.
+                    // (Empty input is unreachable here — `head` would be ""
+                    // and the `"" | "status"` arm above would have matched.)
+                    let condition = trimmed.to_owned();
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SetGoal { condition: condition.clone() })
+                        .ok();
+                    state.goal_condition = Some(condition.clone());
+                    state.goal_round = 0;
+                    state.goal_started_at = Some(std::time::Instant::now());
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: condition,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                    state.on_submit();
                 }
             }
         }
@@ -3087,6 +3199,57 @@ pub(crate) fn launch_fixissue(
 /// previous_dir on the shared context, push the new entry into the
 /// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
 /// DirPicker modal's Enter handler so both paths keep state coherent.
+/// Drop the current conversation and start a brand-new session in the current
+/// `ctx.working_dir`: tell the agent to clear history, reset token/context UI
+/// state, make a fresh `Session`, rebind telemetry, and redraw the welcome
+/// screen so it behaves like a fresh launch.
+///
+/// Shared by the `/session` command and the webui-driven project switch
+/// (`AgentEvent::ProjectSwitched`). For the project-switch case, call
+/// `apply_cd` FIRST so `ctx.working_dir` is the new dir before the new
+/// `Session` is bound to it.
+pub(crate) fn reset_to_new_session(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+) {
+    ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+    ctx.current_session_id = None;
+    state.total_tokens = 0;
+    state.prompt_tokens = 0;
+    state.completion_tokens = 0;
+    state.cached_tokens = 0;
+    state.last_context = None;
+    state.pending_context_render = None;
+    state.thinking_idx = 0;
+    state.on_turn_complete();
+    // New session = new session file on disk. Old session (already saved at its
+    // last TurnComplete) stays on disk so it can still be `/resume`d; we just
+    // stop writing into it.
+    ctx.current_session =
+        atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    // Bind telemetry + agent session id to the new session's UUID (the
+    // ClearConversation above intentionally leaves the id alone; this is the
+    // single source of truth).
+    bind_telemetry_to_session(ctx, &ctx.current_session);
+    // `reset()` wipes the terminal AND the renderer's cached footer/stream
+    // state, so the next Welcome renders against a known (row 1, col 1) anchor.
+    // Wrap the wipe + welcome re-render in one DECSET 2026 envelope so capable
+    // hosts show no intermediate blank frame (same anti-flicker as `/resume`).
+    renderer.begin_sync();
+    renderer.reset();
+    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    renderer.render(UiLine::Welcome {
+        model: ctx.model_name.clone(),
+        working_dir: dir_display,
+    });
+    renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
+    renderer.flush();
+    renderer.end_sync();
+}
+
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     ctx.agent
         .cmd_tx
@@ -3304,6 +3467,137 @@ fn decide_qr_style(
     Some(QrStyle::Dense1x2)
 }
 
+/// Extract the verbatim bodies of fenced (```` ``` ```` / `~~~`) code blocks
+/// from markdown, in document order. Used by `/copy` to recover the ORIGINAL
+/// unwrapped command text — never the rendered body cells, which are already
+/// hard-wrapped + PAD-indented and would corrupt a pasted command.
+///
+/// A fence opens on a line whose trimmed form starts with three or more of the
+/// fence char (an info string like ```` ```bash ```` is fine) and closes on a
+/// line that is ONLY fence chars of the same kind. Inner lines are kept
+/// verbatim (their own indentation preserved). An unterminated fence (a reply
+/// truncated mid-stream) still yields what was captured.
+fn extract_code_blocks(md: &str) -> Vec<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut inner: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    let mut fence_char = '`';
+    let mut fence_len = 3;
+    for line in md.lines() {
+        let t = line.trim();
+        if !in_block {
+            if let Some((c, len)) = fence_start(t) {
+                in_block = true;
+                fence_char = c;
+                fence_len = len;
+                inner.clear();
+            }
+        } else if is_closing_fence(t, fence_char, fence_len) {
+            blocks.push(inner.join("\n"));
+            in_block = false;
+        } else {
+            inner.push(line);
+        }
+    }
+    if in_block {
+        blocks.push(inner.join("\n"));
+    }
+    blocks
+}
+
+/// Outcome of resolving a `/copy [arg]` request against a reply's markdown.
+enum CopyResolve {
+    /// The text to place on the clipboard.
+    Text(String),
+    /// The reply has no fenced code block (or there's no reply yet).
+    NoBlocks,
+    /// `/copy N` referenced an out-of-range index; carries the block count.
+    BadIndex(usize),
+}
+
+/// Map `/copy [arg]` to the text to copy. `""` → last block (the common
+/// "copy the command just shown" case); `all` → every block joined by a blank
+/// line; `N` (1-based) → the Nth block.
+fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
+    let blocks = extract_code_blocks(md);
+    if blocks.is_empty() {
+        return CopyResolve::NoBlocks;
+    }
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return CopyResolve::Text(blocks.last().cloned().unwrap_or_default());
+    }
+    if arg.eq_ignore_ascii_case("all") {
+        return CopyResolve::Text(blocks.join("\n\n"));
+    }
+    match arg.parse::<usize>() {
+        Ok(n) if (1..=blocks.len()).contains(&n) => CopyResolve::Text(blocks[n - 1].clone()),
+        _ => CopyResolve::BadIndex(blocks.len()),
+    }
+}
+
+/// Write `text` to the system clipboard. Tries arboard (system clipboard
+/// API) first; falls back to OSC 52 emitted to `stdout` for headless / SSH
+/// sessions where no windowing system is available.
+///
+/// OSC 52 format: `\x1b]52;c;<base64>\x1b\\`
+///
+/// This is the public entry-point used by both the `/copy` command and the
+/// retained renderer's auto-copy path (issue #699).
+pub(crate) fn copy_text_to_clipboard_osc52(text: &str) -> bool {
+    // Tier 1: system clipboard via arboard (desktop)
+    if try_arboard_clipboard(text) {
+        return true;
+    }
+    // Tier 2: OSC 52 escape sequence. Only emit when stdout is a real
+    // terminal — piping OSC bytes into a file or another process is
+    // meaningless (issue #699 P4).
+    use std::io::IsTerminal as _;
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    write_osc52_clipboard_to(&mut std::io::stdout(), text)
+}
+
+/// Variant of [`copy_text_to_clipboard_osc52`] that emits the OSC 52
+/// fallback through `writer` instead of raw stdout.  Retained-mode
+/// renderers should use this with their own `BufWriter<Stdout>` so the
+/// escape sequence stays ordered with buffered body/content writes.
+pub(crate) fn copy_text_to_clipboard_osc52_via(
+    writer: &mut impl std::io::Write,
+    text: &str,
+) -> bool {
+    if try_arboard_clipboard(text) {
+        return true;
+    }
+    write_osc52_clipboard_to(writer, text)
+}
+
+fn try_arboard_clipboard(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text.to_string()))
+        .is_ok()
+}
+
+/// Emit an OSC 52 escape sequence through `writer`.
+fn write_osc52_clipboard_to(writer: &mut impl std::io::Write, text: &str) -> bool {
+    let seq = encode_osc52("c", text);
+    writer.write_all(seq.as_bytes()).is_ok() && writer.flush().is_ok()
+}
+
+/// Build an OSC 52 escape sequence: `ESC ]52;<buffer>;<base64> ST`.
+/// `buffer` is typically `"c"` (clipboard) or `"p"` (primary selection).
+///
+/// Note: some terminals cap OSC payloads at ~4096 bytes. For code blocks
+/// longer than ~3 KB the OSC 52 path may be silently truncated; the arboard
+/// desktop path (tier 1) has no such limit and will succeed first on any
+/// machine with a windowing system.
+pub(crate) fn encode_osc52(buffer: &str, text: &str) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;{};{}\x1b\\", buffer, b64)
+}
+
 #[cfg(test)]
 mod qr_style_tests {
     use super::*;
@@ -3508,6 +3802,37 @@ fn run_oauth_with_renderer(
     session.finish(Some(&ctx.telemetry))
 }
 
+/// Run `coding_plan::run()` on a blocking thread to prevent
+/// `reqwest::blocking::Client`'s internal tokio runtime from being
+/// dropped inside the TUI's async context. Returns the mutated config
+/// alongside the report — the caller MUST write the returned config back
+/// into `ctx.config`.
+///
+/// See `run_login_flow` for the rationale — the short version is that
+/// `reqwest::blocking::Client` creates its own runtime, and dropping it
+/// inside an existing runtime panics with "Cannot drop a runtime in a
+/// context where blocking is not allowed".
+fn run_coding_plan_blocking(
+    config: &atomcode_core::config::Config,
+    tel: &std::sync::Arc<atomcode_telemetry::Telemetry>,
+) -> Result<(atomcode_core::config::Config, atomcode_core::coding_plan::SetupReport)> {
+    let mut cfg = config.clone();
+    let tel = tel.clone();
+    // Run on a dedicated OS thread so `reqwest::blocking::Client`'s
+    // internal tokio runtime is created AND dropped outside the TUI's
+    // async context. Using `std::thread` instead of
+    // `tokio::task::spawn_blocking` keeps the call site synchronous
+    // (`run_login_flow` isn't async) and avoids the need to
+    // `Handle::block_on`.
+    std::thread::spawn(move || {
+        let report = atomcode_core::coding_plan::run(&mut cfg, Some(&tel));
+        (cfg, report)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("coding plan flow panicked"))
+    .and_then(|(cfg, report)| Ok((cfg, report?)))
+}
+
 /// Run the full login + CodingPlan setup flow: OAuth (if needed) →
 /// claim → fetch models + register providers → fetch status. Shares
 /// the orchestrator with `atomcode login` / `atomcode codingplan` (CLI).
@@ -3546,6 +3871,14 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // stdin / stdout interaction, so we don't need to suspend the
     // renderer. `step_login` short-circuits via `is_logged_in()`.
     //
+    // CodingPlan's `Client` wraps `reqwest::blocking::Client`, which
+    // internally creates its own tokio runtime. Dropping that runtime
+    // inside the TUI's async context (where this slash command runs)
+    // panics with "Cannot drop a runtime in a context where blocking is
+    // not allowed" and `panic = "abort"` kills the process. Run the
+    // whole flow on a blocking thread so the internal runtime is created
+    // and dropped outside the async context.
+    //
     // If the stored token is locally valid (file present, expires_in
     // not yet past) but the server rejects it (revoked, refresh-token
     // dead, etc.), the orchestrator surfaces `report.auth_expired =
@@ -3554,24 +3887,39 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // this the user sees "✓ already logged in as X" followed by
     // "✗ claim failed — run `atomcode login` again" and has to do
     // manually what `/codingplan` could do itself.
-    let mut report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
-    if matches!(&report, Ok(r) if r.auth_expired) {
+    let (cfg_after, mut report) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
+        Ok((cfg, r)) => (cfg, r),
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("internal error: {e:#}")));
+            renderer.flush();
+            return Ok(());
+        }
+    };
+    ctx.config = cfg_after;
+    if report.auth_expired {
         renderer.render(UiLine::CommandOutput(t(Msg::CpReauthAfter401).into_owned()));
         renderer.flush();
         match run_oauth_with_renderer(renderer, ctx)
             .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
-                report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+                let (cfg_after2, r2) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
+                    Ok((cfg, r)) => (cfg, r),
+                    Err(e) => {
+                        renderer.render(UiLine::Error(format!("internal error: {e:#}")));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                };
+                ctx.config = cfg_after2;
+                report = r2;
             }
             Err(e) => {
                 // Re-OAuth itself failed (user pressed ESC, network
                 // dead, etc.). Render the *original* report so they
                 // still see what triggered the retry, then surface the
                 // OAuth error.
-                if let Ok(r) = &report {
-                    renderer.render(UiLine::CommandOutput(r.render()));
-                }
+                renderer.render(UiLine::CommandOutput(report.render()));
                 renderer.render(UiLine::Error(
                     t(Msg::CodingPlanSetupFailed {
                         error: &e.to_string(),
@@ -3584,56 +3932,152 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         }
     }
 
-    match report {
-        Ok(report) => {
-            if report.should_persist_config() {
-                // Config mutation only persists when critical steps passed —
-                // don't write a half-set-up config if login or models failed.
-                save_and_reload(ctx, renderer);
-                // Stamp the drift-monitor sync marker alongside the config
-                // write. Failures are non-fatal: at worst the 24h staleness
-                // hint mis-fires once.
-                let _ = atomcode_core::coding_plan::write_last_sync_now();
-                // Also bump our own last-seen timestamp so the cross-process
-                // sync-check on the next keystroke doesn't redundantly
-                // reload the config we just saved ourselves.
-                ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
-                // Sync ctx.model_name with the freshly-picked default so the
-                // status line and the next turn use the right model without
-                // requiring a /reload.
-                if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
-                    ctx.model_name = p.model.clone();
-                }
-                // Clear any stale drift warning now that we've just
-                // re-synced. Also reset the cooldown so the next
-                // pre-turn trigger (if conditions change) can fire
-                // immediately — no need to wait 15 min after a manual
-                // refresh.
-                if let Ok(mut g) = ctx.monitor_warning.lock() {
-                    *g = None;
-                }
-                ctx.monitor_last_check_at = None;
-                // Same for usage slot — a fresh /login run may have
-                // rotated the quota window or switched plan tiers.
-                if let Ok(mut g) = ctx.usage_slot.lock() {
-                    *g = None;
-                }
-                ctx.usage_last_check_at = None;
-            }
-            renderer.render(UiLine::CommandOutput(report.render()));
-            renderer.flush();
+    if report.should_persist_config() {
+        // Config mutation only persists when critical steps passed —
+        // don't write a half-set-up config if login or models failed.
+        save_and_reload(ctx, renderer);
+        // Stamp the drift-monitor sync marker alongside the config
+        // write. Failures are non-fatal: at worst the 24h staleness
+        // hint mis-fires once.
+        let _ = atomcode_core::coding_plan::write_last_sync_now();
+        // Also bump our own last-seen timestamp so the cross-process
+        // sync-check on the next keystroke doesn't redundantly
+        // reload the config we just saved ourselves.
+        ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
+        // Update `ctx.model_name` to reflect the new default provider from
+        // the just-completed login/setup. This ensures the status line shows
+        // the current model immediately rather than the pre-login value.
+        // The bridge's ReloadConfig is asynchronous (sent by `save_and_reload`
+        // above) — if the bridge fails to switch (e.g. gateway signer
+        // unavailable), the user will see the error on their next chat turn
+        // and can fall back to `/model`. This matches `/model`'s approach
+        // which also updates `ctx.model_name` optimistically.
+        if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
+            ctx.model_name = p.model.clone();
         }
-        Err(e) => {
-            renderer.render(UiLine::Error(
-                t(Msg::CodingPlanSetupFailed {
-                    error: &format!("{:#}", e),
-                })
-                .into_owned(),
-            ));
-            renderer.flush();
+        // NOTE: the footer context window is NOT refreshed here — `run_login_flow`
+        // has no `UiState` handle. The post-login window self-corrects on the
+        // first turn's ContextStats; threading state through just for this rare
+        // path isn't worth it. The /model picker + reload paths do refresh it.
+        // Clear any stale drift warning now that we've just
+        // re-synced. Also reset the cooldown so the next
+        // pre-turn trigger (if conditions change) can fire
+        // immediately — no need to wait 15 min after a manual
+        // refresh.
+        if let Ok(mut g) = ctx.monitor_warning.lock() {
+            *g = None;
+        }
+        ctx.monitor_last_check_at = None;
+        // Same for usage slot — a fresh /login run may have
+        // rotated the quota window or switched plan tiers.
+        if let Ok(mut g) = ctx.usage_slot.lock() {
+            *g = None;
+        }
+        ctx.usage_last_check_at = None;
+    }
+    renderer.render(UiLine::CommandOutput(report.render()));
+    renderer.flush();
+    Ok(())
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::{extract_code_blocks, resolve_copy, CopyResolve};
+
+    const REPLY: &str = "Run cmake + build:\n\
+        ```\n\
+        cmake D:\\proj -DBUILD=ON -DLONG=\"a very long windows path here\"\n\
+        ```\n\
+        then:\n\
+        ```bash\n\
+        cmake --build . --target demo -j4\n\
+        ```";
+
+    #[test]
+    fn extracts_blocks_verbatim_in_order() {
+        let blocks = extract_code_blocks(REPLY);
+        assert_eq!(blocks.len(), 2);
+        // No hard-wrap, no PAD indent — the command is one logical line.
+        assert_eq!(
+            blocks[0],
+            "cmake D:\\proj -DBUILD=ON -DLONG=\"a very long windows path here\""
+        );
+        assert_eq!(blocks[1], "cmake --build . --target demo -j4");
+    }
+
+    #[test]
+    fn multiline_block_preserves_inner_newlines_and_indent() {
+        let md = "```\nline1\n  indented2\nline3\n```";
+        let blocks = extract_code_blocks(md);
+        assert_eq!(blocks, vec!["line1\n  indented2\nline3".to_string()]);
+    }
+
+    #[test]
+    fn unterminated_fence_still_yields_partial() {
+        // A reply truncated mid-stream — still copyable.
+        let md = "```\nhalf a command";
+        assert_eq!(extract_code_blocks(md), vec!["half a command".to_string()]);
+    }
+
+    #[test]
+    fn no_fence_yields_nothing() {
+        assert!(extract_code_blocks("just prose, `inline code` only").is_empty());
+    }
+
+    #[test]
+    fn longer_fence_can_contain_a_shorter_fence() {
+        let md = "````markdown\n```rust\nfn main() {}\n```\n````";
+        assert_eq!(
+            extract_code_blocks(md),
+            vec!["```rust\nfn main() {}\n```".to_string()]
+        );
+    }
+
+    #[test]
+    fn tilde_fence_requires_a_matching_marker() {
+        let md = "~~~text\n```\nstill inside\n~~~";
+        assert_eq!(extract_code_blocks(md), vec!["```\nstill inside".to_string()]);
+    }
+
+    #[test]
+    fn resolve_default_picks_last_block() {
+        match resolve_copy(REPLY, "") {
+            CopyResolve::Text(t) => assert_eq!(t, "cmake --build . --target demo -j4"),
+            _ => panic!("default should resolve to the last block"),
         }
     }
-    Ok(())
+
+    #[test]
+    fn resolve_index_is_one_based() {
+        match resolve_copy(REPLY, "1") {
+            CopyResolve::Text(t) => assert!(t.starts_with("cmake D:\\proj")),
+            _ => panic!("/copy 1 should pick the first block"),
+        }
+    }
+
+    #[test]
+    fn resolve_all_joins_every_block() {
+        match resolve_copy(REPLY, "all") {
+            CopyResolve::Text(t) => {
+                assert!(t.contains("-DBUILD=ON"));
+                assert!(t.contains("--build ."));
+            }
+            _ => panic!("/copy all should join blocks"),
+        }
+    }
+
+    #[test]
+    fn resolve_bad_index_reports_count() {
+        assert!(matches!(resolve_copy(REPLY, "9"), CopyResolve::BadIndex(2)));
+        assert!(matches!(resolve_copy(REPLY, "0"), CopyResolve::BadIndex(2)));
+        assert!(matches!(resolve_copy(REPLY, "x"), CopyResolve::BadIndex(2)));
+    }
+
+    #[test]
+    fn resolve_no_blocks_when_reply_has_none() {
+        assert!(matches!(resolve_copy("plain reply", ""), CopyResolve::NoBlocks));
+        assert!(matches!(resolve_copy("", ""), CopyResolve::NoBlocks));
+    }
 }
 
 #[cfg(test)]

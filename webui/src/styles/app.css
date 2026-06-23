@@ -9,10 +9,12 @@ html, body {
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: var(--app-sans-font-family);
   font-size: 13px;
   color: var(--app-primary-foreground);
   background: var(--app-primary-background);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 #app {
@@ -391,6 +393,19 @@ body {
   white-space: pre-wrap;
 }
 
+/* Non-fatal advisory (e.g. "conversation compacted") — muted amber notice line,
+   visually distinct from a red error and never merged into the reply text. */
+.msg-notice {
+  color: var(--app-warning-accent);
+  background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
+  border-radius: 6px;
+  padding: 4px 10px;
+  margin: 6px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .streaming-cursor {
   display: inline-block;
   width: 7px;
@@ -433,7 +448,8 @@ body {
 .tool-name {
   font-weight: 700;
   color: var(--app-primary-foreground);
-  text-transform: capitalize;
+  /* No text-transform: `displayToolName` already cases names correctly
+     (PascalCase for builtins, lowercase `mcp · server · tool` for MCP). */
   flex-shrink: 0;
 }
 
@@ -582,10 +598,10 @@ body {
 }
 
 .input-box {
-  background: var(--app-input-secondary-background);
+  background: var(--app-input-background);
   border: 1px solid var(--app-input-border);
-  border-radius: var(--corner-radius-large);
-  box-shadow: 0 1px 2px #0000001a;
+  border-radius: 20px;
+  box-shadow: 0 2px 10px #0000000d, 0 1px 3px #00000008;
   display: flex;
   flex-direction: column;
   position: relative;
@@ -610,7 +626,7 @@ body {
   min-height: 3em;
   max-height: 200px;
   overflow-y: auto;
-  padding: 10px 14px;
+  padding: 14px 18px;
   width: 100%;
 }
 .message-input::placeholder { color: var(--app-input-placeholder-foreground); }
@@ -1653,6 +1669,18 @@ body {
   flex-shrink: 1;
 }
 
+/* Reasoning-effort selector — sits left of the model selector, only shown
+   for DeepSeek V4 models. Reuses the model-selector trigger/dropdown styles;
+   `.effort-prefix` is the small muted "Effort" label on the trigger. */
+.input-footer .effort-selector { flex-shrink: 0; }
+.effort-prefix {
+  color: var(--app-secondary-foreground);
+  font-size: 10px;
+  opacity: 0.7;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .input-footer .model-selector-trigger {
   height: 22px;
   color: var(--app-secondary-foreground);
@@ -1824,9 +1852,10 @@ body {
 }
 
 .landing-brand {
+  font-family: var(--app-serif-font-family);
   font-size: clamp(34px, 2.6vw, 52px);
-  font-weight: 600;
-  letter-spacing: -0.02em;
+  font-weight: 500;
+  letter-spacing: -0.01em;
   color: var(--app-brand-text);
 }
 

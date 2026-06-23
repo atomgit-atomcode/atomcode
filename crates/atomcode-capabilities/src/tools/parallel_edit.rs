@@ -10,10 +10,6 @@
 //! `change_dir`/`todo` tools. The kernel ([`Agent`] + `run_to_completion`) is L0, so this
 //! needs nothing above the kernel. Because it carries a provider + a tool factory it is
 //! OPT-IN (constructed by the embedder, not part of `register_coding_tools`).
-//!
-//! Scope vs. the production tool: this ports the dispatch + contract + per-file status
-//! surface. It does NOT run the post-edit build probe (cargo/npm/…) — that is a
-//! product/L2 concern; the model repairs cross-file gaps from the returned statuses.
 
 use super::{err, ok};
 use async_trait::async_trait;
@@ -23,6 +19,7 @@ use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Default per-child system prompt: a focused single-file editor.
@@ -87,13 +84,20 @@ impl Tool for ParallelEditTool {
         "parallel_edit_files"
     }
     fn description(&self) -> &str {
-        "Edit multiple INDEPENDENT files in parallel, one child agent per file. Use ONLY \
-         when you have 2+ concrete files to edit, each with a clear instruction, the edits \
-         don't depend on each other, and any cross-file invariant (shared trait/type/\
-         interface) is captured in `contract`. Do NOT use while still exploring, for \
-         impl/decl splits that need coordinated edits (use edit_file sequentially), or \
-         when you still need to read files first. Each child sees only its file + the \
-         contract — changes not in `contract` will be missed."
+        "Edit multiple INDEPENDENT files in parallel via fork sub-agents.\n\n\
+        Use ONLY when:\n\
+        - You have 2+ concrete files to edit, each with a clear instruction\n\
+        - Edits in different files don't depend on each other\n\
+        - You can express any cross-file invariants (shared trait/type/interface) in `contract`\n\n\
+        Do NOT use when:\n\
+        - You're still exploring or the edit isn't fully decided\n\
+        - Files have impl/decl splits that need coordinated edits (use sequential edit_file)\n\
+        - You want to read more files first (use read_file)\n\n\
+        Each sub-agent sees only its assigned file content + the contract you provide. \
+        Cross-file changes that aren't expressed in `contract` will be missed by the merge — \
+        the sub-agents cannot see each other's edits. After all sub-agents settle, the \
+        framework runs a build probe (cargo/npm/mvn/go) and surfaces compile errors so you \
+        can repair cross-file gaps."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -106,13 +110,22 @@ impl Tool for ParallelEditTool {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "path": { "type": "string", "description": "File path (absolute or relative to the working directory)" },
-                            "instruction": { "type": "string", "description": "Concrete edit for THIS file: what to add/change/remove and why. The child sees only this + the file + the contract." }
+                            "path": {
+                                "type": "string",
+                                "description": "File path. Absolute, or relative to the working directory."
+                            },
+                            "instruction": {
+                                "type": "string",
+                                "description": "Concrete edit description for THIS file. Be specific: what to add/modify/remove and why. The sub-agent sees only this instruction + the file content + the contract — no other context."
+                            }
                         },
                         "required": ["path", "instruction"]
                     }
                 },
-                "contract": { "type": "string", "description": "Cross-file invariants every child must honor (shared traits, signatures, naming). Empty if files are fully independent." }
+                "contract": {
+                    "type": "string",
+                    "description": "Cross-file invariants every sub-agent must honour: shared traits, type signatures, interface contracts, naming conventions. Empty if files are fully independent."
+                }
             },
             "required": ["files"]
         })
@@ -122,24 +135,40 @@ impl Tool for ParallelEditTool {
     fn risk(&self, _args: &str) -> atomcode_kernel::tool::RiskLevel {
         atomcode_kernel::tool::RiskLevel::Risky
     }
+    fn always_grant_scope(&self, _args: &str) -> String {
+        // Tool-wide: "总是 / Always" approves every batch edit this session (v1 parity).
+        String::new()
+    }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => {
                 return err(format!(
-                    "parallel_edit_files: invalid arguments: {e}. Expected {{\"files\":[{{\"path\":..,\"instruction\":..}}], \"contract\":\"\"}}."
+                    "{} (parallel_edit_files arguments must be {{\"files\": [{{\"path\": \"…\", \"instruction\": \"…\"}}, …], \"contract\": \"…\"?}})",
+                    e
                 ))
             }
         };
         if a.files.len() < 2 {
-            return err("parallel_edit_files: provide at least 2 files (use edit_file for a single file).");
+            return err("parallel_edit_files requires at least 2 files. For a single file, call edit_file directly.");
         }
         if a.files.len() > self.max_files {
-            return err(format!("parallel_edit_files: too many files ({}, max {}).", a.files.len(), self.max_files));
+            return err(format!(
+                "parallel_edit_files capped at {} files; you sent {}. Split into smaller batches or run sequentially.",
+                self.max_files, a.files.len()
+            ));
         }
-        if let Some(bad) = a.files.iter().find(|f| f.path.trim().is_empty() || f.instruction.trim().is_empty()) {
-            let _ = bad;
-            return err("parallel_edit_files: every file needs a non-empty `path` and `instruction`.");
+        for (i, f) in a.files.iter().enumerate() {
+            if f.path.trim().is_empty() {
+                return err(format!("files[{}].path is empty", i));
+            }
+            if f.instruction.trim().is_empty() {
+                return err(format!(
+                    "files[{}].instruction is empty. Each file needs a concrete edit description; \
+                     a sub-agent with no instruction will either fake an edit or burn its budget.",
+                    i
+                ));
+            }
         }
 
         let contract_block = if a.contract.trim().is_empty() {
@@ -172,41 +201,150 @@ impl Tool for ParallelEditTool {
             }));
         }
 
-        let mut rows = Vec::with_capacity(handles.len());
-        let mut any_failed = false;
+        struct FileResult {
+            path: String,
+            success: bool,
+            turns_used: usize,
+            summary: String,
+            failures: Vec<String>,
+        }
+
+        let mut results = Vec::with_capacity(handles.len());
         for h in handles {
             let (path, outcome) = match h.await {
                 Ok(pair) => pair,
                 Err(_) => {
-                    any_failed = true;
-                    rows.push("✗ <unknown>: child task panicked/aborted".to_string());
+                    results.push(FileResult {
+                        path: "<unknown>".to_string(),
+                        success: false,
+                        turns_used: 0,
+                        summary: String::new(),
+                        failures: vec!["child task panicked/aborted".to_string()],
+                    });
                     continue;
                 }
             };
             if outcome.stop == StopReason::Stopped {
                 let summary = outcome.text.lines().next().unwrap_or("").trim();
                 let summary = if summary.is_empty() { "(edited)" } else { summary };
-                rows.push(format!("✓ {path}: {summary}"));
+                results.push(FileResult {
+                    path,
+                    success: true,
+                    turns_used: outcome.tool_results.len(),
+                    summary: summary.to_string(),
+                    failures: vec![],
+                });
             } else {
-                any_failed = true;
                 let reason = outcome.error.unwrap_or_else(|| format!("{:?}", outcome.stop));
-                rows.push(format!("✗ {path}: {reason}"));
+                results.push(FileResult {
+                    path: path.clone(),
+                    success: false,
+                    turns_used: outcome.tool_results.len(),
+                    summary: String::new(),
+                    failures: vec![reason],
+                });
             }
         }
 
-        let header = format!(
-            "parallel_edit_files: {} file(s), {} succeeded, {} failed.",
-            rows.len(),
-            rows.iter().filter(|r| r.starts_with('✓')).count(),
-            rows.iter().filter(|r| r.starts_with('✗')).count(),
+        let ok_count = results.iter().filter(|r| r.success).count();
+        let fail_count = results.len() - ok_count;
+        let mut summary = format!(
+            "Sub-agents: {} ok, {} fail (of {})\n",
+            ok_count,
+            fail_count,
+            results.len(),
         );
-        let body = format!("{header}\n{}", rows.join("\n"));
-        if any_failed {
-            err(body)
+        let mut all_success = fail_count == 0;
+        for r in &results {
+            let icon = if r.success { "✓" } else { "✗" };
+            let summary_line = r.summary.lines().next().unwrap_or("").trim();
+            summary.push_str(&format!(
+                "  {} {} ({}T) — {}\n",
+                icon, r.path, r.turns_used, summary_line,
+            ));
+            if !r.success {
+                for failure in &r.failures {
+                    summary.push_str(&format!("      reason: {:?}\n", failure));
+                }
+            }
+        }
+
+        // Build verification — best-effort, structural detector (probes
+        // for build-system markers, not model intent). On miss the table
+        // is the final answer. The marker probe does blocking `read_dir`,
+        // so run it on the blocking pool to keep cancellation responsive.
+        let working_dir = ctx.working_dir.clone();
+        let build_detect = tokio::task::spawn_blocking(move || find_build_command(&working_dir))
+            .await
+            .ok()
+            .flatten();
+        if let Some((cmd, build_dir)) = build_detect {
+            let mut build_cmd = tokio::process::Command::new("sh");
+            build_cmd.args(["-c", &cmd])
+                .current_dir(&build_dir);
+            let output = build_cmd.output().await;
+            if let Ok(out) = output {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let combined = format!("{}{}", stdout, stderr);
+                if !out.status.success() || combined.to_lowercase().contains("error") {
+                    let err_lines: String =
+                        combined.lines().take(15).collect::<Vec<_>>().join("\n");
+                    summary.push_str(&format!(
+                        "\n⚠ BUILD ERRORS after merge:\n{}\nFix these before proceeding.\n",
+                        err_lines
+                    ));
+                    all_success = false;
+                } else {
+                    summary.push_str("\n✓ Build verification passed.\n");
+                }
+            }
+        }
+
+        if all_success {
+            ok(summary)
         } else {
-            ok(body)
+            err(summary)
         }
     }
+}
+
+/// Probe for build markers in the working directory (Cargo.toml, package.json, pom.xml,
+/// go.mod) and return the appropriate build command + the directory where the marker was
+/// found. Searches the working directory then immediate subdirectories so nested project
+/// layouts (a Cargo workspace under a monorepo) still resolve.
+fn find_build_command(wd: &Path) -> Option<(String, std::path::PathBuf)> {
+    let markers: &[(&str, &str)] = &[
+        ("package.json", "npm run build 2>&1 | head -30"),
+        ("Cargo.toml", "cargo check 2>&1 | tail -20"),
+        ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
+        ("go.mod", "go build ./... 2>&1 | tail -20"),
+    ];
+
+    for &(marker, cmd) in markers {
+        if wd.join(marker).exists() {
+            return Some((cmd.to_string(), wd.to_path_buf()));
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(wd) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let sub = entry.path();
+                let name = sub.file_name().unwrap_or_default().to_string_lossy();
+                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                    continue;
+                }
+                for &(marker, cmd) in markers {
+                    if sub.join(marker).exists() {
+                        return Some((cmd.to_string(), sub));
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -272,9 +410,9 @@ mod tests {
             )
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("2 file(s), 2 succeeded, 0 failed"), "{}", r.content);
-        assert!(r.content.contains("✓ a.rs: renamed the symbol"), "{}", r.content);
-        assert!(r.content.contains("✓ b.rs: renamed the symbol"), "{}", r.content);
+        assert!(r.content.contains("2 ok, 0 fail (of 2)"), "{}", r.content);
+        assert!(r.content.contains("✓ a.rs"), "{}", r.content);
+        assert!(r.content.contains("✓ b.rs"), "{}", r.content);
     }
 
     #[tokio::test]
@@ -290,7 +428,7 @@ mod tests {
         let args = format!("{{\"files\":[{}]}}", files.join(","));
         let r = tool(Some("x")).execute(&args, &ctx()).await;
         assert!(r.is_error);
-        assert!(r.content.contains("too many files"), "{}", r.content);
+        assert!(r.content.contains("capped at 12 files"), "{}", r.content);
     }
 
     #[tokio::test]
@@ -299,7 +437,7 @@ mod tests {
             .execute(r#"{"files":[{"path":"a.rs","instruction":""},{"path":"b.rs","instruction":"y"}]}"#, &ctx())
             .await;
         assert!(r.is_error);
-        assert!(r.content.contains("non-empty"), "{}", r.content);
+        assert!(r.content.contains("files[0].instruction is empty"), "{}", r.content);
     }
 
     #[tokio::test]
@@ -310,8 +448,8 @@ mod tests {
             .execute(r#"{"files":[{"path":"a.rs","instruction":"x"},{"path":"b.rs","instruction":"y"}]}"#, &ctx())
             .await;
         assert!(r.is_error, "{}", r.content);
-        assert!(r.content.contains("0 succeeded, 2 failed"), "{}", r.content);
-        assert!(r.content.contains("✗ a.rs:"), "{}", r.content);
+        assert!(r.content.contains("0 ok, 2 fail (of 2)"), "{}", r.content);
+        assert!(r.content.contains("✗ a.rs"), "{}", r.content);
     }
 
     #[test]

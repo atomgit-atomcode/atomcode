@@ -11,6 +11,10 @@ atomcode-kernel = { path = "../atomcode-kernel" }
 # embedders, not for this crate).
 atomcode-capabilities = { path = "../atomcode-capabilities", features = [
     "provider", "tools", "web", "codeintel", "skills", "mcp", "session", "memory",
+    # CC-compatible external hooks (hooks.json): production parity with the legacy
+    # core engine, which always ran them. Zero overhead when no hooks.json exists
+    # (prepare skips registration — see CCExternalHooks::is_empty).
+    "cc-hooks",
 ] }
 # The review specialization, mounted as a `code_review` sub-agent TOOL so the coding
 # agent can review the current changes in-session (L2 composing a sibling L2).
@@ -35,3 +39,6 @@ atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
 async-trait = "0.1"
+# Serialize tests that mutate the process-global ATOMCODE_HOME env var so they
+# don't race (cache_prefix asserts byte-identical system prompt across assemblies).
+serial_test = "3"

@@ -7,10 +7,16 @@ use std::time::{Duration, Instant};
 
 use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
+use atomcode_coding::{
+    assemble, prepare, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
+};
 use atomcode_core::agent::{
     AgentClient, AgentCommand as CoreCmd, AgentEvent as CoreEv, AgentPhase, TurnStopReason,
 };
+use atomcode_core::agent::goal::{GoalResult, GoalState};
+use atomcode_core::agent::goal_evaluator::{EvalOutcome, GoalEvaluator};
+use atomcode_core::conversation::ConversationSnapshot;
+use tokio_util::sync::CancellationToken;
 use atomcode_kernel::event::{
     AgentCommand as KCmd, AgentEvent as KEv, RequestId, StopReason,
 };
@@ -28,6 +34,11 @@ pub struct BridgeConfig {
     pub model: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
+    /// User-configured per-response output cap (`provider.max_tokens`). `None` ⇒ the engine
+    /// derives a fallback from the context window in `build_provider`. Threaded so v2 honors
+    /// the same per-provider knob the legacy engine reads (previously dropped → the gateway's
+    /// hidden default truncated long replies with `finish_reason=length`).
+    pub max_tokens: Option<u32>,
     /// Disable MCP connection (mirrors the legacy `--no-mcp` style switches).
     pub mcp: bool,
     /// Telemetry sink forwarded to the coding assembly (→ a `LlmChat`-emitting
@@ -53,6 +64,18 @@ pub struct BridgeConfig {
     pub thinking_type: Option<String>,
     /// Kimi K2.6 `thinking.keep`.
     pub thinking_keep: Option<String>,
+    /// `--dangerously-skip-permissions` / `-y`: auto-approve every tool without a
+    /// prompt. In v1 the core `PermissionDecider` did this before any prompt surfaced;
+    /// v2's approval round-trips to the bridge (the driver), so the bypass lives here.
+    /// Previously UNTHREADED — the flag never reached v2, so bypass silently no-op'd
+    /// and every Risky tool still prompted (the `BridgeConfig`-drops-config footgun).
+    pub dangerously_skip_permissions: bool,
+    /// Is a human present to answer approval prompts? `true` (interactive TUI / live web)
+    /// ⇒ approvals PARK until answered, so a thinking user is never auto-denied. `false`
+    /// (headless `-p`, automated) ⇒ keep the fail-closed approval timeout so a never-
+    /// answered approval can't park a turn forever. Maps to the kernel agent's
+    /// `request_timeout` (None vs the configured bound) — approval is the only round-trip.
+    pub interactive: bool,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -94,9 +117,33 @@ struct TurnStats {
     total_tokens: usize,
 }
 
+/// Resolve CC hooks contributed INLINE by installed plugins into the kernel-stack hook
+/// config. The bridge is the one driver that may depend on `atomcode-core`'s plugin loader
+/// (L1 / `atomcode-coding` cannot), so this mapping lives here: core hands back neutral
+/// [`PluginCcHook`](atomcode_core::plugin::loader::PluginCcHook) specs and we lift each into
+/// an `atomcode_coding::cc_hooks::HookConfig`. Gathered once per bridge (it reads installed
+/// plugin manifests from disk) and reused across respawns.
+fn gather_plugin_cc_hooks() -> Vec<atomcode_coding::cc_hooks::HookConfig> {
+    atomcode_core::plugin::loader::installed_plugin_cc_hooks()
+        .into_iter()
+        .filter_map(|h| {
+            atomcode_coding::cc_hooks::HookConfig::from_plugin_spec(
+                &h.event,
+                h.matcher,
+                h.command,
+                h.timeout_secs,
+                h.plugin_root,
+            )
+        })
+        .collect()
+}
+
 struct Bridge {
     coding_cfg: CodingAgentConfig,
     opts_template: PrepareOptions,
+    /// Plugin-contributed inline CC hooks, resolved once and threaded into every
+    /// `prepare` (initial + respawns) so plugin hooks survive a model swap / reload.
+    plugin_cc_hooks: Vec<atomcode_coding::cc_hooks::HookConfig>,
     parts: atomcode_coding::CodingParts,
     handle: atomcode_kernel::agent::AgentHandle,
     ev_tx: mpsc::UnboundedSender<CoreEv>,
@@ -132,6 +179,32 @@ struct Bridge {
     pending_local_shell: Vec<String>,
     /// Monotonic id for `!cmd` tool-call display events.
     local_shell_seq: u64,
+    /// `--dangerously-skip-permissions`: auto-approve kernel approval round-trips
+    /// instead of prompting the driver (see [`bypass_auto_approval`]).
+    dangerously_skip_permissions: bool,
+    /// `true` when the bridge was built with a [`noop_handle`] because the kernel
+    /// agent could not be initialised. In this state `SendMessage` is answered with
+    /// an `Error` instead of being forwarded to the (nonexistent) kernel so the user
+    /// sees feedback instead of an infinite "Pondering…" spinner.
+    degraded: bool,
+    /// Active `/goal` state (loop-until-evaluator-met), or None. Reuses v1's
+    /// `GoalState`; the loop is driven from the turn-end Snapshot hook.
+    goal: Option<GoalState>,
+    /// Provider for the goal evaluator (reuses v1's `GoalEvaluator`), built lazily
+    /// on SetGoal from `evaluator_provider`/default provider. Cloned into each
+    /// spawned eval task.
+    goal_provider: Option<Arc<dyn atomcode_core::provider::LlmProvider>>,
+    /// Cancels an in-flight goal evaluation (fresh per goal). Triggered by
+    /// Cancel/ClearGoal/Shutdown so Esc interrupts the evaluator immediately
+    /// instead of waiting out its 30s/event timeout.
+    goal_cancel: CancellationToken,
+    /// Set while a goal evaluation runs OFF the select loop: holds the deferred
+    /// turn (reason + conversation) until the eval result comes back. `Some` ⇒
+    /// an eval is in flight and the driver-facing turn is held open.
+    pending_goal: Option<(StopReason, Vec<atomcode_core::conversation::message::Message>)>,
+    /// The spawned eval task reports its outcome here; drained by the main loop
+    /// as a third event source so commands (Cancel) stay responsive during eval.
+    goal_eval_tx: mpsc::UnboundedSender<EvalOutcome>,
 }
 
 impl Bridge {
@@ -147,6 +220,9 @@ impl Bridge {
             &cfg.working_dir,
         );
         coding_cfg.context_window = cfg.context_window;
+        // User-configured per-call output cap (parity with `apply_reload_provider`); `None` ⇒
+        // the per-provider fallback in `build_provider` applies.
+        coding_cfg.chat_options.max_tokens = cfg.max_tokens;
         coding_cfg.telemetry = cfg.telemetry.clone();
         coding_cfg.reasoning_history = cfg.reasoning_history.clone();
         // `/effort`: thread the per-provider reasoning_effort into the per-call ChatOptions
@@ -159,6 +235,12 @@ impl Bridge {
         coding_cfg.thinking_enabled = cfg.thinking_enabled;
         coding_cfg.thinking_type = cfg.thinking_type.clone();
         coding_cfg.thinking_keep = cfg.thinking_keep.clone();
+        // Interactive drivers PARK approvals (a present human must not be auto-denied for
+        // thinking too long); headless keeps the configured fail-closed timeout. Liveness for
+        // a crashed interactive driver is handled by Cancel/Shutdown flushing pending requests.
+        if cfg.interactive {
+            coding_cfg.request_timeout = None;
+        }
 
         let opts_template = PrepareOptions {
             session: SessionMode::Fresh,
@@ -170,43 +252,65 @@ impl Bridge {
             // command + model self-invocation). Reuses this agent's signed provider.
             review: true,
         };
+        // Inline CC hooks from installed plugins (resolved here — only the bridge can reach
+        // the core plugin loader). Reused across respawns via the Bridge struct below.
+        let plugin_cc_hooks = gather_plugin_cc_hooks();
 
-        let mut parts = match prepare(&coding_cfg, opts_template.clone()).await {
+        let mut parts = match prepare_with_plugin_hooks(
+            &coding_cfg,
+            opts_template.clone(),
+            plugin_cc_hooks.clone(),
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 let _ = ev_tx.send(CoreEv::Error {
                     error: format!("engine v2 prepare failed: {e}"),
-                    messages: vec![],
+                    snapshot: ConversationSnapshot::default(),
                 });
+                // prepare() failed — we can't build a Bridge at all (no parts).
+                // Enter a keep-alive loop so the TUI doesn't exit, but the user
+                // must restart atomcode to recover.
+                Self::keep_alive_loop(ev_tx, cmd_rx).await;
                 return;
             }
         };
         let bridge_session =
             parts.session.as_ref().map(|b| b.id.clone()).unwrap_or_default();
         let provider = match build_provider(&coding_cfg) {
-            Ok(p) => p,
+            Ok(p) => Some(p),
             Err(e) => {
                 let _ = ev_tx.send(CoreEv::Error {
-                    error: format!("engine v2 provider init failed: {e}"),
-                    messages: vec![],
+                    error: atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitFailed {
+                        detail: &e.to_string(),
+                    })
+                    .into_owned(),
+                    snapshot: ConversationSnapshot::default(),
                 });
-                return;
+                None
             }
         };
-        let handle = match assemble(&mut parts, &coding_cfg, provider) {
-            Ok(a) => a.spawn(),
-            Err(e) => {
-                let _ = ev_tx.send(CoreEv::Error {
-                    error: format!("engine v2 assemble failed: {e}"),
-                    messages: vec![],
-                });
-                return;
-            }
+        let (handle, degraded) = match provider {
+            Some(provider) => match assemble(&mut parts, &coding_cfg, provider) {
+                Ok(a) => (a.spawn(), false),
+                Err(e) => {
+                    let _ = ev_tx.send(CoreEv::Error {
+                        error: format!("engine v2 assemble failed: {e}"),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                    (Self::noop_handle(), true)
+                }
+            },
+            None => (Self::noop_handle(), true),
         };
+
+        let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
 
         let mut bridge = Bridge {
             coding_cfg,
             opts_template,
+            plugin_cc_hooks,
             parts,
             handle,
             ev_tx,
@@ -223,6 +327,13 @@ impl Bridge {
             background_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_local_shell: Vec::new(),
             local_shell_seq: 0,
+            dangerously_skip_permissions: cfg.dangerously_skip_permissions,
+            degraded,
+            goal: None,
+            goal_provider: None,
+            goal_cancel: CancellationToken::new(),
+            pending_goal: None,
+            goal_eval_tx,
         };
 
         loop {
@@ -235,6 +346,11 @@ impl Bridge {
                     }
                     None => break, // driver gone
                 },
+                // Goal evaluations run on a spawned task and report here, so a
+                // Cancel arriving mid-eval is still processed (cmd_rx stays live).
+                Some(outcome) = goal_eval_rx.recv() => {
+                    bridge.on_goal_eval_result(outcome).await;
+                }
                 ev = bridge.handle.events.recv() => match ev {
                     Some(e) => bridge.on_kernel_event(e).await,
                     None => {
@@ -248,7 +364,7 @@ impl Bridge {
                         }
                         let _ = bridge.ev_tx.send(CoreEv::Error {
                             error: "engine v2 agent terminated".into(),
-                            messages: vec![],
+                            snapshot: ConversationSnapshot::default(),
                         });
                         break;
                     }
@@ -263,18 +379,144 @@ impl Bridge {
         let _ = self.ev_tx.send(ev);
     }
 
+    /// Goal-mode turn-end hook: spawn the evaluator OFF the select loop and hold
+    /// the turn open (store `pending_goal`) until its result arrives on
+    /// `goal_eval_tx`. Keeping it off the loop means a Cancel during the (up to
+    /// 30s/event) evaluation is still processed — it cancels `goal_cancel`, which
+    /// aborts the spawned evaluate immediately.
+    fn spawn_goal_eval(
+        &mut self,
+        reason: StopReason,
+        messages: Vec<atomcode_core::conversation::message::Message>,
+    ) {
+        let (Some(provider), Some(condition)) = (
+            self.goal_provider.clone(),
+            self.goal.as_ref().filter(|g| g.active).map(|g| g.condition.clone()),
+        ) else {
+            self.finish_turn(reason, messages);
+            return;
+        };
+        let prev = self.goal.as_ref().and_then(|g| g.last_eval_reason.clone());
+        let summary = summarize_for_goal(&messages, prev.as_deref());
+        self.pending_goal = Some((reason, messages));
+        let cancel = self.goal_cancel.clone();
+        let tx = self.goal_eval_tx.clone();
+        tokio::spawn(async move {
+            let evaluator = GoalEvaluator::new(provider);
+            let outcome = evaluator.evaluate(&condition, &summary, &cancel).await;
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// Apply a goal evaluation result delivered from the spawned task. Met (or
+    /// evaluator-exhausted) clears the goal and finishes the held-open turn; NotMet
+    /// (or a recoverable evaluator error) injects a continuation and keeps the turn
+    /// open. A `None` `pending_goal` means the goal was cleared/cancelled while the
+    /// eval ran — ignore the stale outcome.
+    async fn on_goal_eval_result(&mut self, outcome: EvalOutcome) {
+        let Some((reason, messages)) = self.pending_goal.take() else {
+            return;
+        };
+        if let Some(u) = outcome.usage.as_ref() {
+            if let Some(g) = self.goal.as_mut() {
+                g.add_tokens((u.prompt_tokens + u.completion_tokens) as u64);
+            }
+        }
+        match outcome.result {
+            GoalResult::Met { reason: verdict } => {
+                if let Some(g) = self.goal.as_mut() {
+                    g.active = false;
+                    g.last_eval_reason = Some(verdict);
+                }
+                if let Some(g) = self.goal.take() {
+                    let ev = goal_update_ev(&g);
+                    self.emit(ev);
+                }
+                self.finish_turn(reason, messages);
+            }
+            GoalResult::NotMet { reason: verdict } => {
+                let cond = match self.goal.as_mut() {
+                    Some(g) => {
+                        g.round += 1;
+                        g.evaluator_consecutive_failures = 0;
+                        g.last_eval_reason = Some(verdict.clone());
+                        g.condition.clone()
+                    }
+                    None => {
+                        self.finish_turn(reason, messages);
+                        return;
+                    }
+                };
+                let ev = goal_update_ev(self.goal.as_ref().unwrap());
+                self.emit(ev);
+                let text = format!(
+                    "Goal not yet met: {verdict}\n\nContinue working toward this goal:\n```\n{cond}\n```"
+                );
+                self.start_turn_stats();
+                let _ = self.handle.commands.send(KCmd::SendMessage { text, images: vec![] });
+            }
+            GoalResult::Error(e) => {
+                let exhausted = match self.goal.as_mut() {
+                    Some(g) => {
+                        g.evaluator_consecutive_failures += 1;
+                        g.is_evaluator_exhausted()
+                    }
+                    None => {
+                        self.finish_turn(reason, messages);
+                        return;
+                    }
+                };
+                if exhausted {
+                    if let Some(g) = self.goal.as_mut() {
+                        g.active = false;
+                        g.last_eval_reason = Some(format!("evaluator failed: {e}"));
+                    }
+                    if let Some(g) = self.goal.take() {
+                        let ev = goal_update_ev(&g);
+                        self.emit(ev);
+                    }
+                    self.finish_turn(reason, messages);
+                } else {
+                    let cond = self.goal.as_ref().unwrap().condition.clone();
+                    if let Some(g) = self.goal.as_mut() {
+                        g.last_eval_reason = Some(format!("evaluator error, retrying: {e}"));
+                    }
+                    let ev = goal_update_ev(self.goal.as_ref().unwrap());
+                    self.emit(ev);
+                    let text = format!("Continue working toward this goal:\n```\n{cond}\n```");
+                    self.start_turn_stats();
+                    let _ = self.handle.commands.send(KCmd::SendMessage { text, images: vec![] });
+                }
+            }
+        }
+    }
+
     // ---------------- legacy commands → kernel ----------------
 
     /// Returns `true` to shut the bridge down.
     async fn on_command(&mut self, cmd: CoreCmd) -> bool {
         match cmd {
-            CoreCmd::SendMessage { text, images, .. } => {
+            CoreCmd::SendMessage { text, images, image_markers } => {
                 // NO UserEcho here: in non-sync mode every driver echoes the typed
                 // message LOCALLY (tuix renders `UiLine::User` on submit; headless -p
                 // doesn't echo at all). `UserEcho` is a LIVE-SYNC-only event the peer
                 // forwarder injects so the OTHER end mirrors a message it didn't type.
                 // The bridge never drives sync sessions, so emitting it here just
                 // double-renders the user's line (the "两条 input" duplicate).
+                //
+                // Degraded mode (noop kernel handle): the message would be forwarded
+                // to a draining task and silently dropped, leaving the TUI spinning
+                // "Pondering…" forever. Answer with an Error instead so the user sees
+                // feedback immediately.
+                if self.degraded {
+                    self.emit(CoreEv::Error {
+                        error: "engine v2 failed to initialise — the kernel agent is not \
+                                running. Use /model to switch to a working provider, or \
+                                restart atomcode.".into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                    return false;
+                }
                 self.start_turn_stats();
                 // Prepend any pending context that must ride in on this turn but does
                 // NOT itself start one: a just-toggled plan-mode note, then accumulated
@@ -289,12 +531,128 @@ impl Bridge {
                     prefix.push_str(&sh);
                     prefix.push_str("\n\n");
                 }
-                let text = if prefix.is_empty() { text } else { format!("{prefix}{text}") };
-                let images = images.iter().map(convert::image_to_kernel).collect();
+                let mut text = if prefix.is_empty() { text } else { format!("{prefix}{text}") };
+
+                // Vision preprocessing: when the active provider can't accept images
+                // and the user pasted some, run them through the configured VL model
+                // first and turn the result into plain text. This mirrors the v1
+                // AgentLoop::handle_send_message logic that the bridge previously
+                // bypassed — causing non-vision models (like DeepSeek) to receive raw
+                // image data they cannot process (400 error from the upstream API).
+                let images = if !images.is_empty() {
+                    use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+                    let core_images: Vec<atomcode_core::conversation::message::ImagePart> = images.clone();
+                    let config = atomcode_core::config::Config::load(
+                        &atomcode_core::config::Config::default_path(),
+                    );
+                    match config {
+                        Err(_) => {
+                            // Config load failed — fall through with original images;
+                            // a vision-capable model can still handle them natively.
+                            images.iter().map(convert::image_to_kernel).collect()
+                        }
+                        Ok(config) => {
+                            // Build a provider instance for the ACTIVE model to check vision support.
+                            // Use the bridge's actual model (self.coding_cfg.model), NOT
+                            // config.default_provider — they can differ when the user selects
+                            // a different provider via /chat or /live UI. A vision-capable
+                            // default would incorrectly skip VL preprocessing for a non-vision
+                            // active model, forwarding raw image data that causes a 400 error
+                            // ("… is not a multimodal model") from the upstream gateway.
+                            let active_model = self.coding_cfg.model.clone();
+                            let active_provider = config
+                                .providers
+                                .values()
+                                .find(|p| p.model == active_model)
+                                .and_then(|p| atomcode_core::provider::create_provider(p).ok())
+                                .or_else(|| {
+                                    // Fallback: model name not found in any provider config —
+                                    // try default_provider as a best-effort backward compat.
+                                    config
+                                        .providers
+                                        .get(&config.default_provider)
+                                        .and_then(|p| atomcode_core::provider::create_provider(p).ok())
+                                });
+                            match active_provider {
+                                Some(ref provider) => {
+                                    match maybe_preprocess(&config, provider.as_ref(), &text, &core_images).await {
+                                        PreprocessOutcome::Skipped => {
+                                            // Model supports vision natively — forward images as-is.
+                                            images.iter().map(convert::image_to_kernel).collect()
+                                        }
+                                        PreprocessOutcome::Replaced { text: vl_text, vl_key } => {
+                                            let merged = if text.is_empty() {
+                                                format!("[图片内容（由 {vl_key} 识别）]\n{vl_text}")
+                                            } else {
+                                                format!("{text}\n\n[图片内容（由 {vl_key} 识别）]\n{vl_text}")
+                                            };
+                                            text = merged;
+                                            // VL succeeded — images converted to text, clear them
+                                            // so the kernel's provider adapter doesn't send raw
+                                            // image data to a non-vision model.
+                                            let _ = self.emit(CoreEv::VisionPreprocessSuccess {
+                                                vl_key,
+                                                char_count: vl_text.chars().count(),
+                                            });
+                                            Vec::new()
+                                        }
+                                        PreprocessOutcome::Failed { reason } => {
+                                            let merged = if text.is_empty() {
+                                                "[图片识别失败]".to_string()
+                                            } else {
+                                                format!("{text}\n\n[图片识别失败]")
+                                            };
+                                            text = merged;
+                                            // VL failed — return images to the TUI so the user
+                                            // can retry without re-pasting from clipboard.
+                                            let _ = self.emit(CoreEv::RestorePendingImages {
+                                                images: core_images,
+                                                markers: image_markers,
+                                            });
+                                            // Surface the failure reason as a warning, matching
+                                            // v1's AgentLoop::handle_send_message behavior.
+                                            let _ = self.emit(CoreEv::Warning(
+                                                format!("VL 预处理失败：{reason} · 图片已自动保留，可直接重试"),
+                                            ));
+                                            Vec::new()
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // Provider not found — forward images as-is (best effort).
+                                    images.iter().map(convert::image_to_kernel).collect()
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+
                 let _ = self.handle.commands.send(KCmd::SendMessage { text, images });
             }
             CoreCmd::Cancel => {
+                // Esc/Ctrl+C stops an active goal (v1 parity) and interrupts an
+                // in-flight evaluation immediately via the cancel token.
+                self.goal_cancel.cancel();
+                if let Some(mut g) = self.goal.take() {
+                    g.clear();
+                    g.last_eval_reason = Some("cancelled".into());
+                    let ev = goal_update_ev(&g);
+                    self.emit(ev);
+                }
+                // Release + clear any parked approval BEFORE forwarding Cancel: the
+                // kernel then backfills the cancelled tool's result, and clearing our
+                // mirror means a later /model swap (which re-reads the snapshot) can't
+                // find a lingering approval to re-trigger on the next prompt.
+                if let Some(cmd) = take_deny_cmd(&mut self.pending_approval) {
+                    let _ = self.handle.commands.send(cmd);
+                }
                 let _ = self.handle.commands.send(KCmd::Cancel);
+                // If an eval was holding a turn open, close it as cancelled.
+                if let Some((_, messages)) = self.pending_goal.take() {
+                    self.finish_turn(StopReason::Cancelled, messages);
+                }
             }
             CoreCmd::ApproveTool => self.answer_approval(ApprovalResponse::allow()),
             CoreCmd::ApproveToolAlways => {
@@ -378,19 +736,20 @@ impl Bridge {
                     merged
                 }));
             }
-            CoreCmd::SetMessages(msgs) => {
+            CoreCmd::SetConversation(snap) => {
                 // The driver resumes a (legacy-format) session: convert, persist
                 // under the bridge id, respawn resumed — the engine continues the
-                // conversation with monotonic ids.
-                let kmsgs: Vec<_> = msgs.iter().map(convert::message_to_kernel).collect();
-                let snap = SessionSnapshot::new(kmsgs);
+                // conversation with monotonic ids. cold_summaries is a v1
+                // compression concept the bridge doesn't model, so it's dropped.
+                let kmsgs: Vec<_> = snap.messages.iter().map(convert::message_to_kernel).collect();
+                let ksnap = SessionSnapshot::new(kmsgs);
                 if let Some(b) = self.parts.session.as_ref() {
-                    let _ = b.manager.save_snapshot(&self.bridge_session, &snap);
+                    let _ = b.manager.save_snapshot(&self.bridge_session, &ksnap);
                 }
                 self.respawn(SessionMode::Resume(self.bridge_session.clone())).await;
                 // Confirm the engine's view back to the driver (webui sync relies
                 // on MessagesSync echoes).
-                self.emit(CoreEv::MessagesSync { messages: msgs });
+                self.emit(CoreEv::MessagesSync { snapshot: snap });
             }
             CoreCmd::ClearConversation => {
                 self.respawn(SessionMode::Fresh).await;
@@ -402,52 +761,60 @@ impl Bridge {
             CoreCmd::ReloadConfig(config) => {
                 // Switch to the (possibly new) default provider, same parts —
                 // approval grants + conversation survive (C1 respawn semantics).
+                // FIRST settle any in-flight turn/approval so the kernel persists a
+                // clean snapshot before `assemble` below re-reads it — otherwise a
+                // turn cancelled by this swap leaves a dangling tool_use that the
+                // fresh agent re-triggers on the next prompt.
+                if self.turn_running || self.pending_approval.is_some() {
+                    self.settle_in_flight_turn().await;
+                }
                 if let Some(p) = config.providers.get(&config.default_provider) {
-                    self.coding_cfg.model = p.model.clone();
-                    if let Some(b) = &p.base_url {
-                        self.coding_cfg.base_url = b.clone();
-                    }
-                    if let Some(k) = &p.api_key {
-                        self.coding_cfg.api_key = k.clone();
-                    }
-                    // `/effort` / `/think` write the provider config then ReloadConfig: pick
-                    // up the (possibly changed) reasoning_effort so the respawned agent's
-                    // ChatOptions reflect it. (`reasoning_history` is a model-property, set
-                    // once at construction; effort is the knob users flip mid-session.)
-                    self.coding_cfg.chat_options.reasoning_effort =
-                        atomcode_kernel::provider::ReasoningEffort::from_config(p.reasoning_effort.as_deref());
-                    // A /model swap can change the adapter kind + per-provider knobs entirely
-                    // — refresh them all so the rebuilt provider matches the new config.
-                    self.coding_cfg.provider_type = p.provider_type.clone();
-                    self.coding_cfg.reasoning_history = p.reasoning_history.clone();
-                    self.coding_cfg.thinking_enabled = p.thinking_enabled;
-                    self.coding_cfg.thinking_type = p.thinking_type.clone();
-                    self.coding_cfg.thinking_keep = p.thinking_keep.clone();
+                    apply_reload_provider(&mut self.coding_cfg, p);
                     match build_provider(&self.coding_cfg) {
                         Ok(provider) => {
-                            let _ = self.handle.commands.send(KCmd::Shutdown);
-                            let task = std::mem::replace(
-                                &mut self.handle.task,
-                                tokio::spawn(async {}),
-                            );
-                            let _ = task.await;
+                            // Assemble BEFORE tearing down the old handle — if
+                            // assemble fails, the old (possibly noop) handle
+                            // stays intact and the bridge keeps running.
                             match assemble(&mut self.parts, &self.coding_cfg, provider) {
                                 Ok(a) => {
-                                    self.handle = a.spawn();
-                                    self.emit(CoreEv::Warning(format!(
-                                        "engine v2: provider → {} ({})",
-                                        config.default_provider, self.coding_cfg.model
-                                    )));
+                                    let new_handle = a.spawn();
+                                    // Shut down old handle and swap.
+                                    let _ = self.handle.commands.send(KCmd::Shutdown);
+                                    let old_task = std::mem::replace(
+                                        &mut self.handle.task,
+                                        tokio::spawn(async {}),
+                                    );
+                                    let _ = old_task.await;
+                                    self.handle = new_handle;
+                                    self.degraded = false;
+                                    // Clear any stale state that may have accumulated
+                                    // while the (possibly noop) old handle was active.
+                                    self.turn_running = false;
+                                    self.pending_approval = None;
+                                    self.pending_finish = None;
+                                    self.pending_sync = false;
+                                    self.pending_undo = None;
+                                    self.pending_goal = None;
                                 }
-                                Err(e) => self.emit(CoreEv::Error {
-                                    error: format!("provider switch failed: {e}"),
-                                    messages: vec![],
-                                }),
+                                Err(e) => {
+                                    self.emit(CoreEv::Error {
+                                        error: format!("provider switch failed: {e}"),
+                                        snapshot: ConversationSnapshot::default(),
+                                    });
+                                    // Keep the existing handle (may be noop_handle) so
+                                    // the bridge stays alive for another retry.
+                                }
                             }
                         }
-                        Err(e) => self.emit(CoreEv::Warning(format!(
-                            "provider init failed: {e}"
-                        ))),
+                        Err(e) => self.emit(CoreEv::Error {
+                            error: atomcode_core::i18n::t(
+                                atomcode_core::i18n::Msg::ProviderInitFailed {
+                                    detail: &e.to_string(),
+                                },
+                            )
+                            .into_owned(),
+                            snapshot: ConversationSnapshot::default(),
+                        }),
                     }
                 }
             }
@@ -479,7 +846,7 @@ impl Bridge {
                     self.emit(CoreEv::Error {
                         error: "A background task is already running. Wait for it to finish."
                             .into(),
-                        messages: vec![],
+                        snapshot: ConversationSnapshot::default(),
                     });
                 } else {
                     // A SEPARATE one-shot agent runs the task off to the side; its
@@ -553,7 +920,54 @@ impl Bridge {
                 // The model sees the output on the NEXT turn (no LLM turn now).
                 self.pending_local_shell.push(context);
             }
-            CoreCmd::Shutdown => return true,
+            CoreCmd::SetGoal { condition } => {
+                // Goal mode (loop-until-evaluator-met) on v2: reuse v1's GoalState +
+                // GoalEvaluator (atomcode-core is a bridge dep). `/goal <cond>` also
+                // sends the condition as a normal message, so the FIRST turn starts on
+                // its own; this just arms the loop, which is driven from the turn-end
+                // Snapshot hook (`maybe_continue_goal`).
+                if self.goal_provider.is_none() {
+                    self.goal_provider = build_goal_provider();
+                }
+                if self.goal_provider.is_none() {
+                    self.emit(CoreEv::Warning(
+                        "goal mode unavailable: could not build evaluator (check [providers] / \
+                         evaluator_provider in ~/.atomcode/config.toml)"
+                            .into(),
+                    ));
+                } else {
+                    // Fresh cancel token per goal so a prior goal's cancel can't kill this one.
+                    self.goal_cancel = CancellationToken::new();
+                    let state = GoalState::new(condition);
+                    let ev = goal_update_ev(&state);
+                    self.emit(ev);
+                    self.goal = Some(state);
+                }
+            }
+            CoreCmd::ClearGoal => {
+                self.goal_cancel.cancel();
+                if let Some(mut g) = self.goal.take() {
+                    g.clear();
+                    g.last_eval_reason = Some("cleared by user".into());
+                    let ev = goal_update_ev(&g);
+                    self.emit(ev);
+                }
+                // Stop the turn running RIGHT NOW, not just the loop — `/goal
+                // clear` while a round is mid-tool (e.g. a long bash) must
+                // interrupt it, exactly like the Cancel branch (which already
+                // forwards KCmd::Cancel). Without this, clearing only disarmed
+                // the next round and the user watched the current tool run to
+                // completion (part of the reported "goal can't be interrupted").
+                let _ = self.handle.commands.send(KCmd::Cancel);
+                // An eval was holding a turn open — close it now.
+                if let Some((_, messages)) = self.pending_goal.take() {
+                    self.finish_turn(StopReason::Cancelled, messages);
+                }
+            }
+            CoreCmd::Shutdown => {
+                self.goal_cancel.cancel();
+                return true;
+            }
         }
         false
     }
@@ -563,6 +977,45 @@ impl Bridge {
             let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
             let _ = self.handle.commands.send(KCmd::Respond { id, value });
             self.emit(CoreEv::PhaseChange(AgentPhase::Thinking));
+        }
+    }
+
+    /// Drive the CURRENT kernel to a clean terminal and let it persist the snapshot
+    /// BEFORE a /model swap re-assembles from that snapshot. `assemble` reloads the
+    /// latest on-disk snapshot (the SnapshotHook writes one on every `turn_complete`,
+    /// cancel included) — so if a turn (or a parked approval) is still in flight when
+    /// /model fires, the swap would otherwise read a snapshot with a dangling tool_use
+    /// and the fresh agent re-triggers the just-cancelled tool on the next prompt.
+    ///
+    /// Releases any parked approval as a deny + cancels the turn, then drains the
+    /// kernel's events until the turn fully finalizes (TurnComplete → Snapshot
+    /// round-trip → driver-facing finish). Bounded by a per-event timeout so a wedged
+    /// kernel can't hang the swap.
+    async fn settle_in_flight_turn(&mut self) {
+        if let Some(cmd) = take_deny_cmd(&mut self.pending_approval) {
+            let _ = self.handle.commands.send(cmd);
+        }
+        let _ = self.handle.commands.send(KCmd::Cancel);
+        let mut saw_complete = false;
+        for _ in 0..256 {
+            // Bound each await: the cancel/deny above guarantees a TurnComplete in
+            // the normal case, but a crashed kernel must not strand the swap.
+            match tokio::time::timeout(Duration::from_secs(5), self.handle.events.recv()).await {
+                Ok(Some(ev)) => {
+                    if matches!(ev, KEv::TurnComplete { .. }) {
+                        saw_complete = true;
+                    }
+                    self.on_kernel_event(ev).await;
+                    // TurnComplete defers the driver-facing finish until its Snapshot
+                    // reply lands (clearing pending_finish). Wait for BOTH so the
+                    // snapshot is on disk before we re-assemble from it.
+                    if saw_complete && self.pending_finish.is_none() {
+                        break;
+                    }
+                }
+                Ok(None) => break, // kernel task ended
+                Err(_) => break,   // timed out — give up rather than hang the swap
+            }
         }
     }
 
@@ -585,37 +1038,159 @@ impl Bridge {
         let _ = task.await;
         let mut opts = self.opts_template.clone();
         opts.session = session;
-        match prepare(&self.coding_cfg, opts).await {
-            Ok(mut parts) => {
-                // Approval grants survive engine respawns (same contract as C1).
-                parts.approval = self.parts.approval.clone();
-                // Plan mode survives a respawn (/resume, /clear, model swap).
-                parts.plan_mode = self.parts.plan_mode.clone();
-                match build_provider(&self.coding_cfg)
-                    .and_then(|p| assemble(&mut parts, &self.coding_cfg, p).map_err(Into::into))
-                {
-                    Ok(a) => {
-                        self.handle = a.spawn();
-                        self.bridge_session = parts
-                            .session
-                            .as_ref()
-                            .map(|b| b.id.clone())
-                            .unwrap_or_default();
-                        self.parts = parts;
-                        self.turn_running = false;
-                        self.pending_approval = None;
-                    }
-                    Err(e) => self.emit(CoreEv::Error {
+
+        // Try the requested session mode first; if that fails (e.g. Resume could
+        // not find the snapshot), fall back to Fresh before giving up entirely.
+        // This prevents a broken snapshot from crashing the whole bridge.
+        let mut parts = match prepare_with_plugin_hooks(
+            &self.coding_cfg,
+            opts.clone(),
+            self.plugin_cc_hooks.clone(),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                // Don't retry Fresh if the caller already asked for Fresh — that
+                // would loop with the same prepare args and fail the same way.
+                if matches!(opts.session, SessionMode::Fresh) {
+                    self.emit(CoreEv::Error {
                         error: format!("engine v2 respawn failed: {e}"),
-                        messages: vec![],
-                    }),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                    self.handle = Self::noop_handle();
+                    self.degraded = true;
+                    return;
+                }
+                opts.session = SessionMode::Fresh;
+                match prepare_with_plugin_hooks(
+                    &self.coding_cfg,
+                    opts,
+                    self.plugin_cc_hooks.clone(),
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e2) => {
+                        self.emit(CoreEv::Error {
+                            error: format!(
+                                "engine v2 respawn failed (fresh fallback also failed): {e2}"
+                            ),
+                            snapshot: ConversationSnapshot::default(),
+                        });
+                        self.handle = Self::noop_handle();
+                        self.degraded = true;
+                        return;
+                    }
                 }
             }
-            Err(e) => self.emit(CoreEv::Error {
-                error: format!("engine v2 respawn failed: {e}"),
-                messages: vec![],
+        };
+
+        // Approval grants survive engine respawns (same contract as C1).
+        parts.approval = self.parts.approval.clone();
+        // Plan mode survives a respawn (/resume, /clear, model swap).
+        parts.plan_mode = self.parts.plan_mode.clone();
+
+        match build_provider(&self.coding_cfg)
+            .and_then(|p| assemble(&mut parts, &self.coding_cfg, p).map_err(Into::into))
+        {
+            Ok(a) => {
+                self.handle = a.spawn();
+                self.bridge_session = parts
+                    .session
+                    .as_ref()
+                    .map(|b| b.id.clone())
+                    .unwrap_or_default();
+                self.parts = parts;
+                self.turn_running = false;
+                self.pending_approval = None;
+                self.degraded = false;
+            }
+            Err(e) => {
+                self.emit(CoreEv::Error {
+                    error: format!("engine v2 respawn failed: {e}"),
+                    snapshot: ConversationSnapshot::default(),
+                });
+                // Must install a live handle so the bridge event loop's
+                // recv() never returns None and kills the process.
+                self.handle = Self::noop_handle();
+                self.degraded = true;
+            }
+        }
+    }
+
+    /// Replace `self.handle` with a no-op handle that keeps the bridge event loop
+    /// alive (its events channel never closes). Used as a safety net when respawn
+    /// fails — the bridge stays running and can still process driver commands even
+    /// though the agent kernel is gone.
+    ///
+    /// The task listens for `Shutdown` on the kernel command channel (sent by
+    /// `respawn()` and the `run()` shutdown path) instead of blocking forever on
+    /// `std::future::pending()` — otherwise `task.await` hangs permanently and the
+    /// bridge can never exit cleanly.
+    fn noop_handle() -> atomcode_kernel::agent::AgentHandle {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<KCmd>();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<KEv>();
+        atomcode_kernel::agent::AgentHandle {
+            commands: cmd_tx,
+            events: ev_rx,
+            // Hold ev_tx in the task so the receiver side stays open forever.
+            // Listen for Shutdown on cmd_rx so the task can be cleanly awaited.
+            task: tokio::spawn(async move {
+                let _keep_alive = ev_tx;
+                loop {
+                    match cmd_rx.recv().await {
+                        Some(KCmd::Shutdown) | None => break,
+                        _ => {} // drain: ignore all other kernel commands
+                    }
+                }
             }),
         }
+    }
+
+    /// Keep-alive loop for when the initial bridge startup fails. Holds `ev_tx` open
+    /// (via a spawned task that never exits, mirroring [`noop_handle`]) so the TUI
+    /// event forwarder doesn't see the channel close and exit. Listens for driver
+    /// commands — `Shutdown` exits; `ReloadConfig` warns that a restart is needed;
+    /// `SendMessage` is answered with an error; everything else is drained.
+    /// The initial Error event was already sent to the driver before entering.
+    async fn keep_alive_loop(
+        ev_tx: mpsc::UnboundedSender<CoreEv>,
+        mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
+    ) {
+        // Clone ev_tx so we can still send error feedback from this loop while
+        // holding the original open in the spawned task (keeps forwarder alive).
+        let feedback_tx = ev_tx.clone();
+        let _keep = tokio::spawn(async move {
+            let _hold = ev_tx;
+            std::future::pending::<()>().await;
+        });
+        loop {
+            match cmd_rx.recv().await {
+                Some(CoreCmd::Shutdown) | None => break,
+                Some(CoreCmd::ReloadConfig(_)) => {
+                    // The TUI already rendered the switch confirmation
+                    // optimistically; this error makes it clear a restart
+                    // is needed.
+                    let _ = feedback_tx.send(CoreEv::Error {
+                        error: "engine v2 is in degraded mode — /model and /provider \
+                                require a restart. Please quit and re-launch atomcode."
+                            .into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                }
+                Some(CoreCmd::SendMessage { .. }) => {
+                    let _ = feedback_tx.send(CoreEv::Error {
+                        error: "engine v2 failed to initialise — messages cannot be \
+                                processed. Please quit and re-launch atomcode."
+                            .into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                }
+                _ => {} // drain: ignore all other commands
+            }
+        }
+        _keep.abort();
     }
 
     fn finish_turn(&mut self, reason: StopReason, messages: Vec<atomcode_core::conversation::message::Message>) {
@@ -626,7 +1201,9 @@ impl Bridge {
         let duration = self.stats.started.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
         match reason {
             StopReason::Cancelled => {
-                self.emit(CoreEv::TurnCancelled { messages });
+                self.emit(CoreEv::TurnCancelled {
+                    snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
+                });
             }
             other => {
                 let stop_reason = match other {
@@ -647,7 +1224,7 @@ impl Bridge {
                     total_tokens: self.stats.total_tokens,
                     turn_count: self.stats.rounds,
                     tool_call_count: self.stats.tool_calls,
-                    messages,
+                    snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
                     stop_reason,
                 });
             }
@@ -676,7 +1253,7 @@ impl Bridge {
                 }
                 self.respawn(SessionMode::Resume(self.bridge_session.clone())).await;
                 self.emit(CoreEv::ConversationTruncated {
-                    messages: core_msgs,
+                    snapshot: ConversationSnapshot { messages: core_msgs, cold_summaries: vec![] },
                     restored_prompt: undo.restored_prompt,
                     target_n: undo.target_n,
                     prompts_before: undo.prompts_before,
@@ -752,7 +1329,31 @@ impl Bridge {
                 });
                 self.emit(CoreEv::PhaseChange(AgentPhase::Thinking));
             }
+            KEv::ToolBatchStarted { batch_id, calls } => {
+                self.emit(CoreEv::ToolBatchStarted {
+                    batch_id,
+                    calls: calls.into_iter().map(|c| atomcode_core::turn::event::ToolBatchCall {
+                        id: c.id,
+                        name: c.name,
+                        arguments: c.arguments,
+                    }).collect(),
+                });
+            }
+            KEv::ToolBatchCompleted { batch_id, ok, total, elapsed_ms } => {
+                self.emit(CoreEv::ToolBatchCompleted { batch_id, ok, total, elapsed_ms });
+            }
             KEv::Request { id, kind, payload } if kind == APPROVAL_KIND => {
+                // --dangerously-skip-permissions: auto-approve WITHOUT prompting,
+                // matching v1 (the core PermissionDecider auto-allowed before any
+                // prompt). The kernel is neutral about approval and round-trips every
+                // Risky tool here, so the bypass belongs at this driver seam. The
+                // normal ToolStarted/ToolResult events still render the call; only the
+                // approval prompt is skipped.
+                if let Some(resp) = bypass_auto_approval(self.dangerously_skip_permissions) {
+                    let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
+                    let _ = self.handle.commands.send(KCmd::Respond { id, value });
+                    return;
+                }
                 let req: ApprovalRequest = match serde_json::from_value(payload) {
                     Ok(r) => r,
                     Err(_) => {
@@ -780,13 +1381,13 @@ impl Bridge {
                 self.emit(CoreEv::PhaseChange(AgentPhase::WaitingApproval));
                 self.emit(CoreEv::ApprovalNeeded {
                     tool_name: req.tool.clone(),
-                    reason: truncate(&req.args, 200),
+                    reason: "Requires approval".to_string(),
                     call: atomcode_core::tool::ToolCall {
-                        id: String::new(),
+                        id: req.call_id,
                         name: req.tool,
                         arguments: req.args,
                     },
-                    messages: vec![],
+                    snapshot: ConversationSnapshot::default(),
                 });
             }
             KEv::Request { id, .. } => {
@@ -806,23 +1407,77 @@ impl Bridge {
             }
             KEv::Snapshot { snapshot } => {
                 if let Some(reason) = self.pending_finish.take() {
-                    let messages = snapshot.messages.iter().map(convert::message_to_core).collect();
+                    let messages: Vec<atomcode_core::conversation::message::Message> =
+                        snapshot.messages.iter().map(convert::message_to_core).collect();
+                    // Goal hook: a natural stop with an active goal isn't the end.
+                    // Spawn the evaluator OFF this loop (so Cancel stays responsive);
+                    // the turn is held open until `on_goal_eval_result` decides to
+                    // continue (inject) or finish.
+                    if matches!(reason, StopReason::Stopped)
+                        && self.goal.as_ref().map_or(false, |g| g.active)
+                    {
+                        self.spawn_goal_eval(reason, messages);
+                        return;
+                    }
                     self.finish_turn(reason, messages);
                 } else if let Some(nth) = self.pending_undo.take() {
                     self.do_undo(snapshot.messages, nth).await;
                 } else {
                     self.pending_sync = false;
                     let messages = snapshot.messages.iter().map(convert::message_to_core).collect();
-                    self.emit(CoreEv::MessagesSync { messages });
+                    self.emit(CoreEv::MessagesSync {
+                        snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
+                    });
                 }
             }
             KEv::Warning(w) => self.emit(CoreEv::Warning(w)),
-            KEv::Error { message, .. } => {
-                self.emit(CoreEv::Error { error: message, messages: vec![] });
+            KEv::Error { message, http_status, .. } => {
+                let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
+                self.emit(CoreEv::Error { error, snapshot: ConversationSnapshot::default() });
             }
-            KEv::Compacted { committed, .. } => {
-                if committed {
-                    self.emit(CoreEv::Warning("conversation compacted".into()));
+            // A manual `/compact` may make a slow one-shot LLM summary call; announce it
+            // so the user sees a progress line while it runs (v1 streamed the same
+            // "(compacting with LLM summary...)" text). Auto/Overflow stub silently — no
+            // LLM call, no user action to acknowledge — so they stay quiet here.
+            KEv::CompactionStarted { trigger } => {
+                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                    self.emit(CoreEv::TextDelta(
+                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting)
+                            .into_owned(),
+                    ));
+                }
+            }
+            KEv::Compacted { committed, trigger, removed, bytes_before, bytes_after, .. } => {
+                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                    // v1 parity: stream the authoritative result as a plain TextDelta line
+                    // (the TUI's `/compact` handler renders these directly). The kernel
+                    // measures BYTES, so the token figures are derived from the last
+                    // provider usage report (see `manual_compact_result`).
+                    let before_tokens =
+                        self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
+                    self.emit(CoreEv::TextDelta(manual_compact_result(
+                        committed,
+                        removed,
+                        bytes_before,
+                        bytes_after,
+                        before_tokens,
+                    )));
+                    if committed {
+                        // v1 parity: refresh the cached context size so the footer /
+                        // `/context` reflect the shrunk conversation immediately. v1
+                        // recomputes via `build_messages`; the kernel only tracks bytes,
+                        // so update `last_usage` to the same estimate the result line
+                        // shows. The next real turn overwrites it with the exact count.
+                        if let Some(meta) = self.last_usage.as_mut() {
+                            meta.used_tokens =
+                                estimate_after_tokens(before_tokens, bytes_before, bytes_after)
+                                    as u32;
+                        }
+                        self.emit_context_stats();
+                    }
+                } else if let Some(msg) = compaction_advisory(committed, &trigger) {
+                    // Auto/Overflow keep the terse one-line advisory.
+                    self.emit(CoreEv::Warning(msg));
                 }
             }
             KEv::TurnComplete { reason } => {
@@ -836,6 +1491,106 @@ impl Bridge {
             }
             _ => {}
         }
+    }
+}
+
+/// The approval response the bridge auto-sends under `--dangerously-skip-permissions`:
+/// `Some(allow)` when bypass is on — matching v1, where the core `PermissionDecider`
+/// auto-allowed BEFORE any prompt surfaced — and `None` when the request must be
+/// surfaced to the driver for a real decision. Reuses `ApprovalResponse::allow()` so
+/// the bypass path sends the identical, kernel-accepted value the manual ApproveTool
+/// path does.
+fn bypass_auto_approval(skip_permissions: bool) -> Option<ApprovalResponse> {
+    skip_permissions.then(ApprovalResponse::allow)
+}
+
+/// TAKE a parked approval out of the bridge's mirror and return the kernel command
+/// that releases its round-trip as a fail-closed DENY. `None` when nothing is parked.
+///
+/// Used on EVERY teardown of an in-flight turn (Cancel, /model swap): denying the
+/// parked request lets the kernel backfill the cancelled tool's result (so the
+/// conversation has no dangling tool_use), and `take()` clears the mirror so a stale
+/// approval can't re-fire after a model swap re-reads the snapshot.
+fn take_deny_cmd(pending: &mut Option<(RequestId, String)>) -> Option<KCmd> {
+    pending.take().map(|(id, _tool)| {
+        let value =
+            serde_json::to_value(ApprovalResponse::deny()).unwrap_or(serde_json::Value::Null);
+        KCmd::Respond { id, value }
+    })
+}
+
+/// Build the legacy `GoalUpdate` event from goal state (free fn so callers don't
+/// borrow `self.goal` and `self` simultaneously).
+fn goal_update_ev(g: &GoalState) -> CoreEv {
+    CoreEv::GoalUpdate {
+        active: g.active,
+        round: g.round,
+        elapsed_secs: g.elapsed_secs(),
+        condition: g.condition.clone(),
+        last_reason: g.last_eval_reason.clone(),
+    }
+}
+
+/// Build the goal evaluator provider (reused by v1's `GoalEvaluator`) from config:
+/// the `evaluator_provider` entry if set, else the default provider. `None` if the
+/// config can't load or the provider can't be constructed. Minimal port: no
+/// fallback to the active /chat model — set `evaluator_provider` to pin a fast
+/// judge, exactly as the `/goal` help documents.
+fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
+    let config =
+        atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
+    let key = config
+        .evaluator_provider
+        .as_ref()
+        .unwrap_or(&config.default_provider);
+    let pcfg = config.providers.get(key)?;
+    let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
+    Some(Arc::from(provider))
+}
+
+/// Compact the conversation into a plain-text summary for the evaluator, mirroring
+/// v1's `summarize_recent_turns_for_goal`: the previous round's verdict (so the
+/// judge sees what it asked for last time) plus the last 5 non-empty assistant
+/// replies (200 chars each, oldest → newest) — the agent's own account of what it
+/// did, which is the signal the evaluator rules on.
+fn summarize_for_goal(
+    messages: &[atomcode_core::conversation::message::Message],
+    prev_verdict: Option<&str>,
+) -> String {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    let mut sections: Vec<String> = Vec::new();
+    if let Some(v) = prev_verdict {
+        sections.push(format!("Previous round verdict: {v}"));
+    }
+    let mut recent: Vec<String> = Vec::new();
+    for msg in messages.iter().rev() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        let text = match &msg.content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::AssistantWithToolCalls { text, .. } => text.clone().unwrap_or_default(),
+            _ => continue,
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        recent.push(text.chars().take(200).collect());
+        if recent.len() >= 5 {
+            break;
+        }
+    }
+    recent.reverse();
+    if !recent.is_empty() {
+        sections.push(format!(
+            "Recent assistant replies (oldest → newest):\n{}",
+            recent.join("\n---\n")
+        ));
+    }
+    if sections.is_empty() {
+        "(no agent work yet)".to_owned()
+    } else {
+        sections.join("\n\n")
     }
 }
 
@@ -1065,6 +1820,46 @@ fn compute_undo(
     }
 }
 
+fn apply_reload_provider(
+    cfg: &mut CodingAgentConfig,
+    provider: &atomcode_core::config::provider::ProviderConfig,
+) {
+    cfg.model = provider.model.clone();
+    if let Some(base_url) = &provider.base_url {
+        cfg.base_url = base_url.clone();
+    }
+    if let Some(api_key) = &provider.api_key {
+        cfg.api_key = api_key.clone();
+    }
+    cfg.context_window = provider.context_window as u32;
+    // A user-configured `max_tokens` is the per-call output cap; thread it into ChatOptions
+    // so v2 forwards it (the provider's `options.max_tokens.or(cfg.max_tokens)` then honors it).
+    // `None` ⇒ leave it to the provider-config fallback derived in `build_provider`.
+    cfg.chat_options.max_tokens = provider.max_tokens.map(|m| m as u32);
+    // `/effort` / `/think` write the provider config then ReloadConfig: pick
+    // up the (possibly changed) reasoning_effort so the respawned agent's
+    // ChatOptions reflect it. (`reasoning_history` is a model-property, set
+    // once at construction; effort is the knob users flip mid-session.)
+    cfg.chat_options.reasoning_effort =
+        atomcode_kernel::provider::ReasoningEffort::from_config(provider.reasoning_effort.as_deref());
+    // A /model swap can change the adapter kind + per-provider knobs entirely
+    // — refresh them all so the rebuilt provider matches the new config.
+    cfg.provider_type = provider.provider_type.clone();
+    cfg.reasoning_history = provider.reasoning_history.clone();
+    cfg.thinking_enabled = provider.thinking_enabled;
+    cfg.thinking_type = provider.thinking_type.clone();
+    cfg.thinking_keep = provider.thinking_keep.clone();
+}
+
+/// Provider-config fallback output cap when neither the per-call `ChatOptions` nor an explicit
+/// user setting provides one. Mirrors the legacy v1 engine (`core::provider::{openai,claude}`):
+/// a quarter of the context window, clamped to `[8_000, 16_384]`. Without this, v2 sent NO
+/// `max_tokens` for OpenAI-compat (the gateway then applied its own small hidden cap →
+/// frequent `finish_reason=length` truncation) and a flat 4096 for Anthropic.
+fn default_max_tokens(context_window: u32) -> u32 {
+    (context_window / 4).clamp(8_000, 16_384)
+}
+
 fn build_provider(
     cfg: &CodingAgentConfig,
 ) -> anyhow::Result<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
@@ -1080,6 +1875,9 @@ fn build_provider(
         "claude" | "anthropic" => {
             let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             ac.context_window = cfg.context_window;
+            // Fallback output cap (the per-call `chat_options.max_tokens` still wins). Replaces
+            // the flat 4096 default so a large context window gets a proportionate cap.
+            ac.max_tokens = default_max_tokens(cfg.context_window);
             // `/think on` → adaptive extended thinking. (v2 uses adaptive, so v1's
             // thinking_budget has no direct mapping — intentionally dropped.)
             ac.thinking = cfg.thinking_enabled.unwrap_or(false);
@@ -1091,6 +1889,8 @@ fn build_provider(
             let mut oc = OllamaConfig::new(&cfg.base_url, &cfg.model);
             oc.api_key = cfg.api_key.clone();
             oc.context_window = cfg.context_window;
+            // Fallback `num_predict` cap (the per-call `chat_options.max_tokens` still wins).
+            oc.max_tokens = Some(default_max_tokens(cfg.context_window));
             oc.think = cfg.thinking_enabled.unwrap_or(false);
             Ok(Arc::new(
                 OllamaProvider::new(oc).map_err(|e| anyhow::anyhow!(e.message))?,
@@ -1100,6 +1900,9 @@ fn build_provider(
         _ => {
             let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             pc.context_window = cfg.context_window;
+            // Fallback `max_tokens` (the per-call `chat_options.max_tokens` still wins). Without
+            // this v2 sent NO max_tokens and the gateway's hidden default truncated long replies.
+            pc.max_tokens = Some(default_max_tokens(cfg.context_window));
             // Honor the provider's `reasoning_history` override; unset ⇒ leave `None` so the
             // adapter auto-detects by model. A typo fails fast (parity with the legacy engine).
             pc.reasoning_policy = ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
@@ -1114,10 +1917,10 @@ fn build_provider(
             if crypto::is_atomgit_gateway(&cfg.base_url) {
                 if !crypto::signer_available() {
                     anyhow::bail!(
-                        "provider base_url '{}' is an AtomGit gateway this build can't \
-                         authenticate against. Use the official binary, or point the provider \
-                         at a plain OpenAI-compatible endpoint with an api_key.",
-                        cfg.base_url
+                        "{}",
+                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::GatewayAuthUnavailable {
+                            base_url: &cfg.base_url,
+                        })
                     );
                 }
                 pc.request_signer = Some(crate::sign::atomgit_signer(&cfg.base_url)?);
@@ -1127,6 +1930,108 @@ fn build_provider(
                 OpenAiCompatProvider::new(pc).map_err(|e| anyhow::anyhow!(e.message))?,
             ))
         }
+    }
+}
+
+/// Map a raw provider error to a user-actionable one before it reaches the UI.
+///
+/// An atomgit-gateway **401** means the free-quota token was rejected or
+/// expired. The upstream string ("Gitcode auth: token rejected (status=401)")
+/// tells the user nothing they can act on, so swap it for the i18n hint that
+/// points at `/login` — the actual fix. This restores v1 parity: the legacy
+/// engine does the identical swap in `core/provider/openai.rs` (gated on
+/// `is_atomgit_gateway`), and v2 dropped it, leaking the raw 401 to the chat.
+///
+/// Non-atomgit gateways (a user's own `sk-…` key) keep the verbatim message:
+/// `/login` is the wrong advice there — the developer needs the real diagnostic
+/// to fix their key/endpoint.
+fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: &str) -> String {
+    if http_status == Some(401)
+        && atomcode_core::coding_plan::crypto::is_atomgit_gateway(base_url)
+    {
+        return atomcode_core::i18n::t(atomcode_core::i18n::Msg::ChatAuthExpired).to_string();
+    }
+    message
+}
+
+/// Terse one-line advisory for an AUTO / OVERFLOW compaction.
+///
+/// A manual `/compact` is handled by the richer streaming path
+/// ([`manual_compact_result`], emitted as a `TextDelta`) so this returns `None` for
+/// it. A committed auto/overflow compaction announces itself once; a no-op stays
+/// silent — there's no user action to acknowledge and it would be spam.
+fn compaction_advisory(
+    committed: bool,
+    trigger: &atomcode_kernel::message::CompactTrigger,
+) -> Option<String> {
+    use atomcode_kernel::message::CompactTrigger;
+    if matches!(trigger, CompactTrigger::Manual { .. }) {
+        return None; // manual → the TextDelta `manual_compact_result` path
+    }
+    committed.then(|| "conversation compacted".to_string())
+}
+
+/// v1-parity result line for a manual `/compact`, emitted as a `TextDelta` so it
+/// renders as a plain line (matching core's `run_compact`).
+///
+/// The kernel measures conversation BYTES, not tokens, so the token figures are
+/// derived:
+///   - `before_tokens` is the real pre-compaction context size from the last
+///     provider usage report (`last_usage.used_tokens`);
+///   - the after-figure scales `before_tokens` by the byte-reduction ratio
+///     (`bytes_after / bytes_before`).
+/// This reproduces v1's `(compacted — dropped N messages, X → Y tokens)` within
+/// estimation error. A refused / no-op compaction reports `(nothing to compact …)`.
+fn manual_compact_result(
+    committed: bool,
+    removed: usize,
+    bytes_before: usize,
+    bytes_after: usize,
+    before_tokens: usize,
+) -> String {
+    use atomcode_core::i18n::{t, Msg};
+    // Fall back to a coarse bytes/4 estimate only if no usage has been reported yet
+    // (e.g. `/compact` issued before any turn) so figures never read "0 → 0".
+    let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
+    let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
+    let before = fmt_k_tokens(before_tokens);
+    let after = fmt_k_tokens(after_tokens);
+    if committed {
+        return t(Msg::CompactDropped { messages: removed, before: &before, after: &after })
+            .into_owned();
+    }
+    // Refused. Distinguish "would not save tokens" (a summary was built but the
+    // candidate did not shrink — `bytes_after > bytes_before`) from "conversation is
+    // short" (a true no-op plan whose candidate is byte-identical). Mirrors v1, which
+    // shows these as two distinct messages.
+    if bytes_after > bytes_before {
+        t(Msg::CompactNothingNoSavings { before: &before, after: &after }).into_owned()
+    } else {
+        t(Msg::CompactNothingShort).into_owned()
+    }
+}
+
+/// Estimate the post-compaction token count by scaling the pre-compaction count by
+/// the kernel's byte-reduction ratio. The kernel measures conversation BYTES, not
+/// tokens; `before_tokens` (the real provider count) also covers the fixed
+/// system + tools prefix, so this slightly UNDER-states a compaction that left a
+/// large prefix. v1 estimates too (via `build_messages`); this tracks its numbers
+/// closely and is honest about being an estimate. `bytes_before == 0` ⇒ unchanged.
+fn estimate_after_tokens(before_tokens: usize, bytes_before: usize, bytes_after: usize) -> usize {
+    if bytes_before > 0 {
+        ((before_tokens as u128 * bytes_after as u128) / bytes_before as u128) as usize
+    } else {
+        before_tokens
+    }
+}
+
+/// Port of core's (private) `fmt_k_tokens`: `1234` → `"1.2K"`, `< 1000` → verbatim.
+/// Kept local to the bridge so the manual-compact line matches v1's formatting.
+fn fmt_k_tokens(t: usize) -> String {
+    if t >= 1000 {
+        format!("{:.1}K", t as f64 / 1000.0)
+    } else {
+        t.to_string()
     }
 }
 
@@ -1140,10 +2045,162 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
+mod goal_summary_tests {
+    use super::summarize_for_goal;
+    use atomcode_core::conversation::message::{Message, Role};
+
+    #[test]
+    fn summary_has_assistant_replies_and_prev_verdict_but_not_user_msgs() {
+        let msgs = vec![
+            Message::new(Role::User, "do the thing".to_string()),
+            Message::new(Role::Assistant, "".to_string()), // empty → skipped
+            Message::new(Role::Assistant, "did step one".to_string()),
+        ];
+        let s = summarize_for_goal(&msgs, Some("not done: missing tests"));
+        assert!(s.contains("Previous round verdict: not done: missing tests"));
+        assert!(s.contains("did step one"));
+        // only assistant replies feed the summary — user text is not echoed
+        assert!(!s.contains("do the thing"));
+    }
+
+    #[test]
+    fn summary_truncates_replies_to_200_chars() {
+        let long = "x".repeat(1000);
+        let msgs = vec![Message::new(Role::Assistant, long)];
+        let s = summarize_for_goal(&msgs, None);
+        assert!(s.contains("Recent assistant replies"));
+        assert!(s.matches('x').count() <= 200, "each reply capped at 200 chars");
+    }
+
+    #[test]
+    fn summary_empty_when_no_assistant_work() {
+        let msgs = vec![Message::new(Role::User, "go".to_string())];
+        assert_eq!(summarize_for_goal(&msgs, None), "(no agent work yet)");
+    }
+}
+
+#[cfg(test)]
 mod undo_tests {
-    use super::{build_provider, compute_undo};
+    use super::{
+        apply_reload_provider, build_provider, compaction_advisory, compute_undo,
+        default_max_tokens, estimate_after_tokens, fmt_k_tokens, friendly_provider_error,
+        manual_compact_result,
+    };
+    use atomcode_core::config::provider::ProviderConfig;
     use atomcode_coding::CodingAgentConfig;
-    use atomcode_kernel::message::Message;
+    use atomcode_kernel::message::{CompactTrigger, Message};
+    use atomcode_kernel::provider::ReasoningEffort;
+
+    #[test]
+    fn atomgit_gateway_401_swaps_for_login_hint() {
+        // An atomgit-gateway 401 (rejected/expired free-quota token) must NOT leak
+        // the raw upstream diagnostic; it's swapped for the actionable /login hint.
+        let raw = "HTTP 401: [auth_error/401] Authentication Error, \
+                   Gitcode auth: token rejected (status=401)"
+            .to_string();
+        let out = friendly_provider_error(
+            raw.clone(),
+            Some(401),
+            "https://api-ai.gitcode.com/v1",
+        );
+        assert_ne!(out, raw, "raw 401 must not reach the UI verbatim");
+        assert!(out.contains("/login"), "hint must point the user at /login: {out:?}");
+    }
+
+    #[test]
+    fn non_atomgit_401_keeps_verbatim_diagnostic() {
+        // A user-supplied sk-… gateway keeps the real message — /login is the wrong
+        // advice; the developer needs the diagnostic to fix their own key/endpoint.
+        let raw = "HTTP 401: invalid api key".to_string();
+        let out = friendly_provider_error(raw.clone(), Some(401), "https://api.openai.com/v1");
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn non_401_atomgit_error_keeps_verbatim_diagnostic() {
+        // Only 401 is an auth-expiry signal; a 500 from the same gateway is a real
+        // server fault and must surface as-is, not be masked by a login hint.
+        let raw = "HTTP 500: upstream overloaded".to_string();
+        let out = friendly_provider_error(raw.clone(), Some(500), "https://api-ai.gitcode.com/v1");
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn compaction_advisory_announces_committed_auto_overflow_and_ignores_manual() {
+        // Manual `/compact` is handled by the richer streaming `manual_compact_result`
+        // path, so the terse advisory stays silent for it on BOTH outcomes.
+        assert!(compaction_advisory(true, &CompactTrigger::Manual { focus: None }).is_none());
+        assert!(compaction_advisory(false, &CompactTrigger::Manual { focus: None }).is_none());
+
+        // A committed auto/overflow compaction announces itself once.
+        assert!(compaction_advisory(true, &CompactTrigger::Auto { utilization: 0.9 }).is_some());
+        assert!(compaction_advisory(true, &CompactTrigger::Overflow { attempt: 0 }).is_some());
+
+        // Auto / Overflow no-op compaction stays silent (no user action to ack, no spam).
+        assert!(compaction_advisory(false, &CompactTrigger::Auto { utilization: 0.9 }).is_none());
+        assert!(compaction_advisory(false, &CompactTrigger::Overflow { attempt: 0 }).is_none());
+    }
+
+    #[test]
+    fn manual_compact_result_reports_dropped_count_and_token_reduction() {
+        // 129 messages dropped; pre-compaction context = 42.9K tokens; the conversation
+        // shrank to ~25.9% of its bytes → after ≈ 11.1K. Numbers + the `→` arrow are
+        // locale-invariant (en: "dropped N messages, X → Y tokens"; zh: "丢弃 N 条消息，
+        // X → Y tokens"), so we assert on those rather than the surrounding words.
+        let line = manual_compact_result(true, 129, 170_000, 44_000, 42_900);
+        assert!(line.contains("129"), "dropped-count missing: {line}");
+        assert!(line.contains("42.9K"), "before figure missing: {line}");
+        assert!(line.contains("11.1K"), "after figure missing: {line}");
+        assert!(line.contains('→'), "token-reduction arrow missing: {line}");
+    }
+
+    #[test]
+    fn manual_compact_result_true_noop_is_short_line_without_arrow() {
+        // A TRUE no-op (candidate byte-identical: bytes_after == bytes_before) reports the
+        // "(nothing to compact — conversation is short)" line, which — in every locale —
+        // carries NO `→` arrow (unlike the committed / no-savings lines).
+        let noop = manual_compact_result(false, 0, 8_000, 8_000, 6_000);
+        assert!(!noop.is_empty(), "no-op must still acknowledge the command");
+        assert!(!noop.contains('→'), "true no-op must not show a token comparison: {noop}");
+        // Degenerate all-zero inputs also resolve to the short (no-arrow) line.
+        assert!(!manual_compact_result(false, 0, 0, 0, 0).contains('→'));
+    }
+
+    #[test]
+    fn manual_compact_result_net_loss_reports_no_savings_with_figures() {
+        // A refused compaction whose candidate GREW (bytes_after > bytes_before) — e.g.
+        // running `/compact` twice — is NOT "short"; v1 shows a "would not save tokens:
+        // X → Y" line WITH a `→` arrow. before = 5.0K; after = 5000*15000/10000 = 7500.
+        let line = manual_compact_result(false, 0, 10_000, 15_000, 5_000);
+        assert!(line.contains('→'), "net-loss line shows a token comparison: {line}");
+        assert!(line.contains("5.0K"), "before figure: {line}");
+        assert!(line.contains("7.5K"), "after figure: {line}");
+    }
+
+    #[test]
+    fn manual_compact_result_falls_back_to_byte_estimate_without_usage() {
+        // No provider usage yet (before_tokens = 0): rather than show "0 → 0", fall back
+        // to a coarse bytes/4 estimate. 40_000 bytes → ~10K before; halved bytes → ~5K.
+        let line = manual_compact_result(true, 3, 40_000, 20_000, 0);
+        assert!(line.contains("10.0K"), "byte-fallback before figure: {line}");
+        assert!(line.contains("5.0K"), "byte-fallback after figure: {line}");
+    }
+
+    #[test]
+    fn estimate_after_tokens_scales_by_byte_ratio() {
+        // 42.9K tokens, conversation bytes 170K → 44K → ~11.1K (the screenshot's case).
+        assert_eq!(estimate_after_tokens(42_900, 170_000, 44_000), 11_103);
+        // Degenerate bytes_before == 0 leaves the count unchanged (no divide-by-zero).
+        assert_eq!(estimate_after_tokens(5_000, 0, 0), 5_000);
+    }
+
+    #[test]
+    fn fmt_k_tokens_matches_core_format() {
+        assert_eq!(fmt_k_tokens(0), "0");
+        assert_eq!(fmt_k_tokens(999), "999");
+        assert_eq!(fmt_k_tokens(1000), "1.0K");
+        assert_eq!(fmt_k_tokens(42_900), "42.9K");
+    }
 
     fn coding_cfg(reasoning_history: Option<&str>) -> CodingAgentConfig {
         // A plain (non-AtomGit) OpenAI-compatible endpoint so build_provider takes the
@@ -1165,6 +2222,63 @@ mod undo_tests {
         assert!(res.is_err(), "a reasoning_history typo must fail provider construction");
         let err = res.err().unwrap().to_string();
         assert!(err.contains("reasoning_history"), "expected a reasoning_history error, got: {err}");
+    }
+
+    #[test]
+    fn default_max_tokens_mirrors_v1_clamp() {
+        // Parity with the legacy core engine (openai.rs / claude.rs): a quarter of the
+        // context window, clamped to [8_000, 16_384]. v2 previously sent NO max_tokens for
+        // OpenAI-compat (gateway applied its own small hidden cap → finish_reason=length).
+        assert_eq!(default_max_tokens(16_000), 8_000); // 4_000 → floor
+        assert_eq!(default_max_tokens(64_000), 16_000); // in range
+        assert_eq!(default_max_tokens(128_000), 16_384); // 32_000 → ceil
+        assert_eq!(default_max_tokens(1_000_000), 16_384); // huge window → ceil
+    }
+
+    #[test]
+    fn reload_provider_refreshes_context_window_and_provider_knobs() {
+        let mut cfg = CodingAgentConfig::new("old-key", "https://old.example.com/v1", "old-model", "/tmp");
+        cfg.context_window = 16_000;
+        cfg.provider_type = "openai".into();
+        cfg.reasoning_history = Some("exclude".into());
+        cfg.thinking_enabled = Some(false);
+        cfg.thinking_type = Some("disabled".into());
+        cfg.thinking_keep = Some("none".into());
+
+        let provider = ProviderConfig {
+            provider_type: "claude".into(),
+            api_key: Some("new-key".into()),
+            model: "new-model".into(),
+            base_url: Some("https://new.example.com/v1".into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 64_000,
+            max_tokens: Some(5_000),
+            thinking_type: Some("enabled".into()),
+            thinking_keep: Some("all".into()),
+            reasoning_history: Some("include".into()),
+            reasoning_effort: Some("max".into()),
+            thinking_enabled: Some(true),
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        };
+
+        apply_reload_provider(&mut cfg, &provider);
+
+        assert_eq!(cfg.model, "new-model");
+        assert_eq!(cfg.base_url, "https://new.example.com/v1");
+        assert_eq!(cfg.api_key, "new-key");
+        assert_eq!(cfg.context_window, 64_000);
+        // A user-configured `max_tokens` must thread into the per-call ChatOptions so v2
+        // actually sends it (previously dropped → gateway applied its own hidden output cap).
+        assert_eq!(cfg.chat_options.max_tokens, Some(5_000));
+        assert_eq!(cfg.provider_type, "claude");
+        assert_eq!(cfg.reasoning_history.as_deref(), Some("include"));
+        assert_eq!(cfg.chat_options.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(cfg.thinking_enabled, Some(true));
+        assert_eq!(cfg.thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(cfg.thinking_keep.as_deref(), Some("all"));
     }
 
     fn convo() -> Vec<Message> {
@@ -1238,6 +2352,28 @@ mod undo_tests {
     }
 
     #[test]
+    fn bypass_auto_approves_with_allow_else_prompts() {
+        use atomcode_capabilities::tools::{ApprovalResponse, PermissionDecision};
+        // --dangerously-skip-permissions ON: the bridge auto-approves with the SAME
+        // `allow` the manual ApproveTool path sends, and the kernel's middleware must
+        // read it as a PROCEED (not the fail-closed deny that Null/garbage maps to).
+        // This is the v1-parity fix: v1 auto-allowed in the core decider before any
+        // prompt; under v2 the bridge is the driver, so the bypass belongs here.
+        let resp = super::bypass_auto_approval(true).expect("bypass must auto-approve, not prompt");
+        assert_eq!(resp, ApprovalResponse::allow());
+        let decision = PermissionDecision::from_value(&serde_json::to_value(&resp).unwrap());
+        assert!(
+            matches!(decision, PermissionDecision::AllowOnce | PermissionDecision::AllowAlways),
+            "the bypass response must parse as an allow"
+        );
+        // OFF: no auto-response — the request is surfaced to the driver to prompt.
+        assert!(
+            super::bypass_auto_approval(false).is_none(),
+            "without bypass the approval request must reach the driver"
+        );
+    }
+
+    #[test]
     fn synthetic_user_messages_are_not_prompts() {
         let mut msgs = convo();
         let mut note = Message::user("[PLAN MODE ACTIVATED] ...");
@@ -1247,5 +2383,40 @@ mod undo_tests {
         // Still 2 real prompts; the synthetic note must not shift the count/target.
         assert_eq!(p.prompts_before, 2);
         assert_eq!(p.restored_prompt, "second question");
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::take_deny_cmd;
+    use atomcode_capabilities::tools::PermissionDecision;
+    use atomcode_kernel::event::AgentCommand as KCmd;
+
+    #[test]
+    fn cancel_releases_a_parked_approval_as_deny_and_clears_the_mirror() {
+        // A tool is parked awaiting approval (request id 7). Cancelling the turn must
+        // release that round-trip as a DENY *and* clear the bridge's mirror — so the
+        // kernel backfills the cancelled tool's result and a subsequent /model swap
+        // can't find a lingering approval to re-trigger on the next prompt.
+        let mut pending = Some((7u64, "geocoding".to_string()));
+        let cmd = take_deny_cmd(&mut pending).expect("a parked approval must be released on cancel");
+        assert!(pending.is_none(), "the bridge's pending-approval mirror must be cleared");
+        match cmd {
+            KCmd::Respond { id, value } => {
+                assert_eq!(id, 7);
+                assert_eq!(
+                    PermissionDecision::from_value(&value),
+                    PermissionDecision::Deny,
+                    "the released approval must read as a fail-closed DENY"
+                );
+            }
+            other => panic!("expected Respond(deny), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_to_release_when_no_approval_is_parked() {
+        let mut pending: Option<(u64, String)> = None;
+        assert!(take_deny_cmd(&mut pending).is_none());
     }
 }
