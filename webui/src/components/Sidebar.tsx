@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, SessionMetaWithProject } from '../api';
+import { listSessions, getSkills, SkillInfo, SessionMetaWithProject } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
@@ -30,30 +30,31 @@ interface SidebarProps {
   onSessionRenamed?: (id: string, name: string) => void;
   /** Called after a session is deleted. */
   onSessionDeleted?: (id: string) => void;
+  /** Pick a skill from the sidebar Skills menu → insert `/name ` into the chat input. */
+  onPickSkill?: (name: string) => void;
+  /** Open the remote-access dialog (moved from the old top header). */
+  onOpenRemote?: () => void;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
 
-type GroupBy = 'none' | 'date';
-
-const GROUP_KEY = 'atomcode.sidebarGroupBy';
-
-function readGroupBy(): GroupBy {
-  try {
-    const v = localStorage.getItem(GROUP_KEY);
-    if (v === 'date' || v === 'none') return v;
-  } catch {
-    /* ignore */
-  }
-  return 'none';
-}
-
-/** 把时间戳格式化为 YYYY-MM-DD（本地时区），用作日期分组标题。 */
+/** 把时间戳格式化为 YYYY-MM-DD（本地时区），用作日期分组键。 */
 function dateKey(ts: number): string {
   const ms = ts < 1e12 ? ts * 1000 : ts;
   const d = new Date(ms);
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** 友好日期分组标题：今天 / 昨天 / 本年内 MM-DD / 跨年 YYYY-MM-DD。 */
+function friendlyDateLabel(key: string, t: Translate): string {
+  const today = dateKey(Date.now());
+  if (key === today) return t('sidebar.dateToday');
+  const yMs = Date.now() - 86400000;
+  if (key === dateKey(yMs)) return t('sidebar.dateYesterday');
+  const [y, m, d] = key.split('-');
+  const sameYear = String(new Date().getFullYear()) === y;
+  return sameYear ? `${m}-${d}` : key;
 }
 
 /** 把 unix 时间戳（秒或毫秒）格式化为相对时间。 */
@@ -94,32 +95,40 @@ function PanelIcon() {
   );
 }
 
+/** Sparkles glyph for the Skills action. */
+function SparklesIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+      <path d="M8 1.3l1.15 3.1a2 2 0 0 0 1.2 1.2L13.4 6.8l-3.05 1.15a2 2 0 0 0-1.2 1.2L8 12.2 6.85 9.15a2 2 0 0 0-1.2-1.2L2.6 6.8l3.05-1.2a2 2 0 0 0 1.2-1.2z" />
+      <path d="M12.7 10.4l.5 1.35.5-1.35 1.35-.5-1.35-.5-.5-1.35-.5 1.35-1.35.5z" />
+    </svg>
+  );
+}
+
+/** Chevron-down glyph (for the Skills action's caret). */
+function ChevronDownIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
+/** Smartphone glyph for the remote-access button. */
+function SmartphoneIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="4.5" y="1.5" width="7" height="13" rx="1.5" stroke="currentColor" stroke-width="1.2" />
+      <line x1="7" y1="12.3" x2="9" y2="12.3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+    </svg>
+  );
+}
+
 function PlusIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <line x1="8" y1="3" x2="8" y2="13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
       <line x1="3" y1="8" x2="13" y2="8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
-    </svg>
-  );
-}
-
-function SearchIcon() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.3" />
-      <line x1="10.5" y1="10.5" x2="14" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-    </svg>
-  );
-}
-
-/** Sliders / "group by" glyph (vertical faders). */
-function SlidersIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <line x1="5" y1="2.5" x2="5" y2="13.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
-      <line x1="11" y1="2.5" x2="11" y2="13.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
-      <circle cx="5" cy="5.5" r="1.9" fill="var(--app-primary-background)" stroke="currentColor" stroke-width="1.2" />
-      <circle cx="11" cy="10.5" r="1.9" fill="var(--app-primary-background)" stroke="currentColor" stroke-width="1.2" />
     </svg>
   );
 }
@@ -217,14 +226,21 @@ export function Sidebar({
   cwd,
   onSessionRenamed,
   onSessionDeleted,
+  onPickSkill,
+  onOpenRemote,
 }: SidebarProps) {
   const t = useT();
   const { theme, setTheme, lang, setLang } = useSettings();
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
-  const [groupBy, setGroupBy] = useState<GroupBy>(readGroupBy);
-  const [groupMenuOpen, setGroupMenuOpen] = useState(false);
+  // Skills menu: list fetched lazily; the count badge shows once loaded.
+  const [skills, setSkills] = useState<SkillInfo[] | null>(null);
+  const [skillsLoading, setSkillsLoading] = useState(false);
+  const [skillsMenuOpen, setSkillsMenuOpen] = useState(false);
+  const [skillsMenuPos, setSkillsMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
+  const skillsMenuRef = useRef<HTMLDivElement | null>(null);
+  const skillsBtnRef = useRef<HTMLButtonElement | null>(null);
   // Per-session kebab menu: which session, and where to anchor the fixed menu.
   const [menuFor, setMenuFor] = useState<string | null>(null);
   // top XOR bottom: `top` opens the menu downward below the kebab; `bottom`
@@ -239,8 +255,6 @@ export function Sidebar({
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const [settingsSub, setSettingsSub] = useState<'theme' | 'language' | null>(null);
   const [settingsMenuPos, setSettingsMenuPos] = useState<{ left: number; bottom: number } | null>(null);
-  const searchRef = useRef<HTMLInputElement | null>(null);
-  const groupRef = useRef<HTMLDivElement | null>(null);
   const itemMenuRef = useRef<HTMLDivElement | null>(null);
   const settingsMenuRef = useRef<HTMLDivElement | null>(null);
 
@@ -256,18 +270,6 @@ export function Sidebar({
     loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadKey]);
-
-  // Close the group-by menu on outside click.
-  useEffect(() => {
-    if (!groupMenuOpen) return;
-    const h = (e: MouseEvent) => {
-      if (groupRef.current && !groupRef.current.contains(e.target as Node)) {
-        setGroupMenuOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', h);
-    return () => document.removeEventListener('mousedown', h);
-  }, [groupMenuOpen]);
 
   // The kebab menu is fixed-positioned (so the list's overflow can't clip it);
   // close it on outside click, scroll, or resize since it won't track anchors.
@@ -290,16 +292,6 @@ export function Sidebar({
       window.removeEventListener('scroll', close, true);
     };
   }, [menuFor]);
-
-  function selectGroupBy(g: GroupBy) {
-    setGroupBy(g);
-    try {
-      localStorage.setItem(GROUP_KEY, g);
-    } catch {
-      /* ignore */
-    }
-    setGroupMenuOpen(false);
-  }
 
   function openItemMenu(e: MouseEvent, id: string) {
     e.preventDefault();
@@ -371,6 +363,59 @@ export function Sidebar({
   function chooseSettings(section: SettingsSection) {
     setSettingsMenuOpen(false);
     onOpenSettings(section);
+  }
+
+  // Fetch skills once (for the count badge + menu list).
+  function ensureSkills() {
+    if (skills !== null || skillsLoading) return;
+    setSkillsLoading(true);
+    getSkills()
+      .then(setSkills)
+      .catch(() => setSkills([]))
+      .finally(() => setSkillsLoading(false));
+  }
+  useEffect(() => {
+    ensureSkills();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Skills menu is fixed-positioned (so the action row's container can't clip
+  // it); close on outside click / scroll / resize.
+  useEffect(() => {
+    if (!skillsMenuOpen) return;
+    const close = () => setSkillsMenuOpen(false);
+    const onDown = (e: MouseEvent) => {
+      const el = e.target as HTMLElement;
+      if (skillsMenuRef.current?.contains(el)) return;
+      if (skillsBtnRef.current?.contains(el)) return;
+      close();
+    };
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [skillsMenuOpen]);
+
+  function toggleSkillsMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (skillsMenuOpen) {
+      setSkillsMenuOpen(false);
+      return;
+    }
+    ensureSkills();
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setSkillsMenuPos({ top: rect.bottom + 4, left: rect.left, width: rect.width });
+    setSkillsMenuOpen(true);
+  }
+
+  function chooseSkill(name: string) {
+    setSkillsMenuOpen(false);
+    onPickSkill?.(name);
   }
 
   // The settings popup (3 entries). Fixed-positioned, but portaled to <body>:
@@ -445,8 +490,39 @@ export function Sidebar({
           <ModelGlyph />
           <span>{t('settings.menuModel')}</span>
         </button>
-        {/* 远程访问入口已移到顶栏右上角（见 app.tsx header-remote-btn）。 */}
+        {/* 远程访问入口已移到侧栏底部栏（见下方 sidebar-bottom 的 Remote Btn）。 */}
       </div>,
+          document.body,
+        )
+      : null;
+
+  // Skills popover (opens downward below the Skills action). Portaled to <body>
+  // so the mobile drawer's transform/overflow can't clip it. Selecting a skill
+  // inserts `/name ` into the chat input (via onPickSkill, lifted to App).
+  const renderSkillsMenu = () =>
+    skillsMenuOpen && skillsMenuPos
+      ? createPortal(
+          <div
+            class="item-menu skills-menu"
+            ref={skillsMenuRef}
+            style={{
+              top: `${skillsMenuPos.top}px`,
+              left: `${skillsMenuPos.left}px`,
+              minWidth: `${Math.max(skillsMenuPos.width, 200)}px`,
+            }}
+          >
+            {skillsLoading && <div class="group-by-menu-title">{t('sidebar.skillsLoading')}</div>}
+            {!skillsLoading && (skills?.length ?? 0) === 0 && (
+              <div class="group-by-menu-title">{t('sidebar.skillsEmpty')}</div>
+            )}
+            {!skillsLoading &&
+              (skills ?? []).map((s) => (
+                <button key={s.name} class="skills-menu-row" onClick={() => chooseSkill(s.name)} title={s.description || ''}>
+                  <span class="skills-menu-name">/{s.name}</span>
+                  {s.description && <span class="skills-menu-desc">{s.description}</span>}
+                </button>
+              ))}
+          </div>,
           document.body,
         )
       : null;
@@ -467,17 +543,15 @@ export function Sidebar({
       )
     : inCwd;
 
-  // 日期分组：列表本就按 updated_at 倒序，同一天的会话天然相邻，按日期切段即可。
+  // 日期分组（始终开启，对齐设计：列表按 updated_at 倒序，同一天天然相邻，按日期切段）。
   const dateGroups: { key: string; items: SessionMetaWithProject[] }[] = [];
-  if (groupBy === 'date') {
-    for (const s of filtered) {
-      const key = dateKey(s.updated_at || s.created_at);
-      const last = dateGroups[dateGroups.length - 1];
-      if (last && last.key === key) {
-        last.items.push(s);
-      } else {
-        dateGroups.push({ key, items: [s] });
-      }
+  for (const s of filtered) {
+    const key = dateKey(s.updated_at || s.created_at);
+    const last = dateGroups[dateGroups.length - 1];
+    if (last && last.key === key) {
+      last.items.push(s);
+    } else {
+      dateGroups.push({ key, items: [s] });
     }
   }
 
@@ -518,11 +592,6 @@ export function Sidebar({
 
   // Rail (collapsed desktop): a narrow icon rail instead of hiding the sidebar.
   if (collapsed) {
-    const expandAndSearch = () => {
-      onToggleCollapse?.();
-      // Focus the search input once it has rendered (next frame).
-      requestAnimationFrame(() => searchRef.current?.focus());
-    };
     return (
       <aside class="session-list app-sidebar collapsed">
         <nav class="sidebar-rail">
@@ -544,30 +613,46 @@ export function Sidebar({
           </button>
           <button
             class="rail-btn"
-            onClick={expandAndSearch}
-            title={t('sidebar.search')}
-            aria-label={t('sidebar.search')}
+            onClick={onToggleCollapse}
+            title={t('sidebar.skills')}
+            aria-label={t('sidebar.skills')}
           >
-            <SearchIcon />
+            <SparklesIcon />
           </button>
         </nav>
-        <button
-          class="rail-btn rail-btn-settings"
-          onClick={(e) => toggleSettingsMenu(e as unknown as MouseEvent)}
-          title={t('sidebar.settings')}
-          aria-label={t('sidebar.settings')}
-        >
-          <GearIcon />
-        </button>
+        <div class="sidebar-rail-bottom">
+          {onOpenRemote && (
+            <button
+              class="rail-btn"
+              onClick={onOpenRemote}
+              title={t('settings.menuRemote')}
+              aria-label={t('settings.menuRemote')}
+            >
+              <SmartphoneIcon />
+            </button>
+          )}
+          <button
+            class="rail-btn rail-btn-settings"
+            onClick={(e) => toggleSettingsMenu(e as unknown as MouseEvent)}
+            title={t('sidebar.settings')}
+            aria-label={t('sidebar.settings')}
+          >
+            <GearIcon />
+          </button>
+        </div>
         {renderSettingsMenu()}
       </aside>
     );
   }
 
+  const skillCount = skills?.length ?? 0;
+
   return (
     <aside class={'session-list app-sidebar' + (open ? ' open' : '')}>
       <div class="sidebar-brand-row">
-        <span class="sidebar-brand">AtomCode</span>
+        <span class="sidebar-brand">
+<span class="sidebar-brand-name">AtomCode</span>
+        </span>
         <button
           class="sidebar-collapse-btn"
           onClick={onToggleCollapse}
@@ -578,55 +663,27 @@ export function Sidebar({
         </button>
       </div>
 
-      <div class="sidebar-new-row">
-        <button class="sidebar-new-btn" onClick={onNew}>
-          <PlusIcon />
-          <span>{t('sidebar.newChat')}</span>
+      <div class="sidebar-actions">
+        <button class="sidebar-action" onClick={onNew}>
+          <span class="sidebar-action-icon"><PlusIcon /></span>
+          <span class="sidebar-action-label">{t('sidebar.newChat')}</span>
         </button>
-      </div>
-
-      <div class="sidebar-search-row">
-        <input
-          ref={searchRef}
-          class="sidebar-search"
-          type="text"
-          placeholder={t('sidebar.searchPlaceholder')}
-          value={query}
-          onInput={(e) => setQuery((e.target as HTMLInputElement).value)}
-        />
+        <button
+          ref={skillsBtnRef}
+          class={'sidebar-action' + (skillsMenuOpen ? ' open' : '')}
+          onClick={(e) => toggleSkillsMenu(e as unknown as MouseEvent)}
+          aria-haspopup="menu"
+          aria-expanded={skillsMenuOpen}
+        >
+          <span class="sidebar-action-icon"><SparklesIcon /></span>
+          <span class="sidebar-action-label">{t('sidebar.skills')}</span>
+          {skillCount > 0 && <span class="sidebar-action-badge">{skillCount}</span>}
+          <span class="sidebar-action-caret"><ChevronDownIcon /></span>
+        </button>
       </div>
 
       <div class="session-group-header">
         <span class="session-group-label">{t('sidebar.recent')}</span>
-        <div class="group-by-control" ref={groupRef}>
-          <button
-            class={'group-by-btn' + (groupBy !== 'none' ? ' on' : '')}
-            onClick={() => setGroupMenuOpen((o) => !o)}
-            title={t('sidebar.group')}
-            aria-label={t('sidebar.group')}
-          >
-            <SlidersIcon />
-          </button>
-          {groupMenuOpen && (
-            <div class="group-by-menu">
-              <div class="group-by-menu-title">{t('sidebar.groupBy')}</div>
-              <button
-                class={'group-by-item' + (groupBy === 'none' ? ' active' : '')}
-                onClick={() => selectGroupBy('none')}
-              >
-                <span>{t('sidebar.groupNone')}</span>
-                {groupBy === 'none' && <CheckIcon />}
-              </button>
-              <button
-                class={'group-by-item' + (groupBy === 'date' ? ' active' : '')}
-                onClick={() => selectGroupBy('date')}
-              >
-                <span>{t('sidebar.groupDate')}</span>
-                {groupBy === 'date' && <CheckIcon />}
-              </button>
-            </div>
-          )}
-        </div>
       </div>
 
       <div class="session-list-body">
@@ -637,29 +694,39 @@ export function Sidebar({
         {!loading && inCwd.length > 0 && filtered.length === 0 && (
           <div class="session-empty">{t('sidebar.noMatch')}</div>
         )}
-        {!loading && groupBy === 'date'
-          ? dateGroups.map((g) => (
-              <div key={g.key} class="session-date-group">
-                <div class="session-date-label">{g.key}</div>
-                {g.items.map(renderItem)}
-              </div>
-            ))
-          : filtered.map(renderItem)}
+        {!loading &&
+          dateGroups.map((g) => (
+            <div key={g.key} class="session-date-group">
+              <div class="session-date-label">{friendlyDateLabel(g.key, t)}</div>
+              {g.items.map(renderItem)}
+            </div>
+          ))}
       </div>
 
       <div class="sidebar-bottom">
         <LoginButton />
+        <span class="sidebar-bottom-spacer" />
+        {onOpenRemote && (
+          <button
+            class="sidebar-icon-btn"
+            onClick={onOpenRemote}
+            title={t('settings.menuRemote')}
+            aria-label={t('settings.menuRemote')}
+          >
+            <SmartphoneIcon />
+          </button>
+        )}
         <button
-          class="sidebar-settings-btn"
+          class="sidebar-icon-btn sidebar-settings-btn"
           onClick={(e) => toggleSettingsMenu(e as unknown as MouseEvent)}
           title={t('sidebar.settings')}
           aria-label={t('sidebar.settings')}
         >
           <GearIcon />
-          <span>{t('sidebar.settings')}</span>
         </button>
       </div>
       {renderSettingsMenu()}
+      {renderSkillsMenu()}
 
       {/* Per-session actions menu. Fixed + portaled to <body> so neither the
           scroll container nor the mobile drawer's transform/overflow clips it. */}

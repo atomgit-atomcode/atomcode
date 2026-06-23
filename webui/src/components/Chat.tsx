@@ -103,6 +103,12 @@ interface ChatProps {
   restoring?: boolean;
   /** /live turn 完成后通知 App 刷新侧栏列表（session 已落盘，列表需更新）。 */
   onLiveTurnDone?: () => void;
+  /** 打开工作目录选择器（cwd 面包屑已从顶栏移到输入框下方，由本组件渲染）。 */
+  onOpenCwd?: () => void;
+  /** 上报是否处于落地（空对话）态，供 App 决定是否显示会话标题头。 */
+  onLanding?: (landing: boolean) => void;
+  /** 侧栏「技能」菜单选中的技能：变化时把 `/name ` 插入输入框。 */
+  skillInsert?: { name: string; seq: number } | null;
 }
 
 function formatArgs(args: unknown): string {
@@ -269,7 +275,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOpenCwd, onLanding, skillInsert }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -1188,6 +1194,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 已有 historyHint（无法加载、提示去 TUI/磁盘续聊）。
   const landing = messages.length === 0 && !historyHint && !restoring && !loading;
 
+  // 上报落地态给 App（决定是否显示会话标题头）。
+  useEffect(() => {
+    onLanding?.(landing);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [landing]);
+
+  // 侧栏「技能」菜单选中 → 把 `/name ` 插入输入框（按 seq 去重，避免重复插入）。
+  const lastSkillSeqRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!skillInsert) return;
+    if (lastSkillSeqRef.current === skillInsert.seq) return;
+    lastSkillSeqRef.current = skillInsert.seq;
+    insertAtCursor(`/${skillInsert.name} `);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skillInsert]);
+
   // 落地页副标题：项目名 + 缩写路径。
   const cleanCwd = cwd.replace(/\/+$/, '');
   const cwdIdx = cleanCwd.lastIndexOf('/');
@@ -1339,6 +1361,29 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     </div>
   );
 
+  // 输入框下方副栏：左 cwd 面包屑（点击切目录），右键盘提示（对齐设计的 Input Footer）。
+  const inputSubbar = (
+    <div class="input-subbar">
+      <button class="input-cwd" onClick={() => onOpenCwd?.()} title={t('header.switchCwd')}>
+        <svg class="input-cwd-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M1.8 4.2c0-.66.54-1.2 1.2-1.2h2.7l1.3 1.5h5.2c.66 0 1.2.54 1.2 1.2v5.9c0 .66-.54 1.2-1.2 1.2H3c-.66 0-1.2-.54-1.2-1.2z"
+            stroke="currentColor"
+            stroke-width="1.2"
+            stroke-linejoin="round"
+          />
+        </svg>
+        {cwd ? (
+          <span class="input-cwd-path">{projPath}</span>
+        ) : (
+          <span class="input-cwd-path muted">{t('header.noCwd')}</span>
+        )}
+        <span class="input-cwd-chevron">▾</span>
+      </button>
+      <span class="input-hint">{t('chat.kbdHint')}</span>
+    </div>
+  );
+
   // 文件选择器模态（落地态与常规态共用一份）。
   const filePickerModal = showFilePicker && (
     <FilePicker
@@ -1358,19 +1403,50 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     />
   );
 
+  // 落地页快捷提示胶囊：点击把文本填入输入框并聚焦（不自动发送，便于二次编辑）。
+  const quickChips: { label: string; insert: string }[] = [
+    { label: t('chat.chipReview'), insert: '/code-review ' },
+    { label: t('chat.chipExplain'), insert: t('chat.chipExplain') },
+    { label: t('chat.chipTest'), insert: t('chat.chipTest') },
+  ];
+  function fillInput(text: string) {
+    setInput(text);
+    requestAnimationFrame(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      const pos = text.length;
+      ta.setSelectionRange(pos, pos);
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+    });
+  }
+
   if (landing) {
     return (
       <>
         <div class="chat-landing">
           <div class="landing-inner">
-            <div class="landing-brand">AtomCode</div>
-            {cwd && (
-              <div class="landing-subtitle">
-                <span class="landing-project">{projName}</span>
-                <span class="landing-path">{projPath}</span>
-              </div>
-            )}
-            {inputBox}
+            <div class="landing-brand">
+              <span class="landing-brand-logo" aria-hidden="true">
+                <svg width="34" height="34" viewBox="0 0 24 24" fill="none">
+                  <rect x="6.4" y="6.4" width="11.2" height="11.2" rx="2.6" transform="rotate(45 12 12)" stroke="currentColor" stroke-width="1.8" />
+                </svg>
+              </span>
+              <span class="landing-brand-name">AtomCode</span>
+            </div>
+            <div class="landing-tagline">{t('chat.greeting')}</div>
+            <div class="landing-input">
+              {inputBox}
+              {inputSubbar}
+            </div>
+            <div class="landing-chips">
+              {quickChips.map((c) => (
+                <button key={c.label} class="landing-chip" onClick={() => fillInput(c.insert)}>
+                  {c.label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
         {filePickerModal}
@@ -1383,6 +1459,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     <>
       {/* Message timeline */}
       <div class="messages-container">
+        <div class="timeline-inner">
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
             <div>
@@ -1472,10 +1549,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         ))}
 
         <div ref={bottomRef} />
+        </div>
       </div>
 
       {/* Floating input */}
-      <div class="input-container">{inputBox}</div>
+      <div class="input-container">
+        <div class="input-wrap">
+          {inputBox}
+          {inputSubbar}
+        </div>
+      </div>
       {filePickerModal}
       {livePermissionCard}
     </>
