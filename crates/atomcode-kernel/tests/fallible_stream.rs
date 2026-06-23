@@ -4,7 +4,7 @@
 
 use atomcode_kernel::event::AgentEvent;
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
-use atomcode_kernel::testkit::{RecorderHook, ScriptedProvider};
+use atomcode_kernel::testkit::{MockProvider, RecorderHook, ScriptedProvider};
 use atomcode_kernel::tool::ToolRegistry;
 use std::sync::Arc;
 
@@ -207,8 +207,10 @@ use futures::stream::BoxStream;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A provider whose open FAILS the first `fail_first` times (returning a clone of
-/// `err`), then SUCCEEDS with a bare `Done`. Counts total opens so a test can
-/// assert how many re-opens the agent loop drove.
+/// `err`), then SUCCEEDS with a content-bearing response (`TextDelta`+`Done`).
+/// Counts total opens so a test can assert how many re-opens the agent loop drove.
+/// (The success must carry text: a bare `Done` is now treated as a transient
+/// empty-200 and retried, which would mask the open-retry behaviour under test.)
 struct FlakyProvider {
     fail_first: u32,
     err: ProviderError,
@@ -236,7 +238,10 @@ impl LlmProvider for FlakyProvider {
         if n < self.fail_first {
             return Err(self.err.clone());
         }
-        Ok(Box::pin(futures::stream::iter(vec![StreamEvent::Done { truncated: false }])))
+        Ok(Box::pin(futures::stream::iter(vec![
+            StreamEvent::TextDelta("recovered".into()),
+            StreamEvent::Done { truncated: false },
+        ])))
     }
 }
 
@@ -343,5 +348,118 @@ async fn non_retryable_open_failure_fails_fast() {
         calls_seen.calls.load(Ordering::SeqCst),
         1,
         "a non-retryable error must open exactly once (fail fast)"
+    );
+}
+
+// ── EMPTY-RESPONSE FAST RETRY (an empty 200 must be retried, not a silent stop) ─
+//
+// Some OpenAI-compatible gateways (the atomgit→DeepSeek path) occasionally return a
+// 200 with a COMPLETELY empty completion: the stream opens, yields no text, no tool
+// calls and no reasoning, then ends. That is a transient upstream hiccup that
+// recovers on an immediate resend — NOT the model choosing to stop (a real stop
+// carries text). The kernel must re-issue the SAME round with a VISIBLE notice and
+// SUCCEED once the provider recovers, instead of finishing as a silent Stopped
+// (which the user perceives as the agent mysteriously giving up mid-task).
+// `start_paused` advances the backoff on virtual time so the test is instant.
+#[tokio::test(start_paused = true)]
+async fn empty_response_is_retried_then_succeeds() {
+    let reg = ToolRegistry::new();
+    // Call 1: an empty 200 (bare Done, no content). Call 2: a real recovery.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("hello".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let received = provider.received.clone();
+    let recorder = Arc::new(RecorderHook::new());
+
+    let handle = spawn_agent(provider, reg, recorder);
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut text = String::new();
+    let mut errored = false;
+    let mut stop: Option<String> = None;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            AgentEvent::Warning(w) => warnings.push(w),
+            AgentEvent::TextDelta(t) => text.push_str(&t),
+            AgentEvent::Error { .. } => errored = true,
+            AgentEvent::TurnComplete { reason } => {
+                stop = Some(format!("{reason:?}"));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let calls = received.lock().unwrap().len();
+    assert_eq!(
+        calls, 2,
+        "the empty 200 must be RETRIED → a second chat_stream call; got {calls}"
+    );
+    assert_eq!(text, "hello", "the recovered response text must reach the driver");
+    assert!(
+        warnings.iter().any(|w| w.contains("空响应") && w.contains("重试")),
+        "an empty response must emit a VISIBLE retry notice; got {warnings:?}"
+    );
+    assert!(!errored, "a recovered empty response must NOT surface a terminal Error");
+    assert_eq!(
+        stop.as_deref(),
+        Some("Stopped"),
+        "the recovered turn must end successfully (Stopped)"
+    );
+}
+
+// ── EMPTY-RESPONSE EXHAUSTION (a run of empty 200s fails VISIBLY, not silently) ──
+//
+// If every resend is also empty, the dedicated budget is exhausted and the turn
+// ends with StopReason::ProviderError and a clear Error — NOT a silent Stopped that
+// looks like a normal (empty) completion.
+#[tokio::test(start_paused = true)]
+async fn empty_response_exhaustion_fails_visibly() {
+    let reg = ToolRegistry::new();
+    // An empty turns queue makes MockProvider yield a bare Done forever → every open
+    // is an empty 200, so the retry budget is exhausted.
+    let provider = Arc::new(MockProvider::new(vec![]));
+    let received = provider.received.clone();
+    let recorder = Arc::new(RecorderHook::new());
+
+    let handle = spawn_agent(provider, reg, recorder);
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut retry_notices = 0usize;
+    let mut error_msg: Option<String> = None;
+    let mut stop: Option<String> = None;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            AgentEvent::Warning(w) if w.contains("空响应") => retry_notices += 1,
+            AgentEvent::Error { message, .. } => error_msg = Some(message),
+            AgentEvent::TurnComplete { reason } => {
+                stop = Some(format!("{reason:?}"));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(retry_notices, 5, "the dedicated budget is 5 visible retries");
+    let calls = received.lock().unwrap().len();
+    assert_eq!(
+        calls, 6,
+        "1 initial empty open + 5 retries = 6 chat_stream calls; got {calls}"
+    );
+    assert!(
+        error_msg.as_deref().is_some_and(|m| m.contains("空响应")),
+        "exhaustion must surface a clear empty-response Error; got {error_msg:?}"
+    );
+    assert_eq!(
+        stop.as_deref(),
+        Some("ProviderError"),
+        "exhausted empty retries must fail the turn with ProviderError, not a silent Stopped"
     );
 }

@@ -227,10 +227,21 @@ async fn subagent_working_dir_isolation() {
     let sub = SubAgentTool::new(
         "subagent",
         || {
-            Arc::new(RecordingProvider::new(vec![vec![
-                StreamEvent::ToolCall(tool_call("c_probe", "working_dir_probe", "{}")),
-                StreamEvent::Done { truncated: false },
-            ]])) as Arc<_>
+            Arc::new(RecordingProvider::new(vec![
+                vec![
+                    StreamEvent::ToolCall(tool_call("c_probe", "working_dir_probe", "{}")),
+                    StreamEvent::Done { truncated: false },
+                ],
+                // Round 2: the child stops after the probe. It streams REASONING (not
+                // text), so the provider produced content (NOT an empty-200 — which
+                // would now be retried inside the child) while leaving the final
+                // assistant TEXT empty — so SubAgentTool falls back to the probe tool
+                // RESULT (the working_dir), which is what this test asserts.
+                vec![
+                    StreamEvent::Reasoning("(probe complete)".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ])) as Arc<_>
         },
         || {
             let mut reg = ToolRegistry::new();
