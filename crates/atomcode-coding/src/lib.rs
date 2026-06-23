@@ -36,6 +36,7 @@ pub mod plan_mode;
 pub mod runtime;
 pub mod telemetry;
 pub mod turn_synth;
+pub mod undo;
 
 mod assemble;
 
