@@ -124,7 +124,9 @@ impl Tool for ParallelEditTool {
         // upgrades that to Always when the file is in-workspace.
         let parsed = match serde_json::from_str::<ParallelEditArgs>(args) {
             Ok(p) => p,
-            Err(_) => return ApprovalRequirement::AutoApprove,
+            Err(_) => return ApprovalRequirement::RequireApproval(
+                "Cannot parse parallel_edit args — requiring approval for safety".to_string()
+            ),
         };
         for file in &parsed.files {
             if super::is_sensitive_input_path(&file.path) {
