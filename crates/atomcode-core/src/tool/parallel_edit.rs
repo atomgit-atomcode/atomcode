@@ -432,11 +432,14 @@ fn build_task_infos_with_dedup(paths: &[&str]) -> Vec<crate::agent::SubAgentTask
 /// subdirectories so nested project layouts (a Cargo workspace under a
 /// monorepo) still resolve.
 fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBuf)> {
+    // No Unix-only pipes (head/tail): the probe runs under cmd.exe on Windows where
+    // those coreutils don't exist (else the pipe's last command fails and the probe
+    // falsely reports BUILD ERRORS). Output is truncated Rust-side for display below.
     let markers: &[(&str, &str)] = &[
-        ("package.json", "npm run build 2>&1 | head -30"),
-        ("Cargo.toml", "cargo check 2>&1 | tail -20"),
-        ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
-        ("go.mod", "go build ./... 2>&1 | tail -20"),
+        ("package.json", "npm run build 2>&1"),
+        ("Cargo.toml", "cargo check 2>&1"),
+        ("pom.xml", "mvn compile -q 2>&1"),
+        ("go.mod", "go build ./... 2>&1"),
     ];
 
     for &(marker, cmd) in markers {

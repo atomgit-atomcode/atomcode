@@ -279,9 +279,20 @@ impl Tool for ParallelEditTool {
             .ok()
             .flatten();
         if let Some((cmd, build_dir)) = build_detect {
-            let mut build_cmd = tokio::process::Command::new("sh");
-            build_cmd.args(["-c", &cmd])
-                .current_dir(&build_dir);
+            // Platform-appropriate shell: cmd.exe on Windows, sh on Unix (mirrors the
+            // bash tool + v1 parallel_edit). Without this the probe spawned `sh`, which
+            // is absent on Windows → the probe silently never ran.
+            #[cfg(windows)]
+            let (shell, flag) = ("cmd.exe", "/C");
+            #[cfg(not(windows))]
+            let (shell, flag) = ("sh", "-c");
+
+            let mut build_cmd = tokio::process::Command::new(shell);
+            build_cmd.args([flag, &cmd]).current_dir(&build_dir);
+            // Suppress the Windows console-window flash for the probe (CREATE_NO_WINDOW);
+            // tokio's Command exposes creation_flags directly on Windows.
+            #[cfg(windows)]
+            build_cmd.creation_flags(0x0800_0000);
             let output = build_cmd.output().await;
             if let Ok(out) = output {
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -314,11 +325,14 @@ impl Tool for ParallelEditTool {
 /// found. Searches the working directory then immediate subdirectories so nested project
 /// layouts (a Cargo workspace under a monorepo) still resolve.
 fn find_build_command(wd: &Path) -> Option<(String, std::path::PathBuf)> {
+    // No Unix-only pipes (head/tail): the probe runs under cmd.exe on Windows where
+    // those coreutils don't exist. Full output is captured; the error display is
+    // truncated Rust-side (`combined.lines().take(15)`) below.
     let markers: &[(&str, &str)] = &[
-        ("package.json", "npm run build 2>&1 | head -30"),
-        ("Cargo.toml", "cargo check 2>&1 | tail -20"),
-        ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
-        ("go.mod", "go build ./... 2>&1 | tail -20"),
+        ("package.json", "npm run build 2>&1"),
+        ("Cargo.toml", "cargo check 2>&1"),
+        ("pom.xml", "mvn compile -q 2>&1"),
+        ("go.mod", "go build ./... 2>&1"),
     ];
 
     for &(marker, cmd) in markers {
@@ -357,6 +371,29 @@ mod tests {
     use futures::stream::{self, BoxStream};
     use futures::StreamExt;
     use tokio_util::sync::CancellationToken;
+
+    /// The build-verification probe runs under `cmd.exe /C` on Windows, where the
+    /// Unix coreutils `head`/`tail` don't exist — so the detected commands must not
+    /// pipe through them (output is already truncated Rust-side for display).
+    #[test]
+    fn build_commands_are_cross_platform_no_unix_pipes() {
+        let d = tempfile::tempdir().unwrap();
+        for (marker, body) in [
+            ("Cargo.toml", "[package]\nname=\"x\"\nversion=\"0.0.0\"\n"),
+            ("package.json", "{}"),
+            ("pom.xml", "<project/>"),
+            ("go.mod", "module x\n"),
+        ] {
+            let dir = d.path().join(marker.replace('.', "_"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(marker), body).unwrap();
+            let (cmd, _) = find_build_command(&dir).expect("marker should be detected");
+            assert!(
+                !cmd.contains("head") && !cmd.contains("tail"),
+                "build command must not depend on Unix-only head/tail (breaks cmd.exe on Windows): {cmd}"
+            );
+        }
+    }
 
     /// Stateless scripted provider: `Some(reply)` → one text turn then stop;
     /// `None` → a terminal open error (simulates a failed child).
