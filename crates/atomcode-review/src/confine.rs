@@ -10,10 +10,10 @@
 //! tools deliberately do no path-escape enforcement (their trust model leaves it
 //! to the embedder).
 
+use async_trait::async_trait;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{Tool, ToolCall};
-use async_trait::async_trait;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -85,17 +85,39 @@ fn check_one(root: &Path, raw: &str) -> Result<(), String> {
     } else {
         root.join(p)
     };
-    if !normalize_lexical(&joined).starts_with(root) {
+    let normalized = normalize_lexical(&joined);
+    if !normalized.starts_with(root) {
         return Err(format!(
             "path '{raw}' is outside the review repository; review tools may only access files within the repo"
         ));
     }
+    if let Some(existing) = existing_prefix(&normalized) {
+        if let (Ok(canon_root), Ok(canon_existing)) =
+            (std::fs::canonicalize(root), std::fs::canonicalize(existing))
+        {
+            if !canon_existing.starts_with(canon_root) {
+                return Err(format!(
+                    "path '{raw}' is outside the review repository; review tools may only access files within the repo"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
-/// Lexical normalization (no filesystem / symlink resolution): drop `.` and
-/// resolve `..` against prior components. Catches `../` escapes without touching
-/// disk — paths may not exist yet, and we must not follow symlinks here.
+/// Longest existing prefix of `p`, used to catch symlink escapes without requiring
+/// the final path (or glob tail) to exist.
+fn existing_prefix(p: &Path) -> Option<&Path> {
+    for candidate in p.ancestors() {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Lexical normalization: drop `.` and resolve `..` against prior components.
+/// This catches `../` escapes before the later existing-prefix symlink check.
 fn normalize_lexical(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
@@ -142,6 +164,21 @@ mod tests {
     #[test]
     fn rejects_absolute_outside_repo() {
         assert!(check_arguments(&root(), r#"{"file_path":"/etc/passwd"}"#).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
+
+        let root = std::fs::canonicalize(&repo).unwrap();
+        assert!(check_arguments(&root, r#"{"file_path":"link/secret.txt"}"#).is_err());
     }
 
     #[test]
