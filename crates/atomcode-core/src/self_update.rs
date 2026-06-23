@@ -1066,6 +1066,9 @@ fn is_newer(latest: &str, current: &str) -> bool {
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.trim();
     let rest = s.strip_prefix('v')?;
+    // Strip pre-release suffix (e.g. "-beta.1", "-rc.2") so versions
+    // like "v4.25.0-beta.1" parse correctly (Issue #596).
+    let rest = rest.split('-').next()?;
     let mut parts = rest.split('.');
     let a = parts.next()?.parse().ok()?;
     let b = parts.next()?.parse().ok()?;
@@ -1268,6 +1271,25 @@ mod tests {
         // when strings differ (user may have a custom channel).
         assert!(is_newer("build-abc", "build-xyz"));
         assert!(!is_newer("build-abc", "build-abc"));
+    }
+
+    #[test]
+    fn parse_version_handles_prerelease_suffix() {
+        // Issue #596: pre-release versions like "v4.25.0-beta.1" must parse
+        assert_eq!(parse_version("v4.25.0-beta.1"), Some((4, 25, 0)));
+        assert_eq!(parse_version("v4.25.0-rc.2"), Some((4, 25, 0)));
+        assert_eq!(parse_version("v4.25.0-alpha"), Some((4, 25, 0)));
+        // Normal versions still work
+        assert_eq!(parse_version("v4.25.0"), Some((4, 25, 0)));
+    }
+
+    #[test]
+    fn is_newer_handles_prerelease() {
+        // Pre-release version is treated as equal to its release version
+        assert!(!is_newer("v4.25.0", "v4.25.0-beta.1"));
+        assert!(!is_newer("v4.25.0-beta.1", "v4.25.0"));
+        // But still newer than older versions
+        assert!(is_newer("v4.25.0-beta.1", "v4.24.99"));
     }
 
     #[test]

@@ -32,6 +32,9 @@ fn parse_version_line(s: &str) -> Option<(u64, u64, u64)> {
         return None;
     }
     let rest = trimmed.strip_prefix('v')?;
+    // Strip pre-release suffix (e.g. "-beta.1", "-rc.2") so versions
+    // like "v4.25.0-beta.1" parse correctly (Issue #596).
+    let rest = rest.split('-').next()?;
     let mut parts = rest.split('.');
     let major = parts.next()?.parse::<u64>().ok()?;
     let minor = parts.next()?.parse::<u64>().ok()?;
@@ -185,6 +188,33 @@ mod tests {
     #[test]
     fn malformed_current_returns_none() {
         assert_eq!(parse_and_compare("bad", &manifest_body("v4.16.0")), None);
+    }
+
+    #[test]
+    fn prerelease_version_parses_correctly() {
+        // Issue #596: pre-release versions must not return None
+        assert_eq!(
+            parse_and_compare("v4.15.3", &manifest_body("v4.16.0-beta.1")),
+            Some("v4.16.0".to_string())
+        );
+    }
+
+    #[test]
+    fn prerelease_current_parses_correctly() {
+        // Current version with pre-release suffix should also parse
+        assert_eq!(
+            parse_and_compare("v4.15.0-beta.2", &manifest_body("v4.16.0")),
+            Some("v4.16.0".to_string())
+        );
+    }
+
+    #[test]
+    fn prerelease_same_version_returns_none() {
+        // v4.16.0-beta.1 vs v4.16.0 → not newer (pre-release == release)
+        assert_eq!(
+            parse_and_compare("v4.16.0-beta.1", &manifest_body("v4.16.0")),
+            None
+        );
     }
 
     #[test]
