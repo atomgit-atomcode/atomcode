@@ -354,8 +354,14 @@ impl Tool for ParallelEditTool {
                 .flatten()
         };
         if let Some((cmd, build_dir)) = build_detect {
-            let mut build_cmd = tokio::process::Command::new("sh");
-            build_cmd.args(["-c", &cmd])
+            // Use platform-appropriate shell: Windows uses cmd.exe, Unix uses sh
+            #[cfg(windows)]
+            let (shell, flag) = ("cmd.exe", "/C");
+            #[cfg(not(windows))]
+            let (shell, flag) = ("sh", "-c");
+
+            let mut build_cmd = tokio::process::Command::new(shell);
+            build_cmd.args([flag, &cmd])
                 .current_dir(&build_dir);
             crate::process_utils::suppress_console_window(&mut build_cmd);
             let output = build_cmd.output().await;
