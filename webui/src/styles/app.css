@@ -444,30 +444,35 @@ body {
   width: 100%;
 }
 
-/* Each tool is a bordered card (matches the design): tool-bg fill, rounded,
-   clipped so the expanded body's corners stay rounded. */
+/* Each tool renders as a borderless, compact inline row (log-style): a
+   leading type icon, the name, a flex-fill arg preview, and a plain-text
+   status with its own icon. No card chrome — only a subtle hover background. */
 .tool-body {
-  background: var(--app-tool-background);
-  border: 1px solid var(--app-primary-border-color);
-  border-radius: var(--corner-radius-medium);
   margin: 0;
   max-width: 100%;
   font-size: 1em;
-  overflow: hidden;
 }
 
 .tool-header {
   display: flex;
   align-items: center;
-  padding: 8px 12px;
-  gap: 10px;
+  padding: 5px 6px;
+  gap: 8px;
+  border-radius: var(--corner-radius-small);
   cursor: pointer;
   user-select: none;
   min-width: 0;
 }
 
-.tool-header:hover .tool-name-secondary { color: var(--app-primary-foreground); }
+.tool-header:hover { background: var(--app-list-hover-background); }
 .tool-header:active { opacity: 0.65; }
+
+/* Leading tool-type icon (file / search / edit / terminal …). */
+.tool-type-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  color: var(--app-secondary-foreground);
+}
 
 .tool-name {
   font-weight: 600;
@@ -479,10 +484,9 @@ body {
 }
 
 .tool-name-secondary {
-  /* Grow to fill the row between the tool name and the status badge so the
-     command preview uses the available width (no big blank gap) and shows
-     as much as fits; CSS ellipsis trims the rest at the real width. Full
-     args are available by clicking the row to expand. */
+  /* Grow to fill the row between the tool name and the status so the command
+     preview uses the available width (no big blank gap) and shows as much as
+     fits; CSS ellipsis trims the rest. Full args are available on expand. */
   flex: 1 1 auto;
   color: var(--app-secondary-foreground);
   font-size: 12px;
@@ -493,20 +497,25 @@ body {
   white-space: nowrap;
 }
 
-/* Status badge → rounded pill (matches the design's tinted pills). */
+/* Status → plain colored text + leading icon (no filled pill). */
 .tool-annotation {
   margin-left: auto;
-  border-radius: 999px;
-  padding: 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 11px;
   flex-shrink: 0;
   white-space: nowrap;
 }
 
-.tool-annotation.success { color: #74c991; background-color: #74c99133; }
-.tool-annotation.error { color: #f14c4c; background-color: #c74e3933; }
-.tool-annotation.pending { color: var(--app-secondary-foreground); background-color: color-mix(in srgb, var(--app-secondary-foreground), transparent 85%); }
-.tool-annotation.waiting { color: var(--app-warning-accent); background-color: color-mix(in srgb, var(--app-warning-accent), transparent 80%); }
+.tool-status-icon { flex-shrink: 0; display: inline-flex; }
+.tool-status-icon.spin { animation: tool-spin 0.8s linear infinite; transform-origin: center; }
+@keyframes tool-spin { to { transform: rotate(360deg); } }
+
+.tool-annotation.success { color: var(--app-success-foreground); }
+.tool-annotation.error { color: var(--app-error-foreground); }
+.tool-annotation.pending { color: var(--app-secondary-foreground); }
+.tool-annotation.waiting { color: var(--app-warning-accent); }
 
 /* === Code Block (markdown / mono) === */
 .code-block-wrapper { position: relative; margin: 10px 0; }
@@ -870,6 +879,14 @@ body {
 }
 .sidebar-action-caret { display: flex; align-items: center; color: var(--app-secondary-foreground); flex-shrink: 0; }
 
+/* --- Brand row button group (search + collapse, tightly packed) --- */
+.sidebar-brand-btns {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
 .sidebar-search-btn {
   width: 28px;
   height: 28px;
@@ -1166,35 +1183,17 @@ body {
 
 .session-empty { padding: 20px; text-align: center; color: var(--app-secondary-foreground); font-size: 12px; }
 
-/* --- Session search dialog (centered modal) --- */
-.search-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 70;
-  background: rgba(0, 0, 0, 0.45);
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding: 12vh 16px 0;
-  animation: fadeIn 0.12s ease-out;
-}
-.search-dialog {
-  width: min(560px, 100%);
-  max-height: 70dvh;
-  display: flex;
-  flex-direction: column;
-  background: var(--app-menu-background);
-  border: 1px solid var(--app-menu-border);
-  border-radius: var(--corner-radius-large);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-  overflow: hidden;
+/* --- Session search dialog (reuses modal-overlay + modal-card) --- */
+.search-modal-card {
+  width: min(480px, 100%);
+  height: 70dvh;
 }
 .search-input-row {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 12px 14px;
-  border-bottom: 1px solid var(--app-primary-border-color);
+  border-bottom: 1px solid var(--app-menu-border);
   flex-shrink: 0;
 }
 .search-input-row svg {
@@ -1208,7 +1207,7 @@ body {
   padding: 0 8px;
   background: transparent;
   border: none;
-  color: var(--app-primary-foreground);
+  color: var(--app-input-foreground);
   font-family: inherit;
   font-size: 14px;
   outline: none;
@@ -1237,21 +1236,30 @@ body {
 .search-results {
   flex: 1;
   overflow-y: auto;
-  padding: 4px;
+  padding: 4px 4px 8px;
 }
-.search-hint,
 .search-empty {
   padding: 24px 16px;
   text-align: center;
   color: var(--app-secondary-foreground);
   font-size: 13px;
 }
+.search-date-group {
+  margin-top: 4px;
+}
+.search-date-label {
+  padding: 8px 10px 3px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--app-secondary-foreground);
+}
+.search-date-group:first-child .search-date-label { padding-top: 4px; }
 .search-result-item {
   display: flex;
   align-items: center;
   gap: 8px;
   width: 100%;
-  padding: 10px 12px;
+  padding: 8px 10px;
   border: none;
   border-radius: var(--corner-radius-medium);
   background: transparent;
@@ -1561,13 +1569,12 @@ body {
 .tool-body-grid {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
-  /* Sits inside the tool card now: no own border/radius, just a divider under
-     the header. */
-  margin-top: 0;
-  border: none;
-  border-top: 1px solid var(--app-primary-border-color);
-  border-radius: 0;
-  background: transparent;
+  /* No card around the row anymore, so the expanded output is its own
+     contained block, indented to align under the row's name. */
+  margin: 2px 0 4px 26px;
+  border: 1px solid var(--app-primary-border-color);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-tool-background);
   overflow: hidden;
 }
 

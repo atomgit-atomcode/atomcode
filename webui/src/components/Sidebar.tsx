@@ -787,22 +787,24 @@ export function Sidebar({
         <span class="sidebar-brand">
 <span class="sidebar-brand-name">AtomCode</span>
         </span>
-        <button
-          class="sidebar-search-btn"
-          onClick={() => { setSearchOpen(true); setSearchQuery(''); }}
-          title={t('sidebar.search')}
-          aria-label={t('sidebar.search')}
-        >
-          <SearchIcon />
-        </button>
-        <button
-          class="sidebar-collapse-btn"
-          onClick={onToggleCollapse}
-          title={t('sidebar.collapse')}
-          aria-label={t('sidebar.collapse')}
-        >
-          <PanelIcon />
-        </button>
+        <span class="sidebar-brand-btns">
+          <button
+            class="sidebar-search-btn"
+            onClick={() => { setSearchOpen(true); setSearchQuery(''); }}
+            title={t('sidebar.search')}
+            aria-label={t('sidebar.search')}
+          >
+            <SearchIcon />
+          </button>
+          <button
+            class="sidebar-collapse-btn"
+            onClick={onToggleCollapse}
+            title={t('sidebar.collapse')}
+            aria-label={t('sidebar.collapse')}
+          >
+            <PanelIcon />
+          </button>
+        </span>
       </div>
 
       <div class="sidebar-actions">
@@ -885,8 +887,8 @@ export function Sidebar({
 
       {/* Session search dialog (centered modal) */}
       {searchOpen && createPortal(
-        <div class="search-overlay" onClick={(e) => { if (e.target === e.currentTarget) setSearchOpen(false); }}>
-          <div class="search-dialog">
+        <div class="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setSearchOpen(false); }}>
+          <div class="modal-card search-modal-card">
             <div class="search-input-row">
               <SearchIcon />
               <input
@@ -911,27 +913,40 @@ export function Sidebar({
                         (s.working_dir || '').toLowerCase().includes(q),
                     )
                   : sessions;
-                if (!q) {
-                  return <div class="search-hint">{t('sidebar.searchHint')}</div>;
-                }
                 if (results.length === 0) {
                   return <div class="search-empty">{t('sidebar.noMatch')}</div>;
                 }
-                return results.map((s) => {
-                  const label = s.name || s.id.slice(0, 8);
-                  const dir = shortDir(s.working_dir);
-                  return (
-                    <button
-                      key={s.id}
-                      class={'search-result-item' + (s.id === activeSessionId ? ' active' : '')}
-                      onClick={() => { onSelect(s); setSearchOpen(false); }}
-                    >
-                      <span class="search-result-name">{label}</span>
-                      <span class="search-result-dir">{dir}</span>
-                      <span class="search-result-time">{formatTime(s.updated_at || s.created_at, t)}</span>
-                    </button>
-                  );
-                });
+                // 日期分组
+                const groups: { key: string; items: typeof results }[] = [];
+                for (const s of results) {
+                  const key = dateKey(s.updated_at || s.created_at);
+                  const last = groups[groups.length - 1];
+                  if (last && last.key === key) {
+                    last.items.push(s);
+                  } else {
+                    groups.push({ key, items: [s] });
+                  }
+                }
+                return groups.map((g) => (
+                  <div key={g.key} class="search-date-group">
+                    <div class="search-date-label">{friendlyDateLabel(g.key, t)}</div>
+                    {g.items.map((s) => {
+                      const label = s.name || s.id.slice(0, 8);
+                      const dir = shortDir(s.working_dir);
+                      return (
+                        <button
+                          key={s.id}
+                          class={'search-result-item' + (s.id === activeSessionId ? ' active' : '')}
+                          onClick={() => { onSelect(s); setSearchOpen(false); }}
+                        >
+                          <span class="search-result-name">{label}</span>
+                          <span class="search-result-dir">{dir}</span>
+                          <span class="search-result-time">{formatTime(s.updated_at || s.created_at, t)}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ));
               })()}
             </div>
           </div>
