@@ -27,6 +27,7 @@ fn rec() -> Record {
             model: None,
             repo_origin: None,
             mode: None,
+            surface: None,
         },
         event: Event::OpenAtomcode { dangerously_skip_permissions: false },
     }
