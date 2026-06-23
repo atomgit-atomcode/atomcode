@@ -97,3 +97,10 @@ pub mod session;
 /// the user via driver slash-commands. Opt-in `memory` feature. See [`memory`].
 #[cfg(feature = "memory")]
 pub mod memory;
+
+/// Goal mode: loop-until-condition-met. A strict LLM verdict evaluator
+/// ([`goal::GoalEvaluator`]) decides `Verdict: yes/no` each round; the driver loops on
+/// [`goal::GoalState`] until met / exhausted / cancelled. Kernel-provider native — the
+/// v2 replacement for v1's `core::agent::goal`. Opt-in `goal` feature.
+#[cfg(feature = "goal")]
+pub mod goal;

@@ -54,6 +54,9 @@ toml = { version = "0.8", optional = true }
 # timestamps, current-date injection, recall date filtering). dirs (already optional)
 # resolves $ATOMCODE_HOME/sessions. Matches production's chrono pin.
 chrono = { version = "0.4", optional = true }
+# `goal` capability dep: CancellationToken aborts the evaluator's network wait on
+# Ctrl+C without waiting the full timeout. `futures`/`tokio` are already non-optional.
+tokio-util = { version = "0.7", optional = true }
 
 [features]
 default = ["provider", "tools"]
@@ -116,6 +119,10 @@ session = ["dep:dirs", "dep:chrono"]
 # v1 is USER-driven only (driver slash-commands write the store); no model-facing
 # remember/forget tools. Opt-in (NOT default).
 memory = ["dep:dirs"]
+# `goal` capability: loop-until-condition-met goal mode — a strict LLM verdict evaluator
+# (`Verdict: yes/no`) + the GoalState the driver loops on. Kernel-provider native (the v2
+# replacement for v1's core::agent::goal). Opt-in (NOT default).
+goal = ["dep:anyhow", "dep:tokio-util"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }
