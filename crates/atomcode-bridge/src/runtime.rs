@@ -9,7 +9,7 @@ use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::vision;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use atomcode_coding::{
-    assemble, prepare, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
+    assemble, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
 };
 use atomcode_core::agent::{
     AgentClient, AgentCommand as CoreCmd, AgentEvent as CoreEv, AgentPhase, TurnStopReason,
@@ -1552,90 +1552,25 @@ async fn run_background_task(
     task: String,
 ) {
     use std::sync::atomic::Ordering;
-
-    let finish = |summary: String, files: Vec<String>, turns: usize, success: bool| {
-        let _ = ev_tx.send(CoreEv::BackgroundComplete {
-            summary,
-            files_edited: files,
-            turns,
-            success,
-        });
-        flag.store(false, Ordering::Release);
+    // The agent-running lives in coding (`coding::background::run`); the bridge only
+    // builds the (possibly signed) provider, then maps the outcome onto the legacy
+    // `BackgroundComplete` event drivers consume.
+    let outcome = match build_provider(&coding_cfg) {
+        Ok(provider) => atomcode_coding::background::run(&coding_cfg, provider, task).await,
+        Err(e) => atomcode_coding::background::BackgroundOutcome {
+            summary: format!("background setup failed: {e}"),
+            files_edited: vec![],
+            turns: 0,
+            success: false,
+        },
     };
-
-    let opts = PrepareOptions {
-        session: SessionMode::Disabled,
-        skill_dirs: None,
-        mcp: false,
-        memory: false,
-        web: true,
-        // A background one-shot stays lean — no nested review sub-agent.
-        review: false,
-    };
-    let built = async {
-        let mut parts = prepare(&coding_cfg, opts).await.map_err(|e| e.to_string())?;
-        let provider = build_provider(&coding_cfg).map_err(|e| e.to_string())?;
-        assemble(&mut parts, &coding_cfg, provider)
-            .map(|a| a.spawn())
-            .map_err(|e| e.to_string())
-    }
-    .await;
-    let mut handle = match built {
-        Ok(h) => h,
-        Err(e) => return finish(format!("background setup failed: {e}"), vec![], 0, false),
-    };
-
-    let _ = handle.commands.send(KCmd::SendMessage { text: task, images: vec![] });
-    let mut summary = String::new();
-    let mut files: Vec<String> = Vec::new();
-    let mut turns = 0usize;
-    let mut success = true;
-    while let Some(ev) = handle.events.recv().await {
-        match ev {
-            KEv::TextDelta(t) => summary.push_str(&t),
-            KEv::Request { id, kind, .. } if kind == APPROVAL_KIND => {
-                let value = serde_json::to_value(ApprovalResponse::allow())
-                    .unwrap_or(serde_json::Value::Null);
-                let _ = handle.commands.send(KCmd::Respond { id, value });
-            }
-            KEv::Request { id, .. } => {
-                let _ = handle.commands.send(KCmd::Respond { id, value: serde_json::Value::Null });
-            }
-            KEv::ToolStarted { call } => {
-                if matches!(call.name.as_str(), "write_file" | "edit_file" | "parallel_edit") {
-                    if let Some(p) = extract_path(&call.arguments) {
-                        if !files.contains(&p) {
-                            files.push(p);
-                        }
-                    }
-                }
-            }
-            KEv::Usage(_) => turns += 1,
-            KEv::Error { .. } => success = false,
-            KEv::TurnComplete { reason } => {
-                success = success && matches!(reason, StopReason::Stopped);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let _ = handle.commands.send(KCmd::Shutdown);
-    let _ = handle.task.await;
-    let summary = if summary.trim().is_empty() {
-        "(background task finished with no text output)".to_string()
-    } else {
-        summary
-    };
-    finish(summary, files, turns, success);
-}
-
-/// Pull the `path` out of a write/edit tool's JSON arguments, if present.
-fn extract_path(args: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(args)
-        .ok()?
-        .get("path")?
-        .as_str()
-        .map(|s| s.to_string())
+    let _ = ev_tx.send(CoreEv::BackgroundComplete {
+        summary: outcome.summary,
+        files_edited: outcome.files_edited,
+        turns: outcome.turns,
+        success: outcome.success,
+    });
+    flag.store(false, Ordering::Release);
 }
 
 fn apply_reload_provider(
@@ -2093,15 +2028,6 @@ mod undo_tests {
         assert_eq!(cfg.thinking_keep.as_deref(), Some("all"));
     }
 
-    #[test]
-    fn extract_path_pulls_path_from_write_args() {
-        assert_eq!(
-            super::extract_path(r#"{"path":"src/x.rs","content":"hi"}"#),
-            Some("src/x.rs".to_string())
-        );
-        assert_eq!(super::extract_path(r#"{"no_path":1}"#), None);
-        assert_eq!(super::extract_path("not json"), None);
-    }
 
 
     #[test]
