@@ -139,20 +139,26 @@ async fn track_writes_to_disk_queue() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     tel.shutdown(std::time::Duration::from_millis(500)).await;
 
+    // "Written to the disk queue" is satisfied by the event landing in ANY segment:
+    // a ready `.ndjson`, the still-open `.partial`, or a claimed `.ndjson.sending-*`.
+    // `shutdown` does a bounded best-effort POST to the (unreachable) endpoint; when
+    // that send doesn't finish within the budget the segment is left CLAIMED
+    // (`.sending-*`) and recovered → `.ndjson` on the next startup. Scanning only
+    // `.ndjson` made this test depend on that POST's timing against a dead endpoint
+    // (it left the segment `.sending-*` here, so the event was missed). Scan every
+    // file for the persisted event instead.
     let mut found = false;
     for e in std::fs::read_dir(d.path().join("telemetry/queue")).unwrap() {
         let p = e.unwrap().path();
-        if p.extension().and_then(|s| s.to_str()) == Some("ndjson") {
-            let c = std::fs::read_to_string(&p).unwrap();
-            if c.lines()
-                .any(|l| l.contains(r#""event_id":"open_atomcode""#))
-            {
-                found = true;
-                break;
-            }
+        let Ok(c) = std::fs::read_to_string(&p) else { continue };
+        if c.lines()
+            .any(|l| l.contains(r#""event_id":"open_atomcode""#))
+        {
+            found = true;
+            break;
         }
     }
-    assert!(found, "expected an open_atomcode event on disk");
+    assert!(found, "expected an open_atomcode event persisted in the disk queue");
 }
 
 #[tokio::test]
