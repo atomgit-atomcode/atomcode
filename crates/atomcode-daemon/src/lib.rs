@@ -23,7 +23,7 @@ pub mod webui;
 pub(crate) use telemetry_scope::daemon_scope;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, request::Parts as RequestParts, HeaderValue, Method, StatusCode},
     response::{sse::Sse, IntoResponse, Json},
     routing::{delete, get, post},
@@ -60,6 +60,8 @@ use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
     CliOverride, CurrentContext, Event, RepoOrigin, SessionMode, Telemetry, TelemetryState,
 };
+
+const CHAT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 // ============================================================================
 // Shared DTOs for P0 API endpoints
@@ -4086,7 +4088,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Model API
         .route("/models", get(get_models))
         // Chat API
-        .route("/chat", post(chat_stream))
+        .route(
+            "/chat",
+            post(chat_stream).layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
         .route("/chat/permission", post(chat_permission))

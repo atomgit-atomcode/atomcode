@@ -157,6 +157,12 @@ data class ChatRequest(
     val workingDir: String,
     val sessionId: String,
     val provider: String? = null,
+    val images: List<ImageInput> = emptyList(),
+)
+
+data class ImageInput(
+    val mediaType: String,
+    val data: String,
 )
 
 data class StopChatResponse(
@@ -199,6 +205,7 @@ sealed interface ChatEvent {
         val arguments: String,
     ) : ChatEvent
     data class Tokens(val prompt: Int, val completion: Int, val total: Int) : ChatEvent
+    data class Warning(val message: String) : ChatEvent
     data class Done(val tokens: Int, val toolCalls: Int, val sessionId: String?) : ChatEvent
     data object Stopped : ChatEvent
     data class Error(val message: String) : ChatEvent

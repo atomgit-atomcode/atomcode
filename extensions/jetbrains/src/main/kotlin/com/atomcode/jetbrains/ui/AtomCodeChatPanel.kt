@@ -4,6 +4,7 @@ import com.atomcode.jetbrains.daemon.ChatEvent
 import com.atomcode.jetbrains.daemon.ChatStreamListener
 import com.atomcode.jetbrains.daemon.ConnectionState
 import com.atomcode.jetbrains.daemon.CreateProviderRequest
+import com.atomcode.jetbrains.daemon.ImageInput
 import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
 import com.atomcode.jetbrains.daemon.PatchProviderRequest
@@ -48,6 +49,8 @@ import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.awt.Insets
 import java.awt.datatransfer.StringSelection
+import java.util.Base64
+import java.util.Locale
 import java.beans.PropertyChangeEvent
 import java.util.UUID
 import javax.swing.DefaultListModel
@@ -74,6 +77,11 @@ import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
 private const val MAX_ATTACHED_FILE_CHARS = 120_000
+private const val CHAT_REQUEST_BODY_LIMIT_BYTES = 32 * 1024 * 1024
+private const val CHAT_REQUEST_BODY_RESERVED_BYTES = 1 * 1024 * 1024
+private const val MAX_ATTACHED_IMAGE_BYTES =
+    (CHAT_REQUEST_BODY_LIMIT_BYTES - CHAT_REQUEST_BODY_RESERVED_BYTES) * 3 / 4
+private const val MAX_ATTACHED_IMAGE_MB = MAX_ATTACHED_IMAGE_BYTES / 1024 / 1024
 private const val MIN_CHAT_PANEL_WIDTH = 360
 private const val MIN_CHAT_PANEL_HEIGHT = 300
 
@@ -93,7 +101,7 @@ class AtomCodeChatPanel(
         onAttach = { chooseFilesForContext() },
         onSlashCommand = { showCommandMenu() },
         onClearContext = { clearPendingContext() },
-        onRemoveContext = { item -> pendingContext.remove(item); rebuildContext() },
+        onRemoveContext = { item -> removePendingAttachment(item) },
         onModelSelect = { showModelPickerPopup() },
     )
 
@@ -113,6 +121,7 @@ class AtomCodeChatPanel(
     private var currentSession: SessionRefView? = null
     private val streamHandler = StreamEventHandler(messageView)
     private val pendingContext = mutableListOf<ChatContextItem>()
+    private val pendingImages = mutableListOf<PendingImageAttachment>()
     private val queuedPrompts = ArrayDeque<QueuedPrompt>()
     private var disposed = false
     private val connectionListener = java.beans.PropertyChangeListener { event: PropertyChangeEvent ->
@@ -161,6 +170,7 @@ class AtomCodeChatPanel(
         disposed = true
         queuedPrompts.clear()
         pendingContext.clear()
+        pendingImages.clear()
         service.removeConnectionListener(connectionListener)
         messageView.dispose()
     }
@@ -720,23 +730,25 @@ class AtomCodeChatPanel(
         if (handleLocalInputCommand(prompt)) { inputPanel.clearInput(); return }
         val transformedPrompt = slashPromptTemplate(prompt) ?: prompt
         val pendingContextForSend = pendingContext.toList()
+        val pendingImagesForSend = pendingImages.toList()
         val contextForSend = pendingContextForSend + buildAutomaticContext(pendingContextForSend)
         val message = buildPromptWithContext(transformedPrompt, contextForSend)
-        val contextNames = contextForSend.map { it.displayName }
+        val contextNames = contextForSend.map { it.displayName } + pendingImagesForSend.map { it.displayName }
+        val images = pendingImagesForSend.map { it.toImageInput() }
 
         if (generating) {
-            val queued = QueuedPrompt(UUID.randomUUID().toString(), transformedPrompt, message, contextNames)
+            val queued = QueuedPrompt(UUID.randomUUID().toString(), transformedPrompt, message, contextNames, images)
             queuedPrompts += queued
-            if (pendingContextForSend.isNotEmpty()) clearPendingContext()
+            if (pendingContextForSend.isNotEmpty() || pendingImagesForSend.isNotEmpty()) clearPendingContext()
             inputPanel.clearInput()
             renderQueueState()
             return
         }
-        if (pendingContextForSend.isNotEmpty()) clearPendingContext()
-        startPrompt(transformedPrompt, message, contextNames)
+        if (pendingContextForSend.isNotEmpty() || pendingImagesForSend.isNotEmpty()) clearPendingContext()
+        startPrompt(transformedPrompt, message, contextNames, images)
     }
 
-    private fun startPrompt(prompt: String, message: String, contextNames: List<String>) {
+    private fun startPrompt(prompt: String, message: String, contextNames: List<String>, images: List<ImageInput>) {
         val generationId = ++generationSequence
         activeGenerationId = generationId
         // Add user message + immediate thinking feedback
@@ -777,7 +789,7 @@ class AtomCodeChatPanel(
                 replaceSelectedSession(session.id)
                 persistRuntimeSession()
             }
-        }, provider = provider).whenComplete { session, error ->
+        }, provider = provider, images = images).whenComplete { session, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
                     finishPromptAndContinue(generationId)
@@ -808,6 +820,7 @@ class AtomCodeChatPanel(
                 requestPermissionDecision(event)
             }
             is ChatEvent.Tokens -> { /* no-op */ }
+            is ChatEvent.Warning -> streamHandler.onWarning(event.message)
             is ChatEvent.Done -> refreshSessionList(updateCurrentTabTitle = true)
             ChatEvent.Stopped -> streamHandler.onStopped()
             is ChatEvent.Error -> streamHandler.onError(event.message)
@@ -832,7 +845,7 @@ class AtomCodeChatPanel(
         // prompt. Clearing it for one event-loop turn causes the visible flash.
         activeGenerationId = null
         runtime?.removeQueuedPrompt(next.id)
-        startPrompt(next.prompt, next.message, next.contextNames)
+        startPrompt(next.prompt, next.message, next.contextNames, next.images)
     }
 
     private fun finishPrompt(
@@ -980,12 +993,19 @@ class AtomCodeChatPanel(
 
     private fun clearPendingContext() {
         pendingContext.clear()
+        pendingImages.clear()
         runtime?.clearContext()
         rebuildContext()
     }
 
     private fun rebuildContext() {
-        inputPanel.setContextItems(pendingContext.toList())
+        inputPanel.setContextItems(pendingContext.toList() + pendingImages.map { it.toContextItem() })
+    }
+
+    private fun removePendingAttachment(item: ChatContextItem) {
+        val removedContext = pendingContext.remove(item)
+        val removedImage = pendingImages.removeAll { it.path == item.path }
+        if (removedContext || removedImage) rebuildContext()
     }
 
     private fun buildPromptWithContext(prompt: String, context: List<ChatContextItem>): String {
@@ -1057,12 +1077,59 @@ class AtomCodeChatPanel(
                 file.refresh(false, false)
             }
         }
+        val mediaType = imageMediaType(file)
+        if (mediaType != null) {
+            attachImageFile(file, mediaType)
+            return
+        }
         val content = try { String(file.contentsToByteArray(), Charsets.UTF_8) } catch (error: Exception) { Messages.showWarningDialog(project, "Could not read ${file.name}: ${error.message}", "AtomCode"); return }
         if (content.isBlank()) return
         if (content.length > MAX_ATTACHED_FILE_CHARS) { Messages.showWarningDialog(project, "This file is too large to attach. Select a smaller file or attach a selection.", "AtomCode"); return }
         val relative = project.basePath?.let { base -> if (path.startsWith(base)) path.removePrefix(base).trimStart('/', '\\') else path } ?: path
         addContext(ChatContextItem(path = path, displayName = relative, language = file.extension ?: "text", content = content, selection = null, startLine = null, endLine = null))
     }
+
+    private fun attachImageFile(file: VirtualFile, mediaType: String) {
+        val bytes = try {
+            file.contentsToByteArray()
+        } catch (error: Exception) {
+            Messages.showWarningDialog(project, "Could not read ${file.name}: ${error.message}", "AtomCode")
+            return
+        }
+        if (bytes.isEmpty()) return
+        val attachedBytes = pendingImages.sumOf { it.byteSize }
+        if (attachedBytes + bytes.size > MAX_ATTACHED_IMAGE_BYTES) {
+            Messages.showWarningDialog(
+                project,
+                "Attached images are too large. Select image(s) totaling under $MAX_ATTACHED_IMAGE_MB MB.",
+                "AtomCode",
+            )
+            return
+        }
+        val relative = project.basePath?.let { base ->
+            if (file.path.startsWith(base)) file.path.removePrefix(base).trimStart('/', '\\') else file.path
+        } ?: file.path
+        if (pendingImages.none { it.path == file.path }) {
+            pendingImages += PendingImageAttachment(
+                path = file.path,
+                displayName = relative,
+                mediaType = mediaType,
+                byteSize = bytes.size,
+                data = Base64.getEncoder().encodeToString(bytes),
+            )
+        }
+        rebuildContext()
+        focusInput()
+    }
+
+    private fun imageMediaType(file: VirtualFile): String? =
+        when (file.extension?.lowercase(Locale.ROOT)) {
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            "gif" -> "image/gif"
+            "webp" -> "image/webp"
+            else -> null
+        }
 
     // ── Slash commands ──
 
@@ -1138,7 +1205,34 @@ class AtomCodeChatPanel(
 }
 
 private data class SlashCommand(val name: String, val description: String)
-private data class QueuedPrompt(val id: String, val prompt: String, val message: String, val contextNames: List<String>)
+private data class QueuedPrompt(
+    val id: String,
+    val prompt: String,
+    val message: String,
+    val contextNames: List<String>,
+    val images: List<ImageInput>,
+)
+
+private data class PendingImageAttachment(
+    val path: String,
+    val displayName: String,
+    val mediaType: String,
+    val byteSize: Int,
+    val data: String,
+) {
+    fun toImageInput(): ImageInput = ImageInput(mediaType = mediaType, data = data)
+
+    fun toContextItem(): ChatContextItem =
+        ChatContextItem(
+            path = path,
+            displayName = displayName,
+            language = mediaType.substringAfter('/').uppercase(Locale.ROOT),
+            content = "",
+            selection = null,
+            startLine = null,
+            endLine = null,
+        )
+}
 
 data class ChatContextItem(
     val path: String, val displayName: String, val language: String,

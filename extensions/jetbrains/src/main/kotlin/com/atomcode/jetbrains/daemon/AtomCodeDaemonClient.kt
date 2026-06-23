@@ -280,6 +280,17 @@ class AtomCodeDaemonClient(
             append("\"working_dir\":${request.workingDir.jsonQuoted()},")
             append("\"session_id\":${request.sessionId.jsonQuoted()}")
             request.provider?.let { append(",\"provider\":${it.jsonQuoted()}") }
+            if (request.images.isNotEmpty()) {
+                append(",\"images\":[")
+                request.images.forEachIndexed { index, image ->
+                    if (index > 0) append(",")
+                    append("{")
+                    append("\"media_type\":${image.mediaType.jsonQuoted()},")
+                    append("\"data\":${image.data.jsonQuoted()}")
+                    append("}")
+                }
+                append("]")
+            }
             append("}")
         }
         val httpRequest = requestBuilder("/chat")
@@ -295,6 +306,12 @@ class AtomCodeDaemonClient(
         client.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofInputStream())
             .thenAcceptAsync({ response ->
                 try {
+                    if (response.statusCode() >= 400) {
+                        val error = response.body().bufferedReader().use { it.readText() }
+                        onEvent(ChatEvent.Error("Daemon request failed: HTTP ${response.statusCode()}${error.daemonErrorSuffix()}"))
+                        future.complete(null)
+                        return@thenAcceptAsync
+                    }
                     response.body().bufferedReader().use { reader ->
                         var line = reader.readLine()
                         while (line != null) {
@@ -349,6 +366,11 @@ class AtomCodeDaemonClient(
 
 internal fun String.jsonQuoted(): String =
     "\"" + replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
+
+private fun String.daemonErrorSuffix(): String {
+    val message = jsonString("error") ?: jsonString("message") ?: trim()
+    return message.takeIf { it.isNotBlank() }?.let { ": $it" }.orEmpty()
+}
 
 internal fun String?.jsonQuotedOrNull(): String = this?.jsonQuoted() ?: "null"
 

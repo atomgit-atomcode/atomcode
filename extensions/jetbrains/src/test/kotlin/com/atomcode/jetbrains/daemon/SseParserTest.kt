@@ -27,6 +27,16 @@ class SseParserTest {
     }
 
     @Test
+    fun parsesWarningEvent() {
+        val parser = SseParser()
+        val events = parser.feed("""data: {"type":"warning","message":"current model does not support image input"}${"\n\n"}""")
+        assertEquals(
+            listOf(ChatEvent.Warning("current model does not support image input")),
+            events,
+        )
+    }
+
+    @Test
     fun parsesPermissionRequest() {
         val parser = SseParser()
         val events = parser.feed(

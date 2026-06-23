@@ -113,10 +113,17 @@ class StreamEventHandler(
     fun onError(message: String) {
         messageView.finishAssistantTurn()
         messageView.addError(message)
+        hasOutput = true
+    }
+
+    fun onWarning(message: String) {
+        messageView.addAssistantEvent("[Warning] $message")
+        hasOutput = true
     }
 
     fun onUnknown(type: String) {
         messageView.addAssistantEvent("[Unknown event] $type")
+        hasOutput = true
     }
 
     /** 流完成时收尾：如果没有输出，清理思考指示器 */
