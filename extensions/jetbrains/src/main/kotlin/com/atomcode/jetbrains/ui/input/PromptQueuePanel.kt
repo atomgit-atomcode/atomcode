@@ -14,14 +14,28 @@ data class QueuedPromptView(
 )
 
 class PromptQueuePanel : JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)) {
+    private var initialized = false
+
     init {
         isOpaque = true
-        background = JBColor(0xF7F1E4, 0x2A2518)
+        isVisible = false
+        initialized = true
+        applyTheme()
+    }
+
+    override fun updateUI() {
+        super.updateUI()
+        if (initialized) applyTheme()
+    }
+
+    fun applyTheme() {
+        background = QUEUE_BG
         border = BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(1, 0, 0, 0, JBColor(0xD7C59A, 0x4A3E24)),
+            BorderFactory.createMatteBorder(1, 0, 0, 0, QUEUE_BORDER),
             BorderFactory.createEmptyBorder(3, 8, 3, 8),
         )
-        isVisible = false
+        revalidate()
+        repaint()
     }
 
     fun setItems(items: List<QueuedPromptView>, onRemove: (QueuedPromptView) -> Unit) {
@@ -73,6 +87,8 @@ class PromptQueuePanel : JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)) {
     }
 
     companion object {
+        private val QUEUE_BG = JBColor(0xF7F1E4, 0x2A2518)
+        private val QUEUE_BORDER = JBColor(0xD7C59A, 0x4A3E24)
         private val CHIP_BG = JBColor(0xFFF7E4, 0x3A2D16)
         private val CHIP_BORDER = JBColor(0xE1C071, 0x6A5122)
         private val CHIP_FG = JBColor(0x624A12, 0xE2C27B)

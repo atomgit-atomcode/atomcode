@@ -192,6 +192,15 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         flushPending()
     }
 
+    override fun updateUI() {
+        super.updateUI()
+        if (initialized) {
+            SwingUtilities.invokeLater {
+                executeJs("setTheme(${isDarkTheme()})")
+            }
+        }
+    }
+
     private fun flushPending() {
         pendingCalls.forEach { executeJs(it) }
         pendingCalls.clear()
@@ -322,7 +331,34 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 		if(typeof marked==='undefined'||typeof DOMPurify==='undefined')return h(source).replace(/\n/g,'<br>');
 		return DOMPurify.sanitize(marked.parse(source,{gfm:true,breaks:true}),{USE_PROFILES:{html:true}})
 	}
-	function setTheme(d){}
+	function tv(d){return d?{
+		bg:'#1e1e1e',fg:'#d4d4d4',ubg:'#094771',ufg:'#e0e0e0',ub:'#245b82',afg:'#d4d4d4',
+		cbg:'#1e1e1e',cbo:'#3c3c3c',chb:'#2d2d2d',chf:'#9cdcfe',tbg:'#252526',tbo:'#3c3c3c',
+		tfg:'#a7a7a7',ebg:'#3d2020',ebo:'#5a3030',efg:'#f48771',qbg:'#1a3550',qfg:'#8899aa',
+		rbg:'#1a2330',rbo:'#2a3a4a',sfg:'#888',vfg:'#8fbc72',avbg:'#293424',fileBg:'rgba(255,255,255,.055)',
+		fileIconBg:'#21405a',fileIconFg:'#9bd3f5'
+	}:{
+		bg:'#ffffff',fg:'#1e1e1e',ubg:'#d0e4f7',ufg:'#1e1e1e',ub:'#b8d3e7',afg:'#333333',
+		cbg:'#fafafa',cbo:'#cccccc',chb:'#e0e0e0',chf:'#005a9e',tbg:'#f4f4f4',tbo:'#d8d8d8',
+		tfg:'#666666',ebg:'#f8e0e0',ebo:'#d8a0a0',efg:'#c04040',qbg:'#e8eef4',qfg:'#667788',
+		rbg:'#f0f4f8',rbo:'#d0d8e0',sfg:'#666666',vfg:'#4f7f3a',avbg:'#edf5e9',fileBg:'rgba(255,255,255,.55)',
+		fileIconBg:'#e4f1fa',fileIconFg:'#286c99'
+	}}
+	function setTheme(d){
+		var v=tv(!!d),s=document.getElementById('theme-override');
+		if(!s){s=document.createElement('style');s.id='theme-override';document.head.appendChild(s)}
+		s.textContent='body{background:'+v.bg+'!important;color:'+v.fg+'!important}'+
+		'.um .u-card{background:'+v.ubg+'!important;color:'+v.ufg+'!important;border-color:'+v.ub+'!important}'+
+		'.um .u-file{background:'+v.fileBg+'!important}.um .u-file-icon{background:'+v.fileIconBg+'!important;color:'+v.fileIconFg+'!important}'+
+		'.am .av{color:'+v.vfg+'!important}.am .av:before{background:'+v.avbg+'!important;color:'+v.vfg+'!important}'+
+		'.am .b{color:'+v.afg+'!important}.am .b blockquote{border-left-color:'+v.cbo+'!important;color:'+v.sfg+'!important}'+
+		'.am .b code,.am .b pre,.cm{background:'+v.cbg+'!important;border-color:'+v.cbo+'!important}.am .b th,.am .b td{border-color:'+v.cbo+'!important}.am .b a{color:'+v.chf+'!important}'+
+		'.cm .h{background:'+v.chb+'!important;color:'+v.chf+'!important;border-bottom-color:'+v.cbo+'!important}.cm pre{color:'+v.fg+'!important}'+
+		'.tm{color:'+v.tfg+'!important}.tm details[open],.tm summary:hover{background:'+v.tbg+'!important;border-color:'+v.tbo+'!important;color:'+v.fg+'!important}'+
+		'.tm .chev,.tm .tool-dot,.tm .tool-summary,.tm .tool-status{color:'+v.sfg+'!important}.tm .tool-name,.tm pre{color:'+v.fg+'!important}.tm pre{background:'+v.cbg+'!important;border-top-color:'+v.tbo+'!important}'+
+		'.em{background:'+v.ebg+'!important;border-color:'+v.ebo+'!important;color:'+v.efg+'!important}.qm .b{background:'+v.qbg+'!important;color:'+v.qfg+'!important}'+
+		'.rm{background:'+v.rbg+'!important;border-left-color:'+v.rbo+'!important;color:'+v.sfg+'!important}.sm,.th{color:'+v.sfg+'!important}.streaming-cursor{background:'+v.afg+'!important}';
+	}
 	function fileParts(p){var n=String(p||'').replace(/\\/g,'/'),i=n.lastIndexOf('/');return {name:i>=0?n.substring(i+1):n,path:i>=0?n.substring(0,i):''}}
 	function fileType(n){var i=String(n||'').lastIndexOf('.');return i>=0?String(n).substring(i+1,i+5):'file'}
 	function attachmentHtml(items){if(!items||!items.length)return '';var rows=items.map(function(x){var p=fileParts(x);return '<div class="u-file" title="'+h(x)+'"><span class="u-file-icon">'+h(fileType(p.name))+'</span><span class="u-file-copy"><div class="u-file-name">'+h(p.name||x)+'</div><div class="u-file-path">'+h(p.path||'Attached file')+'</div></span></div>'}).join('');return '<div class="u-files">'+rows+'</div>'}

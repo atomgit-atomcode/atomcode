@@ -7,7 +7,10 @@ import java.awt.CardLayout
 import java.awt.Component
 import java.awt.Cursor
 import java.awt.Dimension
+import java.awt.Graphics
+import java.awt.Graphics2D
 import java.awt.Insets
+import java.awt.RenderingHints
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.BoxLayout
@@ -42,37 +45,25 @@ class InputPanel(
 
     private var slashTriggerConsumed = false
     private var commandPopup: JPopupMenu? = null
+    private var initialized = false
+    private val toolButtons = mutableListOf<JButton>()
 
     private val inputArea = JTextArea().apply {
         rows = 3
         lineWrap = true
         wrapStyleWord = true
-        background = INPUT_BG
-        foreground = INPUT_FG
-        caretColor = INPUT_FG
         border = BorderFactory.createEmptyBorder(6, 10, 6, 10)
         font = font.deriveFont(font.size2D)
     }
 
-    private val sendButton = JButton("↑ 发送").apply {
+    private val sendButton = FilledButton("↑ 发送").apply {
         font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 1f)
-        background = SEND_BG
-        // JBColor(亮色, 暗色) — 白色文字在两个主题下都适用
-        foreground = JBColor(0xFFFFFF, 0xFFFFFF)
-        isFocusPainted = false
-        border = BorderFactory.createEmptyBorder(5, 12, 5, 12)
         preferredSize = Dimension(72, 30)
-        isOpaque = true
         addActionListener { fireSend() }
     }
 
-    private val stopButton = JButton("⏹ 停止").apply {
+    private val stopButton = FilledButton("⏹ 停止").apply {
         font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 1f)
-        background = STOP_BG
-        foreground = STOP_FG
-        isFocusPainted = false
-        isOpaque = true
-        border = BorderFactory.createEmptyBorder(5, 12, 5, 12)
         preferredSize = Dimension(72, 30)
         addActionListener { onStop() }
     }
@@ -82,15 +73,10 @@ class InputPanel(
 
     private val tokenLabel = JLabel("").apply {
         font = font.deriveFont(font.size2D - 2f)
-        // JBColor(亮色, 暗色)
-        foreground = JBColor(0x999999, 0x666666)
     }
 
     private val modelLabel = JLabel("GPT-4o ▾").apply {
         font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 2f)
-        foreground = MODEL_FG
-        background = CLICKABLE_BG
-        border = clickableBorder(horizontal = 10)
         isOpaque = true
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         addMouseListener(object : MouseAdapter() {
@@ -107,7 +93,6 @@ class InputPanel(
 
     private val shortcutLabel = JLabel("Enter 发送 · Shift+Enter 换行").apply {
         font = font.deriveFont(font.size2D - 2f)
-        foreground = SECONDARY_FG
     }
 
     private val actionCards = CardLayout()
@@ -120,8 +105,6 @@ class InputPanel(
 
     init {
         isOpaque = true
-        // JBColor(亮色, 暗色)
-        background = JBColor(0xF5F5F5, 0x1E1E1E)
 
         inputArea.document.addDocumentListener(object : DocumentListener {
             override fun insertUpdate(event: DocumentEvent) = handleSlashTrigger()
@@ -194,6 +177,17 @@ class InputPanel(
 
         add(chips, BorderLayout.NORTH)
         add(composerInset, BorderLayout.CENTER)
+        initialized = true
+        applyTheme()
+    }
+
+    override fun updateUI() {
+        super.updateUI()
+        if (initialized) {
+            SwingUtilities.invokeLater {
+                if (initialized) applyTheme()
+            }
+        }
     }
 
     fun getInputText(): String = inputArea.text
@@ -498,9 +492,6 @@ class InputPanel(
     private fun makeToolButton(text: String, action: () -> Unit): JButton =
         JButton(text).apply {
             font = font.deriveFont(font.size2D - 2f)
-            foreground = CLICKABLE_FG
-            background = CLICKABLE_BG
-            border = clickableBorder(horizontal = 12)
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
             isContentAreaFilled = true
             isBorderPainted = true
@@ -509,6 +500,7 @@ class InputPanel(
             margin = Insets(0, 0, 0, 0)
             preferredSize = Dimension(preferredSize.width.coerceAtLeast(62), 30)
             addActionListener { action() }
+            toolButtons += this
             addMouseListener(object : MouseAdapter() {
                 override fun mouseEntered(e: MouseEvent) {
                     background = CLICKABLE_HOVER_BG
@@ -520,6 +512,33 @@ class InputPanel(
             })
         }
 
+    private fun applyTheme() {
+        background = PANEL_BG
+        inputArea.background = INPUT_BG
+        inputArea.foreground = INPUT_FG
+        inputArea.caretColor = INPUT_FG
+
+        sendButton.setFill(SEND_BG, SEND_FG)
+        stopButton.setFill(STOP_BG, STOP_FG)
+
+        tokenLabel.foreground = TOKEN_FG
+        shortcutLabel.foreground = SECONDARY_FG
+        modelLabel.foreground = MODEL_FG
+        modelLabel.background = CLICKABLE_BG
+        modelLabel.border = clickableBorder(horizontal = 10)
+
+        toolButtons.forEach { button ->
+            button.foreground = CLICKABLE_FG
+            button.background = CLICKABLE_BG
+            button.border = clickableBorder(horizontal = 12)
+        }
+        queueChips.applyTheme()
+        contextChips.repaint()
+
+        revalidate()
+        repaint()
+    }
+
     private fun clickableBorder(horizontal: Int) = BorderFactory.createCompoundBorder(
         BorderFactory.createLineBorder(CLICKABLE_BORDER, 1, true),
         BorderFactory.createEmptyBorder(5, horizontal, 5, horizontal),
@@ -527,20 +546,52 @@ class InputPanel(
 
     companion object {
         // JBColor(亮色, 暗色)
+        private val PANEL_BG = JBColor(0xF5F5F5, 0x1E1E1E)
         private val INPUT_BG = JBColor(0xFFFFFF, 0x2D2D2D)
         private val INPUT_FG = JBColor(0x333333, 0xD4D4D4)
         private val COMPOSER_BORDER = JBColor(0xC9C9C9, 0x454545)
         private val SECONDARY_FG = JBColor(0x8A8A8A, 0x707070)
+        private val TOKEN_FG = JBColor(0x999999, 0x666666)
         private val CLICKABLE_BG = JBColor(0xF7F7F7, 0x333333)
         private val CLICKABLE_HOVER_BG = JBColor(0xECECEC, 0x3D3D3D)
         private val CLICKABLE_BORDER = JBColor(0xD4D4D4, 0x4A4A4A)
         private val CLICKABLE_FG = JBColor(0x555555, 0xB8B8B8)
         private val MODEL_FG = JBColor(0x157A61, 0x56D6BF)
         private val SEND_BG = JBColor(0x0078D4, 0x0E639C)
+        private val SEND_FG = JBColor(0xFFFFFF, 0xFFFFFF)
         private val STOP_BG = JBColor(0xF4DEDE, 0x4A2424)
         private val STOP_FG = JBColor(0xA52D2D, 0xF48771)
         private const val SEND_CARD = "send"
         private const val STOP_CARD = "stop"
+    }
+}
+
+private class FilledButton(text: String) : JButton(text) {
+    init {
+        isFocusPainted = false
+        isOpaque = false
+        isContentAreaFilled = false
+        isBorderPainted = false
+        border = BorderFactory.createEmptyBorder(5, 12, 5, 12)
+        margin = Insets(0, 0, 0, 0)
+    }
+
+    fun setFill(backgroundColor: java.awt.Color, foregroundColor: java.awt.Color) {
+        background = backgroundColor
+        foreground = foregroundColor
+        repaint()
+    }
+
+    override fun paintComponent(g: Graphics) {
+        val g2 = g.create() as Graphics2D
+        try {
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            g2.color = background
+            g2.fillRoundRect(0, 0, width, height, 8, 8)
+        } finally {
+            g2.dispose()
+        }
+        super.paintComponent(g)
     }
 }
 
