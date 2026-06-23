@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atomcode_capabilities::memory::MemoryStore;
+use atomcode_capabilities::vision;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use atomcode_coding::{
     assemble, prepare, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
@@ -477,6 +478,30 @@ impl Bridge {
         }
     }
 
+    /// Vision preprocessing failed (no VL provider / build error / VL call error): keep
+    /// the original images so the user can retry without re-pasting, append a
+    /// `[图片识别失败]` placeholder to the message, warn, and forward NO images (a
+    /// non-vision adapter would 400 on raw image data). Returns the empty kernel-image
+    /// vec the SendMessage path sends.
+    fn vision_fail(
+        &self,
+        text: &mut String,
+        core_images: Vec<atomcode_core::conversation::message::ImagePart>,
+        markers: Vec<usize>,
+        reason: String,
+    ) -> Vec<atomcode_kernel::message::ImageContent> {
+        *text = if text.is_empty() {
+            "[图片识别失败]".to_string()
+        } else {
+            format!("{text}\n\n[图片识别失败]")
+        };
+        let _ = self.emit(CoreEv::RestorePendingImages { images: core_images, markers });
+        let _ = self.emit(CoreEv::Warning(format!(
+            "VL 预处理失败：{reason} · 图片已自动保留，可直接重试"
+        )));
+        Vec::new()
+    }
+
     // ---------------- legacy commands → kernel ----------------
 
     /// Returns `true` to shut the bridge down.
@@ -525,94 +550,83 @@ impl Bridge {
                 // AgentLoop::handle_send_message logic that the bridge previously
                 // bypassed — causing non-vision models (like DeepSeek) to receive raw
                 // image data they cannot process (400 error from the upstream API).
-                let images = if !images.is_empty() {
-                    use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
-                    let core_images: Vec<atomcode_core::conversation::message::ImagePart> = images.clone();
-                    let config = atomcode_core::config::Config::load(
-                        &atomcode_core::config::Config::default_path(),
-                    );
-                    match config {
-                        Err(_) => {
-                            // Config load failed — fall through with original images;
-                            // a vision-capable model can still handle them natively.
-                            images.iter().map(convert::image_to_kernel).collect()
-                        }
-                        Ok(config) => {
-                            // Build a provider instance for the ACTIVE model to check vision support.
-                            // Use the bridge's actual model (self.coding_cfg.model), NOT
-                            // config.default_provider — they can differ when the user selects
-                            // a different provider via /chat or /live UI. A vision-capable
-                            // default would incorrectly skip VL preprocessing for a non-vision
-                            // active model, forwarding raw image data that causes a 400 error
-                            // ("… is not a multimodal model") from the upstream gateway.
-                            let active_model = self.coding_cfg.model.clone();
-                            let active_provider = config
-                                .providers
-                                .values()
-                                .find(|p| p.model == active_model)
-                                .and_then(|p| atomcode_core::provider::create_provider(p).ok())
-                                .or_else(|| {
-                                    // Fallback: model name not found in any provider config —
-                                    // try default_provider as a best-effort backward compat.
-                                    config
-                                        .providers
-                                        .get(&config.default_provider)
-                                        .and_then(|p| atomcode_core::provider::create_provider(p).ok())
-                                });
-                            match active_provider {
-                                Some(ref provider) => {
-                                    match maybe_preprocess(&config, provider.as_ref(), &text, &core_images).await {
-                                        PreprocessOutcome::Skipped => {
-                                            // Model supports vision natively — forward images as-is.
-                                            images.iter().map(convert::image_to_kernel).collect()
-                                        }
-                                        PreprocessOutcome::Replaced { text: vl_text, vl_key } => {
-                                            let merged = if text.is_empty() {
-                                                format!("[图片内容（由 {vl_key} 识别）]\n{vl_text}")
-                                            } else {
-                                                format!("{text}\n\n[图片内容（由 {vl_key} 识别）]\n{vl_text}")
-                                            };
-                                            text = merged;
-                                            // VL succeeded — images converted to text, clear them
-                                            // so the kernel's provider adapter doesn't send raw
-                                            // image data to a non-vision model.
-                                            let _ = self.emit(CoreEv::VisionPreprocessSuccess {
-                                                vl_key,
-                                                char_count: vl_text.chars().count(),
-                                            });
-                                            Vec::new()
-                                        }
-                                        PreprocessOutcome::Failed { reason } => {
-                                            let merged = if text.is_empty() {
-                                                "[图片识别失败]".to_string()
-                                            } else {
-                                                format!("{text}\n\n[图片识别失败]")
-                                            };
-                                            text = merged;
-                                            // VL failed — return images to the TUI so the user
-                                            // can retry without re-pasting from clipboard.
-                                            let _ = self.emit(CoreEv::RestorePendingImages {
-                                                images: core_images,
-                                                markers: image_markers,
-                                            });
-                                            // Surface the failure reason as a warning, matching
-                                            // v1's AgentLoop::handle_send_message behavior.
-                                            let _ = self.emit(CoreEv::Warning(
-                                                format!("VL 预处理失败：{reason} · 图片已自动保留，可直接重试"),
-                                            ));
-                                            Vec::new()
-                                        }
-                                    }
-                                }
-                                None => {
-                                    // Provider not found — forward images as-is (best effort).
-                                    images.iter().map(convert::image_to_kernel).collect()
-                                }
-                            }
-                        }
-                    }
-                } else {
+                let images: Vec<atomcode_kernel::message::ImageContent> = if images.is_empty() {
                     Vec::new()
+                } else if vision::model_name_suggests_vision(&self.coding_cfg.model) {
+                    // The ACTIVE model sees images natively — forward as-is. The
+                    // kernel-native heuristic takes just the model NAME, so unlike v1 we
+                    // no longer build a throwaway provider just to detect vision support.
+                    images.iter().map(convert::image_to_kernel).collect()
+                } else {
+                    // Active model is text-only — OCR the images via the configured VL
+                    // model first, then forward the text (clearing the raw images so a
+                    // non-vision adapter never receives data it 400s on).
+                    let kernel_images: Vec<_> =
+                        images.iter().map(convert::image_to_kernel).collect();
+                    // Resolve the configured VL provider as a KERNEL provider. Not
+                    // configured / config-load failure → skip (best-effort; a vision
+                    // model could still be selected later). Configured-but-missing or an
+                    // unbuildable provider → a surfaced failure (config mistake).
+                    let resolved: Result<
+                        Option<(Arc<dyn atomcode_kernel::provider::LlmProvider>, String)>,
+                        String,
+                    > = match atomcode_core::config::Config::load(
+                        &atomcode_core::config::Config::default_path(),
+                    ) {
+                        Err(_) => Ok(None),
+                        Ok(config) => match config
+                            .vision_preprocessor_provider
+                            .clone()
+                            .filter(|k| !k.is_empty())
+                        {
+                            None => Ok(None),
+                            Some(vl_key) => match config.providers.get(&vl_key) {
+                                None => Err(format!(
+                                    "VL provider '{vl_key}' not found in config.providers"
+                                )),
+                                Some(pcfg) => {
+                                    let mut cc = CodingAgentConfig::new(
+                                        pcfg.api_key.clone().unwrap_or_default(),
+                                        pcfg.base_url.clone().unwrap_or_default(),
+                                        pcfg.model.clone(),
+                                        ".",
+                                    );
+                                    apply_reload_provider(&mut cc, pcfg);
+                                    build_provider(&cc)
+                                        .map(|p| Some((p, vl_key)))
+                                        .map_err(|e| format!("VL provider build failed: {e:#}"))
+                                }
+                            },
+                        },
+                    };
+                    match resolved {
+                        Ok(None) => kernel_images,
+                        Err(reason) => self.vision_fail(&mut text, images, image_markers, reason),
+                        Ok(Some((vl_provider, vl_key))) => match vision::preprocess(
+                            vl_provider.as_ref(),
+                            &vl_key,
+                            &text,
+                            &kernel_images,
+                        )
+                        .await
+                        {
+                            vision::PreprocessOutcome::Replaced { text: vl_text, vl_key } => {
+                                text = if text.is_empty() {
+                                    format!("[图片内容（由 {vl_key} 识别）]\n{vl_text}")
+                                } else {
+                                    format!("{text}\n\n[图片内容（由 {vl_key} 识别）]\n{vl_text}")
+                                };
+                                let _ = self.emit(CoreEv::VisionPreprocessSuccess {
+                                    vl_key,
+                                    char_count: vl_text.chars().count(),
+                                });
+                                Vec::new()
+                            }
+                            vision::PreprocessOutcome::Failed { reason } => {
+                                self.vision_fail(&mut text, images, image_markers, reason)
+                            }
+                        },
+                    }
                 };
 
                 let _ = self.handle.commands.send(KCmd::SendMessage { text, images });
