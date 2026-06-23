@@ -1,5 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 use crate::tool::ToolResult;
@@ -83,12 +82,17 @@ impl ToolResultStore {
     }
 }
 
-/// Produce a hex-encoded hash of the content using the std default hasher.
-/// Not cryptographic, but sufficient for content-addressing within a local cache.
+/// Produce a hex-encoded SHA-256 hash of the content.
+///
+/// SHA-256 is used instead of `DefaultHasher` because:
+/// 1. `DefaultHasher` is not guaranteed to be stable across Rust versions,
+///    which would invalidate existing cache entries after a toolchain upgrade.
+/// 2. SHA-256 is collision-resistant, making cache key collisions practically
+///    impossible even for adversarial inputs.
 fn content_hash(content: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    content.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:064x}", hasher.finalize())
 }
 
 /// Generate a one-line summary of tool output.
@@ -207,5 +211,30 @@ mod tests {
         assert!(store.load(&ref_).is_some());
         store.clear();
         assert!(store.load(&ref_).is_none());
+    }
+
+    #[test]
+    fn test_content_hash_stability() {
+        // Same content must always produce the same hash.
+        let h1 = content_hash("test content");
+        let h2 = content_hash("test content");
+        assert_eq!(h1, h2);
+        // SHA-256 produces 32 bytes = 64 hex chars.
+        assert_eq!(h1.len(), 64);
+    }
+
+    #[test]
+    fn test_content_hash_different_inputs() {
+        let h1 = content_hash("content A");
+        let h2 = content_hash("content B");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_content_hash_known_value() {
+        // Verify that the hash matches a known SHA-256 value.
+        // SHA-256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        let h = content_hash("hello");
+        assert_eq!(h, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
     }
 }
