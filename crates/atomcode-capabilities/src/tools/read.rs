@@ -30,7 +30,8 @@ struct Args {
 
 /// Deserialize a usize that weak models may send as a float or a string (`50`, `"50"`,
 /// `50.0`, `"50.0"`) instead of an integer. Absent / null / empty → `None`.
-fn lenient_usize<'de, D>(d: D) -> Result<Option<usize>, D::Error>
+/// Shared with `grep` (max_results/context) — keep this the single source.
+pub(crate) fn lenient_usize<'de, D>(d: D) -> Result<Option<usize>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -41,17 +42,29 @@ where
         F(f64),
         S(String),
     }
+    // Reject negative / NaN rather than silently clamping to 0 — an out-of-domain
+    // line number is a model error worth surfacing, not a value to guess at. Mirrors
+    // the v1 deserializer policy (tolerate float/string REPRESENTATIONS of a
+    // non-negative integer; reject negative & NaN).
+    fn checked(f: f64) -> Result<usize, &'static str> {
+        if f < 0.0 || f.is_nan() {
+            return Err("negative or NaN value not allowed");
+        }
+        Ok(f as usize)
+    }
     Ok(match Option::<Num>::deserialize(d)? {
         None => None,
         Some(Num::U(n)) => Some(n as usize),
-        Some(Num::F(f)) => Some(f.max(0.0) as usize),
+        Some(Num::F(f)) => Some(checked(f).map_err(serde::de::Error::custom)?),
         Some(Num::S(s)) => {
             let t = s.trim();
             if t.is_empty() {
                 None
+            } else if let Ok(n) = t.parse::<usize>() {
+                Some(n)
             } else {
-                let v = t.parse::<usize>().or_else(|_| t.parse::<f64>().map(|f| f.max(0.0) as usize));
-                Some(v.map_err(serde::de::Error::custom)?)
+                let f = t.parse::<f64>().map_err(serde::de::Error::custom)?;
+                Some(checked(f).map_err(serde::de::Error::custom)?)
             }
         }
     })
@@ -187,6 +200,26 @@ mod tests {
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
         ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+    }
+
+    #[test]
+    fn lenient_usize_rejects_negative_and_nan() {
+        // Negative / NaN are out-of-domain → reject (don't silently clamp to 0),
+        // matching the v1 deserializer policy. Covers both the float branch and
+        // the string→float fallback.
+        for bad in [
+            r#"{"file_path":"x","offset":-5.0}"#,   // negative float
+            r#"{"file_path":"x","offset":-5}"#,     // bare negative int (untagged → f64)
+            r#"{"file_path":"x","limit":"-5"}"#,    // negative as string
+            r#"{"file_path":"x","offset":"NaN"}"#,  // NaN as string
+        ] {
+            assert!(
+                serde_json::from_str::<Args>(bad).is_err(),
+                "should reject out-of-domain numeric: {bad}"
+            );
+        }
+        // Representation leniency is preserved: non-negative float / string still OK.
+        assert!(serde_json::from_str::<Args>(r#"{"file_path":"x","offset":2.0,"limit":"3.0"}"#).is_ok());
     }
 
     #[tokio::test]
