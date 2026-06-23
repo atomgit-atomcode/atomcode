@@ -10,7 +10,7 @@ description = "Engine bridge: presents atomcode-core's driver-facing channel pro
 # vocabulary drivers speak) — its engine is what the bridge replaces.
 atomcode-core = { path = "../atomcode-core" }
 atomcode-kernel = { path = "../atomcode-kernel" }
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "session", "memory", "mcp"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "session", "memory", "mcp", "goal"] }
 atomcode-coding = { path = "../atomcode-coding" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }

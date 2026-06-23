@@ -13,8 +13,7 @@ use atomcode_coding::{
 use atomcode_core::agent::{
     AgentClient, AgentCommand as CoreCmd, AgentEvent as CoreEv, AgentPhase, TurnStopReason,
 };
-use atomcode_core::agent::goal::{GoalResult, GoalState};
-use atomcode_core::agent::goal_evaluator::{EvalOutcome, GoalEvaluator};
+use atomcode_capabilities::goal::{EvalOutcome, GoalEvaluator, GoalResult, GoalState};
 use atomcode_core::conversation::ConversationSnapshot;
 use tokio_util::sync::CancellationToken;
 use atomcode_kernel::event::{
@@ -207,7 +206,7 @@ struct Bridge {
     /// Provider for the goal evaluator (reuses v1's `GoalEvaluator`), built lazily
     /// on SetGoal from `evaluator_provider`/default provider. Cloned into each
     /// spawned eval task.
-    goal_provider: Option<Arc<dyn atomcode_core::provider::LlmProvider>>,
+    goal_provider: Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>,
     /// Cancels an in-flight goal evaluation (fresh per goal). Triggered by
     /// Cancel/ClearGoal/Shutdown so Esc interrupts the evaluator immediately
     /// instead of waiting out its 30s/event timeout.
@@ -406,7 +405,7 @@ impl Bridge {
         };
         if let Some(u) = outcome.usage.as_ref() {
             if let Some(g) = self.goal.as_mut() {
-                g.add_tokens((u.prompt_tokens + u.completion_tokens) as u64);
+                g.add_tokens((u.prompt + u.completion) as u64);
             }
         }
         match outcome.result {
@@ -1459,7 +1458,7 @@ fn goal_update_ev(g: &GoalState) -> CoreEv {
 /// config can't load or the provider can't be constructed. Minimal port: no
 /// fallback to the active /chat model — set `evaluator_provider` to pin a fast
 /// judge, exactly as the `/goal` help documents.
-fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
+fn build_goal_provider() -> Option<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
     let config =
         atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
     let key = config
@@ -1467,8 +1466,17 @@ fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>
         .as_ref()
         .unwrap_or(&config.default_provider);
     let pcfg = config.providers.get(key)?;
-    let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
-    Some(Arc::from(provider))
+    // Build a KERNEL provider via the same adapter dispatch the main engine uses
+    // (capabilities' `GoalEvaluator` is kernel-native now). `apply_reload_provider`
+    // maps the evaluator's core `ProviderConfig` knobs onto the coding config.
+    let mut cc = CodingAgentConfig::new(
+        pcfg.api_key.clone().unwrap_or_default(),
+        pcfg.base_url.clone().unwrap_or_default(),
+        pcfg.model.clone(),
+        ".",
+    );
+    apply_reload_provider(&mut cc, pcfg);
+    build_provider(&cc).ok()
 }
 
 /// Compact the conversation into a plain-text summary for the evaluator, mirroring
