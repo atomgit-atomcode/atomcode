@@ -104,3 +104,10 @@ pub mod memory;
 /// v2 replacement for v1's `core::agent::goal`. Opt-in `goal` feature.
 #[cfg(feature = "goal")]
 pub mod goal;
+
+/// Vision preprocessing: OCR images via a configured VL model when the active model
+/// can't see them ([`vision::preprocess`]) + the model-name capability heuristic
+/// ([`vision::model_name_suggests_vision`]). Kernel-provider native — the v2 replacement
+/// for v1's `core::vision_preprocessor`. Opt-in `vision` feature.
+#[cfg(feature = "vision")]
+pub mod vision;

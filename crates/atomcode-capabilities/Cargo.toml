@@ -123,6 +123,10 @@ memory = ["dep:dirs"]
 # (`Verdict: yes/no`) + the GoalState the driver loops on. Kernel-provider native (the v2
 # replacement for v1's core::agent::goal). Opt-in (NOT default).
 goal = ["dep:anyhow", "dep:tokio-util"]
+# `vision` capability: VL preprocessing — when the active model can't see images, OCR
+# them via a configured VL model first. Kernel-provider native (the v2 replacement for
+# v1's core::vision_preprocessor). No extra deps beyond the base futures/tokio. Opt-in.
+vision = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }
