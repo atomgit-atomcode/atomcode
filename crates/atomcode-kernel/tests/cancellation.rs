@@ -408,3 +408,66 @@ async fn cancel_unblocks_pending_middleware_request() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 }
+
+// CLAIM 17d (v1 parity — "cancel the WHOLE multi-turn loop, not just one step"):
+// a Cancel that lands during ONE round of a MULTI-ROUND turn must halt the whole
+// turn — the next round must NOT start. (v1 had a bug where the Cancel handler reset
+// the token, so a round finishing as UsedTools let the loop continue and the user
+// had to press stop once per round.) Round 1 calls `self_cancel` (fires the per-turn
+// token from inside execute) and finishes as a normal tool round; the loop must
+// observe the still-cancelled token at the NEXT round's open and finalize Cancelled
+// WITHOUT issuing round 2's request.
+#[tokio::test]
+async fn cancel_mid_round_halts_the_whole_multi_round_turn() {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(SelfCancelTool));
+
+    // Round 1: a single self_cancel tool call (round finishes as UsedTools).
+    // Round 2: would stream text — but its request must NEVER be issued.
+    let provider = Arc::new(RecordingProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(tool_call("c_cancel", "self_cancel", "{}")),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("round 2 must not run".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let calls = provider.calls();
+
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["self_cancel"]))
+        .build()
+        .spawn();
+
+    handle
+        .commands
+        .send(AgentCommand::SendMessage { text: "go".into(), images: vec![] })
+        .unwrap();
+
+    let reason = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut reason: Option<StopReason> = None;
+        while let Some(ev) = handle.events.recv().await {
+            if let AgentEvent::TurnComplete { reason: r } = ev {
+                reason = Some(r);
+                break;
+            }
+        }
+        reason
+    })
+    .await
+    .expect("one Cancel must halt the multi-round turn, not hang/loop");
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "one Cancel must halt the whole turn: round 2's request must NOT be issued"
+    );
+    assert_eq!(
+        reason,
+        Some(StopReason::Cancelled),
+        "the multi-round turn must end Cancelled, not roll on to the next round"
+    );
+}

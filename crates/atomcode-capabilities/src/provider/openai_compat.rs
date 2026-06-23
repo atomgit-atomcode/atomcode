@@ -144,115 +144,157 @@ impl LlmProvider for OpenAiCompatProvider {
             }
         };
 
-        // Retry the OPEN only (transient status / transport). Once bytes flow, any
-        // mid-stream error surfaces as StreamEvent::Error and is never retried.
-        let policy = &self.cfg.retry;
-        let mut attempt = 1u32;
-        let resp = loop {
-            // Build fresh each attempt so a signer (if any) can re-auth per attempt.
-            let mut req = self
-                .client
-                .post(&self.url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body_bytes.clone());
-            match &self.cfg.request_signer {
-                Some(signer) => {
-                    let auth = signer.sign(&body_bytes);
-                    req = req.bearer_auth(auth.bearer.as_deref().unwrap_or(&self.cfg.api_key));
-                    for (name, value) in auth.headers {
-                        req = req.header(name, value);
-                    }
-                }
-                None => req = req.bearer_auth(&self.cfg.api_key),
-            }
-            let send = req.send().await;
-            match send {
-                Ok(resp) => {
-                    let code = resp.status().as_u16();
-                    if !resp.status().is_success() {
-                        if retry::is_retryable_status(code) && attempt < policy.max_attempts {
-                            let wait = retry::parse_retry_after(resp.headers())
-                                .unwrap_or_else(|| retry::compute_backoff(attempt, policy));
-                            tokio::time::sleep(wait).await;
-                            attempt += 1;
-                            continue;
-                        }
-                        let text = resp.text().await.unwrap_or_default();
-                        // Parse the error envelope ONCE for both the readable detail and
-                        // the STRUCTURED provider code.
-                        let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
-                        let err_obj = envelope.as_ref().and_then(|v| v.get("error"));
-                        let detail = err_obj.map(parse_error_obj).unwrap_or_else(|| truncate_msg(&text));
-                        let provider_code = err_obj.and_then(error_code);
-                        return Err(ProviderError {
-                            retryable: retry::is_retryable_status(code),
-                            message: format!("HTTP {code}: {detail}"),
-                            http_status: Some(code),
-                            code: provider_code,
-                        });
-                    }
-                    break resp;
-                }
-                Err(e) => {
-                    if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
-                        let wait = retry::compute_backoff(attempt, policy);
-                        tokio::time::sleep(wait).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(open_error(e));
-                }
-            }
-        };
-
+        // Open the stream. A hard failure here returns `Err` (not a stream of one
+        // Error event) so the kernel's agent-layer open retry — which keys off the
+        // returned `ProviderError` — still applies.
+        let policy = self.cfg.retry.clone();
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let signer = self.cfg.request_signer.clone();
+        let api_key = self.cfg.api_key.clone();
         let idle = self.cfg.idle_timeout;
-        let byte_stream = resp.bytes_stream();
+        let resp = open_stream(&client, &url, &body_bytes, &signer, &api_key, &policy).await?;
 
         let s = async_stream::stream! {
-            let mut dec = SseDecoder::new();
-            futures::pin_mut!(byte_stream);
-            loop {
-                match tokio::time::timeout(idle, byte_stream.next()).await {
-                    Err(_elapsed) => {
-                        // Mid-stream idle: non-recoverable (partial deltas may already
-                        // have reached the consumer), so not retryable.
-                        yield StreamEvent::Error(ProviderError {
-                            retryable: false,
-                            message: "stream idle timeout".to_string(),
-                            ..Default::default()
-                        });
-                        return;
-                    }
-                    Ok(None) => {
-                        for ev in dec.finish() { yield ev; }
-                        return;
-                    }
-                    Ok(Some(Err(e))) => {
-                        // Mid-stream stays non-retryable (partial deltas may
-                        // already have reached the consumer), but surface the
-                        // full cause chain for diagnosis.
-                        yield StreamEvent::Error(ProviderError {
-                            retryable: false,
-                            message: format!("stream read error: {}", retry::err_chain(&e)),
-                            ..Default::default()
-                        });
-                        return;
-                    }
-                    Ok(Some(Ok(chunk))) => {
-                        let mut saw_done = false;
-                        for ev in dec.feed(chunk.as_ref()) {
-                            if matches!(ev, StreamEvent::Done { .. }) {
-                                saw_done = true;
-                            }
-                            yield ev;
+            // v1 parity (core/openai.rs ~676): a chunked body that dies BEFORE any
+            // event has reached the consumer is safe to redo wholesale — no
+            // text/tool-call/UI delta was committed, so a fresh request is
+            // equivalent to a first attempt. Common cause: gateways that reset the
+            // connection under load (surfaces as "error decoding response body" /
+            // "unexpected EOF during chunk size line"). Once an event HAS been
+            // emitted, retry would duplicate output, so the error is surfaced
+            // verbatim with its full cause chain for diagnosis.
+            const MAX_STREAM_ATTEMPTS: u32 = 2;
+            let mut stream_attempt = 1u32;
+            let mut resp = resp;
+            'reopen: loop {
+                let mut dec = SseDecoder::new();
+                let mut emitted_any = false;
+                let byte_stream = resp.bytes_stream();
+                futures::pin_mut!(byte_stream);
+                loop {
+                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                        Err(_elapsed) => {
+                            // Mid-stream idle: non-recoverable (partial deltas may already
+                            // have reached the consumer), so not retryable.
+                            yield StreamEvent::Error(ProviderError {
+                                retryable: false,
+                                message: "stream idle timeout".to_string(),
+                                ..Default::default()
+                            });
+                            return;
                         }
-                        if saw_done { return; }
+                        Ok(None) => {
+                            for ev in dec.finish() { yield ev; }
+                            return;
+                        }
+                        Ok(Some(Err(e))) => {
+                            // Nothing reached the consumer yet → re-open the whole
+                            // request transparently (bounded by MAX_STREAM_ATTEMPTS).
+                            if !emitted_any && stream_attempt < MAX_STREAM_ATTEMPTS {
+                                if let Ok(fresh) =
+                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &policy).await
+                                {
+                                    stream_attempt += 1;
+                                    resp = fresh;
+                                    continue 'reopen;
+                                }
+                                // Re-open failed: fall through and surface the
+                                // original mid-stream error below.
+                            }
+                            yield StreamEvent::Error(ProviderError {
+                                retryable: false,
+                                message: format!("stream read error: {}", retry::err_chain(&e)),
+                                ..Default::default()
+                            });
+                            return;
+                        }
+                        Ok(Some(Ok(chunk))) => {
+                            let mut saw_done = false;
+                            for ev in dec.feed(chunk.as_ref()) {
+                                emitted_any = true;
+                                if matches!(ev, StreamEvent::Done { .. }) {
+                                    saw_done = true;
+                                }
+                                yield ev;
+                            }
+                            if saw_done { return; }
+                        }
                     }
                 }
             }
         };
 
         Ok(s.boxed())
+    }
+}
+
+/// Open one chat/completions stream, retrying the OPEN (transient status /
+/// transport) per `policy`. Builds the request fresh each attempt so a signer
+/// (if any) re-auths with a new nonce/timestamp. Returns the live `Response` on
+/// a 2xx, or a terminal `ProviderError`. Shared by the initial open and the
+/// mid-stream re-open so both paths behave identically.
+async fn open_stream(
+    client: &reqwest::Client,
+    url: &str,
+    body_bytes: &[u8],
+    signer: &Option<std::sync::Arc<dyn RequestSigner>>,
+    api_key: &str,
+    policy: &RetryPolicy,
+) -> Result<reqwest::Response, ProviderError> {
+    let mut attempt = 1u32;
+    loop {
+        let mut req = client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body_bytes.to_vec());
+        match signer {
+            Some(signer) => {
+                let auth = signer.sign(body_bytes);
+                req = req.bearer_auth(auth.bearer.as_deref().unwrap_or(api_key));
+                for (name, value) in auth.headers {
+                    req = req.header(name, value);
+                }
+            }
+            None => req = req.bearer_auth(api_key),
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                if !resp.status().is_success() {
+                    if retry::is_retryable_status(code) && attempt < policy.max_attempts {
+                        let wait = retry::parse_retry_after(resp.headers())
+                            .unwrap_or_else(|| retry::compute_backoff(attempt, policy));
+                        tokio::time::sleep(wait).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    let text = resp.text().await.unwrap_or_default();
+                    // Parse the error envelope ONCE for both the readable detail and
+                    // the STRUCTURED provider code.
+                    let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
+                    let err_obj = envelope.as_ref().and_then(|v| v.get("error"));
+                    let detail = err_obj.map(parse_error_obj).unwrap_or_else(|| truncate_msg(&text));
+                    let provider_code = err_obj.and_then(error_code);
+                    return Err(ProviderError {
+                        retryable: retry::is_retryable_status(code),
+                        message: format!("HTTP {code}: {detail}"),
+                        http_status: Some(code),
+                        code: provider_code,
+                    });
+                }
+                return Ok(resp);
+            }
+            Err(e) => {
+                if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
+                    let wait = retry::compute_backoff(attempt, policy);
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(open_error(e));
+            }
+        }
     }
 }
 
@@ -1336,5 +1378,151 @@ mod tests {
         // no [DONE]; the network loop calls finish() on EOF
         ev.extend(d.finish());
         assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+    }
+
+    // ---- mid-stream re-open (v1 parity: retry a body that dies before any event) ----
+
+    /// Fully consume one HTTP request (headers + Content-Length body) so the
+    /// client's `send()` always completes — otherwise an unread body can surface
+    /// as an OPEN error and mask the mid-stream behaviour under test.
+    fn read_http_request(s: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = match s.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                let clen = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut remaining = clen.saturating_sub(buf.len() - (pos + 4));
+                while remaining > 0 {
+                    match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => remaining = remaining.saturating_sub(n),
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn midstream_eof_before_any_event_reopens_and_succeeds() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        // Mock gateway: connection #1 opens a chunked 200 then drops the socket
+        // before sending any chunk — reproducing the reported
+        // "unexpected EOF during chunk size line". Because NOTHING reached the
+        // consumer, the provider must transparently re-open (v1 parity); the
+        // caller then sees only the successful connection #2 response.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            // #1: chunked 200, then abrupt close with no chunk → mid-stream EOF.
+            let (mut s1, _) = listener.accept().unwrap();
+            read_http_request(&mut s1);
+            s1.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
+            s1.flush().unwrap();
+            drop(s1);
+
+            // #2: a complete, close-delimited SSE body.
+            let (mut s2, _) = listener.accept().unwrap();
+            read_http_request(&mut s2);
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+            s2.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
+                    .as_bytes(),
+            )
+            .unwrap();
+            s2.flush().unwrap();
+            drop(s2);
+        });
+
+        let cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "glm-test");
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("open should succeed");
+        let events: Vec<StreamEvent> = stream.collect().await;
+
+        let has_error = events.iter().any(|e| matches!(e, StreamEvent::Error(_)));
+        assert!(!has_error, "must not surface a mid-stream error after a clean re-open: {events:?}");
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ok", "should deliver the re-opened response: {events:?}");
+
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn midstream_eof_after_an_event_surfaces_error_without_retry() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        // Once a delta has reached the consumer, a mid-stream EOF must NOT re-open
+        // (that would duplicate output) — it surfaces verbatim. The mock serves a
+        // single chunk carrying one content delta, then drops before the chunked
+        // terminator. The provider serves ONLY this one connection.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_http_request(&mut s);
+            let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n";
+            s.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
+            // One complete chunk (delivers the delta), then abrupt close before the
+            // `0\r\n\r\n` terminator → mid-stream EOF after an event was emitted.
+            s.write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes()).unwrap();
+            s.flush().unwrap();
+            drop(s);
+        });
+
+        let cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "glm-test");
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("open should succeed");
+        let events: Vec<StreamEvent> = stream.collect().await;
+
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "x", "the one delivered delta must appear exactly once: {events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
+            "a post-emit mid-stream EOF must surface an error: {events:?}"
+        );
+
+        let _ = handle.join();
     }
 }

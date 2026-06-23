@@ -54,6 +54,12 @@ pub struct Envelope {
     pub repo_origin: Option<RepoOrigin>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<SessionMode>,
+    /// Logical ORIGIN of the LLM call within the app — distinct from `mode` (the
+    /// session SURFACE: tui/headless/…). Set per-scope so a sub-agent's spend can be
+    /// attributed to its feature (e.g. `"code_review"` for the in-session review tool
+    /// and the standalone `atomcodex review`); `None` = the primary agent loop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -335,6 +341,7 @@ mod tests {
             model: None,
             repo_origin: None,
             mode: None,
+            surface: None,
         }
     }
 
@@ -358,6 +365,18 @@ mod tests {
         env.mode = Some(SessionMode::Tui);
         let v: serde_json::Value = serde_json::to_value(&env).unwrap();
         assert_eq!(v["mode"], "tui");
+    }
+
+    #[test]
+    fn envelope_carries_surface() {
+        let mut env = sample_envelope();
+        // None → field omitted entirely.
+        let s = serde_json::to_string(&env).unwrap();
+        assert!(!s.contains("surface"), "a None surface must be omitted; got {s}");
+        // Some → serialized as the raw tag.
+        env.surface = Some("code_review".into());
+        let v: serde_json::Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["surface"], "code_review");
     }
 
     #[test]

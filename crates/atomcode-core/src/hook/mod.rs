@@ -161,6 +161,8 @@ pub struct HookContext {
 pub enum HookResult {
     /// Hook 成功执行
     Ok,
+    /// Hook 明确允许操作（跳过后续审批）
+    ExplicitAllow,
     /// Hook 失败（非致命，仅记录警告）
     Warning(String),
     /// Hook 拒绝继续操作（致命）

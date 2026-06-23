@@ -127,6 +127,7 @@ fn classify_llm_error(reason: &str) -> LlmErrorKind {
 
 /// Shared attribution + emit path for the telemetry adapters. Fixes the
 /// provider/host/model envelope at assembly; both adapters track within its scope.
+#[derive(Clone)]
 struct Attribution {
     telemetry: Arc<Telemetry>,
     provider: Option<String>,
@@ -136,6 +137,9 @@ struct Attribution {
     /// falling back to the process launch id. `None` for a Disabled-session agent or
     /// an id that isn't a uuid.
     session_id: Option<uuid::Uuid>,
+    /// Logical origin tag (e.g. `"code_review"`) → `Envelope.surface`. `None` = the
+    /// primary agent loop. Set via [`MeteredProvider::with_surface`].
+    surface: Option<String>,
 }
 
 impl Attribution {
@@ -157,6 +161,7 @@ impl Attribution {
             provider_host,
             model: model.into(),
             session_id: session_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
+            surface: None,
         }
     }
 
@@ -166,6 +171,7 @@ impl Attribution {
             provider_host: self.provider_host.clone(),
             model: Some(self.model.clone()),
             session_id: self.session_id,
+            surface: self.surface.clone(),
             ..Default::default()
         }
     }
@@ -467,6 +473,15 @@ impl MeteredProvider {
         session_id: Option<&str>,
     ) -> Self {
         Self { inner, attr: Arc::new(Attribution::new(telemetry, vendor, base_url, model, session_id)) }
+    }
+
+    /// Tag every event this provider emits with a `surface` (e.g. `"code_review"`), so
+    /// the backend can attribute an out-of-loop sub-agent's token spend to its feature
+    /// rather than commingling it with the host session's primary-loop rounds.
+    pub fn with_surface(self, surface: impl Into<String>) -> Self {
+        let mut attr = (*self.attr).clone();
+        attr.surface = Some(surface.into());
+        Self { inner: self.inner, attr: Arc::new(attr) }
     }
 }
 
@@ -879,6 +894,60 @@ mod tests {
             other => panic!("expected LlmChat, got {other:?}"),
         }
         assert_eq!(records[0].envelope.model.as_deref(), Some("deepseek-v4"));
+    }
+
+    // A MeteredProvider tagged `with_surface` stamps every emitted event's envelope
+    // with that surface, so the backend can attribute an out-of-loop sub-agent's spend
+    // (e.g. the code_review tool) instead of commingling it with the host session.
+    #[tokio::test]
+    async fn metered_provider_tags_surface() {
+        // Tagged → surface flows to the envelope.
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        let dec = MeteredProvider::new(
+            Arc::new(CannedSummary { fail: false }),
+            tel,
+            "openai",
+            "https://x/v1",
+            "deepseek-v4",
+            None,
+        )
+        .with_surface("code_review");
+        let mut stream = dec
+            .chat_stream(&[Message::user("review this")], &[], &ChatOptions::default())
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].envelope.surface.as_deref(),
+            Some("code_review"),
+            "a with_surface provider must stamp envelope.surface"
+        );
+
+        // Untagged → surface stays None (the primary-loop default).
+        let (tel2, captured2) = Telemetry::in_memory("test".into());
+        let plain = MeteredProvider::new(
+            Arc::new(CannedSummary { fail: false }),
+            tel2,
+            "openai",
+            "https://x/v1",
+            "deepseek-v4",
+            None,
+        );
+        let mut s2 = plain
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .unwrap();
+        while s2.next().await.is_some() {}
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records2 = captured2.lock().await;
+        assert_eq!(records2.len(), 1);
+        assert_eq!(
+            records2[0].envelope.surface, None,
+            "an untagged provider must leave envelope.surface None"
+        );
     }
 
     #[tokio::test]

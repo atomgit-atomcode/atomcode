@@ -8,7 +8,7 @@ import { listSessions, getSkills, getMcpStatus, SkillInfo, McpStatusInfo, Sessio
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
-import { LoginButton } from './LoginButton';
+import { useAuth } from './LoginButton';
 
 interface SidebarProps {
   activeSessionId: string | null;
@@ -225,6 +225,16 @@ function LangGlyph() {
   );
 }
 
+/** Account glyph (head + shoulders). */
+function AccountGlyph() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="5.5" r="2.5" stroke="currentColor" stroke-width="1.2" />
+      <path d="M3.5 13.5a4.5 4.5 0 0 1 9 0" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+    </svg>
+  );
+}
+
 /** Model glyph (chip). */
 function ModelGlyph() {
   return (
@@ -252,6 +262,7 @@ export function Sidebar({
 }: SidebarProps) {
   const t = useT();
   const { theme, setTheme, lang, setLang } = useSettings();
+  const auth = useAuth();
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
@@ -277,7 +288,8 @@ export function Sidebar({
   const [menuPos, setMenuPos] = useState<
     { top?: number; bottom?: number; right: number } | null
   >(null);
-  // Session search dialog
+  // Session search: a centered modal dialog (same .modal-overlay/.modal-card
+  // family as the rename/delete dialogs), closes on backdrop click / Escape.
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -497,6 +509,21 @@ export function Sidebar({
     setMcpMenuOpen(true);
   }
 
+  // Close the search dialog on Escape (backdrop click is handled on the overlay).
+  useEffect(() => {
+    if (!searchOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSearchOpen(false);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [searchOpen]);
+
+  // Focus the input each time the dialog opens.
+  useEffect(() => {
+    if (searchOpen) searchInputRef.current?.focus();
+  }, [searchOpen]);
+
   // The settings popup (3 entries). Fixed-positioned, but portaled to <body>:
   // on mobile the sidebar becomes a `transform`ed off-canvas drawer, which
   // would make it the containing block for `position: fixed` descendants and
@@ -570,6 +597,17 @@ export function Sidebar({
           <span>{t('settings.menuModel')}</span>
         </button>
         {/* 远程访问入口已移到侧栏底部栏（见下方 sidebar-bottom 的 Remote Btn）。 */}
+
+        {/* 退出登录：放在组最下面，仅登录后显示（头像/登录入口在侧栏底部栏）。 */}
+        {auth.loggedIn && (
+          <>
+            <div class="settings-menu-divider" />
+            <button class="item-menu-row" onClick={auth.doLogout}>
+              <AccountGlyph />
+              <span>{auth.labels.signOut}</span>
+            </button>
+          </>
+        )}
       </div>,
           document.body,
         )
@@ -860,7 +898,39 @@ export function Sidebar({
       </div>
 
       <div class="sidebar-bottom">
-        <LoginButton />
+        {auth.loggedIn ? (
+          <div
+            class="sidebar-account"
+            title={auth.user?.name || auth.user?.username || 'account'}
+          >
+            <span class="login-avatar">
+              {auth.user?.avatar_url ? (
+                <img
+                  class="login-avatar-img"
+                  src={auth.user.avatar_url}
+                  alt=""
+                  referrerpolicy="no-referrer"
+                  onError={(e) => {
+                    (e.currentTarget as HTMLImageElement).style.display = 'none';
+                  }}
+                />
+              ) : (
+                (auth.user?.name || auth.user?.username || 'A').slice(0, 1).toUpperCase()
+              )}
+            </span>
+            <span class="login-name">{auth.user?.name || auth.user?.username || 'account'}</span>
+          </div>
+        ) : (
+          <button
+            class="sidebar-account-btn"
+            onClick={auth.startLogin}
+            disabled={auth.busy}
+            title={auth.busy ? auth.labels.hint : auth.labels.signIn}
+          >
+            <AccountGlyph />
+            <span class="login-name">{auth.busy ? auth.labels.signingIn : auth.labels.signIn}</span>
+          </button>
+        )}
         <span class="sidebar-bottom-spacer" />
         {onOpenRemote && (
           <button
@@ -900,7 +970,6 @@ export function Sidebar({
                 onInput={(e) => setSearchQuery((e.target as HTMLInputElement).value)}
                 autofocus
               />
-              <button class="search-close-btn" onClick={() => setSearchOpen(false)} title={t('common.cancel')} aria-label={t('common.cancel')}>✕</button>
             </div>
             <div class="search-results">
               {(() => {

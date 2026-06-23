@@ -181,9 +181,40 @@ async fn test_hook_engine_modify_args() {
     let result = engine.trigger_pre_tool_use(&ctx).await;
     
     assert!(result.is_ok());
-    let modified_args = result.unwrap();
+    let (modified_args, _) = result.unwrap();
     assert!(modified_args.is_some());
     assert_eq!(modified_args.unwrap(), "{\"modified\": true}");
+}
+
+/// Issue #512: PreToolUse hook returning "allow" must set the
+/// `explicitly_allowed` flag so the caller can skip the approval prompt.
+#[tokio::test]
+async fn test_hook_engine_explicit_allow() {
+    let mut engine = HookEngine::new();
+
+    struct AllowingHook;
+
+    #[async_trait]
+    impl Hook for AllowingHook {
+        fn name(&self) -> &str { "allowing-hook" }
+    }
+
+    #[async_trait]
+    impl PreToolExecutionHook for AllowingHook {
+        async fn on_pre_execute(&self, _ctx: &HookCtx) -> HookResult {
+            HookResult::ExplicitAllow
+        }
+    }
+
+    engine.register_pre_tool_hook(Arc::new(AllowingHook));
+
+    let ctx = HookCtx::new("bash".to_string(), "{}".to_string(), "/tmp".to_string());
+    let result = engine.trigger_pre_tool_use(&ctx).await;
+
+    assert!(result.is_ok());
+    let (args, allowed) = result.unwrap();
+    assert!(args.is_none());   // no arg modification
+    assert!(allowed);          // explicit allow → skip approval
 }
 
 #[tokio::test]
