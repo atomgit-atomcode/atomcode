@@ -2229,11 +2229,60 @@ impl AgentLoop {
     // auto_diagnose_errors → diagnose.rs
     // find_file_in_project → diagnose.rs
 
+    /// Finalize a user-cancelled turn (Esc / stop button).
+    ///
+    /// Shared by two paths: (1) `run_with_filter` returning
+    /// `TurnResult::Cancelled` because the in-flight LLM stream was interrupted
+    /// mid-turn, and (2) the top-of-loop guard in `run_turn_loop` catching a
+    /// cancellation that landed *between* turns (the previous round finished as
+    /// `UsedTools`/`Responded` before the cancel was observed). Both must leave
+    /// the conversation in a valid state and emit `TurnCancelled` exactly once,
+    /// WITHOUT emitting `TurnComplete` (which would buffer a stale "✓ done · N
+    /// rounds" line that fires on the user's next submission).
+    ///
+    /// Sets `last_stop_reason = Cancelled` FIRST so callers (notably the /goal
+    /// wrapper) see Cancelled and break out of their auto-continuation loop.
+    fn finalize_cancelled(&mut self) -> TurnStopReason {
+        self.last_stop_reason = TurnStopReason::Cancelled;
+        // If AgentCommand::Cancel already marked the turn Completed (the outer
+        // run() handler path calls cancel_current_turn itself), there is nothing
+        // left to backfill — just return.
+        if self.conversation.turn_tracker.active_turn().is_none() {
+            return self.last_stop_reason;
+        }
+        // Preserve completed content + backfill (cancelled) for unpaired tool calls.
+        self.conversation.cancel_current_turn();
+        let snapshot = self.conversation.snapshot();
+        let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
+        // finish_turn's bookkeeping without emitting TurnComplete (see doc above).
+        self.datalog.end_turn(self.turn_tokens, self.tool_call_count);
+        self.turn_start = None;
+        self.phase = AgentPhase::Idle;
+        let _ = self
+            .event_tx
+            .send(AgentEvent::PhaseChange(AgentPhase::Idle));
+        self.conversation.save(&Conversation::history_path());
+        self.last_stop_reason
+    }
+
     /// Multi-turn execution loop using TurnRunner.
     /// Each iteration calls TurnRunner.run() for one LLM turn, then applies
     /// discipline (reminders, step limits) and decides whether to continue.
     async fn run_turn_loop(&mut self) -> TurnStopReason {
         loop {
+            // User-cancellation guard. The cancel token stays cancelled across
+            // iterations (the inner Cancel handler no longer resets it), so a
+            // stop that landed while the previous round was finishing as
+            // UsedTools/Responded — i.e. *between* turns, before the cancel was
+            // observed by the LLM stream — is caught here instead of silently
+            // starting another reasoning/tool round. Without this the user had
+            // to press stop once per round to fully halt a multi-step task.
+            // The token is reset to a fresh one by handle_send_message (and the
+            // /goal loop) before the next run_turn_loop, so this is only true
+            // for a genuine in-progress cancellation.
+            if self.cancel_token.is_cancelled() {
+                return self.finalize_cancelled();
+            }
             // Turn budget check BEFORE incrementing, so the reported
             // turn_count equals the number of turns actually executed
             // (not including the "would-be" next turn we refuse to run).
@@ -2707,8 +2756,19 @@ impl AgentLoop {
                             match cmd {
                                 AgentCommand::Cancel => {
                                     crate::ctrace!("AGT", "inner Cancel -> cancel_token.cancel() (was_cancelled={})", cancel_token.is_cancelled());
+                                    // Cancel the in-flight turn. Do NOT reset the
+                                    // token to a fresh one here: it must stay
+                                    // cancelled so the outer turn loop's
+                                    // top-of-loop guard halts the *whole* task
+                                    // instead of starting the next reasoning/tool
+                                    // round. Previously the reset meant one Cancel
+                                    // only interrupted the current step — if the
+                                    // turn finished as UsedTools/Responded the loop
+                                    // continued with a clean token and the user had
+                                    // to press stop once per round. A fresh token is
+                                    // installed by handle_send_message on the next
+                                    // user message.
                                     cancel_token.cancel();
-                                    *cancel_token = CancellationToken::new();
                                 }
                                 AgentCommand::ApproveTool => {
                                     *phase = AgentPhase::Thinking;
@@ -3172,41 +3232,12 @@ impl AgentLoop {
                     }
                 }
                 TurnResult::Cancelled => {
-                    // Mark stop reason FIRST so callers (notably the /goal
-                    // wrapper) see Cancelled and break out of their auto-
-                    // continuation loop. Without this the field keeps the
-                    // previous turn's value (typically Natural), so the
-                    // wrapper thinks the turn ended cleanly and immediately
-                    // schedules another round — producing repeated
-                    // "(cancelled)" cycles when the user keeps hitting Esc.
-                    self.last_stop_reason = TurnStopReason::Cancelled;
-                    // Check if turn was already cancelled by AgentCommand::Cancel
-                    // (which marks the turn as Completed immediately)
-                    if self.conversation.turn_tracker.active_turn().is_none() {
-                        // Already handled by AgentCommand::Cancel - just return
-                        return self.last_stop_reason;
-                    }
-                    // Preserve completed content + backfill (cancelled) for unpaired tool calls
-                    self.conversation.cancel_current_turn();
-                    // Send TurnCancelled event for TUI to sync
-                    let snapshot = self.conversation.snapshot();
-                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
-                    // Do finish_turn's bookkeeping WITHOUT emitting TurnComplete.
-                    // TurnCancelled already tells the TUI the turn ended; emitting
-                    // TurnComplete on top buffers a stale "✓ done · N rounds" line
-                    // that fires the next time the TUI's phase becomes Streaming —
-                    // i.e. right after the user's next submission.
-                    // Note: cancel_current_turn() already marks the turn Completed,
-                    // so complete_current() is a no-op; kept as defensive safety net.
-                    self.datalog
-                        .end_turn(self.turn_tokens, self.tool_call_count);
-                    self.turn_start = None;
-                    self.phase = AgentPhase::Idle;
-                    let _ = self
-                        .event_tx
-                        .send(AgentEvent::PhaseChange(AgentPhase::Idle));
-                    self.conversation.save(&Conversation::history_path());
-                    return self.last_stop_reason;
+                    // In-flight stream interrupted mid-turn. Shared finalize:
+                    // marks Cancelled first (so the /goal wrapper breaks out of
+                    // its auto-continuation loop instead of scheduling another
+                    // "(cancelled)" round), backfills unpaired tool calls, and
+                    // emits TurnCancelled without a stale TurnComplete.
+                    return self.finalize_cancelled();
                 }
             }
         }
