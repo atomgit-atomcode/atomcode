@@ -934,6 +934,10 @@ impl RunningAgent {
             // empty 200), so it must NOT be retried as empty. Set true on the raw
             // arrival in each content arm below.
             let mut saw_stream_content = false;
+            // Did the adapter report dropping an UNPARSEABLE chunk this round (a
+            // `StreamEvent::Malformed`)? Only used to flavor the empty-response retry
+            // notice (malformed/garbled vs truly empty); it is NOT content.
+            let mut saw_malformed = false;
             loop {
                 // MID-STREAM cancel checkpoint: cancellation stops stream
                 // consumption immediately. Carried from production runner.rs:420.
@@ -1049,6 +1053,11 @@ impl RunningAgent {
                         self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
                         return;
                     }
+                    // The adapter dropped an unparseable chunk. Note it (to flavor the
+                    // empty-response retry below) but do NOT treat it as content — a
+                    // round that is ONLY malformed chunks is still content-free and gets
+                    // retried, just with a "格式异常" wording instead of "空响应".
+                    StreamEvent::Malformed => saw_malformed = true,
                     StreamEvent::Done { truncated: t } => {
                         truncated = t;
                         break;
@@ -1081,9 +1090,14 @@ impl RunningAgent {
                     // would be pure wasted latency. A VISIBLE Warning tells the user a
                     // retry is underway (a silent re-open reads as "nothing happened").
                     let wait = (((empty_retries + 1) / 2).min(3)) as u64;
-                    self.rt.emit(AgentEvent::Warning(format!(
-                        "模型返回空响应，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})..."
-                    )));
+                    // Distinguish a GARBLED response (adapter dropped unparseable chunks)
+                    // from a truly EMPTY one — different upstream faults, different wording.
+                    let notice = if saw_malformed {
+                        format!("响应格式异常，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                    } else {
+                        format!("模型返回空响应，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                    };
+                    self.rt.emit(AgentEvent::Warning(notice));
                     // Cancellable backoff: Esc during the wait aborts the turn instead
                     // of forcing the user to sit through the delay (same shape as the
                     // retryable-open arm above).
@@ -1103,9 +1117,15 @@ impl RunningAgent {
                 // (StopReason::ProviderError) rather than the silent Stopped below. The
                 // snapshot is preserved (finish_turn does not roll back), so the user
                 // can simply resend.
-                let msg = format!(
-                    "模型连续 {EMPTY_RESPONSE_MAX_RETRIES} 次返回空响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。"
-                );
+                let msg = if saw_malformed {
+                    format!(
+                        "模型连续 {EMPTY_RESPONSE_MAX_RETRIES} 次返回无法解析的响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。"
+                    )
+                } else {
+                    format!(
+                        "模型连续 {EMPTY_RESPONSE_MAX_RETRIES} 次返回空响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。"
+                    )
+                };
                 self.hooks.on_error(&msg).await;
                 self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
                 self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;

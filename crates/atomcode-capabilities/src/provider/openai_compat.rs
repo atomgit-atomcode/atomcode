@@ -601,7 +601,16 @@ impl SseDecoder {
         }
         let chunk: ChunkResponse = match serde_json::from_str(data) {
             Ok(c) => c,
-            Err(_) => return, // ignore keepalive / unparseable lines
+            Err(_) => {
+                // A non-empty, non-`[DONE]` `data:` payload that is not valid JSON is
+                // garbage from the gateway — comment (`:`) / blank / empty-`data:`
+                // keepalives were already filtered above. Surface it as a content-free
+                // Malformed SIGNAL so the kernel retries it with a distinct "格式异常"
+                // notice, instead of silently dropping it (which looked identical to a
+                // truly empty 200 and conflated the two faults).
+                out.push(StreamEvent::Malformed);
+                return;
+            }
         };
         // Surface the provider's own response id ONCE (cross-ref upstream logs).
         if !self.response_id_seen {
@@ -1075,6 +1084,7 @@ mod tests {
                 StreamEvent::ResponseId(_) => "response_id",
                 StreamEvent::Done { .. } => "done",
                 StreamEvent::Error(_) => "error",
+                StreamEvent::Malformed => "malformed",
             })
             .collect()
     }
@@ -1096,6 +1106,30 @@ mod tests {
         assert_eq!(usage.prompt, 5);
         assert_eq!(usage.completion, 2);
         assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+    }
+
+    #[test]
+    fn sse_malformed_data_line_surfaces_malformed_not_silent_drop() {
+        // A non-empty, non-[DONE] `data:` payload that is not valid JSON is garbage
+        // from the gateway. It must surface StreamEvent::Malformed (so the kernel can
+        // retry it with a "格式异常" notice) rather than being silently dropped.
+        let mut d = SseDecoder::new();
+        let ev = d.feed(b"data: this is not json at all\n");
+        assert!(
+            ev.iter().any(|e| matches!(e, StreamEvent::Malformed)),
+            "an unparseable data: line must surface StreamEvent::Malformed; got {:?}",
+            kinds(&ev)
+        );
+
+        // Keepalive comments, blank lines, and empty `data:` payloads are normal SSE
+        // noise — they must NOT be flagged malformed.
+        let mut d2 = SseDecoder::new();
+        let noise = d2.feed(b": keepalive ping\n\ndata: \n");
+        assert!(
+            !noise.iter().any(|e| matches!(e, StreamEvent::Malformed)),
+            "comments / blank / empty-data lines must NOT be malformed; got {:?}",
+            kinds(&noise)
+        );
     }
 
     #[test]

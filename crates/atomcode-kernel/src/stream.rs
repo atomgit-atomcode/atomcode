@@ -130,6 +130,13 @@ pub enum StreamEvent {
     ResponseId(String),
     /// Mid-stream failure (429/5xx/timeout/auth/…). Cleanly fails the turn.
     Error(ProviderError),
+    /// The adapter received a chunk it could NOT parse (e.g. a non-JSON `data:` line
+    /// from an OpenAI-compatible gateway) and dropped it. Carries NO content — it is a
+    /// diagnostic SIGNAL, not output — so it does NOT count toward the round's content.
+    /// The kernel uses it only to DISTINGUISH a malformed/garbled response from a truly
+    /// empty one when deciding the empty-response retry's wording; both still retry. An
+    /// adapter that never sees unparseable data simply never emits this.
+    Malformed,
     /// End of stream. `truncated` = the response was cut by `finish_reason=length`.
     Done {
         truncated: bool,

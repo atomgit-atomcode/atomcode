@@ -566,6 +566,7 @@ mod tests {
                 StreamEvent::ResponseId(_) => "response_id",
                 StreamEvent::Done { .. } => "done",
                 StreamEvent::Error(_) => "error",
+                StreamEvent::Malformed => "malformed",
             })
             .collect()
     }
