@@ -173,13 +173,13 @@ function TrashIcon() {
 function GearIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.2" />
       <path
-        d="M8 1.5v1.6M8 12.9v1.6M14.5 8h-1.6M3.1 8H1.5M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1M12.6 12.6l-1.1-1.1M4.5 4.5L3.4 3.4"
+        d="M7.1 1l-.5 2.2a4.8 4.8 0 0 0-1.8 1L2.8 3.2 1.4 5.6l1.7 1.4a4.8 4.8 0 0 0 0 2l-1.7 1.4 1.4 2.4 2-.6a4.8 4.8 0 0 0 1.8 1l.5 2.2h2.8l.5-2.2a4.8 4.8 0 0 0 1.8-1l2 .6 1.4-2.4-1.7-1.4a4.8 4.8 0 0 0 0-2l1.7-1.4-1.4-2.4-2 .6a4.8 4.8 0 0 0-1.8-1L9.9 1z"
         stroke="currentColor"
         stroke-width="1.2"
-        stroke-linecap="round"
+        stroke-linejoin="round"
       />
+      <circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.2" />
     </svg>
   );
 }
