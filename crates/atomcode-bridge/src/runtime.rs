@@ -909,7 +909,8 @@ impl Bridge {
                     arguments: serde_json::json!({ "command": cmd }).to_string(),
                 });
                 let start = Instant::now();
-                let (display, context, success) = run_local_shell(&cmd, &cwd).await;
+                let (display, context, success) =
+                    atomcode_capabilities::local_shell::run(&cmd, &cwd).await;
                 self.emit(CoreEv::ToolCallResult {
                     call_id,
                     name: "bash".into(),
@@ -1539,98 +1540,6 @@ fn summarize_for_goal(
     }
 }
 
-/// Escape `<`/`>`/`&` so command output can't forge the `<bash-*>` tags the model
-/// parses (e.g. output containing `</bash-stdout>`).
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-}
-
-/// Run a `!cmd` local shell in `cwd` (300s cap). Returns
-/// `(display_output, context_block, success)`: the display goes to the driver as the
-/// tool result; the `<bash-*>` context block is injected ahead of the next user
-/// message (clamped so `!cat bigfile` can't blow up the conversation).
-async fn run_local_shell(cmd: &str, cwd: &std::path::Path) -> (String, String, bool) {
-    use tokio::process::Command;
-    let mut c = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(cmd);
-        c
-    } else {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(cmd);
-        c
-    };
-    c.current_dir(cwd);
-
-    let out = match tokio::time::timeout(Duration::from_secs(300), c.output()).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            let m = format!("failed to run: {e}");
-            let ctx = format!(
-                "<bash-input>{}</bash-input>\n<bash-stderr>{}</bash-stderr>",
-                xml_escape(cmd),
-                xml_escape(&m)
-            );
-            return (m, ctx, false);
-        }
-        Err(_) => {
-            let ctx = format!(
-                "<bash-input>{}</bash-input>\n<bash-stderr>command timed out</bash-stderr>",
-                xml_escape(cmd)
-            );
-            return ("command timed out (300s)".into(), ctx, false);
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let code = out.status.code();
-    let success = out.status.success();
-
-    // Driver display: full-ish, readable.
-    let mut display = String::new();
-    if !stdout.is_empty() {
-        display.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !display.is_empty() {
-            display.push('\n');
-        }
-        display.push_str(&stderr);
-    }
-    if !success {
-        if !display.is_empty() {
-            display.push('\n');
-        }
-        display.push_str(&format!("[exit {}]", code.unwrap_or(-1)));
-    }
-    if display.is_empty() {
-        display = "(no output)".into();
-    }
-
-    // Model context: escaped + clamped `<bash-*>` block.
-    let clamp = |s: &str| -> String {
-        let e = xml_escape(s);
-        if e.chars().count() > 16_000 {
-            e.chars().take(16_000).collect::<String>() + "\n…[truncated]"
-        } else {
-            e
-        }
-    };
-    let mut ctx = format!("<bash-input>{}</bash-input>", xml_escape(cmd));
-    if !stdout.is_empty() {
-        ctx.push_str(&format!("\n<bash-stdout>{}</bash-stdout>", clamp(&stdout)));
-    }
-    if !stderr.is_empty() {
-        ctx.push_str(&format!("\n<bash-stderr>{}</bash-stderr>", clamp(&stderr)));
-    }
-    if let Some(c) = code {
-        if c != 0 {
-            ctx.push_str(&format!("\n<bash-exit-code>{c}</bash-exit-code>"));
-        }
-    }
-    (display, ctx, success)
-}
 
 /// Run a `/background` task on a SEPARATE one-shot agent (no persistence/MCP/memory —
 /// a fast isolated worker). Approvals are auto-granted (the user explicitly launched
@@ -2194,28 +2103,6 @@ mod undo_tests {
         assert_eq!(super::extract_path("not json"), None);
     }
 
-    #[tokio::test]
-    async fn local_shell_runs_and_formats_output() {
-        let (display, ctx, success) =
-            super::run_local_shell("echo hello", std::path::Path::new(".")).await;
-        assert!(success);
-        assert!(display.contains("hello"));
-        assert!(ctx.contains("<bash-input>echo hello</bash-input>"));
-        assert!(ctx.contains("<bash-stdout>hello</bash-stdout>"));
-    }
-
-    #[tokio::test]
-    async fn local_shell_failure_carries_exit_code() {
-        let (_d, ctx, success) =
-            super::run_local_shell("exit 3", std::path::Path::new(".")).await;
-        assert!(!success);
-        assert!(ctx.contains("<bash-exit-code>3</bash-exit-code>"), "ctx={ctx}");
-    }
-
-    #[test]
-    fn xml_escape_neutralizes_tag_forgery() {
-        assert_eq!(super::xml_escape("a</bash-stdout>b"), "a&lt;/bash-stdout&gt;b");
-    }
 
     #[test]
     fn bypass_auto_approves_with_allow_else_prompts() {

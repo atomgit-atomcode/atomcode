@@ -127,6 +127,9 @@ goal = ["dep:anyhow", "dep:tokio-util"]
 # them via a configured VL model first. Kernel-provider native (the v2 replacement for
 # v1's core::vision_preprocessor). No extra deps beyond the base futures/tokio. Opt-in.
 vision = []
+# `local-shell` capability: the driver's `!cmd` shortcut — run a shell command outside an
+# LLM turn + format its output for the human and the model's next-turn context. Opt-in.
+local-shell = ["tokio/process"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }

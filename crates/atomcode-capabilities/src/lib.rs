@@ -111,3 +111,9 @@ pub mod goal;
 /// for v1's `core::vision_preprocessor`. Opt-in `vision` feature.
 #[cfg(feature = "vision")]
 pub mod vision;
+
+/// Driver-side local shell (`!cmd`): run a shell command outside an LLM turn and format
+/// its output for the human + the model's next-turn `<bash-*>` context
+/// ([`local_shell::run`]). Opt-in `local-shell` feature.
+#[cfg(feature = "local-shell")]
+pub mod local_shell;
