@@ -238,7 +238,7 @@ impl Queue {
                 break;
             }
             if let Some(oldest) = segs.first() {
-                self.dropped += count_non_empty_lines(oldest)?;
+                self.dropped += count_non_empty_lines(oldest).unwrap_or_default();
                 fs::remove_file(oldest)?;
             } else {
                 break;
