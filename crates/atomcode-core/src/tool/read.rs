@@ -79,6 +79,9 @@ where
             }
         }
         fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+            if v < 0.0 || v.is_nan() {
+                return Err(de::Error::custom("negative or NaN value not allowed"));
+            }
             Ok(Some(v as usize))
         }
         fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {

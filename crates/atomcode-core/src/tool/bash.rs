@@ -57,6 +57,9 @@ where
             }
         }
         fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+            if v < 0.0 {
+                return Err(de::Error::custom("negative value not allowed"));
+            }
             Ok(Some(v.ceil() as u64))
         }
         fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
