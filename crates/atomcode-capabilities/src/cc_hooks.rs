@@ -19,8 +19,12 @@
 //!
 //! GRACEFUL BY DESIGN: a hook that times out, fails to spawn, or emits garbage is a
 //! silent continue — a broken hook never wedges the turn. Only an explicit `deny` /
-//! `block` (or a bare exit code `2`, per CC's contract) stops a tool / prompt; any
-//! other non-zero exit is a non-blocking error and the turn proceeds.
+//! `block` decision, or a bare exit `2` that carries a DELIBERATE reason (per CC's
+//! contract), stops a tool / prompt. A bare exit `2` with no output, or whose stderr
+//! is just a command launch failure (e.g. a plugin's `python3 "$CLAUDE_PLUGIN_ROOT/
+//! x.py"` whose path doesn't resolve → python `can't open file` → exit 2), is treated
+//! as a broken hook and does NOT block — see [`deliberate_block_reason`]. Any other
+//! non-zero exit is a non-blocking error and the turn proceeds.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -251,10 +255,13 @@ fn shell_command(command: &str) -> tokio::process::Command {
 }
 
 /// Run one hook: pipe `stdin_json` to it (CC's `json.load(sys.stdin)` contract),
-/// honor the timeout, and return `(exit_code, stdout)`. `exit_code` is the process
-/// exit status — `None` when the child was killed by a signal. The OUTER `None`
-/// (timeout / spawn-failure) → the caller treats it as a silent continue.
-async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(Option<i32>, String)> {
+/// honor the timeout, and return `(exit_code, stdout, stderr)`. `exit_code` is the
+/// process exit status — `None` when the child was killed by a signal. stderr is
+/// captured (not discarded) so callers can (a) surface a real block reason and
+/// (b) tell a DELIBERATE exit-2 block from a hook that merely failed to launch (see
+/// [`deliberate_block_reason`]). The OUTER `None` (timeout / spawn-failure) → the
+/// caller treats it as a silent continue.
+async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(Option<i32>, String, String)> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
@@ -283,7 +290,11 @@ async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(Option
             drop(stdin);
         }
         let out = child.wait_with_output().await.ok()?;
-        Some((out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned()))
+        Some((
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
     };
 
     (tokio::time::timeout(Duration::from_millis(hook.timeout_ms), fut).await).ok().flatten()
@@ -297,6 +308,46 @@ async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(Option
 /// `deny`/`block` decision stops anything.
 fn exit_requests_block(code: Option<i32>) -> bool {
     code == Some(2)
+}
+
+/// Did the hook COMMAND fail to launch / run, rather than the hook program
+/// deliberately deciding to block? CC maps a bare exit `2` to "block", but a
+/// misconfigured command often *also* exits 2 incidentally — most notably
+/// `python3 "$CLAUDE_PLUGIN_ROOT/script.py"` ("can't open file ... [Errno 2]" →
+/// exit 2) when a plugin hook's path doesn't resolve. Treating that as a deliberate
+/// block wedges EVERY prompt / tool for everyone who installed that plugin. So when
+/// stderr carries an interpreter/shell launch-failure signature we classify it as a
+/// broken hook (non-blocking), honoring the module's promise that a merely-broken
+/// hook never wedges the turn. Signatures are specific diagnostics that a real,
+/// human-written block reason is very unlikely to contain verbatim.
+fn is_hook_launch_failure(stderr: &str) -> bool {
+    const SIGNATURES: &[&str] = &[
+        "can't open file",     // python3 missing/unreadable script → exit 2
+        "command not found",   // sh: <cmd>: command not found
+        "cannot execute",      // sh: cannot execute binary file
+        "ModuleNotFoundError", // python missing dependency
+        "No module named",     // python -m / import failure
+        "ImportError",         // python broken import
+    ];
+    SIGNATURES.iter().any(|sig| stderr.contains(sig))
+}
+
+/// Resolve the human-facing reason for a BARE exit-2 (a hook that exited 2 with no
+/// parsed JSON decision) and decide whether it is a DELIBERATE block. Returns
+/// `Some(reason)` only when the hook genuinely meant to block; `None` when it should
+/// be treated as a non-blocking broken / no-op hook. A deliberate CC block hook
+/// communicates a reason (on stdout, or — per CC's UserPromptSubmit convention — on
+/// stderr). A hook that exits 2 with NO output at all, or whose stderr is just an
+/// interpreter/shell launch failure (see [`is_hook_launch_failure`]), is broken, not
+/// deliberate — so the prompt / tool proceeds instead of being wedged.
+fn deliberate_block_reason(stdout: &str, stderr: &str) -> Option<String> {
+    let out = stdout.trim();
+    let err = stderr.trim();
+    let reason = if !out.is_empty() { out } else { err };
+    if reason.is_empty() || is_hook_launch_failure(reason) {
+        return None;
+    }
+    Some(reason.to_string())
 }
 
 /// The last non-empty line of stdout parsed as JSON (CC emits its decision as the
@@ -447,7 +498,7 @@ impl LifecycleHooks for CCExternalHooks {
         let matched = self.matching(HookEvent::SessionStart, None);
         let outs =
             futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
-        for (_code, stdout) in outs.into_iter().flatten() {
+        for (_code, stdout, _stderr) in outs.into_iter().flatten() {
             // SessionStart: stdout (plain or hookSpecificOutput.additionalContext)
             // is injected as context. CC cannot block here.
             let ctx = last_json_line(&stdout)
@@ -479,7 +530,7 @@ impl LifecycleHooks for CCExternalHooks {
             futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
         let mut injected: Vec<String> = Vec::new();
         for out in outs {
-            let Some((exit_code, stdout)) = out else {
+            let Some((exit_code, stdout, stderr)) = out else {
                 continue; // timeout / spawn failure → silent continue.
             };
             let decided = last_json_line(&stdout)
@@ -501,16 +552,18 @@ impl LifecycleHooks for CCExternalHooks {
                 }
             }
             // No parsed decision: CC's exit-code contract takes over. Exit 2 blocks the
-            // prompt even without a JSON decision; any other code is non-blocking, so its
-            // stdout is treated as injected context (a broken hook never wedges input).
+            // prompt — but ONLY when the hook communicated a deliberate reason. A hook
+            // that exits 2 with no output, or whose stderr is just an interpreter/shell
+            // launch failure (e.g. a plugin's `python3 "$CLAUDE_PLUGIN_ROOT/x.py"` whose
+            // path doesn't resolve → python "can't open file" → exit 2), is BROKEN, not a
+            // deliberate block; it must not wedge every prompt. Any other exit code is
+            // non-blocking, so its stdout is treated as injected context.
             if decided.is_none() {
                 if exit_requests_block(exit_code) {
-                    let trimmed = stdout.trim();
-                    return Err(if trimmed.is_empty() {
-                        "prompt blocked by hook (exit 2)".to_string()
-                    } else {
-                        trimmed.to_string()
-                    });
+                    if let Some(reason) = deliberate_block_reason(&stdout, &stderr) {
+                        return Err(reason);
+                    }
+                    // Broken / no-op exit-2 hook → fall through as non-blocking.
                 }
                 let trimmed = stdout.trim();
                 if !trimmed.is_empty() {
@@ -566,7 +619,7 @@ impl ToolMiddleware for CCExternalHooks {
         // remaining hooks — and so the rewrite order is deterministic.
         let mut gate = BeforeOutcome::Proceed;
         for hook in self.matching(HookEvent::PreToolUse, Some(&call.name)) {
-            let Some((exit_code, stdout)) = run_command_hook(hook, &payload).await else {
+            let Some((exit_code, stdout, stderr)) = run_command_hook(hook, &payload).await else {
                 continue;
             };
             let decided = last_json_line(&stdout)
@@ -613,16 +666,16 @@ impl ToolMiddleware for CCExternalHooks {
                 };
                 gate = stronger(gate, this);
             } else if exit_requests_block(exit_code) {
-                // CC exit-code contract: exit 2 (and ONLY 2) blocks. Other non-zero
-                // codes are non-blocking errors → the tool proceeds (a broken hook must
-                // not wedge the turn — the spawn/timeout paths already continue).
-                let trimmed = stdout.trim();
-                let reason = if trimmed.is_empty() {
-                    format!("hook blocked {} (exit 2)", call.name)
-                } else {
-                    trimmed.to_string()
-                };
-                gate = stronger(gate, BeforeOutcome::Deny { reason });
+                // CC exit-code contract: exit 2 (and ONLY 2) blocks. Other non-zero codes
+                // are non-blocking errors → the tool proceeds (a broken hook must not wedge
+                // the turn — the spawn/timeout paths already continue). A bare exit 2 only
+                // denies when the hook gave a deliberate reason: an exit-2 with no output,
+                // or one whose stderr is just a command launch failure (e.g. a plugin's
+                // python script path didn't resolve), is broken, not a deny, so the tool
+                // proceeds rather than being wedged for everyone with that plugin.
+                if let Some(reason) = deliberate_block_reason(&stdout, &stderr) {
+                    gate = stronger(gate, BeforeOutcome::Deny { reason });
+                }
             }
 
             if matches!(gate, BeforeOutcome::Deny { .. }) {
@@ -665,7 +718,7 @@ impl ToolMiddleware for CCExternalHooks {
             h.event == HookEvent::PostToolUse
                 && post_tool_matches(&h.matcher, tool_name.as_deref())
         }) {
-            let Some((_code, stdout)) = run_command_hook(hook, &payload).await else {
+            let Some((_code, stdout, _stderr)) = run_command_hook(hook, &payload).await else {
                 continue;
             };
             if let Some(d) = last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok()) {
@@ -889,13 +942,11 @@ mod tests {
         assert!(matches!(out, BeforeOutcome::Proceed), "exit 1 must NOT block: {out:?}");
     }
 
-    /// Exit 2 with no JSON decision DOES block (CC's bare exit-2 contract).
-    #[tokio::test]
-    async fn before_exit_2_blocks() {
+    async fn run_before(cmd: &str) -> BeforeOutcome {
         let hook = HookConfig {
             event: HookEvent::PreToolUse,
             matcher: None,
-            command: "exit 2".into(),
+            command: cmd.into(),
             timeout_ms: 5_000,
             plugin_root: None,
         };
@@ -904,36 +955,101 @@ mod tests {
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
         let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
         let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
-        let out = cc.before(&mut call, &tool, &rt).await;
-        assert!(out.is_deny(), "exit 2 must block: {out:?}");
+        cc.before(&mut call, &tool, &rt).await
     }
 
-    /// UserPromptSubmit mirrors `before`: exit 2 blocks the prompt (Err), other non-zero
-    /// does not (the prompt proceeds).
+    /// Exit 2 WITH a deliberate reason DOES block (CC's bare exit-2 contract), and the
+    /// reason is surfaced (stdout, then stderr) rather than an opaque "(exit 2)".
+    #[tokio::test]
+    async fn before_deliberate_exit_2_blocks() {
+        let out = run_before("echo BLOCKED; exit 2").await;
+        assert!(out.is_deny(), "deliberate exit 2 must block: {out:?}");
+        if let BeforeOutcome::Deny { reason } = out {
+            assert!(reason.contains("BLOCKED"), "reason surfaced: {reason}");
+        }
+        // Reason on stderr (CC convention) is surfaced too.
+        let out = run_before("echo DENIED-ON-STDERR >&2; exit 2").await;
+        assert!(out.is_deny(), "exit 2 with stderr reason must block: {out:?}");
+        if let BeforeOutcome::Deny { reason } = out {
+            assert!(reason.contains("DENIED-ON-STDERR"), "stderr reason surfaced: {reason}");
+        }
+    }
+
+    /// A bare exit 2 with NO output is a broken / no-op hook, not a deliberate block —
+    /// it must NOT wedge the tool. (Regression: v4.25.4 blocked every prompt/tool when a
+    /// plugin's UserPromptSubmit hook exited 2 incidentally.)
+    #[tokio::test]
+    async fn before_bare_exit_2_does_not_block() {
+        let out = run_before("exit 2").await;
+        assert!(matches!(out, BeforeOutcome::Proceed), "bare exit 2 must NOT block: {out:?}");
+    }
+
+    /// Exit 2 whose stderr is a command launch failure (the real incident: a plugin's
+    /// `python3 "$CLAUDE_PLUGIN_ROOT/x.py"` whose path didn't resolve → python prints
+    /// "can't open file ..." and exits 2) is a broken hook → must NOT block.
+    #[tokio::test]
+    async fn before_launch_failure_exit_2_does_not_block() {
+        let out = run_before("echo \"can't open file '/x.py': [Errno 2] No such file or directory\" >&2; exit 2").await;
+        assert!(matches!(out, BeforeOutcome::Proceed), "launch-failure exit 2 must NOT block: {out:?}");
+    }
+
+    /// UserPromptSubmit mirrors `before`: a DELIBERATE exit 2 (with a reason) blocks the
+    /// prompt (Err), other non-zero does not (the prompt proceeds).
     #[tokio::test]
     async fn user_prompt_exit_code_contract() {
-        let block = HookConfig {
-            event: HookEvent::UserPromptSubmit,
-            matcher: None,
-            command: "exit 2".into(),
-            timeout_ms: 5_000,
-            plugin_root: None,
-        };
-        let cc = CCExternalHooks::new(vec![block], "/tmp");
+        let cc = CCExternalHooks::new(vec![prompt_hook("echo BLOCKED; exit 2")], "/tmp");
         let mut text = "hi".to_string();
-        assert!(cc.user_prompt_submit(&mut text).await.is_err(), "exit 2 blocks the prompt");
+        let err = cc.user_prompt_submit(&mut text).await;
+        assert!(err.is_err(), "deliberate exit 2 blocks the prompt");
+        assert!(err.unwrap_err().contains("BLOCKED"), "block reason is surfaced");
 
-        let ok = HookConfig {
-            event: HookEvent::UserPromptSubmit,
-            matcher: None,
-            command: "exit 1".into(),
-            timeout_ms: 5_000,
-            plugin_root: None,
-        };
-        let cc = CCExternalHooks::new(vec![ok], "/tmp");
+        let cc = CCExternalHooks::new(vec![prompt_hook("exit 1")], "/tmp");
         let mut text = "hi".to_string();
         assert!(cc.user_prompt_submit(&mut text).await.is_ok(), "exit 1 must NOT block");
         assert_eq!(text, "hi", "no stdout ⇒ prompt unchanged");
+    }
+
+    /// REGRESSION (v4.25.4): a UserPromptSubmit hook that exits 2 WITHOUT a deliberate
+    /// reason — either silently, or with only a command launch failure on stderr (a
+    /// plugin's `python3 "$CLAUDE_PLUGIN_ROOT/x.py"` whose path didn't resolve) — is a
+    /// broken hook and must NOT wedge the user's prompt.
+    #[tokio::test]
+    async fn user_prompt_broken_exit_2_does_not_block() {
+        // Bare exit 2, no output.
+        let cc = CCExternalHooks::new(vec![prompt_hook("exit 2")], "/tmp");
+        let mut text = "hi".to_string();
+        assert!(cc.user_prompt_submit(&mut text).await.is_ok(), "bare exit 2 must NOT block");
+        assert_eq!(text, "hi", "prompt unchanged");
+
+        // Exit 2 with a python "can't open file" launch failure on stderr (the incident).
+        let cc = CCExternalHooks::new(
+            vec![prompt_hook(
+                "echo \"can't open file '/x.py': [Errno 2] No such file or directory\" >&2; exit 2",
+            )],
+            "/tmp",
+        );
+        let mut text = "hi".to_string();
+        assert!(
+            cc.user_prompt_submit(&mut text).await.is_ok(),
+            "launch-failure exit 2 must NOT block the prompt"
+        );
+        assert_eq!(text, "hi", "prompt unchanged");
+    }
+
+    #[test]
+    fn launch_failure_vs_deliberate_reason() {
+        // Launch failures → not a deliberate block.
+        assert!(deliberate_block_reason("", "can't open file '/x.py': [Errno 2]").is_none());
+        assert!(deliberate_block_reason("", "python3: command not found").is_none());
+        assert!(deliberate_block_reason("", "ModuleNotFoundError: No module named 'x'").is_none());
+        // Empty output → not a deliberate block.
+        assert!(deliberate_block_reason("", "").is_none());
+        assert!(deliberate_block_reason("  ", " \n").is_none());
+        // A real reason (stdout or stderr) → deliberate block, surfaced verbatim.
+        assert_eq!(deliberate_block_reason("nope, blocked", "").as_deref(), Some("nope, blocked"));
+        assert_eq!(deliberate_block_reason("", "policy: denied").as_deref(), Some("policy: denied"));
+        // stdout wins over stderr when both present.
+        assert_eq!(deliberate_block_reason("from-out", "from-err").as_deref(), Some("from-out"));
     }
 
     #[test]
