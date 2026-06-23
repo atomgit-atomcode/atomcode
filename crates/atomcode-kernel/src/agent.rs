@@ -42,6 +42,17 @@ const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 /// (auth / 400 / balance) never enter this path — they fail fast.
 const MAX_PROVIDER_RETRIES: u32 = 3;
 
+/// How many times the agent loop re-issues a round after the provider returns a
+/// COMPLETELY EMPTY but otherwise-successful completion (a 200 with no text, no
+/// tool calls, no reasoning). This is a DISTINCT tier from `MAX_PROVIDER_RETRIES`
+/// (which only fires on a `retryable` OPEN/stream `Err`): an empty 200 opens fine
+/// and streams a clean `Done`, so it would otherwise be mistaken for the model
+/// choosing to stop. Confirmed transient on the atomgit→DeepSeek path — the SAME
+/// request resent recovers — so it gets MORE attempts and a much SHORTER backoff
+/// than the generic error path (the empty body returns instantly; a long wait is
+/// pure latency). Mirrors v1's `EMPTY_RESPONSE_MAX_RETRIES`.
+const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
+
 /// Short, human reason for the visible "retrying" advisory. Branches on the
 /// STRUCTURED fields (`http_status`) where possible, falling back to a coarse
 /// message sniff for transport errors that carry no status. Mirrors v1's
@@ -757,6 +768,11 @@ impl RunningAgent {
         // visible re-open after a retryable provider error; reset to 0 on a successful
         // open so every round gets its own fresh budget.
         let mut provider_retry: u32 = 0;
+        // EMPTY-RESPONSE retry counter for the WHOLE turn: incremented on each re-issue
+        // after a content-free 200. UNLIKE the two above it is NOT reset per round —
+        // the budget is per-turn (mirrors v1's per-user-message `empty_response_retries`)
+        // so a model that keeps returning empty across rounds can't spin forever.
+        let mut empty_retries: u32 = 0;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -911,6 +927,13 @@ impl RunningAgent {
             let mut usage = TokenUsage::default();
             let mut truncated = false;
             let mut response_id: Option<String> = None;
+            // Did the provider STREAM any model output this round (text / reasoning /
+            // tool call), BEFORE any hook transform? This — not the post-hook
+            // accumulated text — is the empty-200 discriminator: a hook that redacts
+            // or clears the text still means the PROVIDER produced content (not an
+            // empty 200), so it must NOT be retried as empty. Set true on the raw
+            // arrival in each content arm below.
+            let mut saw_stream_content = false;
             loop {
                 // MID-STREAM cancel checkpoint: cancellation stops stream
                 // consumption immediately. Carried from production runner.rs:420.
@@ -957,6 +980,10 @@ impl RunningAgent {
                         // the chunk (`delta.clear()`) suppresses it: an empty post-hook
                         // chunk is neither accumulated NOR emitted (no spurious empty
                         // AgentEvent::TextDelta("")).
+                        // The PROVIDER produced output this round — record it BEFORE the
+                        // (possibly clearing) hook, so a redacted/cleared response is
+                        // not misread as an empty 200 and retried.
+                        saw_stream_content = true;
                         self.hooks.on_text_delta(&mut t).await;
                         if !t.is_empty() {
                             assistant_text.push_str(&t);
@@ -974,6 +1001,7 @@ impl RunningAgent {
                         // that CLEARS the chunk suppresses it: an empty post-hook chunk
                         // is neither accumulated NOR emitted (no spurious empty
                         // AgentEvent::Reasoning("")).
+                        saw_stream_content = true; // provider streamed reasoning (see TextDelta)
                         self.hooks.on_reasoning_delta(&mut t).await;
                         if !t.is_empty() {
                             reasoning.push_str(&t);
@@ -990,17 +1018,22 @@ impl RunningAgent {
                     // block (no preceding text) yields an empty-text block. Pure storage
                     // — no live event (the text already streamed via Reasoning above).
                     StreamEvent::ReasoningSignature { opaque, provider } => {
+                        saw_stream_content = true; // provider streamed a (signed) reasoning block
                         reasoning_blocks.push(crate::message::ReasoningBlock {
                             text: std::mem::take(&mut reasoning_block_text),
                             opaque: Some(opaque),
                             provider: Some(provider),
                         });
                     }
-                    StreamEvent::ToolCall(c) => pending_calls.push(c),
+                    StreamEvent::ToolCall(c) => {
+                        saw_stream_content = true;
+                        pending_calls.push(c);
+                    }
                     // Live DISPLAY of a tool call as it streams; the WHOLE call is still
                     // collected via StreamEvent::ToolCall above for execution. Pure
                     // forward — never touches pending_calls or the executed call.
                     StreamEvent::ToolCallDelta { index, id, name, arguments } => {
+                        saw_stream_content = true;
                         self.rt.emit(AgentEvent::ToolCallStreaming { index, id, name, arguments });
                     }
                     // Fold MULTIPLE Usage events in one round field-wise (max), so a
@@ -1021,6 +1054,62 @@ impl RunningAgent {
                         break;
                     }
                 }
+            }
+            // EMPTY-RESPONSE FAST RETRY (parity with v1 agent/mod.rs:3027): some
+            // OpenAI-compatible gateways (notably the atomgit→DeepSeek path) sometimes
+            // return a 200 with a COMPLETELY empty completion — the stream opened fine
+            // and ended with no text, no tool calls, and no reasoning. That is NOT the
+            // model choosing to stop (a real stop carries visible text); it is a
+            // transient upstream hiccup that recovers on an immediate resend. WITHOUT
+            // this, the empty round falls into the `pending_calls.is_empty()` branch
+            // below and `finish_turn(Stopped)` ends the turn as a SILENT "natural"
+            // completion — the user perceives the agent as mysteriously giving up
+            // mid-task. So: detect a ZERO-CONTENT completion and re-issue the SAME
+            // round on a dedicated, turn-scoped budget. The signal is whether the
+            // PROVIDER streamed ANY output (`saw_stream_content`) — NOT the post-hook
+            // accumulated text, so a hook that redacts/clears a real response is not
+            // misclassified as empty. A `length` truncation is a real (if cut-off)
+            // response, never empty. The two retry tiers in the `match opened` above
+            // never catch this: an empty 200 OPENS successfully (`Ok`), so it is
+            // neither a retryable `Err` nor a context overflow.
+            let empty_completion = !saw_stream_content && !truncated;
+            if empty_completion {
+                if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
+                    empty_retries += 1;
+                    // Front-loaded short backoff: 1,1,2,2,3s (~9s for all 5) — matches
+                    // v1. The empty body returns instantly, so the generic 3/6/9s tier
+                    // would be pure wasted latency. A VISIBLE Warning tells the user a
+                    // retry is underway (a silent re-open reads as "nothing happened").
+                    let wait = (((empty_retries + 1) / 2).min(3)) as u64;
+                    self.rt.emit(AgentEvent::Warning(format!(
+                        "模型返回空响应，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})..."
+                    )));
+                    // Cancellable backoff: Esc during the wait aborts the turn instead
+                    // of forcing the user to sit through the delay (same shape as the
+                    // retryable-open arm above).
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            return;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                    }
+                    round -= 1; // a RETRY of the same logical round, not a new one
+                    continue;
+                }
+                // Exhausted: a run of empty 200s is an upstream fault, not a clean
+                // finish — surface a clear, non-alarming reason and FAIL the turn
+                // (StopReason::ProviderError) rather than the silent Stopped below. The
+                // snapshot is preserved (finish_turn does not roll back), so the user
+                // can simply resend.
+                let msg = format!(
+                    "模型连续 {EMPTY_RESPONSE_MAX_RETRIES} 次返回空响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。"
+                );
+                self.hooks.on_error(&msg).await;
+                self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
+                self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
+                return;
             }
             // Truncation is observable via a Warning; the round still finishes
             // normally (continuation is a separate follow-up task).

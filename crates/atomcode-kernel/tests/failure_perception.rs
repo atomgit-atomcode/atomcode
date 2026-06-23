@@ -19,7 +19,7 @@ use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_kernel::message::Conversation;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
-use atomcode_kernel::testkit::{EchoTool, MockProvider, ScriptedProvider};
+use atomcode_kernel::testkit::{AlwaysStopProvider, EchoTool, MockProvider, ScriptedProvider};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -189,12 +189,13 @@ impl LifecycleHooks for AlwaysContinueHook {
 
 #[tokio::test]
 async fn turn_end_continuation_fuse_stops_runaway() {
-    // The provider always returns a no-tool-call response → the model "wants to
-    // stop" every round, but the always-continue hook keeps injecting → only the
-    // fuse can break the loop. An empty turns queue makes MockProvider yield a bare
-    // Done { truncated: false } forever (no tool calls), exactly modelling this.
+    // The provider returns a content-bearing no-tool-call response → the model
+    // "wants to stop" every round, but the always-continue hook keeps injecting →
+    // only the fuse can break the loop. `AlwaysStopProvider` yields `TextDelta`+`Done`
+    // every round (a REAL stop, not a content-free `Done` — which the kernel now
+    // treats as an empty-200 and retries), exactly modelling this.
     let reg = ToolRegistry::new();
-    let provider = Arc::new(MockProvider::new(vec![]));
+    let provider = Arc::new(AlwaysStopProvider::new("(stop)"));
 
     let mut handle = Agent::builder()
         .provider(provider)
@@ -238,7 +239,9 @@ async fn turn_end_continuation_fuse_stops_runaway() {
 #[tokio::test]
 async fn turn_end_continuation_fuse_is_configurable() {
     let reg = ToolRegistry::new();
-    let provider = Arc::new(MockProvider::new(vec![]));
+    // A content-bearing stop every round (see the runaway test) — a content-free
+    // `Done` would now be retried as an empty-200 instead of looping the fuse.
+    let provider = Arc::new(AlwaysStopProvider::new("(stop)"));
 
     let mut handle = Agent::builder()
         .provider(provider)
