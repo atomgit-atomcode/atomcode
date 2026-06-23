@@ -288,7 +288,8 @@ export function Sidebar({
   const [menuPos, setMenuPos] = useState<
     { top?: number; bottom?: number; right: number } | null
   >(null);
-  // Session search dialog
+  // Session search: a centered modal dialog (same .modal-overlay/.modal-card
+  // family as the rename/delete dialogs), closes on backdrop click / Escape.
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -507,6 +508,21 @@ export function Sidebar({
     setMcpMenuPos({ top: rect.bottom + 4, left: rect.left, width: rect.width });
     setMcpMenuOpen(true);
   }
+
+  // Close the search dialog on Escape (backdrop click is handled on the overlay).
+  useEffect(() => {
+    if (!searchOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSearchOpen(false);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [searchOpen]);
+
+  // Focus the input each time the dialog opens.
+  useEffect(() => {
+    if (searchOpen) searchInputRef.current?.focus();
+  }, [searchOpen]);
 
   // The settings popup (3 entries). Fixed-positioned, but portaled to <body>:
   // on mobile the sidebar becomes a `transform`ed off-canvas drawer, which
@@ -954,7 +970,6 @@ export function Sidebar({
                 onInput={(e) => setSearchQuery((e.target as HTMLInputElement).value)}
                 autofocus
               />
-              <button class="search-close-btn" onClick={() => setSearchOpen(false)} title={t('common.cancel')} aria-label={t('common.cancel')}>✕</button>
             </div>
             <div class="search-results">
               {(() => {

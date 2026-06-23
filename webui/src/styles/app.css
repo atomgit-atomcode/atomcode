@@ -1185,9 +1185,9 @@ body {
 
 .session-empty { padding: 20px; text-align: center; color: var(--app-secondary-foreground); font-size: 12px; }
 
-/* --- Session search dialog (reuses modal-overlay + modal-card) --- */
+/* --- Session search dialog (centered modal — reuses .modal-overlay/.modal-card) --- */
 .search-modal-card {
-  width: min(480px, 100%);
+  width: min(520px, 100%);
   height: 70dvh;
 }
 .search-input-row {
@@ -1217,28 +1217,11 @@ body {
 .search-input::placeholder {
   color: var(--app-input-placeholder-foreground);
 }
-.search-close-btn {
-  width: 28px;
-  height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  border-radius: var(--corner-radius-small);
-  background: transparent;
-  color: var(--app-secondary-foreground);
-  cursor: pointer;
-  font-size: 14px;
-  flex-shrink: 0;
-}
-.search-close-btn:hover {
-  background: var(--app-ghost-button-hover-background);
-  color: var(--app-primary-foreground);
-}
 .search-results {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
-  padding: 4px 4px 8px;
+  padding: 4px;
 }
 .search-empty {
   padding: 24px 16px;
@@ -1263,7 +1246,7 @@ body {
   width: 100%;
   padding: 8px 10px;
   border: none;
-  border-radius: var(--corner-radius-medium);
+  border-radius: var(--corner-radius-small);
   background: transparent;
   color: var(--app-primary-foreground);
   cursor: pointer;
