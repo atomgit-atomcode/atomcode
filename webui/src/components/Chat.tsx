@@ -1115,21 +1115,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   }
 
   // 在 textarea 光标处插入文本（skill 命令 / 文件路径），并复位高度、聚焦。
-  function insertAtCursor(text: string) {
+  // 若 `replaceSkill` 为 true，先清空输入框再插入，避免反复选择技能时累加。
+  function insertAtCursor(text: string, replaceSkill = false) {
     const ta = textareaRef.current;
-    if (!ta) {
+    if (replaceSkill) {
+      setInput(text);
+    } else if (!ta) {
       setInput((v) => v + text);
-      return;
+    } else {
+      const start = ta.selectionStart ?? ta.value.length;
+      const end = ta.selectionEnd ?? ta.value.length;
+      setInput(ta.value.slice(0, start) + text + ta.value.slice(end));
     }
-    const start = ta.selectionStart ?? ta.value.length;
-    const end = ta.selectionEnd ?? ta.value.length;
-    const next = ta.value.slice(0, start) + text + ta.value.slice(end);
-    setInput(next);
     requestAnimationFrame(() => {
       const el = textareaRef.current;
       if (!el) return;
       el.focus();
-      const pos = start + text.length;
+      const pos = replaceSkill ? text.length : (ta?.selectionStart ?? el.value.length) + text.length;
       el.setSelectionRange(pos, pos);
       el.style.height = 'auto';
       el.style.height = Math.min(el.scrollHeight, 160) + 'px';
@@ -1201,12 +1203,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   }, [landing]);
 
   // 侧栏「技能」菜单选中 → 把 `/name ` 插入输入框（按 seq 去重，避免重复插入）。
+  // replaceSkill=true 会先清除已有的技能前缀，避免反复选择时累加。
   const lastSkillSeqRef = useRef<number | null>(null);
   useEffect(() => {
     if (!skillInsert) return;
     if (lastSkillSeqRef.current === skillInsert.seq) return;
     lastSkillSeqRef.current = skillInsert.seq;
-    insertAtCursor(`/${skillInsert.name} `);
+    insertAtCursor(`/${skillInsert.name} `, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [skillInsert]);
 

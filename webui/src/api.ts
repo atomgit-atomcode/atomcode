@@ -316,6 +316,25 @@ export async function getProject(): Promise<ProjectState> {
 }
 
 
+// --- MCP server status ---
+
+export interface McpServerInfo {
+  name: string;
+  status: string;
+  tool_count?: number;
+  error?: string;
+}
+
+export interface McpStatusInfo {
+  servers: McpServerInfo[];
+}
+
+export async function getMcpStatus(): Promise<McpStatusInfo> {
+  const resp = await fetch('/mcp/status', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`mcp status failed: ${resp.status}`);
+  return resp.json();
+}
+
 // --- User-invocable skills (for the input "+" attach menu) ---
 
 export interface SkillInfo {

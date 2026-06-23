@@ -8,8 +8,10 @@ import { getSkills, SkillInfo } from '../api';
 import { useT } from '../settings';
 
 interface AttachMenuProps {
-  /** Insert text into the chat input at the cursor (used for `/<skill> `). */
-  onInsert: (text: string) => void;
+/** Insert text into the chat input at the cursor (used for `/<skill> `).
+ *  When the second arg `replaceSkill` is true, the implementation should
+ *  strip any existing skill prefix before inserting. */
+onInsert: (text: string, replaceSkill?: boolean) => void;
   /** Open the server-side file picker. */
   onPickFile: () => void;
   /** Attach picked image files (native picker → base64 handled by parent). */
@@ -83,7 +85,7 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages }: AttachMenuProp
   }, [open, skills, loading]);
 
   function pickSkill(name: string) {
-    onInsert(`/${name} `);
+    onInsert(`/${name} `, true);
     setOpen(false);
   }
 

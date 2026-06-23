@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, getSkills, SkillInfo, SessionMetaWithProject } from '../api';
+import { listSessions, getSkills, getMcpStatus, SkillInfo, McpStatusInfo, SessionMetaWithProject } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
@@ -169,6 +169,27 @@ function TrashIcon() {
   );
 }
 
+/** MCP / plug glyph (plug-connector for MCP servers). */
+function McpIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M6.5 1.5v5a2.5 2.5 0 0 0 5 0v-5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+      <line x1="4" y1="9" x2="9" y2="9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+      <path d="M4 9v4.5a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1V9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
+/** Search (magnifying glass) glyph. */
+function SearchIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="6.8" cy="6.8" r="4.3" stroke="currentColor" stroke-width="1.3" />
+      <line x1="10" y1="10" x2="14" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+    </svg>
+  );
+}
+
 /** Gear / settings glyph. */
 function GearIcon() {
   return (
@@ -241,6 +262,13 @@ export function Sidebar({
   const [skillsMenuPos, setSkillsMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const skillsMenuRef = useRef<HTMLDivElement | null>(null);
   const skillsBtnRef = useRef<HTMLButtonElement | null>(null);
+  // MCP menu: server list fetched lazily; the count badge shows once loaded.
+  const [mcpStatus, setMcpStatus] = useState<McpStatusInfo | null>(null);
+  const [mcpLoading, setMcpLoading] = useState(false);
+  const [mcpMenuOpen, setMcpMenuOpen] = useState(false);
+  const [mcpMenuPos, setMcpMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
+  const mcpMenuRef = useRef<HTMLDivElement | null>(null);
+  const mcpBtnRef = useRef<HTMLButtonElement | null>(null);
   // Per-session kebab menu: which session, and where to anchor the fixed menu.
   const [menuFor, setMenuFor] = useState<string | null>(null);
   // top XOR bottom: `top` opens the menu downward below the kebab; `bottom`
@@ -249,6 +277,10 @@ export function Sidebar({
   const [menuPos, setMenuPos] = useState<
     { top?: number; bottom?: number; right: number } | null
   >(null);
+  // Session search dialog
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionMetaWithProject | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SessionMetaWithProject | null>(null);
   // Settings menu (3 entries → each opens its own dialog), fixed-anchored above the button.
@@ -418,6 +450,53 @@ export function Sidebar({
     onPickSkill?.(name);
   }
 
+  // Fetch MCP status once (for the count badge + menu list).
+  function ensureMcpStatus() {
+    if (mcpStatus !== null || mcpLoading) return;
+    setMcpLoading(true);
+    getMcpStatus()
+      .then(setMcpStatus)
+      .catch(() => setMcpStatus({ servers: [] }))
+      .finally(() => setMcpLoading(false));
+  }
+  useEffect(() => {
+    ensureMcpStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // MCP menu is fixed-positioned; close on outside click / scroll / resize.
+  useEffect(() => {
+    if (!mcpMenuOpen) return;
+    const close = () => setMcpMenuOpen(false);
+    const onDown = (e: MouseEvent) => {
+      const el = e.target as HTMLElement;
+      if (mcpMenuRef.current?.contains(el)) return;
+      if (mcpBtnRef.current?.contains(el)) return;
+      close();
+    };
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [mcpMenuOpen]);
+
+  function toggleMcpMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (mcpMenuOpen) {
+      setMcpMenuOpen(false);
+      return;
+    }
+    ensureMcpStatus();
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setMcpMenuPos({ top: rect.bottom + 4, left: rect.left, width: rect.width });
+    setMcpMenuOpen(true);
+  }
+
   // The settings popup (3 entries). Fixed-positioned, but portaled to <body>:
   // on mobile the sidebar becomes a `transform`ed off-canvas drawer, which
   // would make it the containing block for `position: fixed` descendants and
@@ -527,6 +606,52 @@ export function Sidebar({
         )
       : null;
 
+  // MCP popover (opens downward below the MCP action). Portaled to <body>
+  // so the mobile drawer's transform/overflow can't clip it. Shows each
+  // MCP server name, its connection status, and (if connected) tool count.
+  const renderMcpMenu = () =>
+    mcpMenuOpen && mcpMenuPos
+      ? createPortal(
+          <div
+            class="item-menu mcp-menu"
+            ref={mcpMenuRef}
+            style={{
+              top: `${mcpMenuPos.top}px`,
+              left: `${mcpMenuPos.left}px`,
+              minWidth: `${Math.max(mcpMenuPos.width, 220)}px`,
+            }}
+          >
+            {mcpLoading && <div class="group-by-menu-title">{t('sidebar.mcpLoading')}</div>}
+            {!mcpLoading && (mcpStatus?.servers?.length ?? 0) === 0 && (
+              <div class="group-by-menu-title">{t('sidebar.mcpEmpty')}</div>
+            )}
+            {!mcpLoading &&
+              (mcpStatus?.servers ?? []).map((srv) => {
+                const statusLabel =
+                  srv.status === 'connected' ? t('sidebar.mcpConnected') :
+                  srv.status === 'connecting' ? t('sidebar.mcpConnecting') :
+                  srv.status === 'error' ? t('sidebar.mcpError') :
+                  t('sidebar.mcpDisconnected');
+                const statusClass = 'mcp-status-dot ' + srv.status;
+                return (
+                  <div key={srv.name} class="mcp-menu-row" title={srv.error || ''}>
+                    <span class="mcp-menu-name">{srv.name}</span>
+                    <span class="mcp-menu-meta">
+                      <span class={statusClass} />
+                      <span class="mcp-menu-status-text">{statusLabel}</span>
+                      {srv.tool_count != null && (
+                        <span class="mcp-menu-tool-count">{t('sidebar.mcpTools', { n: srv.tool_count })}</span>
+                      )}
+                    </span>
+                    {srv.error && <span class="mcp-menu-error">{srv.error}</span>}
+                  </div>
+                );
+              })}
+          </div>,
+          document.body,
+        )
+      : null;
+
   // 先按当前工作目录收窄，再按搜索词过滤。
   const normDir = (p: string) => (p || '').replace(/\/+$/, '');
   const cwdNorm = normDir(cwd || '');
@@ -619,6 +744,14 @@ export function Sidebar({
           >
             <SparklesIcon />
           </button>
+          <button
+            class="rail-btn"
+            onClick={onToggleCollapse}
+            title={t('sidebar.mcp')}
+            aria-label={t('sidebar.mcp')}
+          >
+            <McpIcon />
+          </button>
         </nav>
         <div class="sidebar-rail-bottom">
           {onOpenRemote && (
@@ -646,6 +779,7 @@ export function Sidebar({
   }
 
   const skillCount = skills?.length ?? 0;
+  const mcpCount = mcpStatus?.servers?.length ?? 0;
 
   return (
     <aside class={'session-list app-sidebar' + (open ? ' open' : '')}>
@@ -653,6 +787,14 @@ export function Sidebar({
         <span class="sidebar-brand">
 <span class="sidebar-brand-name">AtomCode</span>
         </span>
+        <button
+          class="sidebar-search-btn"
+          onClick={() => { setSearchOpen(true); setSearchQuery(''); }}
+          title={t('sidebar.search')}
+          aria-label={t('sidebar.search')}
+        >
+          <SearchIcon />
+        </button>
         <button
           class="sidebar-collapse-btn"
           onClick={onToggleCollapse}
@@ -678,6 +820,18 @@ export function Sidebar({
           <span class="sidebar-action-icon"><SparklesIcon /></span>
           <span class="sidebar-action-label">{t('sidebar.skills')}</span>
           {skillCount > 0 && <span class="sidebar-action-badge">{skillCount}</span>}
+          <span class="sidebar-action-caret"><ChevronDownIcon /></span>
+        </button>
+        <button
+          ref={mcpBtnRef}
+          class={'sidebar-action' + (mcpMenuOpen ? ' open' : '')}
+          onClick={(e) => toggleMcpMenu(e as unknown as MouseEvent)}
+          aria-haspopup="menu"
+          aria-expanded={mcpMenuOpen}
+        >
+          <span class="sidebar-action-icon"><McpIcon /></span>
+          <span class="sidebar-action-label">{t('sidebar.mcp')}</span>
+          {mcpCount > 0 && <span class="sidebar-action-badge">{mcpCount}</span>}
           <span class="sidebar-action-caret"><ChevronDownIcon /></span>
         </button>
       </div>
@@ -727,6 +881,63 @@ export function Sidebar({
       </div>
       {renderSettingsMenu()}
       {renderSkillsMenu()}
+      {renderMcpMenu()}
+
+      {/* Session search dialog (centered modal) */}
+      {searchOpen && createPortal(
+        <div class="search-overlay" onClick={(e) => { if (e.target === e.currentTarget) setSearchOpen(false); }}>
+          <div class="search-dialog">
+            <div class="search-input-row">
+              <SearchIcon />
+              <input
+                ref={searchInputRef}
+                class="search-input"
+                type="text"
+                placeholder={t('sidebar.searchPlaceholder')}
+                value={searchQuery}
+                onInput={(e) => setSearchQuery((e.target as HTMLInputElement).value)}
+                autofocus
+              />
+              <button class="search-close-btn" onClick={() => setSearchOpen(false)} title={t('common.cancel')} aria-label={t('common.cancel')}>✕</button>
+            </div>
+            <div class="search-results">
+              {(() => {
+                const q = searchQuery.trim().toLowerCase();
+                const results = q
+                  ? sessions.filter(
+                      (s) =>
+                        (s.name || '').toLowerCase().includes(q) ||
+                        s.id.toLowerCase().startsWith(q) ||
+                        (s.working_dir || '').toLowerCase().includes(q),
+                    )
+                  : sessions;
+                if (!q) {
+                  return <div class="search-hint">{t('sidebar.searchHint')}</div>;
+                }
+                if (results.length === 0) {
+                  return <div class="search-empty">{t('sidebar.noMatch')}</div>;
+                }
+                return results.map((s) => {
+                  const label = s.name || s.id.slice(0, 8);
+                  const dir = shortDir(s.working_dir);
+                  return (
+                    <button
+                      key={s.id}
+                      class={'search-result-item' + (s.id === activeSessionId ? ' active' : '')}
+                      onClick={() => { onSelect(s); setSearchOpen(false); }}
+                    >
+                      <span class="search-result-name">{label}</span>
+                      <span class="search-result-dir">{dir}</span>
+                      <span class="search-result-time">{formatTime(s.updated_at || s.created_at, t)}</span>
+                    </button>
+                  );
+                });
+              })()}
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
 
       {/* Per-session actions menu. Fixed + portaled to <body> so neither the
           scroll container nor the mobile drawer's transform/overflow clips it. */}
