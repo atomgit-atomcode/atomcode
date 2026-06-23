@@ -106,6 +106,11 @@ impl CustomCommandRegistry {
     }
 
     fn parse_command_file(path: &Path) -> Option<CustomCommand> {
+        // Skip oversized command files to avoid high memory usage at startup.
+        const MAX_COMMAND_FILE_SIZE: u64 = 1 << 20; // 1 MiB
+        if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > MAX_COMMAND_FILE_SIZE {
+            return None;
+        }
         let content = std::fs::read_to_string(path).ok()?;
         let (frontmatter, template) = Self::split_frontmatter(&content)?;
         let name = Self::extract_field(&frontmatter, "name")?;
@@ -263,6 +268,20 @@ mod tests {
         assert_eq!(cmd.args_requirement, ArgsRequirement::Optional);
         assert_eq!(cmd.template, "Review: $ARGUMENTS");
         assert_eq!(cmd.source, path);
+    }
+
+    #[test]
+    fn parse_command_file_skips_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.md");
+        // Create a file larger than 1 MiB (1_048_576 bytes).
+        let padding = "x".repeat(1_048_577);
+        let huge_content = format!(
+            "---\nname: huge\ndescription: Huge\n---\n{}",
+            padding
+        );
+        std::fs::write(&path, huge_content).unwrap();
+        assert!(CustomCommandRegistry::parse_command_file(&path).is_none());
     }
 
     #[test]
