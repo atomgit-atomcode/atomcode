@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use atomcode_core::agent::{AgentPhase, TurnStopReason};
 use atomcode_core::conversation::ConversationSnapshot;
+use atomcode_core::tool::ToolCall;
 
 /// Events sent FROM the runtime adapter TO the UI.
 ///
@@ -99,4 +100,12 @@ pub enum UiEvent {
     },
     /// Turn cancelled before completion; carries the cleaned conversation state.
     TurnCancelled { snapshot: ConversationSnapshot },
+    /// Waiting for user approval of a tool call. The driver answers the kernel's
+    /// approval round-trip after the user decides.
+    ApprovalNeeded {
+        tool_name: String,
+        reason: String,
+        call: ToolCall,
+        snapshot: ConversationSnapshot,
+    },
 }

@@ -15,6 +15,7 @@ atomcode-telemetry = { path = "../atomcode-telemetry" }
 # and maps kernel `AgentEvent`s into the UI event vocab, replacing the bridge.
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-coding = { path = "../atomcode-coding" }
+atomcode-capabilities = { path = "../atomcode-capabilities" }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 crossterm = "0.29"
