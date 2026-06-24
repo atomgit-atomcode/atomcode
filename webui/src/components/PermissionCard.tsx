@@ -63,33 +63,46 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
 
   return (
     <div class="modal-overlay">
-      <div class="modal-card">
-        <div class="modal-header">
-          <span>⚠</span>
-          <h3>{t('perm.title')}</h3>
-          <span class="modal-tag">{req.tool_name}</span>
+      <div class="modal-card permission-card">
+        <div class="modal-header permission-header">
+          <span class="permission-logo" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+              <rect
+                x="6.4"
+                y="6.4"
+                width="11.2"
+                height="11.2"
+                rx="2.6"
+                transform="rotate(45 12 12)"
+                stroke="currentColor"
+                stroke-width="1.8"
+              />
+            </svg>
+          </span>
+          <h3 class="permission-title">{t('perm.title')}</h3>
+          <span class="modal-tag permission-tag">{req.tool_name}</span>
         </div>
 
         <div class="modal-body">
-          {req.reason && <p class="field-hint">{req.reason}</p>}
+          {req.reason && <p class="permission-lead">{req.reason}</p>}
           <div class="field-group">
             <span class="modal-label">{t('perm.args')}</span>
             <pre class="tool-body-row-content">{argsDisplay}</pre>
           </div>
         </div>
 
-        <div class="modal-footer">
+        <div class="modal-footer permission-footer">
           <button class="btn" disabled={loading} onClick={() => decide('deny')}>
             {t('perm.deny')}
           </button>
           <button class="btn btn-primary" disabled={loading} onClick={() => decide('allow')}>
             {t('perm.approve')}
           </button>
-          <button class="btn btn-success" disabled={loading} onClick={() => decide('always_allow')}>
+          <button class="btn" disabled={loading} onClick={() => decide('always_allow')}>
             {t('perm.alwaysAllow')}
           </button>
           {req.tool_name.startsWith('mcp__') && (
-            <button class="btn btn-success" disabled={loading} onClick={() => decide('allow_persist')}>
+            <button class="btn" disabled={loading} onClick={() => decide('allow_persist')}>
               {t('perm.allowPersist')}
             </button>
           )}

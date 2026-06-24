@@ -1545,6 +1545,60 @@ body {
   color: var(--app-secondary-foreground);
 }
 
+/* === Permission card (tool approval) — matches landing/home brand style ===
+   The generic modal is reused, but the approval popup adopts the home page's
+   warm clay accent, diamond brand mark and serif title so it feels of-a-piece
+   with the landing hero instead of a system warning dialog. */
+/* No divider lines: the header/body/footer read as one calm surface rather
+   than three boxed-off sections, matching the borderless landing hero. */
+.permission-card .permission-header {
+  gap: 10px;
+  padding: 18px 20px 4px;
+  border-bottom: none;
+}
+.permission-card .modal-body { padding: 12px 20px; }
+.permission-card .permission-footer {
+  padding: 8px 20px 18px;
+  border-top: none;
+}
+.permission-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--app-brand);
+  flex-shrink: 0;
+}
+.permission-title {
+  font-family: var(--app-serif-font-family);
+  font-size: 17px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.01em;
+  color: var(--app-brand-text) !important;
+}
+.permission-card .permission-tag {
+  background: color-mix(in srgb, var(--app-brand), transparent 84%);
+  color: var(--app-brand);
+}
+/* Brief, friendly lead-in line under the header, echoing the landing tagline. */
+.permission-lead {
+  font-family: var(--app-serif-font-family);
+  font-size: 14px;
+  color: var(--app-secondary-foreground);
+  margin: 0;
+}
+/* Args sit in one soft panel instead of bare text, so the body stays quiet. */
+.permission-card .field-group .tool-body-row-content {
+  background: var(--app-tool-background);
+  border-radius: var(--corner-radius-medium);
+}
+/* Pill-shaped actions to match the landing quick-prompt chips. A single clay
+   accent (批准) carries the eye; every other action is a quiet ghost button —
+   no competing green/filled colors. */
+.permission-footer .btn {
+  border-radius: 999px;
+  padding: 0 18px;
+}
+
 /* === Tool detail (expanded args + output) === */
 .tool-chevron {
   font-size: 10px;
