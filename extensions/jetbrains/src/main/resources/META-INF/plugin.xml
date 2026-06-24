@@ -75,6 +75,14 @@
     </action>
 
     <action
+      id="atomcode.openWelcome"
+      class="com.atomcode.jetbrains.actions.OpenWelcomeAction"
+      text="AtomCode: Welcome"
+      description="Open the AtomCode welcome and quick start page">
+      <add-to-group group-id="ToolsMenu" anchor="last" />
+    </action>
+
+    <action
       id="atomcode.openChatInNewTab"
       class="com.atomcode.jetbrains.actions.OpenChatInNewTabAction"
       text="AtomCode: Open Chat in New Tab"

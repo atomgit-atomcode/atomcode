@@ -24,6 +24,7 @@ data class AtomCodeSettings(
     var sendRelativePathWithSelection: Boolean = true,
     var sendWithCtrlEnter: Boolean = false,
     var chatFontSize: Int = 13,
+    var welcomePageShown: Boolean = false,
 )
 
 @Service(Service.Level.APP)

@@ -96,6 +96,14 @@ fun openAtomCodeChatTab(project: Project, newTab: Boolean = false, focusInput: B
     }
 }
 
+fun openAtomCodeWelcomePage(project: Project) {
+    ApplicationManager.getApplication().invokeLater {
+        val toolWindow = ToolWindowManager.getInstance(project).getToolWindow(ATOMCODE_TOOL_WINDOW_ID) ?: return@invokeLater
+        toolWindow.show()
+        ensureAtomCodeChatContent(project, toolWindow).showWelcomePage()
+    }
+}
+
 fun closeCurrentChatTab(project: Project) {
     ApplicationManager.getApplication().invokeLater {
         val toolWindow = ToolWindowManager.getInstance(project).getToolWindow(ATOMCODE_TOOL_WINDOW_ID) ?: return@invokeLater

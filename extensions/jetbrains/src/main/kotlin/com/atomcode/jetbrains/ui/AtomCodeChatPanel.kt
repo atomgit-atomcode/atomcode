@@ -44,14 +44,17 @@ import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.Disposable
 import com.intellij.ide.ClipboardSynchronizer
+import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.ui.mac.foundation.Foundation
 import com.intellij.ui.mac.foundation.ID
 import com.intellij.ui.JBColor
 import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
+import java.awt.Component
 import java.awt.Dialog
 import java.awt.Dimension
+import java.awt.Font
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.awt.Image
@@ -68,6 +71,11 @@ import java.io.InputStream
 import java.net.URI
 import java.nio.ByteBuffer
 import java.beans.PropertyChangeEvent
+import java.time.Duration
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Base64
 import java.util.Locale
 import java.util.UUID
@@ -90,6 +98,7 @@ import javax.swing.JScrollPane
 import javax.swing.JTextArea
 import javax.swing.JTextField
 import javax.swing.JSeparator
+import javax.swing.ListCellRenderer
 import javax.swing.ListSelectionModel
 import javax.swing.JOptionPane
 import javax.swing.SwingUtilities
@@ -107,6 +116,80 @@ private const val MAX_ATTACHED_IMAGE_MB = MAX_ATTACHED_IMAGE_BYTES / 1024 / 1024
 private const val MIN_CHAT_PANEL_WIDTH = 360
 private const val MIN_CHAT_PANEL_HEIGHT = 300
 private const val CLIPBOARD_IMAGE_PATH_PREFIX = "clipboard-image://"
+private const val ATOMCODE_DOCS_ZH_URL = "https://atomcode.atomgit.com/docs/zh/index.html"
+private const val ATOMCODE_DOCS_EN_URL = "https://atomcode.atomgit.com/docs/en/index.html"
+
+private val SESSION_HISTORY_TODAY_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+private val SESSION_HISTORY_YEAR_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MM-dd HH:mm")
+private val SESSION_HISTORY_FULL_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+
+private fun sessionUpdatedInstant(updatedAt: Long): Instant? {
+    if (updatedAt <= 0L) return null
+    val epochMillis = if (updatedAt < 10_000_000_000L) updatedAt * 1000L else updatedAt
+    return runCatching { Instant.ofEpochMilli(epochMillis) }.getOrNull()
+}
+
+private fun formatSessionUpdatedAt(updatedAt: Long): String {
+    val instant = sessionUpdatedInstant(updatedAt) ?: return "未知"
+    val now = Instant.now()
+    val minutes = Duration.between(instant, now).toMinutes()
+    if (minutes in 0..1) return "刚刚"
+    if (minutes in 2..59) return "${minutes} 分钟前"
+
+    val zone = ZoneId.systemDefault()
+    val dateTime = instant.atZone(zone)
+    val today = LocalDate.now(zone)
+    return when {
+        dateTime.toLocalDate() == today -> "今天 ${SESSION_HISTORY_TODAY_TIME_FORMAT.format(dateTime)}"
+        dateTime.year == today.year -> SESSION_HISTORY_YEAR_TIME_FORMAT.format(dateTime)
+        else -> SESSION_HISTORY_FULL_TIME_FORMAT.format(dateTime)
+    }
+}
+
+private fun formatSessionUpdatedAtFull(updatedAt: Long): String {
+    val instant = sessionUpdatedInstant(updatedAt) ?: return "未知"
+    return SESSION_HISTORY_FULL_TIME_FORMAT.format(instant.atZone(ZoneId.systemDefault()))
+}
+
+private class SessionHistoryCellRenderer : JPanel(BorderLayout(12, 0)), ListCellRenderer<SessionMeta> {
+    private val title = JLabel()
+    private val updated = JLabel()
+
+    init {
+        isOpaque = true
+        border = BorderFactory.createEmptyBorder(4, 8, 4, 8)
+        title.isOpaque = false
+        updated.isOpaque = false
+        add(title, BorderLayout.CENTER)
+        add(updated, BorderLayout.EAST)
+    }
+
+    override fun getListCellRendererComponent(
+        list: JList<out SessionMeta>,
+        value: SessionMeta?,
+        index: Int,
+        isSelected: Boolean,
+        cellHasFocus: Boolean,
+    ): Component {
+        background = if (isSelected) list.selectionBackground else list.background
+        val foreground = if (isSelected) list.selectionForeground else list.foreground
+        title.foreground = foreground
+        updated.foreground = if (isSelected) foreground else UIUtil.getContextHelpForeground()
+        title.font = list.font.deriveFont(Font.PLAIN)
+        updated.font = list.font.deriveFont(Font.PLAIN, list.font.size2D - 1f)
+
+        if (value == null) {
+            title.text = ""
+            updated.text = ""
+            toolTipText = null
+        } else {
+            title.text = "${value.displayName} (${value.messageCount})"
+            updated.text = formatSessionUpdatedAt(value.updatedAt)
+            toolTipText = "最后更新：${formatSessionUpdatedAtFull(value.updatedAt)}"
+        }
+        return this
+    }
+}
 
 class AtomCodeChatPanel(
     private val project: Project,
@@ -117,7 +200,7 @@ class AtomCodeChatPanel(
 
     // ── New UI components ──
     private val header = HeaderPanel()
-    private val messageView = JBCefMessageView()
+    private val messageView = JBCefMessageView { action -> handleWelcomeAction(action) }
     private val inputPanel = InputPanel(
         onSend = { text -> handleSend(text) },
         onStop = { stopCurrentGeneration() },
@@ -143,6 +226,8 @@ class AtomCodeChatPanel(
     private var activeGenerationId: Long? = null
     private var setupSnapshot: SetupSnapshot? = null
     private var currentSession: SessionRefView? = null
+    private var welcomeLanguage: String = defaultWelcomeLanguage()
+    private var loggedIn = false
     private val streamHandler = StreamEventHandler(messageView)
     private val pendingContext = mutableListOf<ChatContextItem>()
     private val pendingImages = mutableListOf<PendingImageAttachment>()
@@ -186,6 +271,7 @@ class AtomCodeChatPanel(
         service.addConnectionListener(connectionListener)
         renderConnectionState(service.connectionState)
         applyChatSettings()
+        showWelcomePage()
 
         refreshAfterConnect()
     }
@@ -220,6 +306,10 @@ class AtomCodeChatPanel(
         inputPanel.focusInput()
     }
 
+    fun showWelcomePage() {
+        messageView.showWelcomePage(welcomeLanguage, loggedIn)
+    }
+
     fun submitPrompt(prompt: String) {
         inputPanel.setInputText(prompt)
         handleSend(prompt)
@@ -230,6 +320,29 @@ class AtomCodeChatPanel(
         inputPanel.setInputText(prompt)
         focusInput()
     }
+
+    private fun handleWelcomeAction(action: String) {
+        when {
+            action == "settings" -> showGearMenu()
+            action == "login" -> login()
+            action == "docs" -> BrowserUtil.browse(currentDocsUrl())
+            action == "review" -> composePrompt("/review ")
+            action.startsWith("prompt:") -> composePrompt(action.removePrefix("prompt:"))
+            action.startsWith("language:") -> {
+                welcomeLanguage = normalizeWelcomeLanguage(action.removePrefix("language:"))
+                showWelcomePage()
+            }
+        }
+    }
+
+    private fun currentDocsUrl(): String =
+        if (welcomeLanguage == "zh") ATOMCODE_DOCS_ZH_URL else ATOMCODE_DOCS_EN_URL
+
+    private fun normalizeWelcomeLanguage(language: String): String =
+        if (language.equals("zh", ignoreCase = true)) "zh" else "en"
+
+    private fun defaultWelcomeLanguage(): String =
+        if (Locale.getDefault().language.equals("zh", ignoreCase = true)) "zh" else "en"
 
     fun stopCurrentGeneration() {
         queuedPrompts.clear()
@@ -292,6 +405,7 @@ class AtomCodeChatPanel(
 
     private fun renderSetupSnapshot(snapshot: SetupSnapshot) {
         setupSnapshot = snapshot
+        loggedIn = snapshot.auth?.loggedIn == true
 
         loadingModels = true
         modelPicker.removeAllItems()
@@ -307,6 +421,9 @@ class AtomCodeChatPanel(
             ?: snapshot.currentModel.ifBlank { null }
             ?: "No model"
         inputPanel.setModelName(currentModel)
+        if (currentSession == null && !generating) {
+            showWelcomePage()
+        }
     }
 
     private fun login() {
@@ -517,7 +634,12 @@ class AtomCodeChatPanel(
         var sessions = initialSessions.sortedByDescending { it.updatedAt }
         val model = DefaultListModel<SessionMeta>()
         val search = JTextField()
-        val list = JList(model).apply { selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION; visibleRowCount = 14 }
+        val list = JList(model).apply {
+            selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION
+            visibleRowCount = 14
+            fixedCellHeight = 34
+            cellRenderer = SessionHistoryCellRenderer()
+        }
         val load = JButton("Load"); val rename = JButton("Rename"); val delete = JButton("Delete Selected")
         val refresh = JButton("Refresh"); val close = JButton("Close")
         var searchGeneration = 0
@@ -595,8 +717,8 @@ class AtomCodeChatPanel(
                     sessions = updated.sortedByDescending { it.updatedAt }
                     if (selected.any { it.id == currentSession?.id }) { currentSession = null }
                     replaceSessions(sessions, currentSession?.id)
-                    if (currentSession == null) messageView.clear()
                     refill(sessions); addSystemMessage("Deleted ${selected.size} session(s).")
+                    if (currentSession == null) showWelcomePage()
                 }
             }
         }
@@ -637,8 +759,8 @@ class AtomCodeChatPanel(
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to delete session"); return@invokeLater }
                 if (currentSession?.id == selected.id) { currentSession = null }
                 replaceSessions(sessions, currentSession?.id)
-                if (currentSession == null) messageView.clear()
                 addSystemMessage("Session deleted.")
+                if (currentSession == null) showWelcomePage()
             }
         }
     }

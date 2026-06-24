@@ -29,9 +29,31 @@ import javax.swing.UIManager
  * - JS → Kotlin: JBCefJSQuery 注入回调，JS 扫描 window 获取
  * - JBCefJSQuery 通知页面脚本就绪，主 frame 的 load-end 事件作为兼容兜底
  */
-class JBCefMessageView : JPanel(BorderLayout()) {
+class JBCefMessageView(
+    private val onHomeAction: (String) -> Unit = {},
+) : JPanel(BorderLayout()) {
     private val gson = Gson()
     private data class BrowserTheme(val dark: Boolean, val bg: String, val fg: String)
+    private data class WelcomeContent(
+        val language: String,
+        val title: String,
+        val subtitle: String,
+        val quickStartTitle: String,
+        val quickStart: List<String>,
+        val actionsTitle: String,
+        val actions: List<WelcomeAction>,
+        val commandsTitle: String,
+        val commands: List<WelcomeCommand>,
+        val docsTitle: String,
+        val docsText: String,
+        val settings: String,
+        val login: String,
+        val showLogin: Boolean,
+        val docs: String,
+        val languageLabel: String,
+    )
+    private data class WelcomeAction(val name: String, val label: String)
+    private data class WelcomeCommand(val command: String, val label: String, val action: String)
 
     // 延迟初始化：只在组件进入可显示层级后创建 JCEF 浏览器。
     private var browser: JBCefBrowser? = null
@@ -81,6 +103,10 @@ class JBCefMessageView : JPanel(BorderLayout()) {
                     markJsReady()
                     null
                 }
+                message.startsWith("home:") -> {
+                    SwingUtilities.invokeLater { onHomeAction(message.removePrefix("home:")) }
+                    null
+                }
                 else -> null
             }
         }
@@ -88,6 +114,11 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         b.jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
             override fun onLoadEnd(browser: CefBrowser?, frame: CefFrame?, httpStatusCode: Int) {
                 if (frame?.isMain == true) {
+                    browser?.executeJavaScript(
+                        "window.atomcodeHost = function(msg) { ${q.inject("msg")} }",
+                        browser.url,
+                        0,
+                    )
                     markJsReady()
                 }
             }
@@ -158,6 +189,9 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     fun finishAssistantTurn()                   { sendJs("finishAssistantTurn") }
     fun clear()                                 { sendJs("clearMessages") }
     fun render(model: ChatRenderModel)          { sendRawJs("renderChatModel(${gson.toJson(model)})") }
+    fun showWelcomePage(language: String = defaultWelcomeLanguage(), loggedIn: Boolean = false) {
+        sendRawJs("showWelcomePage(${gson.toJson(welcomeContent(language, loggedIn))})")
+    }
 
     // ── Internals ──
 
@@ -233,6 +267,72 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 
     private fun Color.toCss(): String = "#%02x%02x%02x".format(red, green, blue)
 
+    private fun defaultWelcomeLanguage(): String =
+        if (java.util.Locale.getDefault().language.equals("zh", ignoreCase = true)) "zh" else "en"
+
+    private fun welcomeContent(language: String, loggedIn: Boolean): WelcomeContent =
+        if (language == "zh") {
+            WelcomeContent(
+                language = "zh",
+                title = "AtomCode",
+                subtitle = "智能编码助手",
+                quickStartTitle = "快速开始",
+                quickStart = listOf(
+                    "直接在下方输入你的任务，按 Enter 发送。",
+                    "选中代码后，用右键菜单或 Alt+Enter 调用 AtomCode。",
+                    "用 Add Selection/File as Context 附加文件或选区。",
+                ),
+                actionsTitle = "选中代码后",
+                actions = listOf(
+                    WelcomeAction("Explain Selection", "解释代码意图和实现方式"),
+                    WelcomeAction("Fix Selection", "修复选中片段中的问题"),
+                    WelcomeAction("Optimize Selection", "优化性能和可读性"),
+                    WelcomeAction("Add Selection/File as Context", "把文件或选区附加到下一条消息"),
+                ),
+                commandsTitle = "输入框命令",
+                commands = listOf(
+                    WelcomeCommand("/review", "填入代码审查提示，可继续补充范围或要求", "review"),
+                ),
+                docsTitle = "连接与帮助",
+                docsText = "还没配置模型时，先打开设置或登录 AtomGit；遇到问题可查看文档。",
+                settings = "AtomCode 设置",
+                login = "登录 AtomGit",
+                showLogin = !loggedIn,
+                docs = "查看文档",
+                languageLabel = "语言",
+            )
+        } else {
+            WelcomeContent(
+                language = "en",
+                title = "AtomCode",
+                subtitle = "AI coding assistant",
+                quickStartTitle = "Quick Start",
+                quickStart = listOf(
+                    "Type a task below and press Enter to send.",
+                    "Select code, then use the popup menu or Alt+Enter.",
+                    "Use Add Selection/File as Context to attach code first.",
+                ),
+                actionsTitle = "With Selected Code",
+                actions = listOf(
+                    WelcomeAction("Explain Selection", "Explain intent and implementation"),
+                    WelcomeAction("Fix Selection", "Repair issues in the selected range"),
+                    WelcomeAction("Optimize Selection", "Improve performance and readability"),
+                    WelcomeAction("Add Selection/File as Context", "Attach a file or range to the next message"),
+                ),
+                commandsTitle = "Input Commands",
+                commands = listOf(
+                    WelcomeCommand("/review", "Insert a review prompt, then add scope or constraints", "review"),
+                ),
+                docsTitle = "Connect & Help",
+                docsText = "If no model is configured yet, open settings or sign in to AtomGit. For troubleshooting, open the docs.",
+                settings = "AtomCode Menu",
+                login = "Sign in",
+                showLogin = !loggedIn,
+                docs = "Open Docs",
+                languageLabel = "Language",
+            )
+        }
+
     // ── Inline HTML (避免 classpath 资源加载问题) ──
 
     private fun buildChatHtml(): String {
@@ -285,6 +385,39 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 	.img-modal figure{position:relative;z-index:1;max-width:94vw;max-height:92vh;margin:0;padding:10px;border-radius:10px;background:${if (dark) "#202326" else "#f8fbfd"};box-shadow:0 18px 50px rgba(0,0,0,.35)}
 	.img-modal img{display:block;max-width:calc(94vw - 20px);max-height:calc(92vh - 46px);object-fit:contain}
 	.img-modal figcaption{margin-top:7px;color:${if (dark) "#cfd4da" else "#3d4650"};font-size:11px;text-align:center;max-width:calc(94vw - 20px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+	.home{display:flex;flex-direction:column;gap:10px;width:100%;max-width:1160px;margin:4px auto 0;padding:0 0 12px}
+	.home-hero{border:1px solid $cbo;border-radius:10px;background:${if (dark) "#252526" else "#f8fafc"};padding:12px 14px;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+	.home-head{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}
+	.home-brand{display:flex;align-items:center;gap:9px;min-width:0}
+	.home-title{display:flex;align-items:center;gap:8px;font-size:22px;font-weight:750;line-height:1.15;color:$fg;min-width:0}
+	.home-mark{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:7px;background:${if (dark) "#293424" else "#edf5e9"};color:$vfg;font-size:15px;font-weight:800}
+	.home-subtitle{margin-top:2px;color:$sfg;font-size:12px;white-space:nowrap}
+	.home-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;max-width:520px}
+	.home-btn{border:1px solid $cbo;border-radius:7px;background:${if (dark) "#2d2d2d" else "#ffffff"};color:$fg;padding:6px 10px;min-width:82px;font:12px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;cursor:pointer}
+	.home-btn.primary{background:$ubg;border-color:${if (dark) "#245b82" else "#b8d3e7"};color:$ufg}
+	.home-btn:hover{filter:brightness(${if (dark) "1.14" else ".97"})}
+	.home-lang{display:inline-flex;align-items:center;gap:0;flex:0 0 auto;border:1px solid $cbo;border-radius:8px;overflow:hidden;background:${if (dark) "#2d2d2d" else "#ffffff"}}
+	.home-lang-label{padding:5px 8px;color:$sfg;font-size:11px;border-right:1px solid $cbo}
+	.home-lang button{min-width:58px;border:0;border-radius:0;background:transparent;padding:5px 9px}
+	.home-lang button+button{border-left:1px solid $cbo}
+	.home-grid{display:grid;grid-template-columns:1fr;gap:10px;align-items:stretch}
+	.home-section{border:1px solid $cbo;border-radius:8px;padding:10px 12px;background:${if (dark) "rgba(255,255,255,.025)" else "#ffffff"};min-width:0;height:100%}
+	.home-section h2{margin:0 0 7px;font-size:13px;line-height:1.2;color:$fg}
+	.home-section ul{margin:0;padding-left:17px;color:$afg}
+	.home-section li{margin:3px 0}
+	.command-list{display:flex;flex-direction:column;gap:7px}
+	.action-list{display:grid;grid-template-columns:1fr;gap:7px 10px}
+	.action-row{display:flex;flex-direction:column;gap:2px;min-width:0}
+	.action-row strong{font-size:12px;color:$fg}
+	.action-row span{min-width:0;color:$afg;font-size:12px}
+	.command-row{display:grid;grid-template-columns:minmax(78px,max-content) minmax(0,1fr);gap:10px;align-items:center}
+	.command-row button{border:1px solid $cbo;border-radius:6px;background:$cbg;color:$chf;padding:5px 7px;text-align:left;font:12px 'JetBrains Mono','Consolas',monospace;cursor:pointer}
+	.command-row code{border:1px solid $cbo;border-radius:6px;background:$cbg;color:$chf;padding:5px 7px;font:12px 'JetBrains Mono','Consolas',monospace}
+	.command-row span{min-width:0;color:$afg;font-size:12px}
+	.home-doc{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center}
+	.home-doc p{margin:0;color:$afg;font-size:12px;min-width:0}
+	@media(min-width:720px){.home-grid{grid-template-columns:1fr 1fr}.action-list{grid-template-columns:1fr 1fr}}
+	@media(max-width:640px){.home-head{flex-direction:column;align-items:flex-start}.home-actions{align-items:stretch}.home-btn{flex:1}.home-lang{align-self:flex-start}.home-doc{align-items:flex-start;grid-template-columns:1fr}}
 	.am{display:flex;flex-direction:column;align-items:stretch;min-width:0}
 	.am .av{display:flex;align-items:center;gap:7px;color:$vfg;font-size:11px;font-weight:600;letter-spacing:.01em;margin-bottom:6px}
 	.am .av:before{content:'A';display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:5px;background:${if (dark) "#293424" else "#edf5e9"};color:$vfg;font-size:10px;font-weight:700}
@@ -355,6 +488,9 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 	}
 	if(typeof ResizeObserver!=='undefined')new ResizeObserver(function(){sd()}).observe(m);
 function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+	function host(action){if(typeof window.atomcodeHost==='function'){window.atomcodeHost('home:'+action);return}for(var k in window){if(k.indexOf('JBCefQuery_')===0&&typeof window[k]==='function'){window[k]('home:'+action);return}}}
+	function clearHome(){var x=m.querySelector('.home');if(x)x.remove()}
+	function switchWelcomeLanguage(lang){host('language:'+lang)}
 	function md(s){
 		var source=String(s||'');
 		if(typeof marked==='undefined'||typeof DOMPurify==='undefined')return h(source).replace(/\n/g,'<br>');
@@ -387,7 +523,11 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 		'.tm{color:'+v.tfg+'!important}.tm details[open],.tm summary:hover{background:'+v.tbg+'!important;border-color:'+v.tbo+'!important;color:'+v.fg+'!important}'+
 		'.tm .chev,.tm .tool-dot,.tm .tool-summary,.tm .tool-status{color:'+v.sfg+'!important}.tm .tool-name,.tm pre{color:'+v.fg+'!important}.tm pre{background:'+v.cbg+'!important;border-top-color:'+v.tbo+'!important}'+
 		'.em{background:'+v.ebg+'!important;border-color:'+v.ebo+'!important;color:'+v.efg+'!important}.qm .b{background:'+v.qbg+'!important;color:'+v.qfg+'!important}'+
-		'.rm{background:'+v.rbg+'!important;border-left-color:'+v.rbo+'!important;color:'+v.sfg+'!important}.sm,.th,.turn-summary{color:'+v.sfg+'!important}.turn-summary:before,.turn-summary:after{background:'+v.cbo+'!important}.turn-summary.failed{color:'+v.efg+'!important}.turn-summary.failed:before,.turn-summary.failed:after{background:'+v.ebo+'!important}.streaming-cursor{background:'+v.afg+'!important}';
+		'.rm{background:'+v.rbg+'!important;border-left-color:'+v.rbo+'!important;color:'+v.sfg+'!important}.sm,.th,.turn-summary{color:'+v.sfg+'!important}.turn-summary:before,.turn-summary:after{background:'+v.cbo+'!important}.turn-summary.failed{color:'+v.efg+'!important}.turn-summary.failed:before,.turn-summary.failed:after{background:'+v.ebo+'!important}.streaming-cursor{background:'+v.afg+'!important}'+
+		'.home-hero,.home-section{background:'+v.tbg+'!important;border-color:'+v.cbo+'!important;color:'+v.fg+'!important}'+
+		'.home-title,.home-section h2,.action-row strong{color:'+v.fg+'!important}.home-subtitle,.home-section ul,.action-row span,.command-row span,.home-doc p{color:'+v.afg+'!important}'+
+		'.home-mark{background:'+v.avbg+'!important;color:'+v.vfg+'!important}.home-btn{background:'+v.cbg+'!important;border-color:'+v.cbo+'!important;color:'+v.fg+'!important}.home-btn.primary{background:'+v.ubg+'!important;border-color:'+v.ub+'!important;color:'+v.ufg+'!important}'+
+		'.home-lang{background:'+v.cbg+'!important;border-color:'+v.cbo+'!important}.home-lang-label,.home-lang button+button{border-color:'+v.cbo+'!important}.home-lang-label{color:'+v.sfg+'!important}.command-row button,.command-row code{background:'+v.cbg+'!important;border-color:'+v.cbo+'!important;color:'+v.chf+'!important}';
 	}
 	function fileParts(p){var n=String(p||'').replace(/\\/g,'/'),i=n.lastIndexOf('/');return {name:i>=0?n.substring(i+1):n,path:i>=0?n.substring(0,i):''}}
 	function fileType(n){var i=String(n||'').lastIndexOf('.');return i>=0?String(n).substring(i+1,i+5):'file'}
@@ -397,8 +537,8 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 	function attachmentHtml(items){if(!items||!items.length)return '';var rows=items.map(function(raw){var x=normalizeAttachment(raw),label=x.displayName||x.path||'',p=fileParts(label);if(isImageAttachment(x)){var src=imageSrc(x);return '<button class="u-image" data-src="'+h(src)+'" data-name="'+h(p.name||label||'Image')+'" title="'+h(label)+'"><img src="'+h(src)+'" alt="'+h(p.name||label||'Image')+'"><span class="u-image-name">'+h(p.name||label||'Image')+'</span></button>'}return '<div class="u-file" title="'+h(label)+'"><span class="u-file-icon">'+h(fileType(p.name))+'</span><span class="u-file-copy"><div class="u-file-name">'+h(p.name||label)+'</div><div class="u-file-path">'+h(p.path||'Attached file')+'</div></span></div>'}).join('');return '<div class="u-files">'+rows+'</div>'}
 	function showImagePreview(src,name){var old=document.querySelector('.img-modal');if(old)old.remove();var o=document.createElement('div');o.className='img-modal';o.innerHTML='<button aria-label="Close"></button><figure><img src="'+h(src)+'" alt="'+h(name||'Image')+'"><figcaption>'+h(name||'Image')+'</figcaption></figure>';o.querySelector('button').onclick=function(){o.remove()};o.onclick=function(e){if(e.target===o)o.remove()};document.addEventListener('keydown',function esc(e){if(e.key==='Escape'){o.remove();document.removeEventListener('keydown',esc)}});document.body.appendChild(o)}
 	function bindImagePreviews(root){var imgs=root.querySelectorAll('.u-image');Array.prototype.forEach.call(imgs,function(btn){btn.onclick=function(){showImagePreview(btn.getAttribute('data-src')||'',btn.getAttribute('data-name')||'Image')}})}
-		function addUserMessage(t,a){var d=document.createElement('div');d.className='um';d.innerHTML='<div class="u-card"><div class="u-text">'+h(t)+'</div>'+attachmentHtml(a)+'</div>';bindImagePreviews(d);m.appendChild(d);last=null;sd(true)}
-		function beginAssistantTurn(){active=buildAsst('');last=active;m.appendChild(active);cv=false;sd()}
+		function addUserMessage(t,a){clearHome();var d=document.createElement('div');d.className='um';d.innerHTML='<div class="u-card"><div class="u-text">'+h(t)+'</div>'+attachmentHtml(a)+'</div>';bindImagePreviews(d);m.appendChild(d);last=null;sd(true)}
+		function beginAssistantTurn(){clearHome();active=buildAsst('');last=active;m.appendChild(active);cv=false;sd()}
 		function currentAssistant(){return active&&active.parentNode?active:null}
 		function ensureAssistant(){var a=currentAssistant();if(a){last=a;return a}beginAssistantTurn();return active}
 	function parts(){var a=ensureAssistant();return a.querySelector('.parts')}
@@ -418,12 +558,12 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 	function setTool(e,n,s,d,a,o){e.className='tm ts-'+toolTone(s);e.setAttribute('data-name',n);e.innerHTML=toolHtml(n,s,d,a,o)}
 	function addToolCall(n,s,d,a){var e=document.createElement('div');setTool(e,n,s,d,a);parts().appendChild(e);sd()}
 		function updateToolCall(n,s,d,a){var ps=parts();var tools=Array.prototype.slice.call(ps.querySelectorAll('.tm')).reverse();var e=tools.find(function(x){return x.getAttribute('data-name')===n})||tools[0];if(e){setTool(e,n,s,d,a);sd()}else addToolCall(n,s,d,a)}
-function addError(t){var d=document.createElement('div');d.className='em';d.innerHTML='⚠️ '+h(t);m.appendChild(d);last=null;sd()}
-function addQueuedMessage(t){var d=document.createElement('div');d.className='qm';d.innerHTML='<span class="b">📥 '+h(t)+'</span>';m.appendChild(d);last=null;sd()}
+	function addError(t){clearHome();var d=document.createElement('div');d.className='em';d.innerHTML='⚠️ '+h(t);m.appendChild(d);last=null;sd()}
+function addQueuedMessage(t){clearHome();var d=document.createElement('div');d.className='qm';d.innerHTML='<span class="b">📥 '+h(t)+'</span>';m.appendChild(d);last=null;sd()}
 	function addThinkingIndicator(){var d=document.createElement('div');d.className='rm thp';d.innerHTML='💭 思考中<span class="dots"></span>';parts().appendChild(d);sd()}
 	function replaceThinkingWithAssistant(t){var a=ensureAssistant();var th=a.querySelector('.thp');if(th)th.remove();addAssistantMessage(t||'')}
 		function removeThinkingIndicator(){var a=currentAssistant();if(a){var th=a.querySelector('.thp');if(th)th.remove()}}
-	function addSystemMessage(t){var d=document.createElement('div');d.className='sm';d.textContent=t;m.appendChild(d);last=null;sd()}
+	function addSystemMessage(t){clearHome();var d=document.createElement('div');d.className='sm';d.textContent=t;m.appendChild(d);last=null;sd()}
 	function addAssistantEvent(t){var d=document.createElement('div');d.className='sm';d.textContent=t;parts().appendChild(d);sd()}
 	function addTurnSummary(label,rounds,tools,duration,tokens,failed){var d=document.createElement('div');d.className='turn-summary'+(failed?' failed':'');d.textContent=(failed?'✗ ':'✓ ')+String(label||'Done')+' · '+Number(rounds||0)+' rounds · '+Number(tools||0)+' tools · '+String(duration||'0ms')+' · '+Number(tokens||0)+' tokens';m.appendChild(d);last=null;active=null;sd(true)}
 	function reasoningPreview(t){var fl=String(t||'').split('\n')[0].substring(0,80);if(String(t||'').length>fl.length)fl+='...';return '💭 思考 — '+h(fl)}
@@ -431,6 +571,7 @@ function addQueuedMessage(t){var d=document.createElement('div');d.className='qm
 	function updateReasoningBlock(t){var p=parts(),d=p.querySelector('.reasoning-content');if(!d){addReasoningBlock(t);return}d.innerHTML=reasoningPreview(t);sd()}
 	function removeReasoningBlock(){var a=currentAssistant();if(!a)return;var blocks=a.querySelectorAll('.reasoning-content');Array.prototype.forEach.call(blocks,function(x){x.remove()})}
 	function renderChatModel(model){clearMessages();(model.messages||[]).forEach(function(x){if(x.text!==undefined&&x.contextSummary!==undefined)addUserMessage(x.text,x.contextSummary||[]);else if(x.markdown!==undefined)addAssistantMessage(x.markdown);else if(x.toolName!==undefined)addSystemMessage('[Permission] '+x.toolName+': '+(x.reason||''));else if(x.name!==undefined&&x.callId!==undefined){var e=document.createElement('div');setTool(e,x.name,x.status||'',x.output||x.argumentsJson||'', '', false);parts().appendChild(e)}else if(x.text!==undefined)addSystemMessage(x.text)});sd()}
+	function showWelcomePage(c){clearMessages();var d=document.createElement('div');d.className='home';var quick=(c.quickStart||[]).map(function(x){return '<li>'+h(x)+'</li>'}).join('');var actions=(c.actions||[]).map(function(x){return '<div class="action-row"><strong>'+h(x.name)+'</strong><span>'+h(x.label)+'</span></div>'}).join('');var commands=(c.commands||[]).map(function(x){return '<div class="command-row"><button data-action="'+h(x.action)+'">'+h(x.command)+'</button><span>'+h(x.label)+'</span></div>'}).join('');var loginBtn=c.showLogin?'<button class="home-btn" data-action="login">'+h(c.login)+'</button>':'';d.innerHTML='<section class="home-hero"><div class="home-head"><div class="home-brand"><div class="home-title"><span class="home-mark">A</span><span>'+h(c.title)+'</span></div><div class="home-subtitle">'+h(c.subtitle)+'</div></div><span class="home-lang"><span class="home-lang-label">'+h(c.languageLabel)+'</span><button class="home-btn" data-lang="zh">中文</button><button class="home-btn" data-lang="en">English</button></span></div><div class="home-actions"><button class="home-btn primary" data-action="settings">'+h(c.settings)+'</button>'+loginBtn+'<button class="home-btn" data-action="docs">'+h(c.docs)+'</button></div></section><div class="home-grid"><section class="home-section"><h2>'+h(c.quickStartTitle)+'</h2><ul>'+quick+'</ul></section><section class="home-section"><h2>'+h(c.actionsTitle)+'</h2><div class="action-list">'+actions+'</div></section><section class="home-section"><h2>'+h(c.commandsTitle)+'</h2><div class="command-list">'+commands+'</div></section><section class="home-section"><h2>'+h(c.docsTitle)+'</h2><div class="home-doc"><p>'+h(c.docsText)+'</p><button class="home-btn" data-action="docs">'+h(c.docs)+'</button></div></section></div>';m.appendChild(d);Array.prototype.forEach.call(d.querySelectorAll('[data-action]'),function(btn){btn.onclick=function(){host(btn.getAttribute('data-action')||'')}});Array.prototype.forEach.call(d.querySelectorAll('[data-lang]'),function(btn){btn.onclick=function(){switchWelcomeLanguage(btn.getAttribute('data-lang')||'en')}});sd(true)}
 		function clearMessages(){m.innerHTML='';last=null;active=null;ti=-1;cv=false;nb=true}
 (function find(){for(var k in window){if(k.indexOf('JBCefQuery_')===0&&typeof window[k]==='function'){window[k]('js:ready');return}}setTimeout(find,50)})();
 </script></body></html>""".trimIndent()

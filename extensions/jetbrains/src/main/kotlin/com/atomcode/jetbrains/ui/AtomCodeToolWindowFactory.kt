@@ -30,6 +30,12 @@ class AtomCodeToolWindowFactory : ToolWindowFactory {
         }
 
         toolWindow.setTitleActions(listOf(
+            object : AnAction("Home", "Open AtomCode welcome and quick start", null) {
+                override fun getActionUpdateThread() = ActionUpdateThread.BGT
+                override fun actionPerformed(e: AnActionEvent) {
+                    e.project?.let { openAtomCodeWelcomePage(it) }
+                }
+            },
             object : AnAction("New Tab", "Open a new chat tab", AllIcons.General.Add) {
                 override fun getActionUpdateThread() = ActionUpdateThread.BGT
                 override fun actionPerformed(e: AnActionEvent) {
