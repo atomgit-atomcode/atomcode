@@ -27,6 +27,10 @@ pub struct DirPicker {
     pub current: PathBuf,
     /// Index into `dirs`.
     pub selected: usize,
+    /// Free-text path the user has typed. When non-empty, Enter jumps to THIS
+    /// path (resolved like `/cd <path>`) instead of the highlighted recent dir —
+    /// so a directory that isn't in the recent list can still be entered directly.
+    pub query: String,
 }
 
 impl DirPicker {
@@ -35,7 +39,20 @@ impl DirPicker {
             dirs,
             current,
             selected: 0,
+            query: String::new(),
         }
+    }
+
+    /// Append a typed character to the path query and reset the recent-list
+    /// highlight (the typed path is now the primary Enter target).
+    fn on_char(&mut self, c: char) {
+        self.query.push(c);
+        self.selected = 0;
+    }
+
+    /// Delete the last character of the path query.
+    fn on_backspace(&mut self) {
+        self.query.pop();
     }
 
     fn up(&mut self) {
@@ -62,7 +79,7 @@ impl Modal for DirPicker {
     fn handle_key(
         &mut self,
         code: KeyCode,
-        _mods: KeyModifiers,
+        mods: KeyModifiers,
         buf: &mut Buffer,
         state: &mut UiState,
         ctx: &mut LoopCtx,
@@ -79,7 +96,48 @@ impl Modal for DirPicker {
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
+            // Free-text path entry: plain printable chars build the `query` (Ctrl/Alt
+            // combos are left for shortcuts, not captured as text).
+            KeyCode::Char(c)
+                if !mods.contains(KeyModifiers::CONTROL) && !mods.contains(KeyModifiers::ALT) =>
+            {
+                self.on_char(c);
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Backspace => {
+                self.on_backspace();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
             KeyCode::Enter => {
+                // A typed query takes precedence: resolve+validate+canonicalize it
+                // exactly like `/cd <path>` (handles `~`, `~\`/`~/`, `-`, absolute,
+                // and cwd-relative), so a directory NOT in the recent list works.
+                if !self.query.trim().is_empty() {
+                    match crate::event_loop::commands::resolve_cd(
+                        &self.query,
+                        &ctx.working_dir,
+                        ctx.previous_dir.as_deref(),
+                    ) {
+                        Ok(path) => {
+                            if path != ctx.working_dir {
+                                apply_cd(ctx, path.clone());
+                                let p = path.display().to_string();
+                                renderer.render(UiLine::CommandOutput(
+                                    crate::i18n::t(crate::i18n::Msg::DirChanged { path: &p })
+                                        .into_owned(),
+                                ));
+                            }
+                            renderer.flush();
+                        }
+                        Err(e) => {
+                            renderer.render(UiLine::Error(e));
+                            renderer.flush();
+                        }
+                    }
+                    return Ok(ModalAction::Close);
+                }
                 let Some(path) = self.chosen() else {
                     return Ok(ModalAction::Continue);
                 };
@@ -109,11 +167,13 @@ impl Modal for DirPicker {
         }
     }
 
-    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self);
+        // Show the typed path query as the editable input line (not the main
+        // buffer, which stays untouched while the modal is open).
         renderer.render(UiLine::InputPrompt {
-            buf: buf.text.clone(),
-            cursor_byte: buf.cursor,
+            buf: self.query.clone(),
+            cursor_byte: self.query.len(),
             menu: Some(payload),
             status: build_status(state, ctx),
             attachments: Vec::new(),
@@ -156,6 +216,20 @@ mod tests {
         let p = DirPicker::open(vec![pb("/a"), pb("/b")], pb("/a"));
         assert_eq!(p.selected, 0);
         assert_eq!(p.dirs.len(), 2);
+    }
+
+    #[test]
+    fn typing_builds_query_and_resets_highlight() {
+        // The over-arching fix: you can type a path that isn't in the recent list.
+        let mut p = DirPicker::open(vec![pb("/a"), pb("/b")], pb("/a"));
+        p.selected = 1;
+        p.on_char('~');
+        p.on_char('/');
+        p.on_char('x');
+        assert_eq!(p.query, "~/x");
+        assert_eq!(p.selected, 0, "typing re-focuses the typed path, not a recent dir");
+        p.on_backspace();
+        assert_eq!(p.query, "~/");
     }
 
     #[test]
