@@ -1229,6 +1229,13 @@ impl NativeRuntime {
                 }
             }
             KEv::TurnComplete { reason } => {
+                // Clear the live flags EAGERLY (bridge parity): the turn is over, so a
+                // command racing into the window before the Snapshot reply (e.g. a /model
+                // swap's settle guard, or a goal-loop continuation's start_turn_stats) must
+                // see turn_running=false. Without this, the goal loop's per-round stats
+                // never reset (start_turn_stats guards on !turn_running).
+                self.turn_running = false;
+                self.pending_approval = None;
                 // Defer the driver-facing finish until the Snapshot round-trip carries
                 // the messages the session persists from.
                 self.pending_finish = Some(reason);
