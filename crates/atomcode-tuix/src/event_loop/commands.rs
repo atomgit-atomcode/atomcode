@@ -353,7 +353,7 @@ pub(super) fn execute_slash_command(
 
     match cmd {
         "quit" | "exit" => {
-            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            super::arm_shutdown_watchdog(ctx);
         }
         "copy" => {
             // Copy a fenced code block from the most recent assistant reply to

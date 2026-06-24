@@ -621,6 +621,7 @@ pub async fn run(
         config,
         model_name,
         agent: agent_client,
+        shutdown_deadline: None,
         runtime_factory,
         runtime_spawn_override,
         bg_manager,

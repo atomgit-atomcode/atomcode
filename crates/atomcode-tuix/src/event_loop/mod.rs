@@ -703,6 +703,14 @@ pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
     pub agent: AgentClient,
+    /// Force-exit watchdog deadline. Armed by [`arm_shutdown_watchdog`] when the
+    /// user genuinely asks to leave (`/quit`, `/exit`, a confirmed Ctrl+C). The
+    /// normal exit is the graceful break (Idle + `cmd_tx` closed); this is the
+    /// safety net for when a wedged teardown await never closes the channel, so
+    /// the user is never trapped. `None` = no quit requested. The `/upgrade`
+    /// restart path deliberately does NOT arm this — it needs the normal
+    /// `ExitReason::UpgradeRestart` return to re-exec the new binary.
+    pub shutdown_deadline: Option<std::time::Instant>,
     pub runtime_factory: AgentRuntimeFactory,
     /// Optional engine-v2 spawner; `None` ⇒ the v1 `runtime_factory`. See
     /// [`RuntimeSpawnOverride`].
@@ -3004,6 +3012,13 @@ pub struct App {
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
 
+/// Grace period after a quit request before the force-exit watchdog fires. The
+/// graceful path (engine teardown closes `cmd_tx`) normally completes in well
+/// under a second; the bridge bounds its own kernel-teardown wait at 5s, so 8s
+/// here only ever trips when even that fails — at which point hard-exiting is
+/// strictly better than trapping the user. See [`arm_shutdown_watchdog`].
+const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(8);
+
 impl App {
     fn new(caps: &crate::terminal::TerminalCaps) -> Self {
         Self {
@@ -3758,7 +3773,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     restore_cancelled_message_to_buf(&mut app, renderer, &ctx);
                 } else {
                     crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
-                    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                    arm_shutdown_watchdog(&mut ctx);
                 }
             }
 
@@ -4095,6 +4110,34 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
         if matches!(app.state.phase, UiPhase::Idle) && ctx.agent.cmd_tx.is_closed() {
             break;
+        }
+
+        // Force-exit watchdog. The graceful break above is the normal path; this
+        // only fires when a quit was requested (deadline armed by
+        // `arm_shutdown_watchdog`) but the engine teardown never closed `cmd_tx`
+        // in time — a wedged kernel/bridge await would otherwise trap the user at
+        // the prompt no matter how many times they press /quit. Re-checked every
+        // ~5ms via `deferred_render_tick`, so it trips promptly once the deadline
+        // passes. Restore the terminal first, then hard-exit (skips Drop, which is
+        // exactly why a wedged await can't stop us).
+        if ctx.shutdown_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            crate::tuix_trace!("EXIT", "shutdown watchdog fired -> hard exit (teardown wedged)");
+            let _ = ctx.history.save();
+            renderer.render(UiLine::ClearTransient);
+            renderer.shutdown();
+            // `renderer.shutdown()` restores mouse / Kitty-keyboard / scroll-region
+            // state, but NOT bracketed paste — disabling that is `TerminalGuard::Drop`'s
+            // job (lib.rs), and `process::exit(0)` skips every Drop. Emit `?2004l`
+            // directly so a force-exit doesn't strand the user's shell wrapping every
+            // paste in literal `200~`/`201~` markers.
+            {
+                use std::io::Write as _;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(b"\x1b[?2004l");
+                let _ = out.flush();
+            }
+            let _ = crossterm::terminal::disable_raw_mode();
+            std::process::exit(0);
         }
     }
 
@@ -4500,7 +4543,7 @@ fn handle_input(
                 && app.active_modal.is_some()
             {
                 app.active_modal = None;
-                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                arm_shutdown_watchdog(ctx);
                 return Ok(());
             }
             if matches!(app.state.phase, UiPhase::Idle) {
@@ -5779,7 +5822,7 @@ fn handle_idle_key(
                 .exit_pending
                 .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
             if armed {
-                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                arm_shutdown_watchdog(ctx);
             } else {
                 app.exit_pending = Some(now);
                 renderer.render(UiLine::CommandOutput(
@@ -6449,6 +6492,24 @@ fn handle_streaming_key(
     Ok(())
 }
 
+/// Request agent shutdown AND arm the force-exit watchdog. Use this for EVERY
+/// user-initiated quit (`/quit`, `/exit`, a confirmed Ctrl+C) instead of a bare
+/// `cmd_tx.send(Shutdown)`. The graceful exit (the run-loop breaks once the
+/// agent task ends and closes `cmd_tx`) still wins whenever it can; the deadline
+/// only matters if a wedged teardown await never closes the channel — then the
+/// loop hard-exits at [`SHUTDOWN_WATCHDOG`] rather than trapping the user.
+///
+/// NOT for the `/upgrade` restart path: that must exit via
+/// `ExitReason::UpgradeRestart` to re-exec, so it sends `Shutdown` directly.
+fn arm_shutdown_watchdog(ctx: &mut LoopCtx) {
+    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+    // Don't re-arm (push the deadline back) on a repeated /quit — keep the
+    // earliest deadline so spamming the key can't indefinitely defer the exit.
+    if ctx.shutdown_deadline.is_none() {
+        ctx.shutdown_deadline = Some(std::time::Instant::now() + SHUTDOWN_WATCHDOG);
+    }
+}
+
 /// Cancel the executor that owns the foreground turn.
 ///
 /// In sync mode the turn belongs to `LiveSession`; the local agent is idle and
@@ -6514,7 +6575,7 @@ fn handle_approval_key(
             .exit_pending
             .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
         if armed {
-            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            arm_shutdown_watchdog(ctx);
         } else {
             // First Ctrl+C: deny the current tool and arm the exit confirmation.
             // The goal (if any) continues; Claude Code's /goal works the same way.
