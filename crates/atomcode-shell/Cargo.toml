@@ -1,8 +1,8 @@
 [package]
-name = "atomcode-bridge"
+name = "atomcode-shell"
 version = "0.0.0"
 edition = "2021"
-description = "Neutral driver helpers shared by cli + daemon: BridgeConfig + coding_config + build_provider (with AtomGit signing) + core↔kernel message convert. The translation runtime is gone — tuix and the daemon consume the kernel natively."
+description = "The driver shell: neutral provider/glue helpers shared by the cli + daemon drivers — BridgeConfig + coding_config + build_provider (with AtomGit signing) + core↔kernel message convert. There is no translation runtime; tuix and the daemon consume the kernel natively."
 
 [dependencies]
 # Driver-side provider construction: core supplies crypto (signing gateway) + i18n +

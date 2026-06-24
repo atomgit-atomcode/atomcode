@@ -1,8 +1,8 @@
 //! Native kernel runtime for the TUI (B2).
 //!
 //! Drives a kernel `CodingRuntime` directly and maps its events into [`UiEvent`],
-//! replacing the `atomcode-bridge` translation membrane. The renderer consumes
-//! `UiEvent` instead of `core::agent::AgentEvent`.
+//! replacing the former `atomcode-bridge` translation membrane (now gone). The renderer
+//! consumes `UiEvent` instead of `core::agent::AgentEvent`.
 //!
 pub(crate) mod adapter;
 pub(crate) mod approval;

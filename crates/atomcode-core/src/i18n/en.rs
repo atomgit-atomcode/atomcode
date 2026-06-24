@@ -1082,7 +1082,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CliAboutHelp => "Print this message or the help of the given subcommand(s)".into(),
         Msg::CliHelpMcpCommand => "Executable and arguments".into(),
 
-        // ── engine v2 provider init (atomcode-bridge) ──
+        // ── engine v2 provider init (atomcode-shell) ──
         Msg::ProviderInitFailed { detail } =>
             format!("provider init failed: {detail}").into(),
         Msg::GatewayAuthUnavailable { base_url } =>

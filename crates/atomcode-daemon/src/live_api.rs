@@ -250,11 +250,11 @@ impl KernelTurnExecutor {
     /// Resolve the bridge config from the live provider selection + on-disk config.
     /// Mirrors `build_turn_parts`' provider resolution (LIVE_PROVIDER → executor
     /// default → config default).
-    fn bridge_config(&self) -> Option<atomcode_bridge::BridgeConfig> {
+    fn bridge_config(&self) -> Option<atomcode_shell::BridgeConfig> {
         let config = Config::load(&Config::default_path()).ok()?;
         let name = self.resolve_provider_name();
         let p = config.providers.get(&name)?;
-        Some(atomcode_bridge::BridgeConfig {
+        Some(atomcode_shell::BridgeConfig {
             api_key: p.api_key.clone().unwrap_or_default(),
             base_url: p.base_url.clone().unwrap_or_default(),
             model: p.model.clone(),
@@ -339,7 +339,7 @@ impl TurnExecutor for KernelTurnExecutor {
                 emit(TurnEvent::Error("engine v2：provider 未配置".into()));
                 return;
             };
-            let coding_cfg = atomcode_bridge::coding_config(&bcfg);
+            let coding_cfg = atomcode_shell::coding_config(&bcfg);
             let opts = PrepareOptions {
                 session: SessionMode::Fresh,
                 skill_dirs: None,
@@ -349,7 +349,7 @@ impl TurnExecutor for KernelTurnExecutor {
                 review: true,
             };
             let factory: ProviderFactory = Box::new(|c: &CodingAgentConfig| {
-                atomcode_bridge::build_provider(c).map_err(|e| e.to_string())
+                atomcode_shell::build_provider(c).map_err(|e| e.to_string())
             });
             match CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory).await {
                 Ok(rt) => {
@@ -391,7 +391,7 @@ impl TurnExecutor for KernelTurnExecutor {
         // bridge's SetConversation recipe, done natively).
         if !state.seeded {
             let kmsgs: Vec<_> =
-                prefix.iter().map(atomcode_bridge::convert::message_to_kernel).collect();
+                prefix.iter().map(atomcode_shell::convert::message_to_kernel).collect();
             let ksnap = atomcode_kernel::message::SessionSnapshot::new(kmsgs);
             let session_id = state.runtime.parts().session.as_ref().map(|b| {
                 let _ = b.manager.save_snapshot(&b.id, &ksnap);
@@ -406,7 +406,7 @@ impl TurnExecutor for KernelTurnExecutor {
         let commands = state.runtime.handle().commands.clone();
         let _ = commands.send(atomcode_kernel::event::AgentCommand::SendMessage {
             text: user_text,
-            images: user_images.iter().map(atomcode_bridge::convert::image_to_kernel).collect(),
+            images: user_images.iter().map(atomcode_shell::convert::image_to_kernel).collect(),
         });
 
         // Interactive approval: register the response sender so any view's
@@ -502,7 +502,7 @@ impl TurnExecutor for KernelTurnExecutor {
                     let core_msgs = snapshot
                         .messages
                         .iter()
-                        .map(atomcode_bridge::convert::message_to_core)
+                        .map(atomcode_shell::convert::message_to_core)
                         .collect();
                     break Some(core_msgs);
                 }
@@ -693,9 +693,9 @@ pub(crate) fn chat_bridge_config(
     provider_name: &str,
     working_dir: &Path,
     telemetry: Arc<Telemetry>,
-) -> atomcode_bridge::BridgeConfig {
+) -> atomcode_shell::BridgeConfig {
     let p = config.providers.get(provider_name);
-    atomcode_bridge::BridgeConfig {
+    atomcode_shell::BridgeConfig {
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
@@ -726,12 +726,12 @@ pub(crate) async fn run_chat_turn_v2(
     conv: Arc<Mutex<Conversation>>,
     turn_tx: mpsc::UnboundedSender<TurnEvent>,
     cancel: CancellationToken,
-    bridge_cfg: atomcode_bridge::BridgeConfig,
+    bridge_cfg: atomcode_shell::BridgeConfig,
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
 ) {
     // A fresh NATIVE runtime for this /chat turn (no persistent state — the caller owns
     // persistence). coding_config + build_provider come from the bridge (shared mapping).
-    let coding_cfg = atomcode_bridge::coding_config(&bridge_cfg);
+    let coding_cfg = atomcode_shell::coding_config(&bridge_cfg);
     let opts = PrepareOptions {
         session: SessionMode::Fresh,
         skill_dirs: None,
@@ -741,7 +741,7 @@ pub(crate) async fn run_chat_turn_v2(
         review: true,
     };
     let factory: ProviderFactory = Box::new(|c: &CodingAgentConfig| {
-        atomcode_bridge::build_provider(c).map_err(|e| e.to_string())
+        atomcode_shell::build_provider(c).map_err(|e| e.to_string())
     });
     let mut rt = match CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory).await {
         Ok(rt) => rt,
@@ -771,7 +771,7 @@ pub(crate) async fn run_chat_turn_v2(
     // SetConversation recipe, done natively).
     {
         let kmsgs: Vec<_> =
-            prefix.iter().map(atomcode_bridge::convert::message_to_kernel).collect();
+            prefix.iter().map(atomcode_shell::convert::message_to_kernel).collect();
         let ksnap = atomcode_kernel::message::SessionSnapshot::new(kmsgs);
         let session_id = rt.parts().session.as_ref().map(|b| {
             let _ = b.manager.save_snapshot(&b.id, &ksnap);
@@ -785,7 +785,7 @@ pub(crate) async fn run_chat_turn_v2(
     let commands = rt.handle().commands.clone();
     let _ = commands.send(atomcode_kernel::event::AgentCommand::SendMessage {
         text: user_text,
-        images: user_images.iter().map(atomcode_bridge::convert::image_to_kernel).collect(),
+        images: user_images.iter().map(atomcode_shell::convert::image_to_kernel).collect(),
     });
 
     let mut live_tools = atomcode_coding::LiveTools::new();
@@ -855,7 +855,7 @@ pub(crate) async fn run_chat_turn_v2(
                 let core_msgs = snapshot
                     .messages
                     .iter()
-                    .map(atomcode_bridge::convert::message_to_core)
+                    .map(atomcode_shell::convert::message_to_core)
                     .collect();
                 break Some(core_msgs);
             }

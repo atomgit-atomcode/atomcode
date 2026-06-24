@@ -14,9 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
-# Neutral helper crate: BridgeConfig + coding_config + build_provider (AtomGit
-# signing) + convert, shared by the daemon's native /live + /chat turn producers.
-atomcode-bridge = { path = "../atomcode-bridge" }
+# The driver shell (atomcode-shell): BridgeConfig + coding_config + build_provider
+# (AtomGit signing) + convert, shared by the daemon's native /live + /chat producers.
+atomcode-shell = { path = "../atomcode-shell" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 # Native v2 stack: KernelTurnExecutor drives CodingRuntime directly (no bridge
 # membrane), consuming kernel AgentEvents and answering approvals natively.

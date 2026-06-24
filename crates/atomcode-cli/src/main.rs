@@ -508,8 +508,8 @@ const VERSION: &str = concat!(
 #[command(name = "atomcode", version = VERSION, about = "AI coding assistant in your terminal")]
 struct Cli {
     /// DEPRECATED no-op: the legacy ("v1") engine has been removed, so the new
-    /// kernel stack (via atomcode-bridge) is the only engine. Accepted for script
-    /// compatibility (also via $ATOMCODE_ENGINE); passing "v1" prints a notice.
+    /// kernel stack is the only engine. Accepted for script compatibility (also
+    /// via $ATOMCODE_ENGINE); passing "v1" prints a notice.
     #[arg(long)]
     engine: Option<String>,
 
@@ -1674,7 +1674,7 @@ async fn run() -> Result<i32> {
                     cli.dangerously_skip_permissions,
                     false, // headless ⇒ keep the fail-closed approval timeout
                 );
-                let coding_cfg = atomcode_bridge::coding_config(&bcfg);
+                let coding_cfg = atomcode_shell::coding_config(&bcfg);
                 let opts = atomcode_coding::PrepareOptions {
                     session: atomcode_coding::SessionMode::Fresh,
                     skill_dirs: None,
@@ -1684,7 +1684,7 @@ async fn run() -> Result<i32> {
                     review: true,
                 };
                 let factory: atomcode_coding::ProviderFactory =
-                    Box::new(|c| atomcode_bridge::build_provider(c).map_err(|e| e.to_string()));
+                    Box::new(|c| atomcode_shell::build_provider(c).map_err(|e| e.to_string()));
                 match atomcode_coding::CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory)
                     .await
                 {
@@ -1903,7 +1903,7 @@ fn spawn_native_tui(
         // Interactive (TUI) ⇒ approvals park until answered.
         true,
     );
-    let coding_cfg = atomcode_bridge::coding_config(&bcfg);
+    let coding_cfg = atomcode_shell::coding_config(&bcfg);
     let opts = atomcode_coding::PrepareOptions {
         session: atomcode_coding::SessionMode::Fresh,
         skill_dirs: None,
@@ -1913,7 +1913,7 @@ fn spawn_native_tui(
         review: true,
     };
     let factory: atomcode_coding::ProviderFactory =
-        Box::new(|c| atomcode_bridge::build_provider(c).map_err(|e| e.to_string()));
+        Box::new(|c| atomcode_shell::build_provider(c).map_err(|e| e.to_string()));
     let handle =
         atomcode_tuix::spawn_native_runtime(coding_cfg, opts, factory, dangerously_skip_permissions);
     // The legacy client carries two shared registries the TUI reads for its slash palette
@@ -1935,9 +1935,9 @@ fn bridge_config_from(
     telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
     dangerously_skip_permissions: bool,
     interactive: bool,
-) -> atomcode_bridge::BridgeConfig {
+) -> atomcode_shell::BridgeConfig {
     let p = config.active_provider(provider_override).ok();
-    atomcode_bridge::BridgeConfig {
+    atomcode_shell::BridgeConfig {
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),

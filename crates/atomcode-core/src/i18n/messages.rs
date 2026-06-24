@@ -948,7 +948,7 @@ pub enum Msg<'a> {
     /// About for the built-in help subcommand.
     CliAboutHelp,
 
-    // ── engine v2 provider init (atomcode-bridge) ──
+    // ── engine v2 provider init (atomcode-shell) ──
     /// Frame for a provider/engine init failure surfaced to the driver.
     /// `detail` carries the underlying cause (often `GatewayAuthUnavailable`).
     ProviderInitFailed { detail: &'a str },

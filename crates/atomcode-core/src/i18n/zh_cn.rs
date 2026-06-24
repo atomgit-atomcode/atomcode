@@ -1065,7 +1065,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CliAboutHelp => "打印帮助信息".into(),
         Msg::CliHelpMcpCommand => "可执行文件及参数".into(),
 
-        // ── engine v2 provider init (atomcode-bridge) ──
+        // ── engine v2 provider init (atomcode-shell) ──
         Msg::ProviderInitFailed { detail } =>
             format!("模型初始化失败：{detail}").into(),
         Msg::GatewayAuthUnavailable { base_url } =>

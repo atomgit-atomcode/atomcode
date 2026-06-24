@@ -2,11 +2,10 @@
 //! native adapter: kernel snapshots → core `Message`s (the `UiEvent` snapshots the
 //! session persists from), and core → kernel for `SetMessages` resume / image input.
 //!
-//! Reimplemented here (not imported from the bridge) so the adapter carries no
-//! `atomcode-bridge` dependency — the bridge crate is being deleted, and `convert`
-//! cannot move to `daemon` (it would cycle: `daemon → bridge` already exists) nor to
-//! `coding` (which is core-neutral). Plain field mapping, lossless where both sides
-//! carry the field.
+//! Reimplemented here (not imported) so the adapter carries no dependency on the driver
+//! shell `atomcode-shell` (which also keeps a `convert` for the daemon). It cannot live in
+//! `daemon` (would cycle: `daemon → atomcode-shell` already exists) nor in `coding` (which
+//! is core-neutral). Plain field mapping, lossless where both sides carry the field.
 
 use atomcode_core::conversation::message::{
     ImagePart, Message as CoreMessage, MessageContent, Role as CoreRole,
