@@ -621,7 +621,61 @@ fn html_to_markdown(html: &str) -> String {
             result.push('\n');
         }
     }
-    result.trim().to_string()
+    let result = result.trim().to_string();
+    // Source-file views on every code host (GitHub/GitLab/Gitee/atomgit/…) render the
+    // file as one big <pre><code> wrapped in nav + file-tree chrome. In Markdown that
+    // chrome is dozens of leading link/list lines before the code, which an LLM misreads
+    // as "an empty JS shell" and re-fetches. If a single fenced block dominates, return it.
+    strip_to_dominant_code_block(&result).unwrap_or(result)
+}
+
+/// If a single fenced code block dominates the Markdown — the structural signature of a
+/// source-file view — return just that block; otherwise `None`.
+///
+/// Keyed ONLY on Markdown shape (one fence that is the bulk of the page and at least a
+/// handful of lines), never on a hostname or any forge's HTML/CSS — so it fires for any
+/// code host and leaves ordinary pages, whose code is a minority of the content, untouched.
+fn strip_to_dominant_code_block(md: &str) -> Option<String> {
+    /// A dominant block must be at least this many lines (skip tiny snippets).
+    const MIN_BLOCK_LINES: usize = 15;
+    /// …and at least this percent of the page's bytes (a clear majority, so a docs page
+    /// with a code example or two is never mistaken for a file view).
+    const MIN_BLOCK_PERCENT: usize = 55;
+
+    let total = md.trim().len();
+    if total == 0 {
+        return None;
+    }
+    let lines: Vec<&str> = md.lines().collect();
+    let is_fence = |l: &str| l.trim_start().starts_with("```");
+
+    let mut best: Option<(usize, usize, usize)> = None; // (start, end_inclusive, bytes)
+    let mut i = 0;
+    while i < lines.len() {
+        if is_fence(lines[i]) {
+            let start = i;
+            let mut j = i + 1;
+            while j < lines.len() && !is_fence(lines[j]) {
+                j += 1;
+            }
+            let end = j.min(lines.len() - 1); // closing fence, or last line if unterminated
+            let bytes: usize = lines[start..=end].iter().map(|l| l.len() + 1).sum();
+            if best.is_none_or(|(_, _, b)| bytes > b) {
+                best = Some((start, end, bytes));
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    let (start, end, bytes) = best?;
+    let block_lines = end - start + 1;
+    if block_lines >= MIN_BLOCK_LINES && bytes * 100 >= total * MIN_BLOCK_PERCENT {
+        Some(lines[start..=end].join("\n"))
+    } else {
+        None
+    }
 }
 
 fn decode_entities(s: &str) -> String {
@@ -705,6 +759,42 @@ fn replace_tag_with(html: &str, tag: &str, replacement: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_forge_chrome_to_dominant_code_block() {
+        // A code-host source view = one big <pre><code> wrapped in nav + file-tree chrome.
+        // Once in Markdown that chrome is dozens of link lines the LLM misreads as an empty
+        // shell and re-fetches. A single dominant fence should be returned alone.
+        let mut code = String::new();
+        for i in 0..20 {
+            code.push_str(&format!("fn line_{i}() {{ do_thing({i}); }}\n"));
+        }
+        let html = format!(
+            "<nav><a href=\"/\">home</a> <a href=\"/tree\">files</a></nav>\
+             <h1>repo / src / main.rs</h1>\
+             <pre><code>{code}</code></pre>"
+        );
+        let md = html_to_markdown(&html);
+        assert!(md.contains("fn line_0()"), "code kept: {md}");
+        assert!(md.contains("fn line_19()"), "full code kept: {md}");
+        assert!(!md.contains("home"), "nav chrome stripped: {md}");
+        assert!(!md.contains("repo / src"), "heading chrome stripped: {md}");
+    }
+
+    #[test]
+    fn keeps_ordinary_page_with_minor_code_snippet() {
+        // An ordinary article whose code is a minority of the page must be left intact —
+        // the strip only fires when a fence dominates the page.
+        let html = "<h1>Guide</h1>\
+                    <p>Lots of prose explaining things in detail. More prose. Even more \
+                    prose so the code block stays a clear minority of the page content.</p>\
+                    <pre><code>let x = 1;</code></pre>\
+                    <p>Closing prose paragraph with additional explanatory text here.</p>";
+        let md = html_to_markdown(html);
+        assert!(md.contains("Guide"), "prose heading kept: {md}");
+        assert!(md.contains("let x = 1;"), "snippet kept: {md}");
+        assert!(md.contains("Closing prose"), "trailing prose kept: {md}");
+    }
 
     #[test]
     fn char_cap_counts_chars_not_bytes() {
