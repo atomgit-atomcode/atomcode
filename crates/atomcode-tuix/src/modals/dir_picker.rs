@@ -90,10 +90,6 @@ impl DirPicker {
             self.selected += 1;
         }
     }
-
-    fn chosen(&self) -> Option<PathBuf> {
-        self.filtered().get(self.selected).cloned()
-    }
 }
 
 impl Modal for DirPicker {
@@ -323,10 +319,12 @@ mod tests {
     }
 
     #[test]
-    fn chosen_returns_selected_path() {
+    fn selection_indexes_into_filtered_list() {
+        // `selected` is an index into `filtered()` — the Enter handler resolves the
+        // highlighted recent dir as `filtered()[selected]`.
         let mut p = DirPicker::open(vec![pb("/a"), pb("/b"), pb("/c")], pb("/a"));
         p.down();
-        assert_eq!(p.chosen(), Some(pb("/b")));
+        assert_eq!(p.filtered().get(p.selected).cloned(), Some(pb("/b")));
     }
 
     #[test]

@@ -1346,7 +1346,9 @@ impl TurnRunner {
         self.hook_engine.trigger_on_tool_call_start(&tc_start_ctx).await;
 
         let mut final_args = call.arguments.clone();
-        let mut hook_explicitly_allowed = false;
+        // Deferred init: every non-diverging match arm below assigns this (the
+        // `Err` arm returns early), so a `= false` initializer was dead.
+        let hook_explicitly_allowed;
         match self.hook_engine.trigger_pre_tool_use(&pr_hook_ctx).await {
             Ok((Some(new_args), allowed)) => {
                 final_args = new_args;
