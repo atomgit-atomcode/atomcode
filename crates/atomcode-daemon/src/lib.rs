@@ -301,6 +301,13 @@ pub struct AppState {
     /// server 绑定的地址 / 端口（供 /tunnel/status 报告远程可达性）。
     pub bind_host: String,
     pub bind_port: u16,
+    /// This instance's port-scoped webui cookie name (`atomcode_webui_<port>`),
+    /// resolved ONCE at construction from the actual bound port. Read it directly
+    /// — never re-derive the name from the bare `WEBUI_COOKIE` const at a call
+    /// site, or that site silently fails to authenticate (a sibling `/webui` on a
+    /// different localhost port would shadow the shared-jar cookie). See
+    /// [`auth_token::webui_cookie_name`].
+    pub webui_cookie_name: String,
 }
 
 /// Cached MCP registry for a specific project directory.
@@ -1163,7 +1170,7 @@ async fn serve_webui_index(
                     };
                     let cookie = format!(
                         "{}={}; Path=/; HttpOnly; SameSite=Strict",
-                        auth_token::webui_cookie_name(state.bind_port),
+                        state.webui_cookie_name,
                         token
                     );
                     return axum::response::Response::builder()
@@ -3764,7 +3771,7 @@ async fn get_tunnel_status(
             headers
                 .get(axum::http::header::COOKIE)
                 .and_then(|h| h.to_str().ok()),
-            &auth_token::webui_cookie_name(state.bind_port),
+            &state.webui_cookie_name,
         )
     });
 
@@ -4052,6 +4059,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         pending_permissions: permission_bridge::PermissionResponders::new(),
         bind_host: host.clone(),
         bind_port: port,
+        // `port` here is the ACTUAL bound port (the enforce_token=true webui path
+        // pre-binds via `bind_scanning` and passes its `local_addr` port), so two
+        // instances get distinct cookie names.
+        webui_cookie_name: auth_token::webui_cookie_name(port),
     };
 
     // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。页面必须可加载，

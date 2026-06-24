@@ -22,7 +22,11 @@ use uuid::Uuid;
 /// credential in an HttpOnly cookie — rather than the URL — prevents a
 /// malicious browser extension from reading it off `location.search`
 /// (CWE-598 / CWE-522).
-pub const WEBUI_COOKIE: &str = "atomcode_webui";
+/// Base cookie name. Intentionally `pub(crate)` and NOT used directly as a
+/// cookie name anywhere — the real per-instance name is [`webui_cookie_name`]
+/// (port-scoped). Reading/writing the bare base name would 401 against a
+/// port-scoped instance, so it's kept crate-private to prevent that footgun.
+pub(crate) const WEBUI_COOKIE: &str = "atomcode_webui";
 
 /// Per-instance webui cookie name: `atomcode_webui_<port>`.
 ///
@@ -120,8 +124,10 @@ pub async fn require_webui_token(
     let cookie = req.headers().get(COOKIE).and_then(|h| h.to_str().ok());
     // Read THIS instance's port-scoped cookie name so a sibling `/webui` on a
     // different localhost port (which shares the cookie jar) can't shadow us.
-    let cookie_name = webui_cookie_name(state.bind_port);
-    let token = token_from_header(header).or_else(|| token_from_cookie(cookie, &cookie_name));
+    // Use THIS instance's pre-resolved port-scoped cookie name (computed once on
+    // AppState) so a sibling `/webui` on another localhost port can't shadow us.
+    let token =
+        token_from_header(header).or_else(|| token_from_cookie(cookie, &state.webui_cookie_name));
     match token {
         Some(tok) if state.webui_tokens.is_valid(&tok) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
