@@ -3261,6 +3261,13 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     // Without this, the popup continues showing files from the original
     // startup directory after the user runs `/cd`.
     ctx.file_index.reset(path.clone());
+    // Rebuild the session manager for the new project directory.
+    // `SessionManager::new` derives a `project_hash` from the working dir,
+    // which determines the bucket (`~/.atomcode/sessions/<hash>/`) that
+    // `/resume` lists. Without this, `/resume` after `/cd` still shows
+    // sessions from the old project because the manager still points at the
+    // old hash bucket.
+    ctx.session_manager = SessionManager::new(&path);
     // Sync mode: drive the in-process LiveSession's working dir so (a) the live
     // executor runs the next turn in the new dir (LIVE_WORKING_DIR override, #755)
     // and (b) every webui tab follows the switch over the /live SSE wire. Mirrors
