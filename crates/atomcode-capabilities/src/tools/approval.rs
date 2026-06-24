@@ -182,7 +182,28 @@ impl ToolMiddleware for ApprovalMiddleware {
             args: call.arguments.clone(),
         })
         .unwrap_or(serde_json::Value::Null);
-        match PermissionDecision::from_value(&rt.request(&self.kind, payload).await) {
+        let response = rt.request(&self.kind, payload).await;
+        // A `Null` response is the kernel's DEGRADED signal, not a user decision: the
+        // driver's oneshot sender was dropped, the bounded round-trip timed out, or the
+        // turn was cancelled (see `RequestCtx::request` / `cancel_pending`). A genuine
+        // user "deny" arrives as `{"decision":"deny"}` (non-null). We still fail closed,
+        // but surface the difference — on stderr AND in the deny reason the model/UI
+        // sees — so an internal channel failure can be told apart from a real user
+        // denial. (Issue #173: this path used to collapse both into a silent Deny.)
+        if response.is_null() {
+            eprintln!(
+                "[approval] no decision received for tool '{}' (driver disconnected, \
+                 timed out, or cancelled); denying due to internal channel failure, \
+                 not a user decision",
+                tool.name()
+            );
+            return BeforeOutcome::deny(format!(
+                "approval unresolved for '{}': no decision received (driver disconnected, \
+                 timed out, or cancelled) — internal channel failure, not a user denial",
+                tool.name()
+            ));
+        }
+        match PermissionDecision::from_value(&response) {
             PermissionDecision::AllowOnce => BeforeOutcome::Proceed,
             PermissionDecision::AllowAlways => {
                 self.store.grant(&key);
@@ -305,7 +326,8 @@ mod tests {
     #[tokio::test]
     async fn risky_call_denied_when_driver_silent() {
         // No driver drains the request → the bounded round-trip times out → Null →
-        // Deny → Err (fail closed).
+        // Deny → Err (fail closed). The deny reason must mark this as an INTERNAL
+        // channel failure (not a user denial) for observability (issue #173).
         let (tx, _rx) = unbounded_channel::<AgentEvent>();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(20)));
         let mw = ApprovalMiddleware::in_memory();
@@ -313,7 +335,11 @@ mod tests {
         let mut call = risky_call();
         let res = mw.before(&mut call, &tool, &rt).await;
         assert!(res.is_deny(), "silent driver must fail closed");
-        assert!(res.deny_reason().unwrap().contains("denied"));
+        let reason = res.deny_reason().unwrap();
+        assert!(
+            reason.contains("internal channel failure") && reason.contains("not a user"),
+            "a degraded (Null) round-trip must be distinguishable from a user deny: {reason}"
+        );
     }
 
     /// The exported typed contract must stay byte-compatible with the wire shapes
