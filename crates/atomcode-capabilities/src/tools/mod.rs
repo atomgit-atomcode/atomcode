@@ -113,6 +113,18 @@ pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
     }
 }
 
+/// Coerce every line ending in `s` to `eol` (`"\n"` or `"\r\n"`): collapse any `\r\n`
+/// to `\n`, then expand to the target. Idempotent for `"\n"`. Used by the editors so a
+/// model that copied LF text from `read_file` (which strips `\r` via `str::lines()`) can
+/// still match — and not corrupt — a CRLF file on disk.
+pub(crate) fn coerce_eol(s: &str, eol: &str) -> String {
+    if eol == "\r\n" {
+        s.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        s.replace("\r\n", "\n")
+    }
+}
+
 /// Windows-aware absolute-path test. `Path::is_absolute()` is **platform-dependent**:
 /// on a Unix build it rejects `G:\foo` (treats the whole thing as one relative name),
 /// so `working_dir.join("G:\\…")` silently produces garbage. A coding agent receives

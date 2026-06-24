@@ -4,7 +4,7 @@
 //! symbol modes and the auto-fix / file_store / LSP enrichments are dropped (they
 //! need the heavy coding context).
 
-use super::{err, ok, resolve_path};
+use super::{coerce_eol, err, ok, resolve_path};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
@@ -75,7 +75,22 @@ impl Tool for EditFileTool {
             Err(e) => return err(format!("edit_file: cannot read {}: {e}", path.display())),
         };
 
-        let count = content.matches(&a.old_string).count();
+        // Line-ending tolerance: read_file shows the model LF-normalized text (it does
+        // `str::lines()`, which strips the `\r` from every `\r\n`), but the file on disk
+        // may be CRLF. Match literally first; if that fails, retry with the old_string's
+        // line endings coerced to the file's convention — otherwise a model that copied
+        // LF text could never match a CRLF file (and would flail forever). The new text
+        // always adopts the file's EOL so the edit never introduces mixed endings.
+        let file_eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+        let new_string = coerce_eol(&a.new_string, file_eol);
+        let literal = content.matches(&a.old_string).count();
+        let (old_match, count) = if literal > 0 {
+            (a.old_string.clone(), literal)
+        } else {
+            let coerced = coerce_eol(&a.old_string, file_eol);
+            let c = content.matches(&coerced).count();
+            (coerced, c)
+        };
         if count == 0 {
             return err(format!(
                 "edit_file: old_string not found in {}. The file was NOT modified. Re-read \
@@ -93,9 +108,9 @@ impl Tool for EditFileTool {
         }
 
         let updated = if a.replace_all {
-            content.replace(&a.old_string, &a.new_string)
+            content.replace(&old_match, &new_string)
         } else {
-            content.replacen(&a.old_string, &a.new_string, 1)
+            content.replacen(&old_match, &new_string, 1)
         };
         if let Err(e) = tokio::fs::write(&path, &updated).await {
             return err(format!(
@@ -243,5 +258,38 @@ mod tests {
     #[tokio::test]
     async fn edit_is_risky() {
         assert_eq!(EditFileTool.risk("{}"), RiskLevel::Risky);
+    }
+
+    // A CRLF (Windows) file edited with a multi-line `old_string` whose line break is
+    // `\n` — which is exactly what read_file shows the model, because read_file does
+    // `text.lines()` and strips the `\r`. The edit must still succeed, and the file must
+    // stay CRLF (no mixed line endings introduced).
+    #[tokio::test]
+    async fn crlf_file_matches_lf_oldstring_and_preserves_crlf() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("router.js"), "  path: '/help',\r\n  next: 1,\r\n").unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"router.js","old_string":"  path: '/help',\n  next: 1,","new_string":"  path: '/proxyCase',\n  next: 1,"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "CRLF file must match an LF old_string: {}", r.content);
+        let on_disk = std::fs::read_to_string(d.path().join("router.js")).unwrap();
+        assert_eq!(on_disk, "  path: '/proxyCase',\r\n  next: 1,\r\n", "must stay CRLF: {on_disk:?}");
+    }
+
+    #[tokio::test]
+    async fn lf_file_is_unaffected_by_eol_tolerance() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "let x = 1;\nlet y = 2;\n").unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"a.rs","old_string":"let x = 1;\nlet y = 2;","new_string":"let x = 9;\nlet y = 2;"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.rs")).unwrap(), "let x = 9;\nlet y = 2;\n");
     }
 }
