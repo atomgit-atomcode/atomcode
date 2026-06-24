@@ -15,7 +15,12 @@ atomcode-telemetry = { path = "../atomcode-telemetry" }
 # and maps kernel `AgentEvent`s into the UI event vocab, replacing the bridge.
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-coding = { path = "../atomcode-coding" }
-atomcode-capabilities = { path = "../atomcode-capabilities" }
+# Orchestration capabilities the native adapter wires (goal / vision / local-shell /
+# memory); session+mcp mirror the bridge's set (coding's prepare uses them) so the
+# feature surface is identical. The bridge previously owned this edge.
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "session", "memory", "mcp", "goal", "vision", "local-shell"] }
+# Goal-evaluator cancellation token (Esc interrupts an in-flight evaluation).
+tokio-util = "0.7"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 crossterm = "0.29"

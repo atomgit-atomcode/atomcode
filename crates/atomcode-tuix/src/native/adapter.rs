@@ -16,12 +16,12 @@
 //! adapter is not yet connected to the live event loop (the bridge still backs the
 //! TUI), so this is dead code with zero behavior change until the wiring step.
 
-use std::sync::Arc;
+use std::time::Duration;
 
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use atomcode_coding::{
-    assemble, prepare_with_plugin_hooks, CodingAgentConfig, LiveTools, PrepareOptions,
-    ProviderFactory, TurnStats,
+    assemble, prepare_with_plugin_hooks, CodingAgentConfig, CodingParts, LiveTools, PrepareOptions,
+    ProviderFactory, SessionMode, TurnStats,
 };
 use atomcode_core::agent::{AgentCommand as CoreCmd, AgentPhase};
 use atomcode_core::conversation::ConversationSnapshot;
@@ -30,11 +30,32 @@ use atomcode_kernel::event::{AgentCommand as KCmd, AgentEvent as KEv, RequestId,
 use atomcode_kernel::message::MessageMeta;
 use tokio::sync::mpsc;
 
-use super::approval::{approval_needed_event, bypass_auto_approval};
+use super::approval::{approval_needed_event, bypass_auto_approval, take_deny_cmd};
 use super::convert;
 use super::event::UiEvent;
 use super::lifecycle::finish_turn_events;
 use super::translate::{context_stats_event, map_stream_event};
+
+/// Resolve CC hooks contributed INLINE by installed plugins into the kernel-stack hook
+/// config. tuix is a driver, so it may depend on `atomcode-core`'s plugin loader (L1 /
+/// `atomcode-coding` cannot): core hands back neutral `PluginCcHook` specs and we lift
+/// each into an `atomcode_coding::cc_hooks::HookConfig`. Gathered once and reused across
+/// respawns so plugin hooks survive a model swap / reload. (Relocated from the bridge's
+/// `gather_plugin_cc_hooks`.)
+fn gather_plugin_cc_hooks() -> Vec<atomcode_coding::cc_hooks::HookConfig> {
+    atomcode_core::plugin::loader::installed_plugin_cc_hooks()
+        .into_iter()
+        .filter_map(|h| {
+            atomcode_coding::cc_hooks::HookConfig::from_plugin_spec(
+                &h.event,
+                h.matcher,
+                h.command,
+                h.timeout_secs,
+                h.plugin_root,
+            )
+        })
+        .collect()
+}
 
 /// Driver-facing handle: send legacy `core::AgentCommand`s, receive `UiEvent`s. The
 /// command side is unchanged from the bridge so tuix's send path stays the same;
@@ -65,6 +86,26 @@ pub(crate) fn spawn_native_runtime(
 
 struct NativeRuntime {
     coding_cfg: CodingAgentConfig,
+    /// The prepare options the driver supplied — cloned for every respawn so a
+    /// model swap / `/cd` / `/clear` rebuilds the agent with the same capabilities.
+    opts_template: PrepareOptions,
+    /// Plugin-contributed inline CC hooks, resolved once and threaded into every
+    /// `prepare` (initial + respawns) so plugin hooks survive a model swap / reload.
+    plugin_cc_hooks: Vec<atomcode_coding::cc_hooks::HookConfig>,
+    /// Everything `assemble` composes — REUSED across respawns so approval grants,
+    /// plan mode, session identity, and the shared cwd survive a rebuild.
+    parts: CodingParts,
+    /// Builds the (possibly signing-gateway) provider. Injected by the driver so this
+    /// crate never reaches the closed-source signer; called on the run loop only
+    /// (spawned tasks receive pre-built `Arc<dyn LlmProvider>` clones).
+    factory: ProviderFactory,
+    /// The new-stack session id this runtime persists under (gives `/clear` /
+    /// `/resume` / `/undo` respawns + recall).
+    bridge_session: String,
+    /// `true` when the runtime is backed by a [`noop_handle`] because the kernel agent
+    /// could not be (re)initialised. `SendMessage` is then answered with an `Error`
+    /// instead of being forwarded to the nonexistent kernel.
+    degraded: bool,
     handle: AgentHandle,
     ev_tx: mpsc::UnboundedSender<UiEvent>,
     /// Tool name + duration recovery for `ToolCallResult` (kernel results carry neither).
@@ -91,24 +132,61 @@ impl NativeRuntime {
         mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
         ev_tx: mpsc::UnboundedSender<UiEvent>,
     ) {
-        let fail = |ev_tx: &mpsc::UnboundedSender<UiEvent>, error: String| {
-            let _ = ev_tx.send(UiEvent::Error { error, snapshot: ConversationSnapshot::default() });
-        };
-        let mut parts = match prepare_with_plugin_hooks(&cfg, opts, Vec::new()).await {
-            Ok(p) => p,
-            Err(e) => return fail(&ev_tx, format!("engine prepare failed: {e}")),
-        };
-        let provider: Arc<_> = match (factory)(&cfg) {
-            Ok(p) => p,
-            Err(e) => return fail(&ev_tx, format!("provider init failed: {e}")),
-        };
-        let handle = match assemble(&mut parts, &cfg, provider) {
-            Ok(agent) => agent.spawn(),
-            Err(e) => return fail(&ev_tx, format!("engine assemble failed: {e}")),
+        // Inline CC hooks from installed plugins (resolved here — tuix is the driver that
+        // can reach the core plugin loader). Reused across respawns via the struct below.
+        let plugin_cc_hooks = gather_plugin_cc_hooks();
+
+        let mut parts =
+            match prepare_with_plugin_hooks(&cfg, opts.clone(), plugin_cc_hooks.clone()).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = ev_tx.send(UiEvent::Error {
+                        error: format!("engine prepare failed: {e}"),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                    // prepare() failed — no parts, so no runtime can be built. Keep the
+                    // event channel alive (the TUI forwarder must not see it close and
+                    // exit); the user restarts atomcode to recover.
+                    Self::keep_alive_loop(ev_tx, cmd_rx).await;
+                    return;
+                }
+            };
+        let bridge_session = parts.session.as_ref().map(|b| b.id.clone()).unwrap_or_default();
+
+        // Provider / assemble failure degrades to a noop_handle (the runtime stays alive
+        // and answers SendMessage with an Error) instead of stranding the TUI — matches
+        // the bridge's startup contract.
+        let (handle, degraded) = match (factory)(&cfg) {
+            Ok(provider) => match assemble(&mut parts, &cfg, provider) {
+                Ok(a) => (a.spawn(), false),
+                Err(e) => {
+                    let _ = ev_tx.send(UiEvent::Error {
+                        error: format!("engine assemble failed: {e}"),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                    (Self::noop_handle(), true)
+                }
+            },
+            Err(e) => {
+                let _ = ev_tx.send(UiEvent::Error {
+                    error: atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitFailed {
+                        detail: &e,
+                    })
+                    .into_owned(),
+                    snapshot: ConversationSnapshot::default(),
+                });
+                (Self::noop_handle(), true)
+            }
         };
 
         let mut rt = NativeRuntime {
             coding_cfg: cfg,
+            opts_template: opts,
+            plugin_cc_hooks,
+            parts,
+            factory,
+            bridge_session,
+            degraded,
             handle,
             ev_tx,
             live_tools: LiveTools::new(),
@@ -154,8 +232,193 @@ impl NativeRuntime {
     }
 
     fn start_turn_stats(&mut self) {
-        self.stats = TurnStats::new();
-        self.stats.start();
+        // Guard: a SendMessage that arrives while a turn is already running (e.g. a
+        // goal-loop continuation) must NOT reset the accumulated stats.
+        if !self.turn_running {
+            self.stats = TurnStats::new();
+            self.stats.start();
+        }
+    }
+
+    /// Drive the CURRENT kernel to a clean terminal and let it persist the snapshot
+    /// BEFORE a respawn re-assembles from that snapshot. `assemble` reloads the latest
+    /// on-disk snapshot (written on every `turn_complete`, cancel included) — so a turn
+    /// (or parked approval) still in flight when a /model swap fires would otherwise
+    /// leave a dangling tool_use the fresh agent re-triggers on the next prompt.
+    ///
+    /// Releases any parked approval as a deny + cancels the turn, then drains the
+    /// kernel's events until the turn fully finalizes (TurnComplete → Snapshot
+    /// round-trip → finish). Bounded by a per-event timeout so a wedged kernel can't
+    /// hang the swap.
+    async fn settle_in_flight_turn(&mut self) {
+        if let Some(cmd) = take_deny_cmd(&mut self.pending_approval) {
+            let _ = self.handle.commands.send(cmd);
+        }
+        let _ = self.handle.commands.send(KCmd::Cancel);
+        let mut saw_complete = false;
+        for _ in 0..256 {
+            match tokio::time::timeout(Duration::from_secs(5), self.handle.events.recv()).await {
+                Ok(Some(ev)) => {
+                    if matches!(ev, KEv::TurnComplete { .. }) {
+                        saw_complete = true;
+                    }
+                    self.on_kernel_event(ev).await;
+                    // TurnComplete defers the finish until its Snapshot reply lands
+                    // (clearing pending_finish). Wait for BOTH so the snapshot is on
+                    // disk before we re-assemble from it.
+                    if saw_complete && self.pending_finish.is_none() {
+                        break;
+                    }
+                }
+                Ok(None) => break, // kernel task ended
+                Err(_) => break,   // timed out — give up rather than hang the swap
+            }
+        }
+    }
+
+    /// Tear the kernel agent down and rebuild it via `prepare` → `assemble` against the
+    /// (possibly new) `coding_cfg`, REUSING `self.parts` so approval grants + plan mode
+    /// survive. `Resume` falls back to `Fresh` if the snapshot can't be loaded; a build
+    /// failure installs a [`noop_handle`] + degraded so the run loop's `recv()` never
+    /// closes and kills the process. Mirrors the bridge's `respawn`.
+    async fn respawn(&mut self, session: SessionMode) {
+        // If a turn (or approval) was live, tearing the kernel down would drop its
+        // in-flight events and strand the driver. Close the lifecycle FIRST.
+        if self.turn_running || self.pending_approval.is_some() {
+            self.pending_approval = None;
+            self.finish_turn(StopReason::Cancelled, Vec::new());
+        }
+        let _ = self.handle.commands.send(KCmd::Shutdown);
+        let task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
+        let _ = task.await;
+        let mut opts = self.opts_template.clone();
+        opts.session = session;
+
+        // Try the requested session mode; if Resume can't find the snapshot, fall back
+        // to Fresh before giving up — a broken snapshot must not crash the runtime.
+        let mut parts = match prepare_with_plugin_hooks(
+            &self.coding_cfg,
+            opts.clone(),
+            self.plugin_cc_hooks.clone(),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(opts.session, SessionMode::Fresh) {
+                    self.emit(UiEvent::Error {
+                        error: format!("engine respawn failed: {e}"),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                    self.handle = Self::noop_handle();
+                    self.degraded = true;
+                    return;
+                }
+                opts.session = SessionMode::Fresh;
+                match prepare_with_plugin_hooks(&self.coding_cfg, opts, self.plugin_cc_hooks.clone())
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e2) => {
+                        self.emit(UiEvent::Error {
+                            error: format!("engine respawn failed (fresh fallback also failed): {e2}"),
+                            snapshot: ConversationSnapshot::default(),
+                        });
+                        self.handle = Self::noop_handle();
+                        self.degraded = true;
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Approval grants + plan mode survive engine respawns (same contract as C1).
+        parts.approval = self.parts.approval.clone();
+        parts.plan_mode = self.parts.plan_mode.clone();
+
+        match (self.factory)(&self.coding_cfg)
+            .and_then(|p| assemble(&mut parts, &self.coding_cfg, p).map_err(|e| e.to_string()))
+        {
+            Ok(a) => {
+                self.handle = a.spawn();
+                self.bridge_session =
+                    parts.session.as_ref().map(|b| b.id.clone()).unwrap_or_default();
+                self.parts = parts;
+                self.turn_running = false;
+                self.pending_approval = None;
+                self.degraded = false;
+            }
+            Err(e) => {
+                self.emit(UiEvent::Error {
+                    error: format!("engine respawn failed: {e}"),
+                    snapshot: ConversationSnapshot::default(),
+                });
+                // Must install a LIVE handle so the run loop's recv() never returns
+                // None and kills the process.
+                self.handle = Self::noop_handle();
+                self.degraded = true;
+            }
+        }
+    }
+
+    /// Replace `handle` with a no-op handle that keeps the run loop alive (its events
+    /// channel never closes). Used as a safety net when (re)build fails — the runtime
+    /// stays running and can still process driver commands. The task listens for
+    /// `Shutdown` on the kernel command channel so `task.await` returns cleanly.
+    fn noop_handle() -> AgentHandle {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<KCmd>();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<KEv>();
+        AgentHandle {
+            commands: cmd_tx,
+            events: ev_rx,
+            task: tokio::spawn(async move {
+                let _keep_alive = ev_tx; // hold the sender so the receiver stays open
+                loop {
+                    match cmd_rx.recv().await {
+                        Some(KCmd::Shutdown) | None => break,
+                        _ => {} // drain: ignore all other kernel commands
+                    }
+                }
+            }),
+        }
+    }
+
+    /// Keep-alive loop for when INITIAL startup fails (prepare error → no parts). Holds
+    /// `ev_tx` open via a spawned task so the TUI forwarder doesn't see the channel close
+    /// and exit. `Shutdown` exits; `ReloadConfig`/`SendMessage` get an Error telling the
+    /// user to restart; everything else is drained. The initial Error was already sent.
+    async fn keep_alive_loop(
+        ev_tx: mpsc::UnboundedSender<UiEvent>,
+        mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
+    ) {
+        let feedback_tx = ev_tx.clone();
+        let _keep = tokio::spawn(async move {
+            let _hold = ev_tx;
+            std::future::pending::<()>().await;
+        });
+        loop {
+            match cmd_rx.recv().await {
+                Some(CoreCmd::Shutdown) | None => break,
+                Some(CoreCmd::ReloadConfig(_)) => {
+                    let _ = feedback_tx.send(UiEvent::Error {
+                        error: "engine is in degraded mode — /model and /provider require a \
+                                restart. Please quit and re-launch atomcode."
+                            .into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                }
+                Some(CoreCmd::SendMessage { .. }) => {
+                    let _ = feedback_tx.send(UiEvent::Error {
+                        error: "engine failed to initialise — messages cannot be processed. \
+                                Please quit and re-launch atomcode."
+                            .into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                }
+                _ => {} // drain: ignore all other commands
+            }
+        }
+        _keep.abort();
     }
 
     /// Synthesize + emit the terminal events for a finished turn (reuses the tested
