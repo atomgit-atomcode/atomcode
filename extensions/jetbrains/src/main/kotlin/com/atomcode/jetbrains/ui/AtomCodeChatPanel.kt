@@ -32,6 +32,7 @@ import com.atomcode.jetbrains.ui.message.MessageAttachmentView
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.fileEditor.FileDocumentManager
@@ -1091,7 +1092,9 @@ class AtomCodeChatPanel(
             PathSensitivity.Warn, PathSensitivity.Normal -> Unit
         }
         if (settings.state.autoSaveBeforeRead) {
-            com.intellij.openapi.application.WriteIntentReadAction.run { FileDocumentManager.getInstance().saveAllDocuments() }
+            ApplicationManager.getApplication().runWriteAction {
+                FileDocumentManager.getInstance().saveAllDocuments()
+            }
         }
         val content = editor.document.text
         if (content.isBlank()) return result
@@ -1123,7 +1126,7 @@ class AtomCodeChatPanel(
             PathSensitivity.Warn, PathSensitivity.Normal -> Unit
         }
         if (settings.state.autoSaveBeforeRead) {
-            com.intellij.openapi.application.WriteIntentReadAction.run {
+            ApplicationManager.getApplication().runWriteAction {
                 FileDocumentManager.getInstance().saveAllDocuments()
                 file.refresh(false, false)
             }

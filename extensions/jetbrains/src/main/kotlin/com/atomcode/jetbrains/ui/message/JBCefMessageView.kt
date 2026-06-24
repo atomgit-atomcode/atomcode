@@ -1,13 +1,13 @@
 package com.atomcode.jetbrains.ui.message
 
 import com.google.gson.Gson
-import com.intellij.diagnostic.LoadingState
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.ui.JBColor
 import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
+import com.intellij.ui.jcef.JBCefBrowserBase
 import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.util.ui.UIUtil
 import org.cef.browser.CefBrowser
@@ -19,7 +19,6 @@ import javax.swing.BorderFactory
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.SwingUtilities
-import javax.swing.Timer
 import javax.swing.UIManager
 
 /**
@@ -34,7 +33,7 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     private val gson = Gson()
     private data class BrowserTheme(val dark: Boolean, val bg: String, val fg: String)
 
-    // 延迟初始化：避免在 IDE 启动早期访问 Registry (COMPONENTS_LOADED 之前)
+    // 延迟初始化：只在组件进入可显示层级后创建 JCEF 浏览器。
     private var browser: JBCefBrowser? = null
     private var jsQuery: JBCefJSQuery? = null
 
@@ -43,8 +42,8 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     private var initialized = false
 
     /**
-     * addNotify 在组件被添加到可见容器时调用，此时 IDE 已完全启动。
-     * 延迟创建 JBCefBrowser 避免 Registry 访问时序错误。
+     * addNotify 在组件被添加到可见容器时调用。
+     * 延迟创建 JBCefBrowser 避免在工具窗口还未显示时提前触发 JCEF 初始化。
      */
     override fun addNotify() {
         super.addNotify()
@@ -56,13 +55,6 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 
     private fun scheduleBrowserInit() {
         if (!isDisplayable) return
-        if (!LoadingState.COMPONENTS_LOADED.isOccurred) {
-            Timer(100) { scheduleBrowserInit() }.apply {
-                isRepeats = false
-                start()
-            }
-            return
-        }
         ApplicationManager.getApplication().invokeLater({
             if (browser == null && isDisplayable) {
                 initBrowser()
@@ -76,14 +68,9 @@ class JBCefMessageView : JPanel(BorderLayout()) {
             return
         }
 
-        // JBCefApp lazily reads proxy settings from inside Holder.<clinit>. On recent
-        // IDE builds that is reported as an illegal service request if the HTTP
-        // configuration has not been created yet. Resolve it on demand, outside the
-        // JCEF class initializer, before constructing the first browser.
-        prepareProxySettings()
         val b = JBCefBrowser()
         browser = b
-        val q = JBCefJSQuery.create(b)
+        val q = JBCefJSQuery.create(b as JBCefBrowserBase)
         jsQuery = q
 
         add(b.component, BorderLayout.CENTER)
@@ -116,11 +103,6 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         }, BorderLayout.NORTH)
         revalidate()
         repaint()
-    }
-
-    @Suppress("DEPRECATION")
-    private fun prepareProxySettings() {
-        com.intellij.util.net.HttpConfigurable.getInstance()
     }
 
     fun dispose() {
@@ -233,8 +215,10 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         } catch (_: Exception) { }
     }
 
-    @Suppress("DEPRECATION")
-    private fun isDarkTheme() = UIUtil.isUnderDarcula()
+    private fun isDarkTheme(background: Color): Boolean {
+        val luminance = (0.2126 * background.red + 0.7152 * background.green + 0.0722 * background.blue) / 255.0
+        return luminance < 0.5
+    }
 
     private fun currentBrowserTheme(): BrowserTheme {
         val scheme = EditorColorsManager.getInstance().globalScheme
@@ -244,7 +228,7 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         val fg = scheme.defaultForeground
             ?: UIManager.getColor("EditorPane.foreground")
             ?: UIUtil.getLabelForeground()
-        return BrowserTheme(isDarkTheme(), bg.toCss(), fg.toCss())
+        return BrowserTheme(isDarkTheme(bg), bg.toCss(), fg.toCss())
     }
 
     private fun Color.toCss(): String = "#%02x%02x%02x".format(red, green, blue)

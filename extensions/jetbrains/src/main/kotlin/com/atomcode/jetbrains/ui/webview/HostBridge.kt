@@ -4,6 +4,7 @@ import com.atomcode.jetbrains.store.ChatStore
 import com.atomcode.jetbrains.store.PermissionDecisionKind
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
+import com.intellij.ui.jcef.JBCefBrowserBase
 import com.intellij.ui.jcef.JBCefJSQuery
 
 /**
@@ -28,7 +29,7 @@ class HostBridge(
     )
 
     fun install() {
-        val jsQuery = JBCefJSQuery.create(chatWebView.browser)
+        val jsQuery = JBCefJSQuery.create(chatWebView.browser as JBCefBrowserBase)
         jsQuery.addHandler { rawJson ->
             try {
                 val msg = gson.fromJson(rawJson, CallbackMsg::class.java)
