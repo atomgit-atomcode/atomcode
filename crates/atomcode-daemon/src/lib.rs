@@ -14,6 +14,7 @@ pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
 pub use live_api::live_set_provider;
+pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;
 pub mod auth_token;
 pub mod permission_bridge;

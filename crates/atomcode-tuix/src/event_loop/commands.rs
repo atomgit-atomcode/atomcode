@@ -3261,6 +3261,15 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     // Without this, the popup continues showing files from the original
     // startup directory after the user runs `/cd`.
     ctx.file_index.reset(path.clone());
+    // Sync mode: drive the in-process LiveSession's working dir so (a) the live
+    // executor runs the next turn in the new dir (LIVE_WORKING_DIR override, #755)
+    // and (b) every webui tab follows the switch over the /live SSE wire. Mirrors
+    // the webui /cd endpoint (change_dir → live_set_working_dir). Self-echo is
+    // harmless: the broadcast loops back as ProjectSwitched but no-ops because
+    // ctx.working_dir already equals `path`.
+    if ctx.sync_session.is_some() {
+        atomcode_daemon::live_set_working_dir(path.clone());
+    }
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
 }

@@ -1297,6 +1297,10 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
+    /// Working directory switched (any view's `/cd`). Every webui tab updates its
+    /// path display + session-list filter to follow. Carries the absolute path.
+    #[serde(rename = "working_dir")]
+    WorkingDir { working_dir: String },
 }
 
 /// Map one LiveEvent → 0/1 wire events (variants the frontend doesn't need → None).
@@ -1317,10 +1321,12 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
             running: matches!(s, TurnState::Running),
         },
         LiveEvent::ProviderChanged(p) => LiveWireEvent::Provider { provider: p },
-        // Other webui tabs following a cwd switch is out of scope for now; the
-        // sync-mode TUI follows it directly via the in-process LiveEvent. Skip
-        // the SSE wire (would need a dedicated LiveWireEvent + frontend handler).
-        LiveEvent::WorkingDirChanged(_) => return None,
+        // Carry a cwd switch (TUI `/cd`, webui `/cd`, worktree command) to every
+        // webui tab so its path display + session-list filter follow. The
+        // sync-mode TUI follows the same LiveEvent in-process via live_sync.
+        LiveEvent::WorkingDirChanged(p) => LiveWireEvent::WorkingDir {
+            working_dir: p.to_string_lossy().to_string(),
+        },
         // 会话切换：通知所有 webui tab 跟随切换到新会话。
         LiveEvent::SessionSwitched(session_id) => LiveWireEvent::SessionSwitched { session_id },
         LiveEvent::Turn(te) => match te {

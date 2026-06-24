@@ -368,6 +368,7 @@ export function App() {
             onLiveTurnDone={() => setSessionListVersion((v) => v + 1)}
             onOptimisticSession={handleOptimisticSession}
             onOpenCwd={() => setShowCwd(true)}
+            onCwdChanged={setCwd}
             onLanding={setIsLanding}
             skillInsert={skillInsert}
           />

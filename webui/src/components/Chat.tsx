@@ -108,6 +108,9 @@ interface ChatProps {
   onOptimisticSession?: (title: string) => void;
   /** 打开工作目录选择器（cwd 面包屑已从顶栏移到输入框下方，由本组件渲染）。 */
   onOpenCwd?: () => void;
+  /** 另一端（TUI /cd、worktree、其他 webui tab）切了工作目录：实时流送来 working_dir
+   *  事件时上报新路径，供 App 更新 cwd 面包屑 + 侧栏目录过滤。 */
+  onCwdChanged?: (dir: string) => void;
   /** 上报是否处于落地（空对话）态，供 App 决定是否显示会话标题头。 */
   onLanding?: (landing: boolean) => void;
   /** 侧栏「技能」菜单选中的技能：变化时把 `/name ` 插入输入框。 */
@@ -278,7 +281,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onLanding, skillInsert }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -603,6 +606,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 模型切换是进程级（全局），与正在查看哪个会话无关 → 不门控，始终更新下拉框。
     if (e.type === 'provider') {
       setProvider(e.provider);
+      return;
+    }
+    // 工作目录切换是进程级（另一端 /cd），与查看哪个会话无关 → 不门控，始终上报
+    // 让 App 更新 cwd 面包屑 + 侧栏目录过滤。会话本身不变（对话保留）。
+    if (e.type === 'working_dir') {
+      onCwdChanged?.(e.working_dir);
       return;
     }
     // 会话切换：另一端（webui 新建对话 / TUI /session）创建了新会话，
