@@ -17,7 +17,7 @@
 //! TUI), so this is dead code with zero behavior change until the wiring step.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
@@ -452,6 +452,38 @@ impl NativeRuntime {
         }
     }
 
+    /// `/undo`: truncate the conversation to BEFORE the `nth` user prompt (None = the last
+    /// turn), persist + respawn from it, and report the restored prompt. Runs on the
+    /// kernel snapshot fetched by the `UndoToPrompt` handler.
+    async fn do_undo(
+        &mut self,
+        messages: Vec<atomcode_kernel::message::Message>,
+        nth: Option<usize>,
+    ) {
+        match atomcode_coding::undo::compute_undo(&messages, nth) {
+            Err((requested, available)) => self.emit(UiEvent::UndoFailed { requested, available }),
+            Ok(undo) => {
+                let core_msgs: Vec<_> =
+                    undo.truncated.iter().map(convert::message_to_core).collect();
+                // Persist the truncated history, then respawn so the engine continues from
+                // exactly it (monotonic ids; approval + plan mode kept).
+                if let Some(b) = self.parts.session.as_ref() {
+                    let _ = b.manager.save_snapshot(
+                        &self.bridge_session,
+                        &SessionSnapshot::new(undo.truncated),
+                    );
+                }
+                self.respawn(SessionMode::Resume(self.bridge_session.clone())).await;
+                self.emit(UiEvent::ConversationTruncated {
+                    snapshot: ConversationSnapshot { messages: core_msgs, cold_summaries: vec![] },
+                    restored_prompt: undo.restored_prompt,
+                    target_n: undo.target_n,
+                    prompts_before: undo.prompts_before,
+                });
+            }
+        }
+    }
+
     fn answer_approval(&mut self, resp: ApprovalResponse) {
         if let Some((id, _tool)) = self.pending_approval.take() {
             let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
@@ -465,7 +497,33 @@ impl NativeRuntime {
     async fn on_command(&mut self, cmd: CoreCmd) -> bool {
         match cmd {
             CoreCmd::SendMessage { text, images, .. } => {
+                // Degraded mode (noop kernel handle): the message would be forwarded to a
+                // draining task and silently dropped, leaving the TUI spinning forever.
+                // Answer with an Error so the user sees feedback immediately.
+                if self.degraded {
+                    self.emit(UiEvent::Error {
+                        error: "engine failed to initialise — the kernel agent is not running. \
+                                Use /model to switch to a working provider, or restart atomcode."
+                            .into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                    return false;
+                }
                 self.start_turn_stats();
+                // Prepend any pending context that must ride in on this turn but does NOT
+                // itself start one: a just-toggled plan-mode note, then accumulated `!cmd`
+                // outputs. Kept out of the system prompt (like v1) so it never zeroes the
+                // prefix cache.
+                let mut prefix = String::new();
+                if let Some(note) = self.pending_plan_note.take() {
+                    prefix.push_str(&note);
+                    prefix.push_str("\n\n");
+                }
+                for sh in self.pending_local_shell.drain(..) {
+                    prefix.push_str(&sh);
+                    prefix.push_str("\n\n");
+                }
+                let text = if prefix.is_empty() { text } else { format!("{prefix}{text}") };
                 let images = images.iter().map(convert::image_to_kernel).collect();
                 let _ = self.handle.commands.send(KCmd::SendMessage { text, images });
             }
@@ -642,11 +700,101 @@ impl NativeRuntime {
             CoreCmd::RefreshContextStats => {
                 self.emit(context_stats_event(self.last_usage.as_ref(), &self.coding_cfg));
             }
+            CoreCmd::SetPlanMode(on) => {
+                let was = self.parts.plan_mode.swap(on, std::sync::atomic::Ordering::Relaxed);
+                // Only note an ACTUAL toggle (idempotent SetPlanMode is a no-op). The note
+                // is delivered with the next user message (see SendMessage); the
+                // PlanModeGate enforces the read-only constraint every turn regardless.
+                if was != on {
+                    self.pending_plan_note = Some(
+                        if on {
+                            "[PLAN MODE ACTIVATED] You are now in plan mode: only read-only tools \
+                             are available — do NOT edit, create, or delete anything. Explore and \
+                             present a detailed plan for the user to approve before making changes."
+                        } else {
+                            "[PLAN MODE ENDED] Plan mode is off. You may now edit files and carry \
+                             out the plan."
+                        }
+                        .to_string(),
+                    );
+                }
+            }
+            CoreCmd::Background { task } => {
+                use std::sync::atomic::Ordering;
+                if self.background_running.swap(true, Ordering::AcqRel) {
+                    self.emit(UiEvent::Error {
+                        error: "A background task is already running. Wait for it to finish."
+                            .into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                } else {
+                    // Build the provider on the run loop (the factory isn't Clone, so it
+                    // can't move into the spawned task), then a SEPARATE one-shot agent runs
+                    // the task off to the side; its intermediate events stay internal — only
+                    // the final BackgroundComplete surfaces. (Unlike v1: no auto-commit.)
+                    match (self.factory)(&self.coding_cfg) {
+                        Ok(provider) => {
+                            tokio::spawn(run_background_task(
+                                self.coding_cfg.clone(),
+                                provider,
+                                self.ev_tx.clone(),
+                                self.background_running.clone(),
+                                task,
+                            ));
+                        }
+                        Err(e) => {
+                            self.emit(UiEvent::BackgroundComplete {
+                                summary: format!("background setup failed: {e}"),
+                                files_edited: vec![],
+                                turns: 0,
+                                success: false,
+                            });
+                            self.background_running.store(false, Ordering::Release);
+                        }
+                    }
+                }
+            }
+            CoreCmd::UndoToPrompt { nth } => {
+                // Need the current conversation to truncate against — fetch it; the Snapshot
+                // reply runs `do_undo`.
+                self.pending_undo = Some(nth);
+                let _ = self.handle.commands.send(KCmd::Snapshot);
+            }
+            CoreCmd::LocalShell { cmd } => {
+                let cmd = cmd.trim().to_string();
+                if cmd.is_empty() {
+                    return false;
+                }
+                let cwd = self
+                    .parts
+                    .shared_cwd
+                    .read()
+                    .map(|p| p.clone())
+                    .unwrap_or_else(|_| self.coding_cfg.working_dir.clone());
+                let call_id = format!("local-shell-{}", self.local_shell_seq);
+                self.local_shell_seq += 1;
+                // Show it as a bash tool row in the driver (started → result).
+                self.emit(UiEvent::ToolCallStarted {
+                    id: call_id.clone(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({ "command": cmd }).to_string(),
+                });
+                let start = Instant::now();
+                let (display, context, success) =
+                    atomcode_capabilities::local_shell::run(&cmd, &cwd).await;
+                self.emit(UiEvent::ToolCallResult {
+                    call_id,
+                    name: "bash".into(),
+                    output: display,
+                    success,
+                    duration: start.elapsed(),
+                });
+                // The model sees the output on the NEXT turn (no LLM turn now).
+                self.pending_local_shell.push(context);
+            }
             CoreCmd::Shutdown => return true,
-            // Orchestration not yet wired (B2 ③ follow-up): SetGoal/ClearGoal,
-            // vision preprocessing on SendMessage, Background, UndoToPrompt, ChangeDir,
-            // LocalShell, Remember/Forget/ShowMemory, SetPlanMode, ReloadConfig/Hooks,
-            // SetConversation/SetSessionId/AppendInput. Tracked in memory.
+            // Orchestration not yet wired (B2 ③ follow-up): SetGoal/ClearGoal (A.3) and
+            // vision preprocessing on SendMessage (A.4). Tracked in memory.
             _ => {}
         }
         false
@@ -695,10 +843,15 @@ impl NativeRuntime {
                     .send(KCmd::Respond { id, value: serde_json::Value::Null });
             }
             KEv::Snapshot { snapshot } => {
-                let messages = snapshot.messages.iter().map(convert::message_to_core).collect();
                 if let Some(reason) = self.pending_finish.take() {
+                    let messages =
+                        snapshot.messages.iter().map(convert::message_to_core).collect();
                     self.finish_turn(reason, messages);
+                } else if let Some(nth) = self.pending_undo.take() {
+                    self.do_undo(snapshot.messages, nth).await;
                 } else {
+                    let messages =
+                        snapshot.messages.iter().map(convert::message_to_core).collect();
                     self.emit(UiEvent::MessagesSync {
                         snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
                     });
@@ -727,6 +880,29 @@ impl NativeRuntime {
             }
         }
     }
+}
+
+/// Run a `/background` task on a SEPARATE one-shot agent (no persistence/MCP/memory — a
+/// fast isolated worker). Approvals are auto-granted (the user explicitly launched it).
+/// Intermediate events stay internal; only the final `BackgroundComplete` surfaces. Clears
+/// `flag` on exit. The provider is pre-built by the caller (the [`ProviderFactory`] isn't
+/// `Clone`, so it can't move into the spawned task). Minimal vs v1: no git auto-commit.
+async fn run_background_task(
+    coding_cfg: CodingAgentConfig,
+    provider: Arc<dyn atomcode_kernel::provider::LlmProvider>,
+    ev_tx: mpsc::UnboundedSender<UiEvent>,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    task: String,
+) {
+    use std::sync::atomic::Ordering;
+    let outcome = atomcode_coding::background::run(&coding_cfg, provider, task).await;
+    let _ = ev_tx.send(UiEvent::BackgroundComplete {
+        summary: outcome.summary,
+        files_edited: outcome.files_edited,
+        turns: outcome.turns,
+        success: outcome.success,
+    });
+    flag.store(false, Ordering::Release);
 }
 
 /// Map a driver `ProviderConfig` (the `/model`, `/effort`, `/think` controls write it,
