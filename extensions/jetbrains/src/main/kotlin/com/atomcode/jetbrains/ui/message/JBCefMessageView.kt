@@ -5,14 +5,7 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.ui.JBColor
-import com.intellij.ui.jcef.JBCefApp
-import com.intellij.ui.jcef.JBCefBrowser
-import com.intellij.ui.jcef.JBCefBrowserBase
-import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.util.ui.UIUtil
-import org.cef.browser.CefBrowser
-import org.cef.browser.CefFrame
-import org.cef.handler.CefLoadHandlerAdapter
 import java.awt.BorderLayout
 import java.awt.Color
 import javax.swing.BorderFactory
@@ -56,8 +49,7 @@ class JBCefMessageView(
     private data class WelcomeCommand(val command: String, val label: String, val action: String)
 
     // 延迟初始化：只在组件进入可显示层级后创建 JCEF 浏览器。
-    private var browser: JBCefBrowser? = null
-    private var jsQuery: JBCefJSQuery? = null
+    private var bridge: JBCefMessageBridge? = null
 
     @Volatile private var jsReady = false
     private val pendingCalls = mutableListOf<String>()
@@ -78,52 +70,29 @@ class JBCefMessageView(
     private fun scheduleBrowserInit() {
         if (!isDisplayable) return
         ApplicationManager.getApplication().invokeLater({
-            if (browser == null && isDisplayable) {
+            if (bridge == null && isDisplayable) {
                 initBrowser()
             }
         }, ModalityState.nonModal())
     }
 
     private fun initBrowser() {
-        if (!JBCefApp.isSupported()) {
+        if (!JBCefMessageBridge.isSupported()) {
             showBrowserUnavailable()
             return
         }
 
-        val b = JBCefBrowser()
-        browser = b
-        val q = JBCefJSQuery.create(b as JBCefBrowserBase)
-        jsQuery = q
-
-        add(b.component, BorderLayout.CENTER)
-
-        q.addHandler { message ->
-            when {
-                message == "js:ready" -> {
-                    markJsReady()
-                    null
-                }
-                message.startsWith("home:") -> {
+        val newBridge = JBCefMessageBridge(
+            { message ->
+                if (message.startsWith("home:")) {
                     SwingUtilities.invokeLater { onHomeAction(message.removePrefix("home:")) }
-                    null
                 }
-                else -> null
-            }
-        }
-
-        b.jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
-            override fun onLoadEnd(browser: CefBrowser?, frame: CefFrame?, httpStatusCode: Int) {
-                if (frame?.isMain == true) {
-                    browser?.executeJavaScript(
-                        "window.atomcodeHost = function(msg) { ${q.inject("msg")} }",
-                        browser.url,
-                        0,
-                    )
-                    markJsReady()
-                }
-            }
-        }, b.cefBrowser)
-        b.loadHTML(buildChatHtml())
+            },
+            { markJsReady() },
+        )
+        bridge = newBridge
+        add(newBridge.component, BorderLayout.CENTER)
+        newBridge.loadHtml(buildChatHtml())
     }
 
     private fun showBrowserUnavailable() {
@@ -138,10 +107,8 @@ class JBCefMessageView(
 
     fun dispose() {
         pendingCalls.clear()
-        jsQuery?.dispose()
-        jsQuery = null
-        browser?.dispose()
-        browser = null
+        bridge?.dispose()
+        bridge = null
     }
 
     // ── Public API ──
@@ -221,7 +188,7 @@ class JBCefMessageView(
             SwingUtilities.invokeLater(::markJsReady)
             return
         }
-        if (browser == null) return
+        if (bridge == null) return
         if (jsReady) return
         jsReady = true
         executeJs("setTheme(${gson.toJson(currentBrowserTheme())})")
@@ -243,10 +210,7 @@ class JBCefMessageView(
     }
 
     private fun executeJs(code: String) {
-        val b = browser ?: return
-        try {
-            b.cefBrowser.executeJavaScript(code, b.cefBrowser.url, 0)
-        } catch (_: Exception) { }
+        bridge?.executeJavaScript(code)
     }
 
     private fun isDarkTheme(background: Color): Boolean {
