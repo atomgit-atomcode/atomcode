@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import com.intellij.diagnostic.LoadingState
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.ui.JBColor
 import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
@@ -13,11 +14,13 @@ import org.cef.browser.CefBrowser
 import org.cef.browser.CefFrame
 import org.cef.handler.CefLoadHandlerAdapter
 import java.awt.BorderLayout
+import java.awt.Color
 import javax.swing.BorderFactory
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.SwingUtilities
 import javax.swing.Timer
+import javax.swing.UIManager
 
 /**
  * 基于 JBCefBrowser (Chromium) 的聊天消息视图。
@@ -29,6 +32,7 @@ import javax.swing.Timer
  */
 class JBCefMessageView : JPanel(BorderLayout()) {
     private val gson = Gson()
+    private data class BrowserTheme(val dark: Boolean, val bg: String, val fg: String)
 
     // 延迟初始化：避免在 IDE 启动早期访问 Registry (COMPONENTS_LOADED 之前)
     private var browser: JBCefBrowser? = null
@@ -152,6 +156,18 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     fun removeThinkingIndicator()               { sendJs("removeThinkingIndicator") }
     fun addSystemMessage(text: String)          { sendJs("addSystemMessage", text) }
     fun addAssistantEvent(text: String)         { sendJs("addAssistantEvent", text) }
+    fun addTurnSummary(label: String, rounds: Int, toolCalls: Int, duration: String, tokens: Int, failed: Boolean = false) {
+        sendRawJs(
+            "addTurnSummary(" +
+                "${gson.toJson(label)}," +
+                "$rounds," +
+                "$toolCalls," +
+                "${gson.toJson(duration)}," +
+                "$tokens," +
+                "$failed" +
+                ")"
+        )
+    }
     fun addReasoningBlock(text: String)         { sendJs("addReasoningBlock", text) }
     fun updateReasoningBlock(text: String)      { sendJs("updateReasoningBlock", text) }
     fun updateLastAssistantMessage(text: String) { sendJs("updateLastAssistantMessage", text) }
@@ -192,7 +208,7 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         if (browser == null) return
         if (jsReady) return
         jsReady = true
-        executeJs("setTheme(${isDarkTheme()})")
+        executeJs("setTheme(${gson.toJson(currentBrowserTheme())})")
         flushPending()
     }
 
@@ -200,7 +216,7 @@ class JBCefMessageView : JPanel(BorderLayout()) {
         super.updateUI()
         if (initialized) {
             SwingUtilities.invokeLater {
-                executeJs("setTheme(${isDarkTheme()})")
+                executeJs("setTheme(${gson.toJson(currentBrowserTheme())})")
             }
         }
     }
@@ -220,14 +236,28 @@ class JBCefMessageView : JPanel(BorderLayout()) {
     @Suppress("DEPRECATION")
     private fun isDarkTheme() = UIUtil.isUnderDarcula()
 
+    private fun currentBrowserTheme(): BrowserTheme {
+        val scheme = EditorColorsManager.getInstance().globalScheme
+        val bg = scheme.defaultBackground
+            ?: UIManager.getColor("EditorPane.background")
+            ?: UIUtil.getPanelBackground()
+        val fg = scheme.defaultForeground
+            ?: UIManager.getColor("EditorPane.foreground")
+            ?: UIUtil.getLabelForeground()
+        return BrowserTheme(isDarkTheme(), bg.toCss(), fg.toCss())
+    }
+
+    private fun Color.toCss(): String = "#%02x%02x%02x".format(red, green, blue)
+
     // ── Inline HTML (避免 classpath 资源加载问题) ──
 
     private fun buildChatHtml(): String {
         val markedScript = loadWebScript("/markdown/marked.min.js")
         val purifyScript = loadWebScript("/markdown/purify.min.js")
-        val dark = isDarkTheme()
-        val bg = if (dark) "#1e1e1e" else "#fff"
-        val fg = if (dark) "#d4d4d4" else "#1e1e1e"
+        val theme = currentBrowserTheme()
+        val dark = theme.dark
+        val bg = theme.bg
+        val fg = theme.fg
         val ubg = if (dark) "#094771" else "#d0e4f7"
         val ufg = if (dark) "#e0e0e0" else "#1e1e1e"
         val afg = if (dark) "#d4d4d4" else "#333"
@@ -315,6 +345,9 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 .qm .b{background:$qbg;color:$qfg;padding:6px 12px;border-radius:10px 4px 10px 10px;max-width:78%;font-size:11px}
 .rm{border-left:2px solid $rbo;background:$rbg;color:$sfg;padding:5px 9px;font-size:11px;max-width:100%;margin-bottom:2px}
 .sm{color:$sfg;font-size:11px;padding:1px 8px}
+.turn-summary{display:flex;align-items:center;gap:9px;color:$sfg;font:11px 'JetBrains Mono','Consolas',monospace;margin:8px 0 4px;opacity:.82;white-space:nowrap}
+.turn-summary:before,.turn-summary:after{content:'';height:1px;background:$cbo;flex:1;min-width:24px;opacity:.95}
+.turn-summary.failed{color:$efg}.turn-summary.failed:before,.turn-summary.failed:after{background:$ebo}
 .th{display:flex;flex-direction:column;align-items:flex-start;color:$sfg}
 .th .av{color:$vfg;font-size:11px;margin-bottom:2px}
 	.dots::after{content:'';animation:d 1.5s steps(4,end) infinite}
@@ -356,8 +389,9 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 		rbg:'#f0f4f8',rbo:'#d0d8e0',sfg:'#666666',vfg:'#4f7f3a',avbg:'#edf5e9',fileBg:'rgba(255,255,255,.55)',
 		fileIconBg:'#e4f1fa',fileIconFg:'#286c99'
 	}}
-	function setTheme(d){
-		var v=tv(!!d),s=document.getElementById('theme-override');
+	function setTheme(theme){
+		var d=typeof theme==='object'?!!theme.dark:!!theme,v=tv(d),s=document.getElementById('theme-override');
+		if(theme&&typeof theme==='object'){v.bg=theme.bg||v.bg;v.fg=theme.fg||v.fg}
 		if(!s){s=document.createElement('style');s.id='theme-override';document.head.appendChild(s)}
 		s.textContent='body{background:'+v.bg+'!important;color:'+v.fg+'!important}'+
 		'.um .u-card{background:'+v.ubg+'!important;color:'+v.ufg+'!important;border-color:'+v.ub+'!important}'+
@@ -369,7 +403,7 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 		'.tm{color:'+v.tfg+'!important}.tm details[open],.tm summary:hover{background:'+v.tbg+'!important;border-color:'+v.tbo+'!important;color:'+v.fg+'!important}'+
 		'.tm .chev,.tm .tool-dot,.tm .tool-summary,.tm .tool-status{color:'+v.sfg+'!important}.tm .tool-name,.tm pre{color:'+v.fg+'!important}.tm pre{background:'+v.cbg+'!important;border-top-color:'+v.tbo+'!important}'+
 		'.em{background:'+v.ebg+'!important;border-color:'+v.ebo+'!important;color:'+v.efg+'!important}.qm .b{background:'+v.qbg+'!important;color:'+v.qfg+'!important}'+
-		'.rm{background:'+v.rbg+'!important;border-left-color:'+v.rbo+'!important;color:'+v.sfg+'!important}.sm,.th{color:'+v.sfg+'!important}.streaming-cursor{background:'+v.afg+'!important}';
+		'.rm{background:'+v.rbg+'!important;border-left-color:'+v.rbo+'!important;color:'+v.sfg+'!important}.sm,.th,.turn-summary{color:'+v.sfg+'!important}.turn-summary:before,.turn-summary:after{background:'+v.cbo+'!important}.turn-summary.failed{color:'+v.efg+'!important}.turn-summary.failed:before,.turn-summary.failed:after{background:'+v.ebo+'!important}.streaming-cursor{background:'+v.afg+'!important}';
 	}
 	function fileParts(p){var n=String(p||'').replace(/\\/g,'/'),i=n.lastIndexOf('/');return {name:i>=0?n.substring(i+1):n,path:i>=0?n.substring(0,i):''}}
 	function fileType(n){var i=String(n||'').lastIndexOf('.');return i>=0?String(n).substring(i+1,i+5):'file'}
@@ -407,6 +441,7 @@ function addQueuedMessage(t){var d=document.createElement('div');d.className='qm
 		function removeThinkingIndicator(){var a=currentAssistant();if(a){var th=a.querySelector('.thp');if(th)th.remove()}}
 	function addSystemMessage(t){var d=document.createElement('div');d.className='sm';d.textContent=t;m.appendChild(d);last=null;sd()}
 	function addAssistantEvent(t){var d=document.createElement('div');d.className='sm';d.textContent=t;parts().appendChild(d);sd()}
+	function addTurnSummary(label,rounds,tools,duration,tokens,failed){var d=document.createElement('div');d.className='turn-summary'+(failed?' failed':'');d.textContent=(failed?'✗ ':'✓ ')+String(label||'Done')+' · '+Number(rounds||0)+' rounds · '+Number(tools||0)+' tools · '+String(duration||'0ms')+' · '+Number(tokens||0)+' tokens';m.appendChild(d);last=null;active=null;sd(true)}
 	function reasoningPreview(t){var fl=String(t||'').split('\n')[0].substring(0,80);if(String(t||'').length>fl.length)fl+='...';return '💭 思考 — '+h(fl)}
 	function addReasoningBlock(t){var p=parts(),th=p.querySelector('.thp');if(th)th.remove();var d=document.createElement('div');d.className='rm reasoning-content';d.innerHTML=reasoningPreview(t);p.insertBefore(d,p.firstChild);sd()}
 	function updateReasoningBlock(t){var p=parts(),d=p.querySelector('.reasoning-content');if(!d){addReasoningBlock(t);return}d.innerHTML=reasoningPreview(t);sd()}

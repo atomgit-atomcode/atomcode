@@ -42,6 +42,7 @@ import javax.swing.KeyStroke
 import javax.swing.Action
 import javax.swing.TransferHandler
 import javax.swing.SwingUtilities
+import javax.swing.UIManager
 import javax.swing.text.DefaultEditorKit
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
@@ -301,19 +302,18 @@ class InputPanel(
         val defaultTransferHandler = inputArea.transferHandler
         inputArea.transferHandler = object : TransferHandler() {
             override fun canImport(support: TransferSupport): Boolean =
-                support.hasImageFlavor() || defaultTransferHandler?.canImport(support) == true
+                support.hasAttachableFlavor() || defaultTransferHandler?.canImport(support) == true
 
             override fun importData(support: TransferSupport): Boolean {
-                if (support.hasImageFlavor()) {
-                    onPasteFromClipboard(support.transferable)
-                    return true
+                if (support.hasAttachableFlavor()) {
+                    if (onPasteFromClipboard(support.transferable)) return true
                 }
                 return defaultTransferHandler?.importData(support) == true
             }
         }
     }
 
-    private fun TransferHandler.TransferSupport.hasImageFlavor(): Boolean =
+    private fun TransferHandler.TransferSupport.hasAttachableFlavor(): Boolean =
         dataFlavors.any { flavor ->
             Image::class.java.isAssignableFrom(flavor.representationClass) ||
                 flavor.primaryType.equals("image", ignoreCase = true) ||
@@ -321,7 +321,8 @@ class InputPanel(
                 flavor.mimeType.lowercase().contains("public.png") ||
                 flavor.mimeType.lowercase().contains("public.tiff") ||
                 flavor.mimeType.lowercase().contains("public.jpeg") ||
-                flavor == DataFlavor.javaFileListFlavor
+                flavor == DataFlavor.javaFileListFlavor ||
+                flavor.mimeType.lowercase().contains("text/uri-list")
         }
 
     fun getInputText(): String = inputArea.text
@@ -724,10 +725,10 @@ class InputPanel(
 
     companion object {
         // JBColor(亮色, 暗色)
-        private val PANEL_BG = JBColor(0xF5F5F5, 0x1E1E1E)
-        private val INPUT_BG = JBColor(0xFFFFFF, 0x2D2D2D)
-        private val INPUT_FG = JBColor(0x333333, 0xD4D4D4)
-        private val COMPOSER_BORDER = JBColor(0xC9C9C9, 0x454545)
+        private val PANEL_BG get() = UIManager.getColor("Panel.background") ?: JBColor(0xF5F5F5, 0x1E1E1E)
+        private val INPUT_BG get() = UIManager.getColor("TextArea.background") ?: JBColor(0xFFFFFF, 0x2D2D2D)
+        private val INPUT_FG get() = UIManager.getColor("TextArea.foreground") ?: JBColor(0x333333, 0xD4D4D4)
+        private val COMPOSER_BORDER get() = UIManager.getColor("Component.borderColor") ?: JBColor(0xC9C9C9, 0x454545)
         private val SECONDARY_FG = JBColor(0x5F6368, 0xA0A0A0)
         private val PLACEHOLDER_FG = JBColor(0x7A7F86, 0x8F949B)
         private val PLACEHOLDER_SECONDARY_FG = JBColor(0x9AA0A7, 0x70757C)

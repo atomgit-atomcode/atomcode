@@ -46,6 +46,8 @@ import com.intellij.ide.ClipboardSynchronizer
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.ui.mac.foundation.Foundation
 import com.intellij.ui.mac.foundation.ID
+import com.intellij.ui.JBColor
+import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
 import java.awt.Dialog
 import java.awt.Dimension
@@ -62,12 +64,14 @@ import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
+import java.net.URI
 import java.nio.ByteBuffer
 import java.beans.PropertyChangeEvent
 import java.util.Base64
 import java.util.Locale
 import java.util.UUID
 import javax.imageio.ImageIO
+import javax.swing.BorderFactory
 import javax.swing.DefaultListModel
 import javax.swing.JButton
 import javax.swing.JCheckBox
@@ -89,6 +93,7 @@ import javax.swing.ListSelectionModel
 import javax.swing.JOptionPane
 import javax.swing.SwingUtilities
 import javax.swing.Timer
+import javax.swing.UIManager
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
@@ -157,6 +162,7 @@ class AtomCodeChatPanel(
 
     init {
         minimumSize = Dimension(MIN_CHAT_PANEL_WIDTH, MIN_CHAT_PANEL_HEIGHT)
+        applyTheme()
 
         // ── Assemble 3-zone layout ──
         add(header, BorderLayout.NORTH)
@@ -181,6 +187,22 @@ class AtomCodeChatPanel(
         applyChatSettings()
 
         refreshAfterConnect()
+    }
+
+    override fun updateUI() {
+        super.updateUI()
+        applyTheme()
+    }
+
+    private fun applyTheme() {
+        background = UIUtil.getPanelBackground()
+        border = BorderFactory.createMatteBorder(
+            1,
+            1,
+            1,
+            1,
+            UIManager.getColor("Component.borderColor") ?: JBColor.border(),
+        )
     }
 
     override fun dispose() {
@@ -847,7 +869,10 @@ class AtomCodeChatPanel(
             }
             is ChatEvent.Tokens -> { /* no-op */ }
             is ChatEvent.Warning -> streamHandler.onWarning(event.message)
-            is ChatEvent.Done -> refreshSessionList(updateCurrentTabTitle = true)
+            is ChatEvent.Done -> {
+                streamHandler.onDone(event.tokens, event.toolCalls)
+                refreshSessionList(updateCurrentTabTitle = true)
+            }
             ChatEvent.Stopped -> streamHandler.onStopped()
             is ChatEvent.Error -> streamHandler.onError(event.message)
             is ChatEvent.Unknown -> streamHandler.onUnknown(event.type)
@@ -1149,6 +1174,8 @@ class AtomCodeChatPanel(
     }
 
     private fun pasteClipboardImage(transferable: Transferable?): Boolean {
+        if (attachFilesFromTransferable(transferable)) return true
+
         val bytes = clipboardImageBytes(transferable)
         if (bytes == null) {
             val diagnosticTransferable = transferable?.takeIf { it.hasImageLikeFlavor() }
@@ -1163,6 +1190,21 @@ class AtomCodeChatPanel(
 
         attachClipboardImage(bytes)
         return true
+    }
+
+    private fun attachFilesFromTransferable(transferable: Transferable?): Boolean {
+        val files = filesFromTransferable(transferable)
+        if (files.isEmpty()) return false
+
+        var attached = false
+        files.forEach { file ->
+            val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByPath(file.absolutePath)
+            if (virtualFile != null && !virtualFile.isDirectory) {
+                attachVirtualFile(virtualFile)
+                attached = true
+            }
+        }
+        return attached
     }
 
     private fun clipboardImageBytes(transferable: Transferable?): ByteArray? {
@@ -1185,7 +1227,7 @@ class AtomCodeChatPanel(
     }
 
     private fun Transferable.hasImageLikeFlavor(): Boolean =
-        transferDataFlavors.any { it.looksLikeImageFlavor() || it == DataFlavor.javaFileListFlavor }
+        transferDataFlavors.any { it.looksLikeImageFlavor() }
 
     private fun firstImageLikeClipboardTransferable(): Transferable? {
         val copyPasteManager = CopyPasteManager.getInstance()
@@ -1332,6 +1374,50 @@ class AtomCodeChatPanel(
         }
 
         return null
+    }
+
+    private fun filesFromTransferable(transferable: Transferable?): List<File> {
+        if (transferable == null) return emptyList()
+
+        if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+            val files = try {
+                @Suppress("UNCHECKED_CAST")
+                transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<File>
+            } catch (_: Exception) {
+                null
+            }
+            if (!files.isNullOrEmpty()) return files
+        }
+
+        return transferable.transferDataFlavors
+            .filter { it.isUriListFlavor() }
+            .firstNotNullOfOrNull { flavor ->
+                val data = try {
+                    transferable.getTransferData(flavor)
+                } catch (_: Exception) {
+                    null
+                }
+                uriListToFiles(data as? String).takeIf { it.isNotEmpty() }
+            }
+            .orEmpty()
+    }
+
+    private fun DataFlavor.isUriListFlavor(): Boolean =
+        mimeType.lowercase(Locale.ROOT).contains("text/uri-list")
+
+    private fun uriListToFiles(uriList: String?): List<File> {
+        if (uriList.isNullOrBlank()) return emptyList()
+        return uriList
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }
+            .mapNotNull { value ->
+                runCatching {
+                    val uri = URI(value)
+                    if (uri.scheme.equals("file", ignoreCase = true)) File(uri) else null
+                }.getOrNull()
+            }
+            .toList()
     }
 
     private fun DataFlavor.looksLikeImageFlavor(): Boolean {
