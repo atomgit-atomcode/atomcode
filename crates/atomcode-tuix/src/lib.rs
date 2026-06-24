@@ -12,6 +12,7 @@ pub mod pricing;
 pub mod version_check;
 pub mod markdown;
 pub mod modals;
+mod native;
 pub mod platform;
 pub mod render;
 pub mod sanitize;

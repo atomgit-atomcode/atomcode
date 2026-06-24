@@ -11,6 +11,10 @@ distro-pm = ["atomcode-core/distro-pm"]
 atomcode-core = { path = "../atomcode-core" }
 atomcode-daemon = { path = "../atomcode-daemon" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
+# Native kernel consumption (B2): the runtime adapter drives a `CodingRuntime`
+# and maps kernel `AgentEvent`s into the UI event vocab, replacing the bridge.
+atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-coding = { path = "../atomcode-coding" }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 crossterm = "0.29"
