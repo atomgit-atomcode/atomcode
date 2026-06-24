@@ -69,6 +69,12 @@ impl Tool for EditFileTool {
                     .to_string(),
             );
         }
+        if a.old_string.is_empty() {
+            return err(
+                "edit_file: old_string is empty — provide the exact text fragment to replace."
+                    .to_string(),
+            );
+        }
         let path = resolve_path(&a.file_path, &ctx.working_dir);
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
@@ -77,19 +83,19 @@ impl Tool for EditFileTool {
 
         // Line-ending tolerance: read_file shows the model LF-normalized text (it does
         // `str::lines()`, which strips the `\r` from every `\r\n`), but the file on disk
-        // may be CRLF. Match literally first; if that fails, retry with the old_string's
-        // line endings coerced to the file's convention — otherwise a model that copied
-        // LF text could never match a CRLF file (and would flail forever). The new text
-        // always adopts the file's EOL so the edit never introduces mixed endings.
-        let file_eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
-        let new_string = coerce_eol(&a.new_string, file_eol);
+        // may be CRLF. Match literally first; on a literal hit the model's strings already
+        // agree with the file's bytes, so old/new are used VERBATIM. Only if the literal
+        // match fails do we coerce BOTH old_string and new_string to the file's EOL — that
+        // rescues an LF-copied edit of a CRLF file without injecting mixed endings, and
+        // (unlike coercing unconditionally) leaves verbatim edits of LF files untouched.
         let literal = content.matches(&a.old_string).count();
-        let (old_match, count) = if literal > 0 {
-            (a.old_string.clone(), literal)
+        let (old_match, new_match, count) = if literal > 0 {
+            (a.old_string.clone(), a.new_string.clone(), literal)
         } else {
-            let coerced = coerce_eol(&a.old_string, file_eol);
-            let c = content.matches(&coerced).count();
-            (coerced, c)
+            let file_eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+            let old_c = coerce_eol(&a.old_string, file_eol);
+            let c = content.matches(&old_c).count();
+            (old_c, coerce_eol(&a.new_string, file_eol), c)
         };
         if count == 0 {
             return err(format!(
@@ -106,11 +112,20 @@ impl Tool for EditFileTool {
                 path.display()
             ));
         }
+        if old_match == new_match {
+            // Originals differed (the early guard passed) but EOL-coercion collapsed them
+            // to the same bytes → the replacement would be a silent no-op.
+            return err(
+                "edit_file: old_string and new_string are identical after line-ending \
+                 normalization — nothing to change."
+                    .to_string(),
+            );
+        }
 
         let updated = if a.replace_all {
-            content.replace(&old_match, &new_string)
+            content.replace(&old_match, &new_match)
         } else {
-            content.replacen(&old_match, &new_string, 1)
+            content.replacen(&old_match, &new_match, 1)
         };
         if let Err(e) = tokio::fs::write(&path, &updated).await {
             return err(format!(
@@ -277,6 +292,52 @@ mod tests {
         assert!(!r.is_error, "CRLF file must match an LF old_string: {}", r.content);
         let on_disk = std::fs::read_to_string(d.path().join("router.js")).unwrap();
         assert_eq!(on_disk, "  path: '/proxyCase',\r\n  next: 1,\r\n", "must stay CRLF: {on_disk:?}");
+    }
+
+    // A literal match must write new_string VERBATIM — never coerce its line endings.
+    // Here a mostly-LF file has one stray CRLF line; editing an LF region must NOT force
+    // the replacement to CRLF (that would inject mixed endings, the opposite of intent).
+    #[tokio::test]
+    async fn literal_match_writes_new_verbatim_no_crlf_injection() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("m.txt"), "head\r\nalpha\nbeta\n").unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"m.txt","old_string":"alpha\nbeta","new_string":"alpha\nBETA"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        // The edited LF region stays LF; the unrelated CRLF line is untouched.
+        assert_eq!(std::fs::read_to_string(d.path().join("m.txt")).unwrap(), "head\r\nalpha\nBETA\n");
+    }
+
+    // old_string and new_string that differ ONLY by line-ending form collapse to the
+    // same bytes after normalization → a no-op; it must be refused, not reported as a
+    // successful edit.
+    #[tokio::test]
+    async fn eol_only_difference_is_rejected_as_noop() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("c.txt"), "a\r\nb\r\n").unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"c.txt","old_string":"a\nb","new_string":"a\r\nb"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "a no-op edit must be refused: {}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("c.txt")).unwrap(), "a\r\nb\r\n", "unchanged");
+    }
+
+    #[tokio::test]
+    async fn empty_old_string_is_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "abc").unwrap();
+        let r = EditFileTool
+            .execute(r#"{"file_path":"a.txt","old_string":"","new_string":"X","replace_all":true}"#, &ctx(d.path()))
+            .await;
+        assert!(r.is_error, "empty old_string must be refused (would insert everywhere): {}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "abc", "unchanged");
     }
 
     #[tokio::test]

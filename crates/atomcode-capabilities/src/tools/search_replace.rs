@@ -69,6 +69,9 @@ impl Tool for SearchReplaceTool {
                 ))
             }
         };
+        if a.search.is_empty() {
+            return err("search_replace: search is empty — an empty pattern would corrupt every file.".to_string());
+        }
         let root = resolve_path(a.path.as_deref().unwrap_or("."), &ctx.working_dir);
         if !root.exists() {
             return err(format!("search_replace: directory not found: {}", root.display()));
@@ -182,17 +185,24 @@ fn sr_scan(
                 (re.replace_all(&content, replace).to_string(), re.find_iter(&content).count())
             }
             None => {
-                // Literal mode: coerce the search/replace line endings to THIS file's
-                // convention so an LF-copied multi-line search matches a CRLF file (and
-                // the edit doesn't introduce mixed endings). Plain string replace keeps
-                // `$1` etc. verbatim — no capture-group expansion.
-                let file_eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
-                let needle = coerce_eol(search, file_eol);
-                let count = content.matches(&needle).count();
+                // Literal mode. Match verbatim first; on a literal hit the search already
+                // agrees with the file's bytes, so search/replace are used as-is. Only if
+                // that fails do we coerce BOTH to THIS file's EOL — rescuing an LF-copied
+                // multi-line search against a CRLF file without injecting mixed endings.
+                // Plain string replace keeps `$1` etc. verbatim (no capture-group expansion).
+                let literal = content.matches(search).count();
+                let (needle, repl, count) = if literal > 0 {
+                    (search.to_string(), replace.to_string(), literal)
+                } else {
+                    let file_eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+                    let n = coerce_eol(search, file_eol);
+                    let c = content.matches(&n).count();
+                    (n, coerce_eol(replace, file_eol), c)
+                };
                 if count == 0 {
                     continue;
                 }
-                (content.replace(&needle, &coerce_eol(replace, file_eol)), count)
+                (content.replace(&needle, &repl), count)
             }
         };
         if new_content != content {
@@ -283,6 +293,28 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "ALPHA\r\nbeta\r\n");
+    }
+
+    #[tokio::test]
+    async fn literal_match_writes_verbatim_no_crlf_injection() {
+        // Mostly-LF file with one stray CRLF line. A literal multi-line replace of an LF
+        // region must match it verbatim and NOT force the result to CRLF.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("m.txt"), "head\r\nfoo\nbar\n").unwrap();
+        let r = SearchReplaceTool
+            .execute(r#"{"search":"foo\nbar","replace":"foo\nBAR"}"#, &ctx(d.path()))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("m.txt")).unwrap(), "head\r\nfoo\nBAR\n");
+    }
+
+    #[tokio::test]
+    async fn empty_search_is_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "abc").unwrap();
+        let r = SearchReplaceTool.execute(r#"{"search":"","replace":"X"}"#, &ctx(d.path())).await;
+        assert!(r.is_error, "empty search must be refused (would corrupt every file): {}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "abc", "unchanged");
     }
 
     #[tokio::test]
