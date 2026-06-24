@@ -11,4 +11,5 @@
 #![allow(dead_code)]
 
 pub(crate) mod event;
+pub(crate) mod lifecycle;
 pub(crate) mod translate;

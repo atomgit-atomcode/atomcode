@@ -13,7 +13,8 @@
 
 use std::time::Duration;
 
-use atomcode_core::agent::AgentPhase;
+use atomcode_core::agent::{AgentPhase, TurnStopReason};
+use atomcode_core::conversation::ConversationSnapshot;
 
 /// Events sent FROM the runtime adapter TO the UI.
 ///
@@ -84,6 +85,18 @@ pub enum UiEvent {
     /// A failure. `snapshot` lets the TUI persist mid-turn state.
     Error {
         error: String,
-        snapshot: atomcode_core::conversation::ConversationSnapshot,
+        snapshot: ConversationSnapshot,
     },
+    /// Turn completed. Stats (duration/tokens/turn+tool counts) are synthesized
+    /// from the per-turn `TurnStats`; the kernel `TurnComplete` carries only a reason.
+    TurnComplete {
+        duration: Duration,
+        total_tokens: usize,
+        turn_count: usize,
+        tool_call_count: usize,
+        stop_reason: TurnStopReason,
+        snapshot: ConversationSnapshot,
+    },
+    /// Turn cancelled before completion; carries the cleaned conversation state.
+    TurnCancelled { snapshot: ConversationSnapshot },
 }
