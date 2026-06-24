@@ -76,6 +76,10 @@ impl Tool for BashTool {
         let dur = Duration::from_secs(secs);
 
         let mut cmd = build_command(&a.command);
+        // No console-window flash per command on Windows: in headless/daemon mode (e.g.
+        // the WeChat clawbot bridge) there's no console to inherit, so each cmd.exe would
+        // otherwise allocate a NEW console window on the desktop. No-op off Windows.
+        super::suppress_console_window(&mut cmd);
         cmd.current_dir(&ctx.working_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
