@@ -7101,6 +7101,49 @@ mod empty_completion_notice_tests {
     }
 }
 
+/// Raw name of the dispatch (fan-out child agents) tool whose per-child progress
+/// should stream live without Ctrl+O. Matched by DISPLAY name (via
+/// `display_tool_name`) so it's robust to the snake→Pascal transform; only couples
+/// to the tool's contract name. If the tool is renamed, progress just falls back
+/// to Ctrl+O-gated (graceful).
+const DISPATCH_TOOL_RAW_NAME: &str = "parallel_edit_files";
+
+/// Whether a tool's live `ToolOutputChunk` should stream to scrollback BY DEFAULT
+/// (i.e. without Ctrl+O verbose). True for: verbose mode on; a user-invoked `!`
+/// shell (`local-shell-…`, ran precisely to see output); or the dispatch tool,
+/// whose per-child ↻/✓/✗ progress is the whole point of running it.
+fn streams_tool_output_by_default(
+    show_tool_output: bool,
+    call_id: &str,
+    tool_display: Option<&str>,
+) -> bool {
+    show_tool_output
+        || call_id.starts_with("local-shell-")
+        || tool_display.is_some_and(|d| d == display_tool_name(DISPATCH_TOOL_RAW_NAME))
+}
+
+#[cfg(test)]
+mod tool_output_stream_gate_tests {
+    use super::{display_tool_name, streams_tool_output_by_default, DISPATCH_TOOL_RAW_NAME};
+
+    #[test]
+    fn dispatch_tool_streams_without_verbose() {
+        let disp = display_tool_name(DISPATCH_TOOL_RAW_NAME);
+        assert!(
+            streams_tool_output_by_default(false, "call-1", Some(&disp)),
+            "dispatch tool's progress must stream by default"
+        );
+    }
+
+    #[test]
+    fn verbose_and_shell_stream_other_tools_dont() {
+        assert!(streams_tool_output_by_default(true, "call-1", Some("ReadFile")));
+        assert!(streams_tool_output_by_default(false, "local-shell-7", None));
+        assert!(!streams_tool_output_by_default(false, "call-1", Some("ReadFile")));
+        assert!(!streams_tool_output_by_default(false, "call-1", None));
+    }
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -7245,11 +7288,12 @@ fn handle_agent_event(
             state.on_tool_call_started(&display);
         }
         AgentEvent::ToolOutputChunk { call_id, chunk } => {
-            // Display real-time tool output (e.g., bash stdout/stderr).
-            // Normally gated behind Ctrl+O verbose mode, but user-invoked
-            // `!` shell commands always stream in full — the user ran them
-            // precisely to see the output.
-            if state.show_tool_output || call_id.starts_with("local-shell-") {
+            // Display real-time tool output (e.g., bash stdout/stderr). Normally
+            // gated behind Ctrl+O verbose mode, but user-invoked `!` shell commands
+            // and the dispatch tool's per-child progress always stream (see
+            // `streams_tool_output_by_default`).
+            let tool_display = pending_tools.get(&call_id).map(|(d, ..)| d.as_str());
+            if streams_tool_output_by_default(state.show_tool_output, &call_id, tool_display) {
                 // Append to the scrollback as command output
                 renderer.render(UiLine::CommandOutput(chunk));
                 renderer.flush();

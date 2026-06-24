@@ -181,6 +181,9 @@ impl Tool for ParallelEditTool {
         // tokio::spawn (then awaiting the JoinHandle) keeps the child's cancel wired to
         // the parent token: if this tool future is dropped on cancel, the still-running
         // child is stopped only by `ctx.cancel.child_token()` cascading in.
+        // Dispatch header so the user sees the fan-out begin (v1 SubAgentDispatchStart
+        // parity). Per-file ↻/✓/✗ lines follow via `ctx.progress` → ToolProgress.
+        ctx.progress.emit(format!("并行编辑 {} 个文件(子代理)", a.files.len()));
         let mut handles = Vec::with_capacity(a.files.len());
         for f in &a.files {
             let task = format!(
@@ -195,8 +198,15 @@ impl Tool for ParallelEditTool {
                 .cancel_token(ctx.cancel.child_token())
                 .build();
             let path = f.path.clone();
+            // Cheap clone (Arc inside); moved into the child task so it can report the
+            // moment THIS child settles — concurrent, so lines interleave by real
+            // completion order, giving live per-file progress instead of a black box.
+            let progress = ctx.progress.clone();
             handles.push(tokio::spawn(async move {
+                progress.emit(format!("↻ {path}"));
                 let outcome = child.run_to_completion(task, AutoRespond::AllowAll).await;
+                let icon = if outcome.stop == StopReason::Stopped { "✓" } else { "✗" };
+                progress.emit(format!("{icon} {path}"));
                 (path, outcome)
             }));
         }
@@ -433,6 +443,36 @@ mod tests {
             move || Arc::new(MockProvider { reply: reply.clone() }) as Arc<dyn LlmProvider>,
             || ToolRegistry::new().mount(&[]), // children need no tools for these tests
         )
+    }
+
+    #[tokio::test]
+    async fn emits_per_file_dispatch_progress() {
+        // Real-time per-file progress (v1 SubAgentDispatch* parity): each child's
+        // start (↻) and settle (✓/✗) is surfaced via ctx.progress so the driver
+        // can stream it (AgentEvent::ToolProgress) instead of a black-box result.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let c = captured.clone();
+            ProgressSink::new(Arc::new(move |m| c.lock().unwrap().push(m)))
+        };
+        let ctx = ToolContext {
+            working_dir: std::env::temp_dir(),
+            cancel: CancellationToken::new(),
+            progress: sink,
+        };
+        let _ = tool(Some("done"))
+            .execute(
+                r#"{"files":[{"path":"a.rs","instruction":"x"},{"path":"b.rs","instruction":"y"}]}"#,
+                &ctx,
+            )
+            .await;
+        let msgs = captured.lock().unwrap();
+        // Start line per file.
+        assert!(msgs.iter().any(|m| m.contains("↻") && m.contains("a.rs")), "start a.rs: {msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("↻") && m.contains("b.rs")), "start b.rs: {msgs:?}");
+        // Settle line per file (mock provider stops cleanly → ✓).
+        assert!(msgs.iter().any(|m| m.contains("✓") && m.contains("a.rs")), "done a.rs: {msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("✓") && m.contains("b.rs")), "done b.rs: {msgs:?}");
     }
 
     #[tokio::test]
