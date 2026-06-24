@@ -6957,6 +6957,89 @@ mod approval_retract_tests {
     }
 }
 
+/// Decide the notice to surface when a turn completes having produced NO
+/// user-visible answer. Returns `Some(message)` when the turn ended NATURALLY
+/// (finish_reason=stop), made no tool calls, and rendered no visible text —
+/// e.g. a reasoning-only / `<think>`-only completion that the TUI would
+/// otherwise show as a blank bubble (the "压缩了你怎么给我结果" symptom).
+/// Returns `None` when there is a visible answer, tools ran, the reasoning is
+/// already on screen (`show_reasoning`), or the turn errored / was cancelled /
+/// hit a budget — those all have their own surfacing.
+fn empty_completion_notice(
+    rendered_visible_text: bool,
+    tool_call_count: usize,
+    saw_reasoning: bool,
+    show_reasoning: bool,
+    stop_reason: atomcode_core::agent::TurnStopReason,
+) -> Option<String> {
+    use atomcode_core::agent::TurnStopReason;
+    // Only a NATURAL stop (finish_reason=stop) can be silently blank. Budget,
+    // error, and cancel finishes already render their own labels/banners.
+    if !matches!(stop_reason, TurnStopReason::Natural) {
+        return None;
+    }
+    // A rendered answer, or tool calls (text-free tool turns are normal), means
+    // the turn was not blank from the user's perspective.
+    if rendered_visible_text || tool_call_count > 0 {
+        return None;
+    }
+    // Reasoning already on screen (Ctrl+O enabled) => the turn isn't blank.
+    if saw_reasoning && show_reasoning {
+        return None;
+    }
+    Some(if saw_reasoning {
+        "本轮模型只输出了推理、未给出正文。按 Ctrl+O 可查看推理内容；可直接重试或换个问法。".to_string()
+    } else {
+        "本轮模型未输出任何正文内容。可直接重试或换个问法。".to_string()
+    })
+}
+
+#[cfg(test)]
+mod empty_completion_notice_tests {
+    use super::empty_completion_notice;
+    use atomcode_core::agent::TurnStopReason;
+
+    #[test]
+    fn reasoning_only_hidden_gets_ctrl_o_hint() {
+        let n = empty_completion_notice(false, 0, true, false, TurnStopReason::Natural)
+            .expect("a blank reasoning-only turn must surface a notice");
+        assert!(n.contains("Ctrl+O"), "hidden reasoning should hint at Ctrl+O, got {n:?}");
+    }
+
+    #[test]
+    fn blank_no_reasoning_gets_generic_notice() {
+        let n = empty_completion_notice(false, 0, false, false, TurnStopReason::Natural)
+            .expect("a blank turn must surface a notice");
+        assert!(!n.contains("Ctrl+O"), "no reasoning => no Ctrl+O hint, got {n:?}");
+    }
+
+    #[test]
+    fn visible_text_suppresses_notice() {
+        assert!(empty_completion_notice(true, 0, true, false, TurnStopReason::Natural).is_none());
+    }
+
+    #[test]
+    fn tool_calls_suppress_notice() {
+        assert!(empty_completion_notice(false, 1, false, false, TurnStopReason::Natural).is_none());
+    }
+
+    #[test]
+    fn errored_turn_suppresses_notice() {
+        assert!(empty_completion_notice(false, 0, true, false, TurnStopReason::Error).is_none());
+    }
+
+    #[test]
+    fn cancelled_turn_suppresses_notice() {
+        assert!(empty_completion_notice(false, 0, true, false, TurnStopReason::Cancelled).is_none());
+    }
+
+    #[test]
+    fn reasoning_already_visible_suppresses_notice() {
+        // show_reasoning=true => the reasoning is on screen; the turn is not blank.
+        assert!(empty_completion_notice(false, 0, true, true, TurnStopReason::Natural).is_none());
+    }
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -7010,6 +7093,9 @@ fn handle_agent_event(
         AgentEvent::TextDelta(text) => {
             let visible = think.feed(&text);
             if !visible.is_empty() {
+                // Mark that this turn produced a real visible answer, so the
+                // TurnComplete handler does not surface a "blank turn" notice.
+                state.turn_rendered_visible_text = true;
                 // Keep the raw reply markdown for `/copy`. Clear-on-finalize:
                 // the first delta of a new turn wipes the sealed prior reply,
                 // so between turns the buffer still holds the last reply.
@@ -7026,6 +7112,10 @@ fn handle_agent_event(
             }
         }
         AgentEvent::ReasoningDelta(text) => {
+            // Record that reasoning was produced this turn REGARDLESS of
+            // visibility — the blank-turn notice uses it to say "only reasoning,
+            // press Ctrl+O" vs "no output at all".
+            state.turn_saw_reasoning = true;
             // Display reasoning/thinking content in verbose mode (Ctrl+O)
             // Only show when the user has enabled it
             if state.show_reasoning {
@@ -7416,6 +7506,19 @@ fn handle_agent_event(
                     },
                 ),
             );
+            // A turn that finished NATURALLY but produced no visible answer
+            // (reasoning-only / `<think>`-only) would otherwise render as a
+            // blank bubble — surface a notice so the user isn't left staring at
+            // an empty reply with a big token count (the "怎么不给我结果" case).
+            if let Some(notice) = empty_completion_notice(
+                state.turn_rendered_visible_text,
+                tool_call_count,
+                state.turn_saw_reasoning,
+                state.show_reasoning,
+                stop_reason,
+            ) {
+                renderer.render(UiLine::Warning(notice));
+            }
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
             let errored = matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error);

@@ -73,6 +73,68 @@ fn retry_reason(e: &crate::stream::ProviderError) -> &'static str {
     }
 }
 
+/// Build the user-facing message shown when the empty-response retry budget is
+/// exhausted. Honest about cause: a content-free 200 from some OpenAI-compatible
+/// gateways is a LIKELY symptom of an over-/near-window request, so when the
+/// outgoing prompt is `>= 90%` of the model's context window we SAY that (and
+/// suggest `/compact`) instead of asserting "与上下文长度无关". That
+/// size-independent claim is reserved for requests comfortably within the window
+/// (where an empty 200 really is upstream flakiness), or kept for the malformed
+/// case. `ctx_window == 0` (window unknown) can never claim an over-size cause.
+fn empty_exhaustion_message(
+    saw_malformed: bool,
+    est_prompt_tokens: u32,
+    ctx_window: u32,
+    max_retries: u32,
+    already_advised: bool,
+) -> String {
+    if saw_malformed {
+        return format!(
+            "模型连续 {max_retries} 次返回无法解析的响应（上游偶发）。可直接重试，或稍后再试。"
+        );
+    }
+    // u64 to avoid overflow on the *10 / *9 scaling for very large windows.
+    let near_or_over_window =
+        ctx_window > 0 && (est_prompt_tokens as u64) * 10 >= (ctx_window as u64) * 9;
+    if near_or_over_window && already_advised {
+        // The pre-send over-window advisory already explained the size cause and
+        // the remedy this turn — don't repeat the full size-blame. Keep a SHORT
+        // terminal that points back to it.
+        format!(
+            "模型连续 {max_retries} 次返回空响应。如开头所述，本次请求已超过模型上下文窗口——请精简输入或 /compact 后重试。"
+        )
+    } else if near_or_over_window {
+        format!(
+            "模型连续 {max_retries} 次返回空响应。当前请求约 {}K tokens，已接近或超过模型上下文窗口（约 {}K），很可能是请求过大所致。建议 /compact 或精简输入后重试。",
+            est_prompt_tokens / 1000,
+            ctx_window / 1000,
+        )
+    } else {
+        format!(
+            "模型连续 {max_retries} 次返回空响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。"
+        )
+    }
+}
+
+/// Pre-send advisory: when the estimated OUTGOING request already meets or
+/// exceeds the model's context window, warn the user BEFORE the (likely-doomed)
+/// request. Some OpenAI-compatible gateways answer an over-window prompt with a
+/// content-free 200 instead of a 4xx, which would otherwise silently burn the
+/// empty-response retry budget. Compaction can't shrink the live user message
+/// being asked about, so the actionable advice is to trim input / `/compact` /
+/// use a larger-window model. Returns `None` within the window or when the
+/// window is unknown (`ctx_window == 0`).
+fn over_window_advisory(est_prompt_tokens: u32, ctx_window: u32) -> Option<String> {
+    if ctx_window == 0 || (est_prompt_tokens as u64) < (ctx_window as u64) {
+        return None;
+    }
+    Some(format!(
+        "本次请求约 {}K tokens，已达到或超过当前模型的上下文窗口（约 {}K），模型可能直接返回空响应。建议先用 /compact 压缩历史；若仍超限（单条输入本身过大），请精简输入或改用更大窗口的模型。",
+        est_prompt_tokens / 1000,
+        ctx_window / 1000,
+    ))
+}
+
 /// Enforce the kernel's tool-result size cap on `result.content`, IN PLACE.
 ///
 /// Contract:
@@ -773,6 +835,11 @@ impl RunningAgent {
         // the budget is per-turn (mirrors v1's per-user-message `empty_response_retries`)
         // so a model that keeps returning empty across rounds can't spin forever.
         let mut empty_retries: u32 = 0;
+        // Whether the PRE-SEND over-window advisory has fired this turn. Gates it
+        // to once per turn (robust to the empty-retry / provider-retry `round -= 1`
+        // decrements that reset `round` to 1) AND tells the empty-exhaustion
+        // terminal not to repeat the same size-blame.
+        let mut over_window_warned = false;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -804,6 +871,22 @@ impl RunningAgent {
             let start = self.clock.now_millis();
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
+            // PRE-SEND over-window advisory (at most ONCE per turn — the
+            // `over_window_warned` latch survives the empty-retry / provider-retry
+            // `round -= 1` decrements that would otherwise re-trip a round-based
+            // guard). If the outgoing request already meets/exceeds the model
+            // window, warn BEFORE the (likely-doomed) request rather than after
+            // burning the empty-retry budget on a gateway that answers over-window
+            // with a content-free 200.
+            if !over_window_warned {
+                let est: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
+                if let Some(advisory) =
+                    over_window_advisory(est, self.provider.context_window())
+                {
+                    over_window_warned = true;
+                    self.rt.emit(AgentEvent::Warning(advisory));
+                }
+            }
             // CACHE-PREFIX GUARD: pre_request is documented APPEND-ONLY at the tail — it
             // may add EPHEMERAL reminders but must not mutate / insert / delete WITHIN the
             // stored history. The hook runs on a per-request CLONE, so STORAGE is safe
@@ -1117,15 +1200,18 @@ impl RunningAgent {
                 // (StopReason::ProviderError) rather than the silent Stopped below. The
                 // snapshot is preserved (finish_turn does not roll back), so the user
                 // can simply resend.
-                let msg = if saw_malformed {
-                    format!(
-                        "模型连续 {EMPTY_RESPONSE_MAX_RETRIES} 次返回无法解析的响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。"
-                    )
-                } else {
-                    format!(
-                        "模型连续 {EMPTY_RESPONSE_MAX_RETRIES} 次返回空响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。"
-                    )
-                };
+                // Size-aware wording: estimate the OUTGOING request tokens and
+                // compare to the model window. An empty 200 at/over the window is
+                // very likely a too-large request, so don't assert it's
+                // context-independent — point at /compact instead.
+                let est_prompt: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
+                let msg = empty_exhaustion_message(
+                    saw_malformed,
+                    est_prompt,
+                    self.provider.context_window(),
+                    EMPTY_RESPONSE_MAX_RETRIES,
+                    over_window_warned,
+                );
                 self.hooks.on_error(&msg).await;
                 self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
                 self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
@@ -1804,6 +1890,83 @@ impl AgentBuilder {
             session_id: self.session_id,
             clock: self.clock,
         }
+    }
+}
+
+#[cfg(test)]
+mod empty_exhaustion_message_tests {
+    use super::empty_exhaustion_message;
+
+    #[test]
+    fn size_aware_when_near_or_over_window() {
+        // 339k prompt into a 200k window (170%) must blame request size, NOT
+        // assert it's context-independent.
+        let m = empty_exhaustion_message(false, 339_000, 200_000, 5, false);
+        assert!(m.contains("请求过大"), "over-window must blame size: {m}");
+        assert!(
+            !m.contains("与上下文长度无关"),
+            "must not claim size-independent over window: {m}"
+        );
+    }
+
+    #[test]
+    fn upstream_framing_when_comfortably_within_window() {
+        let m = empty_exhaustion_message(false, 5_000, 200_000, 5, false);
+        assert!(m.contains("与上下文长度无关"), "small request keeps upstream framing: {m}");
+        assert!(!m.contains("请求过大"), "{m}");
+    }
+
+    #[test]
+    fn unknown_window_cannot_claim_over_size() {
+        // window unknown (0) — never attribute to size even with a huge estimate.
+        let m = empty_exhaustion_message(false, 999_999, 0, 5, false);
+        assert!(!m.contains("请求过大"), "unknown window cannot claim over-size: {m}");
+    }
+
+    #[test]
+    fn malformed_keeps_distinct_wording_and_no_size_blame() {
+        let m = empty_exhaustion_message(true, 339_000, 200_000, 5, false);
+        assert!(m.contains("无法解析"), "malformed keeps its wording: {m}");
+        assert!(!m.contains("请求过大"), "malformed is not size-attributed: {m}");
+    }
+
+    #[test]
+    fn already_advised_avoids_duplicating_the_full_size_blame() {
+        // When the pre-send over-window advisory already fired this turn, the
+        // exhaustion terminal must be SHORT and reference it — not repeat the
+        // full "约 NNN K tokens … 接近或超过窗口" blurb (the double-show fix).
+        let m = empty_exhaustion_message(false, 339_000, 200_000, 5, true);
+        assert!(m.contains("如开头"), "should point back to the earlier advisory: {m}");
+        assert!(!m.contains("约"), "must not restate the token estimate: {m}");
+        assert!(m.contains("/compact"), "still actionable: {m}");
+    }
+}
+
+#[cfg(test)]
+mod over_window_advisory_tests {
+    use super::over_window_advisory;
+
+    #[test]
+    fn fires_at_or_over_window() {
+        assert!(over_window_advisory(200_000, 200_000).is_some(), "exactly at window must warn");
+        assert!(over_window_advisory(339_000, 200_000).is_some(), "over window must warn");
+    }
+
+    #[test]
+    fn silent_within_window() {
+        assert!(over_window_advisory(150_000, 200_000).is_none());
+    }
+
+    #[test]
+    fn silent_when_window_unknown() {
+        assert!(over_window_advisory(999_999, 0).is_none());
+    }
+
+    #[test]
+    fn advisory_is_actionable() {
+        let m = over_window_advisory(339_000, 200_000).expect("over-window must warn");
+        assert!(m.contains("/compact"), "must suggest /compact: {m}");
+        assert!(m.contains("上下文窗口"), "must name the context window: {m}");
     }
 }
 

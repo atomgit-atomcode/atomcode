@@ -243,6 +243,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dirs 6.0.0",
+ "encoding_rs",
  "futures",
  "globset",
  "ignore",

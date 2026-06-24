@@ -106,12 +106,42 @@ pub fn register_coding_tools(reg: &mut ToolRegistry) {
 /// Resolve a model-supplied path: absolute → as-is; relative → joined to
 /// `working_dir`. NO escape enforcement (see the module trust-model note).
 pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
-    let p = Path::new(raw);
-    if p.is_absolute() {
-        p.to_path_buf()
+    if is_absolute_path(raw) {
+        PathBuf::from(raw)
     } else {
-        working_dir.join(p)
+        working_dir.join(raw)
     }
+}
+
+/// Coerce every line ending in `s` to `eol` (`"\n"` or `"\r\n"`): collapse any `\r\n`
+/// to `\n`, then expand to the target. Idempotent for `"\n"`. Used by the editors so a
+/// model that copied LF text from `read_file` (which strips `\r` via `str::lines()`) can
+/// still match — and not corrupt — a CRLF file on disk.
+pub(crate) fn coerce_eol(s: &str, eol: &str) -> String {
+    if eol == "\r\n" {
+        s.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        s.replace("\r\n", "\n")
+    }
+}
+
+/// Windows-aware absolute-path test. `Path::is_absolute()` is **platform-dependent**:
+/// on a Unix build it rejects `G:\foo` (treats the whole thing as one relative name),
+/// so `working_dir.join("G:\\…")` silently produces garbage. A coding agent receives
+/// paths for the USER's platform, which may differ from the build target (and tests
+/// must be reproducible off Windows), so we additionally recognize Windows roots:
+/// drive-letter (`C:\`, `C:/`) and UNC (`\\server\share`).
+pub(crate) fn is_absolute_path(raw: &str) -> bool {
+    if Path::new(raw).is_absolute() {
+        return true;
+    }
+    let b = raw.as_bytes();
+    // Drive-rooted: `X:\` or `X:/` (a bare `X:` is drive-RELATIVE, not absolute).
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+        return true;
+    }
+    // UNC: `\\server\share` (the `//…` form is already caught by is_absolute on Unix).
+    b.len() >= 2 && b[0] == b'\\' && b[1] == b'\\'
 }
 
 /// Directories never descended into during a walk (build artifacts / VCS / caches).
@@ -174,6 +204,20 @@ pub(crate) fn err(content: impl Into<String>) -> ToolResult {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolRegistry;
+
+    #[test]
+    fn resolve_path_treats_windows_drive_and_unc_as_absolute() {
+        let wd = Path::new("/work/proj");
+        // A Windows drive path (either slash style) must NOT be joined onto the
+        // working dir — doing so produces garbage like `/work/proj/G:\VR2024\…`
+        // and makes the agent report an existing file as "does not exist".
+        assert_eq!(resolve_path(r"G:\VR2024\keystore", wd), PathBuf::from(r"G:\VR2024\keystore"));
+        assert_eq!(resolve_path("G:/VR2024/keystore", wd), PathBuf::from("G:/VR2024/keystore"));
+        // UNC paths are absolute too.
+        assert_eq!(resolve_path(r"\\server\share\f", wd), PathBuf::from(r"\\server\share\f"));
+        // Plain relative paths still join onto the working dir.
+        assert_eq!(resolve_path("src/main.rs", wd), PathBuf::from("/work/proj/src/main.rs"));
+    }
 
     /// The canonical list of tool names `register_coding_tools` and
     /// `coding_tool_names` must agree on — the single source of truth for these

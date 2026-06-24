@@ -356,12 +356,12 @@ async fn drive_turn(
             AgentEvent::Error { message, .. } => eprintln!("\n[error] {message}"),
             AgentEvent::Warning(w) => eprintln!("[warn] {w}"),
             AgentEvent::CompactionStarted { trigger } => {
-                // The kernel only fires this when a real drain/summary will run; show a
-                // progress line for a user-typed `/compact` (matches the bridge/TUI).
-                // Auto/overflow stay silent in a headless CLI.
-                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
-                    eprintln!("[compacting …]");
-                }
+                // The kernel fires this ONLY when a real drain/summary (a multi-second
+                // LLM call) will run — manual `/compact`, overflow tier 2, OR an auto
+                // compaction that escalated past the high-water mark. Show a progress
+                // line for ALL of them so a headless run isn't silently blocked.
+                let _ = &trigger;
+                eprintln!("[compacting …]");
             }
             AgentEvent::Compacted { committed, .. } => {
                 eprintln!("[compacted{}]", if committed { "" } else { " — refused (no gain)" });
