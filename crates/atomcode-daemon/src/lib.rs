@@ -14,6 +14,7 @@ pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
 pub use live_api::live_set_provider;
+pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;
 pub mod auth_token;
 pub mod permission_bridge;
@@ -23,7 +24,7 @@ pub mod webui;
 pub(crate) use telemetry_scope::daemon_scope;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, request::Parts as RequestParts, HeaderValue, Method, StatusCode},
     response::{sse::Sse, IntoResponse, Json},
     routing::{delete, get, post},
@@ -60,6 +61,8 @@ use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
     CliOverride, CurrentContext, Event, RepoOrigin, SessionMode, Telemetry, TelemetryState,
 };
+
+const CHAT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 // ============================================================================
 // Shared DTOs for P0 API endpoints
@@ -299,6 +302,13 @@ pub struct AppState {
     /// server 绑定的地址 / 端口（供 /tunnel/status 报告远程可达性）。
     pub bind_host: String,
     pub bind_port: u16,
+    /// This instance's port-scoped webui cookie name (`atomcode_webui_<port>`),
+    /// resolved ONCE at construction from the actual bound port. Read it directly
+    /// — never re-derive the name from the bare `WEBUI_COOKIE` const at a call
+    /// site, or that site silently fails to authenticate (a sibling `/webui` on a
+    /// different localhost port would shadow the shared-jar cookie). See
+    /// [`auth_token::webui_cookie_name`].
+    pub webui_cookie_name: String,
 }
 
 /// Cached MCP registry for a specific project directory.
@@ -1161,7 +1171,7 @@ async fn serve_webui_index(
                     };
                     let cookie = format!(
                         "{}={}; Path=/; HttpOnly; SameSite=Strict",
-                        auth_token::WEBUI_COOKIE,
+                        state.webui_cookie_name,
                         token
                     );
                     return axum::response::Response::builder()
@@ -3762,6 +3772,7 @@ async fn get_tunnel_status(
             headers
                 .get(axum::http::header::COOKIE)
                 .and_then(|h| h.to_str().ok()),
+            &state.webui_cookie_name,
         )
     });
 
@@ -4049,6 +4060,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         pending_permissions: permission_bridge::PermissionResponders::new(),
         bind_host: host.clone(),
         bind_port: port,
+        // `port` here is the ACTUAL bound port (the enforce_token=true webui path
+        // pre-binds via `bind_scanning` and passes its `local_addr` port), so two
+        // instances get distinct cookie names.
+        webui_cookie_name: auth_token::webui_cookie_name(port),
     };
 
     // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。页面必须可加载，
@@ -4086,7 +4101,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Model API
         .route("/models", get(get_models))
         // Chat API
-        .route("/chat", post(chat_stream))
+        .route(
+            "/chat",
+            post(chat_stream).layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
         .route("/chat/permission", post(chat_permission))

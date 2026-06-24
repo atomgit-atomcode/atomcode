@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
-use atomcode_capabilities::compaction::StubCompaction;
+use atomcode_capabilities::compaction::{OverflowCompaction, StubCompaction};
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
-use atomcode_kernel::message::{Message, Role};
+use atomcode_kernel::message::{CompactTrigger, Message, Role};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
 use atomcode_kernel::testkit::{EchoTool, RecordingProvider};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
@@ -148,6 +148,85 @@ async fn stub_compaction_keeps_the_wire_prefix_cacheable() {
             "message {i} of the cached prefix changed between t3 and t4 (cache break)"
         );
     }
+}
+
+/// A canned "summary" provider for the compaction strategy: every summarize call yields
+/// the same one-line summary, so a DRAIN+summary is observable on the wire. (A separate
+/// RecordingProvider instance from the main agent provider.)
+fn summary_provider() -> Arc<RecordingProvider> {
+    Arc::new(RecordingProvider::new(vec![
+        vec![StreamEvent::TextDelta("SUMMARY".into()), StreamEvent::Done { truncated: false }],
+        vec![StreamEvent::TextDelta("SUMMARY".into()), StreamEvent::Done { truncated: false }],
+    ]))
+}
+
+/// END-TO-END through the REAL kernel loop with the REAL `OverflowCompaction` strategy:
+/// once utilization crosses `AUTO_DRAIN_UTILIZATION` (0.85) the AUTO task-boundary trigger
+/// ESCALATES from the gentle stub to a drain+LLM-summary — the same plan as a manual
+/// `/compact` — so auto-compaction actually reduces context instead of only folding tool
+/// results. This is the regression lock for "auto-compaction now works without /compact".
+#[tokio::test]
+async fn auto_compaction_escalates_to_summary_at_high_utilization() {
+    // usage prompt 950 vs 1000-token window → util ≈ 0.95 ≥ 0.85 → escalate. 3 turns:
+    //   t2 boundary: only 1 completed turn → nothing older than active → noop (no summary).
+    //   t3 boundary: 2 completed turns → turn 1 drainable + high util → DRAIN+SUMMARY.
+    let provider = Arc::new(
+        RecordingProvider::new(vec![
+            call_round("c1", "t1"),
+            answer_round("done1"),
+            call_round("c2", "t2"),
+            answer_round("done2"),
+            call_round("c3", "t3"),
+            answer_round("done3"),
+        ])
+        .with_ctx_window(1000),
+    );
+    let calls = provider.calls();
+
+    let mut h = Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona("persona")
+        .compaction(Arc::new(OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(summary_provider()),
+        )))
+        .compact_threshold(0.5) // util ≈ 0.95 each turn > 0.5 → auto fires every boundary
+        .build()
+        .spawn();
+
+    drive(&mut h, "turn one").await;
+    drive(&mut h, "turn two").await;
+    let t3 = drive(&mut h, "turn three").await;
+    h.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = h.task.await;
+
+    // (1) The escalation ANNOUNCED itself: CompactionStarted under an AUTO trigger. Before
+    //     the fix, Auto NEVER emitted CompactionStarted (stub-only never summarizes).
+    let started_auto = t3.iter().any(|e| {
+        matches!(e, AgentEvent::CompactionStarted { trigger: CompactTrigger::Auto { .. } })
+    });
+    assert!(
+        started_auto,
+        "auto-compaction at high util must announce a summarize (CompactionStarted/Auto)"
+    );
+
+    // (2) ...and committed a real reduction.
+    let committed = t3.iter().any(|e| matches!(e, AgentEvent::Compacted { committed: true, .. }));
+    assert!(committed, "the escalated auto-compaction must commit");
+
+    // (3) The drain+summary is observable on the wire: turn 3's request carries the synthetic
+    //     summary in place of the drained old turn (a stub-only plan never would).
+    let calls = calls.lock().unwrap();
+    let t3_req = &calls[4].0; // [0,1]=t1, [2,3]=t2, [4,5]=t3
+    assert!(
+        t3_req.iter().any(|m| m.text == "SUMMARY"),
+        "t3 request must carry the drained-history summary; got: {:?}",
+        t3_req
+            .iter()
+            .map(|m| (format!("{:?}", m.role), m.text.chars().take(16).collect::<String>()))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Byte-ish wire identity of one message (role + text + tool_calls + tool_call_id) — the

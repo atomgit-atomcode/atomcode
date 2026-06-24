@@ -425,8 +425,25 @@ pub fn assemble(
     // TelemetryHook of its own. A model-swap respawn re-runs assemble and updates it, so the
     // reviewer always uses the current (metered) provider.
     if let Some(slot) = &parts.review_provider {
+        // Tag the reviewer's rounds with surface="code_review". The sub-agent shares the
+        // HOST session_id, so without this its LlmChat events are indistinguishable from
+        // the primary loop's — the tag lets telemetry attribute review token spend.
+        let review_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
+            Some(tel) => Arc::new(
+                crate::telemetry::MeteredProvider::new(
+                    provider.clone(),
+                    tel.clone(),
+                    cfg.provider_type.as_str(),
+                    &cfg.base_url,
+                    &cfg.model,
+                    parts.session.as_ref().map(|b| b.id.as_str()),
+                )
+                .with_surface("code_review"),
+            ),
+            None => provider.clone(),
+        };
         if let Ok(mut g) = slot.write() {
-            *g = Some(metered_provider.clone());
+            *g = Some(review_provider);
         }
     }
 

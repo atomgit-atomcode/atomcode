@@ -12,13 +12,6 @@ import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { getProject, listSessions, createSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
 
-function cwdDisplay(cwd: string): { prefix: string; name: string } {
-  const clean = cwd.replace(/\/+$/, '');
-  const idx = clean.lastIndexOf('/');
-  if (idx < 0) return { prefix: '', name: cwd };
-  return { prefix: clean.slice(0, idx + 1), name: clean.slice(idx + 1) };
-}
-
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
 function readSessionIdFromUrl(): string | null {
   try {
@@ -38,6 +31,10 @@ export function App() {
   // URL 里是短 id，不能直接当完整 id 用（后端需要完整 id）；先置空，挂载后再还原。
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
+  // 首条消息发出瞬间插入的「乐观会话」：让新会话即时出现在侧栏（后端空会话不入列表，
+  // 真实标题也要等回合落盘后自动命名）。其 id 与真实会话对齐后，列表刷新会用真实条目
+  // 覆盖它（Sidebar 按 id 去重，真实条目优先），标题随之从「前 10 字」换成自动命名。
+  const [optimisticSession, setOptimisticSession] = useState<SessionMetaWithProject | null>(null);
   const [cwd, setCwd] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [showCwd, setShowCwd] = useState(false);
@@ -50,6 +47,11 @@ export function App() {
   const [headerMenuPos, setHeaderMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [headerDialog, setHeaderDialog] = useState<'rename' | 'delete' | null>(null);
   const headerMenuRef = useRef<HTMLDivElement>(null);
+  // Chat reports whether it is showing the centered landing (empty) state, so the
+  // session-title header can hide on landing (matching the design's full-bleed hero).
+  const [isLanding, setIsLanding] = useState(true);
+  // Skills picked from the sidebar Skills menu → bumped so Chat inserts `/name `.
+  const [skillInsert, setSkillInsert] = useState<{ name: string; seq: number } | null>(null);
   // 挂载时 URL 里的（短）session id；用 ref 暂存，避免被 URL 同步 effect 清掉。
   const urlSessionRef = useRef<string | null>(readSessionIdFromUrl());
   // 跳过首次 URL 同步：此时可能正等待把短 id 还原成完整会话，别先清掉参数。
@@ -79,10 +81,49 @@ export function App() {
 
   // Chat 完成首条消息后会回传它创建的 session id；若是新 id，刷新侧栏列表。
   function handleSessionAssigned(id: string) {
+    // 把乐观条目的 id 对齐到后端真实 id（落地页发送时乐观条目用的是临时 id），
+    // 这样接下来的列表刷新能按 id 去重，用真实条目（含自动命名）覆盖乐观条目。
+    setOptimisticSession((prev) => (prev && prev.id !== id ? { ...prev, id } : prev));
     if (id !== sessionId) {
       setSessionId(id);
       setSessionListVersion((v) => v + 1);
     }
+  }
+
+  // 首条消息发出瞬间：用消息前 10 字做临时标题，乐观插入侧栏（即时可见）。
+  // 优先复用已创建会话的 id / 目录（新建按钮、切目录会预建会话）；落地页直发时
+  // 还没有 id，先用临时 id，待 done 回传真实 id 后由 handleSessionAssigned 对齐。
+  function handleOptimisticSession(title: string) {
+    const now = Math.floor(Date.now() / 1000);
+    setOptimisticSession({
+      id: activeSession?.id ?? `optimistic-${now}`,
+      name: title,
+      working_dir: activeSession?.working_dir ?? cwd,
+      project_hash: activeSession?.project_hash ?? '',
+      created_at: activeSession?.created_at ?? now,
+      updated_at: now,
+      message_count: 1,
+    });
+    // 顶部标题头用的是 activeSession.name；首发时同步成临时标题（已有会话元数据时），
+    // 否则标题头会一直停在占位名 session-<ts>。落地页首发无 activeSession，标题头本就
+    // 隐藏，待回合结束列表刷新后由 handleActiveSessionMeta 回填真实标题。
+    // 但如果用户已手动重命名过会话（名称非 session-xxx 格式），则不覆盖，保护用户选择。
+    setActiveSession((prev) =>
+      prev
+        ? {
+            ...prev,
+            name: prev.name.startsWith('session-') ? title : prev.name,
+          }
+        : prev,
+    );
+  }
+
+  // 侧栏列表（重新）加载后回传当前会话的真实元数据：回合落盘后后端已自动命名，
+  // 用真实标题覆盖顶部标题头的临时标题（前 10 字）。仅在仍是同一会话且标题有变时更新。
+  function handleActiveSessionMeta(s: SessionMetaWithProject) {
+    setActiveSession((prev) =>
+      prev && prev.id === s.id && prev.name !== s.name ? { ...prev, name: s.name } : prev,
+    );
   }
 
   // ☰：移动端专用，开/关抽屉。桌面端的收起/展开由侧栏自身的按钮处理。
@@ -151,14 +192,13 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function handleNewSession() {
-    // 立即重置画布（清空消息、回到落地页），保证用户看到即时反馈
+  // 在指定目录下创建一个新会话并切过去（落地、侧栏可见）。
+  // 先重置画布回落地页给即时反馈，再异步建会话；失败则停在落地页。
+  function openNewSession(targetCwd: string | undefined) {
     setSessionId(null);
     setActiveSession(null);
-    setSidebarOpen(false);
-    // 异步在后端创建新会话，成功后切过去（Chat useEffect 加载空历史）
-    const prevCwd = cwd;
-    createSession(prevCwd || undefined)
+    setOptimisticSession(null);
+    createSession(targetCwd || undefined)
       .then((data) => {
         setSessionId(data.id);
         setActiveSession({
@@ -178,7 +218,13 @@ export function App() {
       });
   }
 
+  function handleNewSession() {
+    setSidebarOpen(false);
+    openNewSession(cwd || undefined);
+  }
+
   function handleSelectSession(session: SessionMetaWithProject) {
+    setOptimisticSession(null);
     setSessionId(session.id);
     setActiveSession(session);
     if (session.working_dir) {
@@ -187,11 +233,10 @@ export function App() {
     setSidebarOpen(false);
   }
 
-  // 切换工作目录：侧栏按新目录过滤会话，并自动进入该目录的新对话。
+  // 切换工作目录：侧栏按新目录过滤会话，并在该目录下新建一个会话（落地、侧栏可见）。
   function handlePickCwd(path: string) {
     setCwd(path);
-    setSessionId(null);
-    setActiveSession(null);
+    openNewSession(path || undefined);
   }
 
   // 删除会话：若删的是当前打开的会话，回到空白新对话。
@@ -209,8 +254,6 @@ export function App() {
     }
   }
 
-  const { prefix, name } = cwdDisplay(cwd);
-
   return (
     <div class="app">
       {/* ===== Full-height sidebar (通栏)：品牌 + 收起按钮在其顶部 ===== */}
@@ -223,118 +266,92 @@ export function App() {
         onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
         onOpenSettings={(section) => setSettingsSection(section)}
         reloadKey={sessionListVersion}
+        optimisticSession={optimisticSession}
+        onActiveSessionMeta={handleActiveSessionMeta}
         cwd={cwd}
         onSessionRenamed={handleSessionRenamed}
         onSessionDeleted={handleSessionDeleted}
+        onPickSkill={(name) => setSkillInsert({ name, seq: Date.now() })}
+        onOpenRemote={() => setSettingsSection('remote')}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
         onClick={() => setSidebarOpen(false)}
       />
 
-      {/* ===== Main column: header (cwd breadcrumb) + chat ===== */}
+      {/* ===== Main column: sticky session-title header + chat (no top bar) ===== */}
       <div class="main-column">
-        <header class="header">
-          <button
-            class="ghost-btn hamburger-btn"
-            onClick={toggleSidebar}
-            aria-label={t('header.menu')}
-            title={t('header.sessionList')}
-          >
-            ☰
-          </button>
+        {/* Mobile-only floating menu button (the old top bar carried the ☰; the
+            redesign has no top bar, so a fixed button gives mobile drawer access). */}
+        <button
+          class="mobile-menu-btn"
+          onClick={toggleSidebar}
+          aria-label={t('header.menu')}
+          title={t('header.sessionList')}
+        >
+          ☰
+        </button>
 
-          {activeSession?.name && (
-            <div class="header-session" ref={headerMenuRef}>
-              <button
-                class="header-session-name"
-                title={activeSession.name}
-                onClick={(e) => {
-                  if (headerMenuOpen) {
-                    setHeaderMenuOpen(false);
-                    return;
-                  }
-                  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                  setHeaderMenuPos({ top: r.bottom + 4, left: r.left });
-                  setHeaderMenuOpen(true);
-                }}
+        {activeSession?.name && !isLanding && (
+          <header class="session-header" ref={headerMenuRef}>
+            <button
+              class="session-title-btn"
+              title={activeSession.name}
+              onClick={(e) => {
+                if (headerMenuOpen) {
+                  setHeaderMenuOpen(false);
+                  return;
+                }
+                const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                setHeaderMenuPos({ top: r.bottom + 4, left: r.left });
+                setHeaderMenuOpen(true);
+              }}
+            >
+              <span class="session-title-text">{activeSession.name}</span>
+              <svg
+                class="session-title-chevron"
+                width="11"
+                height="11"
+                viewBox="0 0 16 16"
+                fill="none"
+                aria-hidden="true"
               >
-                <span class="header-session-text">{activeSession.name}</span>
-                <svg
-                  class="header-session-chevron"
-                  width="11"
-                  height="11"
-                  viewBox="0 0 16 16"
-                  fill="none"
-                  aria-hidden="true"
+                <path
+                  d="M4 6l4 4 4-4"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </button>
+            {headerMenuOpen && headerMenuPos && (
+              <div
+                class="item-menu"
+                style={{ top: `${headerMenuPos.top}px`, left: `${headerMenuPos.left}px` }}
+              >
+                <button
+                  class="item-menu-row"
+                  onClick={() => {
+                    setHeaderMenuOpen(false);
+                    setHeaderDialog('rename');
+                  }}
                 >
-                  <path
-                    d="M4 6l4 4 4-4"
-                    stroke="currentColor"
-                    stroke-width="1.5"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  />
-                </svg>
-              </button>
-              {headerMenuOpen && headerMenuPos && (
-                <div
-                  class="item-menu"
-                  style={{ top: `${headerMenuPos.top}px`, left: `${headerMenuPos.left}px` }}
+                  <span>{t('sidebar.rename')}</span>
+                </button>
+                <button
+                  class="item-menu-row danger"
+                  onClick={() => {
+                    setHeaderMenuOpen(false);
+                    setHeaderDialog('delete');
+                  }}
                 >
-                  <button
-                    class="item-menu-row"
-                    onClick={() => {
-                      setHeaderMenuOpen(false);
-                      setHeaderDialog('rename');
-                    }}
-                  >
-                    <span>{t('sidebar.rename')}</span>
-                  </button>
-                  <button
-                    class="item-menu-row danger"
-                    onClick={() => {
-                      setHeaderMenuOpen(false);
-                      setHeaderDialog('delete');
-                    }}
-                  >
-                    <span>{t('sidebar.delete')}</span>
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
-
-          <span class="header-spacer" />
-
-          <button
-            class="cwd-breadcrumb"
-            onClick={() => setShowCwd(true)}
-            title={t('header.switchCwd')}
-          >
-            {cwd ? (
-              <>
-                <span class="cwd-prefix">{prefix}</span>
-                <span class="cwd-name">{name || cwd}</span>
-              </>
-            ) : (
-              <span class="cwd-prefix">{t('header.noCwd')}</span>
+                  <span>{t('sidebar.delete')}</span>
+                </button>
+              </div>
             )}
-            <span class="cwd-chevron">▾</span>
-          </button>
-
-          <button
-            class="ghost-btn header-remote-btn"
-            onClick={() => setSettingsSection('remote')}
-            aria-label={t('settings.menuRemote')}
-            title={t('settings.menuRemote')}
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <rect x="4.5" y="1.5" width="7" height="13" rx="1.5" stroke="currentColor" stroke-width="1.2" />
-              <line x1="7" y1="12.3" x2="9" y2="12.3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
-            </svg>
-          </button>
-        </header>
+          </header>
+        )}
 
         <div class="session-body app-sidebar">
           <Chat
@@ -349,6 +366,11 @@ export function App() {
             activeSession={activeSession}
             restoring={restoring}
             onLiveTurnDone={() => setSessionListVersion((v) => v + 1)}
+            onOptimisticSession={handleOptimisticSession}
+            onOpenCwd={() => setShowCwd(true)}
+            onCwdChanged={setCwd}
+            onLanding={setIsLanding}
+            skillInsert={skillInsert}
           />
         </div>
       </div>

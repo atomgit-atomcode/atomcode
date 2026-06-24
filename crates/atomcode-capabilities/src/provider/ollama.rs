@@ -114,94 +114,127 @@ impl LlmProvider for OllamaProvider {
         let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg);
         super::wire_dump_request(&self.cfg.model, &body); // byte-level dump (ATOMCODE_WIRE_DUMP=1)
 
-        let policy = &self.cfg.retry;
-        let mut attempt = 1u32;
-        let resp = loop {
-            let mut req = self.client.post(&self.url).json(&body);
-            if !self.cfg.api_key.is_empty() {
-                req = req.bearer_auth(&self.cfg.api_key);
-            }
-            match req.send().await {
-                Ok(resp) => {
-                    let code = resp.status().as_u16();
-                    if !resp.status().is_success() {
-                        if retry::is_retryable_status(code) && attempt < policy.max_attempts {
-                            let wait = retry::parse_retry_after(resp.headers())
-                                .unwrap_or_else(|| retry::compute_backoff(attempt, policy));
-                            tokio::time::sleep(wait).await;
-                            attempt += 1;
-                            continue;
-                        }
-                        let text = resp.text().await.unwrap_or_default();
-                        // Ollama errors are `{"error":"..."}` (a STRING).
-                        let detail = serde_json::from_str::<Value>(&text)
-                            .ok()
-                            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(truncate_msg))
-                            .unwrap_or_else(|| truncate_msg(&text));
-                        return Err(ProviderError {
-                            retryable: retry::is_retryable_status(code),
-                            message: format!("HTTP {code}: {detail}"),
-                            http_status: Some(code),
-                            code: None,
-                        });
-                    }
-                    break resp;
-                }
-                Err(e) => {
-                    if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
-                        let wait = retry::compute_backoff(attempt, policy);
-                        tokio::time::sleep(wait).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(open_error(e));
-                }
-            }
-        };
-
+        // Open the stream. A hard failure here returns `Err` so the kernel's
+        // agent-layer open retry still applies.
+        let policy = self.cfg.retry.clone();
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let api_key = self.cfg.api_key.clone();
         let idle = self.cfg.idle_timeout;
-        let byte_stream = resp.bytes_stream();
+        let resp = open_stream(&client, &url, &body, &api_key, &policy).await?;
 
         let s = async_stream::stream! {
-            let mut dec = OllamaNdjsonDecoder::new();
-            futures::pin_mut!(byte_stream);
-            loop {
-                match tokio::time::timeout(idle, byte_stream.next()).await {
-                    Err(_elapsed) => {
-                        yield StreamEvent::Error(ProviderError {
-                            retryable: false,
-                            message: "stream idle timeout".to_string(),
-                            ..Default::default()
-                        });
-                        return;
-                    }
-                    Ok(None) => {
-                        for ev in dec.finish() { yield ev; }
-                        return;
-                    }
-                    Ok(Some(Err(e))) => {
-                        yield StreamEvent::Error(ProviderError {
-                            retryable: false,
-                            message: format!("stream read error: {e}"),
-                            ..Default::default()
-                        });
-                        return;
-                    }
-                    Ok(Some(Ok(chunk))) => {
-                        let mut saw_done = false;
-                        for ev in dec.feed(chunk.as_ref()) {
-                            if matches!(ev, StreamEvent::Done { .. }) {
-                                saw_done = true;
-                            }
-                            yield ev;
+            // v1 parity: a body that dies BEFORE any event reaches the consumer is
+            // safe to redo wholesale (nothing committed). Once an event has been
+            // emitted, retry would duplicate output, so the error surfaces verbatim.
+            const MAX_STREAM_ATTEMPTS: u32 = 2;
+            let mut stream_attempt = 1u32;
+            let mut resp = resp;
+            'reopen: loop {
+                let mut dec = OllamaNdjsonDecoder::new();
+                let mut emitted_any = false;
+                let byte_stream = resp.bytes_stream();
+                futures::pin_mut!(byte_stream);
+                loop {
+                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                        Err(_elapsed) => {
+                            yield StreamEvent::Error(ProviderError {
+                                retryable: false,
+                                message: "stream idle timeout".to_string(),
+                                ..Default::default()
+                            });
+                            return;
                         }
-                        if saw_done { return; }
+                        Ok(None) => {
+                            for ev in dec.finish() { yield ev; }
+                            return;
+                        }
+                        Ok(Some(Err(e))) => {
+                            if !emitted_any && stream_attempt < MAX_STREAM_ATTEMPTS {
+                                if let Ok(fresh) = open_stream(&client, &url, &body, &api_key, &policy).await {
+                                    stream_attempt += 1;
+                                    resp = fresh;
+                                    continue 'reopen;
+                                }
+                            }
+                            yield StreamEvent::Error(ProviderError {
+                                retryable: false,
+                                message: format!("stream read error: {e}"),
+                                ..Default::default()
+                            });
+                            return;
+                        }
+                        Ok(Some(Ok(chunk))) => {
+                            let mut saw_done = false;
+                            for ev in dec.feed(chunk.as_ref()) {
+                                emitted_any = true;
+                                if matches!(ev, StreamEvent::Done { .. }) {
+                                    saw_done = true;
+                                }
+                                yield ev;
+                            }
+                            if saw_done { return; }
+                        }
                     }
                 }
             }
         };
 
         Ok(s.boxed())
+    }
+}
+
+/// Open one `/api/chat` stream, retrying the OPEN (transient status / transport)
+/// per `policy`. Shared by the initial open and the mid-stream re-open.
+async fn open_stream(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    api_key: &str,
+    policy: &RetryPolicy,
+) -> Result<reqwest::Response, ProviderError> {
+    let mut attempt = 1u32;
+    loop {
+        let mut req = client.post(url).json(body);
+        if !api_key.is_empty() {
+            req = req.bearer_auth(api_key);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                if !resp.status().is_success() {
+                    if retry::is_retryable_status(code) && attempt < policy.max_attempts {
+                        let wait = retry::parse_retry_after(resp.headers())
+                            .unwrap_or_else(|| retry::compute_backoff(attempt, policy));
+                        tokio::time::sleep(wait).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    let text = resp.text().await.unwrap_or_default();
+                    // Ollama errors are `{"error":"..."}` (a STRING).
+                    let detail = serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(truncate_msg))
+                        .unwrap_or_else(|| truncate_msg(&text));
+                    return Err(ProviderError {
+                        retryable: retry::is_retryable_status(code),
+                        message: format!("HTTP {code}: {detail}"),
+                        http_status: Some(code),
+                        code: None,
+                    });
+                }
+                return Ok(resp);
+            }
+            Err(e) => {
+                if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
+                    let wait = retry::compute_backoff(attempt, policy);
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(open_error(e));
+            }
+        }
     }
 }
 
@@ -566,6 +599,7 @@ mod tests {
                 StreamEvent::ResponseId(_) => "response_id",
                 StreamEvent::Done { .. } => "done",
                 StreamEvent::Error(_) => "error",
+                StreamEvent::Malformed => "malformed",
             })
             .collect()
     }
@@ -643,5 +677,94 @@ mod tests {
         let mut ev = d.feed(nd(json!({"message":{"role":"assistant","content":"x"},"done":false})).as_bytes());
         ev.extend(d.finish());
         assert!(matches!(ev.last().unwrap(), StreamEvent::Done { .. }));
+    }
+
+    // ---- mid-stream re-open (v1 parity) ----
+
+    /// Fully consume one HTTP request (headers + Content-Length body) so the
+    /// client's `send()` always completes before the mock responds.
+    fn read_http_request(s: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = match s.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                let clen = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut remaining = clen.saturating_sub(buf.len() - (pos + 4));
+                while remaining > 0 {
+                    match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => remaining = remaining.saturating_sub(n),
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn midstream_eof_before_any_event_reopens_and_succeeds() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        // Connection #1 opens a chunked 200 then drops before any chunk; with
+        // nothing delivered the provider must transparently re-open, and #2 serves
+        // a valid NDJSON body.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let (mut s1, _) = listener.accept().unwrap();
+            read_http_request(&mut s1);
+            s1.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
+            s1.flush().unwrap();
+            drop(s1);
+
+            let (mut s2, _) = listener.accept().unwrap();
+            read_http_request(&mut s2);
+            let body = "{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":false}\n{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"eval_count\":1}\n";
+            s2.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{body}")
+                    .as_bytes(),
+            )
+            .unwrap();
+            s2.flush().unwrap();
+            drop(s2);
+        });
+
+        let cfg = OllamaConfig::new(format!("http://127.0.0.1:{port}"), "llama-test");
+        let provider = OllamaProvider::new(cfg).unwrap();
+
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("open should succeed");
+        let events: Vec<StreamEvent> = stream.collect().await;
+
+        let has_error = events.iter().any(|e| matches!(e, StreamEvent::Error(_)));
+        assert!(!has_error, "must not surface a mid-stream error after a clean re-open: {events:?}");
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ok", "should deliver the re-opened response: {events:?}");
+
+        let _ = handle.join();
     }
 }

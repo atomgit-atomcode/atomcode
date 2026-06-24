@@ -1,6 +1,6 @@
 //! MCP server registry - manages connections to multiple MCP servers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +41,12 @@ pub struct McpRegistry {
     /// (the first `wait_for_initial_connections` consumes it), so repeat callers
     /// check this flag and return immediately instead of burning their timeout.
     initial_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Servers marked `trust: true` in config ⇒ every tool from them is auto-approved.
+    /// `std::sync` (not tokio) RwLock because `Tool::risk` is sync and can't `.await`.
+    trusted_servers: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Per-tool auto-approve set, keyed by the full tool name `mcp__{server}__{tool}`
+    /// (from a server's `autoApprove` allowlist, or a runtime "Always" grant).
+    auto_approved_tools: Arc<std::sync::RwLock<HashSet<String>>>,
 }
 
 impl McpRegistry {
@@ -53,6 +59,8 @@ impl McpRegistry {
             connect_events: None,
             initial_ready: Arc::new(tokio::sync::Notify::new()),
             initial_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            trusted_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
         }
     }
 
@@ -67,6 +75,8 @@ impl McpRegistry {
                 connect_events: Some(tx),
                 initial_ready: Arc::new(tokio::sync::Notify::new()),
                 initial_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                trusted_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
+                auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             },
             rx,
         )
@@ -75,6 +85,51 @@ impl McpRegistry {
     /// Get a clone of the event sender, if configured.
     pub fn event_sender(&self) -> Option<mpsc::UnboundedSender<McpConnectEvent>> {
         self.connect_events.clone()
+    }
+
+    /// Whether `server` is configured `trust: true` (auto-approve all its tools).
+    pub fn is_server_trusted(&self, server: &str) -> bool {
+        self.trusted_servers.read().map(|s| s.contains(server)).unwrap_or(false)
+    }
+
+    /// Whether the full tool name (`mcp__{server}__{tool}`) is auto-approved — on a
+    /// server's `autoApprove` allowlist, or granted "Always" at runtime.
+    pub fn is_tool_auto_approved(&self, full_name: &str) -> bool {
+        self.auto_approved_tools.read().map(|s| s.contains(full_name)).unwrap_or(false)
+    }
+
+    /// Mark a server trusted at runtime (idempotent).
+    pub(crate) fn mark_server_trusted(&self, server: &str) {
+        if let Ok(mut s) = self.trusted_servers.write() {
+            s.insert(server.to_string());
+        }
+    }
+
+    /// Mark a specific full tool name auto-approved at runtime (idempotent).
+    pub(crate) fn mark_tool_auto_approved(&self, full_name: &str) {
+        if let Ok(mut s) = self.auto_approved_tools.write() {
+            s.insert(full_name.to_string());
+        }
+    }
+
+    /// Seed trust/auto-approve state from a server's config. Trust is a config
+    /// property independent of connection success, so this is safe to call before/
+    /// regardless of connecting. Idempotent.
+    fn apply_trust_from_config(&self, config: &McpServerConfig) {
+        if config.trust {
+            self.mark_server_trusted(&config.name);
+        }
+        for tool in &config.auto_approve {
+            // Accept either the bare tool name ("query") OR the already-qualified name
+            // ("mcp__server__query") that the user sees in the approval prompt — both
+            // are plausible in `autoApprove`. Normalize to the full name either way.
+            let full = if tool.starts_with("mcp__") {
+                tool.clone()
+            } else {
+                format!("mcp__{}__{}", config.name, tool)
+            };
+            self.mark_tool_auto_approved(&full);
+        }
     }
 
     /// Load MCP configuration and start connecting to servers in the background.
@@ -112,6 +167,13 @@ impl McpRegistry {
                 return registry;
             }
         };
+
+        // Seed trust/auto-approve from config up front (the background connect loop
+        // below inlines its own connect and never calls `add_server`, so it wouldn't
+        // otherwise apply trust). Independent of connection success.
+        for config in &configs {
+            registry.apply_trust_from_config(config);
+        }
 
         if !configs.is_empty() {
             let servers = registry.servers.clone();
@@ -236,6 +298,10 @@ impl McpRegistry {
 
     /// Add a server to the registry.
     pub async fn add_server(&self, config: McpServerConfig) -> Result<()> {
+        // Trust is config-based, not connection-based: record it up front so a tool's
+        // risk() can consult it (and so a reconnect after a transient failure is still
+        // trusted).
+        self.apply_trust_from_config(&config);
         let mut client: Box<dyn McpClient> = match &config.config {
             super::config::McpTransportConfig::Stdio {
                 command,
@@ -452,6 +518,8 @@ impl McpRegistry {
             connect_events: self.connect_events.clone(),
             initial_ready: self.initial_ready.clone(),
             initial_done: self.initial_done.clone(),
+            trusted_servers: self.trusted_servers.clone(),
+            auto_approved_tools: self.auto_approved_tools.clone(),
         })
     }
 }
@@ -481,6 +549,29 @@ mod tests {
     /// still record the failure into `failed_servers`, so the `/mcp`
     /// status listing surfaces it as `failed: <error>` rather than
     /// silently dropping the server from view (#300).
+    #[test]
+    fn auto_approve_accepts_bare_and_qualified_tool_names() {
+        let reg = McpRegistry::new();
+        let cfg = McpServerConfig {
+            name: "docs".to_string(),
+            source: super::super::config::McpConfigSource::Project,
+            disabled: false,
+            config: super::super::config::McpTransportConfig::Stdio {
+                command: "x".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout_ms: None,
+            },
+            trust: false,
+            auto_approve: vec!["query".to_string(), "mcp__docs__search".to_string()],
+        };
+        reg.apply_trust_from_config(&cfg);
+        assert!(reg.is_tool_auto_approved("mcp__docs__query"), "bare name should normalize");
+        assert!(reg.is_tool_auto_approved("mcp__docs__search"), "already-qualified should match");
+        assert!(!reg.is_tool_auto_approved("mcp__docs__other"));
+        assert!(!reg.is_server_trusted("docs"), "trust:false must not trust the server");
+    }
+
     #[tokio::test]
     async fn failed_stdio_connect_appears_in_server_statuses() {
         let registry = McpRegistry::new();
@@ -495,6 +586,8 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: Some(500),
             },
+            trust: false,
+            auto_approve: vec![],
         };
 
         let result = registry.add_server(config).await;

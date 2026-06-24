@@ -271,6 +271,9 @@ async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(Option
         .stderr(Stdio::piped())
         // Drop the future on timeout → kill the subprocess instead of leaking it.
         .kill_on_drop(true);
+    // Suppress the Windows console-window flash when the parent has no console
+    // (daemon/clawbot); no-op off Windows.
+    crate::process_utils::suppress_console_window(&mut cmd);
     if let Some(root) = &hook.plugin_root {
         cmd.env("CLAUDE_PLUGIN_ROOT", root);
         cmd.env("ATOMCODE_PLUGIN_ROOT", root);

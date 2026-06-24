@@ -31,6 +31,8 @@ class StreamEventHandler(
     private var activeToolName: String? = null
     private var activeToolOutput: String = ""
     private var activeToolSummary: String = ""
+    private var turnStartedAtNanos: Long = System.nanoTime()
+    private var turnSummaryShown: Boolean = false
 
     // ── Event handlers ──
 
@@ -87,7 +89,9 @@ class StreamEventHandler(
     }
 
     fun onArtifactStart(title: String?) {
-        messageView.addAssistantEvent("[Artifact] ${title ?: "untitled"} started")
+        // Artifact lifecycle events mirror content that is already present in
+        // the streamed markdown. Rendering them inline splits the text segment
+        // and causes the next delta to replay the accumulated segment.
     }
 
     fun onArtifactContent(content: String) {
@@ -96,7 +100,7 @@ class StreamEventHandler(
     }
 
     fun onArtifactEnd(id: String) {
-        messageView.addAssistantEvent("[Artifact] $id ended")
+        // See onArtifactStart: keep artifact bookkeeping out of the transcript.
     }
 
     fun onPermissionRequired(event: ChatEvent.PermissionRequest) {
@@ -106,15 +110,29 @@ class StreamEventHandler(
     fun onStopped() {
         messageView.finishAssistantTurn()
         messageView.addAssistantEvent("[Stopped]")
+        addTurnSummary("Stopped", tokens = 0, toolCalls = 0, failed = true)
     }
 
     fun onError(message: String) {
         messageView.finishAssistantTurn()
         messageView.addError(message)
+        addTurnSummary("Error", tokens = 0, toolCalls = 0, failed = true)
+        hasOutput = true
+    }
+
+    fun onWarning(message: String) {
+        messageView.addAssistantEvent("[Warning] $message")
+        hasOutput = true
     }
 
     fun onUnknown(type: String) {
         messageView.addAssistantEvent("[Unknown event] $type")
+        hasOutput = true
+    }
+
+    fun onDone(tokens: Int, toolCalls: Int) {
+        messageView.finishAssistantTurn()
+        addTurnSummary("Dialed in", tokens, toolCalls, failed = false)
     }
 
     /** 流完成时收尾：如果没有输出，清理思考指示器 */
@@ -123,6 +141,7 @@ class StreamEventHandler(
         if (!hasOutput) {
             messageView.replaceThinkingWithAssistant("(no output)")
         }
+        addTurnSummary("Dialed in", tokens = 0, toolCalls = 0, failed = false)
     }
 
     /** 重置状态，准备新一轮对话 */
@@ -134,6 +153,30 @@ class StreamEventHandler(
         activeToolName = null
         activeToolOutput = ""
         activeToolSummary = ""
+        turnStartedAtNanos = System.nanoTime()
+        turnSummaryShown = false
+    }
+
+    private fun addTurnSummary(label: String, tokens: Int, toolCalls: Int, failed: Boolean) {
+        if (turnSummaryShown) return
+        turnSummaryShown = true
+        messageView.addTurnSummary(
+            label = label,
+            rounds = 1,
+            toolCalls = toolCalls.coerceAtLeast(0),
+            duration = formatDuration(System.nanoTime() - turnStartedAtNanos),
+            tokens = tokens.coerceAtLeast(0),
+            failed = failed,
+        )
+    }
+}
+
+private fun formatDuration(nanos: Long): String {
+    val millis = (nanos / 1_000_000).coerceAtLeast(0)
+    return if (millis < 1_000) {
+        "${millis}ms"
+    } else {
+        "%.1fs".format(java.util.Locale.ROOT, millis / 1_000.0)
     }
 }
 

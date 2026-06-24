@@ -66,6 +66,7 @@ class ChatPanel(
         onClearContext = { /* clear context chips */ },
         onRemoveContext = { /* remove single context chip */ },
         onModelSelect = { /* model selector dialog - future */ },
+        onPasteFromClipboard = { false },
     )
 
     private val hostBridge = HostBridge(

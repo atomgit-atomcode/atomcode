@@ -463,3 +463,57 @@ async fn empty_response_exhaustion_fails_visibly() {
         "exhausted empty retries must fail the turn with ProviderError, not a silent Stopped"
     );
 }
+
+// ── MALFORMED response is retried with a DISTINCT notice (格式异常, not 空响应) ──
+//
+// When the adapter dropped an unparseable chunk (StreamEvent::Malformed) and the
+// round carries no content, the kernel still retries (same as an empty 200) but the
+// notice says the response was MALFORMED ("响应格式异常") rather than empty — the two
+// are different upstream faults and the wording should not conflate them.
+#[tokio::test(start_paused = true)]
+async fn malformed_response_retried_with_distinct_notice() {
+    let reg = ToolRegistry::new();
+    // Call 1: a malformed-only round (adapter dropped a garbage chunk, no content).
+    // Call 2: a clean recovery.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![StreamEvent::Malformed, StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let received = provider.received.clone();
+    let recorder = Arc::new(RecorderHook::new());
+
+    let handle = spawn_agent(provider, reg, recorder);
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut text = String::new();
+    let mut stop: Option<String> = None;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            AgentEvent::Warning(w) => warnings.push(w),
+            AgentEvent::TextDelta(t) => text.push_str(&t),
+            AgentEvent::TurnComplete { reason } => {
+                stop = Some(format!("{reason:?}"));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let calls = received.lock().unwrap().len();
+    assert_eq!(calls, 2, "a malformed (content-free) response must be RETRIED; got {calls}");
+    assert_eq!(text, "ok", "the recovered response must reach the driver");
+    assert!(
+        warnings.iter().any(|w| w.contains("格式异常") && w.contains("重试")),
+        "a malformed response must emit a格式异常 retry notice; got {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w.contains("空响应")),
+        "a malformed response must NOT use the empty-response (空响应) wording; got {warnings:?}"
+    );
+    assert_eq!(stop.as_deref(), Some("Stopped"), "the recovered turn must succeed");
+}

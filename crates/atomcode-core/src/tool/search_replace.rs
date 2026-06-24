@@ -77,7 +77,9 @@ impl Tool for SearchReplaceTool {
         // never silently inherit a prior [A] press on a safe scope.
         let parsed = match serde_json::from_str::<SearchReplaceArgs>(args) {
             Ok(p) => p,
-            Err(_) => return ApprovalRequirement::AutoApprove,
+            Err(_) => return ApprovalRequirement::RequireApproval(
+                "Cannot parse search_replace args — requiring approval for safety".to_string()
+            ),
         };
         let scope = parsed.path.as_deref().unwrap_or(".");
         if super::is_sensitive_input_path(scope) {

@@ -1,13 +1,11 @@
 package com.atomcode.jetbrains.ui
 
-import com.atomcode.jetbrains.actions.findChatPanel
 import com.atomcode.jetbrains.daemon.ConnectionState
 import com.atomcode.jetbrains.services.AtomCodeProjectService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.StatusBar
 import com.intellij.openapi.wm.StatusBarWidget
 import com.intellij.openapi.wm.StatusBarWidgetFactory
-import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.util.Consumer
 import java.awt.event.MouseEvent
 import java.beans.PropertyChangeListener
@@ -87,9 +85,7 @@ private class AtomCodeStatusBarWidget(private val project: Project) : StatusBarW
 
     override fun getClickConsumer(): Consumer<MouseEvent>? =
         Consumer {
-            ToolWindowManager.getInstance(project).getToolWindow("AtomCode")?.activate {
-                findChatPanel(project)?.focusInput()
-            }
+            openAtomCodeChatTab(project)
         }
 
     companion object {

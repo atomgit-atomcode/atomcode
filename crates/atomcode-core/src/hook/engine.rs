@@ -148,14 +148,19 @@ impl HookEngine {
 
     /// 工具执行前触发所有 PreToolExecutionHook。
     /// 返回:
-    /// - Ok(Some(json))   — 参数被修改
-    /// - Ok(None)         — 继续原样
-    /// - Err(reason)      — 被阻止
-    pub async fn trigger_pre_tool_use(&self, ctx: &HookCtx) -> Result<Option<String>, String> {
+    /// - Ok((Some(json), _))   — 参数被修改
+    /// - Ok((None, true))      — Hook 明确允许，可跳过审批
+    /// - Ok((None, false))     — 继续原样
+    /// - Err(reason)           — 被阻止
+    pub async fn trigger_pre_tool_use(&self, ctx: &HookCtx) -> Result<(Option<String>, bool), String> {
         let mut modified_args: Option<String> = None;
+        let mut explicitly_allowed = false;
         for hook in &self.pre_tool_hooks {
             match hook.on_pre_execute(ctx).await {
                 HookResult::Ok => {}
+                HookResult::ExplicitAllow => {
+                    explicitly_allowed = true;
+                }
                 HookResult::Warning(msg) => {
                     tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg);
                 }
@@ -168,7 +173,7 @@ impl HookEngine {
                 }
             }
         }
-        Ok(modified_args)
+        Ok((modified_args, explicitly_allowed))
     }
 
     /// 工具执行后并发触发所有 PostToolExecutionHook (fire-and-forget)。
@@ -657,7 +662,7 @@ impl PreToolExecutionHook for ShellCommandHook {
                     Ok(PreHookResult::Modify { args }) => HookResult::Modified(
                         serde_json::to_string(&args).unwrap_or_default(),
                     ),
-                    Ok(PreHookResult::Allow) => HookResult::Ok,
+                    Ok(PreHookResult::Allow) => HookResult::ExplicitAllow,
                     Err(_) => HookResult::Ok, // non-JSON → Allow
                 }
             }
@@ -870,7 +875,9 @@ mod tests {
         let ctx = HookCtx::new("bash".into(), "{}".into(), "/tmp".into());
         let result = engine.trigger_pre_tool_use(&ctx).await;
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        let (args, allowed) = result.unwrap();
+        assert!(args.is_none());
+        assert!(!allowed); // empty engine → no explicit allow
     }
 
     #[tokio::test]
@@ -885,7 +892,7 @@ mod tests {
         let hook = Arc::new(ShellCommandHook::from_hook_config(config));
         let ctx = HookCtx::new("bash".into(), "{}".into(), "/tmp".into());
         let result = hook.on_pre_execute(&ctx).await;
-        assert!(matches!(result, HookResult::Ok));
+        assert!(matches!(result, HookResult::ExplicitAllow));
     }
 
     #[tokio::test]

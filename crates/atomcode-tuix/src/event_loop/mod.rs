@@ -703,6 +703,14 @@ pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
     pub agent: AgentClient,
+    /// Force-exit watchdog deadline. Armed by [`arm_shutdown_watchdog`] when the
+    /// user genuinely asks to leave (`/quit`, `/exit`, a confirmed Ctrl+C). The
+    /// normal exit is the graceful break (Idle + `cmd_tx` closed); this is the
+    /// safety net for when a wedged teardown await never closes the channel, so
+    /// the user is never trapped. `None` = no quit requested. The `/upgrade`
+    /// restart path deliberately does NOT arm this — it needs the normal
+    /// `ExitReason::UpgradeRestart` return to re-exec the new binary.
+    pub shutdown_deadline: Option<std::time::Instant>,
     pub runtime_factory: AgentRuntimeFactory,
     /// Optional engine-v2 spawner; `None` ⇒ the v1 `runtime_factory`. See
     /// [`RuntimeSpawnOverride`].
@@ -3004,6 +3012,13 @@ pub struct App {
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
 
+/// Grace period after a quit request before the force-exit watchdog fires. The
+/// graceful path (engine teardown closes `cmd_tx`) normally completes in well
+/// under a second; the bridge bounds its own kernel-teardown wait at 5s, so 8s
+/// here only ever trips when even that fails — at which point hard-exiting is
+/// strictly better than trapping the user. See [`arm_shutdown_watchdog`].
+const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(8);
+
 impl App {
     fn new(caps: &crate::terminal::TerminalCaps) -> Self {
         Self {
@@ -3758,7 +3773,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     restore_cancelled_message_to_buf(&mut app, renderer, &ctx);
                 } else {
                     crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
-                    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                    arm_shutdown_watchdog(&mut ctx);
                 }
             }
 
@@ -4095,6 +4110,34 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
         if matches!(app.state.phase, UiPhase::Idle) && ctx.agent.cmd_tx.is_closed() {
             break;
+        }
+
+        // Force-exit watchdog. The graceful break above is the normal path; this
+        // only fires when a quit was requested (deadline armed by
+        // `arm_shutdown_watchdog`) but the engine teardown never closed `cmd_tx`
+        // in time — a wedged kernel/bridge await would otherwise trap the user at
+        // the prompt no matter how many times they press /quit. Re-checked every
+        // ~5ms via `deferred_render_tick`, so it trips promptly once the deadline
+        // passes. Restore the terminal first, then hard-exit (skips Drop, which is
+        // exactly why a wedged await can't stop us).
+        if ctx.shutdown_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            crate::tuix_trace!("EXIT", "shutdown watchdog fired -> hard exit (teardown wedged)");
+            let _ = ctx.history.save();
+            renderer.render(UiLine::ClearTransient);
+            renderer.shutdown();
+            // `renderer.shutdown()` restores mouse / Kitty-keyboard / scroll-region
+            // state, but NOT bracketed paste — disabling that is `TerminalGuard::Drop`'s
+            // job (lib.rs), and `process::exit(0)` skips every Drop. Emit `?2004l`
+            // directly so a force-exit doesn't strand the user's shell wrapping every
+            // paste in literal `200~`/`201~` markers.
+            {
+                use std::io::Write as _;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(b"\x1b[?2004l");
+                let _ = out.flush();
+            }
+            let _ = crossterm::terminal::disable_raw_mode();
+            std::process::exit(0);
         }
     }
 
@@ -4500,7 +4543,7 @@ fn handle_input(
                 && app.active_modal.is_some()
             {
                 app.active_modal = None;
-                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                arm_shutdown_watchdog(ctx);
                 return Ok(());
             }
             if matches!(app.state.phase, UiPhase::Idle) {
@@ -5779,7 +5822,7 @@ fn handle_idle_key(
                 .exit_pending
                 .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
             if armed {
-                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                arm_shutdown_watchdog(ctx);
             } else {
                 app.exit_pending = Some(now);
                 renderer.render(UiLine::CommandOutput(
@@ -6449,6 +6492,24 @@ fn handle_streaming_key(
     Ok(())
 }
 
+/// Request agent shutdown AND arm the force-exit watchdog. Use this for EVERY
+/// user-initiated quit (`/quit`, `/exit`, a confirmed Ctrl+C) instead of a bare
+/// `cmd_tx.send(Shutdown)`. The graceful exit (the run-loop breaks once the
+/// agent task ends and closes `cmd_tx`) still wins whenever it can; the deadline
+/// only matters if a wedged teardown await never closes the channel — then the
+/// loop hard-exits at [`SHUTDOWN_WATCHDOG`] rather than trapping the user.
+///
+/// NOT for the `/upgrade` restart path: that must exit via
+/// `ExitReason::UpgradeRestart` to re-exec, so it sends `Shutdown` directly.
+fn arm_shutdown_watchdog(ctx: &mut LoopCtx) {
+    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+    // Don't re-arm (push the deadline back) on a repeated /quit — keep the
+    // earliest deadline so spamming the key can't indefinitely defer the exit.
+    if ctx.shutdown_deadline.is_none() {
+        ctx.shutdown_deadline = Some(std::time::Instant::now() + SHUTDOWN_WATCHDOG);
+    }
+}
+
 /// Cancel the executor that owns the foreground turn.
 ///
 /// In sync mode the turn belongs to `LiveSession`; the local agent is idle and
@@ -6514,7 +6575,7 @@ fn handle_approval_key(
             .exit_pending
             .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
         if armed {
-            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            arm_shutdown_watchdog(ctx);
         } else {
             // First Ctrl+C: deny the current tool and arm the exit confirmation.
             // The goal (if any) continues; Claude Code's /goal works the same way.
@@ -6957,6 +7018,132 @@ mod approval_retract_tests {
     }
 }
 
+/// Decide the notice to surface when a turn completes having produced NO
+/// user-visible answer. Returns `Some(message)` when the turn ended NATURALLY
+/// (finish_reason=stop), made no tool calls, and rendered no visible text —
+/// e.g. a reasoning-only / `<think>`-only completion that the TUI would
+/// otherwise show as a blank bubble (the "压缩了你怎么给我结果" symptom).
+/// Returns `None` when there is a visible answer, tools ran, the reasoning is
+/// already on screen (`show_reasoning`), or the turn errored / was cancelled /
+/// hit a budget — those all have their own surfacing.
+fn empty_completion_notice(
+    rendered_visible_text: bool,
+    tool_call_count: usize,
+    saw_reasoning: bool,
+    show_reasoning: bool,
+    stop_reason: atomcode_core::agent::TurnStopReason,
+) -> Option<String> {
+    use atomcode_core::agent::TurnStopReason;
+    // Only a NATURAL stop (finish_reason=stop) can be silently blank. Budget,
+    // error, and cancel finishes already render their own labels/banners.
+    if !matches!(stop_reason, TurnStopReason::Natural) {
+        return None;
+    }
+    // A rendered answer, or tool calls (text-free tool turns are normal), means
+    // the turn was not blank from the user's perspective.
+    if rendered_visible_text || tool_call_count > 0 {
+        return None;
+    }
+    // Reasoning already on screen (Ctrl+O enabled) => the turn isn't blank.
+    if saw_reasoning && show_reasoning {
+        return None;
+    }
+    Some(if saw_reasoning {
+        "本轮模型只输出了推理、未给出正文。按 Ctrl+O 可查看推理内容；可直接重试或换个问法。".to_string()
+    } else {
+        "本轮模型未输出任何正文内容。可直接重试或换个问法。".to_string()
+    })
+}
+
+#[cfg(test)]
+mod empty_completion_notice_tests {
+    use super::empty_completion_notice;
+    use atomcode_core::agent::TurnStopReason;
+
+    #[test]
+    fn reasoning_only_hidden_gets_ctrl_o_hint() {
+        let n = empty_completion_notice(false, 0, true, false, TurnStopReason::Natural)
+            .expect("a blank reasoning-only turn must surface a notice");
+        assert!(n.contains("Ctrl+O"), "hidden reasoning should hint at Ctrl+O, got {n:?}");
+    }
+
+    #[test]
+    fn blank_no_reasoning_gets_generic_notice() {
+        let n = empty_completion_notice(false, 0, false, false, TurnStopReason::Natural)
+            .expect("a blank turn must surface a notice");
+        assert!(!n.contains("Ctrl+O"), "no reasoning => no Ctrl+O hint, got {n:?}");
+    }
+
+    #[test]
+    fn visible_text_suppresses_notice() {
+        assert!(empty_completion_notice(true, 0, true, false, TurnStopReason::Natural).is_none());
+    }
+
+    #[test]
+    fn tool_calls_suppress_notice() {
+        assert!(empty_completion_notice(false, 1, false, false, TurnStopReason::Natural).is_none());
+    }
+
+    #[test]
+    fn errored_turn_suppresses_notice() {
+        assert!(empty_completion_notice(false, 0, true, false, TurnStopReason::Error).is_none());
+    }
+
+    #[test]
+    fn cancelled_turn_suppresses_notice() {
+        assert!(empty_completion_notice(false, 0, true, false, TurnStopReason::Cancelled).is_none());
+    }
+
+    #[test]
+    fn reasoning_already_visible_suppresses_notice() {
+        // show_reasoning=true => the reasoning is on screen; the turn is not blank.
+        assert!(empty_completion_notice(false, 0, true, true, TurnStopReason::Natural).is_none());
+    }
+}
+
+/// Raw name of the dispatch (fan-out child agents) tool whose per-child progress
+/// should stream live without Ctrl+O. Matched by DISPLAY name (via
+/// `display_tool_name`) so it's robust to the snake→Pascal transform; only couples
+/// to the tool's contract name. If the tool is renamed, progress just falls back
+/// to Ctrl+O-gated (graceful).
+const DISPATCH_TOOL_RAW_NAME: &str = "parallel_edit_files";
+
+/// Whether a tool's live `ToolOutputChunk` should stream to scrollback BY DEFAULT
+/// (i.e. without Ctrl+O verbose). True for: verbose mode on; a user-invoked `!`
+/// shell (`local-shell-…`, ran precisely to see output); or the dispatch tool,
+/// whose per-child ↻/✓/✗ progress is the whole point of running it.
+fn streams_tool_output_by_default(
+    show_tool_output: bool,
+    call_id: &str,
+    tool_display: Option<&str>,
+) -> bool {
+    show_tool_output
+        || call_id.starts_with("local-shell-")
+        || tool_display.is_some_and(|d| d == display_tool_name(DISPATCH_TOOL_RAW_NAME))
+}
+
+#[cfg(test)]
+mod tool_output_stream_gate_tests {
+    use super::{display_tool_name, streams_tool_output_by_default, DISPATCH_TOOL_RAW_NAME};
+
+    #[test]
+    fn dispatch_tool_streams_without_verbose() {
+        let disp = display_tool_name(DISPATCH_TOOL_RAW_NAME);
+        assert!(
+            streams_tool_output_by_default(false, "call-1", Some(&disp)),
+            "dispatch tool's progress must stream by default"
+        );
+    }
+
+    #[test]
+    fn verbose_and_shell_stream_other_tools_dont() {
+        assert!(streams_tool_output_by_default(true, "call-1", Some("ReadFile")));
+        assert!(streams_tool_output_by_default(false, "local-shell-7", None));
+        assert!(!streams_tool_output_by_default(false, "call-1", Some("ReadFile")));
+        assert!(!streams_tool_output_by_default(false, "call-1", None));
+    }
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -7010,6 +7197,9 @@ fn handle_agent_event(
         AgentEvent::TextDelta(text) => {
             let visible = think.feed(&text);
             if !visible.is_empty() {
+                // Mark that this turn produced a real visible answer, so the
+                // TurnComplete handler does not surface a "blank turn" notice.
+                state.turn_rendered_visible_text = true;
                 // Keep the raw reply markdown for `/copy`. Clear-on-finalize:
                 // the first delta of a new turn wipes the sealed prior reply,
                 // so between turns the buffer still holds the last reply.
@@ -7026,6 +7216,10 @@ fn handle_agent_event(
             }
         }
         AgentEvent::ReasoningDelta(text) => {
+            // Record that reasoning was produced this turn REGARDLESS of
+            // visibility — the blank-turn notice uses it to say "only reasoning,
+            // press Ctrl+O" vs "no output at all".
+            state.turn_saw_reasoning = true;
             // Display reasoning/thinking content in verbose mode (Ctrl+O)
             // Only show when the user has enabled it
             if state.show_reasoning {
@@ -7094,11 +7288,12 @@ fn handle_agent_event(
             state.on_tool_call_started(&display);
         }
         AgentEvent::ToolOutputChunk { call_id, chunk } => {
-            // Display real-time tool output (e.g., bash stdout/stderr).
-            // Normally gated behind Ctrl+O verbose mode, but user-invoked
-            // `!` shell commands always stream in full — the user ran them
-            // precisely to see the output.
-            if state.show_tool_output || call_id.starts_with("local-shell-") {
+            // Display real-time tool output (e.g., bash stdout/stderr). Normally
+            // gated behind Ctrl+O verbose mode, but user-invoked `!` shell commands
+            // and the dispatch tool's per-child progress always stream (see
+            // `streams_tool_output_by_default`).
+            let tool_display = pending_tools.get(&call_id).map(|(d, ..)| d.as_str());
+            if streams_tool_output_by_default(state.show_tool_output, &call_id, tool_display) {
                 // Append to the scrollback as command output
                 renderer.render(UiLine::CommandOutput(chunk));
                 renderer.flush();
@@ -7416,6 +7611,19 @@ fn handle_agent_event(
                     },
                 ),
             );
+            // A turn that finished NATURALLY but produced no visible answer
+            // (reasoning-only / `<think>`-only) would otherwise render as a
+            // blank bubble — surface a notice so the user isn't left staring at
+            // an empty reply with a big token count (the "怎么不给我结果" case).
+            if let Some(notice) = empty_completion_notice(
+                state.turn_rendered_visible_text,
+                tool_call_count,
+                state.turn_saw_reasoning,
+                state.show_reasoning,
+                stop_reason,
+            ) {
+                renderer.render(UiLine::Warning(notice));
+            }
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
             let errored = matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error);
@@ -8329,9 +8537,12 @@ pub(crate) fn apply_session_snapshot(
     //     Role::User message for plumbing reasons. Re-derive from the
     //     next non-synthetic user turn so the /resume picker stops
     //     showing those as session titles.
-    let should_rename = session.name == "default"
-        || session.name.starts_with("session-")
-        || session.name.trim_start().starts_with('[');
+    //   * `user_renamed` — if the user explicitly renamed (via /rename),
+    //     never auto-name, regardless of name format.
+    let should_rename = !session.user_renamed
+        && (session.name == "default"
+            || session.name.starts_with("session-")
+            || session.name.trim_start().starts_with('['));
     if should_rename {
         use atomcode_core::conversation::message::Role;
         // Primary signal: `Message.synthetic` field (accurate for sessions

@@ -4,6 +4,7 @@ import com.atomcode.jetbrains.daemon.ChatEvent
 import com.atomcode.jetbrains.daemon.ChatStreamListener
 import com.atomcode.jetbrains.daemon.ConnectionState
 import com.atomcode.jetbrains.daemon.CreateProviderRequest
+import com.atomcode.jetbrains.daemon.ImageInput
 import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
 import com.atomcode.jetbrains.daemon.PatchProviderRequest
@@ -27,9 +28,11 @@ import com.atomcode.jetbrains.ui.header.HeaderPanel
 import com.atomcode.jetbrains.ui.input.InputPanel
 import com.atomcode.jetbrains.ui.input.QueuedPromptView
 import com.atomcode.jetbrains.ui.message.JBCefMessageView
+import com.atomcode.jetbrains.ui.message.MessageAttachmentView
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.fileEditor.FileDocumentManager
@@ -40,21 +43,50 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.Disposable
+import com.intellij.ide.ClipboardSynchronizer
+import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.ide.CopyPasteManager
+import com.intellij.ui.mac.foundation.Foundation
+import com.intellij.ui.mac.foundation.ID
+import com.intellij.ui.JBColor
+import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
+import java.awt.Component
 import java.awt.Dialog
 import java.awt.Dimension
+import java.awt.Font
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
+import java.awt.Image
 import java.awt.Insets
+import java.awt.Toolkit
+import java.awt.datatransfer.DataFlavor
 import java.awt.datatransfer.StringSelection
+import java.awt.datatransfer.Transferable
+import java.io.ByteArrayInputStream
+import java.awt.image.BufferedImage
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.InputStream
+import java.net.URI
+import java.nio.ByteBuffer
 import java.beans.PropertyChangeEvent
+import java.time.Duration
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Base64
+import java.util.Locale
 import java.util.UUID
+import javax.imageio.ImageIO
+import javax.swing.BorderFactory
 import javax.swing.DefaultListModel
 import javax.swing.JButton
 import javax.swing.JCheckBox
 import javax.swing.JComboBox
 import javax.swing.JDialog
+import javax.swing.ImageIcon
 import javax.swing.JLabel
 import javax.swing.JList
 import javax.swing.JMenu
@@ -66,14 +98,98 @@ import javax.swing.JScrollPane
 import javax.swing.JTextArea
 import javax.swing.JTextField
 import javax.swing.JSeparator
+import javax.swing.ListCellRenderer
 import javax.swing.ListSelectionModel
 import javax.swing.JOptionPane
 import javax.swing.SwingUtilities
 import javax.swing.Timer
+import javax.swing.UIManager
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
 private const val MAX_ATTACHED_FILE_CHARS = 120_000
+private const val CHAT_REQUEST_BODY_LIMIT_BYTES = 32 * 1024 * 1024
+private const val CHAT_REQUEST_BODY_RESERVED_BYTES = 1 * 1024 * 1024
+private const val MAX_ATTACHED_IMAGE_BYTES =
+    (CHAT_REQUEST_BODY_LIMIT_BYTES - CHAT_REQUEST_BODY_RESERVED_BYTES) * 3 / 4
+private const val MAX_ATTACHED_IMAGE_MB = MAX_ATTACHED_IMAGE_BYTES / 1024 / 1024
+private const val MIN_CHAT_PANEL_WIDTH = 360
+private const val MIN_CHAT_PANEL_HEIGHT = 300
+private const val CLIPBOARD_IMAGE_PATH_PREFIX = "clipboard-image://"
+private const val ATOMCODE_DOCS_ZH_URL = "https://atomcode.atomgit.com/docs/zh/index.html"
+private const val ATOMCODE_DOCS_EN_URL = "https://atomcode.atomgit.com/docs/en/index.html"
+
+private val SESSION_HISTORY_TODAY_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+private val SESSION_HISTORY_YEAR_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MM-dd HH:mm")
+private val SESSION_HISTORY_FULL_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+
+private fun sessionUpdatedInstant(updatedAt: Long): Instant? {
+    if (updatedAt <= 0L) return null
+    val epochMillis = if (updatedAt < 10_000_000_000L) updatedAt * 1000L else updatedAt
+    return runCatching { Instant.ofEpochMilli(epochMillis) }.getOrNull()
+}
+
+private fun formatSessionUpdatedAt(updatedAt: Long): String {
+    val instant = sessionUpdatedInstant(updatedAt) ?: return "未知"
+    val now = Instant.now()
+    val minutes = Duration.between(instant, now).toMinutes()
+    if (minutes in 0..1) return "刚刚"
+    if (minutes in 2..59) return "${minutes} 分钟前"
+
+    val zone = ZoneId.systemDefault()
+    val dateTime = instant.atZone(zone)
+    val today = LocalDate.now(zone)
+    return when {
+        dateTime.toLocalDate() == today -> "今天 ${SESSION_HISTORY_TODAY_TIME_FORMAT.format(dateTime)}"
+        dateTime.year == today.year -> SESSION_HISTORY_YEAR_TIME_FORMAT.format(dateTime)
+        else -> SESSION_HISTORY_FULL_TIME_FORMAT.format(dateTime)
+    }
+}
+
+private fun formatSessionUpdatedAtFull(updatedAt: Long): String {
+    val instant = sessionUpdatedInstant(updatedAt) ?: return "未知"
+    return SESSION_HISTORY_FULL_TIME_FORMAT.format(instant.atZone(ZoneId.systemDefault()))
+}
+
+private class SessionHistoryCellRenderer : JPanel(BorderLayout(12, 0)), ListCellRenderer<SessionMeta> {
+    private val title = JLabel()
+    private val updated = JLabel()
+
+    init {
+        isOpaque = true
+        border = BorderFactory.createEmptyBorder(4, 8, 4, 8)
+        title.isOpaque = false
+        updated.isOpaque = false
+        add(title, BorderLayout.CENTER)
+        add(updated, BorderLayout.EAST)
+    }
+
+    override fun getListCellRendererComponent(
+        list: JList<out SessionMeta>,
+        value: SessionMeta?,
+        index: Int,
+        isSelected: Boolean,
+        cellHasFocus: Boolean,
+    ): Component {
+        background = if (isSelected) list.selectionBackground else list.background
+        val foreground = if (isSelected) list.selectionForeground else list.foreground
+        title.foreground = foreground
+        updated.foreground = if (isSelected) foreground else UIUtil.getContextHelpForeground()
+        title.font = list.font.deriveFont(Font.PLAIN)
+        updated.font = list.font.deriveFont(Font.PLAIN, list.font.size2D - 1f)
+
+        if (value == null) {
+            title.text = ""
+            updated.text = ""
+            toolTipText = null
+        } else {
+            title.text = "${value.displayName} (${value.messageCount})"
+            updated.text = formatSessionUpdatedAt(value.updatedAt)
+            toolTipText = "最后更新：${formatSessionUpdatedAtFull(value.updatedAt)}"
+        }
+        return this
+    }
+}
 
 class AtomCodeChatPanel(
     private val project: Project,
@@ -84,15 +200,16 @@ class AtomCodeChatPanel(
 
     // ── New UI components ──
     private val header = HeaderPanel()
-    private val messageView = JBCefMessageView()
+    private val messageView = JBCefMessageView { action -> handleWelcomeAction(action) }
     private val inputPanel = InputPanel(
         onSend = { text -> handleSend(text) },
         onStop = { stopCurrentGeneration() },
         onAttach = { chooseFilesForContext() },
         onSlashCommand = { showCommandMenu() },
         onClearContext = { clearPendingContext() },
-        onRemoveContext = { item -> pendingContext.remove(item); rebuildContext() },
+        onRemoveContext = { item -> removePendingAttachment(item) },
         onModelSelect = { showModelPickerPopup() },
+        onPasteFromClipboard = { transferable -> pasteClipboardImage(transferable) },
     )
 
     // ── Data state (preserved from original) ──
@@ -109,8 +226,11 @@ class AtomCodeChatPanel(
     private var activeGenerationId: Long? = null
     private var setupSnapshot: SetupSnapshot? = null
     private var currentSession: SessionRefView? = null
+    private var welcomeLanguage: String = defaultWelcomeLanguage()
+    private var loggedIn = false
     private val streamHandler = StreamEventHandler(messageView)
     private val pendingContext = mutableListOf<ChatContextItem>()
+    private val pendingImages = mutableListOf<PendingImageAttachment>()
     private val queuedPrompts = ArrayDeque<QueuedPrompt>()
     private var disposed = false
     private val connectionListener = java.beans.PropertyChangeListener { event: PropertyChangeEvent ->
@@ -127,7 +247,8 @@ class AtomCodeChatPanel(
     }
 
     init {
-        minimumSize = Dimension(280, 300)
+        minimumSize = Dimension(MIN_CHAT_PANEL_WIDTH, MIN_CHAT_PANEL_HEIGHT)
+        applyTheme()
 
         // ── Assemble 3-zone layout ──
         add(header, BorderLayout.NORTH)
@@ -150,8 +271,25 @@ class AtomCodeChatPanel(
         service.addConnectionListener(connectionListener)
         renderConnectionState(service.connectionState)
         applyChatSettings()
+        showWelcomePage()
 
         refreshAfterConnect()
+    }
+
+    override fun updateUI() {
+        super.updateUI()
+        applyTheme()
+    }
+
+    private fun applyTheme() {
+        background = UIUtil.getPanelBackground()
+        border = BorderFactory.createMatteBorder(
+            1,
+            1,
+            1,
+            1,
+            UIManager.getColor("Component.borderColor") ?: JBColor.border(),
+        )
     }
 
     override fun dispose() {
@@ -159,6 +297,7 @@ class AtomCodeChatPanel(
         disposed = true
         queuedPrompts.clear()
         pendingContext.clear()
+        pendingImages.clear()
         service.removeConnectionListener(connectionListener)
         messageView.dispose()
     }
@@ -167,10 +306,43 @@ class AtomCodeChatPanel(
         inputPanel.focusInput()
     }
 
+    fun showWelcomePage() {
+        messageView.showWelcomePage(welcomeLanguage, loggedIn)
+    }
+
     fun submitPrompt(prompt: String) {
         inputPanel.setInputText(prompt)
         handleSend(prompt)
     }
+
+    fun composePrompt(prompt: String, context: ChatContextItem? = null) {
+        context?.let(::addContext)
+        inputPanel.setInputText(prompt)
+        focusInput()
+    }
+
+    private fun handleWelcomeAction(action: String) {
+        when {
+            action == "settings" -> showGearMenu()
+            action == "login" -> login()
+            action == "docs" -> BrowserUtil.browse(currentDocsUrl())
+            action == "review" -> composePrompt("/review ")
+            action.startsWith("prompt:") -> composePrompt(action.removePrefix("prompt:"))
+            action.startsWith("language:") -> {
+                welcomeLanguage = normalizeWelcomeLanguage(action.removePrefix("language:"))
+                showWelcomePage()
+            }
+        }
+    }
+
+    private fun currentDocsUrl(): String =
+        if (welcomeLanguage == "zh") ATOMCODE_DOCS_ZH_URL else ATOMCODE_DOCS_EN_URL
+
+    private fun normalizeWelcomeLanguage(language: String): String =
+        if (language.equals("zh", ignoreCase = true)) "zh" else "en"
+
+    private fun defaultWelcomeLanguage(): String =
+        if (Locale.getDefault().language.equals("zh", ignoreCase = true)) "zh" else "en"
 
     fun stopCurrentGeneration() {
         queuedPrompts.clear()
@@ -233,6 +405,7 @@ class AtomCodeChatPanel(
 
     private fun renderSetupSnapshot(snapshot: SetupSnapshot) {
         setupSnapshot = snapshot
+        loggedIn = snapshot.auth?.loggedIn == true
 
         loadingModels = true
         modelPicker.removeAllItems()
@@ -248,6 +421,9 @@ class AtomCodeChatPanel(
             ?: snapshot.currentModel.ifBlank { null }
             ?: "No model"
         inputPanel.setModelName(currentModel)
+        if (currentSession == null && !generating) {
+            showWelcomePage()
+        }
     }
 
     private fun login() {
@@ -458,7 +634,12 @@ class AtomCodeChatPanel(
         var sessions = initialSessions.sortedByDescending { it.updatedAt }
         val model = DefaultListModel<SessionMeta>()
         val search = JTextField()
-        val list = JList(model).apply { selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION; visibleRowCount = 14 }
+        val list = JList(model).apply {
+            selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION
+            visibleRowCount = 14
+            fixedCellHeight = 34
+            cellRenderer = SessionHistoryCellRenderer()
+        }
         val load = JButton("Load"); val rename = JButton("Rename"); val delete = JButton("Delete Selected")
         val refresh = JButton("Refresh"); val close = JButton("Close")
         var searchGeneration = 0
@@ -536,8 +717,8 @@ class AtomCodeChatPanel(
                     sessions = updated.sortedByDescending { it.updatedAt }
                     if (selected.any { it.id == currentSession?.id }) { currentSession = null }
                     replaceSessions(sessions, currentSession?.id)
-                    if (currentSession == null) messageView.clear()
                     refill(sessions); addSystemMessage("Deleted ${selected.size} session(s).")
+                    if (currentSession == null) showWelcomePage()
                 }
             }
         }
@@ -578,8 +759,8 @@ class AtomCodeChatPanel(
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to delete session"); return@invokeLater }
                 if (currentSession?.id == selected.id) { currentSession = null }
                 replaceSessions(sessions, currentSession?.id)
-                if (currentSession == null) messageView.clear()
                 addSystemMessage("Session deleted.")
+                if (currentSession == null) showWelcomePage()
             }
         }
     }
@@ -667,25 +848,41 @@ class AtomCodeChatPanel(
 
     private fun renderSession(detail: SessionDetail) {
         messageView.clear()
-        addSystemMessage("Loaded ${detail.name.ifBlank { detail.id.take(8) }}.\n")
-        detail.messages.forEach(::renderHistoryMessage)
+        var assistantGroupOpen = false
+        detail.messages.forEach { message ->
+            val role = message.role.lowercase()
+            when (role) {
+                "user" -> {
+                    if (isInternalHistoryUserMessage(message.content)) return@forEach
+                    val restored = decodeHistoryUserMessage(message.content)
+                    messageView.addUserMessage(restored.text, restored.contextSummary)
+                    assistantGroupOpen = false
+                }
+                "assistant" -> {
+                    if (!assistantGroupOpen) {
+                        messageView.beginAssistantTurn()
+                    }
+                    messageView.addAssistantMessage(message.content)
+                    messageView.finishAssistantTurn()
+                    assistantGroupOpen = true
+                }
+                "tool" -> {
+                    renderHistoryToolMessage(message.content)
+                    assistantGroupOpen = true
+                }
+                "system" -> Unit
+                else -> {
+                    addSystemMessage(message.content)
+                    assistantGroupOpen = false
+                }
+            }
+        }
     }
 
-    private fun renderHistoryMessage(message: MessageInfo) {
-        when (message.role.lowercase()) {
-            "user" -> {
-                val restored = decodeHistoryUserMessage(message.content)
-                messageView.addUserMessage(restored.text, restored.contextSummary)
-            }
-            "assistant" -> {
-                messageView.beginAssistantTurn()
-                messageView.addAssistantMessage(message.content)
-                messageView.finishAssistantTurn()
-            }
-            "tool" -> addSystemMessage("Tool: ${message.content}")
-            "system" -> addSystemMessage(message.content)
-            else -> addSystemMessage(message.content)
-        }
+    private fun renderHistoryToolMessage(content: String) {
+        val detail = content.trim()
+        if (detail.isBlank()) return
+        messageView.addToolCall("tool", "done", detail, "历史工具结果")
     }
 
     // ── Send / Chat streaming ──
@@ -696,28 +893,38 @@ class AtomCodeChatPanel(
         if (handleLocalInputCommand(prompt)) { inputPanel.clearInput(); return }
         val transformedPrompt = slashPromptTemplate(prompt) ?: prompt
         val pendingContextForSend = pendingContext.toList()
+        val pendingImagesForSend = pendingImages.toList()
         val contextForSend = pendingContextForSend + buildAutomaticContext(pendingContextForSend)
         val message = buildPromptWithContext(transformedPrompt, contextForSend)
-        val contextNames = contextForSend.map { it.displayName }
+        val contextNames = contextForSend.map { it.displayName } + pendingImagesForSend.map { it.displayName }
+        val attachments = contextForSend.map { MessageAttachmentView(displayName = it.displayName, path = it.path) } +
+            pendingImagesForSend.map { it.toMessageAttachmentView() }
+        val images = pendingImagesForSend.map { it.toImageInput() }
 
         if (generating) {
-            val queued = QueuedPrompt(UUID.randomUUID().toString(), transformedPrompt, message, contextNames)
+            val queued = QueuedPrompt(UUID.randomUUID().toString(), transformedPrompt, message, contextNames, attachments, images)
             queuedPrompts += queued
-            if (pendingContextForSend.isNotEmpty()) clearPendingContext()
+            if (pendingContextForSend.isNotEmpty() || pendingImagesForSend.isNotEmpty()) clearPendingContext()
             inputPanel.clearInput()
             renderQueueState()
             return
         }
-        if (pendingContextForSend.isNotEmpty()) clearPendingContext()
-        startPrompt(transformedPrompt, message, contextNames)
+        if (pendingContextForSend.isNotEmpty() || pendingImagesForSend.isNotEmpty()) clearPendingContext()
+        startPrompt(transformedPrompt, message, contextNames, attachments, images)
     }
 
-    private fun startPrompt(prompt: String, message: String, contextNames: List<String>) {
+    private fun startPrompt(
+        prompt: String,
+        message: String,
+        contextNames: List<String>,
+        attachments: List<MessageAttachmentView>,
+        images: List<ImageInput>,
+    ) {
         val generationId = ++generationSequence
         activeGenerationId = generationId
         // Add user message + immediate thinking feedback
         renderQueueState()
-        messageView.addUserMessage(prompt, contextNames)
+        messageView.addUserMessage(prompt, contextNames, attachments)
         messageView.beginAssistantTurn()
         messageView.addThinkingIndicator()
         inputPanel.clearInput()
@@ -753,7 +960,7 @@ class AtomCodeChatPanel(
                 replaceSelectedSession(session.id)
                 persistRuntimeSession()
             }
-        }, provider = provider).whenComplete { session, error ->
+        }, provider = provider, images = images).whenComplete { session, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
                     finishPromptAndContinue(generationId)
@@ -784,7 +991,11 @@ class AtomCodeChatPanel(
                 requestPermissionDecision(event)
             }
             is ChatEvent.Tokens -> { /* no-op */ }
-            is ChatEvent.Done -> refreshSessionList(updateCurrentTabTitle = true)
+            is ChatEvent.Warning -> streamHandler.onWarning(event.message)
+            is ChatEvent.Done -> {
+                streamHandler.onDone(event.tokens, event.toolCalls)
+                refreshSessionList(updateCurrentTabTitle = true)
+            }
             ChatEvent.Stopped -> streamHandler.onStopped()
             is ChatEvent.Error -> streamHandler.onError(event.message)
             is ChatEvent.Unknown -> streamHandler.onUnknown(event.type)
@@ -808,7 +1019,7 @@ class AtomCodeChatPanel(
         // prompt. Clearing it for one event-loop turn causes the visible flash.
         activeGenerationId = null
         runtime?.removeQueuedPrompt(next.id)
-        startPrompt(next.prompt, next.message, next.contextNames)
+        startPrompt(next.prompt, next.message, next.contextNames, next.attachments, next.images)
     }
 
     private fun finishPrompt(
@@ -956,12 +1167,19 @@ class AtomCodeChatPanel(
 
     private fun clearPendingContext() {
         pendingContext.clear()
+        pendingImages.clear()
         runtime?.clearContext()
         rebuildContext()
     }
 
     private fun rebuildContext() {
-        inputPanel.setContextItems(pendingContext.toList())
+        inputPanel.setContextItems(pendingContext.toList() + pendingImages.map { it.toContextItem() })
+    }
+
+    private fun removePendingAttachment(item: ChatContextItem) {
+        val removedContext = pendingContext.remove(item)
+        val removedImage = pendingImages.removeAll { it.path == item.path }
+        if (removedContext || removedImage) rebuildContext()
     }
 
     private fun buildPromptWithContext(prompt: String, context: List<ChatContextItem>): String {
@@ -996,7 +1214,9 @@ class AtomCodeChatPanel(
             PathSensitivity.Warn, PathSensitivity.Normal -> Unit
         }
         if (settings.state.autoSaveBeforeRead) {
-            com.intellij.openapi.application.WriteIntentReadAction.run { FileDocumentManager.getInstance().saveAllDocuments() }
+            ApplicationManager.getApplication().runWriteAction {
+                FileDocumentManager.getInstance().saveAllDocuments()
+            }
         }
         val content = editor.document.text
         if (content.isBlank()) return result
@@ -1028,10 +1248,15 @@ class AtomCodeChatPanel(
             PathSensitivity.Warn, PathSensitivity.Normal -> Unit
         }
         if (settings.state.autoSaveBeforeRead) {
-            com.intellij.openapi.application.WriteIntentReadAction.run {
+            ApplicationManager.getApplication().runWriteAction {
                 FileDocumentManager.getInstance().saveAllDocuments()
                 file.refresh(false, false)
             }
+        }
+        val mediaType = imageMediaType(file)
+        if (mediaType != null) {
+            attachImageFile(file, mediaType)
+            return
         }
         val content = try { String(file.contentsToByteArray(), Charsets.UTF_8) } catch (error: Exception) { Messages.showWarningDialog(project, "Could not read ${file.name}: ${error.message}", "AtomCode"); return }
         if (content.isBlank()) return
@@ -1039,6 +1264,394 @@ class AtomCodeChatPanel(
         val relative = project.basePath?.let { base -> if (path.startsWith(base)) path.removePrefix(base).trimStart('/', '\\') else path } ?: path
         addContext(ChatContextItem(path = path, displayName = relative, language = file.extension ?: "text", content = content, selection = null, startLine = null, endLine = null))
     }
+
+    private fun attachImageFile(file: VirtualFile, mediaType: String) {
+        val bytes = try {
+            file.contentsToByteArray()
+        } catch (error: Exception) {
+            Messages.showWarningDialog(project, "Could not read ${file.name}: ${error.message}", "AtomCode")
+            return
+        }
+        if (bytes.isEmpty()) return
+        val attachedBytes = pendingImages.sumOf { it.byteSize }
+        if (attachedBytes + bytes.size > MAX_ATTACHED_IMAGE_BYTES) {
+            Messages.showWarningDialog(
+                project,
+                "Attached images are too large. Select image(s) totaling under $MAX_ATTACHED_IMAGE_MB MB.",
+                "AtomCode",
+            )
+            return
+        }
+        val relative = project.basePath?.let { base ->
+            if (file.path.startsWith(base)) file.path.removePrefix(base).trimStart('/', '\\') else file.path
+        } ?: file.path
+        if (pendingImages.none { it.path == file.path }) {
+            pendingImages += PendingImageAttachment(
+                path = file.path,
+                displayName = relative,
+                mediaType = mediaType,
+                byteSize = bytes.size,
+                data = Base64.getEncoder().encodeToString(bytes),
+            )
+        }
+        rebuildContext()
+        focusInput()
+    }
+
+    private fun pasteClipboardImage(transferable: Transferable?): Boolean {
+        if (attachFilesFromTransferable(transferable)) return true
+
+        val bytes = clipboardImageBytes(transferable)
+        if (bytes == null) {
+            val diagnosticTransferable = transferable?.takeIf { it.hasImageLikeFlavor() }
+                ?: firstImageLikeClipboardTransferable()
+            val macTypes = macPasteboardTypeNames()
+            if (diagnosticTransferable != null || macTypes.any(::isImagePasteboardType)) {
+                addSystemMessage(clipboardImageDiagnostic(diagnosticTransferable, macTypes))
+                return true
+            }
+            return false
+        }
+
+        attachClipboardImage(bytes)
+        return true
+    }
+
+    private fun attachFilesFromTransferable(transferable: Transferable?): Boolean {
+        val files = filesFromTransferable(transferable)
+        if (files.isEmpty()) return false
+
+        var attached = false
+        files.forEach { file ->
+            val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByPath(file.absolutePath)
+            if (virtualFile != null && !virtualFile.isDirectory) {
+                attachVirtualFile(virtualFile)
+                attached = true
+            }
+        }
+        return attached
+    }
+
+    private fun clipboardImageBytes(transferable: Transferable?): ByteArray? {
+        imageBytesFromTransferable(transferable)?.let { return it }
+
+        val copyPasteManager = CopyPasteManager.getInstance()
+        imageBytesFromTransferable(copyPasteManager.contents)?.let { return it }
+        copyPasteManager.allContents.firstNotNullOfOrNull(::imageBytesFromTransferable)?.let { return it }
+
+        imageBytesFromTransferable(ClipboardSynchronizer.getInstance().contents)?.let { return it }
+
+        val systemTransferable = try {
+            Toolkit.getDefaultToolkit().systemClipboard.getContents(null)
+        } catch (_: Exception) {
+            null
+        }
+        imageBytesFromTransferable(systemTransferable)?.let { return it }
+
+        return macPasteboardImageBytes()
+    }
+
+    private fun Transferable.hasImageLikeFlavor(): Boolean =
+        transferDataFlavors.any { it.looksLikeImageFlavor() }
+
+    private fun firstImageLikeClipboardTransferable(): Transferable? {
+        val copyPasteManager = CopyPasteManager.getInstance()
+        sequenceOf(copyPasteManager.contents, ClipboardSynchronizer.getInstance().contents)
+            .filterNotNull()
+            .firstOrNull { it.hasImageLikeFlavor() }
+            ?.let { return it }
+
+        copyPasteManager.allContents
+            .firstOrNull { it.hasImageLikeFlavor() }
+            ?.let { return it }
+
+        val systemTransferable = try {
+            Toolkit.getDefaultToolkit().systemClipboard.getContents(null)
+        } catch (_: Exception) {
+            null
+        }
+        return systemTransferable?.takeIf { it.hasImageLikeFlavor() }
+    }
+
+    private fun clipboardImageDiagnostic(transferable: Transferable?, macTypes: List<String>): String {
+        val javaFlavors = transferable?.transferDataFlavors
+            .orEmpty()
+            .joinToString(separator = "\n") { flavor ->
+                "- ${flavor.mimeType}; class=${flavor.representationClass.name}; name=${flavor.humanPresentableName}"
+            }
+            .ifBlank { "- <none>" }
+            .take(4000)
+        val macTypeText = macTypes
+            .joinToString(separator = "\n") { "- $it" }
+            .ifBlank { "- <none or unavailable>" }
+            .take(2000)
+        return "检测到图片剪贴板，但未能解析为附件，已阻止 IDE 默认粘贴写入项目文件。Java clipboard flavors:\n$javaFlavors\nmacOS pasteboard types:\n$macTypeText"
+    }
+
+    private fun macPasteboardTypeNames(): List<String> {
+        if (!System.getProperty("os.name").contains("mac", ignoreCase = true)) return emptyList()
+        return try {
+            val pasteboard = Foundation.invoke("NSPasteboard", "generalPasteboard")
+            if (Foundation.isNil(pasteboard)) return emptyList()
+            val types = Foundation.safeInvoke(pasteboard, "types")
+            if (Foundation.isNil(types)) return emptyList()
+            Foundation.NSArray(types).getList().mapNotNull { id ->
+                runCatching { Foundation.toStringViaUTF8(id) }.getOrNull()
+            }
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    private fun isImagePasteboardType(type: String): Boolean {
+        val normalized = type.lowercase(Locale.ROOT)
+        return normalized.contains("image") ||
+            normalized.contains("png") ||
+            normalized.contains("tiff") ||
+            normalized.contains("jpeg") ||
+            normalized.contains("jpg") ||
+            normalized.contains("pict")
+    }
+
+    private fun macPasteboardImageBytes(): ByteArray? {
+        if (!System.getProperty("os.name").contains("mac", ignoreCase = true)) return null
+        return try {
+            val pasteboard = Foundation.invoke("NSPasteboard", "generalPasteboard")
+            if (Foundation.isNil(pasteboard)) return null
+
+            pasteboardImageObjects(pasteboard)?.let { return it }
+
+            val types = listOf(
+                "public.png",
+                "public.tiff",
+                "public.jpeg",
+                "com.apple.tiff",
+                "com.apple.pict",
+                "Apple TIFF pasteboard type",
+                "NeXT TIFF v4.0 pasteboard type",
+                "NSPasteboardTypePNG",
+                "NSPasteboardTypeTIFF",
+                "NSPasteboardTypeJPEG",
+            )
+            types.firstNotNullOfOrNull { type ->
+                pasteboardDataForType(pasteboard, type)?.let(::imageBytesToPngBytes)
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun pasteboardImageObjects(pasteboard: ID): ByteArray? {
+        val imageClass = Foundation.getObjcClass("NSImage")
+        if (Foundation.isNil(imageClass)) return null
+        val classes = Foundation.fillArray(arrayOf(imageClass))
+        val images = Foundation.safeInvoke(pasteboard, "readObjectsForClasses:options:", classes, ID.NIL)
+        if (Foundation.isNil(images)) return null
+
+        val list = Foundation.NSArray(images)
+        for (index in 0 until list.count()) {
+            val image = list.at(index)
+            if (Foundation.isNil(image)) continue
+            val data = Foundation.safeInvoke(image, "TIFFRepresentation")
+            if (Foundation.isNil(data)) continue
+            val bytes = Foundation.NSData(data).bytes()
+            imageBytesToPngBytes(bytes)?.let { return it }
+        }
+        return null
+    }
+
+    private fun pasteboardDataForType(pasteboard: ID, type: String): ByteArray? {
+        val data = Foundation.safeInvoke(pasteboard, "dataForType:", Foundation.nsString(type))
+        if (Foundation.isNil(data)) return null
+        return Foundation.NSData(data).bytes().takeIf { it.isNotEmpty() }
+    }
+
+    private fun imageBytesFromTransferable(transferable: Transferable?): ByteArray? {
+        if (transferable == null) return null
+
+        if (transferable.isDataFlavorSupported(DataFlavor.imageFlavor)) {
+            val image = try {
+                transferable.getTransferData(DataFlavor.imageFlavor) as? Image
+            } catch (_: Exception) {
+                null
+            }
+            if (image != null) return imageToPngBytes(image)
+        }
+
+        if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+            val files = try {
+                @Suppress("UNCHECKED_CAST")
+                transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<File>
+            } catch (_: Exception) {
+                null
+            }
+            files.orEmpty().firstNotNullOfOrNull(::imageFileToPngBytes)?.let { return it }
+        }
+
+        transferable.transferDataFlavors.forEach { flavor ->
+            if (!flavor.looksLikeImageFlavor()) return@forEach
+            val data = try {
+                transferable.getTransferData(flavor)
+            } catch (_: Exception) {
+                null
+            }
+            dataToPngBytes(data)?.let { return it }
+        }
+
+        return null
+    }
+
+    private fun filesFromTransferable(transferable: Transferable?): List<File> {
+        if (transferable == null) return emptyList()
+
+        if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+            val files = try {
+                @Suppress("UNCHECKED_CAST")
+                transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<File>
+            } catch (_: Exception) {
+                null
+            }
+            if (!files.isNullOrEmpty()) return files
+        }
+
+        return transferable.transferDataFlavors
+            .filter { it.isUriListFlavor() }
+            .firstNotNullOfOrNull { flavor ->
+                val data = try {
+                    transferable.getTransferData(flavor)
+                } catch (_: Exception) {
+                    null
+                }
+                uriListToFiles(data as? String).takeIf { it.isNotEmpty() }
+            }
+            .orEmpty()
+    }
+
+    private fun DataFlavor.isUriListFlavor(): Boolean =
+        mimeType.lowercase(Locale.ROOT).contains("text/uri-list")
+
+    private fun uriListToFiles(uriList: String?): List<File> {
+        if (uriList.isNullOrBlank()) return emptyList()
+        return uriList
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }
+            .mapNotNull { value ->
+                runCatching {
+                    val uri = URI(value)
+                    if (uri.scheme.equals("file", ignoreCase = true)) File(uri) else null
+                }.getOrNull()
+            }
+            .toList()
+    }
+
+    private fun DataFlavor.looksLikeImageFlavor(): Boolean {
+        if (Image::class.java.isAssignableFrom(representationClass)) return true
+        val mime = mimeType.lowercase(Locale.ROOT)
+        val name = humanPresentableName.lowercase(Locale.ROOT)
+        return primaryType.equals("image", ignoreCase = true) ||
+            mime.contains("image/") ||
+            mime.contains("public.png") ||
+            mime.contains("public.tiff") ||
+            mime.contains("public.jpeg") ||
+            name.contains("png") ||
+            name.contains("tiff") ||
+            name.contains("jpeg") ||
+            name.contains("jpg")
+    }
+
+    private fun dataToPngBytes(data: Any?): ByteArray? =
+        when (data) {
+            is Image -> imageToPngBytes(data)
+            is ByteArray -> imageBytesToPngBytes(data)
+            is ByteBuffer -> imageBytesToPngBytes(data.toByteArray())
+            is InputStream -> data.use { imageBytesToPngBytes(it.readBytes()) }
+            is File -> imageFileToPngBytes(data)
+            is List<*> -> data.filterIsInstance<File>().firstNotNullOfOrNull(::imageFileToPngBytes)
+            else -> null
+        }
+
+    private fun ByteBuffer.toByteArray(): ByteArray {
+        val duplicate = duplicate()
+        val bytes = ByteArray(duplicate.remaining())
+        duplicate.get(bytes)
+        return bytes
+    }
+
+    private fun imageFileToPngBytes(file: File): ByteArray? {
+        if (!file.isFile) return null
+        return try {
+            imageBytesToPngBytes(file.readBytes())
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun imageBytesToPngBytes(bytes: ByteArray): ByteArray? {
+        if (bytes.isEmpty()) return null
+        val image = try {
+            ImageIO.read(ByteArrayInputStream(bytes))
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        return bufferedImageToPngBytes(image)
+    }
+
+    private fun attachClipboardImage(bytes: ByteArray) {
+        if (bytes.isEmpty()) return
+        val attachedBytes = pendingImages.sumOf { it.byteSize }
+        if (attachedBytes + bytes.size > MAX_ATTACHED_IMAGE_BYTES) {
+            Messages.showWarningDialog(
+                project,
+                "Attached images are too large. Paste image(s) totaling under $MAX_ATTACHED_IMAGE_MB MB.",
+                "AtomCode",
+            )
+            return
+        }
+
+        val index = pendingImages.count { it.path.startsWith(CLIPBOARD_IMAGE_PATH_PREFIX) } + 1
+        pendingImages += PendingImageAttachment(
+            path = "$CLIPBOARD_IMAGE_PATH_PREFIX${UUID.randomUUID()}.png",
+            displayName = "Clipboard image $index.png",
+            mediaType = "image/png",
+            byteSize = bytes.size,
+            data = Base64.getEncoder().encodeToString(bytes),
+        )
+        rebuildContext()
+        focusInput()
+    }
+
+    private fun imageToPngBytes(image: Image): ByteArray? {
+        val icon = ImageIcon(image)
+        val width = icon.iconWidth
+        val height = icon.iconHeight
+        if (width <= 0 || height <= 0) return null
+
+        val buffered = BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)
+        val graphics = buffered.createGraphics()
+        try {
+            graphics.drawImage(icon.image, 0, 0, null)
+        } finally {
+            graphics.dispose()
+        }
+
+        return bufferedImageToPngBytes(buffered)
+    }
+
+    private fun bufferedImageToPngBytes(buffered: BufferedImage): ByteArray? =
+        ByteArrayOutputStream().use { out ->
+            if (!ImageIO.write(buffered, "png", out)) return null
+            out.toByteArray()
+        }
+
+    private fun imageMediaType(file: VirtualFile): String? =
+        when (file.extension?.lowercase(Locale.ROOT)) {
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            "gif" -> "image/gif"
+            "webp" -> "image/webp"
+            else -> null
+        }
 
     // ── Slash commands ──
 
@@ -1071,7 +1684,7 @@ class AtomCodeChatPanel(
         menu.add(JMenuItem("🗑 Delete Session").apply { addActionListener { deleteSelectedSession() } })
         menu.add(JMenuItem("🔄 Refresh Sessions").apply { addActionListener { refreshSessionList() } })
         menu.add(JSeparator())
-        menu.add(JMenuItem("📂 Open Changes").apply { addActionListener { openProjectChanges() } })
+        menu.add(JMenuItem("📂 打开变更").apply { addActionListener { openProjectChanges() } })
         menu.add(JMenuItem("🩺 Diagnostics").apply { addActionListener { showDiagnostics() } })
         menu.add(JMenuItem("⚙ Settings...").apply { addActionListener { project.openAtomCodeSettings() } })
         val pointer = java.awt.MouseInfo.getPointerInfo().location; SwingUtilities.convertPointFromScreen(pointer, this); menu.show(this, pointer.x, pointer.y)
@@ -1080,8 +1693,8 @@ class AtomCodeChatPanel(
     private fun showCommandMenu() {
         val menu = JPopupMenu()
         val items = listOf(
-            SlashCommand("/login", "Sign in with AtomGit"),
-            SlashCommand("/review", "Review code"),
+            SlashCommand("/login", "登录 AtomGit"),
+            SlashCommand("/review", "审查代码"),
         )
         items.forEach { command ->
             menu.add(JMenuItem("${command.name} - ${command.description}").apply {
@@ -1114,11 +1727,50 @@ class AtomCodeChatPanel(
 }
 
 private data class SlashCommand(val name: String, val description: String)
-private data class QueuedPrompt(val id: String, val prompt: String, val message: String, val contextNames: List<String>)
+private data class QueuedPrompt(
+    val id: String,
+    val prompt: String,
+    val message: String,
+    val contextNames: List<String>,
+    val attachments: List<MessageAttachmentView>,
+    val images: List<ImageInput>,
+)
+
+private data class PendingImageAttachment(
+    val path: String,
+    val displayName: String,
+    val mediaType: String,
+    val byteSize: Int,
+    val data: String,
+) {
+    fun toImageInput(): ImageInput = ImageInput(mediaType = mediaType, data = data)
+
+    fun toMessageAttachmentView(): MessageAttachmentView =
+        MessageAttachmentView(
+            displayName = displayName,
+            path = path,
+            imageMediaType = mediaType,
+            imageData = data,
+        )
+
+    fun toContextItem(): ChatContextItem =
+        ChatContextItem(
+            path = path,
+            displayName = displayName,
+            language = mediaType.substringAfter('/').uppercase(Locale.ROOT),
+            content = "",
+            selection = null,
+            startLine = null,
+            endLine = null,
+            imageMediaType = mediaType,
+            imageData = data,
+        )
+}
 
 data class ChatContextItem(
     val path: String, val displayName: String, val language: String,
     val content: String, val selection: String?, val startLine: Int?, val endLine: Int?,
+    val imageMediaType: String? = null, val imageData: String? = null,
 )
 
 internal data class HistoryUserMessage(
@@ -1142,6 +1794,12 @@ internal fun decodeHistoryUserMessage(content: String): HistoryUserMessage {
     return HistoryUserMessage(question, contextNames)
 }
 
+internal fun isInternalHistoryUserMessage(content: String): Boolean {
+    val trimmed = content.trim()
+    return trimmed.startsWith("<system-reminder>") ||
+        trimmed.startsWith("You made code edits but have not verified them.")
+}
+
 private val HISTORY_CONTEXT_FILE_PATTERN =
     Regex("(?m)^File: (.+?)(?: \\(lines \\d+-\\d+\\))?\\r?\\n```")
 
@@ -1160,7 +1818,7 @@ internal fun slashPromptTemplate(prompt: String): String? {
     val command = parts.firstOrNull()?.lowercase() ?: return null
     val suffix = parts.getOrNull(1)?.trim().orEmpty()
     val template = when (command) {
-        "/review" -> "Please review this code for issues, improvements, and best practices."
+        "/review" -> "请审查这段代码，重点关注潜在问题、改进建议和最佳实践。"
         else -> return null
     }
     return if (suffix.isBlank()) template else "$template\n\n$suffix"

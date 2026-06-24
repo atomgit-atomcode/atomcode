@@ -181,6 +181,9 @@ impl Tool for ParallelEditTool {
         // tokio::spawn (then awaiting the JoinHandle) keeps the child's cancel wired to
         // the parent token: if this tool future is dropped on cancel, the still-running
         // child is stopped only by `ctx.cancel.child_token()` cascading in.
+        // Dispatch header so the user sees the fan-out begin (v1 SubAgentDispatchStart
+        // parity). Per-file ↻/✓/✗ lines follow via `ctx.progress` → ToolProgress.
+        ctx.progress.emit(format!("并行编辑 {} 个文件(子代理)", a.files.len()));
         let mut handles = Vec::with_capacity(a.files.len());
         for f in &a.files {
             let task = format!(
@@ -195,8 +198,15 @@ impl Tool for ParallelEditTool {
                 .cancel_token(ctx.cancel.child_token())
                 .build();
             let path = f.path.clone();
+            // Cheap clone (Arc inside); moved into the child task so it can report the
+            // moment THIS child settles — concurrent, so lines interleave by real
+            // completion order, giving live per-file progress instead of a black box.
+            let progress = ctx.progress.clone();
             handles.push(tokio::spawn(async move {
+                progress.emit(format!("↻ {path}"));
                 let outcome = child.run_to_completion(task, AutoRespond::AllowAll).await;
+                let icon = if outcome.stop == StopReason::Stopped { "✓" } else { "✗" };
+                progress.emit(format!("{icon} {path}"));
                 (path, outcome)
             }));
         }
@@ -279,9 +289,18 @@ impl Tool for ParallelEditTool {
             .ok()
             .flatten();
         if let Some((cmd, build_dir)) = build_detect {
-            let mut build_cmd = tokio::process::Command::new("sh");
-            build_cmd.args(["-c", &cmd])
-                .current_dir(&build_dir);
+            // Platform-appropriate shell: cmd.exe on Windows, sh on Unix (mirrors the
+            // bash tool + v1 parallel_edit). Without this the probe spawned `sh`, which
+            // is absent on Windows → the probe silently never ran.
+            #[cfg(windows)]
+            let (shell, flag) = ("cmd.exe", "/C");
+            #[cfg(not(windows))]
+            let (shell, flag) = ("sh", "-c");
+
+            let mut build_cmd = tokio::process::Command::new(shell);
+            build_cmd.args([flag, &cmd]).current_dir(&build_dir);
+            // Suppress the Windows console-window flash for the probe; no-op off Windows.
+            crate::process_utils::suppress_console_window(&mut build_cmd);
             let output = build_cmd.output().await;
             if let Ok(out) = output {
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -314,11 +333,14 @@ impl Tool for ParallelEditTool {
 /// found. Searches the working directory then immediate subdirectories so nested project
 /// layouts (a Cargo workspace under a monorepo) still resolve.
 fn find_build_command(wd: &Path) -> Option<(String, std::path::PathBuf)> {
+    // No Unix-only pipes (head/tail): the probe runs under cmd.exe on Windows where
+    // those coreutils don't exist. Full output is captured; the error display is
+    // truncated Rust-side (`combined.lines().take(15)`) below.
     let markers: &[(&str, &str)] = &[
-        ("package.json", "npm run build 2>&1 | head -30"),
-        ("Cargo.toml", "cargo check 2>&1 | tail -20"),
-        ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
-        ("go.mod", "go build ./... 2>&1 | tail -20"),
+        ("package.json", "npm run build 2>&1"),
+        ("Cargo.toml", "cargo check 2>&1"),
+        ("pom.xml", "mvn compile -q 2>&1"),
+        ("go.mod", "go build ./... 2>&1"),
     ];
 
     for &(marker, cmd) in markers {
@@ -357,6 +379,29 @@ mod tests {
     use futures::stream::{self, BoxStream};
     use futures::StreamExt;
     use tokio_util::sync::CancellationToken;
+
+    /// The build-verification probe runs under `cmd.exe /C` on Windows, where the
+    /// Unix coreutils `head`/`tail` don't exist — so the detected commands must not
+    /// pipe through them (output is already truncated Rust-side for display).
+    #[test]
+    fn build_commands_are_cross_platform_no_unix_pipes() {
+        let d = tempfile::tempdir().unwrap();
+        for (marker, body) in [
+            ("Cargo.toml", "[package]\nname=\"x\"\nversion=\"0.0.0\"\n"),
+            ("package.json", "{}"),
+            ("pom.xml", "<project/>"),
+            ("go.mod", "module x\n"),
+        ] {
+            let dir = d.path().join(marker.replace('.', "_"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(marker), body).unwrap();
+            let (cmd, _) = find_build_command(&dir).expect("marker should be detected");
+            assert!(
+                !cmd.contains("head") && !cmd.contains("tail"),
+                "build command must not depend on Unix-only head/tail (breaks cmd.exe on Windows): {cmd}"
+            );
+        }
+    }
 
     /// Stateless scripted provider: `Some(reply)` → one text turn then stop;
     /// `None` → a terminal open error (simulates a failed child).
@@ -398,6 +443,36 @@ mod tests {
             move || Arc::new(MockProvider { reply: reply.clone() }) as Arc<dyn LlmProvider>,
             || ToolRegistry::new().mount(&[]), // children need no tools for these tests
         )
+    }
+
+    #[tokio::test]
+    async fn emits_per_file_dispatch_progress() {
+        // Real-time per-file progress (v1 SubAgentDispatch* parity): each child's
+        // start (↻) and settle (✓/✗) is surfaced via ctx.progress so the driver
+        // can stream it (AgentEvent::ToolProgress) instead of a black-box result.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let c = captured.clone();
+            ProgressSink::new(Arc::new(move |m| c.lock().unwrap().push(m)))
+        };
+        let ctx = ToolContext {
+            working_dir: std::env::temp_dir(),
+            cancel: CancellationToken::new(),
+            progress: sink,
+        };
+        let _ = tool(Some("done"))
+            .execute(
+                r#"{"files":[{"path":"a.rs","instruction":"x"},{"path":"b.rs","instruction":"y"}]}"#,
+                &ctx,
+            )
+            .await;
+        let msgs = captured.lock().unwrap();
+        // Start line per file.
+        assert!(msgs.iter().any(|m| m.contains("↻") && m.contains("a.rs")), "start a.rs: {msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("↻") && m.contains("b.rs")), "start b.rs: {msgs:?}");
+        // Settle line per file (mock provider stops cleanly → ✓).
+        assert!(msgs.iter().any(|m| m.contains("✓") && m.contains("a.rs")), "done a.rs: {msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("✓") && m.contains("b.rs")), "done b.rs: {msgs:?}");
     }
 
     #[tokio::test]

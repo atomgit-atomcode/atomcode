@@ -118,7 +118,12 @@ fn expand_shell_injections(template: &str) -> String {
 }
 
 fn run_shell_command(cmd: &str) -> String {
-    match Command::new("sh").arg("-c").arg(cmd).output() {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(cmd);
+    // No console-window flash when run from a console-less daemon (mirrors core's
+    // skill runner); no-op off Windows.
+    crate::process_utils::suppress_console_window_sync(&mut command);
+    match command.output() {
         Ok(out) => {
             let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
             if !out.status.success() {

@@ -73,7 +73,16 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
         format!("{} tok", used_label)
     } else {
         let window_label = format_tok_count(window, /*round_clean=*/ true);
-        format!("{}/{} tok", used_label, window_label)
+        // Surface the utilization percentage once the prompt approaches (>=90%)
+        // or exceeds the window, so an over-window request (e.g. a 339k prompt
+        // into a 200k window) is visible instead of silent. Below the near-limit
+        // threshold the counter stays terse, keeping the common case clean.
+        if used * 10 >= window * 9 {
+            let pct = (used as f64 / window as f64 * 100.0).round() as u64;
+            format!("{}/{} tok ({}%)", used_label, window_label, pct)
+        } else {
+            format!("{}/{} tok", used_label, window_label)
+        }
     }
 }
 
@@ -524,6 +533,31 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// When Some, `paint_frame` paints the overlay cells after the normal
     /// body+footer, so the diff sees the combined frame.
     modal_overlay: Option<ModalOverlayState>,
+    /// Append-only log of the permanent body-producing `UiLine`s in
+    /// render order — the semantic source needed to REFLOW the whole
+    /// transcript when the terminal width changes. `body_lines` holds
+    /// cells already wrapped to the width they were produced at, so a
+    /// resize can only CLIP them (drops the overflow) — it cannot
+    /// re-wrap. Replaying this log through `render()` at the new
+    /// geometry rebuilds every row correctly wrapped (same mechanism
+    /// as the `/resume` replay). Transient / footer / modal variants
+    /// (InputPrompt, Spinner, ApprovalPrompt, ModalOverlay…) are NOT
+    /// logged — they are re-derived from live state by `paint_frame`.
+    /// Consecutive AssistantText / ReasoningText deltas are coalesced
+    /// so per-token streaming doesn't bloat the log.
+    body_log: Vec<UiLine>,
+    /// True only while `reflow_body_to_current_width` is replaying
+    /// `body_log` — suppresses re-logging so replay never grows the log.
+    replaying: bool,
+    /// Set once `body_log` evicts its oldest entry (session exceeded
+    /// `MAX_SCROLLBACK_ROWS` logged events): the oldest transcript prefix
+    /// can no longer be reconstructed by the reflow replay. DIAGNOSTIC ONLY
+    /// — `on_resize` clears the host scrollback (`\x1b[3J`) unconditionally;
+    /// this flag merely annotates the resize trace to record that the
+    /// un-reflowable prefix was dropped. (It used to GATE the wipe, but
+    /// skipping it let the reflow stack a duplicate transcript on every
+    /// resize — the "一直重复输出" bug — so the wipe now always fires.)
+    body_log_truncated: bool,
 }
 
 /// Pre-computed overlay cell grid + screen position for a modal window.
@@ -652,6 +686,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_tool_rows: 0,
             live_group: None,
             modal_overlay: None,
+            body_log: Vec::new(),
+            replaying: false,
+            body_log_truncated: false,
         }
     }
 
@@ -3083,6 +3120,97 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
+    /// Record a permanent body `UiLine` into `body_log` so a later
+    /// resize can reflow it at the new width. No-op while replaying (so
+    /// the reflow itself can't grow the log) and for transient / footer
+    /// / modal variants (re-derived from live state by `paint_frame`).
+    /// Consecutive streaming-text deltas are merged so per-token
+    /// streaming produces one log entry per assistant paragraph, not
+    /// one per token.
+    fn log_body_event(&mut self, line: &UiLine) {
+        if self.replaying {
+            return;
+        }
+        match line {
+            // Transient / footer / modal: never part of the permanent
+            // transcript, so re-derived from live state on every frame.
+            UiLine::InputPrompt { .. }
+            | UiLine::StreamingBox { .. }
+            | UiLine::Spinner { .. }
+            | UiLine::ClearTransient
+            | UiLine::InputCommit
+            // ApprovalPrompt is a live prompt that gets popped once the
+            // user answers (no UiLine marks the pop), so replaying it
+            // would resurrect an already-answered prompt. Re-derived
+            // from app state after a resize instead.
+            | UiLine::ApprovalPrompt { .. }
+            | UiLine::ModalOverlay { .. }
+            | UiLine::ModalOverlayClear => return,
+            _ => {}
+        }
+        // Coalesce consecutive streaming text: feeding the markdown
+        // state machine "he" + "llo\n" yields the same rows as "hello\n"
+        // (partial lines buffer in `assistant_line_buf` until the LF),
+        // so merging is loss-free and keeps the log ~one entry per
+        // paragraph instead of one per token.
+        match (self.body_log.last_mut(), line) {
+            (Some(UiLine::AssistantText(prev)), UiLine::AssistantText(next)) => {
+                prev.push_str(next);
+                return;
+            }
+            (Some(UiLine::ReasoningText(prev)), UiLine::ReasoningText(next)) => {
+                prev.push_str(next);
+                return;
+            }
+            _ => {}
+        }
+        self.body_log.push(line.clone());
+        // Bound memory on very long sessions. Once we drop the oldest entry the
+        // transcript prefix is unrecoverable by the reflow replay; flag it purely so
+        // the resize trace can note the dropped prefix (see `body_log_truncated` —
+        // it no longer gates the scrollback wipe).
+        if self.body_log.len() > MAX_SCROLLBACK_ROWS {
+            self.body_log.remove(0);
+            self.body_log_truncated = true;
+        }
+    }
+
+    /// Re-render the entire logged transcript at the CURRENT screen
+    /// geometry. Drops the old (wrong-width) body state, then replays
+    /// `body_log` through the normal `render()` path so every line —
+    /// welcome banner, user messages, assistant markdown, tool output —
+    /// re-wraps to the new width and re-promotes the correct overflow
+    /// into native scrollback via the append-only LF path. This is the
+    /// width-correct replacement for the old clip-based body re-emit,
+    /// which truncated rows instead of reflowing them. The caller owns
+    /// the surrounding terminal wipe and sync envelope.
+    fn reflow_body_to_current_width(&mut self) {
+        // Drop pre-reflow body + all state derived from it; the replay
+        // rebuilds every field from scratch at the new width.
+        self.body_lines.clear();
+        self.scrolled_off = 0;
+        self.welcome_line_count = 0;
+        self.welcome_banner = None;
+        self.message_marks.clear();
+        self.assistant_line_buf.clear();
+        self.md_state.reset();
+        self.live_group = None;
+        self.inflight_tool = None;
+        self.inflight_tool_rows = 0;
+        self.live_spinner_active = false;
+        self.last_mark_was_assistant = false;
+        self.skip_body_scroll_count = 0;
+        // Take the log out so `render()` can borrow `self` mutably; the
+        // `replaying` guard makes the re-log a no-op regardless.
+        let log = std::mem::take(&mut self.body_log);
+        self.replaying = true;
+        for ev in &log {
+            self.render(ev.clone());
+        }
+        self.replaying = false;
+        self.body_log = log;
+    }
+
     fn reflow_welcome_prefix(&mut self) {
         let Some((ref model, ref working_dir)) = self.welcome_banner else {
             return;
@@ -3130,6 +3258,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     fn render(&mut self, line: UiLine) {
+        // Record permanent body content so a width change can reflow the
+        // whole transcript (see `body_log`). No-op for transient variants
+        // and while replaying.
+        self.log_body_event(&line);
         match line {
             // ── footer-only variants ──
             UiLine::InputPrompt {
@@ -4212,6 +4344,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.assistant_line_buf.clear();
         self.md_state.reset();
         self.last_painted_footer_rows = 0;
+        // Drop the reflow log too: the body it described is gone, so a
+        // later resize must not replay it. The `/resume` / `/clear`
+        // re-render that typically follows repopulates it via `render()`.
+        self.body_log.clear();
+        self.body_log_truncated = false;
         let _ = self.out.flush();
         // Force cold-start CUP+EL on next paint to wipe pre-reset stdout writes.
         self.screen.invalidate();
@@ -4622,6 +4759,33 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             let _ = self.out.write_all(seq.as_bytes());
         }
         crate::tuix_trace!("RSZ", "wipe written");
+        // Clear the host's native scrollback. Resizing the cell grid (a
+        // PowerShell / Windows Terminal font-zoom is the reported case)
+        // makes the terminal REFLOW its main-screen buffer and push the
+        // top of the viewport — the welcome banner — into scrollback. We
+        // run on the main screen (no alt-screen, so the transcript
+        // survives exit), and the viewport wipe above (EL / ED2) is
+        // row-local: it cannot reach those promoted rows. So every zoom
+        // step leaves another welcome copy stranded in scrollback (issue
+        // #709: "向上滚动多出 2 条"). `\x1b[3J` is the only sequence that
+        // clears scrollback; the reflow replay below then re-promotes the
+        // CORRECT overflow at the new width via its append-only LFs, so
+        // the transcript is rebuilt rather than lost.
+        //
+        // We clear EVEN when `body_log` was truncated. The alternative —
+        // skipping 3J to preserve the evicted prefix — is worse: the reflow
+        // re-appends the whole RETAINED transcript on top of the un-cleared
+        // old copy, so every resize stacks a duplicate (the reported
+        // "一直重复输出" on long sessions). The pre-truncation prefix is
+        // already gone from `body_log` and can't be reflowed anyway, so
+        // clearing it loses only un-repaintable history — an acceptable
+        // trade for not duplicating the visible transcript.
+        let _ = self.out.write_all(b"\x1b[3J");
+        crate::tuix_trace!(
+            "RSZ",
+            "scrollback cleared (3J){}",
+            if self.body_log_truncated { " [log truncated: pre-eviction prefix dropped]" } else { "" }
+        );
         self.screen.resize(cols, rows);
         // `screen.resize` rebuilds the Screen (resetting `sync_suppressed`) —
         // re-assert suppression so the `flush_frame` render_diff below paints
@@ -4641,48 +4805,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // bug). invalidate() must run AFTER resize so its sentinel rows are
         // sized to the new width.
         self.screen.invalidate();
-        // Rebuild the semantic welcome banner against the new width so
-        // its right-aligned version/license pair stays adaptive after
-        // terminal resize instead of replaying stale gap cells.
-        self.reflow_welcome_prefix();
-        // Re-emit body tail into the new region so the view matches
-        // memory. Set region first so LFs scroll only within body.
-        //
-        // Cached `body_lines` cells were built against the OLD screen
-        // width — after a resize-smaller drag, rows may exceed the new
-        // terminal width. `serialize_row` writes every real cell, so
-        // overflow would trigger the terminal's own auto-wrap; the
-        // wrapped remainder lands on the next row, which on a fresh
-        // DECSTBM region is either the footer strip or the next body
-        // slot. Symptom the user sees: content shifted by a column and
-        // junk in the footer strip. Clip each row to the new width
-        // before handing it to `emit_body_line_inner` so we never
-        // rely on the terminal to hide our overflow.
-        let bottom = self.body_bottom_row();
-        if bottom > 0 {
-            let screen_w = self.screen.width() as usize;
-            let tail: Vec<Vec<Cell>> = {
-                let n = self.body_lines.len().min(bottom as usize);
-                self.body_lines[self.body_lines.len() - n..]
-                    .iter()
-                    .map(|row| clip_cells_to_width(row, screen_w))
-                    .collect()
-            };
-            // Append-only: body lives at the top of the viewport, so
-            // we draw the tail at absolute rows [1, n] without any
-            // DECSTBM region. Per-row CUP + EL + content; never an
-            // LF (which could nudge content into scrollback).
-            let n = tail.len() as u16;
-            let first_row = bottom.saturating_sub(n) + 1;
-            crate::tuix_trace!("RSZ", "body begin rows={} first_row={}", n, first_row);
-            for (i, row) in tail.iter().enumerate() {
-                let seq = format!("\x1b[{};1H\x1b[K", first_row + i as u16);
-                let _ = self.out.write_all(seq.as_bytes());
-                let bytes = serialize_row(row);
-                let _ = self.out.write_all(&bytes);
-            }
-        }
-        crate::tuix_trace!("RSZ", "body done; paint begin");
+        // Reflow the ENTIRE transcript at the new width by replaying the
+        // semantic `body_log` through `render()`. The old code only
+        // rebuilt the welcome banner and CLIPPED every other row to the
+        // new width (`clip_cells_to_width`) — which dropped the overflow
+        // on a shrink and never re-filled on a grow, so multi-line
+        // history came out garbled (issue #709: "resize 历史布局乱了").
+        // `body_lines` keeps cells already wrapped to their original
+        // width and can't be re-wrapped, so a correct reflow has to
+        // re-render from source. The replay also re-promotes the proper
+        // overflow into scrollback at the new width via its append-only
+        // LFs, completing the `\x1b[3J` rebuild above.
+        self.reflow_body_to_current_width();
+        crate::tuix_trace!("RSZ", "body reflowed; paint begin");
         self.paint_frame();
         self.flush_frame();
         // Close the envelope after the final frame has landed inside it.
@@ -4919,8 +5054,28 @@ mod tests {
     fn ctx_usage_used_above_one_million_uses_m_unit() {
         // Long-running sessions on a 1m window can park `used` above 1M;
         // keep one decimal so the counter still moves visibly turn-to-turn.
-        assert_eq!(format_ctx_usage(1_200_000, 1_000_000), "1.2m/1m tok");
+        // 1.2m of a 1m window is 120% — over the limit, so the percentage shows.
+        assert_eq!(format_ctx_usage(1_200_000, 1_000_000), "1.2m/1m tok (120%)");
         assert_eq!(format_ctx_usage(2_500_000, 0), "2.5m tok");
+    }
+
+    #[test]
+    fn ctx_usage_surfaces_pct_at_and_over_window() {
+        // The over-window case (e.g. a 339k prompt into a 200k window) must be
+        // visible, not silent — the percentage is the "near/over limit" signal.
+        assert_eq!(format_ctx_usage(339_380, 200_000), "339.4k/200k tok (170%)");
+    }
+
+    #[test]
+    fn ctx_usage_pct_appears_at_ninety_percent_threshold() {
+        // 90% is the inclusive near-limit threshold.
+        assert_eq!(format_ctx_usage(180_000, 200_000), "180.0k/200k tok (90%)");
+    }
+
+    #[test]
+    fn ctx_usage_terse_below_near_limit() {
+        // Just under 90% stays terse (no percentage) — common case unchanged.
+        assert_eq!(format_ctx_usage(179_000, 200_000), "179.0k/200k tok");
     }
 
     fn caps_with_color() -> TerminalCaps {
@@ -6588,6 +6743,72 @@ mod tests {
             post_has,
             "welcome disappeared after resize (regression of pre-fix behaviour)\n\
              dump:\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// Regression for issue #709 ("resize 历史布局乱了"): on a width
+    /// change the WHOLE transcript must re-wrap, not just the welcome
+    /// banner. The pre-fix path rebuilt the welcome and `clip`ped every
+    /// other history row to the new width — so on a shrink the right
+    /// portion of any over-wide row was silently dropped. Here a long
+    /// assistant line fits one row at width 80 (both `ALPHATOKEN` and
+    /// `OMEGATOKEN` visible) but must wrap to ≥2 rows at width 40. The
+    /// clip path would have truncated the row, losing `OMEGATOKEN`
+    /// entirely; the reflow path re-wraps so BOTH tokens survive, on
+    /// different rows.
+    #[test]
+    fn retained_resize_reflows_history_body_not_just_welcome() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let status = status_basic();
+
+        // ~60 visible cols: one row at 80, must wrap at 40.
+        let line = "ALPHATOKEN aa bb cc dd ee ff gg hh ii jj kk ll mm nn OMEGATOKEN";
+        r.render(UiLine::AssistantText(line.into()));
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Resize narrower. Feed ONLY the post-resize bytes into a fresh
+        // 40-wide vterm so we assert on the reflowed result in isolation.
+        let buf_before: Vec<u8> = buf.lock().unwrap().clone();
+        let _ = buf_before;
+        buf.lock().unwrap().clear();
+        r.on_resize(40, 24);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
+        drain_into_vterm(&buf, &mut vterm);
+
+        let alpha_row = (0..24).find(|r| vterm.row_text(*r).contains("ALPHATOKEN"));
+        let omega_row = (0..24).find(|r| vterm.row_text(*r).contains("OMEGATOKEN"));
+        assert!(
+            alpha_row.is_some(),
+            "ALPHATOKEN missing after narrow resize\ndump:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            omega_row.is_some(),
+            "OMEGATOKEN was dropped on narrow resize — history was clipped, \
+             not reflowed (issue #709)\ndump:\n{}",
+            vterm.dump()
+        );
+        assert_ne!(
+            alpha_row, omega_row,
+            "tokens landed on the same row at width 40 — line did not wrap, \
+             so this test no longer exercises reflow\ndump:\n{}",
             vterm.dump()
         );
     }
@@ -11926,6 +12147,41 @@ mod tests {
         assert!(
             out.ends_with("\x1b[?2026l"),
             "resize must close with ESU after the final paint: {:?}",
+            out
+        );
+    }
+
+    /// Regression (long-session resize duplication): once `body_log` evicts its
+    /// oldest entries (`body_log_truncated`), on_resize MUST still clear native
+    /// scrollback (`\x1b[3J`). The reflow below re-appends the whole RETAINED
+    /// transcript; if the wipe is skipped, the previous copy stays stranded and every
+    /// font-zoom step stacks another duplicate (the reported "一直重复输出" on big
+    /// sessions). We trade the already-evicted, un-reflowable prefix for no duplication.
+    #[test]
+    fn on_resize_clears_scrollback_even_after_truncation() {
+        let (mut r, buf) = new_capturing(40, 10);
+        for i in 0..6 {
+            r.render(UiLine::AssistantText(format!("line {i}\n")));
+        }
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        // Simulate a long session whose oldest body_log entries were evicted.
+        r.body_log_truncated = true;
+        buf.lock().unwrap().clear();
+
+        r.on_resize(40, 8); // real height change → resize work
+
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(
+            out.contains("\x1b[3J"),
+            "a truncated session must STILL clear scrollback (3J) to avoid stacking \
+             duplicate transcripts on resize: {:?}",
             out
         );
     }

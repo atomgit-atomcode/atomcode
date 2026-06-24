@@ -1,4 +1,4 @@
-// Account / login button for the sidebar bottom bar (left of settings).
+// Account / login state for the settings menu (the gear's "Account" entry).
 // Self-contained: reads the webui token from the URL, calls /auth/* directly,
 // and picks zh/en labels from settings — to stay decoupled from api.ts/i18n.ts.
 
@@ -10,7 +10,7 @@ function authHeaders(): Record<string, string> {
   return TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {};
 }
 
-interface UserInfo {
+export interface UserInfo {
   username: string;
   name?: string | null;
   email?: string | null;
@@ -22,16 +22,15 @@ const L = {
   en: { signIn: 'Sign in', signingIn: 'Signing in…', signOut: 'Sign out', hint: 'Opened sign-in in your browser…' },
 };
 
-export function LoginButton() {
+// Login/logout state + actions, consumed by the Sidebar settings menu.
+export function useAuth() {
   const { lang } = useSettings();
-  const tt = L[lang === 'en' ? 'en' : 'zh'];
+  const labels = L[lang === 'en' ? 'en' : 'zh'];
 
   const [loggedIn, setLoggedIn] = useState(false);
   const [user, setUser] = useState<UserInfo | null>(null);
   const [busy, setBusy] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
   const pollTimer = useRef<number | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
 
   async function refresh() {
     try {
@@ -50,16 +49,6 @@ export function LoginButton() {
       if (pollTimer.current) clearInterval(pollTimer.current);
     };
   }, []);
-
-  // Close the logout menu on outside click.
-  useEffect(() => {
-    if (!menuOpen) return;
-    const h = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
-    };
-    document.addEventListener('mousedown', h);
-    return () => document.removeEventListener('mousedown', h);
-  }, [menuOpen]);
 
   async function startLogin() {
     if (busy) return;
@@ -112,7 +101,6 @@ export function LoginButton() {
   }
 
   async function doLogout() {
-    setMenuOpen(false);
     try {
       await fetch('/auth/logout', { method: 'POST', headers: authHeaders() });
     } catch {
@@ -122,55 +110,5 @@ export function LoginButton() {
     setUser(null);
   }
 
-  if (loggedIn) {
-    const label = user?.name || user?.username || 'account';
-    const initial = label.slice(0, 1).toUpperCase();
-    const avatar = user?.avatar_url;
-    return (
-      <div class="sidebar-login" ref={menuRef}>
-        <button
-          class="sidebar-login-btn is-account"
-          onClick={() => setMenuOpen((o) => !o)}
-          title={label}
-        >
-          <span class="login-avatar">
-            {avatar ? (
-              <img
-                class="login-avatar-img"
-                src={avatar}
-                alt={label}
-                referrerpolicy="no-referrer"
-                onError={(e) => {
-                  // Fall back to the initial if the image fails to load.
-                  (e.currentTarget as HTMLImageElement).style.display = 'none';
-                }}
-              />
-            ) : (
-              initial
-            )}
-          </span>
-          <span class="login-name">{label}</span>
-        </button>
-        {menuOpen && (
-          <div class="item-menu login-menu">
-            <button class="item-menu-row" onClick={doLogout}>
-              {tt.signOut}
-            </button>
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  return (
-    <button
-      class="sidebar-login-btn"
-      onClick={startLogin}
-      disabled={busy}
-      title={busy ? tt.hint : tt.signIn}
-    >
-      <span class="login-avatar empty">👤</span>
-      <span class="login-name">{busy ? tt.signingIn : tt.signIn}</span>
-    </button>
-  );
+  return { loggedIn, user, busy, labels, startLogin, doLogout };
 }

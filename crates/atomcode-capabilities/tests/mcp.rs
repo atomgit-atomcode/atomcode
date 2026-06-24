@@ -25,6 +25,8 @@ fn test_server_config(name: &str) -> McpServerConfig {
             env: BTreeMap::new(),
             timeout_ms: Some(5_000),
         },
+        trust: false,
+        auto_approve: vec![],
     }
 }
 

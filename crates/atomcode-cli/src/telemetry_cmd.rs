@@ -6,6 +6,8 @@ use atomcode_telemetry::{
     queue::Queue,
     CliOverride, Event, Telemetry, TelemetryState,
 };
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -114,27 +116,39 @@ pub fn dump(atomcode_dir: &std::path::Path, last: usize, pretty: bool) -> Result
         println!("(no queued events)");
         return Ok(());
     }
-    let q = Queue::open(qdir)?;
-    let segs = q.ready_segments_sorted()?;
-    let mut all_lines: Vec<String> = Vec::new();
-    for p in segs {
-        let c = std::fs::read_to_string(&p)?;
-        for l in c.lines() {
-            if !l.is_empty() {
-                all_lines.push(l.to_string());
-            }
-        }
-    }
-    let start = all_lines.len().saturating_sub(last);
-    for line in &all_lines[start..] {
+    for line in collect_tail_lines(&qdir, last)? {
         if pretty {
-            let v: serde_json::Value = serde_json::from_str(line)?;
+            let v: serde_json::Value = serde_json::from_str(&line)?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         } else {
             println!("{}", line);
         }
     }
     Ok(())
+}
+
+fn collect_tail_lines(qdir: &std::path::Path, last: usize) -> Result<Vec<String>> {
+    if last == 0 {
+        return Ok(Vec::new());
+    }
+
+    let q = Queue::open(qdir.to_path_buf())?;
+    let mut tail = VecDeque::with_capacity(last);
+    for p in q.ready_segments_sorted()? {
+        let file = std::fs::File::open(&p)?;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = line?;
+            if line.is_empty() {
+                continue;
+            }
+            if tail.len() == last {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+    }
+    Ok(tail.into_iter().collect())
 }
 
 pub fn clear(atomcode_dir: &std::path::Path) -> Result<()> {
@@ -166,4 +180,22 @@ fn write_flag(cfg_path: &std::path::Path, enabled: bool) -> Result<()> {
     }
     std::fs::write(cfg_path, doc.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_tail_lines_keeps_only_last_non_empty_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let qdir = dir.path().join("queue");
+        std::fs::create_dir_all(&qdir).unwrap();
+        std::fs::write(qdir.join("001.ndjson"), b"one\n\ntwo\n").unwrap();
+        std::fs::write(qdir.join("002.ndjson"), b"three\nfour\n").unwrap();
+
+        let lines = collect_tail_lines(&qdir, 2).unwrap();
+
+        assert_eq!(lines, vec!["three".to_string(), "four".to_string()]);
+    }
 }

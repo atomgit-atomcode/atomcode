@@ -1,17 +1,28 @@
 <idea-plugin>
   <id>com.atomcode.jetbrains</id>
   <name>AtomCode</name>
-  <vendor email="support@atomcode.dev">AtomCode</vendor>
+  <vendor email="atomcode@atomgit.com">AtomCode</vendor>
 
   <description><![CDATA[
-    AtomCode for JetBrains brings the local AtomCode coding agent into IntelliJ IDEA.
+    AtomCode brings a local AI coding agent into JetBrains IDEs.
+
+    Use AtomCode from a dedicated tool window, editor context actions, and intentions to explain, fix, optimize, and review code while keeping the IDE workflow native. The plugin connects to a local AtomCode daemon on 127.0.0.1 by default and supports user-configured providers such as OpenAI, Claude, and Ollama through that daemon.
+
+    Code, selected text, attached files, project metadata, provider settings, and API keys are sent only when needed to fulfill user actions and are handled by the local AtomCode daemon. See the privacy policy for details before configuring external model providers.
   ]]></description>
 
   <change-notes><![CDATA[
-    Initial JetBrains plugin scaffold.
+    Initial JetBrains Marketplace release.
+    <ul>
+      <li>Added the AtomCode tool window for local AI coding workflows.</li>
+      <li>Added editor actions and intentions for explaining, fixing, optimizing, and attaching code context.</li>
+      <li>Added local daemon discovery, startup, health checks, and bundled daemon support.</li>
+      <li>Added session history, provider setup, model selection, diagnostics, and privacy-oriented context controls.</li>
+    </ul>
   ]]></change-notes>
 
   <depends>com.intellij.modules.platform</depends>
+  <depends>com.intellij.modules.jcef</depends>
 
   <extensions defaultExtensionNs="com.intellij">
     <toolWindow
@@ -65,10 +76,18 @@
     </action>
 
     <action
+      id="atomcode.openWelcome"
+      class="com.atomcode.jetbrains.actions.OpenWelcomeAction"
+      text="AtomCode: Welcome"
+      description="Open the AtomCode welcome and quick start page">
+      <add-to-group group-id="ToolsMenu" anchor="last" />
+    </action>
+
+    <action
       id="atomcode.openChatInNewTab"
       class="com.atomcode.jetbrains.actions.OpenChatInNewTabAction"
       text="AtomCode: Open Chat in New Tab"
-      description="Open a separate AtomCode chat tab in the tool window">
+      description="Open an independent AtomCode chat tab in the tool window">
       <add-to-group group-id="ToolsMenu" anchor="last" />
     </action>
 
@@ -94,7 +113,7 @@
       id="atomcode.stopGeneration"
       class="com.atomcode.jetbrains.actions.StopGenerationAction"
       text="AtomCode: Stop Generation"
-      description="Stop the active AtomCode generation">
+      description="Stop the current AtomCode generation">
       <add-to-group group-id="ToolsMenu" anchor="last" />
     </action>
 

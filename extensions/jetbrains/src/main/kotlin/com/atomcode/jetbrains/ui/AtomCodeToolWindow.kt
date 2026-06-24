@@ -12,6 +12,7 @@ import com.intellij.ui.content.Content
 import com.intellij.ui.content.ContentFactory
 import com.intellij.ui.content.ContentManagerEvent
 import com.intellij.ui.content.ContentManagerListener
+import java.awt.Dimension
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.JMenuItem
@@ -22,6 +23,7 @@ import javax.swing.SwingUtilities
 
 const val ATOMCODE_TOOL_WINDOW_ID = "AtomCode"
 private val ATOMCODE_TAB_ID_KEY = Key.create<String>("atomcode.tabId")
+private val ATOMCODE_TOOL_WINDOW_MIN_SIZE = Dimension(360, 300)
 
 fun createAtomCodeChatContent(project: Project, toolWindow: ToolWindow, closeable: Boolean): AtomCodeChatPanel {
     val name = nextChatTabName(toolWindow)
@@ -51,6 +53,7 @@ private fun createAtomCodeChatContent(
     }
     toolWindow.contentManager.addContent(content)
     toolWindow.contentManager.setSelectedContent(content)
+    toolWindow.component.minimumSize = ATOMCODE_TOOL_WINDOW_MIN_SIZE
 
     // 给标签栏安装右键菜单
     installTabPopupMenu(toolWindow, project)
@@ -69,15 +72,35 @@ fun selectedAtomCodeChatPanel(project: Project): AtomCodeChatPanel? {
         .firstOrNull()
 }
 
+fun ensureAtomCodeChatContent(project: Project, toolWindow: ToolWindow): AtomCodeChatPanel {
+    val selected = toolWindow.contentManager.selectedContent?.component as? AtomCodeChatPanel
+    if (selected != null) return selected
+    val existing = toolWindow.contentManager.contents
+        .asSequence()
+        .mapNotNull { it.component as? AtomCodeChatPanel }
+        .firstOrNull()
+    if (existing != null) return existing
+    return createAtomCodeChatContent(project, toolWindow, closeable = true)
+}
+
 fun openAtomCodeChatTab(project: Project, newTab: Boolean = false, focusInput: Boolean = true) {
     ApplicationManager.getApplication().invokeLater {
         val toolWindow = ToolWindowManager.getInstance(project).getToolWindow(ATOMCODE_TOOL_WINDOW_ID) ?: return@invokeLater
         toolWindow.show()
-        if (newTab || toolWindow.contentManager.contentCount == 0) {
+        val panel = if (newTab) {
             createAtomCodeChatContent(project, toolWindow, closeable = true)
+        } else {
+            ensureAtomCodeChatContent(project, toolWindow)
         }
-        val panel = selectedAtomCodeChatPanel(project)
-        if (focusInput) panel?.focusInput()
+        if (focusInput) panel.focusInput()
+    }
+}
+
+fun openAtomCodeWelcomePage(project: Project) {
+    ApplicationManager.getApplication().invokeLater {
+        val toolWindow = ToolWindowManager.getInstance(project).getToolWindow(ATOMCODE_TOOL_WINDOW_ID) ?: return@invokeLater
+        toolWindow.show()
+        ensureAtomCodeChatContent(project, toolWindow).showWelcomePage()
     }
 }
 

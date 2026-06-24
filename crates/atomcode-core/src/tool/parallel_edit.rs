@@ -124,7 +124,9 @@ impl Tool for ParallelEditTool {
         // upgrades that to Always when the file is in-workspace.
         let parsed = match serde_json::from_str::<ParallelEditArgs>(args) {
             Ok(p) => p,
-            Err(_) => return ApprovalRequirement::AutoApprove,
+            Err(_) => return ApprovalRequirement::RequireApproval(
+                "Cannot parse parallel_edit args — requiring approval for safety".to_string()
+            ),
         };
         for file in &parsed.files {
             if super::is_sensitive_input_path(&file.path) {
@@ -354,8 +356,14 @@ impl Tool for ParallelEditTool {
                 .flatten()
         };
         if let Some((cmd, build_dir)) = build_detect {
-            let mut build_cmd = tokio::process::Command::new("sh");
-            build_cmd.args(["-c", &cmd])
+            // Use platform-appropriate shell: Windows uses cmd.exe, Unix uses sh
+            #[cfg(windows)]
+            let (shell, flag) = ("cmd.exe", "/C");
+            #[cfg(not(windows))]
+            let (shell, flag) = ("sh", "-c");
+
+            let mut build_cmd = tokio::process::Command::new(shell);
+            build_cmd.args([flag, &cmd])
                 .current_dir(&build_dir);
             crate::process_utils::suppress_console_window(&mut build_cmd);
             let output = build_cmd.output().await;
@@ -424,11 +432,14 @@ fn build_task_infos_with_dedup(paths: &[&str]) -> Vec<crate::agent::SubAgentTask
 /// subdirectories so nested project layouts (a Cargo workspace under a
 /// monorepo) still resolve.
 fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBuf)> {
+    // No Unix-only pipes (head/tail): the probe runs under cmd.exe on Windows where
+    // those coreutils don't exist (else the pipe's last command fails and the probe
+    // falsely reports BUILD ERRORS). Output is truncated Rust-side for display below.
     let markers: &[(&str, &str)] = &[
-        ("package.json", "npm run build 2>&1 | head -30"),
-        ("Cargo.toml", "cargo check 2>&1 | tail -20"),
-        ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
-        ("go.mod", "go build ./... 2>&1 | tail -20"),
+        ("package.json", "npm run build 2>&1"),
+        ("Cargo.toml", "cargo check 2>&1"),
+        ("pom.xml", "mvn compile -q 2>&1"),
+        ("go.mod", "go build ./... 2>&1"),
     ];
 
     for &(marker, cmd) in markers {

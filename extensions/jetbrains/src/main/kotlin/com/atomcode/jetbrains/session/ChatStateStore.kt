@@ -154,6 +154,7 @@ private fun ChatState.applyDaemonEvent(event: ChatEvent, ids: IdFactory, clock: 
         is ChatEvent.ArtifactEnd -> addSystemMessage("[Artifact] ${event.id} ended", SystemLevel.Info, ids, clock)
         is ChatEvent.PermissionRequest -> addPermissionRequest(event, ids, clock)
         is ChatEvent.Tokens -> this
+        is ChatEvent.Warning -> addSystemMessage(event.message, SystemLevel.Warning, ids, clock)
         is ChatEvent.Done -> completeGeneration(event.sessionId)
         ChatEvent.Stopped -> copy(generation = GenerationState.Idle)
             .addSystemMessage("[Stopped]", SystemLevel.Warning, ids, clock)

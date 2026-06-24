@@ -108,6 +108,19 @@ pub fn spawn_bridged_runtime(
     (client, ev_rx)
 }
 
+/// Wait for the kernel agent task to finish after a `Shutdown`, bounded by
+/// `grace`. `Bridge::run` returns only after this await, and the interactive
+/// driver's `/quit` completes only once that task ends and the CoreCmd channel
+/// closes — so a wedged kernel teardown (a tool or SessionEnd hook that never
+/// returns) would otherwise hang `/quit` forever. On timeout we `abort()` the
+/// task and return regardless; a backstop TUI watchdog covers the (now far
+/// rarer) case where even this isn't enough.
+async fn await_kernel_or_abort(task: &mut tokio::task::JoinHandle<()>, grace: Duration) {
+    if tokio::time::timeout(grace, &mut *task).await.is_err() {
+        task.abort();
+    }
+}
+
 /// Per-turn statistics backing the legacy `TurnComplete` payload.
 #[derive(Default)]
 struct TurnStats {
@@ -372,7 +385,7 @@ impl Bridge {
             }
         }
         let _ = bridge.handle.commands.send(KCmd::Shutdown);
-        let _ = bridge.handle.task.await;
+        await_kernel_or_abort(&mut bridge.handle.task, Duration::from_secs(5)).await;
     }
 
     fn emit(&self, ev: CoreEv) {
@@ -780,11 +793,11 @@ impl Bridge {
                                     let new_handle = a.spawn();
                                     // Shut down old handle and swap.
                                     let _ = self.handle.commands.send(KCmd::Shutdown);
-                                    let old_task = std::mem::replace(
+                                    let mut old_task = std::mem::replace(
                                         &mut self.handle.task,
                                         tokio::spawn(async {}),
                                     );
-                                    let _ = old_task.await;
+                                    await_kernel_or_abort(&mut old_task, Duration::from_secs(5)).await;
                                     self.handle = new_handle;
                                     self.degraded = false;
                                     // Clear any stale state that may have accumulated
@@ -1034,8 +1047,8 @@ impl Bridge {
             self.finish_turn(StopReason::Cancelled, Vec::new());
         }
         let _ = self.handle.commands.send(KCmd::Shutdown);
-        let task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
-        let _ = task.await;
+        let mut task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
+        await_kernel_or_abort(&mut task, Duration::from_secs(5)).await;
         let mut opts = self.opts_template.clone();
         opts.session = session;
 
@@ -1435,26 +1448,30 @@ impl Bridge {
                 let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
                 self.emit(CoreEv::Error { error, snapshot: ConversationSnapshot::default() });
             }
-            // A manual `/compact` may make a slow one-shot LLM summary call; announce it
-            // so the user sees a progress line while it runs (v1 streamed the same
-            // "(compacting with LLM summary...)" text). Auto/Overflow stub silently — no
-            // LLM call, no user action to acknowledge — so they stay quiet here.
+            // The kernel emits CompactionStarted ONLY when a slow one-shot LLM summary
+            // will actually run (manual `/compact`, overflow tier 2, or auto-compaction
+            // that escalated past the high-water mark). Always show a progress line so
+            // the user isn't staring at a frozen UI during the multi-second call. A
+            // user-typed `/compact` streams it as a TextDelta (its command handler
+            // renders these inline, v1 parity); auto/overflow — which the user did not
+            // invoke — surface it as a transient Warning instead.
             KEv::CompactionStarted { trigger } => {
+                let text =
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting).into_owned();
                 if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
-                    self.emit(CoreEv::TextDelta(
-                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting)
-                            .into_owned(),
-                    ));
+                    self.emit(CoreEv::TextDelta(text));
+                } else {
+                    self.emit(CoreEv::Warning(text));
                 }
             }
             KEv::Compacted { committed, trigger, removed, bytes_before, bytes_after, .. } => {
+                // The kernel measures BYTES; token figures are derived from the last
+                // provider usage report. Capture it BEFORE mutating `last_usage` below.
+                let before_tokens =
+                    self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
                 if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
                     // v1 parity: stream the authoritative result as a plain TextDelta line
-                    // (the TUI's `/compact` handler renders these directly). The kernel
-                    // measures BYTES, so the token figures are derived from the last
-                    // provider usage report (see `manual_compact_result`).
-                    let before_tokens =
-                        self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
+                    // (the TUI's `/compact` handler renders these directly).
                     self.emit(CoreEv::TextDelta(manual_compact_result(
                         committed,
                         removed,
@@ -1462,22 +1479,23 @@ impl Bridge {
                         bytes_after,
                         before_tokens,
                     )));
-                    if committed {
-                        // v1 parity: refresh the cached context size so the footer /
-                        // `/context` reflect the shrunk conversation immediately. v1
-                        // recomputes via `build_messages`; the kernel only tracks bytes,
-                        // so update `last_usage` to the same estimate the result line
-                        // shows. The next real turn overwrites it with the exact count.
-                        if let Some(meta) = self.last_usage.as_mut() {
-                            meta.used_tokens =
-                                estimate_after_tokens(before_tokens, bytes_before, bytes_after)
-                                    as u32;
-                        }
-                        self.emit_context_stats();
-                    }
                 } else if let Some(msg) = compaction_advisory(committed, &trigger) {
                     // Auto/Overflow keep the terse one-line advisory.
                     self.emit(CoreEv::Warning(msg));
+                }
+                if committed {
+                    // Refresh the cached context size so the footer / `/context` reflect
+                    // the shrunk conversation IMMEDIATELY — for ANY committed compaction,
+                    // not just Manual. Previously Auto/Overflow skipped this, so an auto
+                    // drain+summarize's reduction lagged a full turn (footer stayed at the
+                    // pre-compaction number until the next real usage report). The kernel
+                    // only tracks bytes, so estimate the post-shrink tokens from the byte
+                    // ratio; the next real turn overwrites it with the exact count.
+                    if let Some(meta) = self.last_usage.as_mut() {
+                        meta.used_tokens =
+                            estimate_after_tokens(before_tokens, bytes_before, bytes_after) as u32;
+                    }
+                    self.emit_context_stats();
                 }
             }
             KEv::TurnComplete { reason } => {
@@ -1766,7 +1784,7 @@ async fn run_background_task(
         }
     }
     let _ = handle.commands.send(KCmd::Shutdown);
-    let _ = handle.task.await;
+    await_kernel_or_abort(&mut handle.task, Duration::from_secs(5)).await;
     let summary = if summary.trim().is_empty() {
         "(background task finished with no text output)".to_string()
     } else {
@@ -2344,6 +2362,33 @@ mod undo_tests {
             super::run_local_shell("exit 3", std::path::Path::new(".")).await;
         assert!(!success);
         assert!(ctx.contains("<bash-exit-code>3</bash-exit-code>"), "ctx={ctx}");
+    }
+
+    // A wedged kernel teardown (a tool / SessionEnd hook that never returns) must
+    // NOT hang the bridge: the bounded wait has to return, and abort the task, so
+    // `Bridge::run` ends and the driver's /quit can complete. This is the core of
+    // the "/quit can't exit" fix.
+    #[tokio::test]
+    async fn await_kernel_or_abort_times_out_and_aborts_a_wedged_task() {
+        let mut task = tokio::spawn(async { std::future::pending::<()>().await });
+        let start = std::time::Instant::now();
+        super::await_kernel_or_abort(&mut task, std::time::Duration::from_millis(50)).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "must return on timeout, not hang on the wedged task"
+        );
+        // The task was cancelled, not left running — awaiting it yields a cancel error.
+        assert!(task.await.is_err(), "wedged task must be aborted");
+    }
+
+    // The happy path: a kernel that shuts down cleanly is awaited to completion
+    // (no abort), well within the grace window.
+    #[tokio::test]
+    async fn await_kernel_or_abort_returns_when_task_ends_cleanly() {
+        let mut task = tokio::spawn(async {});
+        super::await_kernel_or_abort(&mut task, std::time::Duration::from_secs(5)).await;
+        // The helper awaited it to completion within the grace window (no abort).
+        assert!(task.is_finished(), "clean task must finish normally, not be aborted");
     }
 
     #[test]

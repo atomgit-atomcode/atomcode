@@ -10,6 +10,7 @@ import com.atomcode.jetbrains.daemon.ConnectionState
 import com.atomcode.jetbrains.daemon.CreateProviderRequest
 import com.atomcode.jetbrains.daemon.DaemonAuth
 import com.atomcode.jetbrains.daemon.HealthResponse
+import com.atomcode.jetbrains.daemon.ImageInput
 import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
 import com.atomcode.jetbrains.daemon.PatchProviderRequest
@@ -257,6 +258,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         session: SessionRefView?,
         listener: ChatStreamListener,
         provider: String? = null,
+        images: List<ImageInput> = emptyList(),
         onSessionReady: (SessionRefView) -> Unit,
     ): CompletableFuture<SessionRefView> {
         return saveDocumentsBeforePrompt().thenCompose {
@@ -265,7 +267,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
             if (state !is ConnectionState.Ready) {
                 CompletableFuture.failedFuture(IllegalStateException("AtomCode is not connected."))
             } else {
-                sendPromptWhenReady(prompt, state.projectPath, session, listener, onSessionReady, provider)
+                sendPromptWhenReady(prompt, state.projectPath, session, listener, onSessionReady, provider, images)
             }
         }.whenComplete { _, error ->
             if (error != null) {
@@ -606,6 +608,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         listener: ChatStreamListener,
         onSessionReady: (SessionRefView) -> Unit,
         provider: String?,
+        images: List<ImageInput>,
     ): CompletableFuture<SessionRefView> {
         val client = getOrCreateClient()
         val workingDir = projectPath.ifBlank { project.basePath.orEmpty() }
@@ -622,6 +625,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 workingDir = sessionRef.workingDir.ifBlank { workingDir },
                 sessionId = sessionRef.id,
                 provider = provider,
+                images = images,
             )
 
             client.streamChat(request) { event ->

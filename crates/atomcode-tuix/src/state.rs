@@ -159,6 +159,16 @@ pub struct UiState {
     pub turn_prompt_tokens: usize,
     pub turn_completion_tokens: usize,
     pub turn_cached_tokens: usize,
+    /// Whether the CURRENT turn has rendered any visible assistant text (a
+    /// non-empty post-think-strip `TextDelta`). Reset at turn start/end. Read on
+    /// `TurnComplete` to detect a turn that finished with NO visible answer —
+    /// e.g. a reasoning-only / `<think>`-only completion the TUI would otherwise
+    /// show as a blank bubble — so it can surface a notice instead.
+    pub turn_rendered_visible_text: bool,
+    /// Whether the CURRENT turn produced any reasoning (a `ReasoningDelta`),
+    /// regardless of `show_reasoning`. Reset at turn start/end. Lets the blank-
+    /// turn notice say "only reasoning, press Ctrl+O" vs "no output at all".
+    pub turn_saw_reasoning: bool,
     /// Verbatim accumulation of the CURRENT/most-recent assistant reply's
     /// visible markdown (post think-strip), reassembled from `TextDelta`s.
     /// `/copy` extracts fenced code blocks from this — it must read the
@@ -391,6 +401,8 @@ impl UiState {
             turn_prompt_tokens: 0,
             turn_completion_tokens: 0,
             turn_cached_tokens: 0,
+            turn_rendered_visible_text: false,
+            turn_saw_reasoning: false,
             last_assistant_response: String::new(),
             response_finalized: false,
             prior_phase: None,
@@ -557,6 +569,10 @@ impl UiState {
         let now = std::time::Instant::now();
         self.turn_started_at = Some(now);
         self.phase_started_at = Some(now);
+        // Fresh turn: no visible text or reasoning seen yet (drives the
+        // blank-turn notice on TurnComplete).
+        self.turn_rendered_visible_text = false;
+        self.turn_saw_reasoning = false;
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
         self.last_stream_activity = Some(now);
@@ -572,6 +588,8 @@ impl UiState {
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
+        self.turn_rendered_visible_text = false;
+        self.turn_saw_reasoning = false;
         // Turn finished normally — no need to offer resubmit of the
         // message any more. (On cancel, the streaming-key handler
         // already took() the Option before the TurnCancelled event
@@ -588,6 +606,8 @@ impl UiState {
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
+        self.turn_rendered_visible_text = false;
+        self.turn_saw_reasoning = false;
     }
 
     pub fn on_error(&mut self) {
@@ -595,6 +615,10 @@ impl UiState {
         self.spinner_label.clear();
         self.turn_started_at = None;
         self.phase_started_at = None;
+        // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
+        // flags so an errored turn can't leak a stale notice into a reused turn.
+        self.turn_rendered_visible_text = false;
+        self.turn_saw_reasoning = false;
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —

@@ -33,7 +33,25 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // Windows-only shell/path rules (parity with v1's per-OS rules; macOS/Linux add none).
     #[cfg(windows)]
     p.push_str(WINDOWS_PLATFORM);
+    // Day-granular date anchor, FROZEN into the system prompt. assemble runs ONCE per
+    // session (and on model-swap via reconcile_coding_persona), NOT per turn — so this is
+    // cache-stable AND present on EVERY round, including a turn's first round which the
+    // per-turn StatusReminderHook deliberately skips. Without it the model has no current-
+    // date reference and a round-1 web_search defaults to its training year (the
+    // `project_system_prompt_date` bug). A cross-day resume refreshes it (reconcile re-inserts
+    // the fresh persona + bumps cache_epoch — ~one cold prefill per day, negligible). v1
+    // `prompt.rs:67` parity.
+    p.push_str(&date_anchor_line(
+        &chrono::Local::now().format("%Y-%m-%d (%A)").to_string(),
+    ));
     p
+}
+
+/// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
+/// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
+/// clock once per session.
+fn date_anchor_line(today: &str) -> String {
+    format!("\n\n## ENVIRONMENT:\nToday's date: {today}")
 }
 
 /// Windows-only platform rules, appended on Windows builds (v1 `config/mod.rs` parity).
@@ -120,6 +138,22 @@ When working with Chinese codebases: Chinese comments and Chinese/Pinyin variabl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn date_anchor_line_formats_env_block() {
+        assert_eq!(
+            date_anchor_line("2099-01-02 (Friday)"),
+            "\n\n## ENVIRONMENT:\nToday's date: 2099-01-02 (Friday)"
+        );
+    }
+
+    #[test]
+    fn persona_carries_a_current_date_anchor() {
+        // Every round needs a date anchor (round 1 is skipped by StatusReminderHook),
+        // else web_search defaults to the training year.
+        let p = coding_persona("m");
+        assert!(p.contains("Today's date:"), "persona must carry a date anchor: {p}");
+    }
 
     #[test]
     fn persona_carries_model_and_anchors() {

@@ -85,14 +85,19 @@ pub fn meter_provider(
     base_url: &str,
     model: &str,
 ) -> Arc<dyn LlmProvider> {
-    Arc::new(atomcode_coding::telemetry::MeteredProvider::new(
-        inner,
-        sink.clone(),
-        "openai",
-        base_url,
-        model,
-        None,
-    ))
+    Arc::new(
+        atomcode_coding::telemetry::MeteredProvider::new(
+            inner,
+            sink.clone(),
+            "openai",
+            base_url,
+            model,
+            None,
+        )
+        // Tag with surface="code_review" so the standalone reviewer's spend is
+        // attributable in telemetry, matching the in-session `code_review` tool.
+        .with_surface("code_review"),
+    )
 }
 
 /// Build the OpenAI-compatible provider for the standalone `review` agent (mirrors

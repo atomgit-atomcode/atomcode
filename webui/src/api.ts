@@ -316,6 +316,25 @@ export async function getProject(): Promise<ProjectState> {
 }
 
 
+// --- MCP server status ---
+
+export interface McpServerInfo {
+  name: string;
+  status: string;
+  tool_count?: number;
+  error?: string;
+}
+
+export interface McpStatusInfo {
+  servers: McpServerInfo[];
+}
+
+export async function getMcpStatus(): Promise<McpStatusInfo> {
+  const resp = await fetch('/mcp/status', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`mcp status failed: ${resp.status}`);
+  return resp.json();
+}
+
 // --- User-invocable skills (for the input "+" attach menu) ---
 
 export interface SkillInfo {
@@ -492,7 +511,8 @@ export type LiveWireEvent =
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
-  | { type: 'session_switched'; session_id: string };
+  | { type: 'session_switched'; session_id: string }
+  | { type: 'working_dir'; working_dir: string };
 
 export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,

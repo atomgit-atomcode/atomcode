@@ -2,9 +2,10 @@ package com.atomcode.jetbrains.ui.webview
 
 import com.atomcode.jetbrains.store.ChatStore
 import com.atomcode.jetbrains.store.PermissionDecisionKind
+import com.atomcode.jetbrains.ui.jcef.JBCefQueryHandlers
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
-import com.intellij.ui.jcef.JBCefJSQuery
+import com.intellij.ui.jcef.JBCefBrowserBase
 
 /**
  * React → Kotlin 回调桥接。
@@ -17,6 +18,7 @@ class HostBridge(
     private val onOpenFile: (String, Int?) -> Unit,
 ) {
     private val gson = Gson()
+    private var jsQuery: com.intellij.ui.jcef.JBCefJSQuery? = null
 
     data class CallbackMsg(
         val type: String? = null,
@@ -28,8 +30,7 @@ class HostBridge(
     )
 
     fun install() {
-        val jsQuery = JBCefJSQuery.create(chatWebView.browser)
-        jsQuery.addHandler { rawJson ->
+        val query = JBCefQueryHandlers.create(chatWebView.browser as JBCefBrowserBase) { rawJson ->
             try {
                 val msg = gson.fromJson(rawJson, CallbackMsg::class.java)
                 when (msg.type) {
@@ -51,11 +52,11 @@ class HostBridge(
                     "scroll_complete" -> { /* no-op */ }
                 }
             } catch (_: Exception) {}
-            null // JBCefJSQuery handler expects nullable return
         }
+        jsQuery = query
         // 将 jsQuery 注入到 JS 全局作用域
         chatWebView.browser.cefBrowser.executeJavaScript(
-            "window.jsQuery = function(msg) { ${jsQuery.inject("msg")} }",
+            "window.jsQuery = function(msg) { ${query.inject("msg")} }",
             chatWebView.browser.cefBrowser.url, 0
         )
     }

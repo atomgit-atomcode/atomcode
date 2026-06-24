@@ -353,7 +353,7 @@ pub(super) fn execute_slash_command(
 
     match cmd {
         "quit" | "exit" => {
-            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            super::arm_shutdown_watchdog(ctx);
         }
         "copy" => {
             // Copy a fenced code block from the most recent assistant reply to
@@ -3261,6 +3261,22 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     // Without this, the popup continues showing files from the original
     // startup directory after the user runs `/cd`.
     ctx.file_index.reset(path.clone());
+    // Rebuild the session manager for the new project directory.
+    // `SessionManager::new` derives a `project_hash` from the working dir,
+    // which determines the bucket (`~/.atomcode/sessions/<hash>/`) that
+    // `/resume` lists. Without this, `/resume` after `/cd` still shows
+    // sessions from the old project because the manager still points at the
+    // old hash bucket.
+    ctx.session_manager = SessionManager::new(&path);
+    // Sync mode: drive the in-process LiveSession's working dir so (a) the live
+    // executor runs the next turn in the new dir (LIVE_WORKING_DIR override, #755)
+    // and (b) every webui tab follows the switch over the /live SSE wire. Mirrors
+    // the webui /cd endpoint (change_dir → live_set_working_dir). Self-echo is
+    // harmless: the broadcast loops back as ProjectSwitched but no-ops because
+    // ctx.working_dir already equals `path`.
+    if ctx.sync_session.is_some() {
+        atomcode_daemon::live_set_working_dir(path.clone());
+    }
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
 }
@@ -3304,33 +3320,13 @@ pub(crate) fn save_recent_dirs(dirs: &[PathBuf]) {
     let _ = std::fs::write(&path, content);
 }
 
-fn resolve_cd(
+pub(crate) fn resolve_cd(
     arg: &str,
     cwd: &std::path::Path,
     prev: Option<&std::path::Path>,
 ) -> std::result::Result<PathBuf, String> {
     let home = crate::platform::home_dir();
-    let target = if arg.is_empty() {
-        home.ok_or_else(|| "home directory not known".to_string())?
-    } else if arg == "-" {
-        prev.map(|p| p.to_path_buf())
-            .ok_or_else(|| "No previous directory".to_string())?
-    } else if let Some(rest) = arg.strip_prefix('~') {
-        let home = home.ok_or_else(|| "home directory not known".to_string())?;
-        let rest = rest.strip_prefix('/').unwrap_or(rest);
-        if rest.is_empty() {
-            home
-        } else {
-            home.join(rest)
-        }
-    } else {
-        let p = PathBuf::from(arg);
-        if p.is_absolute() {
-            p
-        } else {
-            cwd.join(p)
-        }
-    };
+    let target = expand_cd_target(arg, home.as_deref(), cwd, prev)?;
     let canon = target
         .canonicalize()
         .map_err(|e| format!("{}: {}", target.display(), e))?;
@@ -3341,6 +3337,40 @@ fn resolve_cd(
         .into_owned());
     }
     Ok(canon)
+}
+
+/// Expand a `/cd` argument to a target path WITHOUT touching the filesystem (no
+/// canonicalize / existence check — the caller does that). Handles `~`, `~/sub`,
+/// `~\sub` (Windows backslash), `-` (previous dir), absolute, and relative-to-cwd.
+/// Pure (filesystem-free) so the path logic is unit-testable; `resolve_cd` wraps
+/// it with the canonicalize + is_dir validation.
+pub(crate) fn expand_cd_target(
+    arg: &str,
+    home: Option<&std::path::Path>,
+    cwd: &std::path::Path,
+    prev: Option<&std::path::Path>,
+) -> std::result::Result<PathBuf, String> {
+    if arg.is_empty() {
+        return home
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| "home directory not known".to_string());
+    }
+    if arg == "-" {
+        return prev
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| "No previous directory".to_string());
+    }
+    if let Some(rest) = arg.strip_prefix('~') {
+        let home = home.ok_or_else(|| "home directory not known".to_string())?;
+        // Strip the leading separator(s) after `~` — BOTH `/` and `\` so a Windows
+        // user can type `~\Desktop` like `~/Desktop`, and ALL of them so a doubled
+        // separator (`~//x`, easy typo) doesn't leave an absolute remnant that
+        // `home.join` would treat as a root and escape the home dir.
+        let rest = rest.trim_start_matches(['/', '\\']);
+        return Ok(if rest.is_empty() { home.to_path_buf() } else { home.join(rest) });
+    }
+    let p = PathBuf::from(arg);
+    Ok(if p.is_absolute() { p } else { cwd.join(p) })
 }
 
 /// Build the OAuth-prompt body shown in scrollback while waiting for
@@ -4077,6 +4107,60 @@ mod copy_tests {
     fn resolve_no_blocks_when_reply_has_none() {
         assert!(matches!(resolve_copy("plain reply", ""), CopyResolve::NoBlocks));
         assert!(matches!(resolve_copy("", ""), CopyResolve::NoBlocks));
+    }
+}
+
+#[cfg(test)]
+mod expand_cd_target_tests {
+    use super::expand_cd_target;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn tilde_accepts_forward_and_back_slash() {
+        let home = PathBuf::from("/home/u");
+        let cwd = PathBuf::from("/work");
+        // `~/Desktop` and `~\Desktop` (Windows) must both expand to <home>/Desktop.
+        assert_eq!(
+            expand_cd_target("~/Desktop", Some(&home), &cwd, None).unwrap(),
+            home.join("Desktop")
+        );
+        assert_eq!(
+            expand_cd_target("~\\Desktop", Some(&home), &cwd, None).unwrap(),
+            home.join("Desktop")
+        );
+        assert_eq!(expand_cd_target("~", Some(&home), &cwd, None).unwrap(), home);
+    }
+
+    #[test]
+    fn tilde_strips_all_leading_separators_no_home_escape() {
+        // `~//Desktop` / `~\\Desktop` (double separator, easy typo) must stay
+        // home-relative — NOT degrade to the absolute `/Desktop` that a single
+        // `strip_prefix` would leave (Path::join with an absolute arg drops home).
+        let home = PathBuf::from("/home/u");
+        let cwd = PathBuf::from("/work");
+        assert_eq!(
+            expand_cd_target("~//Desktop", Some(&home), &cwd, None).unwrap(),
+            home.join("Desktop")
+        );
+        assert_eq!(
+            expand_cd_target("~\\\\Desktop", Some(&home), &cwd, None).unwrap(),
+            home.join("Desktop")
+        );
+    }
+
+    #[test]
+    fn relative_joins_cwd_absolute_kept() {
+        let cwd = PathBuf::from("/work");
+        assert_eq!(expand_cd_target("sub", None, &cwd, None).unwrap(), cwd.join("sub"));
+        assert_eq!(expand_cd_target("/abs/path", None, &cwd, None).unwrap(), Path::new("/abs/path"));
+    }
+
+    #[test]
+    fn dash_uses_previous_dir() {
+        let cwd = PathBuf::from("/work");
+        let prev = PathBuf::from("/old");
+        assert_eq!(expand_cd_target("-", None, &cwd, Some(&prev)).unwrap(), prev);
+        assert!(expand_cd_target("-", None, &cwd, None).is_err());
     }
 }
 

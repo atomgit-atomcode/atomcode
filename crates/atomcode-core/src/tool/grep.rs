@@ -13,9 +13,9 @@ pub struct GrepTool;
 struct GrepArgs {
     pattern: String,
     path: Option<String>,
-    #[serde(default = "default_max_results")]
+    #[serde(default = "default_max_results", deserialize_with = "deserialize_lenient_usize")]
     max_results: usize,
-    #[serde(default = "default_context")]
+    #[serde(default = "default_context", deserialize_with = "deserialize_lenient_usize")]
     context: usize,
 }
 
@@ -24,6 +24,52 @@ fn default_context() -> usize {
 }
 fn default_max_results() -> usize {
     50
+}
+
+/// Lenient usize deserializer that accepts integers, floats, and numeric strings.
+/// Weak models often send `"50"` or `50.0` instead of `50`.
+fn deserialize_lenient_usize<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Visitor;
+
+    struct LenientUsize;
+
+    impl<'de> Visitor<'de> for LenientUsize {
+        type Value = usize;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a non-negative integer, float, or numeric string")
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            Ok(v as usize)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            if v >= 0 {
+                Ok(v as usize)
+            } else {
+                Err(serde::de::Error::custom("negative value not allowed"))
+            }
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+            if v < 0.0 || v.is_nan() {
+                return Err(serde::de::Error::custom("negative or NaN value not allowed"));
+            }
+            Ok(v as usize)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            v.trim()
+                .parse::<usize>()
+                .map_err(serde::de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(LenientUsize)
 }
 
 #[async_trait]

@@ -33,13 +33,67 @@ body {
   overflow: hidden;
 }
 
-/* Right-hand column: header (cwd + config) stacked above the chat body. */
+/* Right-hand column: sticky session-title header above the chat body (no top bar). */
 .main-column {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-width: 0;
   overflow: hidden;
+  position: relative;
+  background: var(--app-primary-background);
+}
+
+/* Session-title header — sits flush at the top of the main area, left-aligned
+   (close to the content edge), no bottom rule, subtle glass over the content. */
+.session-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 24px;
+  flex-shrink: 0;
+  background: color-mix(in srgb, var(--app-primary-background), transparent 12%);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 5;
+}
+.session-title-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(460px, 60%);
+  height: 28px;
+  padding: 5px 10px;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-primary-foreground);
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.session-title-btn:hover { background: var(--app-ghost-button-hover-background); }
+.session-title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.session-title-chevron { color: var(--app-secondary-foreground); flex-shrink: 0; }
+
+/* Mobile-only floating menu button (opens the sidebar drawer; the redesign has
+   no top bar to host the old ☰). Hidden on desktop. */
+.mobile-menu-btn {
+  display: none;
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 30;
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--app-primary-border-color);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-primary-background);
+  color: var(--app-primary-foreground);
+  cursor: pointer;
+  font-size: 16px;
 }
 
 .app-sidebar {
@@ -186,11 +240,20 @@ body {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 20px 20px 8px;
+  padding: 20px 24px 8px;
   gap: 0;
   min-width: 0;
   background-color: var(--app-primary-background);
   position: relative;
+}
+
+/* Centered fixed-width message column (matches the input width). */
+.timeline-inner {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .messages-empty {
@@ -205,9 +268,11 @@ body {
 .messages-empty .sub { color: var(--app-secondary-foreground); opacity: 0.7; font-size: 12px; margin-top: 4px; }
 
 /* === Timeline Message === */
+/* No left rail: the dot (::before) + connecting line / end-dot (::after) were
+   removed; assistant turns are plain left-aligned blocks (user turns are
+   right-aligned bubbles, so the two sides stay distinguishable). */
 .timeline-message {
   position: relative;
-  padding-left: 30px;
   padding-top: 8px;
   padding-bottom: 8px;
   display: flex;
@@ -218,64 +283,15 @@ body {
 
 .timeline-message:first-child { padding-top: 0; }
 
-.timeline-message::before {
-  content: '';
-  position: absolute;
-  left: 9px;
-  top: 14px;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--app-secondary-foreground);
-  z-index: 1;
-}
-
-.timeline-message:first-child::before { top: 6px; }
-
-.timeline-message::after {
-  content: '';
-  position: absolute;
-  left: 12px;
-  top: 0;
-  bottom: 0;
-  width: 1px;
-  background: var(--app-primary-border-color, var(--app-input-border));
-}
-
-.timeline-message:first-child::after { top: 13px; }
-.user-message-wrapper + .timeline-message::after { top: 21px; }
-.timeline-message:has(+ .user-message-wrapper)::after,
-.timeline-message.is-last::after,
-.timeline-message:last-child::after {
-  left: 9px;
-  width: 7px;
-  background:
-    radial-gradient(circle at center calc(100% - 3.5px), var(--app-timeline-end-dot) 0 3px, transparent 3.5px),
-    linear-gradient(var(--app-primary-border-color, var(--app-input-border)), var(--app-primary-border-color, var(--app-input-border))) center top / 1px calc(100% - 7px) no-repeat;
-}
-
-.timeline-message.is-last.dot-blink::after {
-  left: 12px;
-  width: 1px;
-  background: var(--app-primary-border-color, var(--app-input-border));
-}
-
-/* 简短的终条回复：去掉冗余的橙色末端点 + 短连接线，只保留起始点。 */
-.timeline-message.is-last.is-terse::after { display: none; }
-
-/* Dot Colors */
-.timeline-message.dot-brand::before { background: var(--app-brand); }
-.timeline-message.dot-success::before { background: #74c991; }
-.timeline-message.dot-error::before { background: var(--app-error-foreground); }
-.timeline-message.dot-warning::before { background: #e1c08d; }
-.timeline-message.dot-blink::before { animation: blink 1s linear infinite; }
-
-/* === User Message === */
+/* === User Message (right-aligned chat bubble) === */
 .user-message-wrapper {
   position: relative;
   z-index: 2;
   padding: 10px 0 12px;
   width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
 }
 
 .user-message-bubble {
@@ -284,16 +300,19 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   border: 1px solid var(--app-input-border);
-  border-radius: var(--corner-radius-small);
-  background-color: var(--app-input-background);
+  border-radius: var(--corner-radius-large);
+  background-color: var(--app-input-secondary-background);
   color: var(--app-primary-foreground);
-  padding: 9px 10px;
-  width: 100%;
+  padding: 9px 13px;
+  max-width: 85%;
+  width: auto;
   user-select: text;
   font-size: 13px;
   line-height: 1.5;
   font-weight: 400;
 }
+/* Skill/markdown content can be wide — let it use the full column width. */
+.user-message-bubble.is-markdown { max-width: 100%; width: 100%; }
 
 /* 技能/文档型消息展开后按 markdown 渲染：取消气泡的 pre-wrap，避免块级元素
    之间出现多余空白；首/尾块去掉外边距使其贴合气泡内边距。 */
@@ -406,6 +425,68 @@ body {
   white-space: pre-wrap;
 }
 
+/* === Todo task list === */
+/* The `todo` tool renders as a live checklist panel (☑/▸/☐) instead of a plain
+   tool row — mirrors the TUI / Claude Code task-progress widget. */
+.todo-panel {
+  border: 1px solid var(--app-primary-border-color);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-tool-background, var(--app-secondary-background));
+  padding: 8px 10px;
+  margin: 2px 0;
+}
+
+.todo-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--app-secondary-foreground);
+  margin-bottom: 6px;
+}
+
+.todo-panel-title { flex: 1; min-width: 0; }
+
+.todo-panel-count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  opacity: 0.8;
+}
+
+.todo-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.todo-item {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--app-primary-foreground);
+}
+
+.todo-mark { flex-shrink: 0; font-size: 12px; }
+
+.todo-text { min-width: 0; word-break: break-word; }
+
+.todo-item.completed .todo-mark { color: var(--app-success-foreground); }
+.todo-item.completed .todo-text {
+  text-decoration: line-through;
+  color: var(--app-secondary-foreground);
+}
+
+.todo-item.in_progress .todo-mark { color: var(--app-accent-color, var(--app-brand)); }
+.todo-item.in_progress .todo-text { font-weight: 600; }
+
+.todo-item.pending .todo-mark { color: var(--app-secondary-foreground); }
+
 .streaming-cursor {
   display: inline-block;
   width: 7px;
@@ -420,13 +501,15 @@ body {
 .tool-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 6px;
   margin: 0 0 10px;
   width: 100%;
 }
 
+/* Each tool renders as a borderless, compact inline row (log-style): a
+   leading type icon, the name, a flex-fill arg preview, and a plain-text
+   status with its own icon. No card chrome — only a subtle hover background. */
 .tool-body {
-  background: transparent;
   margin: 0;
   max-width: 100%;
   font-size: 1em;
@@ -435,18 +518,27 @@ body {
 .tool-header {
   display: flex;
   align-items: center;
-  padding: 2px 0;
-  gap: 7px;
+  padding: 5px 6px;
+  gap: 8px;
+  border-radius: var(--corner-radius-small);
   cursor: pointer;
   user-select: none;
   min-width: 0;
 }
 
-.tool-header:hover .tool-name-secondary { color: var(--app-primary-foreground); }
+.tool-header:hover { background: var(--app-list-hover-background); }
 .tool-header:active { opacity: 0.65; }
 
+/* Leading tool-type icon (file / search / edit / terminal …). */
+.tool-type-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  color: var(--app-secondary-foreground);
+}
+
 .tool-name {
-  font-weight: 700;
+  font-weight: 600;
+  font-size: 13px;
   color: var(--app-primary-foreground);
   /* No text-transform: `displayToolName` already cases names correctly
      (PascalCase for builtins, lowercase `mcp · server · tool` for MCP). */
@@ -454,13 +546,12 @@ body {
 }
 
 .tool-name-secondary {
-  /* Grow to fill the row between the tool name and the status badge so the
-     command preview uses the available width (no big blank gap) and shows
-     as much as fits; CSS ellipsis trims the rest at the real width. Full
-     args are available by clicking the row to expand. */
+  /* Grow to fill the row between the tool name and the status so the command
+     preview uses the available width (no big blank gap) and shows as much as
+     fits; CSS ellipsis trims the rest. Full args are available on expand. */
   flex: 1 1 auto;
   color: var(--app-secondary-foreground);
-  font-size: 0.95em;
+  font-size: 12px;
   font-family: var(--app-monospace-font-family);
   min-width: 0;
   overflow: hidden;
@@ -468,19 +559,25 @@ body {
   white-space: nowrap;
 }
 
+/* Status → plain colored text + leading icon (no filled pill). */
 .tool-annotation {
   margin-left: auto;
-  border-radius: 3px;
-  padding: 2px 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 11px;
   flex-shrink: 0;
   white-space: nowrap;
 }
 
-.tool-annotation.success { color: #74c991; background-color: #74c99133; }
-.tool-annotation.error { color: #f14c4c; background-color: #c74e3933; }
-.tool-annotation.pending { color: var(--app-secondary-foreground); background-color: color-mix(in srgb, var(--app-secondary-foreground), transparent 85%); }
-.tool-annotation.waiting { color: var(--app-warning-accent); background-color: color-mix(in srgb, var(--app-warning-accent), transparent 80%); }
+.tool-status-icon { flex-shrink: 0; display: inline-flex; }
+.tool-status-icon.spin { animation: tool-spin 0.8s linear infinite; transform-origin: center; }
+@keyframes tool-spin { to { transform: rotate(360deg); } }
+
+.tool-annotation.success { color: var(--app-success-foreground); }
+.tool-annotation.error { color: var(--app-error-foreground); }
+.tool-annotation.pending { color: var(--app-secondary-foreground); }
+.tool-annotation.waiting { color: var(--app-warning-accent); }
 
 /* === Code Block (markdown / mono) === */
 .code-block-wrapper { position: relative; margin: 10px 0; }
@@ -593,17 +690,70 @@ body {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  padding: 8px 16px 16px;
+  padding: 12px 24px 18px;
   background: var(--app-primary-background);
 }
+
+/* Centered fixed-width input column (input box + cwd breadcrumb below it). */
+.input-wrap {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Sub-row below the input box: cwd breadcrumb (left) + keyboard hint (right). */
+.input-subbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 4px;
+  min-width: 0;
+}
+.input-hint {
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+  opacity: 0.9;
+}
+
+/* cwd breadcrumb chip (relocated below the input box). */
+.input-cwd {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 4px 6px;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--app-monospace-font-family);
+}
+.input-cwd:hover { background: var(--app-ghost-button-hover-background); color: var(--app-primary-foreground); }
+.input-cwd-icon { flex-shrink: 0; }
+.input-cwd-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.input-cwd-path.muted { opacity: 0.85; }
+.input-cwd-chevron { flex-shrink: 0; font-size: 9px; }
 
 .input-box {
   background: var(--app-input-background);
   border: 1px solid var(--app-input-border);
-  border-radius: 20px;
-  box-shadow: 0 2px 10px #0000000d, 0 1px 3px #00000008;
+  border-radius: var(--corner-radius-large);
+  box-shadow: 0 2px 12px #0000001f, 0 1px 3px #00000008;
   display: flex;
   flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
   position: relative;
   color: var(--app-input-foreground);
 }
@@ -621,12 +771,14 @@ body {
   resize: none;
   color: var(--app-input-foreground);
   font-family: inherit;
-  font-size: inherit;
+  font-size: 14px;
   line-height: 1.5;
   min-height: 3em;
   max-height: 200px;
   overflow-y: auto;
-  padding: 14px 18px;
+  /* Box now owns the outer inset (padding 10/12); keep the field's own padding tiny
+     so the typed text aligns with the controls row below it. */
+  padding: 4px 2px 0;
   width: 100%;
 }
 .message-input::placeholder { color: var(--app-input-placeholder-foreground); }
@@ -637,8 +789,7 @@ body {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  border-top: 0.5px solid var(--app-input-border);
-  padding: 5px 8px;
+  padding: 0;
   color: var(--app-secondary-foreground);
   font-size: 11px;
 }
@@ -648,9 +799,9 @@ body {
 .footer-tokens { opacity: 0.7; font-size: 11px; white-space: nowrap; }
 
 .btn-send {
-  width: 26px;
-  height: 26px;
-  border-radius: 5px;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
   border: none;
   background: var(--app-brand-button);
   color: var(--app-brand-ivory);
@@ -659,32 +810,36 @@ body {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  font-size: 13px;
+  font-size: 17px;
 }
 .btn-send:disabled { opacity: 0.4; cursor: default; }
 .btn-send:not(:disabled):hover { filter: brightness(1.1); }
 
+/* Stop shares the send slot (shown while busy) — a solid filled circle with a
+   contrasting square (claude.ai-style), so it reads as the same affordance as
+   the send circle instead of a sparse thin-outline ring. */
 .btn-stop {
-  width: 26px;
-  height: 26px;
-  border-radius: 5px;
-  border: 1.5px solid var(--app-secondary-foreground);
-  background: transparent;
-  color: var(--app-secondary-foreground);
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: none;
+  background: var(--app-primary-foreground);
+  color: var(--app-primary-background);
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
 }
-.btn-stop:hover { border-color: var(--app-primary-foreground); color: var(--app-primary-foreground); }
-.btn-stop .stop-square { width: 9px; height: 9px; border-radius: 2px; background: currentColor; }
+.btn-stop:hover { filter: brightness(1.1); }
+.btn-stop .stop-square { width: 11px; height: 11px; border-radius: 2px; background: currentColor; }
 
 .btn-sync {
-  height: 22px;
-  padding: 0 7px;
-  border-radius: 4px;
-  border: 1px solid var(--app-input-border);
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 8px;
+  border: none;
   background: transparent;
   color: var(--app-secondary-foreground);
   cursor: pointer;
@@ -692,19 +847,22 @@ body {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1;
   white-space: nowrap;
 }
 .btn-sync:hover { background: var(--app-ghost-button-hover-background); color: var(--app-primary-foreground); }
-.btn-sync.active { background: color-mix(in srgb, var(--app-brand) 15%, transparent); border-color: var(--app-brand); color: var(--app-brand); }
+/* Active = brand-tinted square (matches the design's #d977572e fill + brand icon). */
+.btn-sync.active { background: color-mix(in srgb, var(--app-brand) 18%, transparent); color: var(--app-brand); }
+.btn-sync.active:hover { background: color-mix(in srgb, var(--app-brand) 24%, transparent); color: var(--app-brand); }
 
 /* === Sidebar / session list === */
 .session-list {
-  /* 侧栏随视口适度放宽：≤~1600px 维持 240px 不变，大屏逐步放宽至 340px，
+  /* 侧栏随视口适度放宽：≤~1600px 维持 260px 不变，大屏逐步放宽至 320px，
      避免在 2560px 等大屏上侧栏显得过窄、与主区比例失衡。 */
-  width: clamp(240px, 15vw, 340px);
-  background: var(--app-primary-background);
+  width: clamp(260px, 15vw, 320px);
+  /* 暖色二级背景（比主区略深），与主区形成柔和分层（对齐设计）。 */
+  background: var(--app-secondary-background);
   border-right: 1px solid var(--app-primary-border-color);
   display: flex;
   flex-direction: column;
@@ -712,30 +870,101 @@ body {
   flex-shrink: 0;
 }
 
-/* --- Brand row: "atomcode" + collapse button on its right --- */
+/* --- Brand row: diamond logo + "AtomCode" + collapse button --- */
 .sidebar-brand-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  height: 40px;
-  padding: 0 8px 0 12px;
+  padding: 14px 14px 10px;
   flex-shrink: 0;
 }
 
 .sidebar-brand {
-  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.sidebar-brand-name {
+  font-family: var(--app-serif-font-family);
+  font-weight: 600;
   font-size: 16px;
-  letter-spacing: 0.2px;
+  letter-spacing: -0.01em;
   white-space: nowrap;
-  /* 深色背景白字，浅色背景黑字 */
   color: var(--app-brand-text);
 }
 
-/* --- Search row (below the new-conversation button) --- */
-.sidebar-search-row {
+/* --- Sidebar actions: New chat + Skills (filled rows) --- */
+.sidebar-actions {
   display: flex;
-  padding: 2px 8px 8px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 12px 10px;
+  flex-shrink: 0;
+}
+.sidebar-action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  /* 幽灵样式：与侧栏同色、融入背景，仅悬停/展开时有反馈（对齐会话列表项）。 */
+  border: none;
+  border-radius: var(--corner-radius-medium);
+  background: transparent;
+  color: var(--app-primary-foreground);
+  cursor: pointer;
+  font-size: 13.5px;
+  font-family: inherit;
+  text-align: left;
+}
+.sidebar-action:hover { background: var(--app-list-active-background); }
+.sidebar-action.open { background: var(--app-list-active-background); }
+.sidebar-action-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--app-brand);
+  flex-shrink: 0;
+}
+.sidebar-action-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-action-badge {
+  flex-shrink: 0;
+  min-width: 18px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--app-list-active-background);
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+  text-align: center;
+}
+.sidebar-action-caret { display: flex; align-items: center; color: var(--app-secondary-foreground); flex-shrink: 0; }
+
+/* --- Brand row button group (search + collapse, tightly packed) --- */
+.sidebar-brand-btns {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.sidebar-search-btn {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+}
+.sidebar-search-btn:hover {
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
 }
 
 .sidebar-collapse-btn {
@@ -826,22 +1055,20 @@ body {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 4px;
+  padding: 4px 8px 8px;
 }
 
-/* --- "Recent" label + group-by control --- */
+/* --- "Recent" section label --- */
 .session-group-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 6px;
-  padding: 8px 6px 4px 8px;
+  padding: 10px 8px 4px;
 }
 
 .session-group-label {
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  font-size: 0.75em;
+  letter-spacing: 0.5px;
+  font-size: 11px;
   font-weight: 600;
   color: var(--app-secondary-foreground);
 }
@@ -918,7 +1145,7 @@ body {
   align-items: center;
   gap: 2px;
   width: 100%;
-  border-radius: var(--corner-radius-small);
+  border-radius: var(--corner-radius-medium);
   color: var(--app-primary-foreground);
   user-select: none;
 }
@@ -1015,63 +1242,182 @@ body {
 .settings-submenu { display: flex; flex-direction: column; }
 .item-menu-row.sub { padding: 6px 10px 6px 34px; font-size: 12px; color: var(--app-secondary-foreground); }
 .item-menu-row.sub svg { margin-left: auto; color: var(--app-brand); }
+/* Separator between the settings group and the trailing logout row. */
+.settings-menu-divider { height: 1px; margin: 4px 6px; background: var(--app-menu-border); }
 
 .session-empty { padding: 20px; text-align: center; color: var(--app-secondary-foreground); font-size: 12px; }
 
-/* --- Bottom bar: session count + settings entry --- */
-.sidebar-bottom {
-  display: flex;
-  align-items: center;
-  padding: 4px 6px 6px;
-  border-top: 1px solid var(--app-primary-border-color);
-  flex-shrink: 0;
+/* --- Session search dialog (centered modal — reuses .modal-overlay/.modal-card) --- */
+.modal-card.search-modal-card {
+  width: min(840px, 100%);
+  height: 60dvh;
 }
-
-/* Settings entry occupies the whole bottom row (replaces the old session count). */
-.sidebar-settings-btn {
-  margin-left: auto;
-  flex: 0 0 auto;
+.search-input-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 32px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--app-menu-border);
+  flex-shrink: 0;
+}
+.search-input-row svg {
+  color: var(--app-secondary-foreground);
+  flex-shrink: 0;
+}
+.search-input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
   padding: 0 8px;
+  background: transparent;
+  border: none;
+  color: var(--app-input-foreground);
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+}
+.search-input::placeholder {
+  color: var(--app-input-placeholder-foreground);
+}
+.search-results {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px;
+}
+.search-empty {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--app-secondary-foreground);
+  font-size: 13px;
+}
+.search-date-group {
+  margin-top: 4px;
+}
+.search-date-label {
+  padding: 8px 10px 3px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--app-secondary-foreground);
+}
+.search-date-group:first-child .search-date-label { padding-top: 4px; }
+.search-result-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
   border: none;
   border-radius: var(--corner-radius-small);
   background: transparent;
-  color: var(--app-secondary-foreground);
+  color: var(--app-primary-foreground);
   cursor: pointer;
   font-size: 13px;
   text-align: left;
+  font-family: inherit;
 }
-.sidebar-settings-btn:hover {
+.search-result-item:hover {
   background: var(--app-list-hover-background);
-  color: var(--app-primary-foreground);
 }
-.sidebar-settings-btn svg { flex-shrink: 0; }
+.search-result-item.active {
+  background: var(--app-list-active-background);
+}
+.search-result-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 1;
+  min-width: 0;
+}
+.search-result-dir {
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+  font-family: var(--app-monospace-font-family);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 1;
+  min-width: 0;
+}
+.search-result-time {
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+  flex-shrink: 0;
+  white-space: nowrap;
+  margin-left: auto;
+}
 
-/* Login / account entry — sits to the LEFT of the settings button in the
-   bottom bar. Height matches the settings row (adjustable via --login-h). */
-.sidebar-login { position: relative; flex-shrink: 0; }
-.sidebar-login-btn {
+/* --- Bottom bar: account (avatar + name) + remote + settings --- */
+.sidebar-bottom {
   display: flex;
   align-items: center;
-  gap: 6px;
-  height: var(--login-h, 32px);
-  max-width: 140px;
-  padding: 0 8px;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--app-primary-border-color);
+  flex-shrink: 0;
+}
+.sidebar-bottom-spacer { flex: 1; min-width: 0; }
+
+/* Icon buttons (remote / settings) in the bottom bar + collapsed rail bottom. */
+.sidebar-icon-btn {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border: none;
   border-radius: var(--corner-radius-small);
   background: transparent;
   color: var(--app-secondary-foreground);
   cursor: pointer;
-  font-size: 13px;
 }
-.sidebar-login-btn:hover {
+.sidebar-icon-btn:hover {
   background: var(--app-ghost-button-hover-background);
   color: var(--app-primary-foreground);
 }
-.sidebar-login-btn:disabled { opacity: 0.6; cursor: default; }
+.sidebar-icon-btn svg { flex-shrink: 0; }
+
+/* Collapsed rail: bottom-anchored icon group (remote + settings). */
+.sidebar-rail-bottom {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding-bottom: 8px;
+}
+
+/* Account entry in the sidebar bottom bar (left of remote/settings): a static
+   avatar+name chip when logged in, or a "sign in" button when not. Logout
+   itself lives in the settings menu. */
+.sidebar-account,
+.sidebar-account-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 150px;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: var(--corner-radius-small);
+  color: var(--app-secondary-foreground);
+  font-size: 13px;
+}
+.sidebar-account-btn {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+.sidebar-account-btn:hover {
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
+}
+.sidebar-account-btn:disabled { opacity: 0.6; cursor: default; }
+.login-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Account avatar — used by the bottom-bar chip (initial letter or avatar img). */
 .login-avatar {
   width: 20px;
   height: 20px;
@@ -1084,20 +1430,97 @@ body {
   font-size: 11px;
   font-weight: 600;
   flex-shrink: 0;
+  overflow: hidden;
 }
-.login-avatar.empty { background: transparent; color: var(--app-secondary-foreground); font-size: 14px; }
-.login-avatar { overflow: hidden; }
 .login-avatar-img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
-.login-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.login-menu { position: absolute; bottom: 100%; left: 0; margin-bottom: 4px; z-index: 40; min-width: 120px; }
 
 /* Settings popup (3 entries), opens upward from the settings button. */
 .settings-menu { min-width: 180px; }
 
-/* Settings button at the bottom of the collapsed icon rail. */
+/* Skills popup (opens downward below the sidebar Skills action). */
+.skills-menu { max-height: 320px; overflow-y: auto; max-width: 320px; min-height: 0; }
+.skills-menu-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  min-height: 0;
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-menu-foreground, var(--app-primary-foreground));
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+}
+.skills-menu-row:hover { background: var(--app-list-hover-background); }
+.skills-menu-name {
+  font-size: 12.5px;
+  font-family: var(--app-monospace-font-family);
+  color: var(--app-primary-foreground);
+}
+.skills-menu-desc {
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* MCP popup (opens downward below the sidebar MCP action). */
+.mcp-menu { max-height: 360px; overflow-y: auto; max-width: 340px; min-height: 0; }
+.mcp-menu-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  min-height: 0;
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border-radius: var(--corner-radius-small);
+}
+.mcp-menu-name {
+  font-size: 12.5px;
+  font-family: var(--app-monospace-font-family);
+  color: var(--app-primary-foreground);
+}
+.mcp-menu-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+}
+.mcp-status-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.mcp-status-dot.connected { background: #22c55e; }
+.mcp-status-dot.connecting { background: #f59e0b; }
+.mcp-status-dot.disconnected { background: var(--app-secondary-foreground); opacity: 0.4; }
+.mcp-status-dot.error { background: #ef4444; }
+.mcp-menu-status-text { }
+.mcp-menu-tool-count {
+  font-size: 10px;
+  color: var(--app-secondary-foreground);
+  opacity: 0.7;
+}
+.mcp-menu-error {
+  font-size: 10px;
+  color: #ef4444;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Settings button at the bottom of the collapsed icon rail (inside rail-bottom). */
 .rail-btn-settings {
-  margin-top: auto;
-  margin-bottom: 6px;
+  margin: 0;
   align-self: center;
 }
 
@@ -1188,6 +1611,60 @@ body {
   color: var(--app-secondary-foreground);
 }
 
+/* === Permission card (tool approval) — matches landing/home brand style ===
+   The generic modal is reused, but the approval popup adopts the home page's
+   warm clay accent, diamond brand mark and serif title so it feels of-a-piece
+   with the landing hero instead of a system warning dialog. */
+/* No divider lines: the header/body/footer read as one calm surface rather
+   than three boxed-off sections, matching the borderless landing hero. */
+.permission-card .permission-header {
+  gap: 10px;
+  padding: 18px 20px 4px;
+  border-bottom: none;
+}
+.permission-card .modal-body { padding: 12px 20px; }
+.permission-card .permission-footer {
+  padding: 8px 20px 18px;
+  border-top: none;
+}
+.permission-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--app-brand);
+  flex-shrink: 0;
+}
+.permission-title {
+  font-family: var(--app-serif-font-family);
+  font-size: 17px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.01em;
+  color: var(--app-brand-text) !important;
+}
+.permission-card .permission-tag {
+  background: color-mix(in srgb, var(--app-brand), transparent 84%);
+  color: var(--app-brand);
+}
+/* Brief, friendly lead-in line under the header, echoing the landing tagline. */
+.permission-lead {
+  font-family: var(--app-serif-font-family);
+  font-size: 14px;
+  color: var(--app-secondary-foreground);
+  margin: 0;
+}
+/* Args sit in one soft panel instead of bare text, so the body stays quiet. */
+.permission-card .field-group .tool-body-row-content {
+  background: var(--app-tool-background);
+  border-radius: var(--corner-radius-medium);
+}
+/* Pill-shaped actions to match the landing quick-prompt chips. A single clay
+   accent (批准) carries the eye; every other action is a quiet ghost button —
+   no competing green/filled colors. */
+.permission-footer .btn {
+  border-radius: 999px;
+  padding: 0 18px;
+}
+
 /* === Tool detail (expanded args + output) === */
 .tool-chevron {
   font-size: 10px;
@@ -1201,8 +1678,10 @@ body {
 .tool-body-grid {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
-  margin-top: 8px;
-  border: 0.5px solid var(--app-input-border);
+  /* No card around the row anymore, so the expanded output is its own
+     contained block, indented to align under the row's name. */
+  margin: 2px 0 4px 26px;
+  border: 1px solid var(--app-primary-border-color);
   border-radius: var(--corner-radius-small);
   background: var(--app-tool-background);
   overflow: hidden;
@@ -1682,11 +2161,13 @@ body {
 }
 
 .input-footer .model-selector-trigger {
-  height: 22px;
+  height: 28px;
+  border-radius: 16px;
+  border-color: var(--app-primary-border-color);
   color: var(--app-secondary-foreground);
   background: transparent;
-  font-size: 11px;
-  padding: 2px 7px;
+  font-size: 12px;
+  padding: 3px 10px;
 }
 
 /* Dropdown — opens upward when used in the input footer */
@@ -1774,10 +2255,13 @@ body {
 /* === Mobile adaptation (≤768px) === */
 @media (max-width: 768px) {
   .hamburger-btn { display: flex; }
+  .mobile-menu-btn { display: flex; }
 
-  .header-title { font-size: 12px; }
-  .cwd-breadcrumb { max-width: 40vw; }
-  .cwd-breadcrumb .cwd-prefix { display: none; }
+  /* Leave room at the header's left edge for the floating menu button. */
+  .session-header { padding: 10px 12px 10px 54px; }
+
+  /* Keyboard hint is desktop-only affordance; drop it to save room. */
+  .input-hint { display: none; }
 
   /* Sidebar becomes off-canvas drawer */
   .session-list {
@@ -1825,6 +2309,11 @@ body {
     border-top-left-radius: var(--corner-radius-large);
     border-top-right-radius: var(--corner-radius-large);
   }
+  /* 搜索弹窗：手机端占满宽度、几乎全高，作为底部抽屉更顺手 */
+  .modal-card.search-modal-card {
+    width: 100%;
+    height: 85dvh;
+  }
 }
 
 /* === New-chat landing (claude.ai-style centered hero) === */
@@ -1840,36 +2329,70 @@ body {
 
 .landing-inner {
   width: 100%;
-  /* 落地内容随视口适度放大：小屏（≤~1780px）维持 820 的协调观感不变，
-     大屏上逐步放宽，避免标题/输入框在大量留白中显得过小、比例失衡。 */
-  max-width: clamp(820px, 46vw, 1120px);
+  max-width: 760px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: clamp(16px, 1.4vw, 28px);
-  /* 略高于真正的垂直居中，观感更接近 claude.ai；大屏上限制上移量避免悬空。 */
+  gap: 22px;
+  /* 略高于真正的垂直居中，观感更接近 claude.ai。 */
   margin-bottom: min(8vh, 96px);
 }
 
+/* Brand: diamond logo + serif wordmark. */
 .landing-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.landing-brand-logo { display: flex; align-items: center; color: var(--app-brand); }
+.landing-brand-name {
   font-family: var(--app-serif-font-family);
-  font-size: clamp(34px, 2.6vw, 52px);
-  font-weight: 500;
+  font-size: clamp(32px, 2.4vw, 40px);
+  font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--app-brand-text);
 }
 
-.landing-subtitle {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  max-width: 100%;
-  font-size: 13px;
+.landing-tagline {
+  font-family: var(--app-serif-font-family);
+  font-size: 18px;
   color: var(--app-secondary-foreground);
   margin-top: -8px;
 }
-.landing-project { font-weight: 600; color: var(--app-primary-foreground); flex-shrink: 0; }
-.landing-path { opacity: 0.7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Input column (box + cwd breadcrumb below). */
+.landing-input {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Quick-prompt chips. */
+.landing-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+.landing-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 340px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--app-primary-border-color);
+  background: var(--app-secondary-background);
+  color: var(--app-primary-foreground);
+  font-family: inherit;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.landing-chip:hover { border-color: var(--app-brand); color: var(--app-brand); }
 
 /* 复用的输入框在落地态下居中、全宽（而非底部悬浮） */
 .landing-inner .input-box { width: 100%; }
@@ -1943,19 +2466,19 @@ body {
 .attach-menu { position: relative; display: inline-flex; }
 
 .attach-btn {
-  width: 26px;
-  height: 26px;
+  width: 32px;
+  height: 32px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 5px;
-  border: 1px solid var(--app-input-border);
+  border-radius: 8px;
+  border: none;
   background: transparent;
   color: var(--app-secondary-foreground);
   cursor: pointer;
   flex-shrink: 0;
 }
-.attach-btn:hover { color: var(--app-brand); border-color: var(--app-brand); }
+.attach-btn:hover { background: var(--app-ghost-button-hover-background); color: var(--app-primary-foreground); }
 
 .attach-popover {
   position: absolute;
@@ -2139,8 +2662,8 @@ body {
 .input-thumbs {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  padding: 8px 10px 0;
+  gap: 6px;
+  padding: 0;
 }
 .input-thumb {
   position: relative;
@@ -2181,7 +2704,7 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 8px 10px 0;
+  margin: 0;
   padding: 6px 10px;
   border-radius: 6px;
   background: var(--app-error-bg, #fdecec);

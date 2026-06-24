@@ -186,6 +186,12 @@ impl Session {
     /// by the first non-synthetic user turn, while user-renamed sessions are
     /// left alone.
     pub fn auto_name_from_messages(&mut self) {
+        // If the user explicitly renamed this session (via /rename or the
+        // webui rename dialog), never auto-name it — the user's choice
+        // must persist across turns.
+        if self.user_renamed {
+            return;
+        }
         if !should_auto_name_session(&self.name) {
             return;
         }

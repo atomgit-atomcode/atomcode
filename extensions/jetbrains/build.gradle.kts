@@ -78,8 +78,12 @@ intellijPlatform {
     }
 
     signing {
-        certificateChain = providers.environmentVariable("JETBRAINS_CERTIFICATE_CHAIN")
-        privateKey = providers.environmentVariable("JETBRAINS_PRIVATE_KEY")
+        certificateChainFile = layout.file(
+            providers.environmentVariable("JETBRAINS_CERTIFICATE_CHAIN_FILE").map { file(it) },
+        )
+        privateKeyFile = layout.file(
+            providers.environmentVariable("JETBRAINS_PRIVATE_KEY_FILE").map { file(it) },
+        )
         password = providers.environmentVariable("JETBRAINS_PRIVATE_KEY_PASSWORD")
     }
 
@@ -90,6 +94,10 @@ intellijPlatform {
 }
 
 tasks {
+    named("verifyPluginSignature") {
+        dependsOn("signPlugin")
+    }
+
     val skipSearchableOptions = providers.gradleProperty("skipSearchableOptions")
         .map(String::toBoolean)
         .orElse(false)
@@ -197,6 +205,15 @@ tasks {
 
     processResources {
         dependsOn(bundleDaemon, buildWebview)
+        exclude(
+            "webview/.gitignore",
+            "webview/esbuild.config.mjs",
+            "webview/node_modules/**",
+            "webview/package-lock.json",
+            "webview/package.json",
+            "webview/src/**",
+            "webview/tsconfig.json",
+        )
         from(bundledDaemonDir)
     }
 
