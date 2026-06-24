@@ -56,6 +56,42 @@ pub struct BridgeConfig {
     pub interactive: bool,
 }
 
+impl BridgeConfig {
+    /// Build a [`BridgeConfig`] from a resolved provider config — the SINGLE place the
+    /// driver→config field mapping lives, so the cli + daemon construction sites can't
+    /// drift (the BridgeConfig-drops-per-provider-config footgun). `p == None` ⇒ neutral
+    /// defaults (empty creds, 128K window, `"openai"` adapter), mirroring the drivers'
+    /// prior `unwrap_or_default` behaviour for an unknown provider. Provider RESOLUTION
+    /// stays with the caller (cli's `active_provider` vs daemon's `providers.get` differ).
+    pub fn from_provider(
+        p: Option<&atomcode_core::config::provider::ProviderConfig>,
+        working_dir: &std::path::Path,
+        telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
+        dangerously_skip_permissions: bool,
+        interactive: bool,
+    ) -> Self {
+        BridgeConfig {
+            api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
+            base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+            model: p.map(|p| p.model.clone()).unwrap_or_default(),
+            working_dir: working_dir.to_path_buf(),
+            context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
+            mcp: true,
+            telemetry,
+            reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
+            reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
+            provider_type: p
+                .map(|p| p.provider_type.clone())
+                .unwrap_or_else(|| "openai".into()),
+            thinking_enabled: p.and_then(|p| p.thinking_enabled),
+            thinking_type: p.and_then(|p| p.thinking_type.clone()),
+            thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
+            dangerously_skip_permissions,
+            interactive,
+        }
+    }
+}
+
 /// Map a driver-supplied [`BridgeConfig`] to the [`CodingAgentConfig`] the new stack
 /// assembles from. PUBLIC so every native driver (cli, daemon, the headless CLI) reuses
 /// the EXACT same knob mapping — no divergence (the BridgeConfig-drops-per-provider-config
@@ -148,6 +184,13 @@ pub fn build_provider(
     }
 }
 
+/// The standard [`ProviderFactory`] every native driver injects into
+/// `CodingRuntime::spawn`: construct the provider via [`build_provider`] (incl. the
+/// AtomGit signing gateway), surfacing errors as `String` for the kernel's factory slot.
+pub fn provider_factory() -> atomcode_coding::ProviderFactory {
+    Box::new(|c: &CodingAgentConfig| build_provider(c).map_err(|e| e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{build_provider, coding_config, BridgeConfig};
@@ -202,5 +245,62 @@ mod tests {
         assert!(res.is_err(), "a reasoning_history typo must fail provider construction");
         let err = res.err().unwrap().to_string();
         assert!(err.contains("reasoning_history"), "expected a reasoning_history error, got: {err}");
+    }
+
+    fn sample_provider() -> atomcode_core::config::provider::ProviderConfig {
+        atomcode_core::config::provider::ProviderConfig {
+            provider_type: "claude".into(),
+            api_key: Some("sk-1".into()),
+            model: "m-1".into(),
+            base_url: Some("https://api.example.com/v1".into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 64_000,
+            max_tokens: None,
+            thinking_type: Some("enabled".into()),
+            thinking_keep: Some("all".into()),
+            reasoning_history: Some("include".into()),
+            reasoning_effort: Some("high".into()),
+            thinking_enabled: Some(true),
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: true,
+        }
+    }
+
+    #[test]
+    fn from_provider_maps_present_provider() {
+        let pc = sample_provider();
+        let bcfg =
+            BridgeConfig::from_provider(Some(&pc), std::path::Path::new("/work"), None, true, false);
+        assert_eq!(bcfg.api_key, "sk-1");
+        assert_eq!(bcfg.base_url, "https://api.example.com/v1");
+        assert_eq!(bcfg.model, "m-1");
+        assert_eq!(bcfg.working_dir, std::path::PathBuf::from("/work"));
+        assert_eq!(bcfg.context_window, 64_000);
+        assert_eq!(bcfg.provider_type, "claude");
+        assert_eq!(bcfg.reasoning_history.as_deref(), Some("include"));
+        assert_eq!(bcfg.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(bcfg.thinking_enabled, Some(true));
+        assert_eq!(bcfg.thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(bcfg.thinking_keep.as_deref(), Some("all"));
+        assert!(bcfg.mcp);
+        assert!(bcfg.dangerously_skip_permissions);
+        assert!(!bcfg.interactive);
+    }
+
+    #[test]
+    fn from_provider_none_uses_neutral_defaults() {
+        let bcfg = BridgeConfig::from_provider(None, std::path::Path::new("/w"), None, false, true);
+        assert_eq!(bcfg.api_key, "");
+        assert_eq!(bcfg.base_url, "");
+        assert_eq!(bcfg.model, "");
+        assert_eq!(bcfg.context_window, 128_000);
+        assert_eq!(bcfg.provider_type, "openai");
+        assert_eq!(bcfg.reasoning_history, None);
+        assert_eq!(bcfg.thinking_enabled, None);
+        assert!(bcfg.mcp);
+        assert!(!bcfg.dangerously_skip_permissions);
+        assert!(bcfg.interactive);
     }
 }

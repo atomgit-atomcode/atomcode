@@ -13,7 +13,7 @@ use atomcode_core::provider;
 use atomcode_core::tool::PermissionDecision;
 use atomcode_core::turn::event::TurnEvent;
 use atomcode_coding::{
-    CodingAgentConfig, CodingRuntime, PrepareOptions, ProviderFactory, SessionMode,
+    CodingRuntime, PrepareOptions, SessionMode,
 };
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -254,28 +254,16 @@ impl KernelTurnExecutor {
         let config = Config::load(&Config::default_path()).ok()?;
         let name = self.resolve_provider_name();
         let p = config.providers.get(&name)?;
-        Some(atomcode_shell::BridgeConfig {
-            api_key: p.api_key.clone().unwrap_or_default(),
-            base_url: p.base_url.clone().unwrap_or_default(),
-            model: p.model.clone(),
-            working_dir: self.working_dir.clone(),
-            context_window: p.context_window as u32,
-            mcp: true,
-            telemetry: Some(self.telemetry.clone()),
-            reasoning_history: p.reasoning_history.clone(),
-            reasoning_effort: p.reasoning_effort.clone(),
-            provider_type: p.provider_type.clone(),
-            thinking_enabled: p.thinking_enabled,
-            thinking_type: p.thinking_type.clone(),
-            thinking_keep: p.thinking_keep.clone(),
-            // The daemon answers approvals at its OWN driver seam (the `/live`
-            // BypassAll decider / `/chat` interactive perm_rx), so the bridge must
-            // NOT auto-approve — keep the round-trip and the daemon decides.
-            dangerously_skip_permissions: false,
-            // Keep the fail-closed approval timeout for the daemon (current behavior); the
-            // interactive PARK behavior is wired for the cli TUI path for now.
-            interactive: false,
-        })
+        // The daemon answers approvals at its OWN seam (the `/live` BypassAll decider /
+        // `/chat` interactive perm_rx), so keep skip_perms=false (round-trip) +
+        // interactive=false (fail-closed timeout; PARK is the cli TUI path's behavior).
+        Some(atomcode_shell::BridgeConfig::from_provider(
+            Some(p),
+            &self.working_dir,
+            Some(self.telemetry.clone()),
+            false,
+            false,
+        ))
     }
 }
 
@@ -348,9 +336,7 @@ impl TurnExecutor for KernelTurnExecutor {
                 web: true,
                 review: true,
             };
-            let factory: ProviderFactory = Box::new(|c: &CodingAgentConfig| {
-                atomcode_shell::build_provider(c).map_err(|e| e.to_string())
-            });
+            let factory = atomcode_shell::provider_factory();
             match CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory).await {
                 Ok(rt) => {
                     *guard = Some(NativeState {
@@ -694,27 +680,15 @@ pub(crate) fn chat_bridge_config(
     working_dir: &Path,
     telemetry: Arc<Telemetry>,
 ) -> atomcode_shell::BridgeConfig {
-    let p = config.providers.get(provider_name);
-    atomcode_shell::BridgeConfig {
-        api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
-        base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
-        model: p.map(|p| p.model.clone()).unwrap_or_default(),
-        working_dir: working_dir.to_path_buf(),
-        context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
-        mcp: true,
-        telemetry: Some(telemetry),
-        reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
-        reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
-        provider_type: p.map(|p| p.provider_type.clone()).unwrap_or_else(|| "openai".into()),
-        thinking_enabled: p.and_then(|p| p.thinking_enabled),
-        thinking_type: p.and_then(|p| p.thinking_type.clone()),
-        thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
-        // The daemon answers `/chat` approvals at its own seam (interactive perm_rx),
-        // so the bridge must keep the round-trip rather than auto-approving here.
-        dangerously_skip_permissions: false,
-        // Keep the fail-closed approval timeout for the daemon (current behavior).
-        interactive: false,
-    }
+    // The daemon answers `/chat` approvals at its own seam (interactive perm_rx), so keep
+    // skip_perms=false (round-trip) + interactive=false (fail-closed approval timeout).
+    atomcode_shell::BridgeConfig::from_provider(
+        config.providers.get(provider_name),
+        working_dir,
+        Some(telemetry),
+        false,
+        false,
+    )
 }
 
 /// The engine-v2 producer for `/chat`: drive a bridged agent over `conv` and forward
@@ -730,7 +704,7 @@ pub(crate) async fn run_chat_turn_v2(
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
 ) {
     // A fresh NATIVE runtime for this /chat turn (no persistent state — the caller owns
-    // persistence). coding_config + build_provider come from the bridge (shared mapping).
+    // persistence). coding_config + provider_factory come from atomcode-shell (shared mapping).
     let coding_cfg = atomcode_shell::coding_config(&bridge_cfg);
     let opts = PrepareOptions {
         session: SessionMode::Fresh,
@@ -740,9 +714,7 @@ pub(crate) async fn run_chat_turn_v2(
         web: true,
         review: true,
     };
-    let factory: ProviderFactory = Box::new(|c: &CodingAgentConfig| {
-        atomcode_shell::build_provider(c).map_err(|e| e.to_string())
-    });
+    let factory = atomcode_shell::provider_factory();
     let mut rt = match CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory).await {
         Ok(rt) => rt,
         Err(e) => {

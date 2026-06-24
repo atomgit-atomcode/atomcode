@@ -1683,8 +1683,7 @@ async fn run() -> Result<i32> {
                     web: true,
                     review: true,
                 };
-                let factory: atomcode_coding::ProviderFactory =
-                    Box::new(|c| atomcode_shell::build_provider(c).map_err(|e| e.to_string()));
+                let factory = atomcode_shell::provider_factory();
                 match atomcode_coding::CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory)
                     .await
                 {
@@ -1912,8 +1911,7 @@ fn spawn_native_tui(
         web: true,
         review: true,
     };
-    let factory: atomcode_coding::ProviderFactory =
-        Box::new(|c| atomcode_shell::build_provider(c).map_err(|e| e.to_string()));
+    let factory = atomcode_shell::provider_factory();
     let handle =
         atomcode_tuix::spawn_native_runtime(coding_cfg, opts, factory, dangerously_skip_permissions);
     // The legacy client carries two shared registries the TUI reads for its slash palette
@@ -1937,23 +1935,13 @@ fn bridge_config_from(
     interactive: bool,
 ) -> atomcode_shell::BridgeConfig {
     let p = config.active_provider(provider_override).ok();
-    atomcode_shell::BridgeConfig {
-        api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
-        base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
-        model: p.map(|p| p.model.clone()).unwrap_or_default(),
-        working_dir: working_dir.to_path_buf(),
-        context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
-        mcp: true,
+    atomcode_shell::BridgeConfig::from_provider(
+        p,
+        working_dir,
         telemetry,
-        reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
-        reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
-        provider_type: p.map(|p| p.provider_type.clone()).unwrap_or_else(|| "openai".into()),
-        thinking_enabled: p.and_then(|p| p.thinking_enabled),
-        thinking_type: p.and_then(|p| p.thinking_type.clone()),
-        thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
         dangerously_skip_permissions,
         interactive,
-    }
+    )
 }
 
 /// NATIVE headless driver: drive a [`CodingRuntime`] + kernel `AgentEvent`s

@@ -19,4 +19,4 @@ pub mod convert;
 mod runtime;
 mod sign;
 
-pub use runtime::{build_provider, coding_config, BridgeConfig};
+pub use runtime::{build_provider, coding_config, provider_factory, BridgeConfig};
