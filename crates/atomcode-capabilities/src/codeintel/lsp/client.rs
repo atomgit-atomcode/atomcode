@@ -122,6 +122,9 @@ impl LspClient {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        // No console-window flash for the language server (mirrors core's lsp client);
+        // no-op off Windows.
+        crate::process_utils::suppress_console_window(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| format!("failed to spawn {}: {e}", config.command))?;
         let stdout = child.stdout.take().ok_or("no stdout from LSP server")?;
         let stdin = child.stdin.take().ok_or("no stdin to LSP server")?;

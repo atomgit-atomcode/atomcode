@@ -18,15 +18,6 @@ pub(crate) fn config_dir() -> PathBuf {
 }
 
 /// Apply `CREATE_NO_WINDOW` to a spawned stdio MCP server on Windows so it does
-/// not flash a console window; no-op elsewhere. Mirrors
-/// `atomcode_core::process_utils::suppress_console_window`. NOTE: `tokio::process::Command`
-/// exposes `creation_flags` directly on Windows (no `CommandExt` import needed, unlike
-/// the `std` variant).
-#[cfg(target_os = "windows")]
-pub(crate) fn suppress_console_window(cmd: &mut tokio::process::Command) {
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn suppress_console_window(_cmd: &mut tokio::process::Command) {}
+/// not flash a console window. Re-exported from the crate-shared
+/// [`crate::process_utils`] so there is one implementation (this was a duplicate).
+pub(crate) use crate::process_utils::suppress_console_window;

@@ -177,7 +177,11 @@ fn render_matches(matches: &[AstMatch], max: usize) -> String {
 async fn run_ast_grep(argv: &[String], cwd: &Path) -> Result<std::process::Output, String> {
     let mut last_err = None;
     for bin in BINARIES {
-        match tokio::process::Command::new(bin).args(argv).current_dir(cwd).output().await {
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(argv).current_dir(cwd);
+        // No console-window flash when spawned from a console-less daemon (Windows-only).
+        crate::process_utils::suppress_console_window(&mut cmd);
+        match cmd.output().await {
             Ok(o) => return Ok(o),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 last_err = Some(e);

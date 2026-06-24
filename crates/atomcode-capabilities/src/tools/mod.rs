@@ -103,21 +103,13 @@ pub fn register_coding_tools(reg: &mut ToolRegistry) {
     reg.register(Arc::new(TodoTool::new()));
 }
 
-/// Apply `CREATE_NO_WINDOW` on Windows so a spawned child process does not pop a
-/// console window; no-op elsewhere. Critical in headless/daemon mode (e.g. the WeChat
-/// clawbot bridge): with no console to inherit, each `cmd.exe` spawn would otherwise
-/// allocate a NEW console window — the "一对话桌面就闪" flash the user reported. v1
-/// core's bash did this via `process_utils::suppress_console_window`; the v2 tools
-/// dropped it. `tokio::process::Command` exposes `creation_flags` directly on Windows
-/// (no `CommandExt` import needed, unlike the `std` variant).
-#[cfg(target_os = "windows")]
-pub(crate) fn suppress_console_window(cmd: &mut tokio::process::Command) {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn suppress_console_window(_cmd: &mut tokio::process::Command) {}
+/// Apply `CREATE_NO_WINDOW` on Windows so a spawned child does not pop a console window;
+/// no-op elsewhere. Critical in headless/daemon mode (e.g. the WeChat clawbot / OpenClaw
+/// bridge): with no console to inherit, each `cmd.exe` spawn would otherwise allocate a
+/// NEW console window — the "一对话桌面就闪" flash the user reported. Re-exported from the
+/// crate-shared [`crate::process_utils`] so there is ONE implementation (this module's
+/// local copy was deduped into that home, which also carries the `std` `_sync` variant).
+pub(crate) use crate::process_utils::suppress_console_window;
 
 /// Resolve a model-supplied path: absolute → as-is; relative → joined to
 /// `working_dir`. NO escape enforcement (see the module trust-model note).

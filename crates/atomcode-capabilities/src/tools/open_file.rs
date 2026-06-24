@@ -198,6 +198,9 @@ impl Tool for OpenFileTool {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        // Suppress the launcher's own console-window flash (e.g. `cmd /c start`) when
+        // spawned from a console-less daemon; the GUI app it hands off to is unaffected.
+        crate::process_utils::suppress_console_window_sync(&mut cmd);
         match cmd.spawn() {
             Ok(_child) => ok(format!("Opened {} via `{}`.", target.display(), strategy_command_name(&strategy))),
             Err(e) => err(format!(

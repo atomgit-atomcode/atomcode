@@ -289,10 +289,8 @@ impl Tool for ParallelEditTool {
 
             let mut build_cmd = tokio::process::Command::new(shell);
             build_cmd.args([flag, &cmd]).current_dir(&build_dir);
-            // Suppress the Windows console-window flash for the probe (CREATE_NO_WINDOW);
-            // tokio's Command exposes creation_flags directly on Windows.
-            #[cfg(windows)]
-            build_cmd.creation_flags(0x0800_0000);
+            // Suppress the Windows console-window flash for the probe; no-op off Windows.
+            crate::process_utils::suppress_console_window(&mut build_cmd);
             let output = build_cmd.output().await;
             if let Ok(out) = output {
                 let stdout = String::from_utf8_lossy(&out.stdout);
