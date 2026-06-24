@@ -24,6 +24,11 @@ interface SidebarProps {
   onToggleCollapse?: () => void;
   /** Bump to force a session-list reload (e.g. after a new session is created) */
   reloadKey?: number;
+  /** 乐观会话：首条消息发出瞬间即时插入列表（后端空会话不入列表）。
+   *  一旦后端列表出现同 id 的真实会话，即被其覆盖（按 id 去重，真实条目优先）。 */
+  optimisticSession?: SessionMetaWithProject | null;
+  /** 列表（重新）加载后回传当前会话的真实元数据，供顶部标题头同步自动命名后的标题。 */
+  onActiveSessionMeta?: (session: SessionMetaWithProject) => void;
   /** Only show sessions whose working_dir matches this path (empty = show all) */
   cwd?: string;
   /** Called after a session is renamed (id + new name). */
@@ -254,6 +259,8 @@ export function Sidebar({
   collapsed,
   onToggleCollapse,
   reloadKey,
+  optimisticSession,
+  onActiveSessionMeta,
   cwd,
   onSessionRenamed,
   onSessionDeleted,
@@ -305,7 +312,14 @@ export function Sidebar({
   function loadSessions() {
     setLoading(true);
     listSessions()
-      .then(setSessions)
+      .then((list) => {
+        setSessions(list);
+        // 回合落盘后这次刷新会带出已自动命名的当前会话 → 回传给 App 更新标题头。
+        if (activeSessionId) {
+          const found = list.find((s) => s.id === activeSessionId);
+          if (found) onActiveSessionMeta?.(found);
+        }
+      })
       .catch(() => setSessions([]))
       .finally(() => setLoading(false));
   }
@@ -690,12 +704,19 @@ export function Sidebar({
         )
       : null;
 
+  // 乐观会话并入列表：仅当后端列表尚无同 id 条目时置顶插入。后端落盘后列表刷新带出
+  // 真实会话（同 id），此处便不再插入，真实条目（含自动命名标题）自然取而代之。
+  const merged =
+    optimisticSession && !sessions.some((s) => s.id === optimisticSession.id)
+      ? [optimisticSession, ...sessions]
+      : sessions;
+
   // 先按当前工作目录收窄，再按搜索词过滤。
   const normDir = (p: string) => (p || '').replace(/\/+$/, '');
   const cwdNorm = normDir(cwd || '');
   const inCwd = cwdNorm
-    ? sessions.filter((s) => normDir(s.working_dir) === cwdNorm)
-    : sessions;
+    ? merged.filter((s) => normDir(s.working_dir) === cwdNorm)
+    : merged;
 
   const q = query.trim().toLowerCase();
   const filtered = q

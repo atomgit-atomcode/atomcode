@@ -103,6 +103,9 @@ interface ChatProps {
   restoring?: boolean;
   /** /live turn 完成后通知 App 刷新侧栏列表（session 已落盘，列表需更新）。 */
   onLiveTurnDone?: () => void;
+  /** 首条消息发出瞬间上报标题（取消息前 10 字），供 App 乐观插入侧栏，
+   *  让会话即时出现；待后端落盘并自动命名后，列表刷新会换成真实标题。 */
+  onOptimisticSession?: (title: string) => void;
   /** 打开工作目录选择器（cwd 面包屑已从顶栏移到输入框下方，由本组件渲染）。 */
   onOpenCwd?: () => void;
   /** 上报是否处于落地（空对话）态，供 App 决定是否显示会话标题头。 */
@@ -275,7 +278,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOpenCwd, onLanding, skillInsert }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onLanding, skillInsert }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -324,6 +327,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 查看的就是这个实时会话时才把输出渲染进画布——否则用户从侧栏打开了别的历史会话，
   // 实时输出会串进错误页面、且刷新即消失（刷新会按真实会话重载）。
   const liveSessionIdRef = useRef<string | null>(null);
+  // 是否已为「当前会话」上报过乐观侧栏条目。每次切换/新建会话时复位，
+  // 避免同一会话第二条消息（尤其 sync 路径本地不落消息）重复上报、改写标题。
+  const optimisticFiredRef = useRef(false);
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
   // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
@@ -334,6 +340,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (sessionId !== activeIdRef.current) {
       activeIdRef.current = sessionId;
       loadedForRef.current = null;
+      optimisticFiredRef.current = false;
       abortRef.current?.abort();
       setBusy(false);
       setMessages([]);
@@ -851,6 +858,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // 实际投递一条消息（同步 / 常规两条路径）；busy 由各自的事件流复位。
   async function deliver(text: string, images: ImageData[]) {
+    // 本会话首条消息：用消息前 10 字做临时标题，立刻通知 App 乐观插入侧栏，
+    // 让会话「一发送就出现在左侧」。回合 done 后列表刷新会换成后端自动命名。
+    if (!optimisticFiredRef.current && messages.length === 0) {
+      optimisticFiredRef.current = true;
+      const title = (text.split('\n')[0]?.trim() ?? '').slice(0, 10);
+      if (title) onOptimisticSession?.(title);
+    }
+
     if (sync) {
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).

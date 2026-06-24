@@ -31,6 +31,10 @@ export function App() {
   // URL 里是短 id，不能直接当完整 id 用（后端需要完整 id）；先置空，挂载后再还原。
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
+  // 首条消息发出瞬间插入的「乐观会话」：让新会话即时出现在侧栏（后端空会话不入列表，
+  // 真实标题也要等回合落盘后自动命名）。其 id 与真实会话对齐后，列表刷新会用真实条目
+  // 覆盖它（Sidebar 按 id 去重，真实条目优先），标题随之从「前 10 字」换成自动命名。
+  const [optimisticSession, setOptimisticSession] = useState<SessionMetaWithProject | null>(null);
   const [cwd, setCwd] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [showCwd, setShowCwd] = useState(false);
@@ -77,10 +81,41 @@ export function App() {
 
   // Chat 完成首条消息后会回传它创建的 session id；若是新 id，刷新侧栏列表。
   function handleSessionAssigned(id: string) {
+    // 把乐观条目的 id 对齐到后端真实 id（落地页发送时乐观条目用的是临时 id），
+    // 这样接下来的列表刷新能按 id 去重，用真实条目（含自动命名）覆盖乐观条目。
+    setOptimisticSession((prev) => (prev && prev.id !== id ? { ...prev, id } : prev));
     if (id !== sessionId) {
       setSessionId(id);
       setSessionListVersion((v) => v + 1);
     }
+  }
+
+  // 首条消息发出瞬间：用消息前 10 字做临时标题，乐观插入侧栏（即时可见）。
+  // 优先复用已创建会话的 id / 目录（新建按钮、切目录会预建会话）；落地页直发时
+  // 还没有 id，先用临时 id，待 done 回传真实 id 后由 handleSessionAssigned 对齐。
+  function handleOptimisticSession(title: string) {
+    const now = Math.floor(Date.now() / 1000);
+    setOptimisticSession({
+      id: activeSession?.id ?? `optimistic-${now}`,
+      name: title,
+      working_dir: activeSession?.working_dir ?? cwd,
+      project_hash: activeSession?.project_hash ?? '',
+      created_at: activeSession?.created_at ?? now,
+      updated_at: now,
+      message_count: 1,
+    });
+    // 顶部标题头用的是 activeSession.name；首发时同步成临时标题（已有会话元数据时），
+    // 否则标题头会一直停在占位名 session-<ts>。落地页首发无 activeSession，标题头本就
+    // 隐藏，待回合结束列表刷新后由 handleActiveSessionMeta 回填真实标题。
+    setActiveSession((prev) => (prev ? { ...prev, name: title } : prev));
+  }
+
+  // 侧栏列表（重新）加载后回传当前会话的真实元数据：回合落盘后后端已自动命名，
+  // 用真实标题覆盖顶部标题头的临时标题（前 10 字）。仅在仍是同一会话且标题有变时更新。
+  function handleActiveSessionMeta(s: SessionMetaWithProject) {
+    setActiveSession((prev) =>
+      prev && prev.id === s.id && prev.name !== s.name ? { ...prev, name: s.name } : prev,
+    );
   }
 
   // ☰：移动端专用，开/关抽屉。桌面端的收起/展开由侧栏自身的按钮处理。
@@ -154,6 +189,7 @@ export function App() {
   function openNewSession(targetCwd: string | undefined) {
     setSessionId(null);
     setActiveSession(null);
+    setOptimisticSession(null);
     createSession(targetCwd || undefined)
       .then((data) => {
         setSessionId(data.id);
@@ -180,6 +216,7 @@ export function App() {
   }
 
   function handleSelectSession(session: SessionMetaWithProject) {
+    setOptimisticSession(null);
     setSessionId(session.id);
     setActiveSession(session);
     if (session.working_dir) {
@@ -221,6 +258,8 @@ export function App() {
         onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
         onOpenSettings={(section) => setSettingsSection(section)}
         reloadKey={sessionListVersion}
+        optimisticSession={optimisticSession}
+        onActiveSessionMeta={handleActiveSessionMeta}
         cwd={cwd}
         onSessionRenamed={handleSessionRenamed}
         onSessionDeleted={handleSessionDeleted}
@@ -319,6 +358,7 @@ export function App() {
             activeSession={activeSession}
             restoring={restoring}
             onLiveTurnDone={() => setSessionListVersion((v) => v + 1)}
+            onOptimisticSession={handleOptimisticSession}
             onOpenCwd={() => setShowCwd(true)}
             onLanding={setIsLanding}
             skillInsert={skillInsert}
