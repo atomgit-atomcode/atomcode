@@ -53,7 +53,7 @@ fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: 
 /// The synthesized `ContextStats` emitted after each `Usage`. Most fields are
 /// zero; `sent_tokens` + `ctx_window` come from the last provider usage report
 /// (falling back to the configured window).
-fn context_stats_event(last_usage: Option<&MessageMeta>, cfg: &CodingAgentConfig) -> UiEvent {
+pub(crate) fn context_stats_event(last_usage: Option<&MessageMeta>, cfg: &CodingAgentConfig) -> UiEvent {
     let sent = last_usage.map(|m| m.used_tokens as usize).unwrap_or(0);
     let ctx_window = last_usage
         .map(|m| m.ctx_window as usize)

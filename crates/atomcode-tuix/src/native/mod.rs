@@ -10,6 +10,7 @@
 //! later steps. The allow is removed once those wire everything in.
 #![allow(dead_code)]
 
+pub(crate) mod adapter;
 pub(crate) mod approval;
 pub(crate) mod convert;
 pub(crate) mod event;
