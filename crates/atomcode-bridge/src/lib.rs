@@ -1,27 +1,22 @@
-//! # atomcode-bridge — the engine-swap seam (strangler pattern, done properly)
+//! # atomcode-bridge — neutral driver provider helpers (the translation membrane is gone)
 //!
-//! Presents `atomcode-core`'s driver-facing protocol — an [`AgentClient`] command
-//! sender + an `AgentEvent` receiver, the exact two channels tuix / the headless
-//! CLI / every legacy driver already speak — but the engine behind the channels is
-//! the NEW stack (`atomcode-kernel` + `atomcode-capabilities` + `atomcode-coding`'s
-//! prepare/assemble full assembly).
+//! This crate USED to be the engine-swap seam: a `Bridge` state machine that presented
+//! the new stack (`atomcode-kernel` + `atomcode-capabilities` + `atomcode-coding`) behind
+//! `atomcode-core`'s legacy `AgentClient`/`AgentEvent` protocol so the existing drivers
+//! ran the new engine unchanged. That strangler is COMPLETE: tuix consumes the kernel
+//! natively (its own `native` adapter) and the daemon was always native
+//! (`CodingRuntime::spawn`), so the translation runtime has no consumers and was deleted.
 //!
-//! WHY: rebuilding each driver over the new stack is a months-scale port (tuix UX,
-//! daemon/webui, login, bg, plugins). Swapping the engine UNDER the drivers makes
-//! every feature work on day one, behind a runtime switch with instant rollback —
-//! the drivers cannot tell the difference except where the new engine is honest
-//! about not yet supporting something (plan mode → warning, /undo → UndoFailed).
-//!
-//! Session persistence note: legacy drivers PERSIST SESSIONS THEMSELVES (the
-//! `messages` snapshots on TurnComplete/Error/etc. exist for that) — that keeps
-//! working untouched. The bridge ALSO keeps the new stack's L1 persistence on,
-//! under a bridge-owned session id: that's what makes `SetMessages` (resume) and
-//! `ClearConversation` (new session) implementable as engine respawns, and gives
-//! cross-session `recall` for free.
+//! What remains is the small, neutral glue the two remaining drivers (cli + daemon) still
+//! share: a driver-supplied [`BridgeConfig`] + its mapping to a `CodingAgentConfig`
+//! ([`coding_config`]), provider construction with the AtomGit signing gateway
+//! ([`build_provider`]), and core↔kernel message [`convert`]ersions. `build_provider`
+//! can't move into `atomcode-coding` (it uses `atomcode_core::coding_plan::crypto` signing
+//! and coding is core-neutral by design), so it stays on the driver side here. A future
+//! cleanup may relocate these + drop the crate entirely; for now they live in one place.
 
 pub mod convert;
 mod runtime;
 mod sign;
-mod translate;
 
-pub use runtime::{build_provider, coding_config, spawn_bridged_runtime, BridgeConfig};
+pub use runtime::{build_provider, coding_config, BridgeConfig};
