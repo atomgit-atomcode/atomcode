@@ -19,6 +19,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use atomcode_capabilities::goal::{EvalOutcome, GoalEvaluator, GoalResult, GoalState};
 use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use atomcode_coding::{
@@ -31,10 +32,12 @@ use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::event::{AgentCommand as KCmd, AgentEvent as KEv, RequestId, StopReason};
 use atomcode_kernel::message::{MessageMeta, SessionSnapshot};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::approval::{approval_needed_event, bypass_auto_approval, take_deny_cmd};
 use super::convert;
 use super::event::UiEvent;
+use super::goal::{goal_update_ev, summarize_for_goal};
 use super::lifecycle::finish_turn_events;
 use super::translate::{context_stats_event, map_stream_event};
 
@@ -137,6 +140,22 @@ struct NativeRuntime {
     /// Monotonic id for `!cmd` tool-call display events.
     local_shell_seq: u64,
     dangerously_skip_permissions: bool,
+    /// Active `/goal` state (loop-until-evaluator-met), or None. The loop is driven from
+    /// the turn-end Snapshot hook.
+    goal: Option<GoalState>,
+    /// Provider for the goal evaluator, built lazily on SetGoal from `evaluator_provider`
+    /// / the default provider. Cloned into each spawned eval task.
+    goal_provider: Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>,
+    /// Cancels an in-flight goal evaluation (fresh per goal). Triggered by
+    /// Cancel/ClearGoal/Shutdown so Esc interrupts the evaluator immediately.
+    goal_cancel: CancellationToken,
+    /// Set while a goal evaluation runs OFF the select loop: holds the deferred turn
+    /// (reason + conversation) until the eval result comes back. `Some` ⇒ an eval is in
+    /// flight and the driver-facing turn is held open.
+    pending_goal: Option<(StopReason, Vec<atomcode_core::conversation::message::Message>)>,
+    /// The spawned eval task reports its outcome here; drained by the run loop as a third
+    /// event source so commands (Cancel) stay responsive during eval.
+    goal_eval_tx: mpsc::UnboundedSender<EvalOutcome>,
 }
 
 impl NativeRuntime {
@@ -195,6 +214,10 @@ impl NativeRuntime {
             }
         };
 
+        // Goal evaluations run on a spawned task and report here, so a Cancel arriving
+        // mid-eval is still processed (cmd_rx stays live as a third select source).
+        let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
+
         let mut rt = NativeRuntime {
             coding_cfg: cfg,
             opts_template: opts,
@@ -217,6 +240,11 @@ impl NativeRuntime {
             pending_local_shell: Vec::new(),
             local_shell_seq: 0,
             dangerously_skip_permissions,
+            goal: None,
+            goal_provider: None,
+            goal_cancel: CancellationToken::new(),
+            pending_goal: None,
+            goal_eval_tx,
         };
 
         loop {
@@ -225,6 +253,11 @@ impl NativeRuntime {
                     Some(c) => if rt.on_command(c).await { break; },
                     None => break, // driver gone
                 },
+                // Goal evaluations run on a spawned task and report here, so a Cancel
+                // arriving mid-eval is still processed (cmd_rx stays live).
+                Some(outcome) = goal_eval_rx.recv() => {
+                    rt.on_goal_eval_result(outcome).await;
+                }
                 ev = rt.handle.events.recv() => match ev {
                     Some(e) => rt.on_kernel_event(e).await,
                     None => {
@@ -250,6 +283,139 @@ impl NativeRuntime {
 
     fn emit(&self, ev: UiEvent) {
         let _ = self.ev_tx.send(ev);
+    }
+
+    /// Build the goal evaluator provider from config: the `evaluator_provider` entry if
+    /// set, else the default provider. `None` if config can't load or the provider can't
+    /// be built. Uses the injected factory (same provider dispatch the main engine uses).
+    fn build_goal_provider(&self) -> Option<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
+        let config =
+            atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path())
+                .ok()?;
+        let key = config
+            .evaluator_provider
+            .as_ref()
+            .unwrap_or(&config.default_provider);
+        let pcfg = config.providers.get(key)?;
+        let mut cc = CodingAgentConfig::new(
+            pcfg.api_key.clone().unwrap_or_default(),
+            pcfg.base_url.clone().unwrap_or_default(),
+            pcfg.model.clone(),
+            ".",
+        );
+        apply_reload_provider(&mut cc, pcfg);
+        (self.factory)(&cc).ok()
+    }
+
+    /// Goal-mode turn-end hook: spawn the evaluator OFF the select loop and hold the turn
+    /// open (store `pending_goal`) until its result arrives on `goal_eval_tx`. Keeping it
+    /// off the loop means a Cancel during the (up to 30s/event) evaluation is still
+    /// processed — it cancels `goal_cancel`, which aborts the spawned evaluate immediately.
+    fn spawn_goal_eval(
+        &mut self,
+        reason: StopReason,
+        messages: Vec<atomcode_core::conversation::message::Message>,
+    ) {
+        let (Some(provider), Some(condition)) = (
+            self.goal_provider.clone(),
+            self.goal.as_ref().filter(|g| g.active).map(|g| g.condition.clone()),
+        ) else {
+            self.finish_turn(reason, messages);
+            return;
+        };
+        let prev = self.goal.as_ref().and_then(|g| g.last_eval_reason.clone());
+        let summary = summarize_for_goal(&messages, prev.as_deref());
+        self.pending_goal = Some((reason, messages));
+        let cancel = self.goal_cancel.clone();
+        let tx = self.goal_eval_tx.clone();
+        tokio::spawn(async move {
+            let evaluator = GoalEvaluator::new(provider);
+            let outcome = evaluator.evaluate(&condition, &summary, &cancel).await;
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// Apply a goal evaluation result delivered from the spawned task. Met (or
+    /// evaluator-exhausted) clears the goal and finishes the held-open turn; NotMet (or a
+    /// recoverable evaluator error) injects a continuation and keeps the turn open. A
+    /// `None` `pending_goal` means the goal was cleared/cancelled while the eval ran —
+    /// ignore the stale outcome.
+    async fn on_goal_eval_result(&mut self, outcome: EvalOutcome) {
+        let Some((reason, messages)) = self.pending_goal.take() else {
+            return;
+        };
+        if let Some(u) = outcome.usage.as_ref() {
+            if let Some(g) = self.goal.as_mut() {
+                g.add_tokens((u.prompt + u.completion) as u64);
+            }
+        }
+        match outcome.result {
+            GoalResult::Met { reason: verdict } => {
+                if let Some(g) = self.goal.as_mut() {
+                    g.active = false;
+                    g.last_eval_reason = Some(verdict);
+                }
+                if let Some(g) = self.goal.take() {
+                    let ev = goal_update_ev(&g);
+                    self.emit(ev);
+                }
+                self.finish_turn(reason, messages);
+            }
+            GoalResult::NotMet { reason: verdict } => {
+                let cond = match self.goal.as_mut() {
+                    Some(g) => {
+                        g.round += 1;
+                        g.evaluator_consecutive_failures = 0;
+                        g.last_eval_reason = Some(verdict.clone());
+                        g.condition.clone()
+                    }
+                    None => {
+                        self.finish_turn(reason, messages);
+                        return;
+                    }
+                };
+                let ev = goal_update_ev(self.goal.as_ref().unwrap());
+                self.emit(ev);
+                let text = format!(
+                    "Goal not yet met: {verdict}\n\nContinue working toward this goal:\n```\n{cond}\n```"
+                );
+                self.start_turn_stats();
+                let _ = self.handle.commands.send(KCmd::SendMessage { text, images: vec![] });
+            }
+            GoalResult::Error(e) => {
+                let exhausted = match self.goal.as_mut() {
+                    Some(g) => {
+                        g.evaluator_consecutive_failures += 1;
+                        g.is_evaluator_exhausted()
+                    }
+                    None => {
+                        self.finish_turn(reason, messages);
+                        return;
+                    }
+                };
+                if exhausted {
+                    if let Some(g) = self.goal.as_mut() {
+                        g.active = false;
+                        g.last_eval_reason = Some(format!("evaluator failed: {e}"));
+                    }
+                    if let Some(g) = self.goal.take() {
+                        let ev = goal_update_ev(&g);
+                        self.emit(ev);
+                    }
+                    self.finish_turn(reason, messages);
+                } else {
+                    let cond = self.goal.as_ref().unwrap().condition.clone();
+                    if let Some(g) = self.goal.as_mut() {
+                        g.last_eval_reason = Some(format!("evaluator error, retrying: {e}"));
+                    }
+                    let ev = goal_update_ev(self.goal.as_ref().unwrap());
+                    self.emit(ev);
+                    let text = format!("Continue working toward this goal:\n```\n{cond}\n```");
+                    self.start_turn_stats();
+                    let _ = self.handle.commands.send(KCmd::SendMessage { text, images: vec![] });
+                }
+            }
+        }
     }
 
     fn start_turn_stats(&mut self) {
@@ -528,6 +694,15 @@ impl NativeRuntime {
                 let _ = self.handle.commands.send(KCmd::SendMessage { text, images });
             }
             CoreCmd::Cancel => {
+                // Esc/Ctrl+C stops an active goal (v1 parity) and interrupts an in-flight
+                // evaluation immediately via the cancel token.
+                self.goal_cancel.cancel();
+                if let Some(mut g) = self.goal.take() {
+                    g.clear();
+                    g.last_eval_reason = Some("cancelled".into());
+                    let ev = goal_update_ev(&g);
+                    self.emit(ev);
+                }
                 // Release + clear any parked approval BEFORE forwarding Cancel: the kernel
                 // then backfills the cancelled tool's result, and clearing the mirror means
                 // a later respawn (which re-reads the snapshot) can't re-trigger it.
@@ -535,6 +710,10 @@ impl NativeRuntime {
                     let _ = self.handle.commands.send(cmd);
                 }
                 let _ = self.handle.commands.send(KCmd::Cancel);
+                // If an eval was holding a turn open, close it as cancelled.
+                if let Some((_, messages)) = self.pending_goal.take() {
+                    self.finish_turn(StopReason::Cancelled, messages);
+                }
             }
             CoreCmd::ApproveTool => self.answer_approval(ApprovalResponse::allow()),
             CoreCmd::ApproveToolAlways => self.answer_approval(ApprovalResponse::allow_always()),
@@ -663,6 +842,7 @@ impl NativeRuntime {
                                     self.pending_approval = None;
                                     self.pending_finish = None;
                                     self.pending_undo = None;
+                                    self.pending_goal = None;
                                 }
                                 Err(e) => self.emit(UiEvent::Error {
                                     error: format!("provider switch failed: {e}"),
@@ -792,10 +972,48 @@ impl NativeRuntime {
                 // The model sees the output on the NEXT turn (no LLM turn now).
                 self.pending_local_shell.push(context);
             }
-            CoreCmd::Shutdown => return true,
-            // Orchestration not yet wired (B2 ③ follow-up): SetGoal/ClearGoal (A.3) and
-            // vision preprocessing on SendMessage (A.4). Tracked in memory.
-            _ => {}
+            CoreCmd::SetGoal { condition } => {
+                // Goal mode (loop-until-evaluator-met): `/goal <cond>` also sends the
+                // condition as a normal message, so the FIRST turn starts on its own; this
+                // just arms the loop, driven from the turn-end Snapshot hook.
+                if self.goal_provider.is_none() {
+                    self.goal_provider = self.build_goal_provider();
+                }
+                if self.goal_provider.is_none() {
+                    self.emit(UiEvent::Warning(
+                        "goal mode unavailable: could not build evaluator (check [providers] / \
+                         evaluator_provider in ~/.atomcode/config.toml)"
+                            .into(),
+                    ));
+                } else {
+                    // Fresh cancel token per goal so a prior goal's cancel can't kill this one.
+                    self.goal_cancel = CancellationToken::new();
+                    let state = GoalState::new(condition);
+                    let ev = goal_update_ev(&state);
+                    self.emit(ev);
+                    self.goal = Some(state);
+                }
+            }
+            CoreCmd::ClearGoal => {
+                self.goal_cancel.cancel();
+                if let Some(mut g) = self.goal.take() {
+                    g.clear();
+                    g.last_eval_reason = Some("cleared by user".into());
+                    let ev = goal_update_ev(&g);
+                    self.emit(ev);
+                }
+                // Stop the turn running RIGHT NOW (not just the loop) — `/goal clear` while
+                // a round is mid-tool must interrupt it, exactly like Cancel.
+                let _ = self.handle.commands.send(KCmd::Cancel);
+                // An eval was holding a turn open — close it now.
+                if let Some((_, messages)) = self.pending_goal.take() {
+                    self.finish_turn(StopReason::Cancelled, messages);
+                }
+            }
+            CoreCmd::Shutdown => {
+                self.goal_cancel.cancel();
+                return true;
+            }
         }
         false
     }
@@ -844,8 +1062,17 @@ impl NativeRuntime {
             }
             KEv::Snapshot { snapshot } => {
                 if let Some(reason) = self.pending_finish.take() {
-                    let messages =
+                    let messages: Vec<_> =
                         snapshot.messages.iter().map(convert::message_to_core).collect();
+                    // Goal hook: a natural stop with an active goal isn't the end. Spawn
+                    // the evaluator OFF this loop (so Cancel stays responsive); the turn is
+                    // held open until on_goal_eval_result decides to continue or finish.
+                    if matches!(reason, StopReason::Stopped)
+                        && self.goal.as_ref().map_or(false, |g| g.active)
+                    {
+                        self.spawn_goal_eval(reason, messages);
+                        return;
+                    }
                     self.finish_turn(reason, messages);
                 } else if let Some(nth) = self.pending_undo.take() {
                     self.do_undo(snapshot.messages, nth).await;
