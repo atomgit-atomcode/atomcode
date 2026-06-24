@@ -247,9 +247,8 @@ impl KernelTurnExecutor {
             })
     }
 
-    /// Resolve the bridge config from the live provider selection + on-disk config.
-    /// Mirrors `build_turn_parts`' provider resolution (LIVE_PROVIDER → executor
-    /// default → config default).
+    /// Resolve the bridge config from the live provider selection + on-disk config
+    /// (`resolve_provider_name`: LIVE_PROVIDER → executor default → config default).
     fn bridge_config(&self) -> Option<atomcode_shell::BridgeConfig> {
         let config = Config::load(&Config::default_path()).ok()?;
         let name = self.resolve_provider_name();
@@ -1254,8 +1253,8 @@ pub(crate) struct LiveReasoningEffortReq {
 /// POST /live/reasoning_effort — webui 设置 DeepSeek V4 的 reasoning_effort。
 ///
 /// 与 /live/provider 同源：持久化进目标 provider 的 `config.reasoning_effort`，
-/// 下一轮 turn 经 `build_turn_parts` → `create_provider` 自动生效——live 与
-/// /chat 两条路径都现读 config，故两端都会跟随。只有 deepseek-v4 系模型真正
+/// 下一轮 turn 经 `bridge_config`/`chat_bridge_config` → `build_provider` 自动生效——
+/// live 与 /chat 两条路径都现读 config，故两端都会跟随。只有 deepseek-v4 系模型真正
 /// 消费该字段（见 OpenAiProvider::reason_effort_applicable），webui 已据此门控
 /// UI；服务端仅校验取值合法。
 pub(crate) async fn live_reasoning_effort(

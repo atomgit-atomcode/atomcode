@@ -1879,10 +1879,10 @@ fn redirect_stderr_to_log_file() {
 /// Build the interactive TUI's NATIVE runtime: a `spawn_native_runtime` handle (the
 /// relocated bridge state machine, living in tuix) wrapped in the `(AgentClient, UiEvent
 /// receiver)` pair tuix consumes. The cli owns provider construction (incl. the
-/// closed-source signing gateway), injected as the [`ProviderFactory`]. `coding_config`
-/// + `build_provider` are the bridge's shared knob-mapping helpers — they still live in
-/// the bridge crate (daemon also uses them) until daemon is decoupled, but the bridge no
-/// longer backs the TUI: tuix is fully native.
+/// closed-source signing gateway), injected via `atomcode_shell::provider_factory()`.
+/// `coding_config` + `build_provider` are the shared knob-mapping helpers in
+/// `atomcode-shell` (the daemon uses them too); the old bridge translation membrane is
+/// gone — tuix is fully native.
 fn spawn_native_tui(
     config: &atomcode_core::config::Config,
     working_dir: &std::path::Path,

@@ -6432,7 +6432,7 @@ fn handle_streaming_key(
 /// Deliver a tool-approval decision to whichever turn is actually waiting.
 ///
 /// In **sync mode** the running turn belongs to the in-process LiveSession
-/// coordinator (`DaemonTurnExecutor`), not this TUI's own agent — so the
+/// coordinator (`KernelTurnExecutor`), not this TUI's own agent — so the
 /// decision must go to the LiveSession's approver slot
 /// (`current_live_session().approve`), exactly like the webui's
 /// `/live/permission`. Sending it to the TUI agent (which isn't running this
