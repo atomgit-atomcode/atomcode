@@ -11,9 +11,11 @@
 //! handling) needs them — kept shape-compatible with the legacy `core::AgentEvent`
 //! so the 38-arm `handle_agent_event` re-point is mechanical.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use atomcode_core::agent::{AgentPhase, TurnStopReason};
+use atomcode_core::agent::{AgentPhase, SubAgentTaskInfo, TurnStopReason};
+use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::ConversationSnapshot;
 use atomcode_core::tool::ToolCall;
 
@@ -108,4 +110,115 @@ pub enum UiEvent {
         call: ToolCall,
         snapshot: ConversationSnapshot,
     },
+
+    // ── Orchestration (goal / vision / background / undo / sub-agent) ──
+    /// `/undo` rolled the conversation back. Carries the truncated history (persist
+    /// + replay), the restored prompt text, and turn numbers for the confirmation.
+    ConversationTruncated {
+        snapshot: ConversationSnapshot,
+        restored_prompt: String,
+        target_n: usize,
+        prompts_before: usize,
+    },
+    /// `/undo` out of range: `requested` turn vs `available` real prompts.
+    UndoFailed { requested: usize, available: usize },
+    /// Reply to a SyncMessages request — a snapshot for the TUI to sync before
+    /// backgrounding a mid-turn session.
+    MessagesSync { snapshot: ConversationSnapshot },
+    /// A UserPromptSubmit hook failed on an environment issue (not an explicit
+    /// block); the turn continues but the status bar surfaces the error.
+    HookWarningHint(String),
+    /// VL preprocessing failed; return the user's pending images for re-attach.
+    RestorePendingImages {
+        images: Vec<ImagePart>,
+        markers: Vec<usize>,
+    },
+    /// VL preprocessing succeeded — a one-line success notice (the description rides
+    /// into history for the main model, not the UI).
+    VisionPreprocessSuccess { vl_key: String, char_count: usize },
+    /// Sub-agent batch began (ordered child descriptors).
+    SubAgentDispatchStart { tasks: Vec<SubAgentTaskInfo> },
+    /// Sub-agent batch ended (all settled / pool returned).
+    SubAgentDispatchEnd,
+    /// One sub-agent was claimed from the pool and is now running.
+    SubAgentTaskStarted { index: usize },
+    /// Sub-agent finished successfully.
+    SubAgentTaskDone {
+        index: usize,
+        elapsed_ms: u64,
+        turns: usize,
+        summary: String,
+    },
+    /// Sub-agent failed (error / timeout / no-edit).
+    SubAgentTaskFailed {
+        index: usize,
+        elapsed_ms: u64,
+        turns: usize,
+        reason: String,
+    },
+    /// Goal evaluator update — the TUI shows progress.
+    GoalUpdate {
+        active: bool,
+        round: u32,
+        elapsed_secs: u64,
+        condition: String,
+        last_reason: Option<String>,
+    },
+    /// `/background` task finished.
+    BackgroundComplete {
+        summary: String,
+        files_edited: Vec<String>,
+        turns: usize,
+        success: bool,
+    },
+    /// The agent's own `cd`/`change_dir` tool changed the working directory
+    /// (conversation preserved).
+    WorkingDirChanged(PathBuf),
+
+    // ── Live-sync (another view — webui — drives this session) ──
+    /// Another client switched the project working directory (switch + fresh session).
+    ProjectSwitched(PathBuf),
+    /// A user message echoed from another view, to render the user bubble locally.
+    UserEcho(String),
+    /// The synced peer is mid-turn (true = running) — disable/restore local input.
+    PeerBusy(bool),
+    /// Another view switched the model.
+    ProviderChanged(String),
+    /// Another view created a new session — follow it.
+    SessionSwitched(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The orchestration + live-sync variants are constructible with the expected
+    /// shapes and `Clone` (the renderer needs owned events on the fan channel).
+    #[test]
+    fn orchestration_and_live_sync_variants_construct_and_clone() {
+        let events = vec![
+            UiEvent::GoalUpdate {
+                active: true,
+                round: 2,
+                elapsed_secs: 9,
+                condition: "tests pass".into(),
+                last_reason: Some("still failing".into()),
+            },
+            UiEvent::BackgroundComplete {
+                summary: "done".into(),
+                files_edited: vec!["a.rs".into()],
+                turns: 3,
+                success: true,
+            },
+            UiEvent::UndoFailed { requested: 5, available: 2 },
+            UiEvent::UserEcho("hi from webui".into()),
+            UiEvent::PeerBusy(true),
+            UiEvent::SessionSwitched("sess-1".into()),
+        ];
+        for ev in &events {
+            // Exercises Clone + Debug (derived) so the full mirror stays renderable.
+            let _ = format!("{:?}", ev.clone());
+        }
+        assert!(matches!(events[2], UiEvent::UndoFailed { requested: 5, available: 2 }));
+    }
 }
