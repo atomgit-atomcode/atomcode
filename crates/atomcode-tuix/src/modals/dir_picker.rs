@@ -43,16 +43,37 @@ impl DirPicker {
         }
     }
 
-    /// Append a typed character to the path query and reset the recent-list
-    /// highlight (the typed path is now the primary Enter target).
+    /// Recent dirs matching the current query (case-insensitive substring on the
+    /// displayed `~`-collapsed path). Empty query → all recent dirs. When this is
+    /// EMPTY but the query is non-empty (no recent matches), Enter takes the query
+    /// as a literal typed path, so a directory not in the recent list still works.
+    fn filtered(&self) -> Vec<PathBuf> {
+        let q = self.query.trim().to_lowercase();
+        if q.is_empty() {
+            return self.dirs.clone();
+        }
+        self.dirs
+            .iter()
+            .filter(|d| {
+                crate::platform::collapse_home(&d.to_string_lossy())
+                    .to_lowercase()
+                    .contains(&q)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Append a typed character to the path query and reset the highlight to the
+    /// top of the (re-filtered) list.
     fn on_char(&mut self, c: char) {
         self.query.push(c);
         self.selected = 0;
     }
 
-    /// Delete the last character of the path query.
+    /// Delete the last character of the path query and reset the highlight.
     fn on_backspace(&mut self) {
         self.query.pop();
+        self.selected = 0;
     }
 
     fn up(&mut self) {
@@ -60,18 +81,18 @@ impl DirPicker {
     }
 
     fn down(&mut self) {
-        if self.dirs.is_empty() {
+        let n = self.filtered().len();
+        if n == 0 {
             self.selected = 0;
             return;
         }
-        let max = self.dirs.len() - 1;
-        if self.selected < max {
+        if self.selected + 1 < n {
             self.selected += 1;
         }
     }
 
     fn chosen(&self) -> Option<PathBuf> {
-        self.dirs.get(self.selected).cloned()
+        self.filtered().get(self.selected).cloned()
     }
 }
 
@@ -111,14 +132,16 @@ impl Modal for DirPicker {
                 Ok(ModalAction::Continue)
             }
             KeyCode::Enter => {
-                // A typed query takes precedence: resolve+validate+canonicalize it
-                // exactly like `/cd <path>` (handles `~`, `~\`/`~/`, `-`, absolute,
-                // and cwd-relative), so a directory NOT in the recent list works.
-                let query = self.query.trim();
-                if !query.is_empty() {
-                    // Resolve the typed path EXACTLY like `/cd <path>` — and the
-                    // command path trims its arg, so trim here too for parity.
-                    match crate::event_loop::commands::resolve_cd(
+                let filt = self.filtered();
+                // No recent dir matches the query → take the query as a literal typed
+                // path (resolve+validate+canonicalize EXACTLY like `/cd <path>`, which
+                // trims its arg), so a directory NOT in the recent list still works.
+                if filt.is_empty() {
+                    let query = self.query.trim();
+                    if query.is_empty() {
+                        return Ok(ModalAction::Continue);
+                    }
+                    return match crate::event_loop::commands::resolve_cd(
                         query,
                         &ctx.working_dir,
                         ctx.previous_dir.as_deref(),
@@ -133,18 +156,19 @@ impl Modal for DirPicker {
                                 ));
                             }
                             renderer.flush();
-                            return Ok(ModalAction::Close);
+                            Ok(ModalAction::Close)
                         }
                         Err(e) => {
-                            // A typo shouldn't dismiss the picker — show the error
-                            // but KEEP it open (redraw) so the query can be fixed.
+                            // A typo shouldn't dismiss the picker — show the error but
+                            // KEEP it open (redraw) so the query can be fixed.
                             renderer.render(UiLine::Error(e));
                             self.draw(buf, state, ctx, renderer);
-                            return Ok(ModalAction::Continue);
+                            Ok(ModalAction::Continue)
                         }
-                    }
+                    };
                 }
-                let Some(path) = self.chosen() else {
+                // A recent dir is highlighted in the filtered list — cd to it.
+                let Some(path) = filt.get(self.selected).cloned() else {
                     return Ok(ModalAction::Continue);
                 };
                 if path == ctx.working_dir {
@@ -190,7 +214,7 @@ impl Modal for DirPicker {
 
 fn build_menu_payload(p: &DirPicker) -> MenuPayload {
     let items: Vec<(String, String)> = p
-        .dirs
+        .filtered()
         .iter()
         .map(|d| {
             let name = crate::platform::collapse_home(&d.to_string_lossy());
@@ -222,6 +246,53 @@ mod tests {
         let p = DirPicker::open(vec![pb("/a"), pb("/b")], pb("/a"));
         assert_eq!(p.selected, 0);
         assert_eq!(p.dirs.len(), 2);
+    }
+
+    #[test]
+    fn query_filters_recent_list_case_insensitive() {
+        // Typing narrows the recent list (case-insensitive substring on the path).
+        let mut p = DirPicker::open(
+            vec![pb("/tmp/alpha"), pb("/tmp/beta"), pb("/tmp/AlphaBeta")],
+            pb("/tmp/alpha"),
+        );
+        for c in "alp".chars() {
+            p.on_char(c);
+        }
+        assert_eq!(p.filtered(), vec![pb("/tmp/alpha"), pb("/tmp/AlphaBeta")]);
+        assert_eq!(p.selected, 0, "highlight resets to the first match");
+    }
+
+    #[test]
+    fn empty_query_lists_all_recents() {
+        let p = DirPicker::open(vec![pb("/tmp/a"), pb("/tmp/b")], pb("/tmp/a"));
+        assert_eq!(p.filtered().len(), 2);
+    }
+
+    #[test]
+    fn down_clamps_to_filtered_results_not_all_dirs() {
+        let mut p = DirPicker::open(
+            vec![pb("/tmp/alpha"), pb("/tmp/beta"), pb("/tmp/alphabeta")],
+            pb("/x"),
+        );
+        for c in "alp".chars() {
+            p.on_char(c); // matches alpha + alphabeta (2 of 3)
+        }
+        p.down();
+        assert_eq!(p.selected, 1);
+        p.down();
+        assert_eq!(p.selected, 1, "clamps to the 2 filtered results, not all 3 dirs");
+    }
+
+    #[test]
+    fn unmatched_query_filters_to_empty_for_typed_path_fallback() {
+        let mut p = DirPicker::open(vec![pb("/tmp/alpha")], pb("/tmp/alpha"));
+        for c in "zzz".chars() {
+            p.on_char(c);
+        }
+        assert!(
+            p.filtered().is_empty(),
+            "no recent matches → empty list, so Enter falls back to the typed path"
+        );
     }
 
     #[test]
