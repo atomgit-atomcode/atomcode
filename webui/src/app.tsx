@@ -149,14 +149,12 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function handleNewSession() {
-    // 立即重置画布（清空消息、回到落地页），保证用户看到即时反馈
+  // 在指定目录下创建一个新会话并切过去（落地、侧栏可见）。
+  // 先重置画布回落地页给即时反馈，再异步建会话；失败则停在落地页。
+  function openNewSession(targetCwd: string | undefined) {
     setSessionId(null);
     setActiveSession(null);
-    setSidebarOpen(false);
-    // 异步在后端创建新会话，成功后切过去（Chat useEffect 加载空历史）
-    const prevCwd = cwd;
-    createSession(prevCwd || undefined)
+    createSession(targetCwd || undefined)
       .then((data) => {
         setSessionId(data.id);
         setActiveSession({
@@ -176,6 +174,11 @@ export function App() {
       });
   }
 
+  function handleNewSession() {
+    setSidebarOpen(false);
+    openNewSession(cwd || undefined);
+  }
+
   function handleSelectSession(session: SessionMetaWithProject) {
     setSessionId(session.id);
     setActiveSession(session);
@@ -185,11 +188,10 @@ export function App() {
     setSidebarOpen(false);
   }
 
-  // 切换工作目录：侧栏按新目录过滤会话，并自动进入该目录的新对话。
+  // 切换工作目录：侧栏按新目录过滤会话，并在该目录下新建一个会话（落地、侧栏可见）。
   function handlePickCwd(path: string) {
     setCwd(path);
-    setSessionId(null);
-    setActiveSession(null);
+    openNewSession(path || undefined);
   }
 
   // 删除会话：若删的是当前打开的会话，回到空白新对话。
