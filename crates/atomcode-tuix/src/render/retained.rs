@@ -550,10 +550,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// `body_log` — suppresses re-logging so replay never grows the log.
     replaying: bool,
     /// Set once `body_log` evicts its oldest entry (session exceeded
-    /// `MAX_SCROLLBACK_ROWS` logged events). When true the oldest
-    /// transcript prefix can no longer be reconstructed, so `on_resize`
-    /// must NOT clear the host scrollback (`\x1b[3J`) — wiping it would
-    /// lose history the replay can't repaint.
+    /// `MAX_SCROLLBACK_ROWS` logged events): the oldest transcript prefix
+    /// can no longer be reconstructed by the reflow replay. DIAGNOSTIC ONLY
+    /// — `on_resize` clears the host scrollback (`\x1b[3J`) unconditionally;
+    /// this flag merely annotates the resize trace to record that the
+    /// un-reflowable prefix was dropped. (It used to GATE the wipe, but
+    /// skipping it let the reflow stack a duplicate transcript on every
+    /// resize — the "一直重复输出" bug — so the wipe now always fires.)
     body_log_truncated: bool,
 }
 
@@ -3162,9 +3165,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             _ => {}
         }
         self.body_log.push(line.clone());
-        // Bound memory on very long sessions. Once we drop the oldest
-        // entry the transcript prefix is unrecoverable, so flag it to
-        // disable the resize scrollback wipe (see `body_log_truncated`).
+        // Bound memory on very long sessions. Once we drop the oldest entry the
+        // transcript prefix is unrecoverable by the reflow replay; flag it purely so
+        // the resize trace can note the dropped prefix (see `body_log_truncated` —
+        // it no longer gates the scrollback wipe).
         if self.body_log.len() > MAX_SCROLLBACK_ROWS {
             self.body_log.remove(0);
             self.body_log_truncated = true;
@@ -4766,13 +4770,22 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // #709: "向上滚动多出 2 条"). `\x1b[3J` is the only sequence that
         // clears scrollback; the reflow replay below then re-promotes the
         // CORRECT overflow at the new width via its append-only LFs, so
-        // the transcript is rebuilt rather than lost. Skipped when the
-        // log has been truncated (oldest entries evicted) — then the
-        // prefix is unrecoverable and wiping it would drop real history.
-        if !self.body_log_truncated {
-            let _ = self.out.write_all(b"\x1b[3J");
-            crate::tuix_trace!("RSZ", "scrollback cleared (3J)");
-        }
+        // the transcript is rebuilt rather than lost.
+        //
+        // We clear EVEN when `body_log` was truncated. The alternative —
+        // skipping 3J to preserve the evicted prefix — is worse: the reflow
+        // re-appends the whole RETAINED transcript on top of the un-cleared
+        // old copy, so every resize stacks a duplicate (the reported
+        // "一直重复输出" on long sessions). The pre-truncation prefix is
+        // already gone from `body_log` and can't be reflowed anyway, so
+        // clearing it loses only un-repaintable history — an acceptable
+        // trade for not duplicating the visible transcript.
+        let _ = self.out.write_all(b"\x1b[3J");
+        crate::tuix_trace!(
+            "RSZ",
+            "scrollback cleared (3J){}",
+            if self.body_log_truncated { " [log truncated: pre-eviction prefix dropped]" } else { "" }
+        );
         self.screen.resize(cols, rows);
         // `screen.resize` rebuilds the Screen (resetting `sync_suppressed`) —
         // re-assert suppression so the `flush_frame` render_diff below paints
@@ -12134,6 +12147,41 @@ mod tests {
         assert!(
             out.ends_with("\x1b[?2026l"),
             "resize must close with ESU after the final paint: {:?}",
+            out
+        );
+    }
+
+    /// Regression (long-session resize duplication): once `body_log` evicts its
+    /// oldest entries (`body_log_truncated`), on_resize MUST still clear native
+    /// scrollback (`\x1b[3J`). The reflow below re-appends the whole RETAINED
+    /// transcript; if the wipe is skipped, the previous copy stays stranded and every
+    /// font-zoom step stacks another duplicate (the reported "一直重复输出" on big
+    /// sessions). We trade the already-evicted, un-reflowable prefix for no duplication.
+    #[test]
+    fn on_resize_clears_scrollback_even_after_truncation() {
+        let (mut r, buf) = new_capturing(40, 10);
+        for i in 0..6 {
+            r.render(UiLine::AssistantText(format!("line {i}\n")));
+        }
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        // Simulate a long session whose oldest body_log entries were evicted.
+        r.body_log_truncated = true;
+        buf.lock().unwrap().clear();
+
+        r.on_resize(40, 8); // real height change → resize work
+
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(
+            out.contains("\x1b[3J"),
+            "a truncated session must STILL clear scrollback (3J) to avoid stacking \
+             duplicate transcripts on resize: {:?}",
             out
         );
     }
