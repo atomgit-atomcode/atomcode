@@ -16,8 +16,10 @@
 //! adapter is not yet connected to the live event loop (the bridge still backs the
 //! TUI), so this is dead code with zero behavior change until the wiring step.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use atomcode_coding::{
     assemble, prepare_with_plugin_hooks, CodingAgentConfig, CodingParts, LiveTools, PrepareOptions,
@@ -27,7 +29,7 @@ use atomcode_core::agent::{AgentCommand as CoreCmd, AgentPhase};
 use atomcode_core::conversation::ConversationSnapshot;
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::event::{AgentCommand as KCmd, AgentEvent as KEv, RequestId, StopReason};
-use atomcode_kernel::message::MessageMeta;
+use atomcode_kernel::message::{MessageMeta, SessionSnapshot};
 use tokio::sync::mpsc;
 
 use super::approval::{approval_needed_event, bypass_auto_approval, take_deny_cmd};
@@ -120,6 +122,20 @@ struct NativeRuntime {
     /// One pending approval at a time — the legacy protocol has bare Approve/Deny,
     /// so the adapter correlates the kernel request id here.
     pending_approval: Option<(RequestId, String)>,
+    /// A plan-mode toggle note to prepend to the next user message (v1 parity:
+    /// communicated via history, NOT the system prompt, to keep the prefix cache).
+    pending_plan_note: Option<String>,
+    /// `/undo` in flight: the requested prompt index (None = the last turn). Awaits a
+    /// Snapshot to truncate against.
+    pending_undo: Option<Option<usize>>,
+    /// One `/background` task at a time (set while a background worker runs).
+    background_running: Arc<std::sync::atomic::AtomicBool>,
+    /// `!cmd` local-shell outputs accumulated since the last user message: each is a
+    /// `<bash-*>` block injected ahead of the next message so the model sees it (the
+    /// `!` path runs the shell + shows output but starts NO turn of its own).
+    pending_local_shell: Vec<String>,
+    /// Monotonic id for `!cmd` tool-call display events.
+    local_shell_seq: u64,
     dangerously_skip_permissions: bool,
 }
 
@@ -195,6 +211,11 @@ impl NativeRuntime {
             turn_running: false,
             pending_finish: None,
             pending_approval: None,
+            pending_plan_note: None,
+            pending_undo: None,
+            background_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_local_shell: Vec::new(),
+            local_shell_seq: 0,
             dangerously_skip_permissions,
         };
 
@@ -449,12 +470,11 @@ impl NativeRuntime {
                 let _ = self.handle.commands.send(KCmd::SendMessage { text, images });
             }
             CoreCmd::Cancel => {
-                // Release a parked approval as a fail-closed deny BEFORE Cancel so the
-                // kernel backfills the cancelled tool's result (no dangling tool_use).
-                if let Some((id, _)) = self.pending_approval.take() {
-                    let value = serde_json::to_value(ApprovalResponse::deny())
-                        .unwrap_or(serde_json::Value::Null);
-                    let _ = self.handle.commands.send(KCmd::Respond { id, value });
+                // Release + clear any parked approval BEFORE forwarding Cancel: the kernel
+                // then backfills the cancelled tool's result, and clearing the mirror means
+                // a later respawn (which re-reads the snapshot) can't re-trigger it.
+                if let Some(cmd) = take_deny_cmd(&mut self.pending_approval) {
+                    let _ = self.handle.commands.send(cmd);
                 }
                 let _ = self.handle.commands.send(KCmd::Cancel);
             }
@@ -463,6 +483,158 @@ impl NativeRuntime {
             CoreCmd::DenyTool => self.answer_approval(ApprovalResponse::deny()),
             CoreCmd::Compact { prompt } => {
                 let _ = self.handle.commands.send(KCmd::Compact { focus: prompt });
+            }
+            CoreCmd::ChangeDir(dir) => {
+                // `/cd` = a NEW SESSION in the new project: re-prepare the engine rooted at
+                // the new dir so persona/context/instructions/MCP/skills all rebind. An
+                // in-place `shared_cwd` write would only move the tools' cwd, leaving the
+                // frozen session context pointing at the old project.
+                let target = {
+                    let base = self
+                        .parts
+                        .shared_cwd
+                        .read()
+                        .map(|p| p.clone())
+                        .unwrap_or_else(|_| self.coding_cfg.working_dir.clone());
+                    let p = std::path::Path::new(&dir);
+                    if p.is_absolute() { p.to_path_buf() } else { base.join(p) }
+                };
+                match target.canonicalize() {
+                    Ok(d) if d.is_dir() => {
+                        self.coding_cfg.working_dir = d.clone();
+                        self.emit(UiEvent::WorkingDirChanged(d));
+                        self.respawn(SessionMode::Fresh).await;
+                    }
+                    _ => self.emit(UiEvent::Warning(format!("no such directory: {dir}"))),
+                }
+            }
+            CoreCmd::Remember { content, global } => {
+                let store = if global {
+                    MemoryStore::global()
+                } else {
+                    MemoryStore::project(&self.coding_cfg.working_dir)
+                };
+                let msg = match store.append(&content) {
+                    Ok(()) => format!(
+                        "Remembered ({}): {content}",
+                        if global { "global" } else { "project" }
+                    ),
+                    Err(e) => format!("Failed to remember: {e}"),
+                };
+                // System result, NOT a user message → Warning (info line; UserEcho would
+                // render a fake user bubble).
+                self.emit(UiEvent::Warning(msg));
+            }
+            CoreCmd::Forget { keyword } => {
+                let project = MemoryStore::project(&self.coding_cfg.working_dir);
+                let global = MemoryStore::global();
+                let mut removed = project.remove_matching(&keyword).unwrap_or_default();
+                removed.extend(global.remove_matching(&keyword).unwrap_or_default());
+                let msg = if removed.is_empty() {
+                    format!("Nothing matched '{keyword}'")
+                } else {
+                    format!("Forgot {} entr(y/ies)", removed.len())
+                };
+                self.emit(UiEvent::Warning(msg));
+            }
+            CoreCmd::ShowMemory => {
+                let name = self
+                    .coding_cfg
+                    .working_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "project".into());
+                let merged = MemoryStore::merged_for_prompt(
+                    &MemoryStore::global(),
+                    &MemoryStore::project(&self.coding_cfg.working_dir),
+                    &name,
+                );
+                self.emit(UiEvent::Warning(if merged.is_empty() {
+                    "(memory is empty)".into()
+                } else {
+                    merged
+                }));
+            }
+            CoreCmd::SetConversation(snap) => {
+                // The driver resumes a (legacy-format) session: convert, persist under the
+                // session id, respawn resumed. cold_summaries is a v1 compression concept
+                // the new stack doesn't model, so it's dropped.
+                let kmsgs: Vec<_> = snap.messages.iter().map(convert::message_to_kernel).collect();
+                let ksnap = SessionSnapshot::new(kmsgs);
+                if let Some(b) = self.parts.session.as_ref() {
+                    let _ = b.manager.save_snapshot(&self.bridge_session, &ksnap);
+                }
+                self.respawn(SessionMode::Resume(self.bridge_session.clone())).await;
+                // Confirm the engine's view back to the driver (webui sync relies on it).
+                self.emit(UiEvent::MessagesSync { snapshot: snap });
+            }
+            CoreCmd::ClearConversation => {
+                self.respawn(SessionMode::Fresh).await;
+            }
+            CoreCmd::SetSessionId(_id) => {
+                // Legacy gateway-affinity hint. The new stack derives cache affinity from
+                // its own session id; nothing to do.
+            }
+            CoreCmd::ReloadConfig(config) => {
+                // Switch to the (possibly new) default provider, same parts — approval
+                // grants + conversation survive. Settle any in-flight turn/approval FIRST so
+                // the kernel persists a clean snapshot before `assemble` re-reads it
+                // (otherwise the swap leaves a dangling tool_use the fresh agent re-fires).
+                if self.turn_running || self.pending_approval.is_some() {
+                    self.settle_in_flight_turn().await;
+                }
+                if let Some(p) = config.providers.get(&config.default_provider) {
+                    apply_reload_provider(&mut self.coding_cfg, p);
+                    match (self.factory)(&self.coding_cfg) {
+                        Ok(provider) => {
+                            // Assemble BEFORE tearing down the old handle — if assemble
+                            // fails, the old (possibly noop) handle stays intact.
+                            match assemble(&mut self.parts, &self.coding_cfg, provider) {
+                                Ok(a) => {
+                                    let new_handle = a.spawn();
+                                    let _ = self.handle.commands.send(KCmd::Shutdown);
+                                    let old_task = std::mem::replace(
+                                        &mut self.handle.task,
+                                        tokio::spawn(async {}),
+                                    );
+                                    let _ = old_task.await;
+                                    self.handle = new_handle;
+                                    self.degraded = false;
+                                    // Clear stale state accumulated under the old handle.
+                                    self.turn_running = false;
+                                    self.pending_approval = None;
+                                    self.pending_finish = None;
+                                    self.pending_undo = None;
+                                }
+                                Err(e) => self.emit(UiEvent::Error {
+                                    error: format!("provider switch failed: {e}"),
+                                    snapshot: ConversationSnapshot::default(),
+                                }),
+                            }
+                        }
+                        Err(e) => self.emit(UiEvent::Error {
+                            error: atomcode_core::i18n::t(
+                                atomcode_core::i18n::Msg::ProviderInitFailed { detail: &e },
+                            )
+                            .into_owned(),
+                            snapshot: ConversationSnapshot::default(),
+                        }),
+                    }
+                }
+            }
+            CoreCmd::ReloadHooks => {
+                // "Reload everything except the provider" — re-prepare so the engine picks
+                // up mid-session changes to plugin skills / hooks / MCP servers (bound at
+                // prepare time). Resume keeps the conversation + cwd.
+                self.respawn(SessionMode::Resume(self.bridge_session.clone())).await;
+            }
+            CoreCmd::AppendInput(text) => {
+                // Legacy streaming-append: the kernel queues mid-turn sends as a full
+                // follow-up turn — closest faithful behavior.
+                let _ = self
+                    .handle
+                    .commands
+                    .send(KCmd::SendMessage { text, images: vec![] });
             }
             CoreCmd::SyncMessages => {
                 let _ = self.handle.commands.send(KCmd::Snapshot);
@@ -554,5 +726,87 @@ impl NativeRuntime {
                 }
             }
         }
+    }
+}
+
+/// Map a driver `ProviderConfig` (the `/model`, `/effort`, `/think` controls write it,
+/// then send `ReloadConfig`) onto the `CodingAgentConfig` a respawn / model-swap rebuilds
+/// from. Refreshes EVERY per-provider knob — a /model swap can change the adapter kind and
+/// all thinking/reasoning controls — so the rebuilt provider matches the new config.
+/// (Relocated from the bridge's `apply_reload_provider`.)
+fn apply_reload_provider(
+    cfg: &mut CodingAgentConfig,
+    provider: &atomcode_core::config::provider::ProviderConfig,
+) {
+    cfg.model = provider.model.clone();
+    if let Some(base_url) = &provider.base_url {
+        cfg.base_url = base_url.clone();
+    }
+    if let Some(api_key) = &provider.api_key {
+        cfg.api_key = api_key.clone();
+    }
+    cfg.context_window = provider.context_window as u32;
+    // `/effort` / `/think` write the provider config then ReloadConfig: pick up the
+    // (possibly changed) reasoning_effort so the respawned agent's ChatOptions reflect it.
+    cfg.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
+        provider.reasoning_effort.as_deref(),
+    );
+    // A /model swap can change the adapter kind + per-provider knobs entirely — refresh
+    // them all so the rebuilt provider matches the new config.
+    cfg.provider_type = provider.provider_type.clone();
+    cfg.reasoning_history = provider.reasoning_history.clone();
+    cfg.thinking_enabled = provider.thinking_enabled;
+    cfg.thinking_type = provider.thinking_type.clone();
+    cfg.thinking_keep = provider.thinking_keep.clone();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomcode_core::config::provider::ProviderConfig;
+    use atomcode_kernel::provider::ReasoningEffort;
+
+    #[test]
+    fn reload_provider_refreshes_context_window_and_provider_knobs() {
+        let mut cfg =
+            CodingAgentConfig::new("old-key", "https://old.example.com/v1", "old-model", "/tmp");
+        cfg.context_window = 16_000;
+        cfg.provider_type = "openai".into();
+        cfg.reasoning_history = Some("exclude".into());
+        cfg.thinking_enabled = Some(false);
+        cfg.thinking_type = Some("disabled".into());
+        cfg.thinking_keep = Some("none".into());
+
+        let provider = ProviderConfig {
+            provider_type: "claude".into(),
+            api_key: Some("new-key".into()),
+            model: "new-model".into(),
+            base_url: Some("https://new.example.com/v1".into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 64_000,
+            max_tokens: None,
+            thinking_type: Some("enabled".into()),
+            thinking_keep: Some("all".into()),
+            reasoning_history: Some("include".into()),
+            reasoning_effort: Some("max".into()),
+            thinking_enabled: Some(true),
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        };
+
+        apply_reload_provider(&mut cfg, &provider);
+
+        assert_eq!(cfg.model, "new-model");
+        assert_eq!(cfg.base_url, "https://new.example.com/v1");
+        assert_eq!(cfg.api_key, "new-key");
+        assert_eq!(cfg.context_window, 64_000);
+        assert_eq!(cfg.provider_type, "claude");
+        assert_eq!(cfg.reasoning_history.as_deref(), Some("include"));
+        assert_eq!(cfg.chat_options.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(cfg.thinking_enabled, Some(true));
+        assert_eq!(cfg.thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(cfg.thinking_keep.as_deref(), Some("all"));
     }
 }
