@@ -107,7 +107,15 @@ export function App() {
     // 顶部标题头用的是 activeSession.name；首发时同步成临时标题（已有会话元数据时），
     // 否则标题头会一直停在占位名 session-<ts>。落地页首发无 activeSession，标题头本就
     // 隐藏，待回合结束列表刷新后由 handleActiveSessionMeta 回填真实标题。
-    setActiveSession((prev) => (prev ? { ...prev, name: title } : prev));
+    // 但如果用户已手动重命名过会话（名称非 session-xxx 格式），则不覆盖，保护用户选择。
+    setActiveSession((prev) =>
+      prev
+        ? {
+            ...prev,
+            name: prev.name.startsWith('session-') ? title : prev.name,
+          }
+        : prev,
+    );
   }
 
   // 侧栏列表（重新）加载后回传当前会话的真实元数据：回合落盘后后端已自动命名，

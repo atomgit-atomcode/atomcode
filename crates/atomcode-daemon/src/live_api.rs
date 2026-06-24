@@ -1021,15 +1021,21 @@ impl TurnExecutor for KernelTurnExecutor {
 
         // Persist (stable session id → one file per session). Mirrors the legacy
         // executor so /resume sees the conversation after a quit.
+        // Load the existing session from disk (if any) instead of creating a
+        // fresh one, so that `user_renamed` and other accumulated fields
+        // (turn_stats, cold_summaries, etc.) are preserved.
         {
             use atomcode_core::session::{Session, SessionManager};
             let conv_guard = conv.lock().await;
-            let mut session = Session::new(self.working_dir.clone());
+            let manager = SessionManager::new(&self.working_dir);
+            let mut session = manager
+                .load(&self.session_id)
+                .unwrap_or_else(|_| Session::new(self.working_dir.clone()));
             session.id = self.session_id.clone();
             session.messages = conv_guard.messages.clone();
             session.auto_name_from_messages();
             session.touch();
-            if let Err(e) = SessionManager::new(&self.working_dir).save(&session) {
+            if let Err(e) = manager.save(&session) {
                 eprintln!("Warning: failed to save live session (v2): {e}");
             }
         }

@@ -8493,9 +8493,12 @@ pub(crate) fn apply_session_snapshot(
     //     Role::User message for plumbing reasons. Re-derive from the
     //     next non-synthetic user turn so the /resume picker stops
     //     showing those as session titles.
-    let should_rename = session.name == "default"
-        || session.name.starts_with("session-")
-        || session.name.trim_start().starts_with('[');
+    //   * `user_renamed` — if the user explicitly renamed (via /rename),
+    //     never auto-name, regardless of name format.
+    let should_rename = !session.user_renamed
+        && (session.name == "default"
+            || session.name.starts_with("session-")
+            || session.name.trim_start().starts_with('['));
     if should_rename {
         use atomcode_core::conversation::message::Role;
         // Primary signal: `Message.synthetic` field (accurate for sessions
