@@ -1163,7 +1163,7 @@ async fn serve_webui_index(
                     };
                     let cookie = format!(
                         "{}={}; Path=/; HttpOnly; SameSite=Strict",
-                        auth_token::WEBUI_COOKIE,
+                        auth_token::webui_cookie_name(state.bind_port),
                         token
                     );
                     return axum::response::Response::builder()
@@ -3764,6 +3764,7 @@ async fn get_tunnel_status(
             headers
                 .get(axum::http::header::COOKIE)
                 .and_then(|h| h.to_str().ok()),
+            &auth_token::webui_cookie_name(state.bind_port),
         )
     });
 
