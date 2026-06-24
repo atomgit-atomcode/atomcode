@@ -3346,9 +3346,11 @@ pub(crate) fn expand_cd_target(
     }
     if let Some(rest) = arg.strip_prefix('~') {
         let home = home.ok_or_else(|| "home directory not known".to_string())?;
-        // Strip the leading separator after `~` — BOTH `/` and `\` so a Windows
-        // user can type `~\Desktop` just like `~/Desktop` (the native separator).
-        let rest = rest.strip_prefix(['/', '\\']).unwrap_or(rest);
+        // Strip the leading separator(s) after `~` — BOTH `/` and `\` so a Windows
+        // user can type `~\Desktop` like `~/Desktop`, and ALL of them so a doubled
+        // separator (`~//x`, easy typo) doesn't leave an absolute remnant that
+        // `home.join` would treat as a root and escape the home dir.
+        let rest = rest.trim_start_matches(['/', '\\']);
         return Ok(if rest.is_empty() { home.to_path_buf() } else { home.join(rest) });
     }
     let p = PathBuf::from(arg);
@@ -4111,6 +4113,23 @@ mod expand_cd_target_tests {
             home.join("Desktop")
         );
         assert_eq!(expand_cd_target("~", Some(&home), &cwd, None).unwrap(), home);
+    }
+
+    #[test]
+    fn tilde_strips_all_leading_separators_no_home_escape() {
+        // `~//Desktop` / `~\\Desktop` (double separator, easy typo) must stay
+        // home-relative — NOT degrade to the absolute `/Desktop` that a single
+        // `strip_prefix` would leave (Path::join with an absolute arg drops home).
+        let home = PathBuf::from("/home/u");
+        let cwd = PathBuf::from("/work");
+        assert_eq!(
+            expand_cd_target("~//Desktop", Some(&home), &cwd, None).unwrap(),
+            home.join("Desktop")
+        );
+        assert_eq!(
+            expand_cd_target("~\\\\Desktop", Some(&home), &cwd, None).unwrap(),
+            home.join("Desktop")
+        );
     }
 
     #[test]

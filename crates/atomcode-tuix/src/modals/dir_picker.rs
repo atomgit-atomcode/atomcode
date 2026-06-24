@@ -114,9 +114,12 @@ impl Modal for DirPicker {
                 // A typed query takes precedence: resolve+validate+canonicalize it
                 // exactly like `/cd <path>` (handles `~`, `~\`/`~/`, `-`, absolute,
                 // and cwd-relative), so a directory NOT in the recent list works.
-                if !self.query.trim().is_empty() {
+                let query = self.query.trim();
+                if !query.is_empty() {
+                    // Resolve the typed path EXACTLY like `/cd <path>` — and the
+                    // command path trims its arg, so trim here too for parity.
                     match crate::event_loop::commands::resolve_cd(
-                        &self.query,
+                        query,
                         &ctx.working_dir,
                         ctx.previous_dir.as_deref(),
                     ) {
@@ -130,13 +133,16 @@ impl Modal for DirPicker {
                                 ));
                             }
                             renderer.flush();
+                            return Ok(ModalAction::Close);
                         }
                         Err(e) => {
+                            // A typo shouldn't dismiss the picker — show the error
+                            // but KEEP it open (redraw) so the query can be fixed.
                             renderer.render(UiLine::Error(e));
-                            renderer.flush();
+                            self.draw(buf, state, ctx, renderer);
+                            return Ok(ModalAction::Continue);
                         }
                     }
-                    return Ok(ModalAction::Close);
                 }
                 let Some(path) = self.chosen() else {
                     return Ok(ModalAction::Continue);
