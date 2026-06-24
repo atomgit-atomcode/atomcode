@@ -28,6 +28,7 @@ import com.atomcode.jetbrains.ui.header.HeaderPanel
 import com.atomcode.jetbrains.ui.input.InputPanel
 import com.atomcode.jetbrains.ui.input.QueuedPromptView
 import com.atomcode.jetbrains.ui.message.JBCefMessageView
+import com.atomcode.jetbrains.ui.message.MessageAttachmentView
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
@@ -41,23 +42,38 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.Disposable
+import com.intellij.ide.ClipboardSynchronizer
 import com.intellij.openapi.ide.CopyPasteManager
+import com.intellij.ui.mac.foundation.Foundation
+import com.intellij.ui.mac.foundation.ID
 import java.awt.BorderLayout
 import java.awt.Dialog
 import java.awt.Dimension
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
+import java.awt.Image
 import java.awt.Insets
+import java.awt.Toolkit
+import java.awt.datatransfer.DataFlavor
 import java.awt.datatransfer.StringSelection
+import java.awt.datatransfer.Transferable
+import java.io.ByteArrayInputStream
+import java.awt.image.BufferedImage
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.InputStream
+import java.nio.ByteBuffer
+import java.beans.PropertyChangeEvent
 import java.util.Base64
 import java.util.Locale
-import java.beans.PropertyChangeEvent
 import java.util.UUID
+import javax.imageio.ImageIO
 import javax.swing.DefaultListModel
 import javax.swing.JButton
 import javax.swing.JCheckBox
 import javax.swing.JComboBox
 import javax.swing.JDialog
+import javax.swing.ImageIcon
 import javax.swing.JLabel
 import javax.swing.JList
 import javax.swing.JMenu
@@ -84,6 +100,7 @@ private const val MAX_ATTACHED_IMAGE_BYTES =
 private const val MAX_ATTACHED_IMAGE_MB = MAX_ATTACHED_IMAGE_BYTES / 1024 / 1024
 private const val MIN_CHAT_PANEL_WIDTH = 360
 private const val MIN_CHAT_PANEL_HEIGHT = 300
+private const val CLIPBOARD_IMAGE_PATH_PREFIX = "clipboard-image://"
 
 class AtomCodeChatPanel(
     private val project: Project,
@@ -103,6 +120,7 @@ class AtomCodeChatPanel(
         onClearContext = { clearPendingContext() },
         onRemoveContext = { item -> removePendingAttachment(item) },
         onModelSelect = { showModelPickerPopup() },
+        onPasteFromClipboard = { transferable -> pasteClipboardImage(transferable) },
     )
 
     // ── Data state (preserved from original) ──
@@ -734,10 +752,12 @@ class AtomCodeChatPanel(
         val contextForSend = pendingContextForSend + buildAutomaticContext(pendingContextForSend)
         val message = buildPromptWithContext(transformedPrompt, contextForSend)
         val contextNames = contextForSend.map { it.displayName } + pendingImagesForSend.map { it.displayName }
+        val attachments = contextForSend.map { MessageAttachmentView(displayName = it.displayName, path = it.path) } +
+            pendingImagesForSend.map { it.toMessageAttachmentView() }
         val images = pendingImagesForSend.map { it.toImageInput() }
 
         if (generating) {
-            val queued = QueuedPrompt(UUID.randomUUID().toString(), transformedPrompt, message, contextNames, images)
+            val queued = QueuedPrompt(UUID.randomUUID().toString(), transformedPrompt, message, contextNames, attachments, images)
             queuedPrompts += queued
             if (pendingContextForSend.isNotEmpty() || pendingImagesForSend.isNotEmpty()) clearPendingContext()
             inputPanel.clearInput()
@@ -745,15 +765,21 @@ class AtomCodeChatPanel(
             return
         }
         if (pendingContextForSend.isNotEmpty() || pendingImagesForSend.isNotEmpty()) clearPendingContext()
-        startPrompt(transformedPrompt, message, contextNames, images)
+        startPrompt(transformedPrompt, message, contextNames, attachments, images)
     }
 
-    private fun startPrompt(prompt: String, message: String, contextNames: List<String>, images: List<ImageInput>) {
+    private fun startPrompt(
+        prompt: String,
+        message: String,
+        contextNames: List<String>,
+        attachments: List<MessageAttachmentView>,
+        images: List<ImageInput>,
+    ) {
         val generationId = ++generationSequence
         activeGenerationId = generationId
         // Add user message + immediate thinking feedback
         renderQueueState()
-        messageView.addUserMessage(prompt, contextNames)
+        messageView.addUserMessage(prompt, contextNames, attachments)
         messageView.beginAssistantTurn()
         messageView.addThinkingIndicator()
         inputPanel.clearInput()
@@ -845,7 +871,7 @@ class AtomCodeChatPanel(
         // prompt. Clearing it for one event-loop turn causes the visible flash.
         activeGenerationId = null
         runtime?.removeQueuedPrompt(next.id)
-        startPrompt(next.prompt, next.message, next.contextNames, next.images)
+        startPrompt(next.prompt, next.message, next.contextNames, next.attachments, next.images)
     }
 
     private fun finishPrompt(
@@ -1122,6 +1148,291 @@ class AtomCodeChatPanel(
         focusInput()
     }
 
+    private fun pasteClipboardImage(transferable: Transferable?): Boolean {
+        val bytes = clipboardImageBytes(transferable)
+        if (bytes == null) {
+            val diagnosticTransferable = transferable?.takeIf { it.hasImageLikeFlavor() }
+                ?: firstImageLikeClipboardTransferable()
+            val macTypes = macPasteboardTypeNames()
+            if (diagnosticTransferable != null || macTypes.any(::isImagePasteboardType)) {
+                addSystemMessage(clipboardImageDiagnostic(diagnosticTransferable, macTypes))
+                return true
+            }
+            return false
+        }
+
+        attachClipboardImage(bytes)
+        return true
+    }
+
+    private fun clipboardImageBytes(transferable: Transferable?): ByteArray? {
+        imageBytesFromTransferable(transferable)?.let { return it }
+
+        val copyPasteManager = CopyPasteManager.getInstance()
+        imageBytesFromTransferable(copyPasteManager.contents)?.let { return it }
+        copyPasteManager.allContents.firstNotNullOfOrNull(::imageBytesFromTransferable)?.let { return it }
+
+        imageBytesFromTransferable(ClipboardSynchronizer.getInstance().contents)?.let { return it }
+
+        val systemTransferable = try {
+            Toolkit.getDefaultToolkit().systemClipboard.getContents(null)
+        } catch (_: Exception) {
+            null
+        }
+        imageBytesFromTransferable(systemTransferable)?.let { return it }
+
+        return macPasteboardImageBytes()
+    }
+
+    private fun Transferable.hasImageLikeFlavor(): Boolean =
+        transferDataFlavors.any { it.looksLikeImageFlavor() || it == DataFlavor.javaFileListFlavor }
+
+    private fun firstImageLikeClipboardTransferable(): Transferable? {
+        val copyPasteManager = CopyPasteManager.getInstance()
+        sequenceOf(copyPasteManager.contents, ClipboardSynchronizer.getInstance().contents)
+            .filterNotNull()
+            .firstOrNull { it.hasImageLikeFlavor() }
+            ?.let { return it }
+
+        copyPasteManager.allContents
+            .firstOrNull { it.hasImageLikeFlavor() }
+            ?.let { return it }
+
+        val systemTransferable = try {
+            Toolkit.getDefaultToolkit().systemClipboard.getContents(null)
+        } catch (_: Exception) {
+            null
+        }
+        return systemTransferable?.takeIf { it.hasImageLikeFlavor() }
+    }
+
+    private fun clipboardImageDiagnostic(transferable: Transferable?, macTypes: List<String>): String {
+        val javaFlavors = transferable?.transferDataFlavors
+            .orEmpty()
+            .joinToString(separator = "\n") { flavor ->
+                "- ${flavor.mimeType}; class=${flavor.representationClass.name}; name=${flavor.humanPresentableName}"
+            }
+            .ifBlank { "- <none>" }
+            .take(4000)
+        val macTypeText = macTypes
+            .joinToString(separator = "\n") { "- $it" }
+            .ifBlank { "- <none or unavailable>" }
+            .take(2000)
+        return "检测到图片剪贴板，但未能解析为附件，已阻止 IDE 默认粘贴写入项目文件。Java clipboard flavors:\n$javaFlavors\nmacOS pasteboard types:\n$macTypeText"
+    }
+
+    private fun macPasteboardTypeNames(): List<String> {
+        if (!System.getProperty("os.name").contains("mac", ignoreCase = true)) return emptyList()
+        return try {
+            val pasteboard = Foundation.invoke("NSPasteboard", "generalPasteboard")
+            if (Foundation.isNil(pasteboard)) return emptyList()
+            val types = Foundation.safeInvoke(pasteboard, "types")
+            if (Foundation.isNil(types)) return emptyList()
+            Foundation.NSArray(types).getList().mapNotNull { id ->
+                runCatching { Foundation.toStringViaUTF8(id) }.getOrNull()
+            }
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    private fun isImagePasteboardType(type: String): Boolean {
+        val normalized = type.lowercase(Locale.ROOT)
+        return normalized.contains("image") ||
+            normalized.contains("png") ||
+            normalized.contains("tiff") ||
+            normalized.contains("jpeg") ||
+            normalized.contains("jpg") ||
+            normalized.contains("pict")
+    }
+
+    private fun macPasteboardImageBytes(): ByteArray? {
+        if (!System.getProperty("os.name").contains("mac", ignoreCase = true)) return null
+        return try {
+            val pasteboard = Foundation.invoke("NSPasteboard", "generalPasteboard")
+            if (Foundation.isNil(pasteboard)) return null
+
+            pasteboardImageObjects(pasteboard)?.let { return it }
+
+            val types = listOf(
+                "public.png",
+                "public.tiff",
+                "public.jpeg",
+                "com.apple.tiff",
+                "com.apple.pict",
+                "Apple TIFF pasteboard type",
+                "NeXT TIFF v4.0 pasteboard type",
+                "NSPasteboardTypePNG",
+                "NSPasteboardTypeTIFF",
+                "NSPasteboardTypeJPEG",
+            )
+            types.firstNotNullOfOrNull { type ->
+                pasteboardDataForType(pasteboard, type)?.let(::imageBytesToPngBytes)
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun pasteboardImageObjects(pasteboard: ID): ByteArray? {
+        val imageClass = Foundation.getObjcClass("NSImage")
+        if (Foundation.isNil(imageClass)) return null
+        val classes = Foundation.fillArray(arrayOf(imageClass))
+        val images = Foundation.safeInvoke(pasteboard, "readObjectsForClasses:options:", classes, ID.NIL)
+        if (Foundation.isNil(images)) return null
+
+        val list = Foundation.NSArray(images)
+        for (index in 0 until list.count()) {
+            val image = list.at(index)
+            if (Foundation.isNil(image)) continue
+            val data = Foundation.safeInvoke(image, "TIFFRepresentation")
+            if (Foundation.isNil(data)) continue
+            val bytes = Foundation.NSData(data).bytes()
+            imageBytesToPngBytes(bytes)?.let { return it }
+        }
+        return null
+    }
+
+    private fun pasteboardDataForType(pasteboard: ID, type: String): ByteArray? {
+        val data = Foundation.safeInvoke(pasteboard, "dataForType:", Foundation.nsString(type))
+        if (Foundation.isNil(data)) return null
+        return Foundation.NSData(data).bytes().takeIf { it.isNotEmpty() }
+    }
+
+    private fun imageBytesFromTransferable(transferable: Transferable?): ByteArray? {
+        if (transferable == null) return null
+
+        if (transferable.isDataFlavorSupported(DataFlavor.imageFlavor)) {
+            val image = try {
+                transferable.getTransferData(DataFlavor.imageFlavor) as? Image
+            } catch (_: Exception) {
+                null
+            }
+            if (image != null) return imageToPngBytes(image)
+        }
+
+        if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+            val files = try {
+                @Suppress("UNCHECKED_CAST")
+                transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<File>
+            } catch (_: Exception) {
+                null
+            }
+            files.orEmpty().firstNotNullOfOrNull(::imageFileToPngBytes)?.let { return it }
+        }
+
+        transferable.transferDataFlavors.forEach { flavor ->
+            if (!flavor.looksLikeImageFlavor()) return@forEach
+            val data = try {
+                transferable.getTransferData(flavor)
+            } catch (_: Exception) {
+                null
+            }
+            dataToPngBytes(data)?.let { return it }
+        }
+
+        return null
+    }
+
+    private fun DataFlavor.looksLikeImageFlavor(): Boolean {
+        if (Image::class.java.isAssignableFrom(representationClass)) return true
+        val mime = mimeType.lowercase(Locale.ROOT)
+        val name = humanPresentableName.lowercase(Locale.ROOT)
+        return primaryType.equals("image", ignoreCase = true) ||
+            mime.contains("image/") ||
+            mime.contains("public.png") ||
+            mime.contains("public.tiff") ||
+            mime.contains("public.jpeg") ||
+            name.contains("png") ||
+            name.contains("tiff") ||
+            name.contains("jpeg") ||
+            name.contains("jpg")
+    }
+
+    private fun dataToPngBytes(data: Any?): ByteArray? =
+        when (data) {
+            is Image -> imageToPngBytes(data)
+            is ByteArray -> imageBytesToPngBytes(data)
+            is ByteBuffer -> imageBytesToPngBytes(data.toByteArray())
+            is InputStream -> data.use { imageBytesToPngBytes(it.readBytes()) }
+            is File -> imageFileToPngBytes(data)
+            is List<*> -> data.filterIsInstance<File>().firstNotNullOfOrNull(::imageFileToPngBytes)
+            else -> null
+        }
+
+    private fun ByteBuffer.toByteArray(): ByteArray {
+        val duplicate = duplicate()
+        val bytes = ByteArray(duplicate.remaining())
+        duplicate.get(bytes)
+        return bytes
+    }
+
+    private fun imageFileToPngBytes(file: File): ByteArray? {
+        if (!file.isFile) return null
+        return try {
+            imageBytesToPngBytes(file.readBytes())
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun imageBytesToPngBytes(bytes: ByteArray): ByteArray? {
+        if (bytes.isEmpty()) return null
+        val image = try {
+            ImageIO.read(ByteArrayInputStream(bytes))
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        return bufferedImageToPngBytes(image)
+    }
+
+    private fun attachClipboardImage(bytes: ByteArray) {
+        if (bytes.isEmpty()) return
+        val attachedBytes = pendingImages.sumOf { it.byteSize }
+        if (attachedBytes + bytes.size > MAX_ATTACHED_IMAGE_BYTES) {
+            Messages.showWarningDialog(
+                project,
+                "Attached images are too large. Paste image(s) totaling under $MAX_ATTACHED_IMAGE_MB MB.",
+                "AtomCode",
+            )
+            return
+        }
+
+        val index = pendingImages.count { it.path.startsWith(CLIPBOARD_IMAGE_PATH_PREFIX) } + 1
+        pendingImages += PendingImageAttachment(
+            path = "$CLIPBOARD_IMAGE_PATH_PREFIX${UUID.randomUUID()}.png",
+            displayName = "Clipboard image $index.png",
+            mediaType = "image/png",
+            byteSize = bytes.size,
+            data = Base64.getEncoder().encodeToString(bytes),
+        )
+        rebuildContext()
+        focusInput()
+    }
+
+    private fun imageToPngBytes(image: Image): ByteArray? {
+        val icon = ImageIcon(image)
+        val width = icon.iconWidth
+        val height = icon.iconHeight
+        if (width <= 0 || height <= 0) return null
+
+        val buffered = BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)
+        val graphics = buffered.createGraphics()
+        try {
+            graphics.drawImage(icon.image, 0, 0, null)
+        } finally {
+            graphics.dispose()
+        }
+
+        return bufferedImageToPngBytes(buffered)
+    }
+
+    private fun bufferedImageToPngBytes(buffered: BufferedImage): ByteArray? =
+        ByteArrayOutputStream().use { out ->
+            if (!ImageIO.write(buffered, "png", out)) return null
+            out.toByteArray()
+        }
+
     private fun imageMediaType(file: VirtualFile): String? =
         when (file.extension?.lowercase(Locale.ROOT)) {
             "png" -> "image/png"
@@ -1210,6 +1521,7 @@ private data class QueuedPrompt(
     val prompt: String,
     val message: String,
     val contextNames: List<String>,
+    val attachments: List<MessageAttachmentView>,
     val images: List<ImageInput>,
 )
 
@@ -1222,6 +1534,14 @@ private data class PendingImageAttachment(
 ) {
     fun toImageInput(): ImageInput = ImageInput(mediaType = mediaType, data = data)
 
+    fun toMessageAttachmentView(): MessageAttachmentView =
+        MessageAttachmentView(
+            displayName = displayName,
+            path = path,
+            imageMediaType = mediaType,
+            imageData = data,
+        )
+
     fun toContextItem(): ChatContextItem =
         ChatContextItem(
             path = path,
@@ -1231,12 +1551,15 @@ private data class PendingImageAttachment(
             selection = null,
             startLine = null,
             endLine = null,
+            imageMediaType = mediaType,
+            imageData = data,
         )
 }
 
 data class ChatContextItem(
     val path: String, val displayName: String, val language: String,
     val content: String, val selection: String?, val startLine: Int?, val endLine: Int?,
+    val imageMediaType: String? = null, val imageData: String? = null,
 )
 
 internal data class HistoryUserMessage(

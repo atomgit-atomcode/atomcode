@@ -1,13 +1,29 @@
 package com.atomcode.jetbrains.ui.input
 
 import com.atomcode.jetbrains.ui.ChatContextItem
+import com.intellij.ide.PasteProvider
+import com.intellij.openapi.actionSystem.DataContext
+import com.intellij.openapi.actionSystem.DataProvider
+import com.intellij.openapi.actionSystem.PlatformDataKeys
 import com.intellij.ui.JBColor
+import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
 import java.awt.CardLayout
 import java.awt.Component
 import java.awt.Cursor
 import java.awt.Dimension
+import java.awt.Graphics
+import java.awt.Graphics2D
 import java.awt.Insets
+import java.awt.KeyboardFocusManager
+import java.awt.RenderingHints
+import java.awt.Toolkit
+import java.awt.Image
+import java.awt.datatransfer.DataFlavor
+import java.awt.datatransfer.Transferable
+import java.awt.event.InputEvent
+import java.awt.event.KeyEvent
+import java.awt.KeyEventDispatcher
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.BoxLayout
@@ -23,7 +39,10 @@ import javax.swing.JPopupMenu
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
 import javax.swing.KeyStroke
+import javax.swing.Action
+import javax.swing.TransferHandler
 import javax.swing.SwingUtilities
+import javax.swing.text.DefaultEditorKit
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
@@ -38,14 +57,26 @@ class InputPanel(
     private val onClearContext: () -> Unit,
     private val onRemoveContext: (ChatContextItem) -> Unit,
     private val onModelSelect: () -> Unit,
-) : JPanel(BorderLayout()) {
+    private val onPasteFromClipboard: (Transferable?) -> Boolean,
+) : JPanel(BorderLayout()), DataProvider, PasteProvider {
 
     private var slashTriggerConsumed = false
     private var commandPopup: JPopupMenu? = null
     private var initialized = false
     private val toolButtons = mutableListOf<JButton>()
+    private val compactToolButtons = mutableSetOf<JButton>()
+    private var defaultPasteAction: Action? = null
+    private var pasteDispatcherRegistered = false
+    private val menuShortcutMask = Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx
+    private val pasteKeyDispatcher = KeyEventDispatcher { event ->
+        if (event.id != KeyEvent.KEY_PRESSED || event.keyCode != KeyEvent.VK_V) return@KeyEventDispatcher false
+        if (event.modifiersEx and menuShortcutMask != menuShortcutMask) return@KeyEventDispatcher false
+        val focusOwner = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusOwner ?: return@KeyEventDispatcher false
+        if (!SwingUtilities.isDescendingFrom(focusOwner, inputArea)) return@KeyEventDispatcher false
+        onPasteFromClipboard(null)
+    }
 
-    private val inputArea = JTextArea().apply {
+    private val inputArea = PasteAwareTextArea().apply {
         rows = 3
         lineWrap = true
         wrapStyleWord = true
@@ -87,10 +118,6 @@ class InputPanel(
         })
     }
 
-    private val shortcutLabel = JLabel("Enter 发送 · Shift+Enter 换行").apply {
-        font = font.deriveFont(font.size2D - 2f)
-    }
-
     private val actionCards = CardLayout()
     private val actionPanel = JPanel(actionCards).apply {
         isOpaque = false
@@ -101,11 +128,12 @@ class InputPanel(
 
     init {
         isOpaque = true
+        installTransferHandler()
 
         inputArea.document.addDocumentListener(object : DocumentListener {
-            override fun insertUpdate(event: DocumentEvent) = handleSlashTrigger()
-            override fun removeUpdate(event: DocumentEvent) = handleSlashTrigger()
-            override fun changedUpdate(event: DocumentEvent) = handleSlashTrigger()
+            override fun insertUpdate(event: DocumentEvent) = handleInputChanged()
+            override fun removeUpdate(event: DocumentEvent) = handleInputChanged()
+            override fun changedUpdate(event: DocumentEvent) = handleInputChanged()
         })
 
         val inputScroll = JScrollPane(inputArea).apply {
@@ -118,8 +146,8 @@ class InputPanel(
             verticalScrollBarPolicy = JScrollPane.VERTICAL_SCROLLBAR_NEVER
         }
 
-        val attachButton = makeToolButton("📎 附件", onAttach)
-        val commandButton = makeToolButton("/ 命令") { showSlashCommandsFromButton() }
+        val attachButton = makeCompactToolButton("📎", "附件", onAttach)
+        val commandButton = makeCompactToolButton("/", "命令") { showSlashCommandsFromButton() }
 
         // 工具栏与输入框放在同一个 composer 容器内，状态切换时布局保持稳定。
         val toolbar = object : JPanel(null) {
@@ -128,7 +156,6 @@ class InputPanel(
                     this,
                     attachButton,
                     commandButton,
-                    shortcutLabel,
                     tokenLabel,
                     modelLabel,
                     actionPanel,
@@ -141,7 +168,6 @@ class InputPanel(
             minimumSize = Dimension(0, 36)
             add(attachButton)
             add(commandButton)
-            add(shortcutLabel)
             add(tokenLabel)
             add(modelLabel)
             add(actionPanel)
@@ -185,6 +211,118 @@ class InputPanel(
             }
         }
     }
+
+    override fun addNotify() {
+        super.addNotify()
+        if (!pasteDispatcherRegistered) {
+            KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(pasteKeyDispatcher)
+            pasteDispatcherRegistered = true
+        }
+    }
+
+    override fun removeNotify() {
+        if (pasteDispatcherRegistered) {
+            KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(pasteKeyDispatcher)
+            pasteDispatcherRegistered = false
+        }
+        super.removeNotify()
+    }
+
+    override fun getData(dataId: String): Any? =
+        if (PlatformDataKeys.PASTE_PROVIDER.`is`(dataId)) this else null
+
+    override fun performPaste(dataContext: DataContext) {
+        if (!onPasteFromClipboard(null)) {
+            performDefaultPaste()
+        }
+    }
+
+    override fun isPastePossible(dataContext: DataContext): Boolean = inputArea.isEnabled
+
+    override fun isPasteEnabled(dataContext: DataContext): Boolean = inputArea.isEnabled
+
+    private inner class PasteAwareTextArea : JTextArea(), DataProvider, PasteProvider {
+        var placeholderText: String = "Enter 发送 · Shift+Enter 换行"
+
+        override fun paintComponent(graphics: Graphics) {
+            super.paintComponent(graphics)
+            if (text.isNotEmpty() || placeholderText.isBlank()) return
+
+            val graphics2D = graphics.create() as Graphics2D
+            try {
+                graphics2D.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
+                val baseFont = UIUtil.getLabelFont().deriveFont(font.size2D)
+                val insets = insets
+                val usableWidth = (width - insets.left - insets.right).coerceAtLeast(0)
+                val x = insets.left
+                var y = insets.top
+
+                graphics2D.font = baseFont
+                val primary = "输入消息"
+                val primaryMetrics = graphics2D.fontMetrics
+                y += primaryMetrics.ascent
+                graphics2D.color = PLACEHOLDER_FG
+                graphics2D.drawString(primary, x, y)
+
+                graphics2D.font = baseFont.deriveFont(baseFont.size2D - 1f)
+                val secondaryMetrics = graphics2D.fontMetrics
+                val secondary = "  $placeholderText"
+                val secondaryX = x + primaryMetrics.stringWidth(primary) + 6
+                if (secondaryX + secondaryMetrics.stringWidth(secondary) <= insets.left + usableWidth) {
+                    graphics2D.color = PLACEHOLDER_SECONDARY_FG
+                    graphics2D.drawString(secondary, secondaryX, y)
+                }
+            } finally {
+                graphics2D.dispose()
+            }
+        }
+
+        override fun paste() {
+            if (!onPasteFromClipboard(null)) {
+                super.paste()
+            }
+        }
+
+        override fun getData(dataId: String): Any? =
+            if (PlatformDataKeys.PASTE_PROVIDER.`is`(dataId)) this else null
+
+        override fun performPaste(dataContext: DataContext) {
+            if (!onPasteFromClipboard(null)) {
+                performDefaultPaste()
+            }
+        }
+
+        override fun isPastePossible(dataContext: DataContext): Boolean = isEnabled
+
+        override fun isPasteEnabled(dataContext: DataContext): Boolean = isEnabled
+    }
+
+    private fun installTransferHandler() {
+        val defaultTransferHandler = inputArea.transferHandler
+        inputArea.transferHandler = object : TransferHandler() {
+            override fun canImport(support: TransferSupport): Boolean =
+                support.hasImageFlavor() || defaultTransferHandler?.canImport(support) == true
+
+            override fun importData(support: TransferSupport): Boolean {
+                if (support.hasImageFlavor()) {
+                    onPasteFromClipboard(support.transferable)
+                    return true
+                }
+                return defaultTransferHandler?.importData(support) == true
+            }
+        }
+    }
+
+    private fun TransferHandler.TransferSupport.hasImageFlavor(): Boolean =
+        dataFlavors.any { flavor ->
+            Image::class.java.isAssignableFrom(flavor.representationClass) ||
+                flavor.primaryType.equals("image", ignoreCase = true) ||
+                flavor.mimeType.lowercase().contains("image/") ||
+                flavor.mimeType.lowercase().contains("public.png") ||
+                flavor.mimeType.lowercase().contains("public.tiff") ||
+                flavor.mimeType.lowercase().contains("public.jpeg") ||
+                flavor == DataFlavor.javaFileListFlavor
+        }
 
     fun getInputText(): String = inputArea.text
 
@@ -238,12 +376,32 @@ class InputPanel(
         val ctrlEnterAction = "atomcode-input-ctrl-enter"
         val shiftEnterAction = "atomcode-input-shift-enter"
         val tabAction = "atomcode-command-tab"
+        val pasteAction = "atomcode-input-paste"
+        defaultPasteAction = inputArea.actionMap.get(DefaultEditorKit.pasteAction)
 
-        shortcutLabel.text = if (sendWithCtrlEnter) {
+        inputArea.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_V, menuShortcutMask), pasteAction)
+        inputArea.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_V, InputEvent.CTRL_DOWN_MASK), pasteAction)
+        inputArea.actionMap.put(DefaultEditorKit.pasteAction, object : AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                if (!onPasteFromClipboard(null)) {
+                    performDefaultPaste(e)
+                }
+            }
+        })
+        inputArea.actionMap.put(pasteAction, object : AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                if (!onPasteFromClipboard(null)) {
+                    performDefaultPaste(e)
+                }
+            }
+        })
+
+        inputArea.placeholderText = if (sendWithCtrlEnter) {
             "Ctrl+Enter 发送 · Enter 换行"
         } else {
             "Enter 发送 · Shift+Enter 换行"
         }
+        inputArea.repaint()
 
         inputArea.inputMap.put(KeyStroke.getKeyStroke("UP"), "atomcode-command-up")
         inputArea.actionMap.put("atomcode-command-up", object : AbstractAction() {
@@ -314,6 +472,15 @@ class InputPanel(
         inputArea.replaceSelection("\n")
     }
 
+    private fun performDefaultPaste(event: java.awt.event.ActionEvent? = null) {
+        val action = defaultPasteAction
+        if (action != null) {
+            action.actionPerformed(event)
+        } else {
+            inputArea.paste()
+        }
+    }
+
     private fun showSlashCommandsFromButton() {
         if (commandPrefix() == null) {
             slashTriggerConsumed = true
@@ -336,6 +503,11 @@ class InputPanel(
         commandPopup?.isVisible = false
         MenuSelectionManager.defaultManager().clearSelectedPath()
         inputArea.requestFocusInWindow()
+    }
+
+    private fun handleInputChanged() {
+        inputArea.repaint()
+        handleSlashTrigger()
     }
 
     private fun handleSlashTrigger() {
@@ -436,7 +608,6 @@ class InputPanel(
         toolbar: JPanel,
         attach: Component,
         command: Component,
-        shortcut: Component,
         token: Component,
         model: Component,
         action: Component,
@@ -449,7 +620,7 @@ class InputPanel(
         val height = (toolbar.height - insets.top - insets.bottom).coerceAtLeast(0)
         val gap = 8
 
-        listOf(attach, command, shortcut, token, model, action).forEach { it.isVisible = false }
+        listOf(attach, command, token, model, action).forEach { it.isVisible = false }
 
         val actionSize = action.preferredSize
         val actionWidth = actionSize.width.coerceAtMost((right - left).coerceAtLeast(0))
@@ -482,7 +653,6 @@ class InputPanel(
         }
         placeRight(model)
         placeRight(token)
-        placeRight(shortcut)
     }
 
     private fun makeToolButton(text: String, action: () -> Unit): JButton =
@@ -508,6 +678,15 @@ class InputPanel(
             })
         }
 
+    private fun makeCompactToolButton(text: String, tooltip: String, action: () -> Unit): JButton =
+        makeToolButton(text, action).apply {
+            toolTipText = tooltip
+            accessibleContext.accessibleName = tooltip
+            preferredSize = Dimension(38, 30)
+            minimumSize = Dimension(38, 30)
+            compactToolButtons += this
+        }
+
     private fun applyTheme() {
         background = PANEL_BG
         inputArea.background = INPUT_BG
@@ -517,7 +696,7 @@ class InputPanel(
         toolButtons.forEach { button ->
             button.foreground = CLICKABLE_FG
             button.background = CLICKABLE_BG
-            button.border = clickableBorder(horizontal = 12)
+            button.border = clickableBorder(horizontal = if (button in compactToolButtons) 8 else 12)
         }
 
         sendButton.foreground = SEND_FG
@@ -525,7 +704,6 @@ class InputPanel(
         sendButton.border = clickableBorder(horizontal = 12)
 
         tokenLabel.foreground = TOKEN_FG
-        shortcutLabel.foreground = SECONDARY_FG
         modelLabel.foreground = MODEL_FG
         modelLabel.border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
         stopButton.foreground = STOP_FG
@@ -551,6 +729,8 @@ class InputPanel(
         private val INPUT_FG = JBColor(0x333333, 0xD4D4D4)
         private val COMPOSER_BORDER = JBColor(0xC9C9C9, 0x454545)
         private val SECONDARY_FG = JBColor(0x5F6368, 0xA0A0A0)
+        private val PLACEHOLDER_FG = JBColor(0x7A7F86, 0x8F949B)
+        private val PLACEHOLDER_SECONDARY_FG = JBColor(0x9AA0A7, 0x70757C)
         private val TOKEN_FG = JBColor(0x999999, 0x666666)
         private val CLICKABLE_BG = JBColor(0xF7F7F7, 0x333333)
         private val CLICKABLE_HOVER_BG = JBColor(0xECECEC, 0x3D3D3D)

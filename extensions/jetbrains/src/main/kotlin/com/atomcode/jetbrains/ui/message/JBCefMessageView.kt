@@ -129,8 +129,12 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 
     // ── Public API ──
 
-    fun addUserMessage(text: String, contextSummary: List<String> = emptyList()) {
-        sendRawJs("addUserMessage(${gson.toJson(text)},${gson.toJson(contextSummary)})")
+    fun addUserMessage(
+        text: String,
+        contextSummary: List<String> = emptyList(),
+        attachments: List<MessageAttachmentView> = contextSummary.map { MessageAttachmentView(displayName = it) },
+    ) {
+        sendRawJs("addUserMessage(${gson.toJson(text)},${gson.toJson(attachments)})")
     }
     fun beginAssistantTurn()                    { sendJs("beginAssistantTurn") }
     fun addAssistantMessage(text: String)       { sendJs("addAssistantMessage", text) }
@@ -259,6 +263,14 @@ class JBCefMessageView : JPanel(BorderLayout()) {
 	.um .u-file-copy{min-width:0;line-height:1.25}
 	.um .u-file-name{font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 	.um .u-file-path{margin-top:2px;color:${if (dark) "#a9c3d5" else "#55768c"};font-size:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+	.um .u-image{display:block;width:100%;padding:0;border:0;border-radius:8px;overflow:hidden;background:${if (dark) "rgba(255,255,255,.055)" else "rgba(255,255,255,.55)"};color:inherit;text-align:left;cursor:pointer}
+	.um .u-image img{display:block;max-width:220px;max-height:150px;width:auto;height:auto;object-fit:contain;background:${if (dark) "rgba(0,0,0,.18)" else "rgba(255,255,255,.35)"}}
+	.um .u-image-name{display:block;padding:5px 7px;font-size:10px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+	.img-modal{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;padding:28px;background:rgba(0,0,0,.68)}
+	.img-modal button{position:absolute;inset:0;border:0;background:transparent;cursor:zoom-out}
+	.img-modal figure{position:relative;z-index:1;max-width:94vw;max-height:92vh;margin:0;padding:10px;border-radius:10px;background:${if (dark) "#202326" else "#f8fbfd"};box-shadow:0 18px 50px rgba(0,0,0,.35)}
+	.img-modal img{display:block;max-width:calc(94vw - 20px);max-height:calc(92vh - 46px);object-fit:contain}
+	.img-modal figcaption{margin-top:7px;color:${if (dark) "#cfd4da" else "#3d4650"};font-size:11px;text-align:center;max-width:calc(94vw - 20px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 	.am{display:flex;flex-direction:column;align-items:stretch;min-width:0}
 	.am .av{display:flex;align-items:center;gap:7px;color:$vfg;font-size:11px;font-weight:600;letter-spacing:.01em;margin-bottom:6px}
 	.am .av:before{content:'A';display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:5px;background:${if (dark) "#293424" else "#edf5e9"};color:$vfg;font-size:10px;font-weight:700}
@@ -361,8 +373,13 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 	}
 	function fileParts(p){var n=String(p||'').replace(/\\/g,'/'),i=n.lastIndexOf('/');return {name:i>=0?n.substring(i+1):n,path:i>=0?n.substring(0,i):''}}
 	function fileType(n){var i=String(n||'').lastIndexOf('.');return i>=0?String(n).substring(i+1,i+5):'file'}
-	function attachmentHtml(items){if(!items||!items.length)return '';var rows=items.map(function(x){var p=fileParts(x);return '<div class="u-file" title="'+h(x)+'"><span class="u-file-icon">'+h(fileType(p.name))+'</span><span class="u-file-copy"><div class="u-file-name">'+h(p.name||x)+'</div><div class="u-file-path">'+h(p.path||'Attached file')+'</div></span></div>'}).join('');return '<div class="u-files">'+rows+'</div>'}
-		function addUserMessage(t,a){var d=document.createElement('div');d.className='um';d.innerHTML='<div class="u-card"><div class="u-text">'+h(t)+'</div>'+attachmentHtml(a)+'</div>';m.appendChild(d);last=null;sd(true)}
+	function normalizeAttachment(x){return typeof x==='string'?{displayName:x}:x||{}}
+	function isImageAttachment(x){return x&&x.imageData&&String(x.imageMediaType||'').indexOf('image/')===0}
+	function imageSrc(x){return 'data:'+String(x.imageMediaType||'image/png')+';base64,'+String(x.imageData||'')}
+	function attachmentHtml(items){if(!items||!items.length)return '';var rows=items.map(function(raw){var x=normalizeAttachment(raw),label=x.displayName||x.path||'',p=fileParts(label);if(isImageAttachment(x)){var src=imageSrc(x);return '<button class="u-image" data-src="'+h(src)+'" data-name="'+h(p.name||label||'Image')+'" title="'+h(label)+'"><img src="'+h(src)+'" alt="'+h(p.name||label||'Image')+'"><span class="u-image-name">'+h(p.name||label||'Image')+'</span></button>'}return '<div class="u-file" title="'+h(label)+'"><span class="u-file-icon">'+h(fileType(p.name))+'</span><span class="u-file-copy"><div class="u-file-name">'+h(p.name||label)+'</div><div class="u-file-path">'+h(p.path||'Attached file')+'</div></span></div>'}).join('');return '<div class="u-files">'+rows+'</div>'}
+	function showImagePreview(src,name){var old=document.querySelector('.img-modal');if(old)old.remove();var o=document.createElement('div');o.className='img-modal';o.innerHTML='<button aria-label="Close"></button><figure><img src="'+h(src)+'" alt="'+h(name||'Image')+'"><figcaption>'+h(name||'Image')+'</figcaption></figure>';o.querySelector('button').onclick=function(){o.remove()};o.onclick=function(e){if(e.target===o)o.remove()};document.addEventListener('keydown',function esc(e){if(e.key==='Escape'){o.remove();document.removeEventListener('keydown',esc)}});document.body.appendChild(o)}
+	function bindImagePreviews(root){var imgs=root.querySelectorAll('.u-image');Array.prototype.forEach.call(imgs,function(btn){btn.onclick=function(){showImagePreview(btn.getAttribute('data-src')||'',btn.getAttribute('data-name')||'Image')}})}
+		function addUserMessage(t,a){var d=document.createElement('div');d.className='um';d.innerHTML='<div class="u-card"><div class="u-text">'+h(t)+'</div>'+attachmentHtml(a)+'</div>';bindImagePreviews(d);m.appendChild(d);last=null;sd(true)}
 		function beginAssistantTurn(){active=buildAsst('');last=active;m.appendChild(active);cv=false;sd()}
 		function currentAssistant(){return active&&active.parentNode?active:null}
 		function ensureAssistant(){var a=currentAssistant();if(a){last=a;return a}beginAssistantTurn();return active}
@@ -403,3 +420,10 @@ function addQueuedMessage(t){var d=document.createElement('div');d.className='qm
     private fun loadWebScript(path: String): String =
         JBCefMessageView::class.java.getResource(path)?.readText().orEmpty()
 }
+
+data class MessageAttachmentView(
+    val displayName: String,
+    val path: String? = null,
+    val imageMediaType: String? = null,
+    val imageData: String? = null,
+)

@@ -3,14 +3,26 @@ package com.atomcode.jetbrains.ui.input
 import com.atomcode.jetbrains.ui.ChatContextItem
 import com.intellij.ui.JBColor
 import java.awt.BorderLayout
+import java.awt.Component
 import java.awt.Cursor
 import java.awt.Dimension
+import java.awt.Dialog
+import java.awt.Image
+import java.io.ByteArrayInputStream
+import java.util.Base64
+import javax.imageio.ImageIO
 import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
+import javax.swing.ImageIcon
 import javax.swing.JButton
+import javax.swing.JDialog
 import javax.swing.JLabel
 import javax.swing.JPanel
+import javax.swing.JScrollPane
+import javax.swing.SwingConstants
+import javax.swing.SwingUtilities
+import kotlin.math.roundToInt
 
 /** Displays files attached to the next prompt as compact, path-aware rows. */
 class ContextChipsPanel(
@@ -73,15 +85,34 @@ class ContextChipsPanel(
             "  ·  L$start–$end"
         }.orEmpty()
 
-        add(JLabel(item.language.uppercase().take(4).ifBlank { "FILE" }).apply {
-            horizontalAlignment = JLabel.CENTER
-            font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 3f)
-            foreground = TYPE_FG
-            background = TYPE_BG
-            isOpaque = true
-            border = BorderFactory.createEmptyBorder(3, 5, 3, 5)
-            preferredSize = Dimension(38, 24)
-        }, BorderLayout.WEST)
+        val imageIcon = decodeImageIcon(item)
+        if (imageIcon != null) {
+            maximumSize = Dimension(Int.MAX_VALUE, 83)
+            val previewLabel = JLabel(scaledIcon(imageIcon, 76, 58)).apply {
+                horizontalAlignment = SwingConstants.CENTER
+                verticalAlignment = SwingConstants.CENTER
+                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                toolTipText = "查看大图"
+                border = BorderFactory.createLineBorder(ATTACHMENT_BORDER, 1, true)
+                preferredSize = Dimension(82, 62)
+                addMouseListener(object : java.awt.event.MouseAdapter() {
+                    override fun mouseClicked(event: java.awt.event.MouseEvent) {
+                        showImagePreview(item, event.component)
+                    }
+                })
+            }
+            add(previewLabel, BorderLayout.WEST)
+        } else {
+            add(JLabel(item.language.uppercase().take(4).ifBlank { "FILE" }).apply {
+                horizontalAlignment = JLabel.CENTER
+                font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 3f)
+                foreground = TYPE_FG
+                background = TYPE_BG
+                isOpaque = true
+                border = BorderFactory.createEmptyBorder(3, 5, 3, 5)
+                preferredSize = Dimension(38, 24)
+            }, BorderLayout.WEST)
+        }
 
         add(JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -115,6 +146,49 @@ class ContextChipsPanel(
         foreground = ACTION_FG
         margin = java.awt.Insets(0, 4, 0, 4)
         addActionListener { action() }
+    }
+
+    private fun decodeImageIcon(item: ChatContextItem): ImageIcon? {
+        val mediaType = item.imageMediaType ?: return null
+        val data = item.imageData ?: return null
+        if (!mediaType.startsWith("image/")) return null
+        return runCatching {
+            val bytes = Base64.getDecoder().decode(data)
+            ImageIcon(ImageIO.read(ByteArrayInputStream(bytes)) ?: return null)
+        }.getOrNull()
+    }
+
+    private fun scaledIcon(icon: ImageIcon, maxWidth: Int, maxHeight: Int): ImageIcon {
+        val width = icon.iconWidth.takeIf { it > 0 } ?: return icon
+        val height = icon.iconHeight.takeIf { it > 0 } ?: return icon
+        val scale = minOf(maxWidth.toDouble() / width, maxHeight.toDouble() / height, 1.0)
+        val scaledWidth = (width * scale).roundToInt().coerceAtLeast(1)
+        val scaledHeight = (height * scale).roundToInt().coerceAtLeast(1)
+        return ImageIcon(icon.image.getScaledInstance(scaledWidth, scaledHeight, Image.SCALE_SMOOTH))
+    }
+
+    private fun showImagePreview(item: ChatContextItem, source: Component) {
+        val icon = decodeImageIcon(item) ?: return
+        val owner = SwingUtilities.getWindowAncestor(source)
+        val dialog = JDialog(owner, item.displayName, Dialog.ModalityType.MODELESS)
+        val bounds = source.graphicsConfiguration?.bounds
+        val maxWidth = minOf(980, (bounds?.width ?: 1100) - 160).coerceAtLeast(360)
+        val maxHeight = minOf(760, (bounds?.height ?: 860) - 180).coerceAtLeast(260)
+        dialog.contentPane = JScrollPane(JLabel(scaledIcon(icon, maxWidth, maxHeight)).apply {
+            horizontalAlignment = SwingConstants.CENTER
+            verticalAlignment = SwingConstants.CENTER
+            border = BorderFactory.createEmptyBorder(10, 10, 10, 10)
+        }).apply {
+            border = BorderFactory.createEmptyBorder()
+            preferredSize = Dimension(
+                minOf(maxWidth + 22, icon.iconWidth + 22).coerceAtLeast(360),
+                minOf(maxHeight + 22, icon.iconHeight + 22).coerceAtLeast(260),
+            )
+        }
+        dialog.defaultCloseOperation = JDialog.DISPOSE_ON_CLOSE
+        dialog.pack()
+        dialog.setLocationRelativeTo(source)
+        dialog.isVisible = true
     }
 
     companion object {
