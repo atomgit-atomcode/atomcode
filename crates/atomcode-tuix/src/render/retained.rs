@@ -73,7 +73,16 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
         format!("{} tok", used_label)
     } else {
         let window_label = format_tok_count(window, /*round_clean=*/ true);
-        format!("{}/{} tok", used_label, window_label)
+        // Surface the utilization percentage once the prompt approaches (>=90%)
+        // or exceeds the window, so an over-window request (e.g. a 339k prompt
+        // into a 200k window) is visible instead of silent. Below the near-limit
+        // threshold the counter stays terse, keeping the common case clean.
+        if used * 10 >= window * 9 {
+            let pct = (used as f64 / window as f64 * 100.0).round() as u64;
+            format!("{}/{} tok ({}%)", used_label, window_label, pct)
+        } else {
+            format!("{}/{} tok", used_label, window_label)
+        }
     }
 }
 
@@ -5032,8 +5041,28 @@ mod tests {
     fn ctx_usage_used_above_one_million_uses_m_unit() {
         // Long-running sessions on a 1m window can park `used` above 1M;
         // keep one decimal so the counter still moves visibly turn-to-turn.
-        assert_eq!(format_ctx_usage(1_200_000, 1_000_000), "1.2m/1m tok");
+        // 1.2m of a 1m window is 120% — over the limit, so the percentage shows.
+        assert_eq!(format_ctx_usage(1_200_000, 1_000_000), "1.2m/1m tok (120%)");
         assert_eq!(format_ctx_usage(2_500_000, 0), "2.5m tok");
+    }
+
+    #[test]
+    fn ctx_usage_surfaces_pct_at_and_over_window() {
+        // The over-window case (e.g. a 339k prompt into a 200k window) must be
+        // visible, not silent — the percentage is the "near/over limit" signal.
+        assert_eq!(format_ctx_usage(339_380, 200_000), "339.4k/200k tok (170%)");
+    }
+
+    #[test]
+    fn ctx_usage_pct_appears_at_ninety_percent_threshold() {
+        // 90% is the inclusive near-limit threshold.
+        assert_eq!(format_ctx_usage(180_000, 200_000), "180.0k/200k tok (90%)");
+    }
+
+    #[test]
+    fn ctx_usage_terse_below_near_limit() {
+        // Just under 90% stays terse (no percentage) — common case unchanged.
+        assert_eq!(format_ctx_usage(179_000, 200_000), "179.0k/200k tok");
     }
 
     fn caps_with_color() -> TerminalCaps {
