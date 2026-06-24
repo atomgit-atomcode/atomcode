@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use atomcode_capabilities::goal::{EvalOutcome, GoalEvaluator, GoalResult, GoalState};
 use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
+use atomcode_capabilities::vision;
 use atomcode_coding::{
     assemble, prepare_with_plugin_hooks, CodingAgentConfig, CodingParts, LiveTools, PrepareOptions,
     ProviderFactory, SessionMode, TurnStats,
@@ -650,6 +651,30 @@ impl NativeRuntime {
         }
     }
 
+    /// Vision preprocessing failed (no VL provider / build error / VL call error): keep
+    /// the original images so the user can retry without re-pasting, append a
+    /// `[图片识别失败]` placeholder to the message, warn, and forward NO images (a
+    /// non-vision adapter would 400 on raw image data). Returns the empty kernel-image vec
+    /// the SendMessage path sends.
+    fn vision_fail(
+        &self,
+        text: &mut String,
+        core_images: Vec<atomcode_core::conversation::message::ImagePart>,
+        markers: Vec<usize>,
+        reason: String,
+    ) -> Vec<atomcode_kernel::message::ImageContent> {
+        *text = if text.is_empty() {
+            "[图片识别失败]".to_string()
+        } else {
+            format!("{text}\n\n[图片识别失败]")
+        };
+        self.emit(UiEvent::RestorePendingImages { images: core_images, markers });
+        self.emit(UiEvent::Warning(format!(
+            "VL 预处理失败：{reason} · 图片已自动保留，可直接重试"
+        )));
+        Vec::new()
+    }
+
     fn answer_approval(&mut self, resp: ApprovalResponse) {
         if let Some((id, _tool)) = self.pending_approval.take() {
             let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
@@ -662,7 +687,7 @@ impl NativeRuntime {
     /// Returns `true` to break the run loop (Shutdown).
     async fn on_command(&mut self, cmd: CoreCmd) -> bool {
         match cmd {
-            CoreCmd::SendMessage { text, images, .. } => {
+            CoreCmd::SendMessage { text, images, image_markers } => {
                 // Degraded mode (noop kernel handle): the message would be forwarded to a
                 // draining task and silently dropped, leaving the TUI spinning forever.
                 // Answer with an Error so the user sees feedback immediately.
@@ -689,8 +714,86 @@ impl NativeRuntime {
                     prefix.push_str(&sh);
                     prefix.push_str("\n\n");
                 }
-                let text = if prefix.is_empty() { text } else { format!("{prefix}{text}") };
-                let images = images.iter().map(convert::image_to_kernel).collect();
+                let mut text = if prefix.is_empty() { text } else { format!("{prefix}{text}") };
+
+                // Vision preprocessing: when the active provider can't accept images and the
+                // user pasted some, OCR them via the configured VL model first and turn the
+                // result into plain text (a non-vision adapter 400s on raw image data). The
+                // kernel-native heuristic takes just the model NAME, so we never build a
+                // throwaway provider just to detect vision support.
+                let images: Vec<atomcode_kernel::message::ImageContent> = if images.is_empty() {
+                    Vec::new()
+                } else if vision::model_name_suggests_vision(&self.coding_cfg.model) {
+                    // The ACTIVE model sees images natively — forward as-is.
+                    images.iter().map(convert::image_to_kernel).collect()
+                } else {
+                    let kernel_images: Vec<_> =
+                        images.iter().map(convert::image_to_kernel).collect();
+                    // Resolve the configured VL provider as a KERNEL provider. Not
+                    // configured / config-load failure → skip (best-effort). Configured-but-
+                    // missing or unbuildable → a surfaced failure (config mistake).
+                    let resolved: Result<
+                        Option<(Arc<dyn atomcode_kernel::provider::LlmProvider>, String)>,
+                        String,
+                    > = match atomcode_core::config::Config::load(
+                        &atomcode_core::config::Config::default_path(),
+                    ) {
+                        Err(_) => Ok(None),
+                        Ok(config) => match config
+                            .vision_preprocessor_provider
+                            .clone()
+                            .filter(|k| !k.is_empty())
+                        {
+                            None => Ok(None),
+                            Some(vl_key) => match config.providers.get(&vl_key) {
+                                None => Err(format!(
+                                    "VL provider '{vl_key}' not found in config.providers"
+                                )),
+                                Some(pcfg) => {
+                                    let mut cc = CodingAgentConfig::new(
+                                        pcfg.api_key.clone().unwrap_or_default(),
+                                        pcfg.base_url.clone().unwrap_or_default(),
+                                        pcfg.model.clone(),
+                                        ".",
+                                    );
+                                    apply_reload_provider(&mut cc, pcfg);
+                                    (self.factory)(&cc)
+                                        .map(|p| Some((p, vl_key)))
+                                        .map_err(|e| format!("VL provider build failed: {e}"))
+                                }
+                            },
+                        },
+                    };
+                    match resolved {
+                        Ok(None) => kernel_images,
+                        Err(reason) => self.vision_fail(&mut text, images, image_markers, reason),
+                        Ok(Some((vl_provider, vl_key))) => match vision::preprocess(
+                            vl_provider.as_ref(),
+                            &vl_key,
+                            &text,
+                            &kernel_images,
+                        )
+                        .await
+                        {
+                            vision::PreprocessOutcome::Replaced { text: vl_text, vl_key } => {
+                                text = if text.is_empty() {
+                                    format!("[图片内容（由 {vl_key} 识别）]\n{vl_text}")
+                                } else {
+                                    format!("{text}\n\n[图片内容（由 {vl_key} 识别）]\n{vl_text}")
+                                };
+                                self.emit(UiEvent::VisionPreprocessSuccess {
+                                    vl_key,
+                                    char_count: vl_text.chars().count(),
+                                });
+                                Vec::new()
+                            }
+                            vision::PreprocessOutcome::Failed { reason } => {
+                                self.vision_fail(&mut text, images, image_markers, reason)
+                            }
+                        },
+                    }
+                };
+
                 let _ = self.handle.commands.send(KCmd::SendMessage { text, images });
             }
             CoreCmd::Cancel => {
