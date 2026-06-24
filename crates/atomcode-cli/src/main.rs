@@ -1609,49 +1609,43 @@ async fn run() -> Result<i32> {
         );
     }
 
-    // The new stack (the engine behind the legacy channel protocol, atomcode-bridge)
-    // is the only engine. Headless (`-p`) drives a NATIVE CodingRuntime (built in the
-    // headless branch below), so the bridge handle is built only for the interactive
-    // TUI path.
-    let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if !is_headless {
-        let bridge_cfg = bridge_config_from(
+    // tuix now consumes the kernel NATIVELY: `spawn_native_tui` drives a
+    // `spawn_native_runtime` (the relocated bridge state machine, in tuix) and presents
+    // it as the `(AgentClient, UiEvent receiver)` pair the TUI speaks. The bridge
+    // membrane no longer backs the TUI. Headless (`-p`) drives a CodingRuntime directly
+    // (below), so the launch handle is built only for the interactive TUI path.
+    let mut v2_handle: Option<atomcode_tuix::TuiHandle> = if !is_headless {
+        let model = config
+            .active_provider(cli.provider.as_deref())
+            .ok()
+            .map(|p| p.model.clone())
+            .unwrap_or_default();
+        eprintln!("[engine] native kernel runtime active (model {model})");
+        let (client, event_rx) = spawn_native_tui(
             &config,
             &working_dir,
             cli.provider.as_deref(),
-            Some(telemetry.clone()),
+            telemetry.clone(),
             cli.dangerously_skip_permissions,
-            // Interactive (TUI) ⇒ approvals park until answered.
-            true,
         );
-        eprintln!("[engine] new stack active (model {})", bridge_cfg.model);
-        let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
-        Some(atomcode_core::agent::AgentHandle { client, event_rx })
+        Some(atomcode_tuix::TuiHandle { client, event_rx })
     } else {
         None
     };
-    // Engine spawner for in-TUI session switches (/session, /bg, disk /resume):
-    // each one builds a fresh bridge from the CURRENT config, so the engine backs
-    // those runtimes too.
+    // Engine spawner for in-TUI session switches (/session, /bg, disk /resume): each one
+    // builds a fresh native runtime from the CURRENT config, so the engine backs those
+    // runtimes too.
     let runtime_spawn_override: atomcode_tuix::RuntimeSpawnOverride = {
         let tel = telemetry.clone();
-        // Capture the bypass flag so in-TUI re-spawns (/session, /bg, disk /resume)
-        // also honor --dangerously-skip-permissions — not just the launch handle.
+        // Capture the bypass flag so in-TUI re-spawns (/session, /bg, disk /resume) also
+        // honor --dangerously-skip-permissions — not just the launch handle.
         let skip_perms = cli.dangerously_skip_permissions;
         std::sync::Arc::new(
             move |config: &atomcode_core::config::Config, working_dir: &std::path::Path| {
-                // In-TUI re-spawns (/session, /bg, disk /resume) follow the
-                // config's CURRENT default_provider (None) so a /provider switch
-                // inside the session takes effect — the launch-time --provider
-                // override only seeds the initial handle above.
-                atomcode_bridge::spawn_bridged_runtime(bridge_config_from(
-                    config,
-                    working_dir,
-                    None,
-                    Some(tel.clone()),
-                    skip_perms,
-                    // In-TUI re-spawns (/session, /bg, /resume) are always interactive.
-                    true,
-                ))
+                // In-TUI re-spawns follow the config's CURRENT default_provider (None) so a
+                // /provider switch inside the session takes effect — the launch-time
+                // --provider override only seeds the initial handle above.
+                spawn_native_tui(config, working_dir, None, tel.clone(), skip_perms)
             },
         )
     };
@@ -1949,6 +1943,57 @@ fn redirect_stderr_to_log_file() {
 /// points to a deleted section). Reading `default_provider` directly silently
 /// ignored `--provider`, so a headless `--provider X` run picked the config
 /// default instead of X.
+/// Build the interactive TUI's NATIVE runtime: a `spawn_native_runtime` handle (the
+/// relocated bridge state machine, living in tuix) wrapped in the `(AgentClient, UiEvent
+/// receiver)` pair tuix consumes. The cli owns provider construction (incl. the
+/// closed-source signing gateway), injected as the [`ProviderFactory`]. `coding_config`
+/// + `build_provider` are the bridge's shared knob-mapping helpers — they still live in
+/// the bridge crate (daemon also uses them) until daemon is decoupled, but the bridge no
+/// longer backs the TUI: tuix is fully native.
+fn spawn_native_tui(
+    config: &atomcode_core::config::Config,
+    working_dir: &std::path::Path,
+    provider_override: Option<&str>,
+    telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    dangerously_skip_permissions: bool,
+) -> (
+    atomcode_core::agent::AgentClient,
+    tokio::sync::mpsc::UnboundedReceiver<atomcode_tuix::UiEvent>,
+) {
+    let bcfg = bridge_config_from(
+        config,
+        working_dir,
+        provider_override,
+        Some(telemetry),
+        dangerously_skip_permissions,
+        // Interactive (TUI) ⇒ approvals park until answered.
+        true,
+    );
+    let coding_cfg = atomcode_bridge::coding_config(&bcfg);
+    let opts = atomcode_coding::PrepareOptions {
+        session: atomcode_coding::SessionMode::Fresh,
+        skill_dirs: None,
+        mcp: bcfg.mcp,
+        memory: true,
+        web: true,
+        review: true,
+    };
+    let factory: atomcode_coding::ProviderFactory =
+        Box::new(|c| atomcode_bridge::build_provider(c).map_err(|e| e.to_string()));
+    let handle =
+        atomcode_tuix::spawn_native_runtime(coding_cfg, opts, factory, dangerously_skip_permissions);
+    // The legacy client carries two shared registries the TUI reads for its slash palette
+    // / dynamic MCP tools (loaded lazily elsewhere). Same construction the bridge used.
+    let client = atomcode_core::agent::AgentClient {
+        cmd_tx: handle.commands,
+        tool_registry: std::sync::Arc::new(atomcode_core::tool::ToolRegistry::new()),
+        skill_registry: std::sync::Arc::new(std::sync::RwLock::new(
+            atomcode_core::skill::SkillRegistry::new(),
+        )),
+    };
+    (client, handle.events)
+}
+
 fn bridge_config_from(
     config: &atomcode_core::config::Config,
     working_dir: &std::path::Path,

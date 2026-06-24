@@ -29,7 +29,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent, AgentPhase};
+use atomcode_core::agent::{AgentClient, AgentCommand, AgentPhase};
+use crate::native::event::UiEvent;
 use atomcode_core::config::Config;
 use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -689,7 +690,7 @@ pub struct McpReloadProgress {
 /// receives the CURRENT config + working dir (so it tracks `/model` / `/provider`
 /// / `/cd`) and returns the `(client, event_rx)` pair the runtime drives.
 pub type RuntimeSpawnOverride = std::sync::Arc<
-    dyn Fn(&Config, &std::path::Path) -> (AgentClient, mpsc::UnboundedReceiver<AgentEvent>)
+    dyn Fn(&Config, &std::path::Path) -> (AgentClient, mpsc::UnboundedReceiver<UiEvent>)
         + Send
         + Sync,
 >;
@@ -736,7 +737,7 @@ pub struct LoopCtx {
     /// hint state).
     pub monitor_warning: std::sync::Arc<std::sync::Mutex<Option<monitor::CodingPlanWarning>>>,
     /// Hook execution failure hint for the status bar. Written by the
-    /// `AgentEvent::HookWarningHint` handler; read by `build_status` on
+    /// `UiEvent::HookWarningHint` handler; read by `build_status` on
     /// each redraw. Takes precedence over `usage_hint` so a broken hook
     /// is immediately visible. Cleared at the start of each new turn.
     pub hook_warning_hint: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -6919,7 +6920,7 @@ mod approval_retract_tests {
 }
 
 fn handle_agent_event(
-    ev: AgentEvent,
+    ev: UiEvent,
     state: &mut UiState,
     think: &mut ThinkStripper,
     renderer: &mut dyn Renderer,
@@ -6951,24 +6952,24 @@ fn handle_agent_event(
     // (with a stripped, stats-only label).
     let should_flush_now = matches!(
         &ev,
-        AgentEvent::TextDelta(_)
-            | AgentEvent::ReasoningDelta(_)
-            | AgentEvent::ToolCallStreaming { .. }
-            | AgentEvent::ToolCallStarted { .. }
-            | AgentEvent::ApprovalNeeded { .. }
-            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::Thinking)
-            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::CallingTool(_))
-            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::WaitingApproval)
-            | AgentEvent::GoalUpdate { active: true, .. }
-            | AgentEvent::TurnCancelled { .. }
-            | AgentEvent::Error { .. }
+        UiEvent::TextDelta(_)
+            | UiEvent::ReasoningDelta(_)
+            | UiEvent::ToolCallStreaming { .. }
+            | UiEvent::ToolCallStarted { .. }
+            | UiEvent::ApprovalNeeded { .. }
+            | UiEvent::PhaseChange(atomcode_core::agent::AgentPhase::Thinking)
+            | UiEvent::PhaseChange(atomcode_core::agent::AgentPhase::CallingTool(_))
+            | UiEvent::PhaseChange(atomcode_core::agent::AgentPhase::WaitingApproval)
+            | UiEvent::GoalUpdate { active: true, .. }
+            | UiEvent::TurnCancelled { .. }
+            | UiEvent::Error { .. }
     );
     if should_flush_now {
         flush_pending_separator(state, renderer, /* as_goal_end */ false);
     }
 
     match ev {
-        AgentEvent::TextDelta(text) => {
+        UiEvent::TextDelta(text) => {
             let visible = think.feed(&text);
             if !visible.is_empty() {
                 // Keep the raw reply markdown for `/copy`. Clear-on-finalize:
@@ -6986,7 +6987,7 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
-        AgentEvent::ReasoningDelta(text) => {
+        UiEvent::ReasoningDelta(text) => {
             // Display reasoning/thinking content in verbose mode (Ctrl+O)
             // Only show when the user has enabled it
             if state.show_reasoning {
@@ -7000,10 +7001,10 @@ fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::ToolCallStreaming { name, .. } => {
+        UiEvent::ToolCallStreaming { name, .. } => {
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
-        AgentEvent::ToolCallStarted {
+        UiEvent::ToolCallStarted {
             id,
             name,
             arguments,
@@ -7054,7 +7055,7 @@ fn handle_agent_event(
             pending_tools.insert(id, (display.clone(), detail, true));
             state.on_tool_call_started(&display);
         }
-        AgentEvent::ToolOutputChunk { call_id, chunk } => {
+        UiEvent::ToolOutputChunk { call_id, chunk } => {
             // Display real-time tool output (e.g., bash stdout/stderr).
             // Normally gated behind Ctrl+O verbose mode, but user-invoked
             // `!` shell commands always stream in full — the user ran them
@@ -7065,7 +7066,7 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
-        AgentEvent::ToolCallResult {
+        UiEvent::ToolCallResult {
             call_id,
             name,
             output,
@@ -7264,7 +7265,7 @@ fn handle_agent_event(
             renderer.flush();
             let _ = name;
         }
-        AgentEvent::ApprovalNeeded {
+        UiEvent::ApprovalNeeded {
             tool_name, call, snapshot, ..
         } => {
             // Persist mid-turn messages to session so /bg can recover
@@ -7348,12 +7349,12 @@ fn handle_agent_event(
             // /bg resume path).
             redraw_idle_plain(buf, state, ctx, renderer);
         }
-        AgentEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
-        AgentEvent::PhaseChange(AgentPhase::CallingTool(name)) => {
+        UiEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
+        UiEvent::PhaseChange(AgentPhase::CallingTool(name)) => {
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
-        AgentEvent::PhaseChange(_) => {}
-        AgentEvent::TurnComplete {
+        UiEvent::PhaseChange(_) => {}
+        UiEvent::TurnComplete {
             duration,
             total_tokens,
             turn_count,
@@ -7519,7 +7520,7 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
-        AgentEvent::TurnCancelled { snapshot } => {
+        UiEvent::TurnCancelled { snapshot } => {
             // Seal the reply buffer (partial reply still copyable via `/copy`).
             state.response_finalized = true;
             atomcode_core::notify::notify(
@@ -7570,7 +7571,7 @@ fn handle_agent_event(
             // should still be able to /resume the cleaned conversation.
             persist_current_session(ctx, snapshot, renderer);
         }
-        AgentEvent::ConversationTruncated {
+        UiEvent::ConversationTruncated {
             snapshot,
             restored_prompt,
             target_n,
@@ -7614,7 +7615,7 @@ fn handle_agent_event(
             renderer.flush();
             state.on_turn_complete();
         }
-        AgentEvent::UndoFailed { requested, available } => {
+        UiEvent::UndoFailed { requested, available } => {
             let line = if available == 0 {
                 crate::i18n::t(crate::i18n::Msg::CmdUndoNoTurns).into_owned()
             } else {
@@ -7624,7 +7625,7 @@ fn handle_agent_event(
             renderer.render(UiLine::CommandOutput(line));
             renderer.flush();
         }
-        AgentEvent::Error { error, snapshot } => {
+        UiEvent::Error { error, snapshot } => {
             // Seal the reply buffer (any text streamed before the error stays
             // copyable via `/copy`).
             state.response_finalized = true;
@@ -7646,7 +7647,7 @@ fn handle_agent_event(
             // by persist_current_session.
             persist_current_session(ctx, snapshot, renderer);
         }
-        AgentEvent::Warning(w) => {
+        UiEvent::Warning(w) => {
             // Non-fatal — flush a yellow advisory line and let the turn
             // continue. Don't touch state/think/buffers; the warning is
             // purely informational. Used today for the OpenAI provider's
@@ -7655,14 +7656,14 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
-        AgentEvent::HookWarningHint(msg) => {
+        UiEvent::HookWarningHint(msg) => {
             if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                 *slot = Some(msg);
             }
         }
-        AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
+        UiEvent::VisionPreprocessSuccess { vl_key, char_count } => {
             // Format here (not in agent) so we can localize / restyle
-            // without bumping the AgentEvent contract. Char count helps
+            // without bumping the UiEvent contract. Char count helps
             // users notice degenerate near-zero VL outputs that would
             // mislead the main model into "image failed" responses.
             let msg = crate::i18n::t(crate::i18n::Msg::VisionPreprocessSuccess { char_count })
@@ -7673,7 +7674,7 @@ fn handle_agent_event(
             });
             renderer.flush();
         }
-        AgentEvent::RestorePendingImages { images, markers } => {
+        UiEvent::RestorePendingImages { images, markers } => {
             // VL preprocessing failed — re-attach the user's images to
             // the input state so they can retry without re-pasting from
             // clipboard.
@@ -7719,7 +7720,7 @@ fn handle_agent_event(
             // over yet); the next idle/streaming redraw picks up the new
             // pending state on its own.
         }
-        AgentEvent::TokenUsage(u) => {
+        UiEvent::TokenUsage(u) => {
             state.prompt_tokens += u.prompt_tokens;
             state.completion_tokens += u.completion_tokens;
             state.cached_tokens += u.cached_tokens;
@@ -7730,7 +7731,7 @@ fn handle_agent_event(
             state.turn_completion_tokens += u.completion_tokens;
             state.turn_cached_tokens += u.cached_tokens;
         }
-        AgentEvent::WorkingDirChanged(new_dir) => {
+        UiEvent::WorkingDirChanged(new_dir) => {
             // Fires when a tool (change_dir / bash cd) or an AgentCommand::ChangeDir
             // mutated the shared cwd. Sync the footer's view so the status row
             // reflects the new directory on the next redraw (spinner tick if
@@ -7742,7 +7743,7 @@ fn handle_agent_event(
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
-        AgentEvent::ProjectSwitched(new_dir) => {
+        UiEvent::ProjectSwitched(new_dir) => {
             // A webui /cd switched the project directory (delivered via the
             // live-sync forwarder in sync mode). Follow it: change cwd like
             // `/cd` (updates working_dir + @-file index + recent dirs +
@@ -7755,7 +7756,7 @@ fn handle_agent_event(
                 commands::reset_to_new_session(ctx, state, renderer);
             }
         }
-        AgentEvent::ContextStats {
+        UiEvent::ContextStats {
             system_tokens,
             sent_tokens,
             dropped_tokens: _,
@@ -7795,7 +7796,7 @@ fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::ToolBatchStarted { batch_id, calls } => {
+        UiEvent::ToolBatchStarted { batch_id, calls } => {
             // Header label: "Reading 4 files in parallel" when all calls
             // share a tool name (common case for batched read_file /
             // grep / glob); otherwise generic "Running 4 tools in
@@ -7942,7 +7943,7 @@ fn handle_agent_event(
             // of flickering 0→N→0.
             state.on_tool_batch_started();
         }
-        AgentEvent::GoalUpdate { active, round, condition, last_reason, .. } => {
+        UiEvent::GoalUpdate { active, round, condition, last_reason, .. } => {
             if active {
                 state.goal_condition = Some(condition);
                 state.goal_round = round;
@@ -7985,7 +7986,7 @@ fn handle_agent_event(
                 flush_pending_separator(state, renderer, /* as_goal_end */ true);
             }
         }
-        AgentEvent::ToolBatchCompleted {
+        UiEvent::ToolBatchCompleted {
             batch_id,
             ok: _,
             total: _,
@@ -8010,7 +8011,7 @@ fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::SubAgentDispatchStart { tasks } => {
+        UiEvent::SubAgentDispatchStart { tasks } => {
             // Header line: announce the dispatch. The model gets this
             // same fact in the ToolResult; the UI line tells the user
             // "the wait is intentional, not a hang". Per-task running/
@@ -8024,18 +8025,18 @@ fn handle_agent_event(
             renderer.flush();
             state.on_sub_agent_dispatch_start(tasks);
         }
-        AgentEvent::SubAgentTaskStarted { index: _ } => {
+        UiEvent::SubAgentTaskStarted { index: _ } => {
             // Per-task running lines suppressed for CC-style collapsed
             // view. State tracking still happens via DispatchStart's
             // task list. Nothing to render here.
         }
-        AgentEvent::SubAgentTaskDone { index: _, elapsed_ms: _, turns: _, summary: _ } => {
+        UiEvent::SubAgentTaskDone { index: _, elapsed_ms: _, turns: _, summary: _ } => {
             // Per-task done lines suppressed — final count shows in
             // DispatchEnd summary. Still tick the counter so the
             // aggregate `N/M ok` reflects this completion.
             state.on_sub_agent_task_done();
         }
-        AgentEvent::SubAgentTaskFailed { index, elapsed_ms, turns: _, reason } => {
+        UiEvent::SubAgentTaskFailed { index, elapsed_ms, turns: _, reason } => {
             // Failures KEEP their per-task line. Rationale: the user
             // needs to know which sub-agent failed for diagnosis;
             // collapsing into "1 fail" leaves them blind. Successes
@@ -8055,7 +8056,7 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
-        AgentEvent::SubAgentDispatchEnd => {
+        UiEvent::SubAgentDispatchEnd => {
             // Compute the aggregate before clearing state. This is the
             // single line that replaces the old multi-row pipe-table
             // result block — the model still sees the full breakdown
@@ -8092,7 +8093,7 @@ fn handle_agent_event(
             }
             state.on_sub_agent_dispatch_end();
         }
-        AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
+        UiEvent::BackgroundComplete { summary, files_edited, turns, success } => {
             let header = if success {
                 crate::i18n::t(crate::i18n::Msg::BackgroundComplete { turns }).into_owned()
             } else {
@@ -8117,7 +8118,7 @@ fn handle_agent_event(
             }
             renderer.flush();
         }
-        AgentEvent::MessagesSync { snapshot } => {
+        UiEvent::MessagesSync { snapshot } => {
             // Response to AgentCommand::SyncMessages. Persist the
             // snapshot to the current session so /bg can recover
             // the conversation state.
@@ -8127,7 +8128,7 @@ fn handle_agent_event(
                     .set_foreground_session(ctx.current_session.clone());
             }
         }
-        AgentEvent::UserEcho(text) => {
+        UiEvent::UserEcho(text) => {
             let markers = image_markers_in_order(&text);
             renderer.render(UiLine::UserWithAttachments {
                 text,
@@ -8135,7 +8136,7 @@ fn handle_agent_event(
             });
             renderer.flush();
         }
-        AgentEvent::PeerBusy(running) => {
+        UiEvent::PeerBusy(running) => {
             // Live-sync: mirror the peer's busy state so TUI input is
             // visually disabled while the other side's turn is running.
             if running {
@@ -8143,7 +8144,7 @@ fn handle_agent_event(
             } else {
                 // Peer's turn finished. In sync mode this is the ONLY
                 // turn-completion signal we get (the forwarder never sends
-                // AgentEvent::TurnComplete), so do the stream finalization
+                // UiEvent::TurnComplete), so do the stream finalization
                 // TurnComplete normally performs:
                 //  1. Flush the buffered assistant line. A short reply with no
                 //     trailing newline (e.g. "在的！") otherwise stays parked in
@@ -8157,7 +8158,7 @@ fn handle_agent_event(
                 state.on_turn_complete();
             }
         }
-        AgentEvent::ProviderChanged(provider) => {
+        UiEvent::ProviderChanged(provider) => {
             // Live-sync: another view (webui dropdown) switched the model —
             // mirror it into the TUI's active provider + header. Skip when it's
             // already our provider (the echo of the TUI's own /model switch, which
@@ -8189,7 +8190,7 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
-        AgentEvent::SessionSwitched(session_id) => {
+        UiEvent::SessionSwitched(session_id) => {
             // webui 新建对话，TUI 跟随切换到新会话。与 ProjectSwitched 不同，
             // 这里不切目录，只切换到指定 session_id 的新会话。
             crate::tuix_trace!("TUI", "SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());

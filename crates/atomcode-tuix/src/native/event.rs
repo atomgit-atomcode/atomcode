@@ -19,13 +19,8 @@ use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::ConversationSnapshot;
 use atomcode_core::tool::ToolCall;
 
-/// Events sent FROM the runtime adapter TO the UI.
-///
-/// `dead_code` is allowed while this type is being built: its consumer is the
-/// 38-arm `handle_agent_event` renderer, which is re-pointed onto `UiEvent` in a
-/// later step (B2 ②). Until then the carried fields have no reader. The allow is
-/// removed once the renderer consumes the full payload.
-#[allow(dead_code)]
+/// Events sent FROM the runtime adapter TO the UI. Consumed by the 38-arm
+/// `handle_agent_event` renderer (which `UiEvent` replaced `core::AgentEvent` for).
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     /// LLM text delta (streaming).

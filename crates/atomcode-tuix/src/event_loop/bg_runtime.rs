@@ -1,5 +1,6 @@
-use atomcode_core::agent::{AgentClient, AgentEvent};
+use atomcode_core::agent::AgentClient;
 use atomcode_core::i18n::{t, Msg};
+use crate::native::event::UiEvent;
 use atomcode_core::session::{Session, SessionManager};
 
 pub const MAX_BACKGROUND_SLOTS: usize = 16;
@@ -15,12 +16,12 @@ impl RuntimeId {
 
 pub struct RuntimeEvent {
     pub runtime_id: RuntimeId,
-    pub event: AgentEvent,
+    pub event: UiEvent,
 }
 
 pub fn spawn_event_forwarder(
     runtime_id: RuntimeId,
-    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<UiEvent>,
     fan_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
 ) {
     tokio::spawn(async move {
@@ -73,7 +74,7 @@ pub struct BackgroundSlot {
     pub state: RuntimeState,
     pub created_at: u64,
     pub summary: String,
-    pub buffered_events: Vec<AgentEvent>,
+    pub buffered_events: Vec<UiEvent>,
 }
 
 impl BackgroundSlot {
@@ -154,25 +155,25 @@ impl BackgroundSlots {
             .collect()
     }
 
-    pub fn apply_event_to_slot(&mut self, slot: usize, event: &AgentEvent) -> bool {
+    pub fn apply_event_to_slot(&mut self, slot: usize, event: &UiEvent) -> bool {
         if slot == 0 || slot > self.slots.len() {
             return false;
         }
         let bg = &mut self.slots[slot - 1];
         match event {
-            AgentEvent::TurnComplete { snapshot, .. } => {
+            UiEvent::TurnComplete { snapshot, .. } => {
                 bg.state = RuntimeState::Done;
                 super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                 bg.summary = session_summary(&bg.session);
                 true
             }
-            AgentEvent::TurnCancelled { snapshot } => {
+            UiEvent::TurnCancelled { snapshot } => {
                 bg.state = RuntimeState::Cancelled;
                 super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                 bg.summary = session_summary(&bg.session);
                 true
             }
-            AgentEvent::ApprovalNeeded { snapshot, .. } => {
+            UiEvent::ApprovalNeeded { snapshot, .. } => {
                 // Persist mid-turn messages so /bg <N> can replay the
                 // conversation even while the turn is still in progress.
                 if !snapshot.messages.is_empty() {
@@ -181,7 +182,7 @@ impl BackgroundSlots {
                 }
                 false
             }
-            AgentEvent::Error { snapshot, .. } => {
+            UiEvent::Error { snapshot, .. } => {
                 // Persist whatever conversation state we have at error
                 // time so a background session that died mid-turn can
                 // still be `/resume`d to inspect the partial transcript.
@@ -196,12 +197,12 @@ impl BackgroundSlots {
                 bg.state = RuntimeState::Error;
                 did_snapshot
             }
-            AgentEvent::TextDelta(_)
-            | AgentEvent::ReasoningDelta(_)
-            | AgentEvent::ToolCallStreaming { .. }
-            | AgentEvent::ToolCallStarted { .. }
-            | AgentEvent::ToolOutputChunk { .. }
-            | AgentEvent::ToolCallResult { .. } => {
+            UiEvent::TextDelta(_)
+            | UiEvent::ReasoningDelta(_)
+            | UiEvent::ToolCallStreaming { .. }
+            | UiEvent::ToolCallStarted { .. }
+            | UiEvent::ToolOutputChunk { .. }
+            | UiEvent::ToolCallResult { .. } => {
                 bg.buffered_events.push(event.clone());
                 false
             }
@@ -386,7 +387,7 @@ impl BgRuntimeManager {
     pub fn apply_background_event(
         &mut self,
         runtime_id: RuntimeId,
-        event: AgentEvent,
+        event: UiEvent,
         session_manager: &SessionManager,
     ) {
         let Some(slot) = self.backgrounds.slot_for_runtime_id(runtime_id) else {
@@ -667,7 +668,7 @@ mod tests {
 
         slots.apply_event_to_slot(
             1,
-            &AgentEvent::TurnComplete {
+            &UiEvent::TurnComplete {
                 duration: std::time::Duration::from_secs(1),
                 total_tokens: 10,
                 turn_count: 1,
@@ -719,7 +720,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_event_forwarder_tags_events() {
-        use atomcode_core::agent::AgentEvent;
+        use crate::native::event::UiEvent;
 
         let (agent_tx, agent_rx) = tokio::sync::mpsc::unbounded_channel();
         let (fan_tx, mut fan_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -727,11 +728,11 @@ mod tests {
 
         spawn_event_forwarder(runtime_id, agent_rx, fan_tx);
         agent_tx
-            .send(AgentEvent::TextDelta("hello".to_string()))
+            .send(UiEvent::TextDelta("hello".to_string()))
             .unwrap();
 
         let event = fan_rx.recv().await.unwrap();
         assert_eq!(event.runtime_id, runtime_id);
-        assert!(matches!(event.event, AgentEvent::TextDelta(text) if text == "hello"));
+        assert!(matches!(event.event, UiEvent::TextDelta(text) if text == "hello"));
     }
 }

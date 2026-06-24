@@ -1,38 +1,38 @@
-//! 同步模式：把 LiveSession 的 LiveEvent 映射成 TUI 既有的 AgentEvent，
+//! 同步模式：把 LiveSession 的 LiveEvent 映射成 TUI 既有的 UiEvent，
 //! 投进现有 runtime_event_tx，复用 handle_agent_event 渲染。
 
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use atomcode_core::agent::AgentEvent;
+use crate::native::event::UiEvent;
 use atomcode_core::live::{LiveEvent, LiveSession};
 use atomcode_core::turn::event::TurnEvent;
 use super::bg_runtime::{RuntimeEvent, RuntimeId};
 
-/// TurnEvent → 0/1 AgentEvent. UserMessage/StateChanged handled separately in the forwarder.
-pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
+/// TurnEvent → 0/1 UiEvent. UserMessage/StateChanged handled separately in the forwarder.
+pub(crate) fn turn_to_ui_event(te: TurnEvent) -> Option<UiEvent> {
     Some(match te {
-        TurnEvent::TextDelta(s) => AgentEvent::TextDelta(s),
-        TurnEvent::ReasoningDelta(s) => AgentEvent::ReasoningDelta(s),
+        TurnEvent::TextDelta(s) => UiEvent::TextDelta(s),
+        TurnEvent::ReasoningDelta(s) => UiEvent::ReasoningDelta(s),
         TurnEvent::ToolCallStarted { id, name, arguments } =>
-            AgentEvent::ToolCallStarted { id, name, arguments },
+            UiEvent::ToolCallStarted { id, name, arguments },
         TurnEvent::ToolOutputChunk { call_id, chunk } =>
-            AgentEvent::ToolOutputChunk { call_id, chunk },
+            UiEvent::ToolOutputChunk { call_id, chunk },
         TurnEvent::ToolCallResult { call_id, name, output, success, duration } =>
-            AgentEvent::ToolCallResult { call_id, name, output, success, duration },
+            UiEvent::ToolCallResult { call_id, name, output, success, duration },
         TurnEvent::TokenUsage { prompt_tokens, completion_tokens, cached_tokens, .. } =>
-            AgentEvent::TokenUsage(atomcode_core::stream::TokenUsage {
+            UiEvent::TokenUsage(atomcode_core::stream::TokenUsage {
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
             }),
         // TurnEvent::Error is a tuple variant Error(String)
-        TurnEvent::Error(e) => AgentEvent::Error {
+        TurnEvent::Error(e) => UiEvent::Error {
             error: e,
             snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
         },
-        TurnEvent::Warning(w) => AgentEvent::Warning(w),
+        TurnEvent::Warning(w) => UiEvent::Warning(w),
         TurnEvent::ApprovalRequested { tool_name, reason, call, snapshot } =>
-            AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot },
+            UiEvent::ApprovalNeeded { tool_name, reason, call, snapshot },
         // 不需要的：忽略
         TurnEvent::ToolCallStreaming { .. }
         | TurnEvent::ToolBatchStarted { .. }
@@ -64,7 +64,7 @@ pub(crate) fn spawn_live_forwarder(
             match rx.recv().await {
                 Ok(LiveEvent::Turn(te)) => {
                     crate::tuix_trace!("FWD", "Turn event: {:?}", std::mem::discriminant(&te));
-                    if let Some(ae) = turn_to_agent_event(te) {
+                    if let Some(ae) = turn_to_ui_event(te) {
                         if fan_tx.send(RuntimeEvent { runtime_id, event: ae }).is_err() {
                             crate::tuix_trace!("FWD", "fan_tx closed, breaking");
                             break;
@@ -74,7 +74,7 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::UserMessage { text, .. }) => {
                     crate::tuix_trace!("FWD", "UserMessage: {} chars", text.len());
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::UserEcho(text) })
+                        .send(RuntimeEvent { runtime_id, event: UiEvent::UserEcho(text) })
                         .is_err()
                     {
                         break;
@@ -84,7 +84,7 @@ pub(crate) fn spawn_live_forwarder(
                     let running = matches!(st, atomcode_core::live::TurnState::Running);
                     crate::tuix_trace!("FWD", "StateChanged: running={}", running);
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::PeerBusy(running) })
+                        .send(RuntimeEvent { runtime_id, event: UiEvent::PeerBusy(running) })
                         .is_err()
                     {
                         break;
@@ -93,7 +93,7 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::ProviderChanged(provider)) => {
                     crate::tuix_trace!("FWD", "ProviderChanged: {}", provider);
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::ProviderChanged(provider) })
+                        .send(RuntimeEvent { runtime_id, event: UiEvent::ProviderChanged(provider) })
                         .is_err()
                     {
                         break;
@@ -105,7 +105,7 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::WorkingDirChanged(dir)) => {
                     crate::tuix_trace!("FWD", "WorkingDirChanged: {:?}", dir);
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::ProjectSwitched(dir) })
+                        .send(RuntimeEvent { runtime_id, event: UiEvent::ProjectSwitched(dir) })
                         .is_err()
                     {
                         break;
@@ -115,7 +115,7 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::SessionSwitched(session_id)) => {
                     crate::tuix_trace!("FWD", "SessionSwitched: {}", session_id);
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::SessionSwitched(session_id) })
+                        .send(RuntimeEvent { runtime_id, event: UiEvent::SessionSwitched(session_id) })
                         .is_err()
                     {
                         break;
@@ -143,15 +143,15 @@ mod tests {
     fn maps_text_delta() {
         assert!(
             matches!(
-                turn_to_agent_event(TurnEvent::TextDelta("hi".into())),
-                Some(AgentEvent::TextDelta(s)) if s == "hi"
+                turn_to_ui_event(TurnEvent::TextDelta("hi".into())),
+                Some(UiEvent::TextDelta(s)) if s == "hi"
             )
         );
     }
 
     #[test]
     fn ignores_context_stats() {
-        assert!(turn_to_agent_event(TurnEvent::ContextStats {
+        assert!(turn_to_ui_event(TurnEvent::ContextStats {
             system_tokens: 0,
             sent_tokens: 0,
             dropped_tokens: 0,

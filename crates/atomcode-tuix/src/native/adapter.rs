@@ -67,7 +67,7 @@ fn gather_plugin_cc_hooks() -> Vec<atomcode_coding::cc_hooks::HookConfig> {
 /// Driver-facing handle: send legacy `core::AgentCommand`s, receive `UiEvent`s. The
 /// command side is unchanged from the bridge so tuix's send path stays the same;
 /// only the event vocabulary becomes `UiEvent`.
-pub(crate) struct NativeHandle {
+pub struct NativeHandle {
     pub commands: mpsc::UnboundedSender<CoreCmd>,
     pub events: mpsc::UnboundedReceiver<UiEvent>,
 }
@@ -77,7 +77,7 @@ pub(crate) struct NativeHandle {
 /// `spawn_bridged_runtime`). The provider is built via the injected `factory` — the
 /// driver owns provider construction (incl. the closed-source signing gateway),
 /// keeping it out of the neutral engine crates.
-pub(crate) fn spawn_native_runtime(
+pub fn spawn_native_runtime(
     cfg: CodingAgentConfig,
     opts: PrepareOptions,
     factory: ProviderFactory,

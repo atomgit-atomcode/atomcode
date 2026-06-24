@@ -26,7 +26,7 @@ pub mod trace;
 pub mod width;
 
 use anyhow::Result;
-use atomcode_core::agent::AgentHandle;
+use atomcode_core::agent::AgentClient;
 use atomcode_core::config::Config;
 use crossterm::{
     event::{
@@ -41,6 +41,20 @@ use tokio::sync::mpsc;
 use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
 pub use crate::event_loop::RuntimeSpawnOverride;
+// The native runtime entry points the driver (cli) injects through the spawn override
+// and the launch handle. `UiEvent` is the driver-owned event vocabulary the renderer
+// consumes (replacing `core::agent::AgentEvent` — the bridge membrane is gone).
+pub use crate::native::adapter::{spawn_native_runtime, NativeHandle};
+pub use crate::native::event::UiEvent;
+
+/// The interactive TUI's launch handle: the command client (slash palette reads its
+/// registries; the loop sends `AgentCommand`s through it) + the native runtime's
+/// `UiEvent` stream. Replaces `core::agent::AgentHandle` (whose `event_rx` carried
+/// `core::AgentEvent`) now that tuix consumes the kernel natively.
+pub struct TuiHandle {
+    pub client: AgentClient,
+    pub event_rx: mpsc::UnboundedReceiver<UiEvent>,
+}
 use crate::input::history::History;
 use crate::input::reader;
 use crate::render::{
@@ -256,7 +270,7 @@ pub fn panic_restore_terminal() {
 pub async fn run(
     config: Config,
     model_name: String,
-    agent_handle: AgentHandle,
+    agent_handle: TuiHandle,
     runtime_spawn_override: RuntimeSpawnOverride,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
