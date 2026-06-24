@@ -699,23 +699,21 @@ mod tests {
     /// after program restart due to path mismatch.
     #[test]
     fn test_auth_token_path_consistency() {
-        // Both paths should resolve to the same location: ~/.atomcode/auth.toml
+        // auth.toml lives in the config dir — assert that actual contract.
+        // We compare against config_dir() rather than hardcoding ~/.atomcode:
+        // parallel tests set $ATOMCODE_HOME (which config_dir() honors), so
+        // asserting the bare home path here races with them. That config_dir()
+        // defaults to ~/.atomcode is covered by config_dir's own lock-guarded tests.
         let auth_module_path = crate::auth::auth_file_path();
-        let expected_path = crate::tool::real_home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".atomcode")
-            .join("auth.toml");
+        let expected_path = crate::config::Config::config_dir().join("auth.toml");
 
         assert_eq!(
             auth_module_path, expected_path,
-            "auth_file_path() should always return ~/.atomcode/auth.toml"
+            "auth_file_path() should be config_dir()/auth.toml"
         );
-
-        // Verify the path ends with the expected directory structure
         assert!(
-            auth_module_path.ends_with(".atomcode/auth.toml")
-                || auth_module_path.ends_with(".atomcode\\auth.toml"), // Windows compatibility
-            "Path should end with .atomcode/auth.toml, got: {}",
+            auth_module_path.ends_with("auth.toml"),
+            "Path should end with auth.toml, got: {}",
             auth_module_path.display()
         );
     }
