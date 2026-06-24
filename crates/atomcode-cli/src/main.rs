@@ -16,10 +16,8 @@ use clap::{Parser, Subcommand};
 mod telemetry_cmd;
 use atomcode::uninstall;
 
-use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop, AgentRuntimeFactory};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
-use atomcode_core::conversation::Conversation;
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
@@ -50,7 +48,7 @@ use atomcode_telemetry::{
     notice, CliOverride, CurrentContext, Event, Telemetry,
 };
 
-/// Set to `true` at the start of `run_headless` so the panic hook and the
+/// Set to `true` at the start of `run_headless_native` so the panic hook and the
 /// top-level error handler can skip TUI cleanup. In headless mode raw mode
 /// was never enabled, so calling `disable_raw_mode` would be a wasted ioctl
 /// and on Windows can panic if the console handle isn't a real TTY.
@@ -122,7 +120,7 @@ fn truncate_log_line(s: &str, max_chars: usize) -> String {
 /// inside a chunk are preserved, with each non-empty new line getting its own
 /// `[thinking] ` prefix so multi-line thinking stays readable.
 ///
-/// Pulled out of `run_headless` so it can be unit-tested without spinning up
+/// Pulled out of the headless driver so it can be unit-tested without spinning up
 /// the agent loop. Regression target: the old per-chunk `eprintln!` produced
 /// "one word per line" output for streaming reasoning models.
 fn format_thinking_chunk(out: &mut String, open: &mut bool, chunk: &str) {
@@ -149,7 +147,7 @@ fn format_thinking_chunk(out: &mut String, open: &mut bool, chunk: &str) {
 }
 
 /// Close any in-flight `[thinking]` line by writing a newline if one is open.
-/// Mirrors the inline `close_thinking_line` used inside `run_headless`, but
+/// Mirrors the inline `close_thinking_line` used inside the headless driver, but
 /// writes to a buffer so it can be unit-tested.
 fn close_thinking_chunk(out: &mut String, open: &mut bool) {
     if *open {
@@ -523,10 +521,9 @@ const VERSION: &str = concat!(
 #[derive(Parser)]
 #[command(name = "atomcode", version = VERSION, about = "AI coding assistant in your terminal")]
 struct Cli {
-    /// Engine selection: "v2" (new kernel stack via atomcode-bridge) is the
-    /// DEFAULT. Opt out to the legacy engine with "v1" (or "legacy"/"old").
-    /// Also settable via $ATOMCODE_ENGINE. v2 runs the same drivers (headless +
-    /// TUI, incl. in-TUI /session and /resume) over the new engine.
+    /// DEPRECATED no-op: the legacy ("v1") engine has been removed, so the new
+    /// kernel stack (via atomcode-bridge) is the only engine. Accepted for script
+    /// compatibility (also via $ATOMCODE_ENGINE); passing "v1" prints a notice.
     #[arg(long)]
     engine: Option<String>,
 
@@ -1416,7 +1413,10 @@ async fn run() -> Result<i32> {
     // so the TUI boots. The Welcome-wizard / status-row hints will
     // nudge the user to `/login`, and a successful
     // auth flow rebuilds the real provider via `rebuild_provider`.
-    let (provider, model_name) = if let Some(reason) = unavailable_reason {
+    // The provider is built here as a credential PRE-FLIGHT: a failed build (auth
+    // gap) flips `model_name` to "" so the TUI boots into onboarding. The new stack
+    // builds its own provider, so the value itself is discarded (`_provider`).
+    let (_provider, model_name) = if let Some(reason) = unavailable_reason {
         (unavailable_provider(reason), model_name)
     } else {
         match create_provider(&provider_config) {
@@ -1596,63 +1596,48 @@ async fn run() -> Result<i32> {
     // Start with a fresh conversation each session. When `session_to_continue`
     // is present (via `-c` / `--continue`), the TUI replays the prior session's
     // messages into scrollback AND sends them to the agent via
-    // `AgentCommand::SetMessages` so the model context is fully restored.
-    // Bare `atomcode` (no `-c`) starts completely fresh.
-    let conversation = Conversation::new();
-
-    let (mut agent_loop, agent_handle) = AgentLoop::new_with_skip_permissions(
-        config.clone(),
-        provider,
-        tool_registry,
-        tool_context.clone(),
-        conversation,
-        cli.dangerously_skip_permissions,
-    );
-    agent_loop.set_max_turns(cli.max_turns);
-    let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
-
-    // ── Engine selection (the strangler switch) ──────────────────────────────
-    // v2 = the NEW stack behind the legacy channel protocol (atomcode-bridge) and
-    // is now the DEFAULT. The legacy engine stays reachable as the rollback escape
-    // hatch (--engine v1 / $ATOMCODE_ENGINE=v1) until it is removed in a later phase.
-    // The drivers below (headless loop / tuix) are untouched either way.
+    // `--engine v1` (and $ATOMCODE_ENGINE=v1) was the legacy-stack escape hatch.
+    // The legacy engine has been removed; accept the flag for script compatibility
+    // but tell the user it no longer switches engines.
     let engine_choice = cli
         .engine
         .clone()
         .or_else(|| std::env::var("ATOMCODE_ENGINE").ok());
-    let engine_v1 = matches!(engine_choice.as_deref(), Some("v1" | "1" | "legacy" | "old"));
-    let engine_v2 = !engine_v1;
-    if engine_v1 {
-        eprintln!("[engine v1] legacy stack active (opt-out via --engine v1)");
+    if matches!(engine_choice.as_deref(), Some("v1" | "1" | "legacy" | "old")) {
+        eprintln!(
+            "[engine] --engine v1 is no longer supported (legacy stack removed); using the current engine."
+        );
     }
-    // Headless (`-p`) drives a NATIVE CodingRuntime (built in the headless branch
-    // below), so the bridge handle is built only for the interactive TUI path.
-    let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if engine_v2 && !is_headless {
+
+    // The new stack (the engine behind the legacy channel protocol, atomcode-bridge)
+    // is the only engine. Headless (`-p`) drives a NATIVE CodingRuntime (built in the
+    // headless branch below), so the bridge handle is built only for the interactive
+    // TUI path.
+    let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if !is_headless {
         let bridge_cfg = bridge_config_from(
             &config,
             &working_dir,
             cli.provider.as_deref(),
             Some(telemetry.clone()),
             cli.dangerously_skip_permissions,
-            // Interactive (TUI) ⇒ approvals park until answered; headless (`-p`) keeps the
-            // fail-closed timeout so an unanswered approval can't park the run forever.
-            !is_headless,
+            // Interactive (TUI) ⇒ approvals park until answered.
+            true,
         );
-        eprintln!("[engine v2] new stack active (model {})", bridge_cfg.model);
+        eprintln!("[engine] new stack active (model {})", bridge_cfg.model);
         let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
         Some(atomcode_core::agent::AgentHandle { client, event_rx })
     } else {
         None
     };
-    // Engine-v2 spawner for in-TUI session switches (/session, /bg, disk /resume):
-    // each one builds a fresh bridge from the CURRENT config, so the new engine —
-    // not the v1 factory — backs those runtimes too. `None` in v1 keeps the factory.
-    let runtime_spawn_override: Option<atomcode_tuix::RuntimeSpawnOverride> = if engine_v2 {
+    // Engine spawner for in-TUI session switches (/session, /bg, disk /resume):
+    // each one builds a fresh bridge from the CURRENT config, so the engine backs
+    // those runtimes too.
+    let runtime_spawn_override: atomcode_tuix::RuntimeSpawnOverride = {
         let tel = telemetry.clone();
         // Capture the bypass flag so in-TUI re-spawns (/session, /bg, disk /resume)
         // also honor --dangerously-skip-permissions — not just the launch handle.
         let skip_perms = cli.dangerously_skip_permissions;
-        Some(std::sync::Arc::new(
+        std::sync::Arc::new(
             move |config: &atomcode_core::config::Config, working_dir: &std::path::Path| {
                 // In-TUI re-spawns (/session, /bg, disk /resume) follow the
                 // config's CURRENT default_provider (None) so a /provider switch
@@ -1668,9 +1653,7 @@ async fn run() -> Result<i32> {
                     true,
                 ))
             },
-        ))
-    } else {
-        None
+        )
     };
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
@@ -1726,15 +1709,6 @@ async fn run() -> Result<i32> {
         if let Ok(uuid) = uuid::Uuid::parse_str(s.id.as_str()) {
             telemetry.set_session_id(uuid);
         }
-        // Headless `-c`: the TUI rebinds itself, so only push to the agent
-        // here, so the continued session's id reaches the header + datalog.
-        if effective_prompt.is_some() {
-            agent_handle
-                .client
-                .cmd_tx
-                .send(AgentCommand::SetSessionId(s.id.as_str().to_string()))
-                .ok();
-        }
     }
     let scope_ctx = CurrentContext {
         repo_origin: Some(repo),
@@ -1760,13 +1734,10 @@ async fn run() -> Result<i32> {
             // Don't `?`-propagate here: an error must still fall through to the
             // telemetry.shutdown() below, otherwise this session's un-drained
             // mpsc events are lost. Capture the Result and let it bubble up only
-            // *after* the flush. Engine v2 routes through the bridged handle
-            // (engine_loop = None); the legacy engine still spawns its AgentLoop.
-            let notifications_cfg = config.notifications.clone();
-            let headless_result = if engine_v2 {
+            // *after* the flush.
+            let headless_result = {
                 // NATIVE headless: a fresh CodingRuntime drives this turn (no bridge
-                // membrane). coding_config + build_provider are the bridge's shared
-                // helpers; the TUI path still uses the bridge handle (until tuix migrates).
+                // membrane). coding_config + build_provider are the bridge's shared helpers.
                 let bcfg = bridge_config_from(
                     &config,
                     &working_dir,
@@ -1800,22 +1771,8 @@ async fn run() -> Result<i32> {
                         )
                         .await
                     }
-                    Err(e) => Err(anyhow::anyhow!("engine v2 启动失败：{e}")),
+                    Err(e) => Err(anyhow::anyhow!("引擎启动失败：{e}")),
                 }
-            } else {
-                run_headless(
-                    Some(agent_loop),
-                    notifications_cfg,
-                    agent_handle,
-                    prompt,
-                    cli.provider.as_deref(),
-                    verbose,
-                    capture,
-                    working_dir.clone(),
-                    cli.dangerously_skip_permissions,
-                    is_admin,
-                )
-                .await
             };
             match headless_result {
                 Err(e) => Err(e),
@@ -1891,23 +1848,16 @@ async fn run() -> Result<i32> {
             // actual errors in their shell/CI output.
             redirect_stderr_to_log_file();
 
-            let tui_handle = if let Some(h) = v2_handle.take() {
-                // engine v2: the bridge task already runs the engine; the legacy
-                // loop is never started. (/session and /resume inside the TUI go
-                // through runtime_factory and thus still spawn v1 runtimes — the
-                // factory seam is the next strangler step.)
-                h
-            } else {
-                let ctx = atomcode_telemetry::CurrentContext::current();
-                tokio::spawn(async move {
-                    atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
-                });
-                agent_handle
-            };
+            // The bridge task already runs the engine behind the handle's channels.
+            // Built unconditionally for the interactive (non-headless) path above, so
+            // it is always present here.
+            let tui_handle = v2_handle
+                .take()
+                .expect("interactive launch builds the engine handle above");
             // Same as the headless arm: don't `?` — a TUI run that ends in an
             // error must still reach the shutdown/flush below. Ok(()) → exit 0;
             // the error propagates only after telemetry is drained.
-            match atomcode_tuix::run(config, model_name, tui_handle, runtime_factory, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
+            match atomcode_tuix::run(config, model_name, tui_handle, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
                 Ok(()) => Ok(0),
                 Err(e) => Err(e.into()),
             }
@@ -1995,10 +1945,10 @@ fn redirect_stderr_to_log_file() {
 /// both resolve the provider identically.
 ///
 /// `provider_override` is the `--provider` flag: it must flow through the SAME
-/// `active_provider` resolution the legacy engine uses (honor the override, fall
-/// back when the default points to a deleted section). Reading
-/// `default_provider` directly silently ignored `--provider`, so a headless
-/// `--engine v2 --provider X` run picked the config default instead of X.
+/// `active_provider` resolution (honor the override, fall back when the default
+/// points to a deleted section). Reading `default_provider` directly silently
+/// ignored `--provider`, so a headless `--provider X` run picked the config
+/// default instead of X.
 fn bridge_config_from(
     config: &atomcode_core::config::Config,
     working_dir: &std::path::Path,
@@ -2027,446 +1977,9 @@ fn bridge_config_from(
     }
 }
 
-/// Run agent in headless mode (pipe-friendly: stdout = LLM text only,
-/// logs/diagnostics → stderr). Non-interactive: `bash` approvals are
-/// auto-allowed (stderr logs the reason); other tools that require approval
-/// are still denied — **unless** `--dangerously-skip-permissions` was
-/// passed, in which case all tool calls are auto-approved.
-///
-/// `verbose=false` (default): Claude Code -p style — only the assistant reply
-/// reaches the user. Tool calls, token usage, and turn summary are silent.
-/// Errors, approval denials, and cancellations are still surfaced on stderr.
-///
-/// `verbose=true`: also emit tool calls, token usage, [done] summary, working
-/// dir changes, and sub-agent progress on stderr.
-async fn run_headless(
-    // `None` = engine v2: the bridged engine task is ALREADY running behind the
-    // handle's channels (atomcode-bridge); only the legacy engine needs spawning.
-    agent_loop: Option<AgentLoop>,
-    notifications_cfg: atomcode_core::config::NotificationConfig,
-    agent_handle: atomcode_core::agent::AgentHandle,
-    prompt: String,
-    _provider_name: Option<&str>,
-    verbose: bool,
-    capture: bool,
-    working_dir: PathBuf,
-    skip_permissions: bool,
-    is_admin: bool,
-) -> Result<(i32, Option<String>)> {
-    // Tell the panic hook / error path to skip TUI cleanup — raw mode was
-    // never enabled here, so `disable_raw_mode` would be a wasted ioctl
-    // (and on Windows can panic when stdin isn't a real console handle).
-    HEADLESS_MODE.store(true, Ordering::Relaxed);
-
-    // Emit a warning when --dangerously-skip-permissions is active.
-    // The actual permission bypass is handled by InteractivePermissionDecider
-    // (will_auto_approve always returns true), so ApprovalNeeded events
-    // should never reach this loop — but the log line gives the user a
-    // clear signal that the flag is in effect.
-    if skip_permissions {
-        eprintln!(
-            "{}",
-            atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless)
-        );
-    }
-    if is_admin {
-        eprintln!(
-            "{}",
-            atomcode_core::i18n::t(atomcode_core::i18n::Msg::AdminWarningHeadless)
-        );
-    }
-
-    let notifications = notifications_cfg;
-    let (cmd_tx, mut event_rx) = {
-        let handle = agent_handle;
-        (handle.client.cmd_tx, handle.event_rx)
-    };
-
-    if let Some(agent_loop) = agent_loop {
-        let ctx = atomcode_telemetry::CurrentContext::current();
-        tokio::spawn(async move {
-            atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
-        });
-    }
-    let mut exit_code: i32 = 0;
-
-    // NON-FATAL on a closed channel: with engine v2 the bridged task may have
-    // already exited (e.g. a fatal provider-init error like an unsigned AtomGit
-    // gateway) AFTER buffering a `CoreEv::Error`. Propagating the send error here
-    // with `?` would surface a generic "channel closed" and SWALLOW that specific,
-    // actionable error. Instead, fall through to the event loop — it drains the
-    // buffered `Error` (printed below), then sees the channel close.
-    if cmd_tx
-        .send(AgentCommand::SendMessage {
-            text: prompt,
-            images: vec![],
-            image_markers: vec![],
-        })
-        .is_err()
-    {
-        // Channel already closed: drain whatever the engine buffered before exiting.
-        // If it buffered nothing, this non-error default is overridden to 1.
-        exit_code = 1;
-    }
-
-    let mut had_denial = false;
-    let mut last_text_ended_with_newline = true;
-    // Tracks whether we're inside a streaming `[thinking]` line. When true, the
-    // next non-reasoning event must close the line with a `\n` so subsequent
-    // log lines don't glue onto the tail of the thinking text.
-    let mut thinking_line_open = false;
-    // When `capture` is set, we also buffer every TextDelta the agent
-    // emits so the caller (e.g. the fixissue workflow) can post the
-    // full assistant output back to AtomGit as an issue comment.
-    let mut captured: Option<String> = if capture { Some(String::new()) } else { None };
-
-    // Helper: close any in-flight `[thinking]` line before emitting a new log
-    // line on stderr. Avoids `[thinking] ...[tool→ ...]` mashups in verbose.
-    // Thin wrapper over the unit-tested `close_thinking_chunk` that flushes
-    // directly to stderr.
-    fn close_thinking_line(open: &mut bool) {
-        let mut buf = String::new();
-        close_thinking_chunk(&mut buf, open);
-        if !buf.is_empty() {
-            eprint!("{}", buf);
-            let _ = io::stderr().flush();
-        }
-    }
-
-    while let Some(event) = event_rx.recv().await {
-        match event {
-            AgentEvent::TextDelta(text) => {
-                close_thinking_line(&mut thinking_line_open);
-                if !text.is_empty() {
-                    last_text_ended_with_newline = text.ends_with('\n');
-                }
-                if let Some(buf) = captured.as_mut() {
-                    buf.push_str(&text);
-                }
-                print!("{}", text);
-                io::stdout().flush()?;
-            }
-            AgentEvent::ReasoningDelta(text) => {
-                // In CLI verbose mode, show reasoning/thinking content.
-                // Reasoning arrives as many tiny streaming chunks (often a
-                // single token). The old implementation used `eprintln!` per
-                // chunk, producing "one word per line" output. We now stream
-                // chunks onto a single `[thinking] ...` line via the
-                // unit-tested `format_thinking_chunk` helper.
-                if verbose && !text.is_empty() {
-                    let mut buf = String::new();
-                    format_thinking_chunk(&mut buf, &mut thinking_line_open, &text);
-                    eprint!("{}", buf);
-                    let _ = io::stderr().flush();
-                }
-            }
-            AgentEvent::ToolCallStreaming { name, hint } => {
-                if verbose {
-                    close_thinking_line(&mut thinking_line_open);
-                    let detail = if hint.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" → {}", hint)
-                    };
-                    eprintln!("[tool-streaming← {}{}]", name, detail);
-                }
-            }
-            AgentEvent::ToolCallStarted {
-                id: _,
-                name,
-                arguments,
-            } => {
-                if verbose {
-                    close_thinking_line(&mut thinking_line_open);
-                    let args = truncate_log_line(&arguments, 200);
-                    eprintln!("[tool→ {} args={}]", name, args);
-                }
-            }
-            AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
-                if verbose {
-                    close_thinking_line(&mut thinking_line_open);
-                    eprint!("{}", chunk);
-                    let _ = io::stderr().flush();
-                }
-            }
-            AgentEvent::ToolCallResult {
-                call_id: _,
-                name,
-                output,
-                success,
-                duration,
-            } => {
-                if verbose {
-                    close_thinking_line(&mut thinking_line_open);
-                    let status = if success { "OK" } else { "FAILED" };
-                    let dur_ms = duration.as_millis();
-                    let trimmed = output.trim_end();
-                    if trimmed.is_empty() {
-                        eprintln!("[tool← {} {} {}ms]", name, status, dur_ms);
-                    } else {
-                        let snippet = truncate_log_line(trimmed, 500);
-                        eprintln!("[tool← {} {} {}ms] {}", name, status, dur_ms, snippet);
-                    }
-                }
-            }
-            AgentEvent::ApprovalNeeded {
-                tool_name, reason, ..
-            } => {
-                close_thinking_line(&mut thinking_line_open);
-                if skip_permissions {
-                    // --dangerously-skip-permissions: auto-approve everything.
-                    // This branch should rarely be reached because
-                    // InteractivePermissionDecider.will_auto_approve()
-                    // returns true, preventing ApprovalRequested from being
-                    // emitted in the first place. But if it does reach here
-                    // (e.g. a race), honor the flag.
-                    eprintln!("[headless] auto-approved {}: {}", tool_name, reason);
-                    cmd_tx.send(AgentCommand::ApproveTool)?;
-                } else if tool_name == "bash" {
-                    // -p / headless cannot prompt; user opts in by using non-interactive mode.
-                    eprintln!("[headless] auto-approved bash: {}", reason);
-                    cmd_tx.send(AgentCommand::ApproveTool)?;
-                } else {
-                    // Always shown — security signal must not be silent.
-                    eprintln!("[approval-denied] tool={} reason={}", tool_name, reason);
-                    cmd_tx.send(AgentCommand::DenyTool)?;
-                    had_denial = true;
-                }
-            }
-            AgentEvent::TokenUsage(usage) => {
-                if verbose {
-                    close_thinking_line(&mut thinking_line_open);
-                    // `cached` = provider prompt-cache HIT tokens (e.g. DeepSeek's
-                    // `prompt_cache_hit_tokens`): how much of the prompt was served from
-                    // the prefix cache instead of recomputed. Shown only when > 0 so the
-                    // line stays clean on providers that don't report it.
-                    if usage.cached_tokens > 0 {
-                        eprintln!(
-                            "[tokens] prompt={} completion={} cached={} ({:.0}% hit)",
-                            usage.prompt_tokens,
-                            usage.completion_tokens,
-                            usage.cached_tokens,
-                            if usage.prompt_tokens > 0 {
-                                usage.cached_tokens as f64 / usage.prompt_tokens as f64 * 100.0
-                            } else {
-                                0.0
-                            }
-                        );
-                    } else {
-                        eprintln!(
-                            "[tokens] prompt={} completion={}",
-                            usage.prompt_tokens, usage.completion_tokens
-                        );
-                    }
-                }
-            }
-            AgentEvent::PhaseChange(_) => {
-                // Silent in headless mode (in both default and verbose).
-            }
-            AgentEvent::TurnComplete {
-                duration,
-                total_tokens,
-                turn_count,
-                tool_call_count,
-                stop_reason,
-                ..
-            } => {
-                close_thinking_line(&mut thinking_line_open);
-                atomcode_core::notify::notify_turn_finished(
-                    &notifications,
-                    atomcode_core::notify::TurnNotification {
-                        duration,
-                        turn_count,
-                        tool_call_count,
-                        total_tokens: Some(total_tokens),
-                        stop_reason,
-                        working_dir: Some(&working_dir),
-                    },
-                );
-                // Always ensure stdout ends with a newline so downstream parsers see a clean line.
-                if !last_text_ended_with_newline {
-                    println!();
-                    io::stdout().flush()?;
-                }
-                if verbose {
-                    // Natural completion stays silent on the stop reason to
-                    // preserve the familiar Claude Code -p [done] format.
-                    // Budget-enforced / error / cancel truncation gets an
-                    // explicit `stopped=<tag>` suffix so eval runners and
-                    // humans can tell "natural end" from "we hit a limit".
-                    let suffix = match stop_reason {
-                        atomcode_core::agent::TurnStopReason::Natural => String::new(),
-                        other => format!(" stopped={}", other.as_tag()),
-                    };
-                    eprintln!(
-                        "[done] {:.1}s tokens={} turns={} tool_calls={}{}",
-                        duration.as_secs_f64(),
-                        atomcode_core::i18n::fmt_tokens(total_tokens),
-                        turn_count,
-                        tool_call_count,
-                        suffix
-                    );
-                }
-                let _ = cmd_tx.send(AgentCommand::Shutdown);
-                break;
-            }
-            AgentEvent::TurnCancelled { .. } => {
-                close_thinking_line(&mut thinking_line_open);
-                // Always shown — user needs to know cancellation happened.
-                eprintln!("[cancelled]");
-                exit_code = 130;
-                let _ = cmd_tx.send(AgentCommand::Shutdown);
-                break;
-            }
-            AgentEvent::Error { error, .. } => {
-                close_thinking_line(&mut thinking_line_open);
-                // Always shown — errors are not noise.
-                eprintln!("[error] {}", error);
-                exit_code = 1;
-                let _ = cmd_tx.send(AgentCommand::Shutdown);
-                break;
-            }
-            AgentEvent::Warning(w) => {
-                // Headless CLI: warnings go to stderr always (they're
-                // meant to be loud). No exit-code change, no shutdown —
-                // we expect the turn to keep running.
-                eprintln!("[warning] {}", w);
-            }
-            AgentEvent::HookWarningHint(msg) => {
-                eprintln!("[hook-warning] {}", msg);
-            }
-            AgentEvent::WorkingDirChanged(new_dir) => {
-                if verbose {
-                    eprintln!("[cwd] {}", new_dir.display());
-                }
-            }
-            AgentEvent::ContextStats { .. } => {
-                // Silent in headless mode
-            }
-            AgentEvent::ToolBatchStarted { batch_id: _, calls } => {
-                if verbose {
-                    eprintln!("[tool-batch] {} calls in parallel", calls.len());
-                }
-            }
-            AgentEvent::ToolBatchCompleted {
-                batch_id: _,
-                ok,
-                total,
-                elapsed_ms,
-            } => {
-                if verbose {
-                    eprintln!(
-                        "[tool-batch] completed {}/{} ok in {}ms",
-                        ok, total, elapsed_ms
-                    );
-                }
-            }
-            AgentEvent::SubAgentDispatchStart { tasks } => {
-                if verbose {
-                    eprintln!("[sub-agent] dispatching {} in parallel", tasks.len());
-                    for (i, t) in tasks.iter().enumerate() {
-                        eprintln!("[sub-agent {}] {}{}", i, t.path, t.dedup_suffix);
-                    }
-                }
-            }
-            AgentEvent::SubAgentDispatchEnd => {
-                if verbose {
-                    eprintln!("[sub-agent] dispatch complete");
-                }
-            }
-            AgentEvent::SubAgentTaskStarted { index } => {
-                if verbose {
-                    eprintln!("[sub-agent {}] running", index);
-                }
-            }
-            AgentEvent::SubAgentTaskDone {
-                index,
-                elapsed_ms,
-                turns,
-                summary: _,
-            } => {
-                if verbose {
-                    eprintln!(
-                        "[sub-agent {}] done {}s · {}T",
-                        index,
-                        elapsed_ms / 1000,
-                        turns
-                    );
-                }
-            }
-            AgentEvent::SubAgentTaskFailed {
-                index,
-                elapsed_ms,
-                turns: _,
-                reason,
-            } => {
-                if verbose {
-                    eprintln!(
-                        "[sub-agent {}] failed {}s · {}",
-                        index,
-                        elapsed_ms / 1000,
-                        reason.lines().next().unwrap_or("")
-                    );
-                }
-            }
-            AgentEvent::BackgroundComplete {
-                summary,
-                files_edited,
-                turns,
-                success,
-            } => {
-                let status = if success { "ok" } else { "fail" };
-                eprintln!("[background {} turns={}] {}", status, turns, summary);
-                if verbose && !files_edited.is_empty() {
-                    eprintln!("[background files={}]", files_edited.join(","));
-                }
-            }
-            // VL preprocessor failure restores pending image bytes for the
-            // TUI to re-attach. CLI has no interactive input buffer to put
-            // them in, so just ignore — the failure itself was already
-            // surfaced as AgentEvent::Warning above, and the conversation
-            // proceeds with the placeholder. No retry path exists in CLI.
-            AgentEvent::RestorePendingImages { .. } => {}
-            // VL preprocessor success notice. Mirror the TUI behaviour
-            // briefly to stderr so non-interactive users (CI, scripts)
-            // still see that VL ran. Char count helps spot degenerate
-            // outputs.
-            AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
-                eprintln!(
-                    "[vl-preprocess ok provider={} chars={}]",
-                    vl_key, char_count
-                );
-            }
-            AgentEvent::ConversationTruncated { .. }
-            | AgentEvent::UndoFailed { .. }
-            | AgentEvent::MessagesSync { .. } => {
-                // Only used by TUI for /bg or /undo; ignore in headless CLI.
-            }
-            AgentEvent::UserEcho(_)
-            | AgentEvent::PeerBusy(_)
-            | AgentEvent::ProviderChanged(_)
-            | AgentEvent::ProjectSwitched(_)
-            | AgentEvent::SessionSwitched(_) => {
-                // Live-sync only — not applicable in headless CLI.
-            }
-            AgentEvent::GoalUpdate { .. } => {
-                // Goal progress — headless mode ignores for now.
-            }
-        }
-    }
-
-    // Priority: Error(1) > Denial(2) > 0; TurnCancelled(130) is absolute.
-    if exit_code == 0 && had_denial {
-        exit_code = 2;
-    }
-
-    Ok((exit_code, captured))
-}
-
-/// NATIVE headless driver (engine v2): drive a [`CodingRuntime`] + kernel `AgentEvent`s
-/// directly, no bridge membrane. Renders to stdout/stderr in the SAME format as
-/// [`run_headless`] and returns the SAME exit codes (0 natural / 1 error / 2 denial /
-/// 130 cancel). The kernel `TurnComplete` carries only `reason`, so the `[done]` line's
+/// NATIVE headless driver: drive a [`CodingRuntime`] + kernel `AgentEvent`s
+/// directly, no bridge membrane. Returns exit codes 0 natural / 1 error / 2 denial /
+/// 130 cancel. The kernel `TurnComplete` carries only `reason`, so the `[done]` line's
 /// figures are synthesized here (the TurnStats the bridge used to build); a tool result
 /// recovers its name+duration from a `live_tools` map (kernel results carry neither).
 ///

@@ -25,7 +25,7 @@ pub mod trace;
 pub mod width;
 
 use anyhow::Result;
-use atomcode_core::agent::{AgentHandle, AgentRuntimeFactory};
+use atomcode_core::agent::AgentHandle;
 use atomcode_core::config::Config;
 use crossterm::{
     event::{
@@ -256,8 +256,7 @@ pub async fn run(
     config: Config,
     model_name: String,
     agent_handle: AgentHandle,
-    runtime_factory: AgentRuntimeFactory,
-    runtime_spawn_override: Option<RuntimeSpawnOverride>,
+    runtime_spawn_override: RuntimeSpawnOverride,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
@@ -618,7 +617,6 @@ pub async fn run(
         config,
         model_name,
         agent: agent_client,
-        runtime_factory,
         runtime_spawn_override,
         bg_manager,
         foreground_runtime_id,
