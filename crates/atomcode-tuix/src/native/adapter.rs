@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::approval::{approval_needed_event, bypass_auto_approval, take_deny_cmd};
+use super::compaction::{compaction_advisory, estimate_after_tokens, manual_compact_result};
 use super::convert;
 use super::event::UiEvent;
 use super::goal::{goal_update_ev, summarize_for_goal};
@@ -284,6 +285,10 @@ impl NativeRuntime {
 
     fn emit(&self, ev: UiEvent) {
         let _ = self.ev_tx.send(ev);
+    }
+
+    fn emit_context_stats(&self) {
+        self.emit(context_stats_event(self.last_usage.as_ref(), &self.coding_cfg));
     }
 
     /// Build the goal evaluator provider from config: the `evaluator_provider` entry if
@@ -980,9 +985,7 @@ impl NativeRuntime {
             CoreCmd::SyncMessages => {
                 let _ = self.handle.commands.send(KCmd::Snapshot);
             }
-            CoreCmd::RefreshContextStats => {
-                self.emit(context_stats_event(self.last_usage.as_ref(), &self.coding_cfg));
-            }
+            CoreCmd::RefreshContextStats => self.emit_context_stats(),
             CoreCmd::SetPlanMode(on) => {
                 let was = self.parts.plan_mode.swap(on, std::sync::atomic::Ordering::Relaxed);
                 // Only note an ACTUAL toggle (idempotent SetPlanMode is a no-op). The note
@@ -1185,6 +1188,44 @@ impl NativeRuntime {
                     self.emit(UiEvent::MessagesSync {
                         snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
                     });
+                }
+            }
+            // A manual `/compact` may make a slow one-shot LLM summary call; announce it so
+            // the user sees a progress line while it runs. Auto/Overflow stub silently.
+            KEv::CompactionStarted { trigger } => {
+                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                    self.emit(UiEvent::TextDelta(
+                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting)
+                            .into_owned(),
+                    ));
+                }
+            }
+            KEv::Compacted { committed, trigger, removed, bytes_before, bytes_after, .. } => {
+                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                    // Stream the authoritative result as a plain TextDelta line. The kernel
+                    // measures BYTES, so token figures are derived from the last usage report.
+                    let before_tokens =
+                        self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
+                    self.emit(UiEvent::TextDelta(manual_compact_result(
+                        committed,
+                        removed,
+                        bytes_before,
+                        bytes_after,
+                        before_tokens,
+                    )));
+                    if committed {
+                        // Refresh the cached context size so the footer / `/context` reflect
+                        // the shrunk conversation immediately (the next turn overwrites it
+                        // with the exact count).
+                        if let Some(meta) = self.last_usage.as_mut() {
+                            meta.used_tokens =
+                                estimate_after_tokens(before_tokens, bytes_before, bytes_after)
+                                    as u32;
+                        }
+                        self.emit_context_stats();
+                    }
+                } else if let Some(msg) = compaction_advisory(committed, &trigger) {
+                    self.emit(UiEvent::Warning(msg));
                 }
             }
             KEv::TurnComplete { reason } => {

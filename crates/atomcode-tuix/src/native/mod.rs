@@ -12,6 +12,7 @@
 
 pub(crate) mod adapter;
 pub(crate) mod approval;
+pub(crate) mod compaction;
 pub(crate) mod convert;
 pub(crate) mod event;
 pub(crate) mod goal;
