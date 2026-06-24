@@ -1464,25 +1464,18 @@ async fn run() -> Result<i32> {
     let is_headless =
         cli.prompt.is_some() || cli.prompt_file.is_some() || fixissue_prompt.is_some();
 
-    // Load MCP tools from .mcp.json (project) and ~/.atomcode/mcp.json (user).
-    // For TUI mode, start connections in background to avoid blocking startup.
-    // For headless mode (-p/--prompt-file/fixissue), wait for connections since tools
-    // are needed immediately.
+    // MCP registry + connect-event channel are consumed ONLY by the interactive TUI
+    // (`atomcode_tuix::run`, the non-headless arm below). Headless drives its own
+    // `CodingRuntime`, which connects MCP itself via `prepare()` (PrepareOptions.mcp) —
+    // so the headless arm must NOT eagerly `from_config().await` here: that would connect
+    // every server (blocking) just to discard the result, then connect them all again
+    // inside the runtime. Headless ⇒ (None, None); the TUI starts connections in the
+    // background so startup doesn't block.
     let (mcp_registry, mcp_connect_rx) = if is_headless {
-        // Headless: need tools right now, wait for connections
-        let registry = McpRegistry::from_config(&working_dir).await;
-        let mcp_tools = registry.list_all_tools().await;
-        // Headless drives its own CodingRuntime (which loads MCP itself); this
-        // registry is only consumed by the TUI path, so just wrap it.
-        let mcp_registry = if mcp_tools.is_empty() {
-            None
-        } else {
-            Some(std::sync::Arc::new(registry))
-        };
-        (mcp_registry, None)
+        (None, None)
     } else {
-        // TUI: start in background, tools populate as servers connect
-        // Create event channel so TUI can display connection status in scrollback
+        // TUI: start in background, tools populate as servers connect.
+        // Event channel lets the TUI display connection status in scrollback.
         use atomcode_core::mcp::McpConnectEvent;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
         let registry = McpRegistry::from_config_background_with_events(&working_dir, Some(tx));
