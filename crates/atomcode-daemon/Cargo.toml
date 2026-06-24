@@ -14,8 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
-# Engine v2: drive the new stack behind the legacy command/event protocol. The
-# daemon's live turns can run on it via KernelTurnExecutor ($ATOMCODE_ENGINE=v2).
+# Neutral helper crate: BridgeConfig + coding_config + build_provider (AtomGit
+# signing) + convert, shared by the daemon's native /live + /chat turn producers.
 atomcode-bridge = { path = "../atomcode-bridge" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 # Native v2 stack: KernelTurnExecutor drives CodingRuntime directly (no bridge

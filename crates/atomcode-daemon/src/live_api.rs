@@ -190,18 +190,6 @@ fn live_session_id_or_unknown() -> String {
 // Live engine: kernel-backed TurnExecutor (native CodingRuntime)
 // ============================================================================
 
-/// True when the daemon should run on the NEW stack (kernel + capabilities + coding).
-/// The `/live` path is ALWAYS native now (the v1 DaemonTurnExecutor was deleted); this
-/// gate only still controls the `/chat` endpoint's remaining v1 TurnRunner branch
-/// (opt OUT with `$ATOMCODE_ENGINE=v1` / `legacy` / `old`), which is a follow-up to
-/// remove.
-pub(crate) fn live_engine_v2() -> bool {
-    !matches!(
-        std::env::var("ATOMCODE_ENGINE").ok().as_deref(),
-        Some("v1" | "1" | "legacy" | "old")
-    )
-}
-
 /// `TurnExecutor` backed by the new stack, driving a kernel [`CodingRuntime`] directly
 /// (no bridge membrane). ONE runtime per LiveSession (persistent across turns) so
 /// MCP/memory are prepared once, not per message. `conv` stays the source of truth: the

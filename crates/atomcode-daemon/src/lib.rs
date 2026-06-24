@@ -43,19 +43,10 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use atomcode_core::auth;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::lsp::manager::build_lsp_manager;
-use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
-use atomcode_core::provider;
+use atomcode_core::mcp::McpRegistry;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::telemetry_bootstrap::detect_repo_origin;
-use atomcode_core::tool::diagnostics::DiagnosticsTool;
-use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::turn::event::{TurnEvent, TurnResult};
-use atomcode_core::turn::permission::{
-    ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
-    PermissionDecider,
-};
-use atomcode_core::turn::runner::TurnRunner;
+use atomcode_core::turn::event::TurnEvent;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
     CliOverride, CurrentContext, Event, RepoOrigin, SessionMode, Telemetry, TelemetryState,
@@ -275,8 +266,6 @@ pub struct AppState {
     pub stopped_sessions: StoppedSessionsStore,
     /// MCP server registry (global, used for /mcp/status backward compat)
     pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,
-    /// Per-project MCP registry cache (keyed by working_dir)
-    pub mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     /// In-flight OAuth login sessions (login_id -> entry)
     pub login_sessions: LoginSessionsStore,
     /// Shared telemetry handle (R1.4)
@@ -300,15 +289,6 @@ pub struct AppState {
     pub bind_host: String,
     pub bind_port: u16,
 }
-
-/// Cached MCP registry for a specific project directory.
-pub struct CachedMcpRegistry {
-    pub registry: Arc<McpRegistry>,
-    pub last_used: std::time::Instant,
-}
-
-/// Maximum number of per-project MCP registries to cache.
-const MCP_CACHE_MAX: usize = 5;
 
 /// Get default working directory
 fn default_working_dir() -> PathBuf {
@@ -2176,7 +2156,6 @@ async fn chat_stream(
     // Clone state for the spawned task
     let chat_tasks = state.chat_tasks.clone();
     let stopped_sessions = state.stopped_sessions.clone();
-    let mcp_cache = state.mcp_cache.clone();
     let telemetry = state.telemetry.clone();
     let pending_permissions = state.pending_permissions.clone();
     let interactive_permission =
@@ -2205,7 +2184,6 @@ async fn chat_stream(
                 tx.clone(),
                 cancel_token,
                 stopped_sessions.clone(),
-                mcp_cache,
                 telemetry,
                 pending_permissions,
                 interactive_permission,
@@ -2258,16 +2236,10 @@ async fn process_chat_request(
     event_tx: mpsc::UnboundedSender<ChatEvent>,
     cancel_token: CancellationToken,
     stopped_sessions: StoppedSessionsStore,
-    mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     telemetry: Arc<Telemetry>,
     pending_permissions: permission_bridge::PermissionResponders,
     interactive_permission: bool,
 ) -> anyhow::Result<()> {
-    use atomcode_core::tool::{
-        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
-        read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
-        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
-    };
     // Load config
     let config_path = Config::default_path();
     let config = Config::load(&config_path)?;
@@ -2280,9 +2252,13 @@ async fn process_chat_request(
         .providers
         .get(&provider_name)
         .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?;
-
-    // Create provider instance
-    let provider = provider::create_provider(provider_config)?;
+    // Validate the provider config eagerly, exactly as the engine did up-front:
+    // create_provider rejects empty/whitespace + control-char api_keys, an untrusted
+    // gateway with no key, and unknown provider_types — surfacing an actionable config
+    // error BEFORE the turn spawns (the v2 producer's build_provider does not re-check
+    // these). We discard the instance; run_chat_turn_v2 builds its own provider. The
+    // prior default path also constructed-then-dropped this, so error parity is kept.
+    let _ = atomcode_core::provider::create_provider(provider_config)?;
 
     // Get working directory
     let working_dir = req
@@ -2318,14 +2294,9 @@ async fn process_chat_request(
 
     // Create conversation from session messages
     let conversation = Arc::new(tokio::sync::Mutex::new(session.to_conversation()));
-    // 构造用户消息：带图走 MultiPart（vision）；模型不支持视觉时经 vision_preprocessor
-    // 用 VL 模型把图片转文字（与 TUI/agent 行为一致）。无图则纯文本。
-    //
-    // v2 引擎时跳过 VL 预处理——bridge 的 on_command 会在收到 SendMessage 时
-    // 调用 maybe_preprocess，此时再做一次是冗余的（VL 模型会被多调一次）。
-    // v2 路径直接把原文 + 原图写入 MultiPart，bridge 收到后负责 VL 转换并清空
-    // images 发给 kernel；conversation 中保留原图用于 webui 缩略图渲染。
-    let engine_v2 = live_api::live_engine_v2();
+    // 构造用户消息：无图则纯文本；带图走 MultiPart。原文 + 原图直接交给引擎——
+    // run_chat_turn_v2 把图片透传给 kernel（由模型/适配器处理，当前 /chat 不做
+    // VL 文字化预处理）；conversation 中保留原图用于 webui 缩略图渲染。
     {
         use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
 
@@ -2341,9 +2312,7 @@ async fn process_chat_request(
         let mut conv = conversation.lock().await;
         if images.is_empty() {
             conv.add_user_message(&req.message);
-        } else if engine_v2 {
-            // v2 引擎：跳过 VL 预处理，直接用原文 + 原图写入 MultiPart。
-            // bridge 的 on_command 会负责 VL 预处理并清空发给 kernel 的 images。
+        } else {
             let idx = conv.messages.len();
             conv.messages.push(Message {
                 role: Role::User,
@@ -2354,243 +2323,8 @@ async fn process_chat_request(
                 synthetic: false,
             });
             conv.turn_tracker.on_user_message(idx);
-        } else {
-            // v1 引擎：在此做 VL 预处理。VL 文本决定喂给模型的 `text`；
-            // 原图始终保留在 MultiPart 里。非视觉模型在 provider 层会把
-            // MultiPart 降级为纯文本（VL 文本得以送达），而会话/历史保留原图，
-            // 用于在对话里渲染缩略图。
-            use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
-            let text = match maybe_preprocess(&config, &*provider, &req.message, &images).await {
-                PreprocessOutcome::Skipped => req.message.clone(),
-                PreprocessOutcome::Replaced { text, vl_key } => {
-                    if req.message.trim().is_empty() {
-                        format!("[图片内容（由 {vl_key} 识别）]\n{text}")
-                    } else {
-                        format!("{}\n\n[图片内容（由 {vl_key} 识别）]\n{text}", req.message)
-                    }
-                }
-                PreprocessOutcome::Failed { .. } => {
-                    if req.message.trim().is_empty() {
-                        "[图片识别失败]".to_string()
-                    } else {
-                        format!("{}\n\n[图片识别失败]", req.message)
-                    }
-                }
-            };
-            let idx = conv.messages.len();
-            conv.messages.push(Message {
-                role: Role::User,
-                content: MessageContent::MultiPart {
-                    text: if text.is_empty() { None } else { Some(text) },
-                    images,
-                },
-                synthetic: false,
-            });
-            conv.turn_tracker.on_user_message(idx);
         }
     }
-    // Build tool registry and context — use real telemetry from AppState (R11.1, R11.2, R11.3)
-    let mut tool_context = ToolContext::with_telemetry(
-        working_dir.clone(),
-        req.session_id.as_deref().unwrap_or("default"),
-        telemetry.clone(),
-    );
-    let mut tool_registry = ToolRegistry::new();
-    // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
-    // the CLI's --disable-tools behaviour. Comma-separated tool names.
-    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let enabled = |name: &str| !disabled_tools.contains(name);
-
-    if enabled("read_file") {
-        tool_registry.register_sync(Box::new(ReadFileTool));
-    }
-    if enabled("write_file") {
-        tool_registry.register_sync(Box::new(WriteFileTool));
-    }
-    if enabled("edit_file") {
-        tool_registry.register_sync(Box::new(EditFileTool));
-    }
-    if enabled("bash") {
-        tool_registry.register_sync(Box::new(BashTool));
-    }
-    if enabled("grep") {
-        tool_registry.register_sync(Box::new(GrepTool));
-    }
-    if enabled("glob") {
-        tool_registry.register_sync(Box::new(GlobTool));
-    }
-    if enabled("list_directory") {
-        tool_registry.register_sync(Box::new(ListDirTool));
-    }
-    if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
-    }
-    if enabled("web_fetch") {
-        tool_registry.register_sync(Box::new(WebFetchTool));
-    }
-    if enabled("search_replace") {
-        tool_registry.register_sync(Box::new(SearchReplaceTool));
-    }
-    if enabled("todo") {
-        tool_registry.register_sync(Box::new(TodoTool::new()));
-    }
-
-    // Load skills and register use_skill tool
-    let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
-    skill_registry.reload(&working_dir);
-    let has_skills = !skill_registry.is_empty();
-    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
-    if has_skills && enabled("use_skill") {
-        tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
-            registry: skill_registry.clone(),
-        }));
-    }
-
-    // Register MCP tools using per-project cache.
-    // Each project directory gets its own MCP registry (loaded from its .mcp.json + global).
-    let mcp_registry: Arc<McpRegistry> = {
-        let cache = mcp_cache.read().await;
-        if let Some(cached) = cache.get(&working_dir) {
-            cached.registry.clone()
-        } else {
-            drop(cache);
-            // Cache miss — create new registry for this project
-            let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
-            new_registry
-                .wait_for_initial_connections(Duration::from_secs(5))
-                .await;
-            // Store in cache
-            let mut cache = mcp_cache.write().await;
-            // Evict LRU if cache is full
-            if cache.len() >= MCP_CACHE_MAX {
-                if let Some(oldest_key) = cache
-                    .iter()
-                    .min_by_key(|(_, v)| v.last_used)
-                    .map(|(k, _)| k.clone())
-                {
-                    cache.remove(&oldest_key);
-                }
-            }
-            cache.insert(
-                working_dir.clone(),
-                CachedMcpRegistry {
-                    registry: new_registry.clone(),
-                    last_used: std::time::Instant::now(),
-                },
-            );
-            new_registry
-        }
-    };
-    // Update last_used timestamp
-    {
-        let mut cache = mcp_cache.write().await;
-        if let Some(entry) = cache.get_mut(&working_dir) {
-            entry.last_used = std::time::Instant::now();
-        }
-    }
-    let mcp_tools = mcp_registry.list_all_tools().await;
-    if !mcp_tools.is_empty() {
-        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
-    }
-
-    // Build LSP manager from config and inject into ToolContext.
-    let lsp_manager = build_lsp_manager(&config.lsp, &working_dir);
-    if lsp_manager.is_some() && enabled("diagnostics") {
-        tool_registry.register_sync(Box::new(DiagnosticsTool));
-    }
-    tool_context.lsp = lsp_manager;
-
-    let shared_tools = Arc::new(tool_registry);
-
-    // webui/daemon mode: interactive approval bridged over HTTP. The decider
-    // sends an `ApprovalRequest` on `perm_req_tx` (we keep the receiver alive so
-    // `send` succeeds — if it were dropped, EVERY tool would auto-deny) and
-    // blocks on `perm_resp_rx` until the browser POSTs a decision to
-    // `/chat/permission`, which is routed back here via `pending_permissions`.
-    // The user-facing notification is the `TurnEvent::ApprovalRequested` event
-    // forwarded as a `permission_request` SSE event below.
-    // Only registered in interactive (webui/channel) mode has a human approver
-    // reachable via POST /chat/permission, so only there do we use the blocking
-    // InteractivePermissionDecider + its register/keep-alive/unregister
-    // plumbing. The standalone daemon (VSCode extension, no browser) has no
-    // approver, so it must keep the prior BypassAll behaviour — otherwise any
-    // tool requiring approval would block the turn forever.
-    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = if interactive_permission {
-        let (perm_req_tx, perm_req_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-        let (perm_resp_tx, perm_resp_rx) =
-            tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
-        let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-            atomcode_core::tool::PermissionStore::new(),
-        ));
-        pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
-        (
-            Box::new(InteractivePermissionDecider::new(
-                perm_req_tx,
-                perm_resp_rx,
-                perm_store,
-            )),
-            Some(perm_req_rx),
-        )
-    } else {
-        (
-            Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
-            None,
-        )
-    };
-    // Same ctx selection as interactive AgentLoop: walk config.providers
-    // for the active provider (the one actually selected for this turn,
-    // not config.default_provider), fallback to synthetic 128K config if absent.
-    let daemon_ctx = match config.providers.get(&provider_name) {
-        Some(pc) => atomcode_core::ctx::for_provider(pc),
-        None => {
-            atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
-                provider_type: String::new(),
-                api_key: None,
-                model: String::new(),
-                base_url: None,
-                system_prompt: None,
-                user_agent: None,
-                context_window: 128_000,
-                max_tokens: None,
-                thinking_type: None,
-                thinking_keep: None,
-                reasoning_history: None,
-                reasoning_effort: None,
-                thinking_enabled: None,
-                thinking_budget: None,
-                skip_tls_verify: false,
-                ephemeral: true,
-            })
-        }
-    };
-    // Load configured hooks for this session (JSON/TOML/builtins/webhooks),
-    // mirroring the TUI agent so daemon/WebUI turns stay hook-aware.
-    let mut hook_engine = atomcode_core::hook::HookEngine::new();
-    hook_engine.load_all(&working_dir);
-    let mut turn_runner = TurnRunner {
-        provider: provider.into(),
-        tools: shared_tools,
-        context: tool_context,
-        config: config.clone(),
-        ctx: daemon_ctx,
-        permission,
-        recently_edited_files: Vec::new(),
-        hook_engine: std::sync::Arc::new(hook_engine),
-        loop_guard: Default::default(),
-        current_turn_number: 0,
-    };
-
-    // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
-    let system_prompt =
-        build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
@@ -2621,126 +2355,39 @@ async fn process_chat_request(
             tool_calls: 0,
             session_id: session.id.to_string(),
         });
-        // Turn never ran — drop the permission registration and the request
-        // receiver (the decider/perm_req_tx are owned by `turn_runner`, which is
-        // dropped here too). Only registered in interactive (webui/channel) mode.
+        // Turn never ran. No permission responder has been registered yet (that
+        // happens when the turn task spawns below), so this unregister is a harmless
+        // no-op — kept for symmetry with the normal-completion cleanup.
         if interactive_permission {
             pending_permissions.unregister(&perm_session_key);
         }
         return Ok(());
     }
 
-    // Clone conversation Arc for the spawn task
-    let conversation_clone = conversation.clone();
-
     // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id
     let tel_ctx = CurrentContext::current();
 
-    // Run turn(s) in a background task. Engine v2 ($ATOMCODE_ENGINE=v2) drives the new
-    // stack via atomcode-bridge instead of the v1 TurnRunner; the downstream
-    // turn_rx → ChatEvent consumer + persistence are SHARED (they only read turn_rx).
-    if live_api::live_engine_v2() {
-        let bridge_cfg =
-            live_api::chat_bridge_config(&config, &provider_name, &working_dir, telemetry.clone());
-        // Interactive approval: route /chat/permission decisions to the v2 producer
-        // (this re-registration supersedes the v1 decider's, which never runs here).
-        let perm_rx = if interactive_permission {
-            let (tx, rx) = mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
-            pending_permissions.register(perm_session_key.clone(), tx);
-            Some(rx)
-        } else {
-            None
-        };
-        let conv = conversation.clone();
-        let cancel = cancel_token.clone();
-        tokio::spawn(async move {
-            CurrentContext::scope(tel_ctx, || async move {
-                live_api::run_chat_turn_v2(conv, turn_tx, cancel, bridge_cfg, perm_rx).await;
-            })
-            .await;
-        });
+    // Run the turn in a background task on the kernel stack (coding + capabilities)
+    // via the shared `run_chat_turn_v2` producer. The downstream turn_rx → ChatEvent
+    // consumer + persistence below are SHARED (they only read turn_rx).
+    let bridge_cfg =
+        live_api::chat_bridge_config(&config, &provider_name, &working_dir, telemetry.clone());
+    // Interactive approval: route /chat/permission decisions to the producer.
+    let perm_rx = if interactive_permission {
+        let (tx, rx) = mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
+        pending_permissions.register(perm_session_key.clone(), tx);
+        Some(rx)
     } else {
-        tokio::spawn(async move {
-            // Keep the ApprovalRequest receiver alive for the entire turn. The
-            // InteractivePermissionDecider (inside turn_runner) sends on the paired
-            // sender; if this receiver were dropped, every `send` would fail and the
-            // decider would auto-deny EVERY tool. We never read from it — the browser
-            // notification comes from the forwarded `TurnEvent::ApprovalRequested`.
-            // In standalone (BypassAll) mode there is no channel — this is `None`.
-            let _keep_perm_req_rx = perm_req_rx;
-            CurrentContext::scope(tel_ctx, || async move {
-                let mut conv = conversation_clone.lock().await;
-
-                // Loop until LLM produces text without tool calls
-                loop {
-                    // ── Context compression check before each turn ──
-                    // Uses the same two-tier strategy as CLI (T1: tool_result stubs,
-                    // T2: LLM summarization into cold zone).
-                    // Task hint is extracted dynamically from the last non-synthetic
-                    // user message so it stays current across multi-tool turns and
-                    // includes VL-preprocessed image descriptions (matching live_api.rs).
-                    {
-                        let task_hint = conv
-                            .messages
-                            .iter()
-                            .rev()
-                            .find(|m| {
-                                matches!(
-                                    m.role,
-                                    atomcode_core::conversation::message::Role::User
-                                ) && !m.synthetic
-                            })
-                            .and_then(|m| m.text())
-                            .map(|text| {
-                                if text.chars().count() > 200 {
-                                    format!(
-                                        "TASK: {}...",
-                                        text.chars().take(197).collect::<String>()
-                                    )
-                                } else {
-                                    format!("TASK: {}", text)
-                                }
-                            });
-                        let state_hint = task_hint.as_deref();
-                        atomcode_core::agent::compression::maybe_compress_history(
-                            &*turn_runner.ctx,
-                            &mut conv,
-                            &*turn_runner.provider,
-                            &turn_runner.tools,
-                            &system_prompt,
-                            state_hint,
-                        )
-                        .await;
-                    }
-
-                    let result = turn_runner
-                        .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
-                        .await;
-
-                    match result {
-                        TurnResult::Responded { .. } => {
-                            // LLM produced text, turn is complete
-                            break;
-                        }
-                        TurnResult::UsedTools { .. } => {
-                            // Truncation of tool outputs is handled inside
-                            // TurnRunner::run_with_filter now. Nothing to do
-                            // here — just loop back for the next LLM call.
-                            continue;
-                        }
-                        TurnResult::Failed(e) => {
-                            let _ = turn_tx.send(TurnEvent::Error(e));
-                            break;
-                        }
-                        TurnResult::Cancelled => {
-                            break;
-                        }
-                    }
-                }
-            })
-            .await;
-        });
-    }
+        None
+    };
+    let conv = conversation.clone();
+    let cancel = cancel_token.clone();
+    tokio::spawn(async move {
+        CurrentContext::scope(tel_ctx, || async move {
+            live_api::run_chat_turn_v2(conv, turn_tx, cancel, bridge_cfg, perm_rx).await;
+        })
+        .await;
+    });
 
     // Forward turn events to chat events
     let mut total_tokens = 0usize;
@@ -2935,133 +2582,6 @@ async fn process_chat_request(
         pending_permissions.unregister(&perm_session_key);
     }
     Ok(())
-}
-
-/// Build system prompt for daemon/API mode.
-///
-/// Aligned with TUI's `AgentLoop::build_system_prompt` to provide the same
-/// capabilities (model identity, layered instructions, memory, git snapshot,
-/// full rules). The only omission is plan mode (not applicable in API mode).
-///
-/// This function is self-contained — it does NOT touch any TUI code path.
-pub(crate) fn build_api_system_prompt(
-    working_dir: &PathBuf,
-    _config: &Config,
-    provider_config: &atomcode_core::config::provider::ProviderConfig,
-    skill_registry: &Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
-) -> String {
-    // Respect user's custom system_prompt override (same as TUI).
-    let rules = if let Some(custom) = provider_config.system_prompt.as_deref() {
-        custom.to_string()
-    } else {
-        atomcode_core::config::prompt_sections::build_rules().to_string()
-    };
-
-    // Environment metadata
-    let shell = if cfg!(target_os = "windows") {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
-    } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
-    };
-    let env_info = format!("Platform: {} | Shell: {}", std::env::consts::OS, shell);
-
-    // Identity: inject model name so the model correctly identifies itself.
-    let model_display = &provider_config.model;
-
-    // Assemble prompt: identity + env → rules LAST (recency effect).
-    let mut prompt = format!(
-        "You are AtomCode. When asked who you are, say you are AtomCode \
-         (an AI coding agent by AtomGit) running the {} model. \
-         Never claim to be another product.\n\
-         Working directory: {wd}\n\
-         All file paths in tool calls must be absolute, resolved under {wd}. \
-         Verify file existence before editing.\n{env_info}\n",
-        model_display,
-        wd = working_dir.display(),
-        env_info = env_info,
-    );
-
-    // Git commit attribution (Co-Authored-By trailer).
-    prompt.push_str(&format!(
-        "\n=== GIT COMMITS ===\n\
-         When you create a git commit on the user's behalf, end the commit \
-         message with this trailer (preceded by a blank line):\n\
-         \n\
-         Co-Authored-By: AtomCode ({}) <noreply@atomgit.com>\n\
-         \n\
-         Use a HEREDOC for `git commit -m` so the trailer's blank line is \
-         preserved verbatim. Skip this trailer for `git commit --amend` \
-         and `git revert` (those operate on existing commits whose \
-         attribution shouldn't change).\n",
-        model_display
-    ));
-
-    // Layered instructions (global → project → user).
-    // Pure file reads, no side effects, < 1ms.
-    let instructions = atomcode_core::config::instructions::LayeredInstructions::load(working_dir);
-    let merged_instructions = instructions.merged();
-    if !merged_instructions.is_empty() {
-        prompt.push_str(&format!("\n{}\n", merged_instructions));
-    }
-
-    // Persistent memory (global + project).
-    // Pure file reads, no side effects.
-    {
-        use atomcode_core::config::memory::MemoryStore;
-        let project_name = working_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string());
-        let global = MemoryStore::global();
-        let project = MemoryStore::project(working_dir);
-        let memory_block = MemoryStore::merged_for_prompt(&global, &project, &project_name);
-        if !memory_block.is_empty() {
-            prompt.push_str(&format!("\n{}\n", memory_block));
-        }
-    }
-
-    // Available skills
-    if let Ok(registry) = skill_registry.read() {
-        let skills: Vec<String> = registry
-            .invocable_by_llm()
-            .map(|s| {
-                let hint = s
-                    .argument_hint
-                    .as_ref()
-                    .map(|h| format!(" {}", h))
-                    .unwrap_or_default();
-                format!("- /{}{}: {}", s.name, hint, s.description)
-            })
-            .collect();
-        if !skills.is_empty() {
-            prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
-            prompt.push_str(
-                "Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
-            );
-            prompt.push_str(&skills.join("\n"));
-            prompt.push('\n');
-        }
-    }
-
-    // Git snapshot (branch / HEAD / status).
-    // Blocking I/O (~30ms) — acceptable per chat request since this runs once
-    // at prompt construction time, not on a hot path.
-    let env_snapshot = atomcode_core::ctx::EnvSnapshot::capture(working_dir);
-    prompt.push_str(&env_snapshot.as_prompt_section());
-
-    // RULES GO LAST — recency effect ensures the model remembers these.
-    prompt.push_str(&format!(
-        "\n=== RULES (follow these strictly) ===\n{rules}\n"
-    ));
-
-    // Platform-specific rules (Windows path conventions, etc.)
-    let platform = atomcode_core::config::platform_rules();
-    if !platform.is_empty() {
-        prompt.push_str(platform);
-        prompt.push('\n');
-    }
-
-    prompt
 }
 
 /// Request to stop a chat session
@@ -4031,7 +3551,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         chat_tasks: Arc::new(RwLock::new(HashMap::new())),
         stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
         mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
-        mcp_cache: Arc::new(RwLock::new(HashMap::new())),
         login_sessions: Arc::new(RwLock::new(HashMap::new())),
         telemetry: telemetry.clone(),
         repo_origin: repo_origin.clone(),
