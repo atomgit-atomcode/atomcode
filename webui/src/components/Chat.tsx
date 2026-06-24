@@ -499,6 +499,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 把 sync 状态写回 URL 的 ?sync 参数，使刷新后能保持当前开/关状态
+  // （否则关掉同步后 URL 仍带 sync=1，刷新一下又被重新开启 —— issue #816）。
+  // 覆盖所有改变 sync 的入口：toggleSync、以及实时流出错时的自动关闭。
+  // 用 replaceState 避免在浏览器历史里堆积条目。
+  useEffect(() => {
+    try {
+      const url = new URL(location.href);
+      if (sync) url.searchParams.set('sync', '1');
+      else url.searchParams.delete('sync');
+      history.replaceState(history.state, '', url.toString());
+    } catch { /* URL/history 不可用时忽略 */ }
+  }, [sync]);
+
   // ── Shared history → display conversion (reused by session load AND live snapshot) ──
   function sessionMessagesToDisplay(msgs: SessionMessage[]): Message[] {
     const loaded: Message[] = [];
