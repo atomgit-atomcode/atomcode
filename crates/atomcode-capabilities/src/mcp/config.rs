@@ -54,6 +54,13 @@ pub struct McpServerConfig {
     pub config: McpTransportConfig,
     /// Where this server config was loaded from (user-level or project-level).
     pub source: McpConfigSource,
+    /// `trust: true` in the config ⇒ every tool from this server is auto-approved
+    /// (the approval prompt is skipped). MCP servers are external code, so this is
+    /// OPT-IN per server.
+    pub trust: bool,
+    /// Per-tool auto-approve allowlist (the `autoApprove` array): bare tool names
+    /// (e.g. `["query", "search"]`) whose calls skip the approval prompt.
+    pub auto_approve: Vec<String>,
 }
 
 /// Configuration source for a server.
@@ -103,6 +110,12 @@ struct McpServerEntry {
     auth: Option<McpAuthEntry>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// `trust: true` ⇒ auto-approve every tool from this server (skip the prompt).
+    #[serde(default)]
+    trust: bool,
+    /// `autoApprove: ["query", ...]` ⇒ per-tool auto-approve allowlist.
+    #[serde(default, rename = "autoApprove", alias = "auto_approve")]
+    auto_approve: Vec<String>,
 }
 
 use serde::Deserialize;
@@ -186,6 +199,8 @@ fn load_config_file(path: &Path, source: McpConfigSource) -> Result<Vec<McpServe
 }
 
 fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServerConfig> {
+    let trust = entry.trust;
+    let disabled = entry.disabled;
     let transport = if let Some(command) = entry.command {
         McpTransportConfig::Stdio {
             command: expand_tilde(&expand_env_vars(&command)),
@@ -229,9 +244,11 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
 
     Ok(McpServerConfig {
         name: name.to_string(),
-        disabled: entry.disabled,
+        disabled,
         config: transport,
         source: McpConfigSource::Project, // default; overwritten by load_config_file
+        trust,
+        auto_approve: entry.auto_approve,
     })
 }
 
@@ -539,6 +556,29 @@ mod tests {
         let raw: McpConfigFile =
             serde_json::from_str(r#"{"mcpServers":{"a":{"command":"echo","args":[]}}}"#).unwrap();
         assert!(raw.mcp_servers.contains_key("a"));
+    }
+
+    #[test]
+    fn parses_trust_and_auto_approve_from_mcp_json() {
+        // The exact shapes from the bug report — both must be honored, not dropped.
+        let raw: McpConfigFile = serde_json::from_str(
+            r#"{"mcpServers":{"my-docs":{"command":"my-docs-server","trust":true,"autoApprove":["query","search"]}}}"#,
+        )
+        .unwrap();
+        let (name, entry) = raw.mcp_servers.into_iter().next().unwrap();
+        let cfg = server_entry_to_config(&name, entry).unwrap();
+        assert!(cfg.trust, "trust:true must be parsed");
+        assert_eq!(cfg.auto_approve, vec!["query".to_string(), "search".to_string()]);
+    }
+
+    #[test]
+    fn trust_and_auto_approve_default_off_when_absent() {
+        let raw: McpConfigFile =
+            serde_json::from_str(r#"{"mcpServers":{"s":{"url":"http://127.0.0.1:8080/mcp"}}}"#).unwrap();
+        let (name, entry) = raw.mcp_servers.into_iter().next().unwrap();
+        let cfg = server_entry_to_config(&name, entry).unwrap();
+        assert!(!cfg.trust);
+        assert!(cfg.auto_approve.is_empty());
     }
 
     #[test]
