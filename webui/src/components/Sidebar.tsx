@@ -439,6 +439,8 @@ export function Sidebar({
 
   // Skills menu is fixed-positioned (so the action row's container can't clip
   // it); close on outside click / scroll / resize.
+  // Scroll events originating inside the menu itself are ignored so the user
+  // can scroll the list without the menu closing.
   useEffect(() => {
     if (!skillsMenuOpen) return;
     const close = () => setSkillsMenuOpen(false);
@@ -448,13 +450,17 @@ export function Sidebar({
       if (skillsBtnRef.current?.contains(el)) return;
       close();
     };
+    const onScroll = (e: Event) => {
+      if (skillsMenuRef.current?.contains(e.target as Node)) return;
+      close();
+    };
     document.addEventListener('mousedown', onDown);
     window.addEventListener('resize', close);
-    window.addEventListener('scroll', close, true);
+    window.addEventListener('scroll', onScroll, true);
     return () => {
       document.removeEventListener('mousedown', onDown);
       window.removeEventListener('resize', close);
-      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('scroll', onScroll, true);
     };
   }, [skillsMenuOpen]);
 
@@ -491,6 +497,8 @@ export function Sidebar({
   }, []);
 
   // MCP menu is fixed-positioned; close on outside click / scroll / resize.
+  // Scroll events originating inside the menu itself are ignored so the user
+  // can scroll the list without the menu closing.
   useEffect(() => {
     if (!mcpMenuOpen) return;
     const close = () => setMcpMenuOpen(false);
@@ -500,13 +508,17 @@ export function Sidebar({
       if (mcpBtnRef.current?.contains(el)) return;
       close();
     };
+    const onScroll = (e: Event) => {
+      if (mcpMenuRef.current?.contains(e.target as Node)) return;
+      close();
+    };
     document.addEventListener('mousedown', onDown);
     window.addEventListener('resize', close);
-    window.addEventListener('scroll', close, true);
+    window.addEventListener('scroll', onScroll, true);
     return () => {
       document.removeEventListener('mousedown', onDown);
       window.removeEventListener('resize', close);
-      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('scroll', onScroll, true);
     };
   }, [mcpMenuOpen]);
 

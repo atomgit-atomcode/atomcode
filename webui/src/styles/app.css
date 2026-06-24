@@ -425,6 +425,68 @@ body {
   white-space: pre-wrap;
 }
 
+/* === Todo task list === */
+/* The `todo` tool renders as a live checklist panel (☑/▸/☐) instead of a plain
+   tool row — mirrors the TUI / Claude Code task-progress widget. */
+.todo-panel {
+  border: 1px solid var(--app-primary-border-color);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-tool-background, var(--app-secondary-background));
+  padding: 8px 10px;
+  margin: 2px 0;
+}
+
+.todo-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--app-secondary-foreground);
+  margin-bottom: 6px;
+}
+
+.todo-panel-title { flex: 1; min-width: 0; }
+
+.todo-panel-count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  opacity: 0.8;
+}
+
+.todo-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.todo-item {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--app-primary-foreground);
+}
+
+.todo-mark { flex-shrink: 0; font-size: 12px; }
+
+.todo-text { min-width: 0; word-break: break-word; }
+
+.todo-item.completed .todo-mark { color: var(--app-success-foreground); }
+.todo-item.completed .todo-text {
+  text-decoration: line-through;
+  color: var(--app-secondary-foreground);
+}
+
+.todo-item.in_progress .todo-mark { color: var(--app-accent-color, var(--app-brand)); }
+.todo-item.in_progress .todo-text { font-weight: 600; }
+
+.todo-item.pending .todo-mark { color: var(--app-secondary-foreground); }
+
 .streaming-cursor {
   display: inline-block;
   width: 7px;
@@ -1376,12 +1438,14 @@ body {
 .settings-menu { min-width: 180px; }
 
 /* Skills popup (opens downward below the sidebar Skills action). */
-.skills-menu { max-height: 320px; overflow-y: auto; max-width: 320px; }
+.skills-menu { max-height: 320px; overflow-y: auto; max-width: 320px; min-height: 0; }
 .skills-menu-row {
   display: flex;
   flex-direction: column;
   gap: 1px;
   width: 100%;
+  min-height: 0;
+  flex-shrink: 0;
   padding: 6px 10px;
   border: none;
   border-radius: var(--corner-radius-small);
@@ -1406,12 +1470,14 @@ body {
 }
 
 /* MCP popup (opens downward below the sidebar MCP action). */
-.mcp-menu { max-height: 360px; overflow-y: auto; max-width: 340px; }
+.mcp-menu { max-height: 360px; overflow-y: auto; max-width: 340px; min-height: 0; }
 .mcp-menu-row {
   display: flex;
   flex-direction: column;
   gap: 2px;
   width: 100%;
+  min-height: 0;
+  flex-shrink: 0;
   padding: 6px 10px;
   border-radius: var(--corner-radius-small);
 }
