@@ -148,10 +148,30 @@ impl Tool for ReadFileTool {
             Err(e) => return err(format!("read_file: failed to read {}: {e}", path.display())),
         };
         if looks_binary(&bytes) {
-            return ok(format!("Binary file ({} bytes), cannot display as text.", bytes.len()));
+            return ok(format!(
+                "Binary file ({} bytes), cannot display as text.{}",
+                bytes.len(),
+                binary_recovery_hint(&path, &a.file_path),
+            ));
         }
 
-        let text = String::from_utf8_lossy(&bytes);
+        // Decode: prefer UTF-8; fall back to GB18030 (GBK/GB2312 superset) for text-ish
+        // extensions. Chinese Windows editors write .txt/.md/.csv as GBK, which a lossy
+        // UTF-8 decode would mangle into replacement chars (mojibake). If neither decodes,
+        // treat it as binary and hand back a recovery hint.
+        let text: std::borrow::Cow<str> = match std::str::from_utf8(&bytes) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(_) => match decode_non_utf8_text(&path, &bytes) {
+                Some(s) => std::borrow::Cow::Owned(s),
+                None => {
+                    return ok(format!(
+                        "Binary file ({} bytes), cannot display as text.{}",
+                        bytes.len(),
+                        binary_recovery_hint(&path, &a.file_path),
+                    ))
+                }
+            },
+        };
         let lines: Vec<&str> = text.lines().collect();
         let total = lines.len();
 
@@ -190,6 +210,108 @@ impl Tool for ReadFileTool {
         }
         ok(out)
     }
+}
+
+/// Text-ish extensions worth trying a GBK/GB18030 decode for when UTF-8 fails.
+/// A binary file with one of these would already have tripped `looks_binary`,
+/// so this gate just avoids feeding genuine binary blobs to the decoder.
+const GBK_CANDIDATE_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "csv", "tsv", "log", "sql", "ini", "conf", "cfg", "toml", "yaml",
+    "yml", "html", "htm", "xml", "json", "js", "ts", "css", "py", "rb", "go", "rs", "c", "h",
+    "cpp", "hpp", "java", "kt", "sh", "bat", "ps1",
+];
+
+fn has_text_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            GBK_CANDIDATE_EXTENSIONS.iter().any(|t| *t == e)
+        })
+        .unwrap_or(false)
+}
+
+/// Attempt to decode a file that failed UTF-8 validation. Tries GB18030 (superset of
+/// GBK/GB2312) only, and only for text-ish extensions — that's ~100% of the real-world
+/// miss we've seen on Chinese Windows `.txt`. Returns `None` for everything else so the
+/// caller emits the recovery hint instead of mojibake.
+fn decode_non_utf8_text(path: &std::path::Path, bytes: &[u8]) -> Option<String> {
+    if !has_text_extension(path) {
+        return None;
+    }
+    let (decoded, _, had_errors) = encoding_rs::GB18030.decode(bytes);
+    if had_errors {
+        return None;
+    }
+    Some(decoded.into_owned())
+}
+
+/// Build a recovery hint for a file that couldn't be decoded as text. Lets the model
+/// pivot to an external converter (pandoc / pdftotext / unzip for .docx) on the first
+/// failure instead of cycling through offset/limit values for 30 turns.
+fn binary_recovery_hint(path: &std::path::Path, full_path_str: &str) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let q = shell_quote(full_path_str);
+    match ext.as_str() {
+        "doc" => format!(
+            "\n\n[Recovery] This is a legacy Word (.doc) binary. Run one of:\n\
+             - bash: `antiword {q}`\n\
+             - bash: `pandoc {q} -t plain`\n\
+             - bash: `catdoc {q}`"
+        ),
+        "docx" => format!(
+            "\n\n[Recovery] This is a modern Word (.docx) — a zip containing XML. Run:\n\
+             - bash: `unzip -p {q} word/document.xml | sed 's/<[^>]*>//g'`\n\
+             - or: `pandoc {q} -t plain`"
+        ),
+        "xls" => format!(
+            "\n\n[Recovery] Legacy Excel (.xls). Run:\n\
+             - bash: `libreoffice --headless --convert-to csv --outdir /tmp {q} && cat /tmp/*.csv`"
+        ),
+        "xlsx" => format!(
+            "\n\n[Recovery] Modern Excel (.xlsx). Run:\n\
+             - bash: `libreoffice --headless --convert-to csv --outdir /tmp {q} && cat /tmp/*.csv`\n\
+             - or: `unzip -p {q} xl/sharedStrings.xml` (raw string table)"
+        ),
+        "ppt" | "pptx" => format!(
+            "\n\n[Recovery] PowerPoint. Run:\n\
+             - bash: `pandoc {q} -t plain`"
+        ),
+        "pdf" => format!(
+            "\n\n[Recovery] PDF. Run:\n\
+             - bash: `pdftotext {q} -` (poppler)\n\
+             - or: `mutool draw -F txt {q}`"
+        ),
+        "rtf" => format!(
+            "\n\n[Recovery] RTF. Run:\n\
+             - bash: `pandoc {q} -t plain`\n\
+             - or: `unrtf --text {q}`"
+        ),
+        _ => "\n\n[Hint] The file is not UTF-8 and not a recognised text extension. \
+             If it's text in another encoding, ask the user; if it's a packaged format \
+             (archive, installer, media), there is no point reading it as text."
+            .to_string(),
+    }
+}
+
+/// Minimal shell-quoter for embedding a path in a bash command suggestion.
+/// POSIX single-quoted form: wraps in `'`, escapes any existing `'` as `'\''`.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str(r"'\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 #[cfg(test)]
@@ -251,6 +373,32 @@ mod tests {
         let r = ReadFileTool.execute(r#"{"file_path":"b.bin"}"#, &ctx(d.path())).await;
         assert!(!r.is_error);
         assert!(r.content.starts_with("Binary file"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn decodes_gbk_text_file() {
+        // Chinese Windows editors write .txt/.md as GBK/GB18030, not UTF-8.
+        // from_utf8_lossy would mangle these into replacement chars (mojibake);
+        // a GB18030 fallback must recover the original text.
+        let d = tempfile::tempdir().unwrap();
+        let (gbk, _, had_err) = encoding_rs::GB18030.encode("你好，世界");
+        assert!(!had_err);
+        std::fs::write(d.path().join("notes.txt"), &gbk).unwrap();
+        let r = ReadFileTool.execute(r#"{"file_path":"notes.txt"}"#, &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("你好，世界"), "GBK should decode, got: {}", r.content);
+    }
+
+    #[tokio::test]
+    async fn binary_file_includes_recovery_hint() {
+        // A binary with a recognised document extension should pivot the model to an
+        // external converter on the first failure, not leave it cycling offset/limit.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("report.pdf"), b"%PDF-1.4\0\0\0binary blob").unwrap();
+        let r = ReadFileTool.execute(r#"{"file_path":"report.pdf"}"#, &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.starts_with("Binary file"), "{}", r.content);
+        assert!(r.content.contains("pdftotext"), "pdf recovery hint, got: {}", r.content);
     }
 
     #[tokio::test]
