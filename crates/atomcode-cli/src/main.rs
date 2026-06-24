@@ -1668,14 +1668,7 @@ async fn run() -> Result<i32> {
                     false, // headless ⇒ keep the fail-closed approval timeout
                 );
                 let coding_cfg = atomcode_shell::coding_config(&bcfg);
-                let opts = atomcode_coding::PrepareOptions {
-                    session: atomcode_coding::SessionMode::Fresh,
-                    skill_dirs: None,
-                    mcp: true,
-                    memory: true,
-                    web: true,
-                    review: true,
-                };
+                let opts = atomcode_coding::PrepareOptions::default();
                 let factory = atomcode_shell::provider_factory();
                 match atomcode_coding::CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory)
                     .await
@@ -1896,14 +1889,7 @@ fn spawn_native_tui(
         true,
     );
     let coding_cfg = atomcode_shell::coding_config(&bcfg);
-    let opts = atomcode_coding::PrepareOptions {
-        session: atomcode_coding::SessionMode::Fresh,
-        skill_dirs: None,
-        mcp: bcfg.mcp,
-        memory: true,
-        web: true,
-        review: true,
-    };
+    let opts = atomcode_coding::PrepareOptions::default();
     let factory = atomcode_shell::provider_factory();
     let handle =
         atomcode_tuix::spawn_native_runtime(coding_cfg, opts, factory, dangerously_skip_permissions);

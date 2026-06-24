@@ -327,14 +327,7 @@ impl TurnExecutor for KernelTurnExecutor {
                 return;
             };
             let coding_cfg = atomcode_shell::coding_config(&bcfg);
-            let opts = PrepareOptions {
-                session: SessionMode::Fresh,
-                skill_dirs: None,
-                mcp: true,
-                memory: true,
-                web: true,
-                review: true,
-            };
+            let opts = PrepareOptions::default();
             let factory = atomcode_shell::provider_factory();
             match CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory).await {
                 Ok(rt) => {
@@ -705,14 +698,7 @@ pub(crate) async fn run_chat_turn_v2(
     // A fresh NATIVE runtime for this /chat turn (no persistent state — the caller owns
     // persistence). coding_config + provider_factory come from atomcode-shell (shared mapping).
     let coding_cfg = atomcode_shell::coding_config(&bridge_cfg);
-    let opts = PrepareOptions {
-        session: SessionMode::Fresh,
-        skill_dirs: None,
-        mcp: true,
-        memory: true,
-        web: true,
-        review: true,
-    };
+    let opts = PrepareOptions::default();
     let factory = atomcode_shell::provider_factory();
     let mut rt = match CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory).await {
         Ok(rt) => rt,

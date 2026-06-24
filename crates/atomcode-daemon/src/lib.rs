@@ -2355,12 +2355,8 @@ async fn process_chat_request(
             tool_calls: 0,
             session_id: session.id.to_string(),
         });
-        // Turn never ran. No permission responder has been registered yet (that
-        // happens when the turn task spawns below), so this unregister is a harmless
-        // no-op — kept for symmetry with the normal-completion cleanup.
-        if interactive_permission {
-            pending_permissions.unregister(&perm_session_key);
-        }
+        // Turn never ran; the permission responder is only registered when the turn
+        // task spawns (below), so there is nothing to unregister here.
         return Ok(());
     }
 
