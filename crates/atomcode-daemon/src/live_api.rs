@@ -1,36 +1,24 @@
 //! LiveSession 的 daemon 侧：独立 turn 构造 + 真实 TurnExecutor + /live 端点。
 //! 不依赖也不修改 process_chat_request / `/chat`（以少量重复换 /chat 零回归）。
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::live::{LiveEvent, TurnExecutor, TurnState, UserInput};
-use atomcode_core::lsp::manager::build_lsp_manager;
-use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
-use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::PermissionDecision;
-use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::turn::event::{TurnEvent, TurnResult};
-use atomcode_core::turn::permission::{
-    ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
-    PermissionDecider,
-};
-use atomcode_core::turn::runner::TurnRunner;
+use atomcode_core::turn::event::TurnEvent;
 use atomcode_coding::{
     CodingAgentConfig, CodingRuntime, PrepareOptions, ProviderFactory, SessionMode,
 };
 use atomcode_telemetry::Telemetry;
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::CachedMcpRegistry;
 
 // ============================================================================
 // 进程内全局 LiveSession 持有者
@@ -43,12 +31,12 @@ static LIVE: StdMutex<Option<Arc<atomcode_core::live::LiveSession>>> = StdMutex:
 static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
 
 /// 当前 LiveSession 选中的 provider（模型）。None=用 config.default_provider。
-/// webui 每次 /live/message 带上 provider 时更新；DaemonTurnExecutor::run_turn 每轮读取，
+/// webui 每次 /live/message 带上 provider 时更新；KernelTurnExecutor::run_turn 每轮读取，
 /// 因此在 sync/live 模式下切换模型才能对下一轮生效（执行器是 Arc<dyn> 不可变，故用进程级覆盖）。
 static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
 
 /// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
-/// live_message / live_stream 端点写入；DaemonTurnExecutor::run_turn 读取后设置
+/// live_message / live_stream 端点写入；KernelTurnExecutor::run_turn 读取后设置
 /// CurrentContext.mode，确保 live 路径发出的遥测事件携带正确的 client 来源。
 static LIVE_MODE: StdMutex<Option<atomcode_telemetry::SessionMode>> = StdMutex::new(None);
 
@@ -102,23 +90,6 @@ fn live_current_provider() -> String {
         .unwrap_or_default()
 }
 
-/// 进程级共享 MCP 缓存（供 TUI 侧 ensure_live_session 使用，无需 AppState）。
-static LIVE_MCP_CACHE: OnceLock<
-    Arc<
-        tokio::sync::RwLock<
-            std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>,
-        >,
-    >,
-> = OnceLock::new();
-
-fn live_mcp_cache(
-) -> Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>>
-{
-    LIVE_MCP_CACHE
-        .get_or_init(|| Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))
-        .clone()
-}
-
 /// 取当前活动 LiveSession（无则 None）。供 TUI（同进程）附着用。
 pub fn current_live_session() -> Option<Arc<atomcode_core::live::LiveSession>> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -139,7 +110,6 @@ pub fn ensure_live_session(
     // TUI 调用方传入的是已在内存里的 ctx.current_session.messages，直接用闭包包一层即可。
     ensure_live_session_global(
         working_dir,
-        live_mcp_cache(),
         telemetry,
         session_id,
         move || (initial_messages, Vec::new()),
@@ -154,11 +124,6 @@ pub fn ensure_live_session(
 /// 求值。复用既有会话时根本不会调用，从而避免 webui 每条消息都为被丢弃的历史读盘。
 pub(crate) fn ensure_live_session_global(
     working_dir: std::path::PathBuf,
-    mcp_cache: Arc<
-        tokio::sync::RwLock<
-            std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>,
-        >,
-    >,
     telemetry: Arc<atomcode_telemetry::Telemetry>,
     session_id: Option<atomcode_core::session::SessionId>,
     initial_session: impl FnOnce() -> (
@@ -192,25 +157,15 @@ pub(crate) fn ensure_live_session_global(
     let session_id = session_id.unwrap_or_default();
     // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
     *LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
-    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = if live_engine_v2() {
-        eprintln!("[engine v2] daemon live turns on the new stack");
-        Arc::new(KernelTurnExecutor::new(
-            working_dir,
-            None,
-            false,
-            session_id,
-            telemetry,
-        ))
-    } else {
-        Arc::new(DaemonTurnExecutor {
-            working_dir,
-            provider_name: None,
-            mcp_cache,
-            telemetry,
-            auto_approve: false,
-            session_id,
-        })
-    };
+    // The daemon's live turns run NATIVELY on the new stack (kernel + capabilities +
+    // coding) via the KernelTurnExecutor — the v1 DaemonTurnExecutor is gone.
+    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(KernelTurnExecutor::new(
+        working_dir,
+        None,
+        false,
+        session_id,
+        telemetry,
+    ));
     // 历史在锁内、确认要建会话后才求值——既省掉无谓读盘，也避免「锁外判定、锁内已被
     // 别的请求替换」的 TOCTOU：是否新建与用什么历史新建是同一临界区里的决定。
     let (initial_messages, cold_summaries) = initial_session();
@@ -231,404 +186,15 @@ fn live_session_id_or_unknown() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// All components needed to run one agent turn.
-pub(crate) struct TurnParts {
-    pub provider: Arc<dyn atomcode_core::provider::LlmProvider>,
-    pub tools: Arc<ToolRegistry>,
-    pub context: ToolContext,
-    pub config: Config,
-    pub ctx: Arc<dyn atomcode_core::ctx::CtxBuilder>,
-    pub system_prompt: String,
-}
-
-/// 独立构造 turn 组件（与 process_chat_request 等价，但不复用其代码）。
-/// `provider_name` 为 None 时用 config.default_provider。
-pub(crate) async fn build_turn_parts(
-    working_dir: &Path,
-    provider_name: Option<&str>,
-    mcp_cache: &Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
-    telemetry: Arc<Telemetry>,
-) -> anyhow::Result<TurnParts> {
-    use atomcode_core::tool::{
-        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
-        read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
-        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
-    };
-
-    // Load config
-    let config_path = Config::default_path();
-    let config = Config::load(&config_path)?;
-
-    // Determine provider
-    let resolved_provider_name = provider_name
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| config.default_provider.clone());
-    let provider_config = config
-        .providers
-        .get(&resolved_provider_name)
-        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved_provider_name))?;
-
-    // Create provider instance
-    let provider = provider::create_provider(provider_config)?;
-
-    // Build tool context — use "live" as session-id label
-    let mut tool_context =
-        ToolContext::with_telemetry(working_dir.to_path_buf(), "live", telemetry);
-
-    let mut tool_registry = ToolRegistry::new();
-
-    // Honour ATOMCODE_DISABLE_TOOLS env var (same logic as process_chat_request)
-    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let enabled = |name: &str| !disabled_tools.contains(name);
-
-    if enabled("read_file") {
-        tool_registry.register_sync(Box::new(ReadFileTool));
-    }
-    if enabled("write_file") {
-        tool_registry.register_sync(Box::new(WriteFileTool));
-    }
-    if enabled("edit_file") {
-        tool_registry.register_sync(Box::new(EditFileTool));
-    }
-    if enabled("bash") {
-        tool_registry.register_sync(Box::new(BashTool));
-    }
-    if enabled("grep") {
-        tool_registry.register_sync(Box::new(GrepTool));
-    }
-    if enabled("glob") {
-        tool_registry.register_sync(Box::new(GlobTool));
-    }
-    if enabled("list_directory") {
-        tool_registry.register_sync(Box::new(ListDirTool));
-    }
-    if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
-    }
-    if enabled("web_fetch") {
-        tool_registry.register_sync(Box::new(WebFetchTool));
-    }
-    if enabled("search_replace") {
-        tool_registry.register_sync(Box::new(SearchReplaceTool));
-    }
-    if enabled("todo") {
-        tool_registry.register_sync(Box::new(TodoTool::new()));
-    }
-
-    // Load skills and register use_skill tool
-    let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
-    skill_registry.reload(working_dir);
-    let has_skills = !skill_registry.is_empty();
-    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
-    if has_skills && enabled("use_skill") {
-        tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
-            registry: skill_registry.clone(),
-        }));
-    }
-
-    // Register MCP tools using per-project cache (same pattern as process_chat_request)
-    let working_dir_buf = working_dir.to_path_buf();
-    let mcp_registry: Arc<McpRegistry> = {
-        let cache = mcp_cache.read().await;
-        if let Some(cached) = cache.get(&working_dir_buf) {
-            cached.registry.clone()
-        } else {
-            drop(cache);
-            // Cache miss — create new registry for this project
-            let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir_buf));
-            new_registry
-                .wait_for_initial_connections(Duration::from_secs(5))
-                .await;
-            // Store in cache
-            let mut cache = mcp_cache.write().await;
-            // Evict LRU if cache is full
-            if cache.len() >= crate::MCP_CACHE_MAX {
-                if let Some(oldest_key) = cache
-                    .iter()
-                    .min_by_key(|(_, v)| v.last_used)
-                    .map(|(k, _)| k.clone())
-                {
-                    cache.remove(&oldest_key);
-                }
-            }
-            cache.insert(
-                working_dir_buf.clone(),
-                CachedMcpRegistry {
-                    registry: new_registry.clone(),
-                    last_used: std::time::Instant::now(),
-                },
-            );
-            new_registry
-        }
-    };
-    // Update last_used timestamp
-    {
-        let mut cache = mcp_cache.write().await;
-        if let Some(entry) = cache.get_mut(&working_dir_buf) {
-            entry.last_used = std::time::Instant::now();
-        }
-    }
-    let mcp_tools = mcp_registry.list_all_tools().await;
-    if !mcp_tools.is_empty() {
-        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
-    }
-
-    // Build LSP manager from config and inject into ToolContext.
-    let lsp_manager = build_lsp_manager(&config.lsp, working_dir);
-    if lsp_manager.is_some() && enabled("diagnostics") {
-        tool_registry.register_sync(Box::new(DiagnosticsTool));
-    }
-    tool_context.lsp = lsp_manager;
-
-    // Build ctx for the RESOLVED provider (not default) so context-window /
-    // truncation matches the model actually being called when a non-default
-    // provider is selected. (process_chat_request uses default here; build_turn_parts
-    // exposes provider_name explicitly, so we calibrate ctx to it.)
-    let ctx = match config.providers.get(&resolved_provider_name) {
-        Some(pc) => atomcode_core::ctx::for_provider(pc),
-        None => {
-            atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
-                provider_type: String::new(),
-                api_key: None,
-                model: String::new(),
-                base_url: None,
-                system_prompt: None,
-                user_agent: None,
-                context_window: 128_000,
-                max_tokens: None,
-                thinking_type: None,
-                thinking_keep: None,
-                reasoning_history: None,
-                reasoning_effort: None,
-                thinking_enabled: None,
-                thinking_budget: None,
-                skip_tls_verify: false,
-                ephemeral: true,
-            })
-        }
-    };
-
-    // Build system prompt
-    let system_prompt =
-        crate::build_api_system_prompt(&working_dir_buf, &config, provider_config, &skill_registry);
-
-    Ok(TurnParts {
-        provider: provider.into(),
-        tools: Arc::new(tool_registry),
-        context: tool_context,
-        config,
-        ctx,
-        system_prompt,
-    })
-}
-
-/// 真实执行器：每个 turn 用 build_turn_parts 建 TurnRunner，跑 turn 循环，
-/// 把 TurnRunner 的 mpsc<TurnEvent> 桥接成 LiveEvent::Turn 广播。
-pub(crate) struct DaemonTurnExecutor {
-    pub working_dir: PathBuf,
-    pub provider_name: Option<String>,
-    pub mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
-    pub telemetry: Arc<Telemetry>,
-    /// 阶段②：自动批准（true=BypassAll），便于多 tab 验证；阶段③改交互式审批。
-    pub auto_approve: bool,
-    /// 稳定的 session_id：进程内唯一，每轮落盘时覆盖同一文件（一会话=一条记录）。
-    pub session_id: atomcode_core::session::SessionId,
-}
-
-#[async_trait]
-impl TurnExecutor for DaemonTurnExecutor {
-    /// 非视觉主模型 + 带图时经 VL 把图转文字（原图保留用于缩略图）。在 coordinator
-    /// 追加用户消息前调用，TUI / webui 共享。provider 解析与 `run_turn` 同源
-    /// （LIVE_PROVIDER 优先，回退执行器默认）。
-    async fn preprocess_input(&self, input: UserInput) -> UserInput {
-        if input.images.is_empty() {
-            return input;
-        }
-        let live_provider = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
-        let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
-        UserInput {
-            text,
-            images: input.images,
-        }
-    }
-    async fn run_turn(
-        &self,
-        conv: &Arc<Mutex<Conversation>>,
-        events: broadcast::Sender<LiveEvent>,
-        approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
-        cancel: CancellationToken,
-    ) {
-        // 优先用 webui 选中的 provider（LIVE_PROVIDER），回退到执行器默认（self.provider_name）。
-        let live_provider = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
-        let parts = match build_turn_parts(
-            &self.working_dir,
-            provider_name,
-            &self.mcp_cache,
-            self.telemetry.clone(),
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = events.send(LiveEvent::Turn(TurnEvent::Error(format!(
-                    "构造 turn 失败：{e}"
-                ))));
-                return;
-            }
-        };
-        // Build the permission decider. When interactive, mirror process_chat_request:
-        // create two channels, register the response sender into the LiveSession approver
-        // slot (so any view calling LiveSession.approve() delivers the decision here),
-        // and keep the request receiver alive for the duration of the turn (the channel
-        // must stay open so InteractivePermissionDecider::decide() can send on it without
-        // erroring; TurnRunner also emits TurnEvent::ApprovalRequested which we broadcast).
-        let (permission, _perm_req_keep): (Box<dyn PermissionDecider>, Option<_>) =
-            if self.auto_approve {
-                (
-                    Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
-                    None,
-                )
-            } else {
-                let (perm_req_tx, perm_req_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-                let (perm_resp_tx, perm_resp_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<PermissionDecision>();
-                // Register the response sender into the LiveSession approver slot.
-                // LiveSession.approve(decision) will take this sender and deliver the decision.
-                *approver.lock().await = Some(perm_resp_tx);
-                let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-                    atomcode_core::tool::PermissionStore::new(),
-                ));
-                (
-                    Box::new(InteractivePermissionDecider::new(
-                        perm_req_tx,
-                        perm_resp_rx,
-                        perm_store,
-                    )),
-                    Some(perm_req_rx),
-                )
-            };
-
-        // Load configured hooks for this session (JSON/TOML/builtins/webhooks),
-        // mirroring the TUI agent so LiveSession turns stay hook-aware.
-        let mut hook_engine = atomcode_core::hook::HookEngine::new();
-        hook_engine.load_all(&self.working_dir);
-        let mut runner = TurnRunner {
-            provider: parts.provider,
-            tools: parts.tools,
-            context: parts.context,
-            config: parts.config,
-            ctx: parts.ctx,
-            permission,
-            recently_edited_files: Vec::new(),
-            hook_engine: std::sync::Arc::new(hook_engine),
-            loop_guard: Default::default(),
-            current_turn_number: 0,
-        };
-
-        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
-        let ev2 = events.clone();
-        let forward = tokio::spawn(async move {
-            while let Some(te) = turn_rx.recv().await {
-                let _ = ev2.send(LiveEvent::Turn(te));
-            }
-        });
-
-        {
-            let mut c = conv.lock().await;
-            // 设置 telemetry mode：取 live_message 端点在 LIVE_MODE 写入的 client 来源，
-            // 使本轮 turn 内 TurnRunner 发出的遥测事件携带正确的 envelope.mode。
-            let live_mode = *LIVE_MODE.lock().unwrap_or_else(|e| e.into_inner());
-            let scope_ctx = atomcode_telemetry::CurrentContext {
-                mode: live_mode,
-                session_id: uuid::Uuid::parse_str(self.session_id.as_str()).ok(),
-                ..atomcode_telemetry::CurrentContext::current()
-            };
-            atomcode_telemetry::CurrentContext::scope(scope_ctx, || async {
-            loop {
-                // ── Context compression check before each turn ──
-                {
-                    let task_hint = c
-                        .messages
-                        .iter()
-                        .rev()
-                        .find(|m| matches!(m.role, atomcode_core::conversation::message::Role::User) && !m.synthetic)
-                        .and_then(|m| m.text())
-                        .map(|text| {
-                            if text.chars().count() > 200 {
-                                format!("TASK: {}...", text.chars().take(197).collect::<String>())
-                            } else {
-                                format!("TASK: {}", text)
-                            }
-                        });
-                    let state_hint = task_hint.as_deref();
-                    atomcode_core::agent::compression::maybe_compress_history(
-                        &*runner.ctx,
-                        &mut c,
-                        &*runner.provider,
-                        &runner.tools,
-                        &parts.system_prompt,
-                        state_hint,
-                    )
-                    .await;
-                }
-
-                let result = runner
-                    .run(&mut c, &parts.system_prompt, &turn_tx, cancel.clone())
-                    .await;
-                match result {
-                    TurnResult::UsedTools { .. } => continue,
-                    TurnResult::Responded { .. } | TurnResult::Cancelled => break,
-                    TurnResult::Failed(e) => {
-                        let _ = turn_tx.send(TurnEvent::Error(e));
-                        break;
-                    }
-                }
-            }
-            }).await;
-        }
-        drop(turn_tx);
-        let _ = forward.await;
-
-        // 每轮结束后持久化会话（稳定 id → 覆盖同一文件，一会话=一条记录）。
-        // 加载已有 session 以保留 turn_stats 等累积字段，而非每轮 Session::new()
-        // 重置为空。process_chat_request 采用相同模式复用 session 对象。
-        {
-            use atomcode_core::session::{Session, SessionManager};
-            let conv_guard = conv.lock().await;
-            let manager = SessionManager::new(&self.working_dir);
-            let mut session = manager
-                .load(&self.session_id)
-                .unwrap_or_else(|_| Session::new(self.working_dir.clone()));
-            session.id = self.session_id.clone();
-            session.update_from_conversation(&conv_guard);
-            session.auto_name_from_messages();
-            session.touch();
-            if let Err(e) = manager.save(&session) {
-                eprintln!("Warning: failed to save live session: {e}");
-            }
-        }
-    }
-}
-
 // ============================================================================
-// Engine v2: kernel-backed TurnExecutor (via atomcode-bridge)
+// Live engine: kernel-backed TurnExecutor (native CodingRuntime)
 // ============================================================================
 
-/// True when the daemon should run live turns on the NEW stack (kernel +
-/// capabilities + coding) via atomcode-bridge. The new stack is the DEFAULT now
-/// (same strangler flip as the cli); opt OUT to the legacy `DaemonTurnExecutor`
-/// with `$ATOMCODE_ENGINE=v1` (or `legacy`/`old`).
+/// True when the daemon should run on the NEW stack (kernel + capabilities + coding).
+/// The `/live` path is ALWAYS native now (the v1 DaemonTurnExecutor was deleted); this
+/// gate only still controls the `/chat` endpoint's remaining v1 TurnRunner branch
+/// (opt OUT with `$ATOMCODE_ENGINE=v1` / `legacy` / `old`), which is a follow-up to
+/// remove.
 pub(crate) fn live_engine_v2() -> bool {
     !matches!(
         std::env::var("ATOMCODE_ENGINE").ok().as_deref(),
@@ -636,12 +202,11 @@ pub(crate) fn live_engine_v2() -> bool {
     )
 }
 
-/// `TurnExecutor` backed by the new stack, presented through atomcode-bridge's
-/// legacy channel protocol. ONE bridge runtime per LiveSession (persistent across
-/// turns) so MCP/memory are prepared once, not per message. `conv` stays the
-/// source of truth: the bridge is seeded from it on the first turn, then each turn
-/// sends only the new user message and the engine's resulting snapshot is written
-/// back.
+/// `TurnExecutor` backed by the new stack, driving a kernel [`CodingRuntime`] directly
+/// (no bridge membrane). ONE runtime per LiveSession (persistent across turns) so
+/// MCP/memory are prepared once, not per message. `conv` stays the source of truth: the
+/// runtime is seeded from it on the first turn, then each turn sends only the new user
+/// message and the engine's resulting snapshot is written back.
 pub(crate) struct KernelTurnExecutor {
     working_dir: PathBuf,
     provider_name: Option<String>,
@@ -1534,7 +1099,6 @@ pub(crate) async fn live_stream(
     let load_sid = sid.clone();
     let session = ensure_live_session_global(
         working_dir,
-        live_mcp_cache(),
         state.telemetry.clone(),
         sid,
         move || match load_sid {
@@ -1602,7 +1166,7 @@ pub(crate) struct LiveMessageReq {
 /// 行为一致——同步会话把 live 路径从 `Agent::run` 切到 coordinator 后曾漏掉这一步，导致
 /// 非视觉主模型（如 deepseek-v4-flash）在 sync/live 下看不到图片。任何 config/provider
 /// 加载失败都降级为原文，不阻断发送。`provider_name` 为本轮已解析的主 provider（与
-/// `DaemonTurnExecutor::run_turn` 同源），仅用其模型名判定是否原生支持视觉。
+/// `KernelTurnExecutor::run_turn` 同源），仅用其模型名判定是否原生支持视觉。
 async fn preprocess_live_caption(
     message: &str,
     images: &[ImagePart],
@@ -1647,7 +1211,7 @@ pub(crate) async fn live_message(
     Extension(client_mode): Extension<atomcode_telemetry::SessionMode>,
     Json(req): Json<LiveMessageReq>,
 ) -> impl IntoResponse {
-    // 更新进程级 live mode，使 DaemonTurnExecutor::run_turn 能用它设置 telemetry envelope mode。
+    // 更新进程级 live mode，使 KernelTurnExecutor::run_turn 能用它设置 telemetry envelope mode。
     *LIVE_MODE.lock().unwrap() = Some(client_mode);
     let working_dir = { state.project.read().await.working_dir.clone() };
     // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
@@ -1662,7 +1226,6 @@ pub(crate) async fn live_message(
     let load_sid = sid.clone();
     let session = ensure_live_session_global(
         working_dir,
-        live_mcp_cache(),
         state.telemetry.clone(),
         sid,
         move || match load_sid {
