@@ -1435,16 +1435,20 @@ impl Bridge {
                 let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
                 self.emit(CoreEv::Error { error, snapshot: ConversationSnapshot::default() });
             }
-            // A manual `/compact` may make a slow one-shot LLM summary call; announce it
-            // so the user sees a progress line while it runs (v1 streamed the same
-            // "(compacting with LLM summary...)" text). Auto/Overflow stub silently — no
-            // LLM call, no user action to acknowledge — so they stay quiet here.
+            // The kernel emits CompactionStarted ONLY when a slow one-shot LLM summary
+            // will actually run (manual `/compact`, overflow tier 2, or auto-compaction
+            // that escalated past the high-water mark). Always show a progress line so
+            // the user isn't staring at a frozen UI during the multi-second call. A
+            // user-typed `/compact` streams it as a TextDelta (its command handler
+            // renders these inline, v1 parity); auto/overflow — which the user did not
+            // invoke — surface it as a transient Warning instead.
             KEv::CompactionStarted { trigger } => {
+                let text =
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting).into_owned();
                 if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
-                    self.emit(CoreEv::TextDelta(
-                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting)
-                            .into_owned(),
-                    ));
+                    self.emit(CoreEv::TextDelta(text));
+                } else {
+                    self.emit(CoreEv::Warning(text));
                 }
             }
             KEv::Compacted { committed, trigger, removed, bytes_before, bytes_after, .. } => {

@@ -298,7 +298,13 @@ impl CompactionStrategy for OverflowCompaction {
             // to the stub when there's nothing older than the active turn to drain).
             // This is why auto-compaction now actually reduces context instead of only
             // nibbling tool results — the prior behavior forced users to /compact by hand.
-            CompactTrigger::Auto { .. } if view.utilization >= AUTO_DRAIN_UTILIZATION => {
+            // The `auto_drain_would_help` guard prevents thrashing: if the bulk is the
+            // sacred-floor-protected first message / active turn (e.g. one over-window
+            // paste), summarizing the small drainable remainder can't cut pressure, so
+            // an LLM summary + cache-bust every turn would be pure waste — stay on stub.
+            CompactTrigger::Auto { .. }
+                if view.utilization >= AUTO_DRAIN_UTILIZATION && auto_drain_would_help(view) =>
+            {
                 self.manual_plan(view, None).await
             }
             _ => self.inner.plan(view).await,
@@ -306,8 +312,9 @@ impl CompactionStrategy for OverflowCompaction {
     }
 
     /// True only when `plan` will DRAIN old turns into a summary (the slow path) — for
-    /// a manual `/compact`, overflow tier 2, or an AUTO trigger that has crossed
-    /// `AUTO_DRAIN_UTILIZATION`. When there is nothing older than the active turn to
+    /// a manual `/compact`, overflow tier 2, or an AUTO trigger that crossed
+    /// `AUTO_DRAIN_UTILIZATION` AND whose drain would actually reduce pressure
+    /// (`auto_drain_would_help`). When there is nothing older than the active turn to
     /// drain it falls back to the fast inner stub (drain ≤ floor) and is NOT announced.
     /// CHEAP: just the same `active_turn_start` scan `manual_plan`/`overflow_plan` use.
     fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
@@ -316,9 +323,43 @@ impl CompactionStrategy for OverflowCompaction {
         match &view.trigger {
             CompactTrigger::Manual { .. } => drains,
             CompactTrigger::Overflow { attempt } => *attempt >= 2 && drains,
-            CompactTrigger::Auto { .. } => view.utilization >= AUTO_DRAIN_UTILIZATION && drains,
+            CompactTrigger::Auto { .. } => {
+                view.utilization >= AUTO_DRAIN_UTILIZATION && drains && auto_drain_would_help(view)
+            }
         }
     }
+}
+
+/// Anti-thrash guard for AUTO escalation: would draining the old (post-sacred-floor,
+/// pre-active-turn) span plausibly bring utilization back BELOW the high-water mark?
+/// Estimates the tokens that would REMAIN after the drain (the protected prefix + the
+/// active turn) by their byte share of the provider-recorded `used_tokens`. If that
+/// remainder alone still exceeds `ctx_window * AUTO_DRAIN_UTILIZATION`, summarizing the
+/// middle can't help — so an over-window single paste (un-drainable, in the sacred
+/// floor) does NOT trigger a futile LLM summary + cache-bust on every turn. Returns
+/// `true` (allow escalation) when there is no basis to estimate (window/usage unknown),
+/// matching the pre-guard behavior for the normal long-session case.
+fn auto_drain_would_help(view: &CompactionView<'_>) -> bool {
+    let floor = view.sacred_floor;
+    let drain_to = active_turn_start(view.messages, 1).max(floor);
+    if drain_to <= floor {
+        return false; // nothing drainable
+    }
+    if view.ctx_window == 0 || view.used_tokens == 0 {
+        return true; // no basis to estimate — allow (long-session default)
+    }
+    let total_bytes: usize = view.messages.iter().map(|m| m.text.len()).sum();
+    if total_bytes == 0 {
+        return false;
+    }
+    let drainable_bytes: usize =
+        view.messages[floor..drain_to].iter().map(|m| m.text.len()).sum();
+    let remaining_bytes = total_bytes.saturating_sub(drainable_bytes);
+    // Token estimate of what survives the drain, by byte share of the recorded usage.
+    let remaining_tokens =
+        (remaining_bytes as u64).saturating_mul(view.used_tokens as u64) / total_bytes as u64;
+    let mark = (view.ctx_window as f32 * AUTO_DRAIN_UTILIZATION) as u64;
+    remaining_tokens < mark
 }
 
 /// Index at which the kept window (the `keep_recent_turns` most-recent turns) begins;
@@ -776,6 +817,35 @@ mod tests {
         let plan = strat.plan(&v).await;
         assert!(plan.summary.is_none(), "moderate auto = no LLM summary");
         assert_eq!(plan.drain_to, 0, "moderate auto = no drain (stub only)");
+    }
+
+    /// Anti-thrash: when the bulk is the sacred-floor-protected FIRST user message
+    /// (the over-window-paste case), draining the small remainder can't bring
+    /// utilization down — so Auto must NOT pay an LLM summary + cache-bust every
+    /// turn. It stays on the cheap stub even though utilization is high.
+    #[tokio::test]
+    async fn auto_does_not_summarize_when_bulk_is_protected_first_message() {
+        let msgs = vec![
+            Message::system("p"),
+            // Huge first paste — protected by sacred_floor, un-drainable.
+            Message::user(&"x".repeat(5000)),
+            Message::assistant("a1", vec![]),
+            Message::user("u2"),
+            Message::assistant("a2", vec![]),
+            Message::user("u3-active"),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let strat =
+            OverflowCompaction::new(StubCompaction::default(), Some(Arc::new(CannedSummaryProvider)));
+        let v = auto_view(&conv.messages, floor, 0.95);
+        assert!(
+            !strat.will_summarize(&v),
+            "must NOT summarize when the bulk is un-drainable (anti-thrash)"
+        );
+        let plan = strat.plan(&v).await;
+        assert!(plan.summary.is_none(), "no LLM summary when draining can't reduce pressure");
     }
 
     #[tokio::test]
