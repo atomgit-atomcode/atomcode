@@ -30,6 +30,18 @@ pub struct ReviewAgentConfig {
     /// PR metadata — without copying or replacing the built-in reviewer instructions.
     /// Composes with `persona`: final prompt = (override or built-in) + "\n\n" + append.
     pub persona_append: Option<String>,
+    /// Hard cap on LLM rounds (tool-call iterations) per turn — the round safety fuse.
+    /// `None` (default) ⇒ UNLIMITED, matching the kernel's neutral default: how deep to
+    /// dig is a per-deployment perf/latency policy, NOT a library decision. Engineering
+    /// callers (e.g. a CI/PR pipeline) set a bound via `--max-rounds` to stop a model from
+    /// endlessly grepping a large repo; a bare CLI run stays unbounded.
+    pub max_rounds: Option<u32>,
+    /// Absolute wall-clock cap on the whole review turn. `None` (default) ⇒ UNLIMITED.
+    /// Enforced via the kernel's `cancel_token` seam (a timer cancels the turn on deadline),
+    /// NOT a kernel change — it's the only guard that also fires while a provider stalls
+    /// mid-stream (keepalive bytes keep `stream_timeout`'s idle timer reset). Engineering
+    /// callers set it (e.g. `--max-duration 900`); a bare CLI run stays unbounded.
+    pub max_turn_duration: Option<std::time::Duration>,
 }
 
 impl ReviewAgentConfig {
@@ -50,6 +62,8 @@ impl ReviewAgentConfig {
             request_timeout: Duration::from_secs(300),
             persona: None,
             persona_append: None,
+            max_rounds: None,
+            max_turn_duration: None,
         }
     }
 

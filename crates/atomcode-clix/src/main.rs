@@ -16,7 +16,7 @@ mod tel;
 
 use anyhow::{bail, Context, Result};
 use atomcode_kernel::agent::Agent;
-use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_review::{build_review_agent_with, Finding, ReviewAgentConfig};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -117,6 +117,18 @@ struct ReviewArgs {
     /// against a stalled provider). Raise it for slow providers / very large contexts.
     #[arg(long, default_value_t = 180)]
     stream_timeout: u64,
+    /// Hard cap on LLM rounds (tool-call iterations) for this review — the round safety
+    /// fuse. Omit ⇒ UNLIMITED. On a large repo a small diff can otherwise send the model
+    /// grepping/reading for an unbounded number of rounds; engineering callers bound it
+    /// (e.g. `--max-rounds 35`). On the cap the run stops and reports findings gathered so far.
+    #[arg(long)]
+    max_rounds: Option<u32>,
+    /// Absolute wall-clock cap (seconds) on the whole review. Omit ⇒ UNLIMITED. The only
+    /// guard that also fires while a provider stalls mid-stream (keepalive bytes defeat
+    /// `--stream-timeout`'s idle timer, and `--max-rounds` only checks at round boundaries).
+    /// On the cap the run stops and reports findings gathered so far. E.g. `--max-duration 900`.
+    #[arg(long)]
+    max_duration: Option<u64>,
     /// Emit findings as JSON instead of a human-readable report.
     #[arg(long)]
     json: bool,
@@ -162,7 +174,14 @@ async fn review(args: ReviewArgs) -> Result<()> {
         None => {
             let diff = obtain_diff(&repo, &args)?;
             if diff.trim().is_empty() {
-                println!("No changes to review.");
+                // Honor --json even on an empty diff: emit a valid EMPTY envelope, not prose.
+                // A bare "No changes" line makes downstream JSON parsers fail on `N...`; an
+                // empty diff is a clean outcome (nothing to review), not a failure.
+                if args.json {
+                    println!("{}", render_json(&[], "No changes to review.", None)?);
+                } else {
+                    println!("No changes to review.");
+                }
                 return Ok(());
             }
             let label = format!("{} changed line(s)", diff.lines().count());
@@ -254,6 +273,8 @@ async fn review(args: ReviewArgs) -> Result<()> {
     let mut cfg = ReviewAgentConfig::new(api_key, base_url, model, &repo);
     cfg.context_window = context_window;
     cfg.stream_timeout = std::time::Duration::from_secs(args.stream_timeout);
+    cfg.max_rounds = args.max_rounds;
+    cfg.max_turn_duration = args.max_duration.map(std::time::Duration::from_secs);
     // Full system-prompt override (flag text > file/stdin). None ⇒ built-in reviewer persona.
     cfg.persona = resolve_system_prompt(args.system_prompt.clone(), args.system_prompt_file.clone())?;
     // Appended sections compose after the persona: engine-injected language rules first,
@@ -323,20 +344,39 @@ async fn review(args: ReviewArgs) -> Result<()> {
     // delivered — a stall AFTER findings were collected still produced the review, so warn
     // but succeed; a failure with no findings (auth/connect/immediate stall) is a real
     // failure CI must detect.
-    if let Some(err) = run.error {
+    // Cut-short detection: an error OR a non-`Stopped` terminal (Cancelled via max-duration,
+    // Timeout, MaxRounds) means the run didn't finish on the model's own terms. If nothing was
+    // delivered, that's a real failure CI/callers must see — NEVER a clean "no issues" run
+    // (the max-duration cancel path emits Cancelled WITHOUT an error, so checking error alone
+    // would silently pass a cut-short review as clean). With findings already collected the
+    // review still produced value: warn but succeed.
+    if review_incomplete(run.stop, run.error.is_some()) {
+        let why = run.error.clone().unwrap_or_else(|| format!("{:?}", run.stop));
         if findings.is_empty() {
-            bail!("review run failed before producing findings: {err}");
+            bail!("review did not complete ({why}): no findings collected");
         }
-        eprintln!("warning: review ended early ({err}); {} finding(s) collected before it stopped", findings.len());
+        eprintln!("warning: review ended early ({why}); {} finding(s) collected before it stopped", findings.len());
     }
     Ok(())
+}
+
+/// Whether a review was CUT SHORT rather than finishing on the model's own terms: a
+/// non-`Stopped` terminal (Cancelled via max-duration / Timeout / MaxRounds) or a surfaced
+/// error. Combined with "no findings" this is a real failure — must not pass as a clean run.
+fn review_incomplete(stop: StopReason, has_error: bool) -> bool {
+    has_error || !matches!(stop, StopReason::Stopped)
 }
 
 /// Result of driving one review turn loop while live-tracing tool activity to stderr.
 #[derive(Default)]
 struct ReviewRun {
-    /// Accumulated assistant prose (the final summary).
+    /// The closing summary: assistant prose emitted AFTER the last tool call.
+    /// Cleared on every `ToolStarted` so pre-call narration never leaks in.
     text: String,
+    /// How the turn ended. `Stopped` = the model finished on its own; anything else
+    /// (Cancelled via max-duration, Timeout, MaxRounds, ProviderError) means the review
+    /// was CUT SHORT — must NOT be reported as a clean "no issues" run. Default `Stopped`.
+    stop: StopReason,
     /// Last error surfaced, if any.
     error: Option<String>,
     /// Final token usage.
@@ -345,6 +385,54 @@ struct ReviewRun {
     tool_counts: std::collections::BTreeMap<String, usize>,
     /// Total tool calls.
     tool_calls: usize,
+}
+
+impl ReviewRun {
+    /// Fold ONE agent event into the run, mutating accumulators in place.
+    /// Returns `false` once the turn is terminal (the caller then stops reading).
+    /// `call_names` maps tool-call id → name for the live stderr trace.
+    fn apply(&mut self, ev: AgentEvent, call_names: &mut std::collections::HashMap<String, String>) -> bool {
+        match ev {
+            AgentEvent::ToolStarted { call } => {
+                self.tool_calls += 1;
+                *self.tool_counts.entry(call.name.clone()).or_default() += 1;
+                call_names.insert(call.id.clone(), call.name.clone());
+                // A tool call means whatever prose came before it was pre-call narration
+                // ("let me read X…"), NOT the persona's Closing Summary. Drop it — only
+                // text emitted AFTER the last tool call survives, which is exactly the
+                // closing summary (persona §XI). Without this, every turn's narration
+                // leaked into `text` and onto the PR comment.
+                self.text.clear();
+                eprintln!("  → {} {}", call.name, tool_hint(&call.name, &call.arguments));
+            }
+            AgentEvent::ToolResult { result } => {
+                let name = call_names.get(&result.call_id).map(String::as_str).unwrap_or("tool");
+                let mark = if result.is_error { "✗" } else { "✓" };
+                eprintln!("    {mark} {name} ({} chars)", result.content.chars().count());
+            }
+            AgentEvent::TextDelta(t) => self.text.push_str(&t),
+            // Each turn emits ONE per-turn usage figure; SUM across turns for the run total.
+            // (Last-wins kept only the final turn and silently under-reported the whole
+            // agentic run — e.g. a 40-turn review looked like one 50k-prompt call.)
+            AgentEvent::Usage(meta) => {
+                let u = self.usage.get_or_insert(Default::default());
+                u.prompt += meta.tokens.prompt;
+                u.completion += meta.tokens.completion;
+                u.cached += meta.tokens.cached;
+            }
+            AgentEvent::Error { message, .. } => {
+                eprintln!("    [error] {message}");
+                self.error = Some(message);
+            }
+            AgentEvent::Warning(w) => eprintln!("    [warn] {w}"),
+AgentEvent::TurnComplete { reason } => {
+    self.stop = reason;
+    return false;
+}
+            _ => {}
+        }
+        true
+    }
 }
 
 /// Spawn the review agent, kick off the turn, and stream a live execution trace to stderr:
@@ -358,35 +446,8 @@ async fn run_review_streaming(agent: Agent, task: String) -> ReviewRun {
     let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     while let Some(ev) = handle.events.recv().await {
-        match ev {
-            AgentEvent::ToolStarted { call } => {
-                run.tool_calls += 1;
-                *run.tool_counts.entry(call.name.clone()).or_default() += 1;
-                call_names.insert(call.id.clone(), call.name.clone());
-                eprintln!("  → {} {}", call.name, tool_hint(&call.name, &call.arguments));
-            }
-            AgentEvent::ToolResult { result } => {
-                let name = call_names.get(&result.call_id).map(String::as_str).unwrap_or("tool");
-                let mark = if result.is_error { "✗" } else { "✓" };
-                eprintln!("    {mark} {name} ({} chars)", result.content.chars().count());
-            }
-            AgentEvent::TextDelta(t) => run.text.push_str(&t),
-            // Each turn emits ONE per-turn usage figure; SUM across turns for the run total.
-            // (Last-wins kept only the final turn and silently under-reported the whole
-            // agentic run — e.g. a 40-turn review looked like one 50k-prompt call.)
-            AgentEvent::Usage(meta) => {
-                let u = run.usage.get_or_insert(Default::default());
-                u.prompt += meta.tokens.prompt;
-                u.completion += meta.tokens.completion;
-                u.cached += meta.tokens.cached;
-            }
-            AgentEvent::Error { message, .. } => {
-                eprintln!("    [error] {message}");
-                run.error = Some(message);
-            }
-            AgentEvent::Warning(w) => eprintln!("    [warn] {w}"),
-            AgentEvent::TurnComplete { .. } => break,
-            _ => {}
+        if !run.apply(ev, &mut call_names) {
+            break;
         }
     }
     let _ = handle.commands.send(AgentCommand::Shutdown);
@@ -729,6 +790,48 @@ fn render_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cut_short_runs_are_incomplete() {
+        // 正常完成、无 error → 完整（可当 clean）。
+        assert!(!review_incomplete(StopReason::Stopped, false));
+        // 关键回归：max-duration 的 cancel 发 Cancelled 但 error=None——必须判为未完成，
+        // 否则 0 finding 时会被当成"审完无问题"假成功入库。
+        assert!(review_incomplete(StopReason::Cancelled, false));
+        // 其它切短终态同样未完成。
+        assert!(review_incomplete(StopReason::Timeout, false));
+        assert!(review_incomplete(StopReason::MaxRounds, false));
+        // 有 error 即使 Stopped 也算未完成。
+        assert!(review_incomplete(StopReason::Stopped, true));
+    }
+
+    #[test]
+    fn closing_summary_survives_pre_call_narration_dropped() {
+        use atomcode_kernel::tool::ToolCall;
+        let tool = |id: &str, name: &str| AgentEvent::ToolStarted {
+            call: ToolCall { id: id.into(), name: name.into(), arguments: "{}".into() },
+        };
+        // 模型每轮调工具前都会叙述（"let me read X…"），那是过程噪声，不该进 text；
+        // 只有最后一次工具调用之后输出的 Closing Summary（persona §XI）才该保留。
+        let events = [
+            AgentEvent::TextDelta("Now let me read the kernel file…".into()),
+            tool("c1", "read_file"),
+            AgentEvent::TextDelta("Now let me check validation.go…".into()),
+            tool("c2", "report_finding"),
+            AgentEvent::TextDelta("## 审查总结\nP0: 1, P1: 2\n整体风险：HIGH".into()),
+            AgentEvent::TurnComplete { reason: StopReason::Stopped },
+        ];
+        let mut run = ReviewRun::default();
+        let mut names = std::collections::HashMap::new();
+        for ev in events {
+            run.apply(ev, &mut names);
+        }
+        assert_eq!(
+            run.text.trim(),
+            "## 审查总结\nP0: 1, P1: 2\n整体风险：HIGH",
+            "只保留末轮 Closing Summary，丢弃工具调用前的过程叙述",
+        );
+    }
 
     fn finding(priority: &str, confidence: f32, title: &str) -> Finding {
         Finding {

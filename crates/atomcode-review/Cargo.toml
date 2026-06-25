@@ -9,11 +9,13 @@ atomcode-kernel = { path = "../atomcode-kernel" }
 # Read-only review toolset: fs read/grep/glob + ast_grep + report_finding (in `tools`),
 # code-intelligence (`codeintel`), and web_search (`web`). NO write/edit/bash mounted.
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "codeintel", "web"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 # The `code_review` sub-agent tool: async Tool trait + JSON arg parsing.
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# turn 总时长软上限：经 kernel cancel_token seam 定时 cancel（不改 kernel）。
+tokio-util = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
