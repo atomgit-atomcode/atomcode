@@ -932,10 +932,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CompactingSlow => "Compacting… (slow)".into(),
         Msg::CompactMarkDrain { messages, before, after } => {
             let plural = if messages == 1 { "" } else { "s" };
-            format!("Compacted · {} message{} summarized · ~{}→~{}", messages, plural, before, after).into()
+            format!("Compacted · {} message{} summarized · ~{}→~{} tok", messages, plural, before, after).into()
         }
         Msg::CompactMarkStub { saved } =>
-            format!("Tool output folded · saved ~{}", saved).into(),
+            format!("Tool output folded · saved ~{} tok", saved).into(),
         Msg::GoalHelp =>
             "  /goal — autonomous multi-round work toward a stated condition.\n  \
              Usage:\n  \

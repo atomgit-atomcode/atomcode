@@ -407,6 +407,7 @@ mod tests {
         assert!(s.contains("48.2K") && s.contains("9.1K"), "token figures missing: {s}");
         assert!(s.contains('→'), "before→after arrow missing: {s}");
         assert!(s.contains('~'), "estimate marker missing: {s}");
+        assert!(s.contains("tok"), "token unit missing: {s}");
     }
 
     #[test]
@@ -414,6 +415,7 @@ mod tests {
         let s = crate::i18n::t(crate::i18n::Msg::CompactMarkStub { saved: "6.0K" });
         assert!(s.contains("6.0K"), "saved figure missing: {s}");
         assert!(!s.contains('→'), "stub marker shows a single figure, no arrow: {s}");
+        assert!(s.contains("tok"), "token unit missing: {s}");
     }
 
     #[test]
