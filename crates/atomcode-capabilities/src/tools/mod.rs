@@ -39,6 +39,7 @@ pub mod list;
 pub mod open_file;
 pub mod parallel_edit;
 pub mod read;
+pub mod repair;
 pub mod report_finding;
 pub mod search_replace;
 pub mod sensitive_path;
@@ -58,6 +59,7 @@ pub use approval::{
     ApprovalMiddleware, ApprovalRequest, ApprovalResponse, InMemoryPermissionStore,
     PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
+pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
 pub use cd::ChangeDirTool;
