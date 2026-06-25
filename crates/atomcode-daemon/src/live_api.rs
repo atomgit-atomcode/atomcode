@@ -250,7 +250,7 @@ impl KernelTurnExecutor {
     }
 
     /// Resolve the currently active provider name using the same precedence as
-    /// `bridge_config`: LIVE_PROVIDER → executor default → config default.
+    /// `shell_config`: LIVE_PROVIDER → executor default → config default.
     fn resolve_provider_name(&self) -> String {
         let live = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
         live.or_else(|| self.provider_name.clone())
@@ -263,14 +263,14 @@ impl KernelTurnExecutor {
 
     /// Resolve the bridge config from the live provider selection + on-disk config
     /// (`resolve_provider_name`: LIVE_PROVIDER → executor default → config default).
-    fn bridge_config(&self) -> Option<atomcode_shell::BridgeConfig> {
+    fn shell_config(&self) -> Option<atomcode_shell::ShellConfig> {
         let config = Config::load(&Config::default_path()).ok()?;
         let name = self.resolve_provider_name();
         let p = config.providers.get(&name)?;
         // The daemon answers approvals at its OWN seam (the `/live` BypassAll decider /
         // `/chat` interactive perm_rx), so keep skip_perms=false (round-trip) +
         // interactive=false (fail-closed timeout; PARK is the cli TUI path's behavior).
-        Some(atomcode_shell::BridgeConfig::from_provider(
+        Some(atomcode_shell::ShellConfig::from_provider(
             Some(p),
             &self.working_dir,
             Some(self.telemetry.clone()),
@@ -336,11 +336,11 @@ impl TurnExecutor for KernelTurnExecutor {
             Some(s) => s.provider_name != current_provider,
         };
         if needs_build {
-            let Some(bcfg) = self.bridge_config() else {
+            let Some(shell_cfg) = self.shell_config() else {
                 emit(TurnEvent::Error("engine v2：provider 未配置".into()));
                 return;
             };
-            let coding_cfg = atomcode_shell::coding_config(&bcfg);
+            let coding_cfg = atomcode_shell::coding_config(&shell_cfg);
             // daemon has no --disable-tools flag; honor the ATOMCODE_DISABLE_TOOLS env knob.
             let opts = PrepareOptions {
                 disabled_tools: env_disabled_tools(),
@@ -684,15 +684,15 @@ mod kernel_to_turn_tests {
 }
 
 /// Derive the bridge config for a `/chat` request from the resolved provider.
-pub(crate) fn chat_bridge_config(
+pub(crate) fn chat_shell_config(
     config: &Config,
     provider_name: &str,
     working_dir: &Path,
     telemetry: Arc<Telemetry>,
-) -> atomcode_shell::BridgeConfig {
+) -> atomcode_shell::ShellConfig {
     // The daemon answers `/chat` approvals at its own seam (interactive perm_rx), so keep
     // skip_perms=false (round-trip) + interactive=false (fail-closed approval timeout).
-    atomcode_shell::BridgeConfig::from_provider(
+    atomcode_shell::ShellConfig::from_provider(
         config.providers.get(provider_name),
         working_dir,
         Some(telemetry),
@@ -710,12 +710,12 @@ pub(crate) async fn run_chat_turn_v2(
     conv: Arc<Mutex<Conversation>>,
     turn_tx: mpsc::UnboundedSender<TurnEvent>,
     cancel: CancellationToken,
-    bridge_cfg: atomcode_shell::BridgeConfig,
+    shell_cfg: atomcode_shell::ShellConfig,
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
 ) {
     // A fresh NATIVE runtime for this /chat turn (no persistent state — the caller owns
     // persistence). coding_config + provider_factory come from atomcode-shell (shared mapping).
-    let coding_cfg = atomcode_shell::coding_config(&bridge_cfg);
+    let coding_cfg = atomcode_shell::coding_config(&shell_cfg);
     // daemon has no --disable-tools flag; honor the ATOMCODE_DISABLE_TOOLS env knob.
     let opts = PrepareOptions {
         disabled_tools: env_disabled_tools(),
@@ -1261,7 +1261,7 @@ pub(crate) struct LiveReasoningEffortReq {
 /// POST /live/reasoning_effort — webui 设置 DeepSeek V4 的 reasoning_effort。
 ///
 /// 与 /live/provider 同源：持久化进目标 provider 的 `config.reasoning_effort`，
-/// 下一轮 turn 经 `bridge_config`/`chat_bridge_config` → `build_provider` 自动生效——
+/// 下一轮 turn 经 `shell_config`/`chat_shell_config` → `build_provider` 自动生效——
 /// live 与 /chat 两条路径都现读 config，故两端都会跟随。只有 deepseek-v4 系模型真正
 /// 消费该字段（见 OpenAiProvider::reason_effort_applicable），webui 已据此门控
 /// UI；服务端仅校验取值合法。

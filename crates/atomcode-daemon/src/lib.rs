@@ -2366,8 +2366,8 @@ async fn process_chat_request(
     // Run the turn in a background task on the kernel stack (coding + capabilities)
     // via the shared `run_chat_turn_v2` producer. The downstream turn_rx → ChatEvent
     // consumer + persistence below are SHARED (they only read turn_rx).
-    let bridge_cfg =
-        live_api::chat_bridge_config(&config, &provider_name, &working_dir, telemetry.clone());
+    let shell_cfg =
+        live_api::chat_shell_config(&config, &provider_name, &working_dir, telemetry.clone());
     // Interactive approval: route /chat/permission decisions to the producer.
     let perm_rx = if interactive_permission {
         let (tx, rx) = mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
@@ -2380,7 +2380,7 @@ async fn process_chat_request(
     let cancel = cancel_token.clone();
     tokio::spawn(async move {
         CurrentContext::scope(tel_ctx, || async move {
-            live_api::run_chat_turn_v2(conv, turn_tx, cancel, bridge_cfg, perm_rx).await;
+            live_api::run_chat_turn_v2(conv, turn_tx, cancel, shell_cfg, perm_rx).await;
         })
         .await;
     });

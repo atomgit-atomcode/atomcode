@@ -8,7 +8,7 @@
 //! (`CodingRuntime::spawn`), so the translation runtime had no consumers and was deleted.
 //!
 //! This crate is what remained of that shell — the small, neutral glue the two drivers
-//! (cli + daemon) share: a driver-supplied [`BridgeConfig`] + its mapping to a
+//! (cli + daemon) share: a driver-supplied [`ShellConfig`] + its mapping to a
 //! `CodingAgentConfig` ([`coding_config`]), provider construction with the AtomGit signing
 //! gateway ([`build_provider`]), and core↔kernel message [`convert`]ersions.
 //! `build_provider` can't move into `atomcode-coding` (it uses
@@ -19,4 +19,4 @@ pub mod convert;
 mod runtime;
 mod sign;
 
-pub use runtime::{build_provider, coding_config, provider_factory, BridgeConfig};
+pub use runtime::{build_provider, coding_config, provider_factory, ShellConfig};

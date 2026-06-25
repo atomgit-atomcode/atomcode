@@ -1639,7 +1639,7 @@ async fn run() -> Result<i32> {
             let headless_result = {
                 // NATIVE headless: a fresh CodingRuntime drives this turn (no bridge
                 // membrane). coding_config + build_provider are the bridge's shared helpers.
-                let bcfg = bridge_config_from(
+                let shell_cfg = shell_config_from(
                     &config,
                     &working_dir,
                     cli.provider.as_deref(),
@@ -1647,7 +1647,7 @@ async fn run() -> Result<i32> {
                     cli.dangerously_skip_permissions,
                     false, // headless ⇒ keep the fail-closed approval timeout
                 );
-                let coding_cfg = atomcode_shell::coding_config(&bcfg);
+                let coding_cfg = atomcode_shell::coding_config(&shell_cfg);
                 let opts = atomcode_coding::PrepareOptions {
                     disabled_tools: disabled_tools.clone(),
                     ..Default::default()
@@ -1863,7 +1863,7 @@ fn spawn_native_tui(
     atomcode_core::agent::AgentClient,
     tokio::sync::mpsc::UnboundedReceiver<atomcode_tuix::UiEvent>,
 ) {
-    let bcfg = bridge_config_from(
+    let shell_cfg = shell_config_from(
         config,
         working_dir,
         provider_override,
@@ -1872,7 +1872,7 @@ fn spawn_native_tui(
         // Interactive (TUI) ⇒ approvals park until answered.
         true,
     );
-    let coding_cfg = atomcode_shell::coding_config(&bcfg);
+    let coding_cfg = atomcode_shell::coding_config(&shell_cfg);
     let opts = atomcode_coding::PrepareOptions {
         disabled_tools: disabled_tools.to_vec(),
         ..Default::default()
@@ -1892,16 +1892,16 @@ fn spawn_native_tui(
     (client, handle.events)
 }
 
-fn bridge_config_from(
+fn shell_config_from(
     config: &atomcode_core::config::Config,
     working_dir: &std::path::Path,
     provider_override: Option<&str>,
     telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
     dangerously_skip_permissions: bool,
     interactive: bool,
-) -> atomcode_shell::BridgeConfig {
+) -> atomcode_shell::ShellConfig {
     let p = config.active_provider(provider_override).ok();
-    atomcode_shell::BridgeConfig::from_provider(
+    atomcode_shell::ShellConfig::from_provider(
         p,
         working_dir,
         telemetry,
@@ -2997,15 +2997,15 @@ fn is_auth_gap_error(msg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bridge_config_from, close_thinking_chunk, format_thinking_chunk, is_auth_gap_error,
+        shell_config_from, close_thinking_chunk, format_thinking_chunk, is_auth_gap_error,
         resolve_working_dir, truncate_log_line,
     };
     use std::path::PathBuf;
 
     #[test]
-    fn bridge_config_honors_provider_override() {
+    fn shell_config_honors_provider_override() {
         // Regression: engine-v2 headless `--provider X` was silently ignored —
-        // bridge_config_from read `default_provider` directly instead of routing
+        // shell_config_from read `default_provider` directly instead of routing
         // through `active_provider`, so the bridge picked the config default
         // (e.g. an AtomGit gateway needing a signer this build lacks) and a
         // `--provider deepseek` run hit the wrong endpoint and failed.
@@ -3028,14 +3028,14 @@ mod tests {
         let wd = PathBuf::from("/tmp/x");
 
         // No override → the config default (gateway), no reasoning_history set.
-        let def = bridge_config_from(&config, &wd, None, None, false, false);
+        let def = shell_config_from(&config, &wd, None, None, false, false);
         assert_eq!(def.base_url, "https://llm-api.atomgit.com/v1");
         assert_eq!(def.model, "gw-model");
         assert_eq!(def.reasoning_history, None);
 
         // `--provider direct` → that provider's endpoint/model/key + its per-provider
         // reasoning_history override, NOT the default.
-        let ov = bridge_config_from(&config, &wd, Some("direct"), None, false, false);
+        let ov = shell_config_from(&config, &wd, Some("direct"), None, false, false);
         assert_eq!(ov.base_url, "https://api.deepseek.com");
         assert_eq!(ov.model, "direct-model");
         assert_eq!(ov.api_key, "sk-direct");

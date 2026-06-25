@@ -4,7 +4,7 @@
 //! stack behind `core`'s legacy `AgentClient`/`AgentEvent` protocol) is GONE — tuix now
 //! consumes the kernel natively (its own `native` adapter) and the daemon was always
 //! native (`CodingRuntime::spawn`). What remains here is the small, neutral glue both
-//! drivers (cli + daemon) still share: a driver-supplied [`BridgeConfig`], its mapping to
+//! drivers (cli + daemon) still share: a driver-supplied [`ShellConfig`], its mapping to
 //! a [`CodingAgentConfig`] ([`coding_config`]), and provider construction with the
 //! AtomGit signing gateway ([`build_provider`], via [`crate::sign`]). `build_provider`
 //! can't live in `atomcode-coding` (it uses `atomcode_core::coding_plan::crypto` signing,
@@ -19,7 +19,7 @@ use atomcode_coding::CodingAgentConfig;
 /// (the cli / daemon already have a loaded `Config`) so this crate stays
 /// config-format-agnostic.
 #[derive(Clone)]
-pub struct BridgeConfig {
+pub struct ShellConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
@@ -56,10 +56,10 @@ pub struct BridgeConfig {
     pub interactive: bool,
 }
 
-impl BridgeConfig {
-    /// Build a [`BridgeConfig`] from a resolved provider config — the SINGLE place the
+impl ShellConfig {
+    /// Build a [`ShellConfig`] from a resolved provider config — the SINGLE place the
     /// driver→config field mapping lives, so the cli + daemon construction sites can't
-    /// drift (the BridgeConfig-drops-per-provider-config footgun). `p == None` ⇒ neutral
+    /// drift (the ShellConfig-drops-per-provider-config footgun). `p == None` ⇒ neutral
     /// defaults (empty creds, 128K window, `"openai"` adapter), mirroring the drivers'
     /// prior `unwrap_or_default` behaviour for an unknown provider. Provider RESOLUTION
     /// stays with the caller (cli's `active_provider` vs daemon's `providers.get` differ).
@@ -70,7 +70,7 @@ impl BridgeConfig {
         dangerously_skip_permissions: bool,
         interactive: bool,
     ) -> Self {
-        BridgeConfig {
+        ShellConfig {
             api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
             base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
             model: p.map(|p| p.model.clone()).unwrap_or_default(),
@@ -92,11 +92,11 @@ impl BridgeConfig {
     }
 }
 
-/// Map a driver-supplied [`BridgeConfig`] to the [`CodingAgentConfig`] the new stack
+/// Map a driver-supplied [`ShellConfig`] to the [`CodingAgentConfig`] the new stack
 /// assembles from. PUBLIC so every native driver (cli, daemon, the headless CLI) reuses
-/// the EXACT same knob mapping — no divergence (the BridgeConfig-drops-per-provider-config
+/// the EXACT same knob mapping — no divergence (the ShellConfig-drops-per-provider-config
 /// footgun).
-pub fn coding_config(cfg: &BridgeConfig) -> CodingAgentConfig {
+pub fn coding_config(cfg: &ShellConfig) -> CodingAgentConfig {
     let mut coding_cfg =
         CodingAgentConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model, &cfg.working_dir);
     coding_cfg.context_window = cfg.context_window;
@@ -193,12 +193,12 @@ pub fn provider_factory() -> atomcode_coding::ProviderFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_provider, coding_config, BridgeConfig};
+    use super::{build_provider, coding_config, ShellConfig};
     use atomcode_coding::CodingAgentConfig;
 
     #[test]
     fn coding_config_maps_bridge_knobs_without_divergence() {
-        let bcfg = BridgeConfig {
+        let shell_cfg = ShellConfig {
             api_key: "k".into(),
             base_url: "https://example.test/v1".into(),
             model: "m".into(),
@@ -215,7 +215,7 @@ mod tests {
             dangerously_skip_permissions: false,
             interactive: true,
         };
-        let cc = coding_config(&bcfg);
+        let cc = coding_config(&shell_cfg);
         assert_eq!(cc.provider_type, "claude");
         assert_eq!(cc.context_window, 64_000);
         assert_eq!(cc.model, "m");
@@ -271,36 +271,36 @@ mod tests {
     #[test]
     fn from_provider_maps_present_provider() {
         let pc = sample_provider();
-        let bcfg =
-            BridgeConfig::from_provider(Some(&pc), std::path::Path::new("/work"), None, true, false);
-        assert_eq!(bcfg.api_key, "sk-1");
-        assert_eq!(bcfg.base_url, "https://api.example.com/v1");
-        assert_eq!(bcfg.model, "m-1");
-        assert_eq!(bcfg.working_dir, std::path::PathBuf::from("/work"));
-        assert_eq!(bcfg.context_window, 64_000);
-        assert_eq!(bcfg.provider_type, "claude");
-        assert_eq!(bcfg.reasoning_history.as_deref(), Some("include"));
-        assert_eq!(bcfg.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(bcfg.thinking_enabled, Some(true));
-        assert_eq!(bcfg.thinking_type.as_deref(), Some("enabled"));
-        assert_eq!(bcfg.thinking_keep.as_deref(), Some("all"));
-        assert!(bcfg.mcp);
-        assert!(bcfg.dangerously_skip_permissions);
-        assert!(!bcfg.interactive);
+        let shell_cfg =
+            ShellConfig::from_provider(Some(&pc), std::path::Path::new("/work"), None, true, false);
+        assert_eq!(shell_cfg.api_key, "sk-1");
+        assert_eq!(shell_cfg.base_url, "https://api.example.com/v1");
+        assert_eq!(shell_cfg.model, "m-1");
+        assert_eq!(shell_cfg.working_dir, std::path::PathBuf::from("/work"));
+        assert_eq!(shell_cfg.context_window, 64_000);
+        assert_eq!(shell_cfg.provider_type, "claude");
+        assert_eq!(shell_cfg.reasoning_history.as_deref(), Some("include"));
+        assert_eq!(shell_cfg.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(shell_cfg.thinking_enabled, Some(true));
+        assert_eq!(shell_cfg.thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(shell_cfg.thinking_keep.as_deref(), Some("all"));
+        assert!(shell_cfg.mcp);
+        assert!(shell_cfg.dangerously_skip_permissions);
+        assert!(!shell_cfg.interactive);
     }
 
     #[test]
     fn from_provider_none_uses_neutral_defaults() {
-        let bcfg = BridgeConfig::from_provider(None, std::path::Path::new("/w"), None, false, true);
-        assert_eq!(bcfg.api_key, "");
-        assert_eq!(bcfg.base_url, "");
-        assert_eq!(bcfg.model, "");
-        assert_eq!(bcfg.context_window, 128_000);
-        assert_eq!(bcfg.provider_type, "openai");
-        assert_eq!(bcfg.reasoning_history, None);
-        assert_eq!(bcfg.thinking_enabled, None);
-        assert!(bcfg.mcp);
-        assert!(!bcfg.dangerously_skip_permissions);
-        assert!(bcfg.interactive);
+        let shell_cfg = ShellConfig::from_provider(None, std::path::Path::new("/w"), None, false, true);
+        assert_eq!(shell_cfg.api_key, "");
+        assert_eq!(shell_cfg.base_url, "");
+        assert_eq!(shell_cfg.model, "");
+        assert_eq!(shell_cfg.context_window, 128_000);
+        assert_eq!(shell_cfg.provider_type, "openai");
+        assert_eq!(shell_cfg.reasoning_history, None);
+        assert_eq!(shell_cfg.thinking_enabled, None);
+        assert!(shell_cfg.mcp);
+        assert!(!shell_cfg.dangerously_skip_permissions);
+        assert!(shell_cfg.interactive);
     }
 }
