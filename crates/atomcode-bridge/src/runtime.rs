@@ -2142,6 +2142,15 @@ mod undo_tests {
     }
 
     #[test]
+    fn compaction_mark_label_falls_back_to_byte_estimate_without_usage() {
+        // No provider usage yet (before_tokens = 0): fall back to bytes/4 rather
+        // than showing "0 → 0". 40_000 bytes → ~10K before; halved bytes → ~5K after.
+        let label = compaction_mark_label(3, 40_000, 20_000, 0);
+        assert!(label.contains("10.0K"), "byte-fallback before figure: {label}");
+        assert!(label.contains("5.0K"), "byte-fallback after figure: {label}");
+    }
+
+    #[test]
     fn manual_noop_short_has_no_arrow() {
         // True no-op (byte-identical candidate) → "conversation is short", no arrow.
         assert!(!manual_noop_result(8_000, 8_000, 6_000).contains('→'));
