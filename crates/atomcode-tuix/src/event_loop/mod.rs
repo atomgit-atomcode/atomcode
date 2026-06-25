@@ -985,6 +985,12 @@ pub struct Buffer {
     stash: String,
     /// Placeholder index → original pasted text. Index 0 = paste #1.
     pastes: Vec<String>,
+    /// The draft's `pastes` registry, parked alongside `stash` when the
+    /// user scrolls into history (Up). Restored together with `stash`
+    /// when HistoryNext walks back past the newest entry, so a draft
+    /// that contained a folded paste survives a round-trip through
+    /// history navigation. Mirrors `stash` for the paste registry.
+    stash_pastes: Vec<String>,
 }
 
 /// Minimum line count or char count for a paste to fold into a
@@ -1010,6 +1016,7 @@ impl Buffer {
             menu_suppressed: false,
             stash: String::new(),
             pastes: Vec::new(),
+            stash_pastes: Vec::new(),
         }
     }
 
@@ -1292,6 +1299,9 @@ impl Buffer {
                 let new_idx = match self.history_idx {
                     None => {
                         self.stash = self.text.clone();
+                        // Park the draft's paste registry too, so a draft
+                        // containing a folded paste survives Up→Down.
+                        self.stash_pastes = self.pastes.clone();
                         Some(history.len() - 1)
                     }
                     Some(i) if i > 0 => Some(i - 1),
@@ -1300,6 +1310,12 @@ impl Buffer {
                 self.history_idx = new_idx;
                 if let Some(i) = new_idx {
                     self.text = history[i].text.clone();
+                    // Rehydrate the paste registry from the recalled entry
+                    // so its `[Pasted #N …]` placeholders expand back to the
+                    // original bodies on submit (issue #843). The live
+                    // registry was cleared after the prior submit, so without
+                    // this the agent would receive the literal placeholder.
+                    self.pastes = history[i].pastes.clone();
                     // Park cursor at column 0 — recalled history is for
                     // re-running, not editing in place. A `/session foo`
                     // pulled from history would otherwise leave the
@@ -1319,6 +1335,9 @@ impl Buffer {
                         // as HistoryPrev.
                         self.history_idx = Some(i + 1);
                         self.text = history[i + 1].text.clone();
+                        // Rehydrate pastes for the newly shown entry, same
+                        // as HistoryPrev (issue #843).
+                        self.pastes = history[i + 1].pastes.clone();
                         self.cursor = 0;
                     } else {
                         // Past the newest entry — restore the user's
@@ -1327,6 +1346,7 @@ impl Buffer {
                         // they started scrolling.
                         self.history_idx = None;
                         self.text = self.stash.clone();
+                        self.pastes = self.stash_pastes.clone();
                         self.cursor = self.text.len();
                     }
                 }
@@ -1590,6 +1610,84 @@ mod buffer_tests {
             &expanded[..expanded.len().min(120)]
         );
         assert!(b.pastes.is_empty(), "clear after expand must still empty the registry");
+    }
+
+    /// Regression (issue #843): a message containing a folded paste is
+    /// submitted, then recalled via Up-arrow and re-sent. Before the fix
+    /// the recalled buffer carried only the `[Pasted #N …]` placeholder
+    /// — the live `pastes` registry had been cleared after the first
+    /// submit — so `expand_pastes` was a no-op and the agent received the
+    /// literal placeholder. The history entry now persists the paste
+    /// bodies and `HistoryPrev` rehydrates `Buffer.pastes`, so expansion
+    /// works on recall.
+    #[test]
+    fn recalled_paste_expands_after_history_prev() {
+        use crate::input::history::HistoryEntry;
+        let reg = CommandRegistry::builtin();
+
+        // Simulate the first submit: paste folds, then the submit path
+        // snapshots the live registry into the pushed history entry.
+        let mut b = Buffer::new();
+        let body = "important data\n".repeat(8);
+        b.insert_paste(body.clone());
+        let submitted_text = b.text.clone();
+        assert!(submitted_text.contains("[Pasted #1"), "should fold to placeholder");
+        let entry = HistoryEntry {
+            text: submitted_text.clone(),
+            images: vec![],
+            pastes: b.pastes.clone(),
+        };
+        // Submit consumes the buffer + clears the live registry.
+        b.text.clear();
+        b.cursor = 0;
+        b.clear_pastes();
+
+        // A fresh turn: empty buffer, empty registry. User presses Up.
+        let history = vec![entry];
+        let _ = b.apply(Action::HistoryPrev, &history, &reg);
+        assert_eq!(b.text, submitted_text, "Up recalls the folded text");
+        assert!(!b.pastes.is_empty(), "registry must be rehydrated on recall");
+
+        // Submitting now expands back to the real body, not the placeholder.
+        let expanded = b.expand_pastes(&b.text);
+        assert!(
+            expanded.contains("important data"),
+            "recalled paste must expand to its body: {}",
+            &expanded[..expanded.len().min(120)]
+        );
+        assert!(!expanded.contains("[Pasted #"), "no placeholder may survive");
+    }
+
+    /// A folded paste in the draft must survive an Up→Down round-trip
+    /// through history: pressing Down past the newest entry restores the
+    /// stashed draft AND its paste registry, so expansion still works.
+    #[test]
+    fn draft_paste_survives_history_round_trip() {
+        use crate::input::history::HistoryEntry;
+        let reg = CommandRegistry::builtin();
+        let history = vec![HistoryEntry {
+            text: "earlier".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
+
+        let mut b = Buffer::new();
+        let body = "draft body\n".repeat(8);
+        b.insert_paste(body.clone());
+        let draft_text = b.text.clone();
+
+        // Up into history (stashes draft + its pastes), then Down back out.
+        let _ = b.apply(Action::HistoryPrev, &history, &reg);
+        assert_eq!(b.text, "earlier");
+        let _ = b.apply(Action::HistoryNext, &history, &reg);
+        assert_eq!(b.text, draft_text, "draft text restored");
+
+        let expanded = b.expand_pastes(&b.text);
+        assert!(
+            expanded.contains("draft body"),
+            "draft paste must still expand after round-trip: {}",
+            &expanded[..expanded.len().min(120)]
+        );
     }
 
     #[test]
@@ -2026,7 +2124,7 @@ mod menu_tests {
     fn history_prev_parks_cursor_at_zero_and_marks_history_mode() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![], pastes: vec![] }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
 
@@ -2138,7 +2236,7 @@ mod menu_tests {
     fn history_next_back_to_stash_restores_cursor_to_end() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![], pastes: vec![] }];
 
         // Type a partial draft, then scroll into history and back out.
         let _ = buf.apply(Action::Insert('h'), &history, &reg);
@@ -2160,7 +2258,7 @@ mod menu_tests {
         // re-appear naturally once the user starts editing the recall.
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![], pastes: vec![] }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
         assert!(buf.is_in_history());
@@ -2172,7 +2270,7 @@ mod menu_tests {
     fn sync_recalled_attachments_mirrors_buffer_history_idx() {
         use crate::input::history::{HistoryEntry, HistoryImageRef};
         let history: Vec<HistoryEntry> = vec![
-            HistoryEntry { text: "no img".into(), images: vec![] },
+            HistoryEntry { text: "no img".into(), images: vec![], pastes: vec![] },
             HistoryEntry {
                 text: "with img".into(),
                 images: vec![HistoryImageRef {
@@ -2180,6 +2278,7 @@ mod menu_tests {
                     mt: "image/png".into(),
                     n: 1,
                 }],
+                pastes: vec![],
             },
         ];
         let reg = CommandRegistry::builtin();
@@ -2217,6 +2316,7 @@ mod menu_tests {
                 mt: "image/png".into(),
                 n: 1,
             }],
+            pastes: vec![],
         }];
         let reg = CommandRegistry::builtin();
         let mut buf = Buffer::new();
@@ -2249,6 +2349,7 @@ mod menu_tests {
                 mt: "image/png".into(),
                 n: 1,
             }],
+            pastes: vec![],
         }];
         let reg = CommandRegistry::builtin();
         let mut buf = Buffer::new();
@@ -2371,6 +2472,7 @@ mod menu_tests {
                 mt: img.media_type.clone(),
                 n: 1,
             }],
+            pastes: vec![],
         });
         history.save().unwrap();
         // GC must NOT delete our file (it's referenced).
@@ -5155,6 +5257,7 @@ fn handle_idle_key(
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: committed.clone(),
                         images: Vec::new(),
+                        pastes: Vec::new(),
                     });
                     app.state.last_submitted_message = Some(committed.clone());
                     execute_slash_command(
@@ -5283,6 +5386,7 @@ fn handle_idle_key(
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: committed.clone(),
                         images: Vec::new(),
+                        pastes: Vec::new(),
                     });
                     if let Some((cmd, arg)) = parse_slash_line(&committed) {
                         execute_slash_command(
@@ -5345,6 +5449,7 @@ fn handle_idle_key(
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: committed.clone(),
                     images: Vec::new(),
+                    pastes: Vec::new(),
                 });
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
                     if cmd.eq_ignore_ascii_case("paste") {
@@ -5566,6 +5671,9 @@ fn handle_idle_key(
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: line.clone(),
                         images: Vec::new(),
+                        // Registry still live here (cleared after dispatch);
+                        // carry it so recall re-expands any folded paste.
+                        pastes: app.buf.pastes.clone(),
                     });
                     app.state.last_submitted_message = Some(line.clone());
                     let arg = if skill_args.is_empty() {
@@ -5639,6 +5747,9 @@ fn handle_idle_key(
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: line.clone(),
                     images: Vec::new(),
+                    // `/goal <pasted body>` recall must re-expand too — the
+                    // registry is still live here (cleared after dispatch).
+                    pastes: app.buf.pastes.clone(),
                 });
                 // Stash for Esc-restore, same as regular messages. Most slash
                 // commands run synchronously (cleared in the Idle branch
@@ -5706,6 +5817,12 @@ fn handle_idle_key(
                     renderer.render(UiLine::Warning(n));
                 }
                 let mut expanded = app.buf.expand_pastes(&line);
+                // Snapshot the live paste registry BEFORE clearing it, so
+                // the history entry can carry the original paste bodies.
+                // Up-arrow recall rehydrates `Buffer.pastes` from this so a
+                // recalled message's `[Pasted #N …]` placeholder expands to
+                // the real content instead of being sent literally (#843).
+                let submitted_pastes = app.buf.pastes.clone();
                 // Pastes have now been substituted into `expanded`;
                 // safe to drop the registry. Doing it any earlier
                 // (e.g. up at the buf.text.clear() prep) was the
@@ -5773,6 +5890,7 @@ fn handle_idle_key(
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: line.clone(),
                     images: kept_refs,
+                    pastes: submitted_pastes,
                 });
                 // Clear stale hook warning at the start of each turn.
                 if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
@@ -6460,6 +6578,9 @@ fn handle_streaming_key(
             ctx.history.push(crate::input::history::HistoryEntry {
                 text: line.clone(),
                 images: q_refs,
+                // Snapshot before the clear_pastes() below so recall of a
+                // queued message re-expands its folded paste (#843).
+                pastes: app.buf.pastes.clone(),
             });
             app.message_queue.push_back(crate::state::QueuedMessage {
                 text: expanded,

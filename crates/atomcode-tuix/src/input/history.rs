@@ -14,6 +14,19 @@ pub struct HistoryEntry {
     /// compact (`{"text":"hi"}` rather than `{"text":"hi","images":[]}`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<HistoryImageRef>,
+    /// Original bodies of any folded `[Pasted #N …]` placeholders in
+    /// `text`, in placeholder order (index 0 = paste #1). Mirrors the
+    /// `Buffer.pastes` registry that was live when the line was
+    /// submitted. Without this, an up-arrow recall of a message that
+    /// contained a paste would bring back only the compact placeholder
+    /// — the buffer's live `pastes` registry is cleared after each
+    /// submit, so `expand_pastes` had nothing to substitute and the
+    /// agent received the literal `[Pasted #N +M lines]` token instead
+    /// of the pasted body (issue #843). On recall the buffer rehydrates
+    /// its `pastes` from this field so expansion works again. Skipped on
+    /// serialization when empty so plain rows stay compact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pastes: Vec<String>,
 }
 
 /// Reference to a single image cached on disk under
@@ -65,9 +78,9 @@ impl History {
                             return e;
                         }
                         if let Ok(t) = serde_json::from_str::<String>(l) {
-                            return HistoryEntry { text: t, images: Vec::new() };
+                            return HistoryEntry { text: t, images: Vec::new(), pastes: Vec::new() };
                         }
-                        HistoryEntry { text: l.to_string(), images: Vec::new() }
+                        HistoryEntry { text: l.to_string(), images: Vec::new(), pastes: Vec::new() }
                     })
                     .collect()
             })
@@ -180,8 +193,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hist");
         let mut h = History::load(&path);
-        h.push(HistoryEntry { text: "one".into(), images: Vec::new() });
-        h.push(HistoryEntry { text: "two".into(), images: Vec::new() });
+        h.push(HistoryEntry { text: "one".into(), images: Vec::new(), pastes: Vec::new() });
+        h.push(HistoryEntry { text: "two".into(), images: Vec::new(), pastes: Vec::new() });
         h.save().unwrap();
 
         let h2 = History::load(&path);
@@ -195,8 +208,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hist");
         let mut h = History::load(&path);
-        h.push(HistoryEntry { text: "1\n2\n3".into(), images: Vec::new() });
-        h.push(HistoryEntry { text: "next".into(), images: Vec::new() });
+        h.push(HistoryEntry { text: "1\n2\n3".into(), images: Vec::new(), pastes: Vec::new() });
+        h.push(HistoryEntry { text: "next".into(), images: Vec::new(), pastes: Vec::new() });
         h.save().unwrap();
 
         let h2 = History::load(&path);
@@ -224,9 +237,9 @@ mod tests {
     fn duplicate_consecutive_collapsed() {
         let dir = tempdir().unwrap();
         let mut h = History::load(dir.path().join("hist"));
-        h.push(HistoryEntry { text: "x".into(), images: Vec::new() });
-        h.push(HistoryEntry { text: "x".into(), images: Vec::new() });
-        h.push(HistoryEntry { text: "y".into(), images: Vec::new() });
+        h.push(HistoryEntry { text: "x".into(), images: Vec::new(), pastes: Vec::new() });
+        h.push(HistoryEntry { text: "x".into(), images: Vec::new(), pastes: Vec::new() });
+        h.push(HistoryEntry { text: "y".into(), images: Vec::new(), pastes: Vec::new() });
         assert_eq!(h.entries().len(), 2);
         assert_eq!(h.entries()[0].text, "x");
         assert_eq!(h.entries()[1].text, "y");
@@ -237,7 +250,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut h = History::load(dir.path().join("hist"));
         for i in 0..2000 {
-            h.push(HistoryEntry { text: format!("cmd{}", i), images: Vec::new() });
+            h.push(HistoryEntry { text: format!("cmd{}", i), images: Vec::new(), pastes: Vec::new() });
         }
         assert!(h.entries().len() <= HISTORY_MAX);
         assert!(!h.entries().iter().any(|e| e.text == "cmd0"));
@@ -247,9 +260,9 @@ mod tests {
     fn empty_entries_ignored() {
         let dir = tempdir().unwrap();
         let mut h = History::load(dir.path().join("hist"));
-        h.push(HistoryEntry { text: "".into(), images: Vec::new() });
-        h.push(HistoryEntry { text: "  ".into(), images: Vec::new() });
-        h.push(HistoryEntry { text: "real".into(), images: Vec::new() });
+        h.push(HistoryEntry { text: "".into(), images: Vec::new(), pastes: Vec::new() });
+        h.push(HistoryEntry { text: "  ".into(), images: Vec::new(), pastes: Vec::new() });
+        h.push(HistoryEntry { text: "real".into(), images: Vec::new(), pastes: Vec::new() });
         assert_eq!(h.entries().len(), 1);
         assert_eq!(h.entries()[0].text, "real");
     }
@@ -263,6 +276,7 @@ mod tests {
                 mt: "image/png".to_string(),
                 n: 2,
             }],
+            pastes: vec![],
         };
         let j = serde_json::to_string(&e).unwrap();
         let back: HistoryEntry = serde_json::from_str(&j).unwrap();
@@ -275,7 +289,7 @@ mod tests {
 
     #[test]
     fn history_entry_text_only_serializes_without_images_field() {
-        let e = HistoryEntry { text: "hi".to_string(), images: vec![] };
+        let e = HistoryEntry { text: "hi".to_string(), images: vec![], pastes: vec![] };
         let j = serde_json::to_string(&e).unwrap();
         assert!(!j.contains("images"), "empty images vec must be skipped: {}", j);
         assert_eq!(j, r#"{"text":"hi"}"#);
@@ -331,6 +345,7 @@ mod tests {
                 mt: "image/png".into(),
                 n: 1,
             }],
+            pastes: vec![],
         });
         h.push(HistoryEntry {
             text: "y".into(),
@@ -339,6 +354,7 @@ mod tests {
                 mt: "image/png".into(),
                 n: 1,
             }],
+            pastes: vec![],
         });
         h.save().unwrap();
         assert!(cache.join("aaaaaaaaaaaaaaaa.png").exists());
@@ -364,7 +380,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = dir.path().join("image-cache");  // does not exist
         let mut h = History::load_with_cache(dir.path().join("hist"), cache);
-        h.push(HistoryEntry { text: "x".into(), images: vec![] });
+        h.push(HistoryEntry { text: "x".into(), images: vec![], pastes: vec![] });
         // Must not error.
         h.save().unwrap();
     }
