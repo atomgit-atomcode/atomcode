@@ -5063,8 +5063,8 @@ mod tests {
     }
 
     #[test]
-    fn ctx_usage_pct_appears_at_ninety_percent_threshold() {
-        // 90% is the inclusive near-limit threshold.
+    fn ctx_usage_at_ninety_percent() {
+        // Exact 90%: 180k of 200k rounds cleanly to 90% — just a representative value now, not a gate.
         assert_eq!(format_ctx_usage(180_000, 200_000), "180.0k/200k tok (90%)");
     }
 
