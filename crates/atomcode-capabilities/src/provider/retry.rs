@@ -114,6 +114,22 @@ pub(crate) fn err_chain(err: &(dyn std::error::Error + 'static)) -> String {
     out
 }
 
+/// Human-readable message for a mid-stream response-body read failure.
+///
+/// The raw reqwest chain for a dropped connection ("error decoding response
+/// body: … 远程主机强迫关闭了一个现有的连接。 (os error 10054)") is opaque to
+/// users. For the transient transport class (connection reset/abort/EOF — a
+/// gateway dropping the connection under load) we LEAD with a Chinese
+/// explanation and append the full cause chain for diagnosis. Logical failures
+/// (e.g. a malformed body) keep the verbatim `stream read error: <chain>` form.
+pub(crate) fn stream_read_error_message(err: &(dyn std::error::Error + 'static)) -> String {
+    if chain_has_transient_io(err) {
+        format!("网络连接中断:远端关闭或重置了连接(已自动重连仍失败,可重试)。详情: {}", err_chain(err))
+    } else {
+        format!("stream read error: {}", err_chain(err))
+    }
+}
+
 /// Parse `Retry-After` as integer seconds. `None` for absent / malformed / HTTP-date.
 pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
@@ -375,5 +391,33 @@ mod tests {
         let s = err_chain(&e);
         assert!(s.contains("error sending request"), "keeps the top message: {s}");
         assert!(s.contains("connection reset by peer (os error 54)"), "appends the cause: {s}");
+    }
+
+    #[test]
+    fn stream_read_error_message_explains_a_connection_reset_in_plain_language() {
+        use std::io::{Error, ErrorKind};
+        // The reported Windows case: a gateway forcibly closing the connection
+        // mid-body surfaces as the opaque "os error 10054 / 远程主机强迫关闭了一个
+        // 现有的连接". Lead with a human-readable Chinese explanation, but still
+        // append the raw cause chain so the failure stays diagnosable.
+        let e = Wrap(Error::new(
+            ErrorKind::ConnectionReset,
+            "远程主机强迫关闭了一个现有的连接。 (os error 10054)",
+        ));
+        let msg = stream_read_error_message(&e);
+        assert!(msg.contains("网络连接中断"), "leads with a plain-language notice: {msg}");
+        assert!(msg.contains("os error 10054"), "still appends the raw cause for diagnosis: {msg}");
+    }
+
+    #[test]
+    fn stream_read_error_message_keeps_verbatim_form_for_logical_errors() {
+        use std::io::{Error, ErrorKind};
+        // A non-transport failure (e.g. malformed body) is NOT a network drop —
+        // it must keep the verbatim `stream read error:` form, not be mislabeled
+        // a connection interruption.
+        let e = Wrap(Error::new(ErrorKind::InvalidData, "bad frame"));
+        let msg = stream_read_error_message(&e);
+        assert!(msg.starts_with("stream read error:"), "verbatim form for logical errors: {msg}");
+        assert!(!msg.contains("网络连接中断"), "must not mislabel a logical error: {msg}");
     }
 }
