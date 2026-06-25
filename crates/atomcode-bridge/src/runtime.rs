@@ -1448,54 +1448,48 @@ impl Bridge {
                 let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
                 self.emit(CoreEv::Error { error, snapshot: ConversationSnapshot::default() });
             }
-            // The kernel emits CompactionStarted ONLY when a slow one-shot LLM summary
-            // will actually run (manual `/compact`, overflow tier 2, or auto-compaction
-            // that escalated past the high-water mark). Always show a progress line so
-            // the user isn't staring at a frozen UI during the multi-second call. A
-            // user-typed `/compact` streams it as a TextDelta (its command handler
-            // renders these inline, v1 parity); auto/overflow — which the user did not
-            // invoke — surface it as a transient Warning instead.
-            KEv::CompactionStarted { trigger } => {
-                let text =
-                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting).into_owned();
-                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
-                    self.emit(CoreEv::TextDelta(text));
-                } else {
-                    self.emit(CoreEv::Warning(text));
-                }
+            // The kernel emits CompactionStarted ONLY for a slow one-shot LLM
+            // summary (manual `/compact`, overflow tier 2, or auto past the
+            // high-water mark). Unified: take over the spinner with a
+            // "Compacting…" label for BOTH auto and manual — the old split
+            // (manual=TextDelta, auto=Warning) is gone. The 70% stub tier does
+            // NOT emit CompactionStarted, so it never spins (it's instantaneous).
+            KEv::CompactionStarted { .. } => {
+                self.emit(CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::Begin));
             }
             KEv::Compacted { committed, trigger, removed, bytes_before, bytes_after, .. } => {
-                // The kernel measures BYTES; token figures are derived from the last
-                // provider usage report. Capture it BEFORE mutating `last_usage` below.
+                use atomcode_core::agent::CompactionUiKind;
+                // The kernel measures BYTES; token figures derive from the last
+                // provider usage. Capture it BEFORE mutating `last_usage` below.
                 let before_tokens =
                     self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
-                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
-                    // v1 parity: stream the authoritative result as a plain TextDelta line
-                    // (the TUI's `/compact` handler renders these directly).
-                    self.emit(CoreEv::TextDelta(manual_compact_result(
-                        committed,
-                        removed,
-                        bytes_before,
-                        bytes_after,
-                        before_tokens,
-                    )));
-                } else if let Some(msg) = compaction_advisory(committed, &trigger) {
-                    // Auto/Overflow keep the terse one-line advisory.
-                    self.emit(CoreEv::Warning(msg));
-                }
                 if committed {
-                    // Refresh the cached context size so the footer / `/context` reflect
-                    // the shrunk conversation IMMEDIATELY — for ANY committed compaction,
-                    // not just Manual. Previously Auto/Overflow skipped this, so an auto
-                    // drain+summarize's reduction lagged a full turn (footer stayed at the
-                    // pre-compaction number until the next real usage report). The kernel
-                    // only tracks bytes, so estimate the post-shrink tokens from the byte
-                    // ratio; the next real turn overwrites it with the exact count.
+                    // Unified marker for auto + manual. Drain (removed>0) shows
+                    // before→after; stub fold (removed==0) shows tokens saved.
+                    let label =
+                        compaction_mark_label(removed, bytes_before, bytes_after, before_tokens);
+                    self.emit(CoreEv::CompactionUi(CompactionUiKind::Mark(label)));
+                    // Refresh the cached context size so footer / `/context`
+                    // reflect the shrink IMMEDIATELY (kernel tracks bytes only;
+                    // estimate post-shrink tokens from the byte ratio — the next
+                    // real turn overwrites it with the exact count).
                     if let Some(meta) = self.last_usage.as_mut() {
                         meta.used_tokens =
                             estimate_after_tokens(before_tokens, bytes_before, bytes_after) as u32;
                     }
                     self.emit_context_stats();
+                } else {
+                    // No-op / refused: release the spinner, draw no marker. A
+                    // manual /compact also gets an inline "nothing to compact"
+                    // note; the auto path stays silent (nothing to acknowledge).
+                    self.emit(CoreEv::CompactionUi(CompactionUiKind::End));
+                    if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                        self.emit(CoreEv::TextDelta(manual_noop_result(
+                            bytes_before,
+                            bytes_after,
+                            before_tokens,
+                        )));
+                    }
                 }
             }
             KEv::TurnComplete { reason } => {
@@ -1972,56 +1966,41 @@ fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: 
     message
 }
 
-/// Terse one-line advisory for an AUTO / OVERFLOW compaction.
-///
-/// A manual `/compact` is handled by the richer streaming path
-/// ([`manual_compact_result`], emitted as a `TextDelta`) so this returns `None` for
-/// it. A committed auto/overflow compaction announces itself once; a no-op stays
-/// silent — there's no user action to acknowledge and it would be spam.
-fn compaction_advisory(
-    committed: bool,
-    trigger: &atomcode_kernel::message::CompactTrigger,
-) -> Option<String> {
-    use atomcode_kernel::message::CompactTrigger;
-    if matches!(trigger, CompactTrigger::Manual { .. }) {
-        return None; // manual → the TextDelta `manual_compact_result` path
-    }
-    committed.then(|| "conversation compacted".to_string())
-}
-
-/// v1-parity result line for a manual `/compact`, emitted as a `TextDelta` so it
-/// renders as a plain line (matching core's `run_compact`).
-///
-/// The kernel measures conversation BYTES, not tokens, so the token figures are
-/// derived:
-///   - `before_tokens` is the real pre-compaction context size from the last
-///     provider usage report (`last_usage.used_tokens`);
-///   - the after-figure scales `before_tokens` by the byte-reduction ratio
-///     (`bytes_after / bytes_before`).
-/// This reproduces v1's `(compacted — dropped N messages, X → Y tokens)` within
-/// estimation error. A refused / no-op compaction reports `(nothing to compact …)`.
-fn manual_compact_result(
-    committed: bool,
+/// Localized completion marker for a COMMITTED compaction, unified across auto
+/// + manual. A drain (`removed > 0`) reports the messages summarized and the
+/// token before→after; an in-place stub fold (`removed == 0`) reports the
+/// tokens saved. Token figures are byte-ratio ESTIMATES (`estimate_after_tokens`),
+/// flagged with `~` in the i18n copy; `removed` is exact. `before_tokens` is the
+/// last real provider usage; falls back to bytes/4 if none has been reported.
+fn compaction_mark_label(
     removed: usize,
     bytes_before: usize,
     bytes_after: usize,
     before_tokens: usize,
 ) -> String {
     use atomcode_core::i18n::{t, Msg};
-    // Fall back to a coarse bytes/4 estimate only if no usage has been reported yet
-    // (e.g. `/compact` issued before any turn) so figures never read "0 → 0".
+    let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
+    let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
+    if removed > 0 {
+        let before = fmt_k_tokens(before_tokens);
+        let after = fmt_k_tokens(after_tokens);
+        t(Msg::CompactMarkDrain { messages: removed, before: &before, after: &after }).into_owned()
+    } else {
+        let saved = fmt_k_tokens(before_tokens.saturating_sub(after_tokens));
+        t(Msg::CompactMarkStub { saved: &saved }).into_owned()
+    }
+}
+
+/// Inline note for a manual `/compact` that did NOT commit (nothing to drop):
+/// "(nothing to compact — conversation is short)" for a true no-op, or
+/// "(… would not save tokens: X → Y)" when a summary was built but didn't
+/// shrink. The auto path stays silent on a no-op (no user action to ack).
+fn manual_noop_result(bytes_before: usize, bytes_after: usize, before_tokens: usize) -> String {
+    use atomcode_core::i18n::{t, Msg};
     let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
     let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
     let before = fmt_k_tokens(before_tokens);
     let after = fmt_k_tokens(after_tokens);
-    if committed {
-        return t(Msg::CompactDropped { messages: removed, before: &before, after: &after })
-            .into_owned();
-    }
-    // Refused. Distinguish "would not save tokens" (a summary was built but the
-    // candidate did not shrink — `bytes_after > bytes_before`) from "conversation is
-    // short" (a true no-op plan whose candidate is byte-identical). Mirrors v1, which
-    // shows these as two distinct messages.
     if bytes_after > bytes_before {
         t(Msg::CompactNothingNoSavings { before: &before, after: &after }).into_owned()
     } else {
@@ -2100,13 +2079,13 @@ mod goal_summary_tests {
 #[cfg(test)]
 mod undo_tests {
     use super::{
-        apply_reload_provider, build_provider, compaction_advisory, compute_undo,
+        apply_reload_provider, build_provider, compaction_mark_label, compute_undo,
         default_max_tokens, estimate_after_tokens, fmt_k_tokens, friendly_provider_error,
-        manual_compact_result,
+        manual_noop_result,
     };
     use atomcode_core::config::provider::ProviderConfig;
     use atomcode_coding::CodingAgentConfig;
-    use atomcode_kernel::message::{CompactTrigger, Message};
+    use atomcode_kernel::message::Message;
     use atomcode_kernel::provider::ReasoningEffort;
 
     #[test]
@@ -2144,64 +2123,36 @@ mod undo_tests {
     }
 
     #[test]
-    fn compaction_advisory_announces_committed_auto_overflow_and_ignores_manual() {
-        // Manual `/compact` is handled by the richer streaming `manual_compact_result`
-        // path, so the terse advisory stays silent for it on BOTH outcomes.
-        assert!(compaction_advisory(true, &CompactTrigger::Manual { focus: None }).is_none());
-        assert!(compaction_advisory(false, &CompactTrigger::Manual { focus: None }).is_none());
-
-        // A committed auto/overflow compaction announces itself once.
-        assert!(compaction_advisory(true, &CompactTrigger::Auto { utilization: 0.9 }).is_some());
-        assert!(compaction_advisory(true, &CompactTrigger::Overflow { attempt: 0 }).is_some());
-
-        // Auto / Overflow no-op compaction stays silent (no user action to ack, no spam).
-        assert!(compaction_advisory(false, &CompactTrigger::Auto { utilization: 0.9 }).is_none());
-        assert!(compaction_advisory(false, &CompactTrigger::Overflow { attempt: 0 }).is_none());
+    fn compaction_mark_label_drain_reports_messages_and_token_reduction() {
+        // 129 messages summarized; pre = 42.9K tokens; bytes 170k→44k ⇒ after ≈ 11.1K.
+        let label = compaction_mark_label(129, 170_000, 44_000, 42_900);
+        assert!(label.contains("129"), "count: {label}");
+        assert!(label.contains("42.9K") && label.contains("11.1K"), "figures: {label}");
+        assert!(label.contains('→'), "drain shows before→after arrow: {label}");
+        assert!(label.contains('~'), "estimate marker: {label}");
     }
 
     #[test]
-    fn manual_compact_result_reports_dropped_count_and_token_reduction() {
-        // 129 messages dropped; pre-compaction context = 42.9K tokens; the conversation
-        // shrank to ~25.9% of its bytes → after ≈ 11.1K. Numbers + the `→` arrow are
-        // locale-invariant (en: "dropped N messages, X → Y tokens"; zh: "丢弃 N 条消息，
-        // X → Y tokens"), so we assert on those rather than the surrounding words.
-        let line = manual_compact_result(true, 129, 170_000, 44_000, 42_900);
-        assert!(line.contains("129"), "dropped-count missing: {line}");
-        assert!(line.contains("42.9K"), "before figure missing: {line}");
-        assert!(line.contains("11.1K"), "after figure missing: {line}");
-        assert!(line.contains('→'), "token-reduction arrow missing: {line}");
+    fn compaction_mark_label_stub_reports_saved_no_arrow() {
+        // removed == 0 ⇒ stub fold. pre = 42.9K; bytes 170k→136k ⇒ after ≈ 34.3K, saved ≈ 8.6K.
+        let label = compaction_mark_label(0, 170_000, 136_000, 42_900);
+        assert!(!label.contains('→'), "stub shows saved delta, not before→after: {label}");
+        assert!(label.contains('~'), "estimate marker: {label}");
+        assert!(label.contains("8.6K"), "saved figure: {label}");
     }
 
     #[test]
-    fn manual_compact_result_true_noop_is_short_line_without_arrow() {
-        // A TRUE no-op (candidate byte-identical: bytes_after == bytes_before) reports the
-        // "(nothing to compact — conversation is short)" line, which — in every locale —
-        // carries NO `→` arrow (unlike the committed / no-savings lines).
-        let noop = manual_compact_result(false, 0, 8_000, 8_000, 6_000);
-        assert!(!noop.is_empty(), "no-op must still acknowledge the command");
-        assert!(!noop.contains('→'), "true no-op must not show a token comparison: {noop}");
-        // Degenerate all-zero inputs also resolve to the short (no-arrow) line.
-        assert!(!manual_compact_result(false, 0, 0, 0, 0).contains('→'));
+    fn manual_noop_short_has_no_arrow() {
+        // True no-op (byte-identical candidate) → "conversation is short", no arrow.
+        assert!(!manual_noop_result(8_000, 8_000, 6_000).contains('→'));
     }
 
     #[test]
-    fn manual_compact_result_net_loss_reports_no_savings_with_figures() {
-        // A refused compaction whose candidate GREW (bytes_after > bytes_before) — e.g.
-        // running `/compact` twice — is NOT "short"; v1 shows a "would not save tokens:
-        // X → Y" line WITH a `→` arrow. before = 5.0K; after = 5000*15000/10000 = 7500.
-        let line = manual_compact_result(false, 0, 10_000, 15_000, 5_000);
-        assert!(line.contains('→'), "net-loss line shows a token comparison: {line}");
-        assert!(line.contains("5.0K"), "before figure: {line}");
-        assert!(line.contains("7.5K"), "after figure: {line}");
-    }
-
-    #[test]
-    fn manual_compact_result_falls_back_to_byte_estimate_without_usage() {
-        // No provider usage yet (before_tokens = 0): rather than show "0 → 0", fall back
-        // to a coarse bytes/4 estimate. 40_000 bytes → ~10K before; halved bytes → ~5K.
-        let line = manual_compact_result(true, 3, 40_000, 20_000, 0);
-        assert!(line.contains("10.0K"), "byte-fallback before figure: {line}");
-        assert!(line.contains("5.0K"), "byte-fallback after figure: {line}");
+    fn manual_noop_net_loss_reports_no_savings_with_arrow() {
+        // Refused because the candidate GREW (bytes_after > bytes_before).
+        let line = manual_noop_result(10_000, 15_000, 5_000);
+        assert!(line.contains('→'), "net-loss shows a token comparison: {line}");
+        assert!(line.contains("5.0K") && line.contains("7.5K"), "figures: {line}");
     }
 
     #[test]
