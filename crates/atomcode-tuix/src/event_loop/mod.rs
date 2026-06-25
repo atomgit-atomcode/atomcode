@@ -8023,6 +8023,40 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
+        AgentEvent::CompactionUi(kind) => match kind {
+            atomcode_core::agent::CompactionUiKind::Begin => {
+                state.compacting = true;
+                // A standalone manual `/compact` runs from Idle (its command
+                // handler does NOT call on_submit), so the spinner wouldn't
+                // animate. Force Streaming so "Compacting…" shows, and record
+                // it so completion restores Idle. An auto-compaction is already
+                // mid-turn (Streaming) — leave its phase to the turn lifecycle.
+                if !matches!(state.phase, UiPhase::Streaming) {
+                    state.compaction_forced_streaming = true;
+                    state.phase = UiPhase::Streaming;
+                    state.phase_started_at = Some(std::time::Instant::now());
+                }
+                state.note_stream_activity();
+            }
+            atomcode_core::agent::CompactionUiKind::End => {
+                state.compacting = false;
+                if state.compaction_forced_streaming {
+                    state.compaction_forced_streaming = false;
+                    state.phase = UiPhase::Idle;
+                    state.spinner_label.clear();
+                }
+            }
+            atomcode_core::agent::CompactionUiKind::Mark(label) => {
+                state.compacting = false;
+                renderer.render(UiLine::CompactionMark(label));
+                renderer.flush();
+                if state.compaction_forced_streaming {
+                    state.compaction_forced_streaming = false;
+                    state.phase = UiPhase::Idle;
+                    state.spinner_label.clear();
+                }
+            }
+        },
         AgentEvent::HookWarningHint(msg) => {
             if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                 *slot = Some(msg);
@@ -9093,6 +9127,21 @@ fn draw_spinner_now(
 /// queued suffixes are appended here so format is consistent across
 /// every call site.
 fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Option<&str>) -> String {
+    // Compaction takes over the spinner: show "Compacting…" (or a slow variant
+    // past the stall threshold) with the phase elapsed appended, instead of a
+    // thinking label. Unified for auto + manual /compact.
+    if state.compacting {
+        let base = if state.compaction_stalled() {
+            crate::i18n::t(crate::i18n::Msg::CompactingSlow)
+        } else {
+            crate::i18n::t(crate::i18n::Msg::Compacting)
+        };
+        let mut out = base.into_owned();
+        if let Some(d) = state.phase_elapsed() {
+            out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
+        }
+        return out;
+    }
     let base = &state.spinner_label;
     let mut out = format!("{}{}", base, state.ellipsis());
     // Order matters. The phase clock (`· 372ms`) ticks every frame, and any

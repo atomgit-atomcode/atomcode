@@ -187,6 +187,19 @@ pub struct SubAgentTaskInfo {
     pub dedup_suffix: String,
 }
 
+/// UI lifecycle of a single compaction (see `AgentEvent::CompactionUi`).
+#[derive(Clone, Debug)]
+pub enum CompactionUiKind {
+    /// A slow LLM-summary compaction is about to run — take over the spinner.
+    Begin,
+    /// The compaction did not commit (no-op / refused) — release the spinner,
+    /// draw no marker.
+    End,
+    /// The compaction committed — release the spinner and draw this localized
+    /// marker line in scrollback.
+    Mark(String),
+}
+
 /// Events sent FROM the agent loop TO the UI.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -312,6 +325,12 @@ pub enum AgentEvent {
     /// Currently sourced from the OpenAI provider's truncation detector
     /// when the proxy reports implausibly few prompt_tokens.
     Warning(String),
+    /// Unified compaction UI lifecycle, decoupled from the kernel's byte-level
+    /// `Compacted` audit. Drives the TUI's spinner takeover (`Begin`/`End`) and
+    /// the dim scrollback marker (`Mark`, label already localized by the
+    /// producer). Same for auto-compaction and manual `/compact`. Daemon/web
+    /// drivers ignore it via their catch-all arms.
+    CompactionUi(CompactionUiKind),
     /// A UserPromptSubmit hook failed due to an environment issue (missing
     /// dependency, crash, etc.) rather than an explicit block. The turn
     /// continues but the status-bar hint should surface the error so the

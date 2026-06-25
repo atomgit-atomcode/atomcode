@@ -144,6 +144,16 @@ pub struct UiState {
     pub agent_mode: AgentMode,
     pub spinner_label: String,
     pub spinner_frame: usize,
+    /// A compaction's slow LLM summary is currently running — the footer
+    /// spinner shows "Compacting…" instead of a thinking label and the stall
+    /// hint is compaction-specific. Set by `AgentEvent::CompactionUi(Begin)`,
+    /// cleared on `End`/`Mark`.
+    pub compacting: bool,
+    /// Whether `CompactionUi(Begin)` forced `phase = Streaming` (a standalone
+    /// manual `/compact` started from Idle, which otherwise animates no
+    /// spinner). If so, completion restores Idle; an auto-compaction runs
+    /// mid-turn and leaves the phase to the turn's own lifecycle.
+    pub compaction_forced_streaming: bool,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
@@ -393,6 +403,8 @@ impl UiState {
             agent_mode: AgentMode::default(),
             spinner_label: String::new(),
             spinner_frame: 0,
+            compacting: false,
+            compaction_forced_streaming: false,
             unicode_symbols,
             total_tokens: 0,
             prompt_tokens: 0,
@@ -555,6 +567,14 @@ impl UiState {
         let awaiting_model = matches!(self.phase, UiPhase::Streaming)
             && THINKING_LABELS.contains(&self.spinner_label.as_str());
         stream_stalled_for(awaiting_model, self.last_stream_activity.map(|t| t.elapsed()))
+    }
+
+    /// Whether a running compaction's summary has stalled past
+    /// [`STREAM_STALL_HINT`]. Mirrors [`Self::stream_stalled`] but gates on
+    /// `compacting` instead of a THINKING_LABEL (the spinner shows
+    /// "Compacting…", not a thinking label, during a compaction).
+    pub fn compaction_stalled(&self) -> bool {
+        stream_stalled_for(self.compacting, self.last_stream_activity.map(|t| t.elapsed()))
     }
 
     fn current_thinking(&self) -> &'static str {
@@ -1356,5 +1376,20 @@ mod tests {
         };
         assert_eq!(q.images.len(), 1);
         assert_eq!(q.image_markers, vec![1]);
+    }
+
+    #[test]
+    fn compaction_stalled_only_when_compacting_and_silent() {
+        let mut s = UiState::new();
+        // Not compacting → never "compaction stalled" regardless of silence.
+        s.compacting = false;
+        s.last_stream_activity = Some(std::time::Instant::now() - STREAM_STALL_HINT);
+        assert!(!s.compaction_stalled());
+        // Compacting + silent past the threshold → stalled.
+        s.compacting = true;
+        assert!(s.compaction_stalled());
+        // Compacting but fresh activity → not stalled.
+        s.last_stream_activity = Some(std::time::Instant::now());
+        assert!(!s.compaction_stalled());
     }
 }

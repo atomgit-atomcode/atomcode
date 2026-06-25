@@ -2415,6 +2415,13 @@ async fn run_headless(
             AgentEvent::GoalUpdate { .. } => {
                 // Goal progress — headless mode ignores for now.
             }
+            AgentEvent::CompactionUi(kind) => {
+                // Headless: no spinner / scrollback. Echo a committed marker to
+                // stderr so non-interactive runs still note the compaction.
+                if let atomcode_core::agent::CompactionUiKind::Mark(label) = kind {
+                    eprintln!("[compact] {}", label);
+                }
+            }
         }
     }
 
