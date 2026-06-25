@@ -73,10 +73,12 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
 ///
 /// Why: `{"file_path": "D:\test\foo.py"}` parses as valid JSON, but
 /// `serde_json` decodes `\t`→TAB and `\f`→FF, corrupting the path. The
-/// model almost certainly meant literal backslashes. For strings that
-/// contain a drive-letter prefix (`[A-Za-z]:[\\/]`), this pass treats
-/// the bare `\X` (X ∈ {t,n,r,b,f,u}) as a literal backslash and doubles
-/// it so JSON decodes back to the intended path.
+/// model almost certainly meant literal backslashes. KEY-SCOPED: this only
+/// applies to the VALUE of a path-typed key (`file_path`/`path`) that contains
+/// a drive-letter prefix (`[A-Za-z]:[\\/]`), where it treats the bare `\X`
+/// (X ∈ {t,n,r,b,f,u}) as a literal backslash and doubles it. A `\n`/`\t` in a
+/// `content`/`old_string` value is left as the model's intended JSON escape —
+/// rewriting there silently corrupted valid code/text.
 ///
 /// Idempotent: already-correctly-escaped `\\` is preserved (the second
 /// backslash is consumed as part of the escape pair, not a fresh one).
@@ -87,10 +89,23 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
 /// strings like `"category:\nimportant"` don't trip it — the byte
 /// preceding the alpha must not itself be alphabetic.
 fn pre_escape_windows_paths_in_json(s: &str) -> String {
+    // KEY-SCOPED: only the VALUE of a path-typed key is eligible for the rewrite.
+    // A `\n`/`\t` inside `content`/`old_string`/`new_string` (or any non-path
+    // value) is almost always an intended JSON escape, not a path separator;
+    // rewriting there silently corrupted valid model output (a code blob with a
+    // drive-label + newline like `print('C:\ndone')` became literal `\n`).
+    // `file_path`/`path` are the file-targeting keys where a lone-backslash drive
+    // path is genuinely ambiguous and worth disambiguating.
+    const PATH_KEYS: &[&str] = &["file_path", "path"];
+
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
     let mut out = String::with_capacity(n + 16);
     let mut i = 0;
+    // The most recently seen object key. A string is a KEY when the next
+    // non-whitespace char after it is `:`; otherwise it is a VALUE whose key is
+    // `current_key` (carries across array elements, reset by the next real key).
+    let mut current_key: Option<String> = None;
     while i < n {
         if chars[i] != '"' {
             out.push(chars[i]);
@@ -113,11 +128,28 @@ fn pre_escape_windows_paths_in_json(s: &str) -> String {
         }
         let body_end = j.min(n);
         let body: String = chars[body_start..body_end].iter().collect();
+        let after = if body_end < n { body_end + 1 } else { body_end };
+
+        // Key vs value: peek past the close quote and any whitespace for `:`.
+        let mut k = after;
+        while k < n && chars[k].is_whitespace() {
+            k += 1;
+        }
+        let is_key = k < n && chars[k] == ':';
+
         out.push('"');
-        if looks_like_windows_path(&body) {
-            rewrite_windows_path_body(&body, &mut out);
-        } else {
+        if is_key {
             out.push_str(&body);
+            current_key = Some(body);
+        } else {
+            let is_path_value = current_key
+                .as_deref()
+                .is_some_and(|kk| PATH_KEYS.iter().any(|p| kk.eq_ignore_ascii_case(p)));
+            if is_path_value && looks_like_windows_path(&body) {
+                rewrite_windows_path_body(&body, &mut out);
+            } else {
+                out.push_str(&body);
+            }
         }
         if body_end < n {
             out.push('"');
@@ -1245,28 +1277,31 @@ mod tests {
     }
 
     #[test]
-    fn repair_tool_args_edit_file_windows_path_in_old_string() {
-        // edit_file old_string contains a code snippet with a Windows
-        // path literal — the pre-pass must rewrite that literal so the
-        // generic JSON parser sees the model's intent.
-        let input = "{\"file_path\": \"/src/x.py\", \"old_string\": \"path = 'D:\\test'\", \"new_string\": \"path = 'D:\\prod'\"}";
+    fn repair_tool_args_windows_path_rescue_scoped_to_path_keys() {
+        // KEY-SCOPED (option 1): a lone-backslash drive path is disambiguated in
+        // `file_path` (genuinely a path), but a `\n`/`\t` inside `old_string` is
+        // taken as the JSON escape the model wrote — NOT doubled into a literal
+        // backslash — so valid code/text isn't corrupted. (Models must escape
+        // paths they embed in code, e.g. `D:\\test`.)
+        let input = "{\"file_path\": \"D:\\test\\foo.py\", \"old_string\": \"x = 'C:\\nfoo'\"}";
         let out = repair_tool_args("edit_file", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
-        assert_eq!(v["old_string"], "path = 'D:\\test'");
-        assert_eq!(v["new_string"], "path = 'D:\\prod'");
+        // file_path: the lone-backslash path rescued to literal backslashes.
+        assert_eq!(v["file_path"], "D:\\test\\foo.py");
+        // old_string: the `\n` stays the model's intended NEWLINE, not `\\n`.
+        assert_eq!(v["old_string"], "x = 'C:\nfoo'");
     }
 
     #[test]
-    fn repair_tool_args_windows_path_after_escaped_quote() {
-        // Body contains `\"D:\foo\"` — pre-pass walker must honour `\"`
-        // when locating the string close, so the drive-letter detection
-        // sees the right body content.
-        let input = "{\"cmd\": \"run \\\"D:\\foo.exe\\\"\"}";
+    fn repair_tool_args_drive_shape_in_non_path_value_not_rewritten() {
+        // KEY-SCOPED: a drive-letter shape in a NON-path value (`cmd`) is left
+        // exactly as the model wrote it — only file_path/path get the path pass.
+        // A properly-escaped path round-trips unchanged; the pre-pass walker still
+        // honours `\"` when locating the string close.
+        let input = "{\"cmd\": \"run \\\"D:\\\\foo.exe\\\"\"}";
         let out = repair_tool_args("bash", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
-        let s = v["cmd"].as_str().unwrap();
-        assert!(s.contains("D:\\foo.exe"), "Windows path inside quoted arg lost: {:?}", s);
-        assert!(!s.contains('\t'), "no tab corruption: {:?}", s);
+        assert_eq!(v["cmd"], "run \"D:\\foo.exe\"");
     }
 
     #[test]
@@ -1428,10 +1463,12 @@ use std::sync::Arc;
 ///
 /// **Register it FIRST** (ahead of any approval gate) so the bytes an approval
 /// gate sees are exactly the bytes that execute — the repaired, valid JSON. The
-/// repair chain leaves already-valid JSON untouched EXCEPT under-escaped Windows
-/// drive-letter paths, which it intentionally rewrites (`{"file_path":"D:\test"}`
-/// is valid JSON that mis-decodes to `D:<TAB>est`); it returns hopelessly broken
-/// input unchanged, so rewriting unconditionally is safe and never blocks: a
+/// repair chain leaves already-valid JSON untouched EXCEPT an under-escaped
+/// Windows drive path in a `file_path`/`path` VALUE, which it intentionally
+/// rewrites (`{"file_path":"D:\test"}` is valid JSON that mis-decodes to
+/// `D:<TAB>est`) — `content`/`old_string` values are never rewritten. It returns
+/// hopelessly broken input unchanged, so rewriting unconditionally is safe and
+/// never blocks: a
 /// non-repairable payload still reaches the tool, which surfaces the real parse
 /// error to the model.
 pub struct RepairToolArgsMiddleware;
@@ -1558,5 +1595,18 @@ mod hardening_tests {
         let v: serde_json::Value =
             serde_json::from_str(&mixed).expect("recovered to valid JSON");
         assert_eq!(v["file_path"], "a.py");
+    }
+
+    // --- #2 (key-scoping): valid non-path content with a drive-letter shape is
+    //     identity — the Windows-path pass no longer corrupts it. ---
+
+    #[test]
+    fn valid_content_with_drive_shape_is_identity() {
+        // A valid `content` value containing a drive-label + newline (`C:\n`) must
+        // NOT be rewritten — `\n` is the model's intended newline, not a path
+        // separator. Pre-key-scoping this doubled it to literal `\\n`, landing
+        // broken code on disk.
+        let input = r#"{"content":"print('C:\ndone')"}"#;
+        assert_eq!(repair_tool_args("write_file", input), input);
     }
 }
