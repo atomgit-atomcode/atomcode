@@ -175,9 +175,14 @@ async fn edit_creates_file_history_backup() {
     assert!(new_content.contains("modified content"));
     assert!(!new_content.contains("original content"));
 
-    // Verify backup exists (file_history should have created one)
+    // Verify backup exists (file_history should have created one).
+    // EditFileTool keys file_history by the canonicalized path
+    // (inspect_path_access → canonicalize_candidate_path), so look up under
+    // the same canonical key. On macOS the temp dir is a /var → /private/var
+    // symlink, and querying with the raw path would silently miss.
     let fh = ctx.file_history.lock().await;
-    let latest = fh.latest_version(&path);
+    let canon = std::fs::canonicalize(&path).unwrap();
+    let latest = fh.latest_version(&canon.to_string_lossy());
     assert!(
         latest.is_some(),
         "file_history should have a backup version"

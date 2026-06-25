@@ -1,9 +1,13 @@
-// crates/atomcode-core/tests/plugin_integration.rs
+// crates/atomcode-tuix/tests/plugin_integration.rs
 //
 // End-to-end smoke test for the plugin marketplace pipeline:
 // add_marketplace → install → SkillRegistry::reload + CustomCommandRegistry::load.
 // Verifies that newly-installed plugin assets are visible to the in-process
 // registries that the TUI consults on `/plugin` reload.
+//
+// Lives in atomcode-tuix (not atomcode-core) because `CustomCommandRegistry`
+// is a tuix type — core can't depend on tuix. tuix depends on core, so this
+// test can reach both `atomcode_core::plugin`/`skill` and the tuix registry.
 //
 // Mutates the process-wide `ATOMCODE_HOME` env var, so we serialise via
 // `#[serial_test::serial]` to avoid colliding with other tests that read
@@ -81,6 +85,6 @@ fn add_install_reload_flow() {
     assert!(reg.get("e2e:sk").is_some(), "missing skill e2e:sk");
 
     // Verify CustomCommandRegistry sees `e2e:c`.
-    let creg = atomcode_core::commands::CustomCommandRegistry::load(working.path());
+    let creg = atomcode_tuix::custom_commands::CustomCommandRegistry::load(working.path());
     assert!(creg.get("e2e:c").is_some(), "missing command e2e:c");
 }
