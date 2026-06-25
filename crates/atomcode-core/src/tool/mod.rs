@@ -2,7 +2,6 @@ pub mod auto_fix;
 pub mod bash;
 pub mod blast_radius;
 pub mod cd;
-pub mod diagnostics;
 pub mod edit;
 pub mod file_deps;
 pub mod file_history;
@@ -975,8 +974,6 @@ pub struct ToolContext {
     pub first_error_signatures: Arc<RwLock<Vec<String>>>,
     /// Shared telemetry handle. Always present (possibly in disabled state).
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
-    /// Shared LSP manager for diagnostics tool. `None` when LSP is disabled.
-    pub lsp: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
     /// Optional event sender for real-time tool output streaming (e.g., bash stdout).
     /// When set, tools like bash can send output chunks as they're produced.
     pub event_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::turn::event::TurnEvent>>>,
@@ -1028,7 +1025,6 @@ impl ToolContext {
             read_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             first_error_signatures: Arc::new(RwLock::new(Vec::new())),
             telemetry,
-            lsp: None,
             event_tx: None,
             current_call_id: None,
             tool_registry: None,
@@ -1051,7 +1047,6 @@ impl ToolContext {
         let mut ctx = Self::new(wd);
         ctx.graph = self.graph.clone();
         ctx.telemetry = self.telemetry.clone();
-        ctx.lsp = self.lsp.clone();
         // Share the FileStore — sub-agents reading the same file reuse
         // the parent's disk work and benefit from invalidation events
         // emitted by either side.
@@ -1059,19 +1054,6 @@ impl ToolContext {
         ctx
     }
 
-    /// Notify LSP that a file changed (if LSP is enabled).
-    /// This is a convenience method for write/edit/search_replace tools.
-    pub async fn notify_lsp_file_changed(&self, path: &Path, content: &str) {
-        if let Some(ref lsp) = self.lsp {
-            if let Err(e) = lsp.notify_file_changed(path, content).await {
-                tracing::warn!(
-                    "[lsp] Failed to refresh diagnostics for {}: {}",
-                    path.display(),
-                    e
-                );
-            }
-        }
-    }
 }
 
 /// Build a disabled (no-op) `Telemetry` handle — zero overhead, no I/O.

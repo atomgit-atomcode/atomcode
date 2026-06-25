@@ -588,10 +588,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("✓ MCP 服务 '{name}' 已连接").into(),
         Msg::McpServerFailed { name, error } =>
             format!("× MCP 服务 '{name}' 失败：{error}").into(),
-        Msg::LspServerStarted { name, ext } =>
-            format!("✓ LSP 服务 '{name}' 已为 .{ext} 启动").into(),
-        Msg::LspServerFailed { name, ext, error } =>
-            format!("× LSP 服务 '{name}'（.{ext}）失败：{error}").into(),
 
         // ── /worktree ──
         Msg::WorktreeUsage =>

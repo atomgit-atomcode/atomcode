@@ -600,10 +600,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("✓ MCP server '{name}' connected").into(),
         Msg::McpServerFailed { name, error } =>
             format!("× MCP server '{name}' failed: {error}").into(),
-        Msg::LspServerStarted { name, ext } =>
-            format!("✓ LSP server '{name}' started for .{ext}").into(),
-        Msg::LspServerFailed { name, ext, error } =>
-            format!("× LSP server '{name}' for .{ext} failed: {error}").into(),
 
         // ── /worktree ──
         Msg::WorktreeUsage =>

@@ -180,9 +180,6 @@ impl Tool for WriteFileTool {
             .await
             .retain(|(p, _, _), _| p != &path);
 
-        // Notify LSP that file changed (if LSP is enabled).
-        ctx.notify_lsp_file_changed(&path, &parsed.content).await;
-
         let output = if let Some(old_lines) = overwrite_info {
             let diff = new_lines as i64 - old_lines as i64;
             let sign = if diff >= 0 { "+" } else { "" };

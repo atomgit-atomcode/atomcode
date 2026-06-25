@@ -129,9 +129,6 @@ async fn validate_write_check(
         .await
         .unwrap_or_else(|_| raw_path.to_path_buf());
 
-    // Notify LSP that file changed (if LSP is enabled).
-    ctx.notify_lsp_file_changed(&canon_path, &validated.fixed_content)
-        .await;
     // D3: drop any FileStore entry for this path. peek_file against the
     // pre-edit store_id will return a "stale" hint pointing at re-read,
     // ensuring the model never operates on a snapshot that no longer

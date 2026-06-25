@@ -337,6 +337,20 @@ pub struct NotificationConfig {
     pub background_only: bool,
 }
 
+/// Custom language-server configuration for a file extension, set under
+/// `[lsp.servers]` in the user's config. A serde DTO with no runtime behavior —
+/// the live LSP engine is atomcode-capabilities' codeintel LSP (configured
+/// separately). Relocated from the deleted `crate::lsp::registry` so the config
+/// schema's TOML stays byte-compatible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub root_markers: Vec<String>,
+}
+
 /// Controls LSP (Language Server Protocol) integration.
 ///
 /// Off by default. 5-7 atomgr datalog (build 942b615): the only `diagnostics`
@@ -359,7 +373,7 @@ pub struct LspConfig {
     pub auto_detect: bool,
     /// Custom server configurations keyed by file extension.
     #[serde(default)]
-    pub servers: std::collections::HashMap<String, crate::lsp::registry::LspServerConfig>,
+    pub servers: std::collections::HashMap<String, LspServerConfig>,
     /// Time in milliseconds to wait after file sync before reading diagnostics.
     /// LSP servers need time to process notifications and publish diagnostics.
     /// Larger files or slower servers may need higher values.
@@ -728,7 +742,7 @@ mod tests {
         let mut servers = std::collections::HashMap::new();
         servers.insert(
             "rs".to_string(),
-            crate::lsp::registry::LspServerConfig {
+            LspServerConfig {
                 command: "my-custom-rust-ls".to_string(),
                 args: vec![],
                 root_markers: vec![],

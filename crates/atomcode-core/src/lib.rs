@@ -12,7 +12,6 @@ pub mod i18n;
 pub mod input_history;
 pub mod live;
 pub mod locale;
-pub mod lsp;
 pub mod mcp;
 pub mod notify;
 pub mod provider;

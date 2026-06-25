@@ -416,8 +416,6 @@ pub enum Msg<'a> {
     // MCP / LSP server connect feedback (event handler output)
     McpServerConnected { name: &'a str },
     McpServerFailed { name: &'a str, error: &'a str },
-    LspServerStarted { name: &'a str, ext: &'a str },
-    LspServerFailed { name: &'a str, ext: &'a str, error: &'a str },
 
     // ── /worktree ──
     WorktreeUsage,

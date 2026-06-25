@@ -195,13 +195,12 @@ impl Tool for SearchReplaceTool {
                     success: false,
                 });
             }
-            // Canonicalize so downstream by-path lookups (FileStore, LSP)
+            // Canonicalize so downstream by-path lookups (FileStore)
             // match what read.rs stored — the walk can yield the un-resolved
             // symlink form (macOS `/var/...` vs `/private/var/...`).
             let canon = tokio::fs::canonicalize(&file_path)
                 .await
                 .unwrap_or_else(|_| file_path.clone());
-            ctx.notify_lsp_file_changed(&canon, &new_content).await;
             ctx.file_store.write().await.invalidate(&canon);
             total_replacements += count;
             files_modified.push(format!("  {} ({} replacements)", file_path.display(), count));
