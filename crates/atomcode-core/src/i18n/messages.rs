@@ -775,11 +775,13 @@ pub enum Msg<'a> {
     /// Spinner label variant when the compaction summary has stalled (>20s).
     CompactingSlow,
     /// Scrollback marker for a committed drain+summarize compaction (auto or
-    /// manual). `messages` = exact count summarized; `before`/`after` = `~`-
-    /// flagged token estimates.
+    /// manual). `messages` = exact count summarized; `before`/`after` = raw
+    /// token-estimate strings (e.g. "48.2K") — the `~` marker is added by the
+    /// i18n format string, not by the caller.
     CompactMarkDrain { messages: usize, before: &'a str, after: &'a str },
     /// Scrollback marker for a committed in-place stub fold (tool results
-    /// collapsed, no messages dropped). `saved` = `~`-flagged token estimate.
+    /// collapsed, no messages dropped). `saved` = raw token-estimate string;
+    /// the `~` marker is added by the i18n format string, not by the caller.
     CompactMarkStub { saved: &'a str },
 
     // ── /goal ──
