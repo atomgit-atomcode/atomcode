@@ -1605,6 +1605,27 @@ pub(crate) async fn live_stop() -> impl IntoResponse {
 }
 
 #[derive(serde::Deserialize)]
+pub(crate) struct LiveSwitchSessionReq {
+    pub session_id: String,
+}
+
+/// POST /live/switch_session — webui 切到「已存在」的会话时广播会话切换，
+/// 让同进程 sync 模式的 TUI 跟随加载该会话（含历史）。
+///
+/// 与新建会话（create_session）走同一条广播：仅带 session_id；TUI 侧按 id
+/// 跨项目定位会话文件（SessionManager::load_any），据其 working_dir 切目录、
+/// 回放历史。无活动 LiveSession（如 headless daemon 无 TUI 附着，或 TUI 未开
+/// sync）时静默 no-op——没有视图需要跟随。不在此处 ensure_live_session：避免
+/// 在无人跟随时凭空建一个新的 LiveSession。
+pub(crate) async fn live_switch_session_endpoint(
+    Json(req): Json<LiveSwitchSessionReq>,
+) -> impl IntoResponse {
+    let sid = atomcode_core::session::SessionId::from_string(req.session_id);
+    live_switch_session(sid);
+    Json(serde_json::json!({ "ok": true }))
+}
+
+#[derive(serde::Deserialize)]
 pub(crate) struct LiveProviderReq {
     pub provider: String,
 }

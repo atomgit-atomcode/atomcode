@@ -8439,14 +8439,18 @@ fn handle_agent_event(
             }
         }
         AgentEvent::SessionSwitched(session_id) => {
-            // webui 新建对话，TUI 跟随切换到新会话。与 ProjectSwitched 不同，
-            // 这里不切目录，只切换到指定 session_id 的新会话。
+            // 另一端（webui 新建对话 / webui 侧栏切到已存在会话）切换了会话，
+            // 同步模式的 TUI 跟随。按 session_id 跨项目定位会话文件：
+            //  - webui「新建」：文件已落盘但为空 → 回放空历史 = 干净空白会话；
+            //  - webui 切到「已存在」会话：把该会话的历史一并加载、回放进 TUI。
+            // 二者统一走 load_any，省掉「新建/切换」分支。找不到文件（罕见）才退回
+            // 到「按指定 id 建空白会话」的旧行为。
             crate::tuix_trace!("TUI", "SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
             let sid = atomcode_core::session::SessionId::from_string(session_id);
-            // 清除当前对话、重置到新 session，但用 webui 指定的 session_id
-            // 以确保三端（TUI / webui / 磁盘）落到同一个文件。
+            let loaded = atomcode_core::session::SessionManager::load_any(&sid).ok();
+
+            // 重置对话与计数（无论加载成功与否都先清场）。
             ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
-            ctx.current_session_id = None;
             state.total_tokens = 0;
             state.prompt_tokens = 0;
             state.completion_tokens = 0;
@@ -8455,37 +8459,77 @@ fn handle_agent_event(
             state.pending_context_render = None;
             state.thinking_idx = 0;
             state.on_turn_complete();
-            // 使用 webui 指定的 session_id 创建新 session，保证三端一致。
-            let mut new_session =
-                atomcode_core::session::Session::default_session(ctx.working_dir.clone());
-            new_session.id = sid;
-            ctx.current_session = new_session;
+
+            // 目标会话所属目录：已存在会话用其自身 working_dir；建不出来时沿用当前目录。
+            let target_session = match loaded {
+                Some(session) => {
+                    // 该会话属于另一个项目 → 先像 /cd 一样切目录（与 webui handleSelectSession
+                    // 的 setCwd 对齐），保证后续回合在正确项目里执行、@-索引/会话列表也跟随。
+                    if ctx.working_dir != session.working_dir {
+                        commands::apply_cd(ctx, session.working_dir.clone());
+                    }
+                    ctx.current_session_id = Some(sid.clone());
+                    session
+                }
+                None => {
+                    // 罕见：磁盘上找不到该会话（如 webui 刚新建、广播早于落盘）。
+                    // 退回旧行为：用指定 id 建一个空白会话，保证三端落同一文件。
+                    ctx.current_session_id = None;
+                    let mut new_session =
+                        atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+                    new_session.id = sid;
+                    new_session
+                }
+            };
+
+            // 把历史灌进 agent 会话，使后续回合带上下文（空会话则等价于清空）。
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SetConversation(
+                    target_session.to_conversation_snapshot(),
+                ))
+                .ok();
+            commands::bind_telemetry_to_session(ctx, &target_session);
+            ctx.current_session = target_session;
             ctx.bg_manager
                 .set_foreground_session(ctx.current_session.clone());
-            commands::bind_telemetry_to_session(ctx, &ctx.current_session);
-            // 如果在同步模式，重新附着 LiveSession 以绑定新 session_id。
+
+            // 重绘画布并回放目标会话历史（/resume 同款干净回放，不带「同步快照」分隔）。
+            renderer.begin_sync();
+            renderer.reset();
+            if ctx.current_session.messages.is_empty() {
+                let dir_display =
+                    crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+                renderer.render(UiLine::Welcome {
+                    model: ctx.model_name.clone(),
+                    working_dir: dir_display,
+                });
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
+                ));
+            } else {
+                crate::modals::session_picker::replay_session(
+                    renderer,
+                    &ctx.current_session,
+                    true,
+                );
+            }
+            renderer.flush();
+            renderer.end_sync();
+
+            // 同步模式：用「带历史」的 session_id 重新附着 LiveSession，使三端
+            // （TUI / webui / 磁盘）落到同一会话、同一对话。render_snapshot=false：
+            // 历史已在上面 replay 过，避免重复刷。
             if ctx.sync_session.is_some() {
                 let session = atomcode_daemon::ensure_live_session(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
                     Some(ctx.current_session.id.clone()),
-                    Vec::new(),
+                    ctx.current_session.messages.clone(),
                 );
-                crate::tuix_trace!("TUI", "SessionSwitched: attaching new LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
+                crate::tuix_trace!("TUI", "SessionSwitched: attaching LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
                 attach_live_session(ctx, renderer, session, false);
             }
-            renderer.begin_sync();
-            renderer.reset();
-            let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-            renderer.render(UiLine::Welcome {
-                model: ctx.model_name.clone(),
-                working_dir: dir_display,
-            });
-            renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
-            ));
-            renderer.flush();
-            renderer.end_sync();
         }
     }
 }

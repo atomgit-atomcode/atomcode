@@ -3,7 +3,7 @@
 
 import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -352,6 +352,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
       // 无 id（新建）则不加载、直接落地。
       setLoading(sessionId != null);
+      // sync 模式：本端在侧栏切到另一个（已存在）会话时，通知后端广播会话切换，
+      // 使同进程 sync 模式的 TUI 跟随加载该会话历史。
+      // 不会回环：远端 session_switched 事件的 handler 会先把 activeIdRef 设为该 id，
+      // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
+      if (sync && sessionId) {
+        postLiveSwitchSession(sessionId).catch(() => {});
+      }
     }
 
     if (!sessionId) return;
@@ -623,11 +630,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 重新连接后 /live handler 会绑定到新 LiveSession。
     if (e.type === 'session_switched') {
       liveSessionIdRef.current = e.session_id;
+      // 本端正是发起此次切换的视图（侧栏切到已存在会话→postLiveSwitchSession→广播
+      // 回流），或重复广播：此时我们已经在该会话上、历史也正在/已经加载，绝不能再清空
+      // 画布，否则刚 getSession 加载好的历史会被自己的广播回流抹掉（且 sessionId 未变，
+      // 加载 effect 不会重跑，history 永远回不来）。仅把实时流重绑到新 LiveSession 即可。
+      const alreadyViewing = activeIdRef.current === e.session_id;
       activeIdRef.current = e.session_id;
-      onSessionId(e.session_id);
-      setMessages([]);
-      setTokens(null);
-      setHistoryHint(null);
+      if (!alreadyViewing) {
+        onSessionId(e.session_id);
+        setMessages([]);
+        setTokens(null);
+        setHistoryHint(null);
+      }
       if (sync) {
         stopLiveStream();
         startLiveStream();

@@ -400,6 +400,36 @@ impl SessionManager {
         serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
+    /// Find and load a session by ID across **all** project buckets.
+    ///
+    /// Sessions are sharded into `<sessions_root>/<project_hash>/<id>.json` by
+    /// the working dir's hash, so `load` needs to know the project. A webui
+    /// session-switch broadcast carries only the id (the TUI may even be in a
+    /// different project), so here we scan every bucket for a matching file and
+    /// return the first hit — the loaded session's own `working_dir` then tells
+    /// the caller which project it belongs to. Errs `NotFound` when no bucket
+    /// contains the id.
+    pub fn load_any(id: &SessionId) -> std::io::Result<Session> {
+        let root = Self::sessions_root_dir();
+        let file_name = format!("{}.json", id);
+        for entry in std::fs::read_dir(&root)? {
+            let path = entry?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let candidate = path.join(&file_name);
+            if candidate.is_file() {
+                let json = std::fs::read_to_string(&candidate)?;
+                return serde_json::from_str(&json)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("session {id} not found in any project"),
+        ))
+    }
+
     /// List all sessions for this project (metadata only).
     pub fn list(&self) -> std::io::Result<Vec<SessionMeta>> {
         let project_dir = self.project_dir();

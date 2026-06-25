@@ -567,6 +567,18 @@ export async function postLiveStop(): Promise<void> {
   if (!resp.ok) throw new Error(`stop live chat failed: ${resp.status}`);
 }
 
+/** Sync-mode session switch: notify the daemon when the user selects a
+ *  different (existing) session in the sidebar, so the same-process TUI
+ *  follows — loading that session's history. Broadcasts via the same path
+ *  as new-session creation; a no-op server-side when no view is attached. */
+export async function postLiveSwitchSession(sessionId: string): Promise<void> {
+  await fetch('/live/switch_session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+}
+
 /** Sync-mode model switch: notify the daemon immediately when the dropdown
  *  changes (not just on send), so the TUI header and other tabs follow. */
 export async function postLiveProvider(provider: string): Promise<void> {
