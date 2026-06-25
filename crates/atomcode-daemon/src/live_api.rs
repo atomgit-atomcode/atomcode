@@ -959,6 +959,9 @@ impl TurnExecutor for KernelTurnExecutor {
                 }),
                 AgentEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
                 AgentEvent::Warning(w) => emit(TurnEvent::Warning(w)),
+                AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
+                    emit(TurnEvent::Warning(label))
+                }
                 AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot } => {
                     emit(TurnEvent::ApprovalRequested {
                         tool_name,
@@ -1089,6 +1092,9 @@ pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
         },
         AgentEvent::WorkingDirChanged(p) => TurnEvent::WorkingDirChanged(p),
         AgentEvent::Warning(w) => TurnEvent::Warning(w),
+        AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
+            TurnEvent::Warning(label)
+        }
         _ => return None,
     })
 }
@@ -1814,6 +1820,23 @@ mod tests {
     async fn preprocess_live_caption_is_passthrough_without_images() {
         let out = preprocess_live_caption("看下这个图片", &[], None).await;
         assert_eq!(out, "看下这个图片");
+    }
+
+    #[test]
+    fn compaction_mark_maps_to_warning_wire_event() {
+        // Web parity / finding 7: a committed compaction's Mark must reach non-TUI
+        // drivers. The bridge now emits CompactionUi(Mark) instead of the old
+        // Warning("conversation compacted"); the daemon must translate it to a warning
+        // wire event so /webui + /chat clients still see the notice. Begin/End are TUI
+        // spinner lifecycle and are intentionally dropped (web has no compaction spinner).
+        use atomcode_core::agent::{AgentEvent, CompactionUiKind};
+        let label = "已压缩 · 摘要 3 条 · ~40K→~10K".to_string();
+        assert!(matches!(
+            agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Mark(label.clone()))),
+            Some(TurnEvent::Warning(w)) if w == label
+        ));
+        assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Begin)).is_none());
+        assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::End)).is_none());
     }
 
     // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，
