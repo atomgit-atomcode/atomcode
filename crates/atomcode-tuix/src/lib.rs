@@ -15,6 +15,8 @@ pub mod modals;
 pub mod platform;
 pub mod render;
 pub mod sanitize;
+#[cfg(unix)]
+mod signal_restore;
 pub mod state;
 pub mod terminal;
 pub mod terminal_bg;
@@ -96,6 +98,11 @@ impl TerminalGuard {
             kbd_flags_pushed: false,
         };
         if caps.raw_mode {
+            // Capture the cooked termios and install fatal-signal terminal-restore
+            // handlers BEFORE flipping to raw mode, so a SIGTERM/SIGHUP kill (which
+            // runs no Drop) still leaves the shell a usable terminal. Unix-only.
+            #[cfg(unix)]
+            crate::signal_restore::arm();
             crossterm::terminal::enable_raw_mode()?;
             g.raw_enabled = true;
         }
@@ -228,11 +235,17 @@ impl Drop for TerminalGuard {
 /// CSI-u report (the reported crash artefact).
 ///
 /// Mirrors `RetainedRenderer::Drop` (mouse-mode off, Kitty pop, cursor
-/// show, autowrap on, DECSTBM release) and appends a CRLF so the panic
-/// backtrace prints on a fresh line below the last painted TUI row
-/// instead of on top of it. Every sequence is idempotent, so emitting
-/// it after a graceful shutdown that already sent the same bytes is a
-/// harmless no-op.
+/// show, autowrap on, DECSTBM release), then disables bracketed paste
+/// (`?2004l`) and appends a CRLF so the panic backtrace prints on a fresh
+/// line below the last painted TUI row instead of on top of it. Every
+/// sequence is idempotent, so emitting it after a graceful shutdown that
+/// already sent the same bytes is a harmless no-op.
+///
+/// Bracketed paste is armed by `TerminalGuard`, not the renderer, so it is
+/// NOT in `RetainedRenderer::Drop` — but the abrupt-exit paths that lean on
+/// this sequence (panic hook, signal-restore handler) DO need it off, else
+/// the shell wraps every paste in literal `200~`/`201~`. It is the single
+/// source of truth for "undo everything the TUI armed".
 ///
 /// The Kitty pop uses the `<` introducer (`\x1b[<1u`), never `>`: `>`
 /// would *arm* the protocol on the way out — the very bug this fixes.
@@ -240,7 +253,7 @@ impl Drop for TerminalGuard {
 /// stack), so this stays unconditional and we needn't thread the
 /// `kbd_flags_pushed` state out of `TerminalGuard`.
 pub(crate) fn panic_restore_sequence() -> &'static [u8] {
-    b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\r\n"
+    b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\x1b[?2004l\r\n"
 }
 
 /// Emit [`panic_restore_sequence`] to stdout and flush. Best-effort
@@ -781,5 +794,6 @@ mod panic_restore_tests {
         assert!(text.contains("\x1b[r"), "must release DECSTBM scroll region: {text:?}");
         assert!(text.contains("\x1b[?1002l"), "must disable button-event mouse: {text:?}");
         assert!(text.contains("\x1b[?1006l"), "must disable SGR mouse coords: {text:?}");
+        assert!(text.contains("\x1b[?2004l"), "must disable bracketed paste: {text:?}");
     }
 }
