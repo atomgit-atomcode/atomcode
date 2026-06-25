@@ -14,6 +14,17 @@
 /// `tool_name` selects a specialized extractor when available (e.g. `edit_file`
 /// which may contain unescaped source code in `old_string`/`new_string`).
 pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
+    // Defense-in-depth bound. Repair is best-effort salvage of weak-model
+    // output: a multi-hundred-KB argument is either already-valid (the tool
+    // parses it directly) or hopeless — don't run the structural passes over a
+    // giant blob. The passes below are O(N), but this caps total work and
+    // allocation on pathological input and is a hard ceiling for the middleware
+    // (which runs synchronously on the host thread under panic=abort).
+    const MAX_REPAIR_BYTES: usize = 512 * 1024;
+    if args.len() > MAX_REPAIR_BYTES {
+        return args.to_string();
+    }
+
     // Pre-pass: rescue ambiguous Windows paths BEFORE any JSON parsing
     // touches them. `{"file_path": "D:\test\foo.py"}` is *valid* JSON
     // (`\t` and `\f` are spec-legal escapes), so the fast path would
@@ -34,7 +45,10 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
         return repaired;
     }
     // Specialized: edit_file often ships source code with unescaped quotes/newlines.
-    if tool_name == "edit_file" {
+    // Case-insensitive so a model that emits `Edit_File`/`EDIT_FILE` still gets the
+    // extractor (the kernel resolves tools strictly today, but the middleware now
+    // passes the resolved tool's canonical name — see `RepairToolArgsMiddleware`).
+    if tool_name.eq_ignore_ascii_case("edit_file") {
         if let Some(v) = extract_edit_file_args(&pre) {
             if let Ok(s) = serde_json::to_string(&v) {
                 return s;
@@ -419,11 +433,32 @@ pub fn repair_json(s: &str) -> String {
         }
         i += 1;
     }
-    // Insert commas in reverse order to preserve indices
-    for pos in insertions.into_iter().rev() {
-        chars.insert(pos, ',');
+    // Insert the queued commas in a single O(N) pass. Replaying with
+    // `Vec::insert` (each O(N), shifting the tail) over O(N) insertions was
+    // O(N^2) — a long run of comma-less fields from a weak model would pin a
+    // core. `insertions` is ascending (collected in a forward scan), so a single
+    // ordered rebuild is byte-identical to the reverse `insert` replay.
+    if insertions.is_empty() {
+        result = chars.into_iter().collect();
+    } else {
+        let mut rebuilt = Vec::with_capacity(chars.len() + insertions.len());
+        let mut ins = insertions.into_iter().peekable();
+        for (idx, c) in chars.into_iter().enumerate() {
+            // `chars.insert(pos, ',')` inserts BEFORE chars[pos], so emit a comma
+            // before each char whose index is queued (a while-loop tolerates
+            // duplicate positions, though the forward scan can't produce them).
+            while ins.peek() == Some(&idx) {
+                rebuilt.push(',');
+                ins.next();
+            }
+            rebuilt.push(c);
+        }
+        // Any insertion queued at end-of-string (pos == chars.len()).
+        for _ in ins {
+            rebuilt.push(',');
+        }
+        result = rebuilt.into_iter().collect();
     }
-    result = chars.into_iter().collect();
 
     // Fix unquoted keys: {path: "src"} → {"path": "src"}
     // Guarded by `structural_mask` so a `{`/`,` INSIDE a string value
@@ -478,31 +513,39 @@ pub fn repair_json(s: &str) -> String {
     // Remove trailing commas before } or ]. Both the `,` and the
     // closing brace must be structural — a literal `,}` inside a
     // string value (e.g. `"tail,}"`) must survive unchanged.
-    loop {
+    //
+    // Single right-to-left pass. The previous fixpoint loop removed only ONE
+    // comma per closing brace per pass and recomputed `structural_mask` each
+    // pass → O(N^2), a host-freeze on a long `,,,,]` run from a weak model.
+    // `structural_mask` is invariant under structural-comma removal (it depends
+    // only on quote positions), so one pass suffices: a structural comma is
+    // dropped iff its nearest kept right-neighbor — reachable through a run of
+    // already-dropped structural commas — is a structural `}`/`]`. Whitespace or
+    // any other char breaks the run (matching the old loop, which required the
+    // IMMEDIATE right neighbor to be the brace). Output is identical.
+    {
         let rchars: Vec<char> = result.chars().collect();
         let mask = structural_mask(&rchars);
-        let mut next = String::with_capacity(rchars.len());
-        let mut i = 0;
-        let mut changed = false;
-        while i < rchars.len() {
-            if mask[i]
-                && rchars[i] == ','
-                && i + 1 < rchars.len()
-                && mask[i + 1]
-                && (rchars[i + 1] == '}' || rchars[i + 1] == ']')
-            {
-                next.push(rchars[i + 1]);
-                i += 2;
-                changed = true;
-                continue;
+        let mut keep = vec![true; rchars.len()];
+        let mut right_is_close = false;
+        for i in (0..rchars.len()).rev() {
+            if mask[i] && rchars[i] == ',' {
+                if right_is_close {
+                    keep[i] = false; // drop; a removed comma is transparent
+                } else {
+                    right_is_close = false;
+                }
+            } else if mask[i] && (rchars[i] == '}' || rchars[i] == ']') {
+                right_is_close = true;
+            } else {
+                right_is_close = false;
             }
-            next.push(rchars[i]);
-            i += 1;
         }
-        result = next;
-        if !changed {
-            break;
-        }
+        result = rchars
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, c)| if keep[i] { Some(c) } else { None })
+            .collect();
     }
 
     // If it doesn't start with { or [, wrap it
@@ -1385,17 +1428,20 @@ use std::sync::Arc;
 ///
 /// **Register it FIRST** (ahead of any approval gate) so the bytes an approval
 /// gate sees are exactly the bytes that execute — the repaired, valid JSON. The
-/// repair chain is identity on already-valid JSON and returns hopelessly broken
+/// repair chain leaves already-valid JSON untouched EXCEPT under-escaped Windows
+/// drive-letter paths, which it intentionally rewrites (`{"file_path":"D:\test"}`
+/// is valid JSON that mis-decodes to `D:<TAB>est`); it returns hopelessly broken
 /// input unchanged, so rewriting unconditionally is safe and never blocks: a
 /// non-repairable payload still reaches the tool, which surfaces the real parse
 /// error to the model.
 pub struct RepairToolArgsMiddleware;
 
 impl RepairToolArgsMiddleware {
-    /// Normalize the call's arguments to valid JSON in place. Extracted from
-    /// `before` so it can be unit-tested without a `Tool`/`RequestCtx`.
-    fn repair_call(&self, call: &mut ToolCall) {
-        call.arguments = repair_tool_args(&call.name, &call.arguments);
+    /// Normalize the call's arguments to valid JSON in place, selecting the
+    /// `edit_file` specialized extractor by `tool_name`. Extracted from `before`
+    /// so it can be unit-tested without a `Tool`/`RequestCtx`.
+    fn repair_call(&self, tool_name: &str, call: &mut ToolCall) {
+        call.arguments = repair_tool_args(tool_name, &call.arguments);
     }
 }
 
@@ -1406,10 +1452,14 @@ impl ToolMiddleware for RepairToolArgsMiddleware {
     async fn before(
         &self,
         call: &mut ToolCall,
-        _tool: &Arc<dyn Tool>,
+        tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
-        self.repair_call(call);
+        // Use the RESOLVED tool's canonical name, not the raw `call.name`, so the
+        // edit_file extractor selection survives any future alias / case-insensitive
+        // tool resolution in the kernel — matching v1, which repaired with the
+        // corrected name.
+        self.repair_call(tool.name(), call);
         BeforeOutcome::Proceed
     }
 }
@@ -1432,7 +1482,7 @@ mod middleware_tests {
         // the kernel's `from_str` rejects outright.
         let mw = RepairToolArgsMiddleware;
         let mut c = call("write_file", r#"{"file_path":"game.html","content":"<html>",}"#);
-        mw.repair_call(&mut c);
+        mw.repair_call("write_file", &mut c);
         let v: serde_json::Value =
             serde_json::from_str(&c.arguments).expect("arguments should be valid JSON after repair");
         assert_eq!(v["file_path"], "game.html");
@@ -1443,7 +1493,70 @@ mod middleware_tests {
         let mw = RepairToolArgsMiddleware;
         let valid = r#"{"file_path":"a.html","content":"x"}"#;
         let mut c = call("write_file", valid);
-        mw.repair_call(&mut c);
+        mw.repair_call("write_file", &mut c);
         assert_eq!(c.arguments, valid, "valid JSON must not be altered");
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    // --- #1: the two former O(N^2) repair_json passes are now single-pass O(N).
+    //     These inputs froze the host (seconds-to-minutes) on the old code; assert
+    //     the output is still correct (the test would never finish if it hung). ---
+
+    #[test]
+    fn trailing_comma_run_collapses_correctly() {
+        // `{"k":[,,,...]}` (a botched list) used to remove one comma per pass → O(N^2).
+        let input = format!("{{\"k\":[{}]}}", ",".repeat(50_000));
+        let out = repair_tool_args("write_file", &input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON after repair");
+        assert!(
+            v["k"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+            "comma run must collapse to []: {out}"
+        );
+    }
+
+    #[test]
+    fn missing_comma_run_inserts_correctly() {
+        // `{"k0":"v" "k1":"v" ...}` used to replay N× O(N) Vec::insert → O(N^2).
+        let n = 20_000;
+        let mut s = String::from("{");
+        for i in 0..n {
+            if i > 0 {
+                s.push(' ');
+            }
+            s.push_str(&format!("\"k{i}\":\"v\""));
+        }
+        s.push('}');
+        let out = repair_tool_args("write_file", &s);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON after repair");
+        assert_eq!(v["k0"], "v");
+        assert_eq!(v[format!("k{}", n - 1)], "v");
+    }
+
+    #[test]
+    fn oversized_input_is_returned_unchanged() {
+        // Past the MAX_REPAIR_BYTES ceiling, repair is skipped and the original is
+        // returned verbatim (the tool surfaces its own parse error).
+        let big = format!("{{\"content\":\"{}\",}}", "x".repeat(600_000));
+        assert_eq!(repair_tool_args("write_file", &big), big);
+    }
+
+    // --- #3: edit_file extractor selection is case-insensitive (canonical name). ---
+
+    #[test]
+    fn edit_file_extractor_is_case_insensitive() {
+        // old_string carries an UNESCAPED double-quote — only the edit_file
+        // specialized extractor recovers this; repair_json cannot. A model that
+        // emits the name as `Edit_File` must route identically to `edit_file`.
+        let input = r#"{"file_path": "a.py", "old_string": "say "hi" now", "new_string": "x"}"#;
+        let lower = repair_tool_args("edit_file", input);
+        let mixed = repair_tool_args("Edit_File", input);
+        assert_eq!(lower, mixed, "tool-name casing must not change repair routing");
+        let v: serde_json::Value =
+            serde_json::from_str(&mixed).expect("recovered to valid JSON");
+        assert_eq!(v["file_path"], "a.py");
     }
 }
