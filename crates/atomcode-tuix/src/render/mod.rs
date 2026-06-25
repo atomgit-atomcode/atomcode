@@ -129,6 +129,12 @@ pub enum UiLine {
     /// know" apart from "the turn died." Currently used by the OpenAI
     /// provider's truncation detector.
     Warning(String),
+    /// A compaction occurred here — a dim, left-aligned dash rule marking the
+    /// scrollback point where history was folded/summarized. Unified across
+    /// auto-compaction and manual `/compact`. Payload is the localized label
+    /// (e.g. "已压缩 · 摘要 12 条 · ~48.2K→~9.1K"); renderers wrap it in a dash
+    /// rule honoring the terminal's unicode caps. Permanent (enters scrollback).
+    CompactionMark(String),
     TurnCancelled,
     TurnComplete,
     /// Legacy single-line spinner (kept for tests / PlainRenderer fallback).
@@ -502,6 +508,15 @@ pub struct ToolGroupChild {
     pub text: String,
 }
 
+/// Wrap a compaction marker label in a dash rule: `─── {label} ───` (unicode)
+/// or `--- {label} ---` (ASCII fallback for fonts lacking box-drawing — the
+/// same `unicode_symbols` gate the spinner `◐`→`|/-\` and ellipsis `…`→`...`
+/// use). Pure, so the wrapping is unit-tested independent of a renderer.
+pub fn compaction_rule(label: &str, unicode: bool) -> String {
+    let dash = if unicode { "───" } else { "---" };
+    format!("{dash} {label} {dash}")
+}
+
 /// Convert a Duration to a short label like "1.2s" or "340ms".
 pub fn fmt_dur(d: Duration) -> String {
     let ms = d.as_millis();
@@ -515,6 +530,16 @@ pub fn fmt_dur(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_rule_wraps_label_unicode() {
+        assert_eq!(compaction_rule("已压缩 · 摘要 2 条", true), "─── 已压缩 · 摘要 2 条 ───");
+    }
+
+    #[test]
+    fn compaction_rule_wraps_label_ascii_fallback() {
+        assert_eq!(compaction_rule("done", false), "--- done ---");
+    }
 
     fn two_column() -> MenuKind {
         MenuKind::TwoColumn {

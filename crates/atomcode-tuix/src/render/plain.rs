@@ -329,6 +329,16 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     reset
                 );
             }
+            UiLine::CompactionMark(label) => {
+                self.drop_transient();
+                let dim = if self.caps.colors { "\x1b[2m" } else { "" };
+                let reset = if self.caps.colors { SGR_RESET } else { "" };
+                let body = crate::render::compaction_rule(
+                    &scrub_controls(&label),
+                    self.caps.unicode_symbols,
+                );
+                let _ = writeln!(self.out, "{}{}{}", dim, body, reset);
+            }
             UiLine::TurnCancelled => {
                 self.drop_transient();
                 let _ = writeln!(self.out, "(cancelled)");

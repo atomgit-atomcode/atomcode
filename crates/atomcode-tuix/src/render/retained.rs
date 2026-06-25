@@ -3980,6 +3980,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let body = format!("! {}", scrub_controls(&msg));
                 self.push_body_text(&body, &warn_style);
             }
+            UiLine::CompactionMark(label) => {
+                // Dim, left-aligned rule marking where compaction folded
+                // history. Faint DarkGrey (not bold) so it reads as structure,
+                // not an alert — deliberately distinct from Warning's bold
+                // yellow. Unified for auto + manual /compact.
+                let style = CellStyle {
+                    fg: Some(crossterm::style::Color::DarkGrey),
+                    ..CellStyle::default()
+                };
+                let body = crate::render::compaction_rule(
+                    &scrub_controls(&label),
+                    self.caps.unicode_symbols,
+                );
+                self.push_body_text(&body, &style);
+            }
             UiLine::CommandOutput(text) => {
                 // CommandOutput is trusted internal text — let SGR
                 // through the sanitizer so colour / bold / faint
