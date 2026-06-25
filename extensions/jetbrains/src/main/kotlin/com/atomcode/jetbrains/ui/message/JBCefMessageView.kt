@@ -77,19 +77,34 @@ class JBCefMessageView(
     }
 
     private fun initBrowser() {
-        if (!JBCefMessageBridge.isSupported()) {
+        val supported = try {
+            JBCefMessageBridge.isSupported()
+        } catch (_: LinkageError) {
+            false
+        } catch (_: ClassNotFoundException) {
+            false
+        }
+        if (!supported) {
             showBrowserUnavailable()
             return
         }
 
-        val newBridge = JBCefMessageBridge(
-            { message ->
-                if (message.startsWith("home:")) {
-                    SwingUtilities.invokeLater { onHomeAction(message.removePrefix("home:")) }
-                }
-            },
-            { markJsReady() },
-        )
+        val newBridge = try {
+            JBCefMessageBridge(
+                { message ->
+                    if (message.startsWith("home:")) {
+                        SwingUtilities.invokeLater { onHomeAction(message.removePrefix("home:")) }
+                    }
+                },
+                { markJsReady() },
+            )
+        } catch (_: LinkageError) {
+            showBrowserUnavailable()
+            return
+        } catch (_: ReflectiveOperationException) {
+            showBrowserUnavailable()
+            return
+        }
         bridge = newBridge
         add(newBridge.component, BorderLayout.CENTER)
         newBridge.loadHtml(buildChatHtml())

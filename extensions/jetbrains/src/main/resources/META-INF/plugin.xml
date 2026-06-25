@@ -22,7 +22,6 @@
   ]]></change-notes>
 
   <depends>com.intellij.modules.platform</depends>
-  <depends>com.intellij.modules.jcef</depends>
 
   <extensions defaultExtensionNs="com.intellij">
     <toolWindow
