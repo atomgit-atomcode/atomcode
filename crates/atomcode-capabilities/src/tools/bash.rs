@@ -35,10 +35,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the working directory and return its combined \
-         stdout/stderr and exit code. Default timeout 60s (max 300). Destructive \
-         commands (recursive force delete, sudo, dd, history rewrites, …) are flagged \
-         risky and may require approval."
+        shell_tool_description(cfg!(target_os = "windows"))
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -108,6 +105,40 @@ impl Tool for BashTool {
     }
 }
 
+/// The `bash` tool description for the current platform.
+///
+/// The tool keeps the name `bash` (every provider's model is trained to reach
+/// for a `bash` tool), but on Windows it actually executes via `cmd.exe` (see
+/// `build_command`). Left unsaid, weak models follow the `bash` name and emit
+/// bash-only syntax — heredocs, `$(...)`, `printf '\n'`, single-quote quoting —
+/// which cmd.exe can't parse, so the model thrashes into temp-file workarounds.
+/// Naming the real shell here removes the contradiction. Pure (takes a bool) so
+/// the Windows wording is unit-testable off Windows.
+fn shell_tool_description(is_windows: bool) -> &'static str {
+    // Single-source the base paragraph so a Windows/Unix edit can't drift. A
+    // macro (not a `const`) because `concat!` only splices literals.
+    macro_rules! base {
+        () => {
+            "Run a shell command in the working directory and return its combined \
+             stdout/stderr and exit code. Default timeout 60s (max 300). Destructive \
+             commands (recursive force delete, sudo, dd, history rewrites, …) are flagged \
+             risky and may require approval."
+        };
+    }
+    if is_windows {
+        concat!(
+            base!(),
+            "\n\
+             Windows: commands run via cmd.exe, NOT bash. Use cmd.exe syntax — do NOT use \
+             bash-only constructs such as heredocs (<<EOF), command substitution $(...), or \
+             printf '\\n'. Chain steps with &&. For multi-line text (e.g. a multi-line commit \
+             message) write it to a temp file and pass the file (e.g. git commit -F msg.txt)."
+        )
+    } else {
+        base!()
+    }
+}
+
 #[cfg(unix)]
 fn build_command(command: &str) -> tokio::process::Command {
     // Prefer bash for the bash-isms models emit; the OS PATH resolves it. If bash is
@@ -119,8 +150,15 @@ fn build_command(command: &str) -> tokio::process::Command {
 
 #[cfg(windows)]
 fn build_command(command: &str) -> tokio::process::Command {
+    // Pass the command to cmd.exe VERBATIM via `raw_arg`. The normal `.arg()`
+    // applies std's `CommandLineToArgvW` quoting, which cmd.exe does NOT follow —
+    // embedded quotes (`node -e "..."`), `%VAR%`, `^` etc. would be mangled
+    // (the reported "cmd.exe 把双引号吞掉了"). Mirrors atomcode-core's
+    // process_utils::shell_command / tool/bash.rs.
+    use std::os::windows::process::CommandExt;
     let mut cmd = tokio::process::Command::new("cmd.exe");
-    cmd.arg("/C").arg(command);
+    cmd.arg("/C");
+    cmd.as_std_mut().raw_arg(command);
     cmd
 }
 
@@ -580,6 +618,23 @@ mod tests {
     }
     fn risk_of(cmd: &str) -> RiskLevel {
         BashTool.risk(&serde_json::json!({ "command": cmd }).to_string())
+    }
+
+    // On Windows the description must explicitly tell the model it runs via
+    // cmd.exe (not bash) and steer it away from bash-only syntax — otherwise the
+    // model follows the `bash` tool name and emits heredocs / $(...) / single-quote
+    // quoting that cmd.exe can't parse, then thrashes into temp-file workarounds.
+    #[test]
+    fn windows_description_steers_to_cmd_not_bash() {
+        let win = shell_tool_description(true);
+        assert!(win.contains("cmd.exe"), "windows desc must name cmd.exe");
+        let lc = win.to_lowercase();
+        assert!(lc.contains("not bash"), "windows desc must say it is not bash");
+        assert!(lc.contains("heredoc"), "windows desc must warn off heredocs");
+        assert!(win.contains("$("), "windows desc must warn off command substitution");
+
+        let unix = shell_tool_description(false);
+        assert!(!unix.contains("cmd.exe"), "unix desc must not mention cmd.exe");
     }
 
     #[test]
