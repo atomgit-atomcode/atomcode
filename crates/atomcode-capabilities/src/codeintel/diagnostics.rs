@@ -65,18 +65,26 @@ impl Tool for DiagnosticsTool {
                 Err(e) => return err(format!("diagnostics: cannot read {}: {e}", path.display())),
             };
             match self.manager.notify_file_changed(&ctx.working_dir, &path, &content).await {
+                LspSyncOutcome::Synced { server, newly_started: true } => {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("?");
+                    ctx.progress.emit(format!("LSP: started {server} for .{ext} ✓"));
+                }
+                LspSyncOutcome::Synced { newly_started: false, .. } => {
+                    // server already running — stay silent to avoid repeating the line
+                }
                 LspSyncOutcome::Unsupported { ext } => {
                     let detail = if ext.is_empty() {
                         "no language server for files without an extension".to_string()
                     } else {
                         format!("no language server for .{ext} (not configured, or its binary is not installed)")
                     };
+                    ctx.progress.emit(format!("LSP: {detail}"));
                     return ok(format!("LSP not available: {detail}."));
                 }
                 LspSyncOutcome::Failed { server, error } => {
+                    ctx.progress.emit(format!("LSP: {server} failed to start: {error}"));
                     return ok(format!("LSP not available: {server} failed to start: {error}"));
                 }
-                LspSyncOutcome::Synced { .. } => {}
             }
             // Give the server a moment to analyze + publish.
             tokio::time::sleep(Duration::from_millis(self.manager.settle_delay_ms())).await;
@@ -119,6 +127,36 @@ mod tests {
     }
     fn ctx(dir: &std::path::Path) -> ToolContext {
         ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+    }
+
+    fn capturing_ctx(
+        dir: &std::path::Path,
+    ) -> (ToolContext, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let c = captured.clone();
+        let progress = atomcode_kernel::tool::ProgressSink::new(std::sync::Arc::new(move |m: String| {
+            c.lock().unwrap().push(m);
+        }));
+        let ctx = ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress,
+        };
+        (ctx, captured)
+    }
+
+    #[tokio::test]
+    async fn emits_progress_when_server_unavailable() {
+        let tool = DiagnosticsTool::new(missing_binary_manager());
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let (ctx, captured) = capturing_ctx(d.path());
+        let _ = tool.execute(r#"{"file_path":"a.rs"}"#, &ctx).await;
+        let msgs = captured.lock().unwrap().clone();
+        assert!(
+            msgs.iter().any(|m| m.contains("no language server for .rs")),
+            "expected an LSP progress line, got: {msgs:?}"
+        );
     }
 
     #[tokio::test]
