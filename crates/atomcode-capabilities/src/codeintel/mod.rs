@@ -145,3 +145,17 @@ pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
 pub(crate) fn err(content: impl Into<String>) -> ToolResult {
     ToolResult { call_id: String::new(), content: content.into(), is_error: true }
 }
+
+#[cfg(test)]
+mod tool_name_tests {
+    use super::codeintel_tool_names;
+
+    #[cfg(feature = "lsp")]
+    #[test]
+    fn diagnostics_is_listed_when_lsp_enabled() {
+        assert!(
+            codeintel_tool_names().contains(&"diagnostics"),
+            "diagnostics must be mounted when the lsp feature is on"
+        );
+    }
+}
