@@ -929,7 +929,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("(compacted — dropped {} message{}, {} → {} tokens)\n", messages, plural, before, after).into()
         }
         Msg::Compacting => "Compacting…".into(),
-        Msg::CompactingSlow => "Compacting… (slow · esc to cancel)".into(),
+        Msg::CompactingSlow => "Compacting… (slow)".into(),
         Msg::CompactMarkDrain { messages, before, after } => {
             let plural = if messages == 1 { "" } else { "s" };
             format!("Compacted · {} message{} summarized · ~{}→~{}", messages, plural, before, after).into()

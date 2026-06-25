@@ -914,7 +914,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CompactDropped { messages, before, after } =>
             format!("（已压缩 — 丢弃 {} 条消息，{} → {} tokens）\n", messages, before, after).into(),
         Msg::Compacting => "正在压缩…".into(),
-        Msg::CompactingSlow => "正在压缩…（较慢，esc 取消）".into(),
+        Msg::CompactingSlow => "正在压缩…（较慢）".into(),
         Msg::CompactMarkDrain { messages, before, after } =>
             format!("已压缩 · 摘要 {} 条 · ~{}→~{}", messages, before, after).into(),
         Msg::CompactMarkStub { saved } =>
