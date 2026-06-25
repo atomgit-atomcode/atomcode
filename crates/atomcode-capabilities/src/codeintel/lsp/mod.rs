@@ -17,6 +17,6 @@ pub mod registry;
 pub mod types;
 
 pub use client::LspClient;
-pub use manager::LspManager;
+pub use manager::{LspManager, LspSyncOutcome};
 pub use registry::{extension_to_language_id, LspServerConfig, LspServerRegistry};
 pub use types::{Diagnostic, DiagnosticSeverity};

@@ -3,7 +3,7 @@
 //! when the language server is not installed.
 
 use super::lsp::types::DiagnosticSeverity;
-use super::lsp::LspManager;
+use super::lsp::{LspManager, LspSyncOutcome};
 use super::{err, ok, resolve_path};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
@@ -64,11 +64,16 @@ impl Tool for DiagnosticsTool {
                 Ok(c) => c,
                 Err(e) => return err(format!("diagnostics: cannot read {}: {e}", path.display())),
             };
-            if !self.manager.notify_file_changed(&ctx.working_dir, &path, &content).await {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("?");
-                return ok(format!(
-                    "LSP not available: no language server for .{ext} (not configured, or its binary is not installed)."
-                ));
+            match self.manager.notify_file_changed(&ctx.working_dir, &path, &content).await {
+                LspSyncOutcome::Unsupported { ext } => {
+                    return ok(format!(
+                        "LSP not available: no language server for .{ext} (not configured, or its binary is not installed)."
+                    ));
+                }
+                LspSyncOutcome::Failed { server, error } => {
+                    return ok(format!("LSP not available: {server} failed to start: {error}"));
+                }
+                LspSyncOutcome::Synced { .. } => {}
             }
             // Give the server a moment to analyze + publish.
             tokio::time::sleep(Duration::from_millis(self.manager.settle_delay_ms())).await;

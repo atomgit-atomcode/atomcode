@@ -21,6 +21,18 @@ pub struct LspManager {
     settle_delay_ms: u64,
 }
 
+/// Result of syncing a document to its language server. Lets the calling tool report
+/// connect-status to the driver without coupling the manager to a UI/event channel.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LspSyncOutcome {
+    /// Server is up (newly spawned or already running) and the doc was synced.
+    Synced { server: String, newly_started: bool },
+    /// No language server for this extension — unconfigured OR its binary is absent.
+    Unsupported { ext: String },
+    /// The server binary exists but spawning it failed.
+    Failed { server: String, error: String },
+}
+
 impl LspManager {
     pub fn new() -> Self {
         Self::with_registry(LspServerRegistry::with_defaults())
@@ -36,51 +48,55 @@ impl LspManager {
         path.extension()?.to_str().map(str::to_string)
     }
 
-    /// Ensure a server is running for `path`'s language, rooted at `root`. Returns
-    /// `false` (gracefully) if no server is configured for the extension or its binary
-    /// is not installed.
-    pub async fn ensure_server(&self, root: &Path, path: &Path) -> bool {
+    /// Detailed outcome of ensuring a server for `path`'s language, rooted at `root`.
+    async fn ensure_server_detailed(&self, root: &Path, path: &Path) -> LspSyncOutcome {
         let Some(ext) = Self::ext_of(path) else {
-            return false;
+            return LspSyncOutcome::Unsupported { ext: String::new() };
         };
         if self.clients.lock().await.contains_key(&ext) {
-            return true;
+            let server = self.registry.get(&ext).map(|c| c.command.clone()).unwrap_or_default();
+            return LspSyncOutcome::Synced { server, newly_started: false };
         }
         let Some(config) = self.registry.get(&ext) else {
-            return false;
+            return LspSyncOutcome::Unsupported { ext };
         };
+        let server = config.command.clone();
         // Binary not on PATH → graceful degrade (no error, no spawn).
         if which::which(&config.command).is_err() {
-            return false;
+            return LspSyncOutcome::Unsupported { ext };
         }
         let mut clients = self.clients.lock().await;
         if clients.contains_key(&ext) {
-            return true; // another caller won the race
+            return LspSyncOutcome::Synced { server, newly_started: false }; // another caller won the race
         }
         match LspClient::spawn(config, root).await {
             Ok(c) => {
                 clients.insert(ext, Arc::new(c));
-                true
+                LspSyncOutcome::Synced { server, newly_started: true }
             }
-            Err(_) => false,
+            Err(e) => LspSyncOutcome::Failed { server, error: e.to_string() },
         }
     }
 
-    /// Open/refresh a document so the server re-analyzes it. `false` if no server.
-    pub async fn notify_file_changed(&self, root: &Path, path: &Path, content: &str) -> bool {
-        if !self.ensure_server(root, path).await {
-            return false;
+    /// Ensure a server is running for `path`'s language, rooted at `root`. Returns
+    /// `false` (gracefully) if no server is configured or its binary is not installed.
+    pub async fn ensure_server(&self, root: &Path, path: &Path) -> bool {
+        matches!(self.ensure_server_detailed(root, path).await, LspSyncOutcome::Synced { .. })
+    }
+
+    /// Open/refresh a document so the server re-analyzes it. The outcome tells the caller
+    /// what happened (for status reporting). The document is synced only when `Synced`.
+    pub async fn notify_file_changed(&self, root: &Path, path: &Path, content: &str) -> LspSyncOutcome {
+        let outcome = self.ensure_server_detailed(root, path).await;
+        if matches!(outcome, LspSyncOutcome::Synced { .. }) {
+            if let Some(ext) = Self::ext_of(path) {
+                let client = self.clients.lock().await.get(&ext).cloned();
+                if let Some(client) = client {
+                    let _ = client.sync_document(path, content, &extension_to_language_id(&ext)).await;
+                }
+            }
         }
-        let Some(ext) = Self::ext_of(path) else {
-            return false;
-        };
-        let client = self.clients.lock().await.get(&ext).cloned();
-        if let Some(client) = client {
-            let _ = client.sync_document(path, content, &extension_to_language_id(&ext)).await;
-            true
-        } else {
-            false
-        }
+        outcome
     }
 
     pub async fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
@@ -126,6 +142,22 @@ mod tests {
             LspServerConfig { command: "atomcode-no-such-lsp-binary-xyz".into(), args: vec![], root_markers: vec![] },
         );
         r
+    }
+
+    #[tokio::test]
+    async fn notify_reports_unsupported_when_binary_missing() {
+        let mgr = LspManager::with_registry(missing_binary_registry());
+        let d = tempfile::tempdir().unwrap();
+        let outcome = mgr.notify_file_changed(d.path(), Path::new("a.rs"), "fn main() {}").await;
+        assert_eq!(outcome, LspSyncOutcome::Unsupported { ext: "rs".into() });
+    }
+
+    #[tokio::test]
+    async fn notify_reports_unsupported_for_unknown_extension() {
+        let mgr = LspManager::with_registry(missing_binary_registry());
+        let d = tempfile::tempdir().unwrap();
+        let outcome = mgr.notify_file_changed(d.path(), Path::new("a.txt"), "x").await;
+        assert_eq!(outcome, LspSyncOutcome::Unsupported { ext: "txt".into() });
     }
 
     #[tokio::test]
