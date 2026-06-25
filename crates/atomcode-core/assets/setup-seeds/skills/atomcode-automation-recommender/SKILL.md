@@ -23,7 +23,7 @@ Analyze codebase patterns to recommend tailored AtomCode automations, then **off
 |------|----------|----------------|
 | **Skills** | Packaged expertise, workflows, repeatable tasks | `npx skills add <pkg>` or create `.atomcode/skills/<name>/SKILL.md` |
 | **Plugins** | Collections of skills, commands, agents, hooks | `/plugin marketplace add <url>` then `/plugin install <name>` |
-| **MCP Servers** | External tool integrations (databases, APIs, docs) | Write to `.atomcode/mcp.json` or `~/.atomcode/mcp.json` |
+| **MCP Servers** | External tool integrations (databases, APIs, docs) | Write to `.mcp.json` (project root) or `~/.atomcode/mcp.json` (global) |
 | **Hooks** | Automatic actions on tool events (format, lint, block) | Write to `.atomcode/settings.json` |
 | **Subagents** | Specialized reviewers (security, performance, a11y) | Create `.atomcode/skills/<name>/SKILL.md` with reviewer prompt |
 | **Commands** | Quick slash commands (/test, /review, /deploy) | Create `.atomcode/commands/<name>.md` |
@@ -271,10 +271,10 @@ If `npx` fails, show:
 Use the Write tool to create `.atomcode/skills/<name>/SKILL.md` with the recommended content.
 
 **MCP Servers:**
-Use the Write/Edit tool to add the server config to `.atomcode/mcp.json` or `~/.atomcode/mcp.json`:
+Use the Write/Edit tool to add the server config to `.mcp.json` in the project root (NOT `.atomcode/mcp.json` — the loader does not read that) or the global `~/.atomcode/mcp.json`:
 ```bash
 # Read existing config
-cat .atomcode/mcp.json 2>/dev/null || echo '{}'
+cat .mcp.json 2>/dev/null || echo '{}'
 # Merge new server config
 ```
 
@@ -296,7 +296,7 @@ Use the Write tool to create `.atomcode/commands/<name>.md`.
 
 已安装：
   ✓ skill: [name] — [source]
-  ✓ mcp: [name] — 写入 .atomcode/mcp.json（重启 AtomCode 后生效）
+  ✓ mcp: [name] — 写入 .mcp.json（重启 AtomCode 后生效）
   ✓ hook: [name] — 写入 .atomcode/settings.json
   ✓ subagent: [name] — 创建 .atomcode/skills/[name]/SKILL.md
 
