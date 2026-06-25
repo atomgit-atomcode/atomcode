@@ -601,6 +601,9 @@ impl UiState {
     pub fn on_turn_complete(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
+        // Defensive: never carry a compaction spinner state into the next turn.
+        self.compacting = false;
+        self.compaction_forced_streaming = false;
         self.turn_started_at = None;
         self.phase_started_at = None;
         // Per-turn token tallies are consumed by the separator that renders just
@@ -621,6 +624,8 @@ impl UiState {
     pub fn on_turn_cancelled(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
+        self.compacting = false;
+        self.compaction_forced_streaming = false;
         self.turn_started_at = None;
         self.phase_started_at = None;
         self.turn_prompt_tokens = 0;
@@ -633,6 +638,8 @@ impl UiState {
     pub fn on_error(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
+        self.compacting = false;
+        self.compaction_forced_streaming = false;
         self.turn_started_at = None;
         self.phase_started_at = None;
         // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
