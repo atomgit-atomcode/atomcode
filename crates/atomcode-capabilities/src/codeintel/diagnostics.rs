@@ -66,9 +66,12 @@ impl Tool for DiagnosticsTool {
             };
             match self.manager.notify_file_changed(&ctx.working_dir, &path, &content).await {
                 LspSyncOutcome::Unsupported { ext } => {
-                    return ok(format!(
-                        "LSP not available: no language server for .{ext} (not configured, or its binary is not installed)."
-                    ));
+                    let detail = if ext.is_empty() {
+                        "no language server for files without an extension".to_string()
+                    } else {
+                        format!("no language server for .{ext} (not configured, or its binary is not installed)")
+                    };
+                    return ok(format!("LSP not available: {detail}."));
                 }
                 LspSyncOutcome::Failed { server, error } => {
                     return ok(format!("LSP not available: {server} failed to start: {error}"));

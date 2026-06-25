@@ -25,7 +25,8 @@ pub struct LspManager {
 /// connect-status to the driver without coupling the manager to a UI/event channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LspSyncOutcome {
-    /// Server is up (newly spawned or already running) and the doc was synced.
+    /// Server is up (newly spawned or already running). When returned from
+    /// `notify_file_changed`, the document was also synced to the server.
     Synced { server: String, newly_started: bool },
     /// No language server for this extension — unconfigured OR its binary is absent.
     Unsupported { ext: String },
