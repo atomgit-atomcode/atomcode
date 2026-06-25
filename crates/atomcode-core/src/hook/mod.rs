@@ -9,7 +9,6 @@ pub mod json_config;
 
 // PR submodules
 pub mod async_batcher;
-pub mod built_in;
 pub mod config_loader;
 pub mod engine;
 pub mod script_runner;

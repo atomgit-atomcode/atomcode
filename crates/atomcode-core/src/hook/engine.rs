@@ -440,7 +440,7 @@ impl HookEngine {
             match shell_hook.event {
                 HookEvent::PreToolUse => {
                     // 只注册为 PreToolExecutionHook（可阻断/修改）。
-                    // OnToolCallStartHook 是内置 hook 的专用 slot（如 ToolAuditLogHook），
+                    // OnToolCallStartHook 是内置 hook 的专用观察 slot，
                     // 用户 shell hook 不应双重触发。
                     self.register_pre_tool_hook(shell_hook);
                 }
