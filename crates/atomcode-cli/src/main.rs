@@ -18,7 +18,6 @@ use atomcode::uninstall;
 
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
-use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
     merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig,
@@ -1484,27 +1483,6 @@ async fn run() -> Result<i32> {
         (Some(mcp_registry), Some(rx))
     };
 
-    // Build LSP manager from config and inject into ToolContext.
-    // TUI mode uses the event-channel constructor so server start /
-    // failure surfaces in scrollback (✓/✗ lines) instead of being
-    // eprintln!'d directly to stderr — which would land inside the
-    // input box while the renderer owns the terminal. Headless keeps
-    // the no-channel path: stderr leakage doesn't matter when no TUI
-    // is active and CI logs benefit from raw error visibility.
-    let (lsp_manager, lsp_connect_rx) = if is_headless {
-        (build_lsp_manager(&config.lsp, &working_dir), None)
-    } else {
-        match atomcode_core::lsp::build_lsp_manager_with_events(&config.lsp, &working_dir) {
-            Some((mgr, rx)) => (Some(mgr), Some(rx)),
-            None => (None, None),
-        }
-    };
-    // Keep the LSP manager alive for the whole session: it owns the connect-event
-    // sender feeding `lsp_connect_rx` (shown in TUI scrollback). The native engine
-    // builds its own tools and never consumes this manager — this binding is purely
-    // the keep-alive that preserves the prior (tool_context-owned) lifetime.
-    let _lsp_manager_keepalive = lsp_manager;
-
     // Continue the previous session only when the user explicitly opts
     // in via `-c` / `--continue`. Bare `atomcode` starts a fresh
     // session — no auto-resume, no scrollback replay. Users who want to
@@ -1770,7 +1748,7 @@ async fn run() -> Result<i32> {
             // Same as the headless arm: don't `?` — a TUI run that ends in an
             // error must still reach the shutdown/flush below. Ok(()) → exit 0;
             // the error propagates only after telemetry is drained.
-            match atomcode_tuix::run(config, model_name, tui_handle, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
+            match atomcode_tuix::run(config, model_name, tui_handle, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
                 Ok(()) => Ok(0),
                 Err(e) => Err(e.into()),
             }
