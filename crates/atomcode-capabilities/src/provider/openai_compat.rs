@@ -164,7 +164,10 @@ impl LlmProvider for OpenAiCompatProvider {
             // "unexpected EOF during chunk size line"). Once an event HAS been
             // emitted, retry would duplicate output, so the error is surfaced
             // verbatim with its full cause chain for diagnosis.
-            const MAX_STREAM_ATTEMPTS: u32 = 2;
+            // 1 initial open + up to 2 transparent reopens. A gateway resetting
+            // connections under load can drop more than one attempt before a
+            // healthy backend answers, so a single reopen is not enough.
+            const MAX_STREAM_ATTEMPTS: u32 = 3;
             let mut stream_attempt = 1u32;
             let mut resp = resp;
             'reopen: loop {
@@ -192,6 +195,12 @@ impl LlmProvider for OpenAiCompatProvider {
                             // Nothing reached the consumer yet → re-open the whole
                             // request transparently (bounded by MAX_STREAM_ATTEMPTS).
                             if !emitted_any && stream_attempt < MAX_STREAM_ATTEMPTS {
+                                // Brief backoff so an immediate reopen does not slam a
+                                // gateway that is resetting under load. Bounded and
+                                // esc-interruptible: the kernel races the whole
+                                // stream.next() against cancellation, so a sleep here is
+                                // cancelled with the turn.
+                                tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if let Ok(fresh) =
                                     open_stream(&client, &url, &body_bytes, &signer, &api_key, &policy).await
                                 {
@@ -204,7 +213,7 @@ impl LlmProvider for OpenAiCompatProvider {
                             }
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,
-                                message: format!("stream read error: {}", retry::err_chain(&e)),
+                                message: retry::stream_read_error_message(&e),
                                 ..Default::default()
                             });
                             return;
@@ -1470,6 +1479,71 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "ok", "should deliver the re-opened response: {events:?}");
+
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn midstream_reset_twice_before_any_event_reopens_until_success() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        // A gateway resetting connections under load can drop MORE than one
+        // attempt before a healthy backend answers. Connections #1 and #2 both
+        // open a chunked 200 then close before any chunk (nothing reached the
+        // consumer); #3 serves a complete body. With a single reopen this would
+        // surface an error after #2 — the provider must reopen twice and deliver
+        // only #3's response.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                read_http_request(&mut s);
+                s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .unwrap();
+                s.flush().unwrap();
+                drop(s);
+            }
+            let (mut s3, _) = listener.accept().unwrap();
+            read_http_request(&mut s3);
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+            s3.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
+                    .as_bytes(),
+            )
+            .unwrap();
+            s3.flush().unwrap();
+            drop(s3);
+        });
+
+        let mut cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "glm-test");
+        // Keep the inter-reopen backoff negligible so the test is fast.
+        cfg.retry.base_delay = std::time::Duration::from_millis(1);
+        cfg.retry.max_delay = std::time::Duration::from_millis(2);
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("open should succeed");
+        let events: Vec<StreamEvent> = stream.collect().await;
+
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
+            "two pre-event resets must be ridden through transparently: {events:?}"
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ok", "should deliver the third (successful) response: {events:?}");
 
         let _ = handle.join();
     }

@@ -148,7 +148,10 @@ impl LlmProvider for AnthropicProvider {
             // v1 parity: a body that dies BEFORE any event reaches the consumer is
             // safe to redo wholesale (nothing committed). Once an event has been
             // emitted, retry would duplicate output, so the error surfaces verbatim.
-            const MAX_STREAM_ATTEMPTS: u32 = 2;
+            // 1 initial open + up to 2 transparent reopens — a gateway resetting
+            // connections under load can drop more than one attempt before a
+            // healthy backend answers.
+            const MAX_STREAM_ATTEMPTS: u32 = 3;
             let mut stream_attempt = 1u32;
             let mut resp = resp;
             'reopen: loop {
@@ -172,6 +175,9 @@ impl LlmProvider for AnthropicProvider {
                         }
                         Ok(Some(Err(e))) => {
                             if !emitted_any && stream_attempt < MAX_STREAM_ATTEMPTS {
+                                // Brief, esc-interruptible backoff before reopening so an
+                                // immediate retry does not slam a gateway resetting under load.
+                                tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if let Ok(fresh) =
                                     open_stream(&client, &url, &body, &api_key, &anthropic_version, &policy).await
                                 {
@@ -182,7 +188,7 @@ impl LlmProvider for AnthropicProvider {
                             }
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,
-                                message: format!("stream read error: {e}"),
+                                message: retry::stream_read_error_message(&e),
                                 ..Default::default()
                             });
                             return;
@@ -1317,6 +1323,67 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "ok", "should deliver the re-opened response: {events:?}");
+
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn midstream_reset_twice_before_any_event_reopens_until_success() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        // Connections #1 and #2 both drop before any event; #3 serves a valid
+        // body. A single reopen would surface an error after #2 — the provider
+        // must reopen twice and deliver only #3's response.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                read_http_request(&mut s);
+                s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .unwrap();
+                s.flush().unwrap();
+                drop(s);
+            }
+            let (mut s3, _) = listener.accept().unwrap();
+            read_http_request(&mut s3);
+            let body = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            s3.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
+                    .as_bytes(),
+            )
+            .unwrap();
+            s3.flush().unwrap();
+            drop(s3);
+        });
+
+        let mut cfg = AnthropicConfig::new("k", format!("http://127.0.0.1:{port}"), "claude-test");
+        cfg.retry.base_delay = std::time::Duration::from_millis(1);
+        cfg.retry.max_delay = std::time::Duration::from_millis(2);
+        let provider = AnthropicProvider::new(cfg).unwrap();
+
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("open should succeed");
+        let events: Vec<StreamEvent> = stream.collect().await;
+
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
+            "two pre-event resets must be ridden through transparently: {events:?}"
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ok", "should deliver the third (successful) response: {events:?}");
 
         let _ = handle.join();
     }
