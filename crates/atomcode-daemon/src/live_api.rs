@@ -19,6 +19,20 @@ use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+/// Tool names to exclude from the mounted set, read from `ATOMCODE_DISABLE_TOOLS`
+/// (comma-separated). The daemon has no `--disable-tools` flag, so the env knob is the
+/// only entry point — feeds `PrepareOptions.disabled_tools`. Empty/unset ⇒ full toolset.
+fn env_disabled_tools() -> Vec<String> {
+    std::env::var("ATOMCODE_DISABLE_TOOLS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 // ============================================================================
 // 进程内全局 LiveSession 持有者
@@ -327,7 +341,11 @@ impl TurnExecutor for KernelTurnExecutor {
                 return;
             };
             let coding_cfg = atomcode_shell::coding_config(&bcfg);
-            let opts = PrepareOptions::default();
+            // daemon has no --disable-tools flag; honor the ATOMCODE_DISABLE_TOOLS env knob.
+            let opts = PrepareOptions {
+                disabled_tools: env_disabled_tools(),
+                ..Default::default()
+            };
             let factory = atomcode_shell::provider_factory();
             match CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory).await {
                 Ok(rt) => {
@@ -698,7 +716,11 @@ pub(crate) async fn run_chat_turn_v2(
     // A fresh NATIVE runtime for this /chat turn (no persistent state — the caller owns
     // persistence). coding_config + provider_factory come from atomcode-shell (shared mapping).
     let coding_cfg = atomcode_shell::coding_config(&bridge_cfg);
-    let opts = PrepareOptions::default();
+    // daemon has no --disable-tools flag; honor the ATOMCODE_DISABLE_TOOLS env knob.
+    let opts = PrepareOptions {
+        disabled_tools: env_disabled_tools(),
+        ..Default::default()
+    };
     let factory = atomcode_shell::provider_factory();
     let mut rt = match CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory).await {
         Ok(rt) => rt,

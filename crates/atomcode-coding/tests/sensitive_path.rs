@@ -28,6 +28,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         memory: false,
         web: false,
         review: false,
+        disabled_tools: Vec::new(),
     };
     let mut parts = prepare(&cfg, opts).await.unwrap();
 

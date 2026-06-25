@@ -26,6 +26,7 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
         memory: false,
         web: false,
         review: false,
+        disabled_tools: Vec::new(),
     };
 
     let mut parts = prepare(&cfg, opts).await.unwrap();

@@ -1430,10 +1430,10 @@ async fn run() -> Result<i32> {
 
     let working_dir = resolve_working_dir(cli.dir.clone());
 
-    // --disable-tools (CLI) / ATOMCODE_DISABLE_TOOLS (env) gated the v1
-    // TurnRunner's tool registry. The native engine (interactive TUI + headless)
-    // builds its own tool set via CodingRuntime and no longer reads this; accept
-    // the inputs for script compatibility but tell the user they're inert.
+    // --disable-tools (CLI) / ATOMCODE_DISABLE_TOOLS (env): tool names to EXCLUDE from
+    // the mounted toolset. The native engine registers the full set, then mounts only
+    // the subset minus this denylist (threaded into `PrepareOptions.disabled_tools`) —
+    // e.g. SWE-bench drops `bash` to force patch-only edits.
     let mut disabled_tools: Vec<String> = cli
         .disable_tools
         .iter()
@@ -1452,8 +1452,7 @@ async fn run() -> Result<i32> {
         disabled_tools.sort();
         disabled_tools.dedup();
         eprintln!(
-            "[atomcode] --disable-tools/ATOMCODE_DISABLE_TOOLS ({}) is no longer enforced \
-             (the native engine manages its own tools); ignoring.",
+            "[atomcode] disabling tools: {} (excluded from the mounted toolset)",
             disabled_tools.join(", ")
         );
     }
@@ -1532,6 +1531,7 @@ async fn run() -> Result<i32> {
             cli.provider.as_deref(),
             telemetry.clone(),
             cli.dangerously_skip_permissions,
+            &disabled_tools,
         );
         Some(atomcode_tuix::TuiHandle { client, event_rx })
     } else {
@@ -1545,12 +1545,14 @@ async fn run() -> Result<i32> {
         // Capture the bypass flag so in-TUI re-spawns (/session, /bg, disk /resume) also
         // honor --dangerously-skip-permissions — not just the launch handle.
         let skip_perms = cli.dangerously_skip_permissions;
+        // In-TUI re-spawns inherit the same tool denylist as the launch handle.
+        let disabled_for_respawn = disabled_tools.clone();
         std::sync::Arc::new(
             move |config: &atomcode_core::config::Config, working_dir: &std::path::Path| {
                 // In-TUI re-spawns follow the config's CURRENT default_provider (None) so a
                 // /provider switch inside the session takes effect — the launch-time
                 // --provider override only seeds the initial handle above.
-                spawn_native_tui(config, working_dir, None, tel.clone(), skip_perms)
+                spawn_native_tui(config, working_dir, None, tel.clone(), skip_perms, &disabled_for_respawn)
             },
         )
     };
@@ -1646,7 +1648,10 @@ async fn run() -> Result<i32> {
                     false, // headless ⇒ keep the fail-closed approval timeout
                 );
                 let coding_cfg = atomcode_shell::coding_config(&bcfg);
-                let opts = atomcode_coding::PrepareOptions::default();
+                let opts = atomcode_coding::PrepareOptions {
+                    disabled_tools: disabled_tools.clone(),
+                    ..Default::default()
+                };
                 let factory = atomcode_shell::provider_factory();
                 match atomcode_coding::CodingRuntime::spawn(coding_cfg, opts, Vec::new(), factory)
                     .await
@@ -1853,6 +1858,7 @@ fn spawn_native_tui(
     provider_override: Option<&str>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     dangerously_skip_permissions: bool,
+    disabled_tools: &[String],
 ) -> (
     atomcode_core::agent::AgentClient,
     tokio::sync::mpsc::UnboundedReceiver<atomcode_tuix::UiEvent>,
@@ -1867,7 +1873,10 @@ fn spawn_native_tui(
         true,
     );
     let coding_cfg = atomcode_shell::coding_config(&bcfg);
-    let opts = atomcode_coding::PrepareOptions::default();
+    let opts = atomcode_coding::PrepareOptions {
+        disabled_tools: disabled_tools.to_vec(),
+        ..Default::default()
+    };
     let factory = atomcode_shell::provider_factory();
     let handle =
         atomcode_tuix::spawn_native_runtime(coding_cfg, opts, factory, dangerously_skip_permissions);

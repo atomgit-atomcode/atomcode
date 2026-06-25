@@ -156,6 +156,7 @@ pub async fn code(args: CodeArgs) -> Result<()> {
         // The `code` agent can also review the current changes in-session (the dedicated
         // `atomcodex review` subcommand still exists for headless/CI one-shots).
         review: true,
+        disabled_tools: Vec::new(),
     };
 
     eprintln!("preparing ({model}) …");

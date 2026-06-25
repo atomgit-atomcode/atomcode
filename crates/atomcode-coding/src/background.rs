@@ -44,6 +44,7 @@ pub async fn run(
         web: true,
         // A background one-shot stays lean — no nested review sub-agent.
         review: false,
+        disabled_tools: Vec::new(),
     };
     let built = async {
         let mut parts = prepare(cfg, opts).await.map_err(|e| e.to_string())?;

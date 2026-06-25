@@ -80,6 +80,11 @@ pub struct PrepareOptions {
     /// in-session via the review specialization). Reuses the host provider (set at
     /// assemble), so it works on a signing gateway. `false` ⇒ not mounted.
     pub review: bool,
+    /// Tool names to EXCLUDE from the mounted set, honoring a driver's
+    /// `--disable-tools` / `ATOMCODE_DISABLE_TOOLS` (e.g. SWE-bench dropping `bash`
+    /// to force patch-only edits). Matched by exact name; unknown names are
+    /// ignored. Empty (default) ⇒ the full set is mounted.
+    pub disabled_tools: Vec<String>,
 }
 
 impl Default for PrepareOptions {
@@ -91,8 +96,19 @@ impl Default for PrepareOptions {
             memory: true,
             web: true,
             review: true,
+            disabled_tools: Vec::new(),
         }
     }
+}
+
+/// Remove any tool whose name is in `disabled` from the mounted name list. Unknown
+/// names are ignored (a no-op), so a driver can pass through whatever the user typed.
+pub(crate) fn apply_tool_denylist(mut names: Vec<String>, disabled: &[String]) -> Vec<String> {
+    if disabled.is_empty() {
+        return names;
+    }
+    names.retain(|n| !disabled.iter().any(|d| d == n));
+    names
 }
 
 /// The session identity + persistence wiring, allocated ONCE by [`prepare`] —
@@ -338,6 +354,10 @@ pub async fn prepare_with_plugin_hooks(
             session.as_ref().map(|b| b.id.as_str()),
         )));
     }
+
+    // Honor the driver's tool denylist (--disable-tools / ATOMCODE_DISABLE_TOOLS).
+    // The full toolset stays registered; only the MOUNTED subset shrinks.
+    let names = apply_tool_denylist(names, &opts.disabled_tools);
 
     Ok(CodingParts {
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
@@ -621,7 +641,29 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            disabled_tools: Vec::new(),
         }
+    }
+
+    #[test]
+    fn denylist_removes_named_tools_and_ignores_unknown() {
+        let names = vec![
+            "read_file".to_string(),
+            "bash".to_string(),
+            "grep".to_string(),
+        ];
+        let out = apply_tool_denylist(
+            names,
+            &["bash".to_string(), "nonexistent_tool".to_string()],
+        );
+        assert_eq!(out, vec!["read_file".to_string(), "grep".to_string()]);
+    }
+
+    #[test]
+    fn denylist_empty_is_identity() {
+        let names = vec!["read_file".to_string(), "bash".to_string()];
+        let out = apply_tool_denylist(names.clone(), &[]);
+        assert_eq!(out, names);
     }
 
     /// `prepare` loads a project `.hooks.json` and exposes the runner via
@@ -656,6 +698,34 @@ mod tests {
             parts.hooks.len(),
             baseline_hooks + 1,
             "the CC runner is also pushed onto the lifecycle hook chain"
+        );
+
+        std::env::remove_var("ATOMCODE_HOME");
+    }
+
+    /// `prepare` drops a disabled tool from the mounted `tool_names` while keeping the
+    /// rest — the end-to-end path for `--disable-tools` / `ATOMCODE_DISABLE_TOOLS`.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn prepare_honors_disabled_tools() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let proj = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", proj.path());
+
+        let mut opts = io_free_opts();
+        opts.disabled_tools = vec!["bash".to_string()];
+        let parts = prepare(&cfg, opts).await.unwrap();
+
+        assert!(
+            !parts.tool_names.contains(&"bash".to_string()),
+            "disabled bash must be excluded from the mounted set: {:?}",
+            parts.tool_names
+        );
+        assert!(
+            parts.tool_names.contains(&"read_file".to_string()),
+            "non-disabled tools must remain mounted: {:?}",
+            parts.tool_names
         );
 
         std::env::remove_var("ATOMCODE_HOME");

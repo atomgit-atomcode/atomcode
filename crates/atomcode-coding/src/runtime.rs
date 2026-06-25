@@ -141,6 +141,7 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            disabled_tools: Vec::new(),
         };
 
         let factory: ProviderFactory = Box::new(move |_cfg| Ok(provider.clone()));
@@ -189,6 +190,7 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            disabled_tools: Vec::new(),
         };
         let factory: ProviderFactory = Box::new(move |_cfg| Ok(provider.clone()));
         let mut rt = CodingRuntime::spawn(cfg, opts, Vec::new(), factory).await.expect("spawn");
