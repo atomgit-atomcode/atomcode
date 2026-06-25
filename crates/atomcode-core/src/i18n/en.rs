@@ -928,6 +928,14 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             let plural = if messages == 1 { "" } else { "s" };
             format!("(compacted — dropped {} message{}, {} → {} tokens)\n", messages, plural, before, after).into()
         }
+        Msg::Compacting => "Compacting…".into(),
+        Msg::CompactingSlow => "Compacting… (slow · esc to cancel)".into(),
+        Msg::CompactMarkDrain { messages, before, after } => {
+            let plural = if messages == 1 { "" } else { "s" };
+            format!("Compacted · {} message{} summarized · ~{}→~{}", messages, plural, before, after).into()
+        }
+        Msg::CompactMarkStub { saved } =>
+            format!("Tool output folded · saved ~{}", saved).into(),
         Msg::GoalHelp =>
             "  /goal — autonomous multi-round work toward a stated condition.\n  \
              Usage:\n  \

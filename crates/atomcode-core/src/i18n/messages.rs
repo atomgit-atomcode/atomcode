@@ -770,6 +770,17 @@ pub enum Msg<'a> {
     CompactStarting,
     CompactNothingNoSavings { before: &'a str, after: &'a str },
     CompactDropped { messages: usize, before: &'a str, after: &'a str },
+    /// Footer spinner label while a compaction's LLM summary runs (slow tier).
+    Compacting,
+    /// Spinner label variant when the compaction summary has stalled (>20s).
+    CompactingSlow,
+    /// Scrollback marker for a committed drain+summarize compaction (auto or
+    /// manual). `messages` = exact count summarized; `before`/`after` = `~`-
+    /// flagged token estimates.
+    CompactMarkDrain { messages: usize, before: &'a str, after: &'a str },
+    /// Scrollback marker for a committed in-place stub fold (tool results
+    /// collapsed, no messages dropped). `saved` = `~`-flagged token estimate.
+    CompactMarkStub { saved: &'a str },
 
     // ── /goal ──
     /// The full `/goal help` usage block (header + Usage + Notes).

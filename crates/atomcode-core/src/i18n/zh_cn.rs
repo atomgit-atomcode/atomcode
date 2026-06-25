@@ -913,6 +913,12 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("（无需压缩 — 压缩后不会节省 token：{} → {}）\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } =>
             format!("（已压缩 — 丢弃 {} 条消息，{} → {} tokens）\n", messages, before, after).into(),
+        Msg::Compacting => "正在压缩…".into(),
+        Msg::CompactingSlow => "正在压缩…（较慢，esc 取消）".into(),
+        Msg::CompactMarkDrain { messages, before, after } =>
+            format!("已压缩 · 摘要 {} 条 · ~{}→~{}", messages, before, after).into(),
+        Msg::CompactMarkStub { saved } =>
+            format!("已折叠工具输出 · 节省 ~{}", saved).into(),
         Msg::GoalHelp =>
             "  /goal — 朝着设定的条件自主进行多轮工作。\n  \
              用法：\n  \

@@ -396,6 +396,27 @@ mod tests {
     }
 
     #[test]
+    fn compact_mark_drain_renders_numbers_and_arrow() {
+        // Locale-invariant assertion (numbers + the → arrow appear in both en & zh).
+        let s = crate::i18n::t(crate::i18n::Msg::CompactMarkDrain {
+            messages: 12,
+            before: "48.2K",
+            after: "9.1K",
+        });
+        assert!(s.contains("12"), "message count missing: {s}");
+        assert!(s.contains("48.2K") && s.contains("9.1K"), "token figures missing: {s}");
+        assert!(s.contains('→'), "before→after arrow missing: {s}");
+        assert!(s.contains('~'), "estimate marker missing: {s}");
+    }
+
+    #[test]
+    fn compact_mark_stub_renders_saved_without_arrow() {
+        let s = crate::i18n::t(crate::i18n::Msg::CompactMarkStub { saved: "6.0K" });
+        assert!(s.contains("6.0K"), "saved figure missing: {s}");
+        assert!(!s.contains('→'), "stub marker shows a single figure, no arrow: {s}");
+    }
+
+    #[test]
     fn cli_flag_unparseable_falls_through() {
         let env = |_: &str| None;
         assert_eq!(
