@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::{
-    DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker,
+    DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard,
+    ProxyPicker, SessionPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
@@ -777,6 +778,9 @@ pub(super) fn execute_slash_command(
             ));
             renderer.flush();
         }
+        "proxy" => {
+            *active_modal = Some(Box::new(ProxyPicker::open(&ctx.config)));
+        }
         "status" => {
             let mut txt = t(Msg::StatusBody {
                 model: &ctx.model_name,
@@ -785,6 +789,10 @@ pub(super) fn execute_slash_command(
                 tokens: state.total_tokens,
             })
             .into_owned();
+            txt.push_str(&format!(
+                "  Proxy:  {}\n",
+                ctx.config.network.proxy.summary()
+            ));
             txt.push_str(&render_codingplan_status_for_status_cmd());
 
             txt.push('\n');
@@ -1841,9 +1849,7 @@ pub(super) fn execute_slash_command(
             let provider = ctx.config.providers.get_mut(&provider_name);
             match provider {
                 None => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::CmdNoActiveProvider).into_owned(),
-                    ));
+                    renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
                     renderer.flush();
                 }
                 Some(p) => {
@@ -3226,8 +3232,7 @@ pub(crate) fn reset_to_new_session(
     // New session = new session file on disk. Old session (already saved at its
     // last TurnComplete) stays on disk so it can still be `/resume`d; we just
     // stop writing into it.
-    ctx.current_session =
-        atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+    ctx.current_session = atomcode_core::session::Session::default_session(ctx.working_dir.clone());
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
     // Bind telemetry + agent session id to the new session's UUID (the

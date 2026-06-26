@@ -33,6 +33,7 @@ fn empty_config() -> Config {
         providers: HashMap::new(),
         datalog: Default::default(),
         notifications: Default::default(),
+        network: Default::default(),
         auto_update: true,
         telemetry: Default::default(),
         lsp: Default::default(),

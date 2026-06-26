@@ -26,9 +26,10 @@ pub mod language_picker;
 pub mod model_picker;
 pub mod onboarding_wizard;
 pub mod plugin_manager;
-mod qr;
 pub mod password;
 pub mod provider_wizard;
+pub mod proxy_picker;
+mod qr;
 pub mod session_picker;
 pub use dir_picker::DirPicker;
 pub use file_viewer::FileViewer;
@@ -38,6 +39,7 @@ pub use model_picker::ModelPicker;
 pub use onboarding_wizard::OnboardingWizard;
 pub use plugin_manager::PluginManager;
 pub use provider_wizard::ProviderWizard;
+pub use proxy_picker::ProxyPicker;
 pub use session_picker::SessionPicker;
 
 /// Result of a modal consuming one key event.

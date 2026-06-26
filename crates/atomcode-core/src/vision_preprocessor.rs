@@ -194,6 +194,7 @@ mod tests {
             default_provider: String::new(),
             evaluator_provider: None,
             default_workdir: None,
+            network: Default::default(),
             providers: HashMap::new(),
             datalog: Default::default(),
             auto_update: true,

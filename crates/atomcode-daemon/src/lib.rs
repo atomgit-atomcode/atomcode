@@ -1185,9 +1185,7 @@ async fn serve_webui_index(
                         .header(header::SET_COOKIE, cookie)
                         .body(axum::body::Body::empty())
                         .map(IntoResponse::into_response)
-                        .unwrap_or_else(|_| {
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                        });
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
             }
         }
@@ -2296,6 +2294,7 @@ async fn process_chat_request(
     // Load config
     let config_path = Config::default_path();
     let config = Config::load(&config_path)?;
+    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // Determine provider
     let provider_name = req
@@ -3544,7 +3543,11 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
     let sync_suffix = if sync { "&sync=1" } else { "" };
     let is_wildcard = bound_host == "0.0.0.0" || bound_host == "::";
     // 通配绑定（用户意在暴露到网络）时探测本机局域网 IP。
-    let lan_ip = if is_wildcard { primary_lan_ipv4() } else { None };
+    let lan_ip = if is_wildcard {
+        primary_lan_ipv4()
+    } else {
+        None
+    };
     // 选择自动打开浏览器 + 主显示用的地址：
     // - 回环绑定：127.0.0.1。
     // - 通配绑定（0.0.0.0/::）：优先用局域网 IP —— 它在本机和其它设备上都可访问，
@@ -4385,10 +4388,7 @@ mod tests {
     #[test]
     fn strip_query_key_preserves_other_params() {
         assert_eq!(strip_query_key("token=abc", "token"), "");
-        assert_eq!(
-            strip_query_key("token=abc&session=Y", "token"),
-            "session=Y"
-        );
+        assert_eq!(strip_query_key("token=abc&session=Y", "token"), "session=Y");
         assert_eq!(
             strip_query_key("session=Y&token=abc&sync=1", "token"),
             "session=Y&sync=1"

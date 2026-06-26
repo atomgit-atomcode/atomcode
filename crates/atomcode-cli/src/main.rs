@@ -1320,6 +1320,7 @@ async fn run() -> Result<i32> {
                 providers: HashMap::new(),
                 datalog: Default::default(),
                 notifications: Default::default(),
+                network: Default::default(),
                 auto_update: true,
                 telemetry: Default::default(),
                 lsp: Default::default(),
@@ -1341,6 +1342,7 @@ async fn run() -> Result<i32> {
             providers: HashMap::new(),
             datalog: Default::default(),
             notifications: Default::default(),
+            network: Default::default(),
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
@@ -1353,6 +1355,7 @@ async fn run() -> Result<i32> {
             web_search: Default::default(),
         }
     };
+    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // ── i18n locale ──
     // Locale was already pre-resolved above (before clap parse) so --help
@@ -3126,6 +3129,7 @@ fn run_codingplan_core(
             datalog: Default::default(),
             auto_update: true,
             notifications: Default::default(),
+            network: Default::default(),
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
@@ -3137,6 +3141,7 @@ fn run_codingplan_core(
             web_search: Default::default(),
         },
     };
+    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // If the stored token is locally valid (file present, expires_in
     // not yet past) but the server rejects it (revoked, refresh-token

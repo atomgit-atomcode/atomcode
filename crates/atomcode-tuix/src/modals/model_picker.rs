@@ -302,6 +302,7 @@ mod tests {
             default_provider: default.to_string(),
             evaluator_provider: None,
             default_workdir: None,
+            network: Default::default(),
             providers: map,
             datalog: Default::default(),
             notifications: Default::default(),

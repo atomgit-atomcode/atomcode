@@ -297,6 +297,7 @@ fn test_config() -> Config {
         providers,
         datalog: Default::default(),
         notifications: Default::default(),
+        network: Default::default(),
         auto_update: false,
         telemetry: Default::default(),
         lsp: Default::default(),

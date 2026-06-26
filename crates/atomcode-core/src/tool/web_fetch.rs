@@ -188,7 +188,7 @@ fn err_result(msg: impl Into<String>) -> ToolResult {
 /// overrides are fixed at builder time. `resolve_to_addrs` keeps the URL's
 /// port, SNI and TLS cert hostname intact — only the dialed address is pinned.
 fn build_client(host: &str, pinned: &[SocketAddr]) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         // Handle redirects manually so every hop re-runs scheme + IP checks.
         // reqwest's built-in follower would let a 302 rebind to 127.0.0.1
         // after we've already validated the start URL's host.

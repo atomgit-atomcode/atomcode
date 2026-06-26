@@ -115,7 +115,7 @@ pub trait LlmProvider: Send + Sync {
 /// `skip_tls_verify` disables TLS certificate verification when true.
 pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool) -> reqwest::Client {
     let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(30))
         // Total request timeout. Long edit_file / write_file generations
         // on self-hosted GLM/Qwen NPU clusters can stream for 5-15 min on
@@ -553,7 +553,7 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     // Same 5s/10s budget as `auth::oauth::blocking_client` — this runs on
     // the TUI thread via `get_valid_token`, so an unreachable OAuth host
     // must never hang the UI.
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .build()
