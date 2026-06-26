@@ -72,7 +72,19 @@ impl Tool for BashTool {
         let secs = a.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, MAX_TIMEOUT_SECS);
         let dur = Duration::from_secs(secs);
 
-        let mut cmd = build_command(&a.command);
+        // macOS sudo (and some Linux configs) needs explicit `-A` to use SUDO_ASKPASS —
+        // rewrite `sudo` → `sudo -A` so a plain `sudo` pops our password modal. Only when
+        // the askpass helper is actually active; off Windows the command is untouched.
+        #[cfg(unix)]
+        let effective_command = if atomcode_askpass::current_env().is_some() {
+            rewrite_sudo_for_askpass(&a.command)
+        } else {
+            a.command.clone()
+        };
+        #[cfg(not(unix))]
+        let effective_command = a.command.clone();
+
+        let mut cmd = build_command(&effective_command);
         // No console-window flash per command on Windows: in headless/daemon mode (e.g.
         // the WeChat clawbot bridge) there's no console to inherit, so each cmd.exe would
         // otherwise allocate a NEW console window on the desktop. No-op off Windows.
@@ -170,6 +182,116 @@ fn apply_askpass_env(cmd: &mut tokio::process::Command, env: &atomcode_askpass::
         .env("SSH_ASKPASS_REQUIRE", "force")
         .env("ATOMCODE_ASKPASS_SOCK", &env.sock_path)
         .env("ATOMCODE_ASKPASS_TOKEN", &env.token);
+}
+
+/// Rewrite `sudo` command words to `sudo -A` so the askpass helper is actually used.
+///
+/// macOS sudo (and some Linux sudoers configs) does NOT auto-invoke `SUDO_ASKPASS` just
+/// because no tty is available — it needs an explicit `-A`. Models write plain `sudo`, so
+/// without this they hit "sudo: a terminal is required to read the password". Only called
+/// when the askpass helper is active (`current_env()` is `Some`).
+///
+/// `sudo` is matched only in COMMAND POSITION (string start, or after a shell separator
+/// `; | & ( { \n`), never inside quotes or as an argument. `-A` is skipped when the sudo
+/// invocation already carries `-A`/`--askpass`, `-n`/`--non-interactive` (explicit
+/// no-prompt — adding `-A` would wrongly make it prompt), or `-S`/`--stdin`.
+#[cfg(unix)]
+fn rewrite_sudo_for_askpass(command: &str) -> String {
+    let mut out = String::with_capacity(command.len() + 8);
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut cmd_start = true;
+    let mut i = 0;
+    while i < command.len() {
+        let c = command[i..].chars().next().unwrap();
+        let clen = c.len_utf8();
+        if in_single {
+            out.push(c);
+            if c == '\'' {
+                in_single = false;
+            }
+            i += clen;
+            cmd_start = false;
+            continue;
+        }
+        if in_double {
+            out.push(c);
+            if c == '"' {
+                in_double = false;
+            }
+            i += clen;
+            cmd_start = false;
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_single = true;
+                out.push(c);
+                cmd_start = false;
+            }
+            '"' => {
+                in_double = true;
+                out.push(c);
+                cmd_start = false;
+            }
+            ';' | '|' | '&' | '(' | '{' | '\n' => {
+                out.push(c);
+                cmd_start = true;
+            }
+            _ if c.is_whitespace() => {
+                out.push(c); // leading whitespace doesn't end command position
+            }
+            _ => {
+                if cmd_start
+                    && command[i..].starts_with("sudo")
+                    && command[i + 4..].chars().next().is_some_and(|n| n.is_whitespace())
+                    && !sudo_opts_have_askpass_or_noninteractive(&command[i + 4..])
+                {
+                    out.push_str("sudo -A");
+                    i += 4;
+                    cmd_start = false;
+                    continue;
+                }
+                out.push(c);
+                cmd_start = false;
+            }
+        }
+        i += clen;
+    }
+    out
+}
+
+/// True if the option run immediately after `sudo` already contains `-A`/`--askpass`,
+/// `-n`/`--non-interactive`, or `-S`/`--stdin`. Scans leading option tokens (consuming the
+/// argument of arg-taking short options like `-u`), stopping at the command word.
+#[cfg(unix)]
+fn sudo_opts_have_askpass_or_noninteractive(rest: &str) -> bool {
+    const ARG_TAKING: &[char] = &['u', 'g', 'p', 'U', 'C', 'c', 'h', 'r', 't', 'T', 'R'];
+    let mut tokens = rest.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        if matches!(tok, ";" | "|" | "&" | "&&" | "||") {
+            break;
+        }
+        if let Some(long) = tok.strip_prefix("--") {
+            match long {
+                "askpass" | "non-interactive" | "stdin" => return true,
+                _ => continue,
+            }
+        } else if let Some(short) = tok.strip_prefix('-') {
+            if short.is_empty() {
+                break; // lone "-" is not an option
+            }
+            if short.contains('A') || short.contains('n') || short.contains('S') {
+                return true;
+            }
+            if short.chars().last().is_some_and(|l| ARG_TAKING.contains(&l)) {
+                tokens.next(); // consume this option's argument
+            }
+        } else {
+            break; // first non-option token = the command
+        }
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -668,6 +790,40 @@ mod tests {
     }
     fn risk_of(cmd: &str) -> RiskLevel {
         BashTool.risk(&serde_json::json!({ "command": cmd }).to_string())
+    }
+
+    // macOS sudo (and some Linux configs) does NOT auto-use SUDO_ASKPASS just because
+    // there is no tty — it needs an explicit `-A`. When the askpass helper is active we
+    // rewrite `sudo` command words to `sudo -A` so a plain `sudo` pops our password modal.
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_sudo_inserts_dash_A_only_when_appropriate() {
+        // bare sudo in command position → gets -A
+        assert_eq!(rewrite_sudo_for_askpass("sudo find / -name x"), "sudo -A find / -name x");
+        // already has -A → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("sudo -A find /"), "sudo -A find /");
+        // -n (non-interactive: explicit no-prompt) → MUST NOT add -A
+        assert_eq!(rewrite_sudo_for_askpass("sudo -n true"), "sudo -n true");
+        // -S (read password from stdin) → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("sudo -S cat /etc/x"), "sudo -S cat /etc/x");
+        // `sudo` as an argument, not a command → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("echo sudo here"), "echo sudo here");
+        // after `&&` → command position → rewritten
+        assert_eq!(rewrite_sudo_for_askpass("cd /x && sudo make install"), "cd /x && sudo -A make install");
+        // in a pipe → command position → rewritten
+        assert_eq!(rewrite_sudo_for_askpass("ls | sudo tee f"), "ls | sudo -A tee f");
+        // `sudo` inside quotes → not a command → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("grep 'sudo' file"), "grep 'sudo' file");
+        // other leading flags → -A inserted right after sudo
+        assert_eq!(rewrite_sudo_for_askpass("sudo -E find /"), "sudo -A -E find /");
+        // -u takes an arg (root); the command `find` follows → -A inserted, arg not mistaken
+        assert_eq!(rewrite_sudo_for_askpass("sudo -u root find /"), "sudo -A -u root find /");
+        // -u root then -n → non-interactive present → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("sudo -u root -n true"), "sudo -u root -n true");
+        // two sudo segments → both rewritten
+        assert_eq!(rewrite_sudo_for_askpass("sudo a; sudo b"), "sudo -A a; sudo -A b");
+        // no sudo at all → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("find / -name x"), "find / -name x");
     }
 
     // On Windows the description must explicitly tell the model it runs via
