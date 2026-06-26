@@ -64,7 +64,10 @@ impl PasswordModal {
                 KeyOutcome::Continue
             }
             KeyCode::Enter => KeyOutcome::Submit,
+            // Esc and Ctrl+C both dismiss the prompt (send None). Ctrl+C is the
+            // universal escape hatch, so an orphaned modal can always be cleared.
             KeyCode::Esc => KeyOutcome::Cancel,
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => KeyOutcome::Cancel,
             _ => KeyOutcome::Continue,
         }
     }
@@ -193,6 +196,20 @@ mod tests {
         let mut m = PasswordModal::new("p".into(), tx);
         m.feed_for_test(KeyCode::Char('x'), KeyModifiers::NONE);
         assert_eq!(m.feed_for_test(KeyCode::Esc, KeyModifiers::NONE), ModalActionTest::Close);
+        assert_eq!(rx.blocking_recv().unwrap(), None);
+    }
+
+    // Ctrl+C must be an escape hatch: dismiss the prompt (like Esc) rather than be
+    // swallowed as a no-op — otherwise an orphaned password modal can't be cleared.
+    #[test]
+    fn ctrl_c_cancels_with_none() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut m = PasswordModal::new("p".into(), tx);
+        m.feed_for_test(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            m.feed_for_test(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ModalActionTest::Close
+        );
         assert_eq!(rx.blocking_recv().unwrap(), None);
     }
 

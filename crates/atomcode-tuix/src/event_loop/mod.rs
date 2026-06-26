@@ -3862,6 +3862,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
                     handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    // A turn ending with a password modal still up = orphan (the sudo/ssh
+                    // that asked for it finished or timed out); dismiss it so `Password:`
+                    // doesn't linger in the input box.
+                    dismiss_orphan_capturing_modal(&mut app, &ctx, renderer);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -4293,6 +4297,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
                     handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    // A turn ending with a password modal still up = orphan (the sudo/ssh
+                    // that asked for it finished or timed out); dismiss it so `Password:`
+                    // doesn't linger in the input box.
+                    dismiss_orphan_capturing_modal(&mut app, &ctx, renderer);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -6847,6 +6855,20 @@ fn clear_capturing_modal_on_cancel(app: &mut App) {
         .is_some_and(|m| m.captures_all_keys())
     {
         app.active_modal = None;
+    }
+}
+
+/// After a turn ends (phase back to `Idle`), a still-installed capturing modal is an
+/// ORPHAN: the sudo/ssh that requested the password finished or timed out, so the prompt
+/// can never be answered. Dismiss it (drop → the askpass server's `reply_rx` resolves to
+/// `Err` → clean failure, no task leak) and repaint the idle prompt so the stale
+/// `Password:` line is cleared. No-op unless `Idle` with a capturing modal up.
+fn dismiss_orphan_capturing_modal(app: &mut App, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    if matches!(app.state.phase, UiPhase::Idle)
+        && app.active_modal.as_ref().is_some_and(|m| m.captures_all_keys())
+    {
+        app.active_modal = None;
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     }
 }
 
