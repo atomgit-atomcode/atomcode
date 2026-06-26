@@ -38,10 +38,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  × CodingPlan tier setup failed — {}\n", error).into(),
         Msg::CpClaimFailedBare =>
             "  × CodingPlan tier setup failed\n".into(),
-        Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✓ CodingPlan {} active\n", tier).into(),
-        Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✓ CodingPlan {} active\n", tier).into(),
+        Msg::CpClaimTierSucceeded { plan } =>
+            format!("  ✓ {} active\n", plan).into(),
+        Msg::CpClaimTierAlreadyHeld { plan } =>
+            format!("  ✓ {} active\n", plan).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
             format!("  × CodingPlan {} tier setup failed — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s } =>

@@ -42,12 +42,15 @@ pub enum Msg<'a> {
     /// text — there's nothing to put after `— `, so the line stops
     /// at the prefix.
     CpClaimFailedBare,
-    /// Per-tier cascade row — winning tier, fresh claim.
-    /// Example (zh-CN): `  ✓ CodingPlan Lite 领取成功`
-    CpClaimTierSucceeded { tier: &'a str },
+    /// Per-tier cascade row — winning tier, fresh claim. `plan` is the
+    /// full plan label already including the "CodingPlan " prefix (the
+    /// server's `plan_name`, e.g. "CodingPlan Pro", or "CodingPlan
+    /// {tier}" fallback). Example (zh-CN): `  ✓ CodingPlan Pro 生效`
+    CpClaimTierSucceeded { plan: &'a str },
     /// Per-tier cascade row — winning tier, server reported the user
-    /// already holds this tier or higher (`duplicate=true`).
-    CpClaimTierAlreadyHeld { tier: &'a str },
+    /// already holds this tier or higher (`duplicate=true`). `plan` as
+    /// above.
+    CpClaimTierAlreadyHeld { plan: &'a str },
     /// Per-tier cascade row — tier was refused (2xx with success=
     /// false / 5xx / transport). `reason` is the server's human-
     /// readable message (e.g. `额度已满`, `暂无开放`) or a short

@@ -178,13 +178,26 @@ impl SetupReport {
             let mut any_success = false;
             for attempt in &self.claim_attempts {
                 let tier = attempt.tier.as_str();
+                // Server's `plan_name` already carries the "CodingPlan "
+                // prefix and reflects the user's real entitlement; prefer
+                // it over the requested cascade tier. Empty (legacy
+                // gateway) → fall back to "CodingPlan {tier}".
+                let plan_label = |plan_name: &str| -> String {
+                    if plan_name.is_empty() {
+                        format!("CodingPlan {}", tier)
+                    } else {
+                        plan_name.to_string()
+                    }
+                };
                 match &attempt.outcome {
-                    TierOutcome::Claimed { .. } => {
-                        out.push_str(&t(Msg::CpClaimTierSucceeded { tier }));
+                    TierOutcome::Claimed { plan_name, .. } => {
+                        let plan = plan_label(plan_name);
+                        out.push_str(&t(Msg::CpClaimTierSucceeded { plan: &plan }));
                         any_success = true;
                     }
-                    TierOutcome::AlreadyHeld { .. } => {
-                        out.push_str(&t(Msg::CpClaimTierAlreadyHeld { tier }));
+                    TierOutcome::AlreadyHeld { plan_name, .. } => {
+                        let plan = plan_label(plan_name);
+                        out.push_str(&t(Msg::CpClaimTierAlreadyHeld { plan: &plan }));
                         any_success = true;
                     }
                     TierOutcome::Refused { .. } | TierOutcome::Errored { .. } => {
@@ -518,11 +531,14 @@ pub struct ClaimInfo {
 /// rejections users wanted to see.
 #[derive(Debug, Clone)]
 pub enum TierOutcome {
-    /// `success=true` on this tier — cascade winner.
-    Claimed { message: String },
+    /// `success=true` on this tier — cascade winner. `plan_name` is the
+    /// server's view of the user's actual plan (e.g. "CodingPlan Pro");
+    /// empty on legacy gateways, in which case the renderer falls back
+    /// to the requested tier.
+    Claimed { message: String, plan_name: String },
     /// `duplicate=true` — user already held this (or a higher) tier;
-    /// cascade treats this as winner and stops.
-    AlreadyHeld { message: String },
+    /// cascade treats this as winner and stops. `plan_name` as above.
+    AlreadyHeld { message: String, plan_name: String },
     /// `2xx success=false duplicate=false` — per-tier refusal (e.g.
     /// `额度已满` / `暂无开放`). Cascade walks past to the next tier.
     Refused { message: String },
@@ -772,6 +788,7 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>, bool) {
                         tier,
                         outcome: TierOutcome::AlreadyHeld {
                             message: resp.message.clone(),
+                            plan_name: resp.plan_name.clone(),
                         },
                     });
                     let skipped = StepResult::Skipped(if resp.message.is_empty() {
@@ -789,6 +806,7 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>, bool) {
                         tier,
                         outcome: TierOutcome::Claimed {
                             message: resp.message.clone(),
+                            plan_name: resp.plan_name.clone(),
                         },
                     });
                     let ok = StepResult::Ok(ClaimInfo {
@@ -1749,6 +1767,7 @@ mod tests {
                     tier: PlanType::Lite,
                     outcome: TierOutcome::Claimed {
                         message: "领取成功".into(),
+                        plan_name: String::new(),
                     },
                 },
             ],
@@ -1789,6 +1808,69 @@ mod tests {
         assert!(
             !out.contains("CodingPlan claimed"),
             "legacy claim-summary row must be suppressed when per-tier rows present: {}",
+            out
+        );
+    }
+
+    /// When the server returns `plan_name`, the success row shows the
+    /// user's *actual* plan ("CodingPlan Pro") rather than the requested
+    /// cascade tier ("Max"). Fixes the misleading "CodingPlan Max 生效"
+    /// line that appeared while the status block below showed Pro.
+    #[test]
+    fn render_success_row_uses_server_plan_name_over_requested_tier() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Skipped("already claimed — using Max".into()),
+            claim_attempts: vec![TierAttempt {
+                tier: PlanType::Max,
+                outcome: TierOutcome::AlreadyHeld {
+                    message: "已领取".into(),
+                    plan_name: "CodingPlan Pro".into(),
+                },
+            }],
+            models: StepResult::Skipped("models step not exercised here".into()),
+            status: StepResult::Skipped("status not exercised here".into()),
+            auth_expired: false,
+        };
+        let out = report.render();
+        assert!(
+            out.contains("CodingPlan Pro 生效") || out.contains("CodingPlan Pro active"),
+            "server plan_name (Pro) must drive the 生效 row: {}",
+            out
+        );
+        assert!(
+            !out.contains("CodingPlan Max"),
+            "requested tier (Max) must not surface when plan_name is present: {}",
+            out
+        );
+    }
+
+    /// Legacy gateway: no `plan_name` → fall back to the requested
+    /// cascade tier so old servers keep rendering "CodingPlan Lite 生效".
+    #[test]
+    fn render_success_row_falls_back_to_tier_when_plan_name_empty() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Ok(ClaimInfo {
+                message: "claimed".into(),
+                duplicate: false,
+                plan_type: PlanType::Lite,
+            }),
+            claim_attempts: vec![TierAttempt {
+                tier: PlanType::Lite,
+                outcome: TierOutcome::Claimed {
+                    message: "领取成功".into(),
+                    plan_name: String::new(),
+                },
+            }],
+            models: StepResult::Skipped("models step not exercised here".into()),
+            status: StepResult::Skipped("status not exercised here".into()),
+            auth_expired: false,
+        };
+        let out = report.render();
+        assert!(
+            out.contains("CodingPlan Lite 生效") || out.contains("CodingPlan Lite active"),
+            "empty plan_name must fall back to requested tier (Lite): {}",
             out
         );
     }

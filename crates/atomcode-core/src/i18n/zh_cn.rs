@@ -38,10 +38,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  × CodingPlan 套餐配置失败 — {}\n", error).into(),
         Msg::CpClaimFailedBare =>
             "  × CodingPlan 套餐配置失败\n".into(),
-        Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✓ CodingPlan {} 生效\n", tier).into(),
-        Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✓ CodingPlan {} 生效\n", tier).into(),
+        Msg::CpClaimTierSucceeded { plan } =>
+            format!("  ✓ {} 生效\n", plan).into(),
+        Msg::CpClaimTierAlreadyHeld { plan } =>
+            format!("  ✓ {} 生效\n", plan).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
             format!("  × CodingPlan {} 套餐配置失败 — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
