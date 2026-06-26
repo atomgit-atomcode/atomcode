@@ -704,6 +704,13 @@ enum Commands {
     /// Manage hooks (list, test, enable/disable)
     #[command(subcommand)]
     Hooks(HookCommands),
+    /// Internal: askpass helper invoked by sudo/ssh via SUDO_ASKPASS / SSH_ASKPASS.
+    /// Not intended for direct user invocation.
+    #[command(name = "__askpass", hide = true)]
+    Askpass {
+        /// The prompt string forwarded by sudo/ssh (e.g. "[sudo] password:").
+        prompt: String,
+    },
 }
 
 /// Subcommands for hooks management
@@ -1029,6 +1036,37 @@ async fn run() -> Result<i32> {
 
     // No --help was passed. Parse normally to get the Cli struct.
     let cli = Cli::parse();
+
+    // ── Askpass early exit ────────────────────────────────────────────────────
+    // Handle `atomcode __askpass <prompt>` before ANY TUI/telemetry setup.
+    // sudo/ssh invoke this helper synchronously; it must not spawn async
+    // runtimes, connect to telemetry, or open a terminal.
+    if let Some(Commands::Askpass { prompt }) = &cli.command {
+        #[cfg(unix)]
+        {
+            use std::path::Path;
+            let sock = std::env::var("ATOMCODE_ASKPASS_SOCK").ok();
+            let token = std::env::var("ATOMCODE_ASKPASS_TOKEN").ok();
+            match (sock, token) {
+                (Some(s), Some(t)) => {
+                    match atomcode::askpass::run_askpass(prompt, Path::new(&s), &t) {
+                        Some(pw) => {
+                            print!("{pw}");
+                            return Ok(0);
+                        }
+                        None => return Ok(1),
+                    }
+                }
+                _ => return Ok(1),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = prompt;
+            return Ok(1);
+        }
+    }
+    // ── End askpass early exit ────────────────────────────────────────────────
 
     let is_admin = atomcode_core::process_utils::is_running_as_admin();
 
@@ -2634,6 +2672,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             Ok(())
         }
         Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
+        Commands::Askpass { .. } => {
+            unreachable!("__askpass is handled early in run() before handle_command")
+        }
     }
 }
 
