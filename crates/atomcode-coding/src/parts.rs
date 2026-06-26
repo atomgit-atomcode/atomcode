@@ -182,7 +182,7 @@ pub async fn prepare_with_plugin_hooks(
     // Always-on core: neutral fs/bash toolset + codeintel.
     register_coding_tools(&mut registry);
     names.extend(atomcode_capabilities::tools::coding_tool_names().iter().map(|s| s.to_string()));
-    register_codeintel_tools(&mut registry);
+    register_codeintel_tools(&mut registry, &cfg.lsp);
     names.extend(
         atomcode_capabilities::codeintel::codeintel_tool_names().iter().map(|s| s.to_string()),
     );

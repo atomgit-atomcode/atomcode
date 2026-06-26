@@ -76,6 +76,11 @@ pub struct CodingAgentConfig {
     /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
     /// tool was hardwired to Exa with no way to opt into DDG.
     pub web_search_provider: Option<String>,
+    /// LSP diagnostics policy (`[lsp]` config): whether the `diagnostics` tool is mounted,
+    /// which language servers it knows, and the settle delay. Off by default — the driver
+    /// maps the user's config in. Without this, `[lsp]` was inert (the tool always mounted
+    /// with hardcoded defaults, ignoring `enabled`/`servers`/`settle_delay`).
+    pub lsp: atomcode_capabilities::codeintel::LspSettings,
 }
 
 /// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
@@ -115,6 +120,7 @@ impl CodingAgentConfig {
             thinking_keep: None,
             compact_threshold: 0.7,
             web_search_provider: None,
+            lsp: atomcode_capabilities::codeintel::LspSettings::default(),
         }
     }
 }

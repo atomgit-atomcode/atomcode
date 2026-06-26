@@ -272,6 +272,7 @@ impl KernelTurnExecutor {
         // interactive=false (fail-closed timeout; PARK is the cli TUI path's behavior).
         Some(atomcode_shell::ShellConfig::from_provider(
             Some(p),
+            &config.lsp,
             &self.working_dir,
             Some(self.telemetry.clone()),
             false,
@@ -694,6 +695,7 @@ pub(crate) fn chat_shell_config(
     // skip_perms=false (round-trip) + interactive=false (fail-closed approval timeout).
     atomcode_shell::ShellConfig::from_provider(
         config.providers.get(provider_name),
+        &config.lsp,
         working_dir,
         Some(telemetry),
         false,

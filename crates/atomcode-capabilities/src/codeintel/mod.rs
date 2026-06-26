@@ -17,6 +17,7 @@
 //! opt-in `codeintel` cargo feature (12 grammars = heavy C compilation).
 
 use atomcode_kernel::tool::{ToolRegistry, ToolResult};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -88,10 +89,70 @@ pub fn codeintel_tool_names() -> &'static [&'static str] {
     ]
 }
 
+/// A user-configured language server for one file extension (`[lsp.servers]`). The
+/// neutral, feature-agnostic mirror of core's `config::LspServerConfig` — drivers map
+/// their config type into this so L1 never depends on the driver's config crate.
+#[derive(Debug, Clone)]
+pub struct LspServerSetting {
+    pub command: String,
+    pub args: Vec<String>,
+    pub root_markers: Vec<String>,
+}
+
+/// Driver-supplied LSP policy, threaded down to [`register_codeintel_tools`]. Neutral and
+/// NOT behind the `lsp` feature (the registration signature is the same in both builds), so
+/// the driver maps its `[lsp]` config into this once. Off by default — opt-in only, matching
+/// the config schema and the production v1 `build_lsp_manager` gate.
+#[derive(Debug, Clone)]
+pub struct LspSettings {
+    /// Master switch. When false, the `diagnostics` tool is NOT registered (so it never
+    /// mounts and no language-server binary is ever spawned).
+    pub enabled: bool,
+    /// Seed the built-in server set (rust-analyzer / gopls / …). When false, only the
+    /// explicit [`servers`](Self::servers) are known — the user opts in per language.
+    pub auto_detect: bool,
+    /// Custom / override servers, keyed by file extension. Merged over the (optional)
+    /// defaults, so a user entry for an extension wins.
+    pub servers: HashMap<String, LspServerSetting>,
+    /// Settle delay (ms) before reading diagnostics after a document sync.
+    pub settle_delay_ms: u64,
+}
+
+impl Default for LspSettings {
+    fn default() -> Self {
+        Self { enabled: false, auto_detect: false, servers: HashMap::new(), settle_delay_ms: 350 }
+    }
+}
+
+/// Build the language-server registry from [`LspSettings`] — defaults (when `auto_detect`)
+/// with the user's explicit servers merged on top. Mirrors v1's `build_registry`.
+#[cfg(feature = "lsp")]
+fn build_lsp_registry(lsp: &LspSettings) -> lsp::LspServerRegistry {
+    let mut registry = if lsp.auto_detect {
+        lsp::LspServerRegistry::with_defaults()
+    } else {
+        lsp::LspServerRegistry::empty()
+    };
+    for (ext, s) in &lsp.servers {
+        registry.insert(
+            ext.clone(),
+            lsp::LspServerConfig {
+                command: s.command.clone(),
+                args: s.args.clone(),
+                root_markers: s.root_markers.clone(),
+            },
+        );
+    }
+    registry
+}
+
 /// Register all code-intelligence tools. The 5 graph tools SHARE one lazily-built
 /// [`CodeIndex`]; the symbol tools and `find_references` are stateless. With the `lsp`
-/// feature, the `diagnostics` tool (sharing one [`LspManager`]) is also registered.
-pub fn register_codeintel_tools(reg: &mut ToolRegistry) {
+/// feature AND `lsp.enabled`, the `diagnostics` tool (sharing one [`LspManager`] built from
+/// `lsp`) is also registered; when disabled it is left out entirely (the static
+/// `codeintel_tool_names` still lists it, but [`ToolRegistry::mount`] silently skips an
+/// unregistered name, so the model never sees it).
+pub fn register_codeintel_tools(reg: &mut ToolRegistry, lsp: &LspSettings) {
     reg.register(Arc::new(ListSymbolsTool));
     reg.register(Arc::new(ReadSymbolTool));
     reg.register(Arc::new(FindReferencesTool));
@@ -102,7 +163,12 @@ pub fn register_codeintel_tools(reg: &mut ToolRegistry) {
     reg.register(Arc::new(BlastRadiusTool::new(index.clone())));
     reg.register(Arc::new(FileDependenciesTool::new(index)));
     #[cfg(feature = "lsp")]
-    reg.register(Arc::new(DiagnosticsTool::new(Arc::new(LspManager::new()))));
+    if lsp.enabled {
+        let manager = LspManager::with_registry_and_delay(build_lsp_registry(lsp), lsp.settle_delay_ms);
+        reg.register(Arc::new(DiagnosticsTool::new(Arc::new(manager))));
+    }
+    #[cfg(not(feature = "lsp"))]
+    let _ = lsp; // settings are only consulted under the `lsp` feature
 }
 
 // Local path/result helpers (kept independent of the `tools` feature).
@@ -156,6 +222,75 @@ mod tool_name_tests {
         assert!(
             codeintel_tool_names().contains(&"diagnostics"),
             "diagnostics must be mounted when the lsp feature is on"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "lsp"))]
+mod lsp_settings_tests {
+    use super::{build_lsp_registry, LspServerSetting, LspSettings};
+
+    fn settings(enabled: bool, auto_detect: bool) -> LspSettings {
+        LspSettings { enabled, auto_detect, servers: Default::default(), settle_delay_ms: 150 }
+    }
+
+    #[test]
+    fn auto_detect_yields_builtin_defaults() {
+        let reg = build_lsp_registry(&settings(true, true));
+        assert_eq!(reg.get("rs").unwrap().command, "rust-analyzer");
+        assert!(reg.get("go").is_some(), "auto-detect must include the built-in server set");
+    }
+
+    #[test]
+    fn no_auto_detect_starts_empty() {
+        let reg = build_lsp_registry(&settings(true, false));
+        assert!(reg.get("rs").is_none(), "without auto-detect, defaults must NOT be present");
+    }
+
+    #[test]
+    fn user_servers_merge_without_auto_detect() {
+        let mut s = settings(true, false);
+        s.servers.insert(
+            "rb".into(),
+            LspServerSetting { command: "solargraph".into(), args: vec!["stdio".into()], root_markers: vec![] },
+        );
+        let reg = build_lsp_registry(&s);
+        assert!(reg.get("rs").is_none(), "defaults stay off");
+        let rb = reg.get("rb").unwrap();
+        assert_eq!(rb.command, "solargraph");
+        assert_eq!(rb.args, vec!["stdio".to_string()]);
+    }
+
+    #[test]
+    fn user_servers_override_defaults_under_auto_detect() {
+        let mut s = settings(true, true);
+        s.servers.insert(
+            "rs".into(),
+            LspServerSetting { command: "custom-ra".into(), args: vec![], root_markers: vec!["Cargo.toml".into()] },
+        );
+        let reg = build_lsp_registry(&s);
+        assert_eq!(reg.get("rs").unwrap().command, "custom-ra", "user override must win over the default");
+        assert!(reg.get("go").is_some(), "other defaults remain");
+    }
+
+    #[test]
+    fn enabled_gates_diagnostics_registration() {
+        use atomcode_kernel::tool::ToolRegistry;
+
+        let mut off = ToolRegistry::new();
+        super::register_codeintel_tools(&mut off, &settings(false, true));
+        assert!(
+            off.mount(&["diagnostics"]).get("diagnostics").is_none(),
+            "disabled ⇒ diagnostics tool must NOT be registered"
+        );
+        // the non-LSP codeintel tools are always present, gate or not.
+        assert!(off.mount(&["list_symbols"]).get("list_symbols").is_some());
+
+        let mut on = ToolRegistry::new();
+        super::register_codeintel_tools(&mut on, &settings(true, true));
+        assert!(
+            on.mount(&["diagnostics"]).get("diagnostics").is_some(),
+            "enabled ⇒ diagnostics tool must be registered"
         );
     }
 }

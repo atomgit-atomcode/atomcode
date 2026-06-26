@@ -39,7 +39,12 @@ impl LspManager {
         Self::with_registry(LspServerRegistry::with_defaults())
     }
     pub fn with_registry(registry: LspServerRegistry) -> Self {
-        Self { clients: Mutex::new(HashMap::new()), registry, settle_delay_ms: SETTLE_DELAY_MS }
+        Self::with_registry_and_delay(registry, SETTLE_DELAY_MS)
+    }
+    /// Like [`with_registry`](Self::with_registry) but with a caller-supplied settle delay
+    /// (the user's `[lsp] diagnostics_settle_delay_ms`), instead of the built-in default.
+    pub fn with_registry_and_delay(registry: LspServerRegistry, settle_delay_ms: u64) -> Self {
+        Self { clients: Mutex::new(HashMap::new()), registry, settle_delay_ms }
     }
     pub fn settle_delay_ms(&self) -> u64 {
         self.settle_delay_ms
@@ -178,5 +183,19 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         assert!(mgr.diagnostics(&d.path().join("a.rs")).await.is_empty());
         assert!(mgr.all_diagnostics().await.is_empty());
+    }
+
+    #[test]
+    fn with_registry_and_delay_sets_settle_delay() {
+        // The driver passes the user's `[lsp] diagnostics_settle_delay_ms`; the manager must
+        // honor it rather than hardcoding SETTLE_DELAY_MS.
+        let mgr = LspManager::with_registry_and_delay(LspServerRegistry::empty(), 999);
+        assert_eq!(mgr.settle_delay_ms(), 999);
+    }
+
+    #[test]
+    fn with_registry_keeps_builtin_default_delay() {
+        let mgr = LspManager::with_registry(LspServerRegistry::empty());
+        assert_eq!(mgr.settle_delay_ms(), SETTLE_DELAY_MS);
     }
 }

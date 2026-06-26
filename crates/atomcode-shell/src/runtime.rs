@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use atomcode_capabilities::codeintel::{LspServerSetting, LspSettings};
 use atomcode_coding::CodingAgentConfig;
 
 /// What a driver supplies to build the new-stack coding runtime. Resolved by the CALLER
@@ -54,6 +55,33 @@ pub struct ShellConfig {
     /// ⇒ approvals PARK until answered. `false` (headless `-p`, automated) ⇒ keep the
     /// fail-closed approval timeout. Maps to the kernel agent's `request_timeout`.
     pub interactive: bool,
+    /// LSP diagnostics policy mapped from the driver's `[lsp]` config (off by default).
+    pub lsp: LspSettings,
+}
+
+/// Map core's `[lsp]` config DTO to the neutral [`LspSettings`] the coding/capabilities
+/// layers consume — the one place that bridges `atomcode_core::config` to L1 (which may not
+/// depend on core). Field-for-field; the per-extension server map is copied verbatim.
+fn lsp_settings_from(lsp: &atomcode_core::config::LspConfig) -> LspSettings {
+    LspSettings {
+        enabled: lsp.enabled,
+        auto_detect: lsp.auto_detect,
+        settle_delay_ms: lsp.diagnostics_settle_delay_ms,
+        servers: lsp
+            .servers
+            .iter()
+            .map(|(ext, s)| {
+                (
+                    ext.clone(),
+                    LspServerSetting {
+                        command: s.command.clone(),
+                        args: s.args.clone(),
+                        root_markers: s.root_markers.clone(),
+                    },
+                )
+            })
+            .collect(),
+    }
 }
 
 impl ShellConfig {
@@ -65,6 +93,7 @@ impl ShellConfig {
     /// stays with the caller (cli's `active_provider` vs daemon's `providers.get` differ).
     pub fn from_provider(
         p: Option<&atomcode_core::config::provider::ProviderConfig>,
+        lsp: &atomcode_core::config::LspConfig,
         working_dir: &std::path::Path,
         telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
         dangerously_skip_permissions: bool,
@@ -88,6 +117,7 @@ impl ShellConfig {
             thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
             dangerously_skip_permissions,
             interactive,
+            lsp: lsp_settings_from(lsp),
         }
     }
 }
@@ -116,6 +146,7 @@ pub fn coding_config(cfg: &ShellConfig) -> CodingAgentConfig {
     if cfg.interactive {
         coding_cfg.request_timeout = None;
     }
+    coding_cfg.lsp = cfg.lsp.clone();
     coding_cfg
 }
 
@@ -214,6 +245,7 @@ mod tests {
             thinking_keep: None,
             dangerously_skip_permissions: false,
             interactive: true,
+            lsp: Default::default(),
         };
         let cc = coding_config(&shell_cfg);
         assert_eq!(cc.provider_type, "claude");
@@ -223,6 +255,37 @@ mod tests {
         assert_eq!(cc.thinking_enabled, Some(true));
         // interactive ⇒ no fail-closed approval timeout (a present human isn't auto-denied).
         assert_eq!(cc.request_timeout, None);
+    }
+
+    #[test]
+    fn lsp_config_flows_from_core_through_to_coding() {
+        // The user's `[lsp]` must reach the coding config (it was previously inert).
+        let mut lsp = atomcode_core::config::LspConfig::default();
+        lsp.enabled = true;
+        lsp.auto_detect = true;
+        lsp.diagnostics_settle_delay_ms = 222;
+        lsp.servers.insert(
+            "rb".into(),
+            atomcode_core::config::LspServerConfig {
+                command: "solargraph".into(),
+                args: vec!["stdio".into()],
+                root_markers: vec![],
+            },
+        );
+        let shell = ShellConfig::from_provider(None, &lsp, std::path::Path::new("/tmp"), None, false, true);
+        let cc = coding_config(&shell);
+        assert!(cc.lsp.enabled);
+        assert!(cc.lsp.auto_detect);
+        assert_eq!(cc.lsp.settle_delay_ms, 222);
+        assert_eq!(cc.lsp.servers.get("rb").unwrap().command, "solargraph");
+        assert_eq!(cc.lsp.servers.get("rb").unwrap().args, vec!["stdio".to_string()]);
+    }
+
+    #[test]
+    fn lsp_defaults_to_disabled() {
+        let lsp = atomcode_core::config::LspConfig::default();
+        let shell = ShellConfig::from_provider(None, &lsp, std::path::Path::new("/tmp"), None, false, false);
+        assert!(!coding_config(&shell).lsp.enabled, "default config ⇒ LSP off");
     }
 
     fn coding_cfg(reasoning_history: Option<&str>) -> CodingAgentConfig {
@@ -271,8 +334,9 @@ mod tests {
     #[test]
     fn from_provider_maps_present_provider() {
         let pc = sample_provider();
+        let lsp = atomcode_core::config::LspConfig::default();
         let shell_cfg =
-            ShellConfig::from_provider(Some(&pc), std::path::Path::new("/work"), None, true, false);
+            ShellConfig::from_provider(Some(&pc), &lsp, std::path::Path::new("/work"), None, true, false);
         assert_eq!(shell_cfg.api_key, "sk-1");
         assert_eq!(shell_cfg.base_url, "https://api.example.com/v1");
         assert_eq!(shell_cfg.model, "m-1");
@@ -291,7 +355,8 @@ mod tests {
 
     #[test]
     fn from_provider_none_uses_neutral_defaults() {
-        let shell_cfg = ShellConfig::from_provider(None, std::path::Path::new("/w"), None, false, true);
+        let lsp = atomcode_core::config::LspConfig::default();
+        let shell_cfg = ShellConfig::from_provider(None, &lsp, std::path::Path::new("/w"), None, false, true);
         assert_eq!(shell_cfg.api_key, "");
         assert_eq!(shell_cfg.base_url, "");
         assert_eq!(shell_cfg.model, "");

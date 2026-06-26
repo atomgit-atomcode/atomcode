@@ -3,7 +3,7 @@
 
 use crate::config::ReviewAgentConfig;
 use crate::persona::review_persona;
-use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
+use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools, LspSettings};
 use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_capabilities::tools::{
     register_coding_tools, AstGrepTool, ReportFindingTool, WebSearchTool,
@@ -63,7 +63,9 @@ pub fn build_review_agent_with(
 fn mount_review_tools(report: &ReportFindingTool) -> MountedTools {
     let mut reg = ToolRegistry::new();
     register_coding_tools(&mut reg); // read_file/grep/glob/list_directory (+ write/edit/bash, unmounted)
-    register_codeintel_tools(&mut reg);
+    // Review is read-only and config-less: keep LSP off so it never spawns a language server
+    // (the `diagnostics` name in `review_tool_names` then simply doesn't resolve at mount).
+    register_codeintel_tools(&mut reg, &LspSettings::default());
     reg.register(Arc::new(AstGrepTool));
     reg.register(Arc::new(WebSearchTool::new()));
     reg.register(Arc::new(report.clone())); // shares state with the returned handle

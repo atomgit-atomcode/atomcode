@@ -1903,6 +1903,7 @@ fn shell_config_from(
     let p = config.active_provider(provider_override).ok();
     atomcode_shell::ShellConfig::from_provider(
         p,
+        &config.lsp,
         working_dir,
         telemetry,
         dangerously_skip_permissions,
