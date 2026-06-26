@@ -407,4 +407,14 @@ mod tests {
             Locale::En
         );
     }
+
+    #[test]
+    fn auto_copy_notice_strings() {
+        use crate::i18n::{t_with, Locale, messages::Msg};
+        let en = t_with(Locale::En, Msg::AutoCopyOk { chars: 1953 });
+        assert_eq!(en, "copied 1953 chars to clipboard · disable auto-copy in /config");
+        let zh = t_with(Locale::ZhCn, Msg::AutoCopyOk { chars: 1953 });
+        assert!(zh.contains("1953") && zh.contains("/config"));
+        assert!(!t_with(Locale::En, Msg::AutoCopyFailed).is_empty());
+    }
 }

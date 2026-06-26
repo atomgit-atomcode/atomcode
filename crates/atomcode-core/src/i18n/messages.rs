@@ -609,6 +609,10 @@ pub enum Msg<'a> {
     CopyBadIndex { count: usize },
     /// `/copy`: the clipboard write failed (no arboard backend — headless/SSH).
     CopyFailed,
+    /// Auto-copy on selection: clipboard write succeeded, showing count of chars copied.
+    AutoCopyOk { chars: usize },
+    /// Auto-copy on selection: clipboard write failed.
+    AutoCopyFailed,
     /// Hint shown after a code block is auto-copied to clipboard (issue #699).
     CodeBlockCopied,
     /// Description for the `/guide` slash command — asks atomcode-guide a question.

@@ -804,6 +804,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CopyNoCodeBlock => "上一条回复里没有可复制的代码块".into(),
         Msg::CopyBadIndex { count } => format!("没有这个代码块——上一条回复共 {count} 个（用 /copy N，范围 1..={count}）").into(),
         Msg::CopyFailed => "剪贴板不可用——复制失败".into(),
+        Msg::AutoCopyOk { chars } =>
+            format!("已复制 {chars} 字到剪贴板 · 在 /config 中关闭自动复制").into(),
+        Msg::AutoCopyFailed => "复制失败 — 剪贴板不可用".into(),
         Msg::CodeBlockCopied => "📋 代码块已复制到剪贴板".into(),
         Msg::CmdDescGuide => "向 atomcode-guide 提问使用方法".into(),
         Msg::CmdDescView => "在浮层窗口中查看文件内容".into(),
