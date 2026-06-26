@@ -596,6 +596,15 @@ fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
             crate::tuix_trace!("RD", "mouse scroll down");
             Some(InputEvent::MouseScroll(3))
         }
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            Some(InputEvent::MouseDown { col: m.column, row: m.row })
+        }
+        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            Some(InputEvent::MouseDrag { col: m.column, row: m.row })
+        }
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            Some(InputEvent::MouseUp { col: m.column, row: m.row })
+        }
         _ => None,
     }
 }
@@ -1016,5 +1025,22 @@ mod tests {
         worker
             .join()
             .expect("paused worker joins after sender drop");
+    }
+
+    /// Left mouse button Down/Drag/Up events map cleanly through
+    /// `mouse_input_event` and report 0-based coordinates. Non-left
+    /// buttons are ignored (return None).
+    #[test]
+    fn maps_left_button_press_drag_release() {
+        use crossterm::event::{MouseEvent, MouseEventKind, MouseButton, KeyModifiers};
+        let mk = |kind| MouseEvent { kind, column: 4, row: 7, modifiers: KeyModifiers::NONE };
+        assert!(matches!(mouse_input_event(mk(MouseEventKind::Down(MouseButton::Left))),
+            Some(InputEvent::MouseDown { col: 4, row: 7 })));
+        assert!(matches!(mouse_input_event(mk(MouseEventKind::Drag(MouseButton::Left))),
+            Some(InputEvent::MouseDrag { col: 4, row: 7 })));
+        assert!(matches!(mouse_input_event(mk(MouseEventKind::Up(MouseButton::Left))),
+            Some(InputEvent::MouseUp { col: 4, row: 7 })));
+        // Non-left buttons ignored.
+        assert!(mouse_input_event(mk(MouseEventKind::Down(MouseButton::Right))).is_none());
     }
 }

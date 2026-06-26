@@ -27,4 +27,11 @@ pub enum InputEvent {
     /// catch-all for terminals that forward wheel ticks outside the
     /// SGR mouse protocol, and the event-loop arm is a no-op.
     MouseScroll(i32),
+    /// Left mouse button pressed at (col,row), 0-based. Only emitted when
+    /// mouse capture is enabled (auto-copy-on-select feature).
+    MouseDown { col: u16, row: u16 },
+    /// Left button dragged to (col,row), 0-based.
+    MouseDrag { col: u16, row: u16 },
+    /// Left button released at (col,row), 0-based.
+    MouseUp { col: u16, row: u16 },
 }

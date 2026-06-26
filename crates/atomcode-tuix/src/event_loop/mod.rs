@@ -4387,6 +4387,9 @@ fn handle_input(
             InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
             InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
             InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
+            InputEvent::MouseDown { col, row } => format!("mouse_down({},{})", col, row),
+            InputEvent::MouseDrag { col, row } => format!("mouse_drag({},{})", col, row),
+            InputEvent::MouseUp { col, row } => format!("mouse_up({},{})", col, row),
         }
     );
 
@@ -4503,6 +4506,9 @@ fn handle_input(
             }
         }
         InputEvent::Eof => {}
+        // Mouse events for auto-copy-on-select feature (Task 7+).
+        // Currently no-op; real selection tracking is implemented in Task 8.
+        InputEvent::MouseDown { .. } | InputEvent::MouseDrag { .. } | InputEvent::MouseUp { .. } => {}
         // Act on Press AND Repeat. Release is dropped (it would double-fire
         // every handler on Windows, where crossterm emits all three kinds
         // per keystroke).
