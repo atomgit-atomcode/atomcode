@@ -673,13 +673,6 @@ pub struct AgentLoop {
     /// Active /goal state. Default is inactive (no goal set).
     goal: goal::GoalState,
 
-    /// Files edited across all rounds of the current /goal session.
-    /// `files_edited_this_turn` is reset every turn boundary, so we maintain
-    /// this separate cumulative set for the evaluator's summary — lets the
-    /// evaluator see progress across many rounds (see CR M13).
-    /// Cleared in `SetGoal` and `finalize_goal_cancelled`.
-    goal_files_edited: Vec<String>,
-
     /// Goal evaluator — built lazily in `run()` from evaluator_provider config.
     goal_evaluator: Option<goal_evaluator::GoalEvaluator>,
 
@@ -1177,7 +1170,6 @@ impl AgentLoop {
             cached_system_prompt_extensions: Vec::new(),
             cached_system_prompt: None,
             goal: goal::GoalState::default(),
-            goal_files_edited: Vec::new(),
             goal_evaluator: None,
             last_stop_reason: TurnStopReason::Natural,
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
@@ -1774,8 +1766,16 @@ impl AgentLoop {
                     let _ = self.event_tx.send(AgentEvent::MessagesSync { snapshot });
                 }
                 AgentCommand::SetGoal { condition } => {
-                    self.goal = goal::GoalState::new(condition);
-                    self.goal_files_edited.clear();
+                    let max_rounds = std::env::var("ATOMCODE_GOAL_MAX_ROUNDS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .filter(|&n| n > 0);
+                    let max_duration = std::env::var("ATOMCODE_GOAL_MAX_DURATION_SECS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .filter(|&n| n > 0)
+                        .map(std::time::Duration::from_secs);
+                    self.goal = goal::GoalState::new_with_limits(condition, max_rounds, max_duration);
                     self.emit_goal_update(true, None);
                 }
                 AgentCommand::ClearGoal => {
