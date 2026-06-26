@@ -3293,15 +3293,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
     // ── Copy-mode: alt-screen selection overlay ──────────────────────────
 
-    /// True while the user is drag-selecting text in the copy-mode overlay.
-    pub(crate) fn in_copy_mode(&self) -> bool {
-        self.copy_mode.is_some()
-    }
-
     /// Enable (`on=true`) or disable (`on=false`) button-event + SGR mouse
-    /// coordinate reporting. Called by Task 8 wiring; NOT called in the
-    /// constructor — startup defers mouse handling to the terminal.
-    pub(crate) fn set_mouse_capture(&mut self, on: bool) {
+    /// coordinate reporting. Private emitter called by the `Renderer` trait
+    /// impl — NOT called in the constructor (startup defers mouse handling
+    /// to the terminal). Renamed from `set_mouse_capture` (Task 8 name-clash
+    /// resolution: the trait provides the public name).
+    fn emit_mouse_capture(&mut self, on: bool) {
         let seq: &[u8] = if on {
             b"\x1b[?1002h\x1b[?1006h"
         } else {
@@ -3309,6 +3306,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         let _ = self.out.write_all(seq);
         let _ = self.out.flush();
+    }
+
+    /// Orchestrate a copy-mode mouse gesture: open the alt-screen overlay on
+    /// the first `Press` or `Scroll` while not already in copy mode, drive
+    /// selection on `Drag`, copy to clipboard on `Release`, and set a
+    /// transient copy-notice footer row indicating success or failure.
+    ///
+    /// Called from the `Renderer` trait impl (which inlines this body to
+    /// avoid any inherent/trait name-clash ambiguity) and also directly by
+    /// tests via the concrete type.
+    pub fn copy_gesture(&mut self, g: crate::overlay::CopyModeInput) {
+        use crate::overlay::CopyModeInput as I;
+        // Press or Scroll opens the overlay if it is not already active.
+        if matches!(g, I::Press(..) | I::Scroll(..)) && self.copy_mode.is_none() {
+            self.open_copy_mode();
+        }
+        if let Some(n) = self.copy_mode_event(g) {
+            let text = if n == usize::MAX {
+                crate::i18n::t(crate::i18n::Msg::AutoCopyFailed).into_owned()
+            } else {
+                crate::i18n::t(crate::i18n::Msg::AutoCopyOk { chars: n }).into_owned()
+            };
+            self.set_copy_notice(text);
+        }
     }
 
     /// Enter alt-screen copy mode: snapshot `body_lines`, initialise the
@@ -3440,6 +3461,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Some(t) => t.elapsed() < COPY_NOTICE_TTL && self.copy_notice.is_some(),
             None => false,
         }
+    }
+
+    /// Test-only accessor: returns the current copy-notice text (if any).
+    /// Used by Task 8 orchestrator tests to assert the notice was set correctly
+    /// without relying on TTL timing.
+    #[cfg(test)]
+    pub fn copy_notice_text_for_test(&self) -> Option<&str> {
+        self.copy_notice.as_deref()
     }
 }
 
@@ -4582,6 +4611,36 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.suppress_auto_copy = suppress;
     }
 
+    // ── Task 8: copy-mode Renderer-trait methods ──────────────────────────
+
+    fn set_mouse_capture(&mut self, on: bool) {
+        self.emit_mouse_capture(on);
+    }
+
+    /// Drive a copy-mode mouse gesture through the orchestrator. The body is
+    /// inlined here (rather than delegating to `self.copy_gesture(g)`) to
+    /// eliminate any inherent/trait name-clash ambiguity — Rust would choose
+    /// the inherent method, but the explicit inline makes intent unambiguous
+    /// and rules out accidental infinite recursion at a glance.
+    fn copy_gesture(&mut self, g: crate::overlay::copy_mode::CopyModeInput) {
+        use crate::overlay::copy_mode::CopyModeInput as I;
+        if matches!(g, I::Press(..) | I::Scroll(..)) && self.copy_mode.is_none() {
+            self.open_copy_mode();
+        }
+        if let Some(n) = self.copy_mode_event(g) {
+            let text = if n == usize::MAX {
+                crate::i18n::t(crate::i18n::Msg::AutoCopyFailed).into_owned()
+            } else {
+                crate::i18n::t(crate::i18n::Msg::AutoCopyOk { chars: n }).into_owned()
+            };
+            self.set_copy_notice(text);
+        }
+    }
+
+    fn in_copy_mode(&self) -> bool {
+        self.copy_mode.is_some()
+    }
+
     fn clear_screen(&mut self) {
         // Same as reset for retained mode — Screen IS our model, so
         // wiping the terminal requires wiping the model too. The
@@ -5131,6 +5190,9 @@ fn spinner_meta_suffix(label: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Bring the Renderer trait into scope so trait methods (in_copy_mode,
+    // set_mouse_capture, copy_gesture) are callable on concrete types.
+    use crate::render::Renderer;
     use crate::terminal::{EnvView, TerminalCaps};
     use std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -12862,6 +12924,60 @@ mod tests {
         assert!(
             off_s.contains("\x1b[?1006l"),
             "disable must emit ?1006l: {off_s:?}"
+        );
+    }
+
+    // ── Task 8: copy_gesture orchestrator ─────────────────────────────────
+
+    /// `copy_gesture(Press)` must open the overlay (alt-screen entered,
+    /// `in_copy_mode()` returns true); `copy_gesture(Release)` must select the
+    /// dragged text, copy it to clipboard, close the overlay
+    /// (`in_copy_mode()` false), and set a copy-notice containing "copied N
+    /// chars". Body row layout: AssistantText "hello world\n" is prefixed by
+    /// PAD_COL=2, so 'h' is at col 2, 'o' at col 6; overlay row = 0 (last
+    /// body_line, which anchors to the bottom of the viewport).
+    #[test]
+    fn copy_gesture_press_release_copies_and_sets_notice() {
+        use crate::overlay::copy_mode::CopyModeInput as G;
+
+        let (mut r, buf) = new_capturing(40, 10);
+        // Seed one body row. PAD_COL=2 prepends two spaces so 'h' lands at
+        // col 2 and 'o' at col 6 inside the overlay's cell grid.
+        r.render(UiLine::AssistantText("hello world\n".into()));
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // Press at 'h' (col 2, overlay row 0): orchestrator opens the
+        // overlay (not yet in copy mode) then calls copy_mode_event(Press).
+        r.copy_gesture(G::Press(2, 0));
+        assert!(r.in_copy_mode(), "overlay must be open after Press");
+
+        // Release at 'o' (col 6, same row): selects "hello" (5 chars),
+        // copies via OSC 52 (always succeeds against CapturingSink), closes
+        // overlay, sets notice.
+        r.copy_gesture(G::Release(6, 0));
+        assert!(!r.in_copy_mode(), "overlay must close after Release");
+
+        let notice = r
+            .copy_notice_text_for_test()
+            .expect("copy notice must be set after a successful copy");
+        assert!(
+            notice.contains("copied 5 chars"),
+            "notice must report the char count; got: {notice:?}"
+        );
+    }
+
+    /// `copy_gesture(Cancel)` while NOT in copy mode must be a safe no-op
+    /// (overlay stays closed, no panic, no notice set).
+    #[test]
+    fn copy_gesture_cancel_when_not_in_copy_mode_is_noop() {
+        use crate::overlay::copy_mode::CopyModeInput as G;
+        let (mut r, _buf) = new_capturing(40, 10);
+        r.copy_gesture(G::Cancel); // must not panic
+        assert!(!r.in_copy_mode(), "must stay out of copy mode");
+        assert!(
+            r.copy_notice_text_for_test().is_none(),
+            "must not set a notice on cancel-without-open"
         );
     }
 }

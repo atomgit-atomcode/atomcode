@@ -78,6 +78,12 @@ enum RenderCmd {
     /// Suppress / restore automatic clipboard copy during history replay
     /// (issue #699 P1-1). Fire-and-forget.
     SetSuppressAutoCopy(bool),
+    /// Enable/disable SGR mouse button-event + coordinate reporting for
+    /// auto-copy-on-select. Fire-and-forget.
+    SetMouseCapture(bool),
+    /// Forward a copy-mode mouse gesture to the inner renderer's
+    /// orchestrator. Fire-and-forget.
+    CopyGesture(crate::overlay::copy_mode::CopyModeInput),
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -181,6 +187,17 @@ impl Renderer for TaskRenderer {
         let _ = self.cmd_tx.send(RenderCmd::SetSuppressAutoCopy(suppress));
     }
 
+    fn set_mouse_capture(&mut self, on: bool) {
+        let _ = self.cmd_tx.send(RenderCmd::SetMouseCapture(on));
+    }
+
+    fn copy_gesture(&mut self, g: crate::overlay::copy_mode::CopyModeInput) {
+        let _ = self.cmd_tx.send(RenderCmd::CopyGesture(g));
+    }
+
+    // in_copy_mode returns false: the proxy cannot query the worker thread
+    // synchronously. The event loop tracks its own copy-mode state (Task 9).
+
     fn suspend_for_external(&mut self) {
         self.ack(AckOp::SuspendForExternal);
     }
@@ -244,6 +261,12 @@ impl Drop for TaskRenderer {
 
 fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
     use std::time::Instant;
+    // Render-queue (Decision 6): while the copy-mode alt-screen overlay is
+    // open, body lines arriving from the event loop must NOT paint over the
+    // alt screen. We accumulate them here and replay them after the overlay
+    // closes (on the `CopyGesture` that ends copy mode).
+    let mut copy_queue: Vec<UiLine> = Vec::new();
+
     while let Ok(cmd) = cmd_rx.recv() {
         // Measure the wall-clock time each terminal I/O takes so the log
         // shows where Mac Terminal.app / iTerm2 / etc. actually spend time.
@@ -252,17 +275,32 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
         // forever to serialize or intermediate `write_all` blocking.
         match cmd {
             RenderCmd::Line(line) => {
+                // While the overlay is up, queue the line instead of painting
+                // it over the alt screen. The queue is drained after the
+                // gesture that closes the overlay (see CopyGesture below).
+                if inner.in_copy_mode() {
+                    copy_queue.push(line);
+                    continue;
+                }
                 let tag = ui_line_tag(&line);
                 let t0 = Instant::now();
                 inner.render(line);
                 crate::tuix_trace!("REN", "Line {} render={}µs", tag, t0.elapsed().as_micros());
             }
             RenderCmd::Flush => {
+                // Skip painting while the overlay is up.
+                if inner.in_copy_mode() {
+                    continue;
+                }
                 let t0 = Instant::now();
                 inner.flush();
                 crate::tuix_trace!("REN", "Flush flush={}µs", t0.elapsed().as_micros());
             }
             RenderCmd::FlushDeferred => {
+                // Skip painting while the overlay is up.
+                if inner.in_copy_mode() {
+                    continue;
+                }
                 // Skip logging when it's a true no-op (no pending payload
                 // and window not elapsed). throttle.rs already logs when
                 // this path actually paints.
@@ -316,6 +354,20 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             }
             RenderCmd::SetSuppressAutoCopy(suppress) => {
                 inner.set_suppress_auto_copy(suppress);
+            }
+            RenderCmd::SetMouseCapture(on) => {
+                inner.set_mouse_capture(on);
+            }
+            RenderCmd::CopyGesture(g) => {
+                inner.copy_gesture(g);
+                // If the gesture closed the overlay, replay any body lines that
+                // arrived while it was open (render-queue drain, Decision 6).
+                if !inner.in_copy_mode() && !copy_queue.is_empty() {
+                    for l in copy_queue.drain(..) {
+                        inner.render(l);
+                    }
+                    inner.flush_deferred();
+                }
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();

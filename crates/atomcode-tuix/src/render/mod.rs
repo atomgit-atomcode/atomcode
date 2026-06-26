@@ -266,6 +266,28 @@ pub trait Renderer: Send {
     /// this.
     fn set_suppress_auto_copy(&mut self, _suppress: bool) {}
 
+    /// Enable/disable SGR mouse button-event + coordinate reporting for
+    /// auto-copy-on-select. `true` sends `?1002h?1006h`; `false` sends
+    /// `?1002l?1006l`. Default no-op — only the retained renderer acts on
+    /// this; TaskRenderer forwards it to the worker thread.
+    fn set_mouse_capture(&mut self, _on: bool) {}
+
+    /// Forward a copy-mode mouse gesture into the renderer's orchestrator,
+    /// which opens the alt-screen overlay on the first `Press`/`Scroll`,
+    /// drives selection on `Drag`, copies to clipboard on `Release`, and
+    /// sets the transient copy-notice footer row. Default no-op — only the
+    /// retained renderer acts on this; TaskRenderer forwards it to the
+    /// worker thread.
+    fn copy_gesture(&mut self, _g: crate::overlay::copy_mode::CopyModeInput) {}
+
+    /// Returns `true` while the copy-mode alt-screen overlay is open.
+    /// Default `false` — the proxy `TaskRenderer` cannot query the worker
+    /// thread synchronously; the event loop tracks its own copy-mode state
+    /// (Task 9). Only the retained renderer returns the real value.
+    fn in_copy_mode(&self) -> bool {
+        false
+    }
+
     /// Hand the terminal off to a non-TUI child process (blocking OAuth
     /// flow, `/shell`, etc.): disable raw mode + bracketed paste, finish
     /// any pending writes. After this returns, the child is free to use
