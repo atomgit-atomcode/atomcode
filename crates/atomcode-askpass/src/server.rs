@@ -71,7 +71,7 @@ pub fn key_for_prompt(prompt: &str) -> String {
     if prompt.contains("[sudo]") || prompt.starts_with("Password:") {
         return "sudo".to_string();
     }
-    if let Some(at_pos) = prompt.find('@') {
+    if let Some(at_pos) = prompt.rfind('@') {
         let rest = &prompt[at_pos + 1..];
         if let Some(apos) = rest.find("'s password:") {
             let host = &rest[..apos];
@@ -164,9 +164,14 @@ pub fn start(
     // Remove any stale socket from a previous run.
     let _ = std::fs::remove_file(&sock_path);
 
-    let listener = tokio::net::UnixListener::bind(&sock_path)?;
+    // Tighten umask so the socket is created 0600 from the start (no TOCTOU
+    // window where group/world bits are briefly visible).
+    let old_mask = unsafe { libc::umask(0o177) };
+    let bind_result = tokio::net::UnixListener::bind(&sock_path);
+    unsafe { libc::umask(old_mask) }; // always restore, even on error
+    let listener = bind_result?;
 
-    // Restrict to owner only.
+    // Belt-and-suspenders: explicitly enforce 0600 regardless of umask.
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
 
@@ -205,6 +210,8 @@ mod tests {
         assert_eq!(key_for_prompt("[sudo] password for alice:"), "sudo");
         assert_eq!(key_for_prompt("alice@host.example.com's password:"), "ssh:host.example.com");
         assert_eq!(key_for_prompt("Enter passphrase for key '/x':"), "generic");
+        // multi-@ (e.g. user@proxy@host): host must be the segment after the LAST '@'
+        assert_eq!(key_for_prompt("user@proxy@host's password:"), "ssh:host");
     }
 
     #[tokio::test]

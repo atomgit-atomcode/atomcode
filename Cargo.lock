@@ -214,6 +214,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-askpass"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "atomcode-bridge"
 version = "0.0.0"
 dependencies = [
