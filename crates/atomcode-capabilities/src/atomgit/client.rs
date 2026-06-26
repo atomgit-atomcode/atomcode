@@ -23,7 +23,7 @@ pub struct AtomgitClient {
 impl AtomgitClient {
     /// Build the client. Errors only if the TLS/HTTP stack fails to initialise.
     pub fn new(cfg: AtomgitConfig) -> Result<Self, String> {
-        let http = reqwest::Client::builder()
+        let http = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
             .user_agent(cfg.user_agent)
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()

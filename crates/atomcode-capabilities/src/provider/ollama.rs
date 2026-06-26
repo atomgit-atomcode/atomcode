@@ -80,7 +80,7 @@ pub struct OllamaProvider {
 
 impl OllamaProvider {
     pub fn new(cfg: OllamaConfig) -> Result<Self, ProviderError> {
-        let client = reqwest::Client::builder()
+        let client = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
             .connect_timeout(cfg.connect_timeout)
             // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
             .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)

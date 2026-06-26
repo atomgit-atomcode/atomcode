@@ -52,6 +52,13 @@ pub(crate) mod paths;
 /// console-window flash without `capabilities` depending on `core`.
 pub(crate) mod process_utils;
 
+/// Proxy policy for outbound HTTP clients — a self-contained mirror of
+/// `core::proxy` (reads the process `ATOMCODE_PROXY_MODE` env) so v2 clients
+/// honor `no_proxy` without `capabilities` depending on `core`. Compiled
+/// whenever a reqwest-using capability is enabled.
+#[cfg(any(feature = "provider", feature = "web", feature = "atomgit", feature = "mcp"))]
+pub(crate) mod proxy;
+
 #[cfg(feature = "provider")]
 pub mod provider;
 

@@ -325,7 +325,7 @@ async fn validate_host(url: &Url) -> Result<Vec<SocketAddr>, String> {
 /// change the host and the resolve override is fixed at builder time; `resolve_to_addrs`
 /// keeps the URL's port / SNI / TLS cert hostname intact — only the dialed address is pinned.
 fn build_client(host: &str, pinned: &[SocketAddr]) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         // Follow redirects MANUALLY so every hop re-runs scheme + IP checks; the built-in
         // follower would let a 302 rebind to 127.0.0.1 after the start URL passed.
         .redirect(Policy::none())

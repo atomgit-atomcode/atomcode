@@ -96,7 +96,7 @@ impl OpenAiCompatProvider {
         let policy = cfg
             .reasoning_policy
             .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model, &cfg.base_url));
-        let client = reqwest::Client::builder()
+        let client = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
             .connect_timeout(cfg.connect_timeout)
             // Drop idle keep-alive connections before the gateway LB does, so
             // we don't reuse a server-closed socket (the "error sending
