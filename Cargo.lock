@@ -475,6 +475,7 @@ version = "4.25.6"
 dependencies = [
  "anyhow",
  "arboard",
+ "atomcode-askpass",
  "atomcode-core",
  "atomcode-daemon",
  "atomcode-telemetry",
@@ -500,6 +501,7 @@ dependencies = [
  "uuid",
  "vte",
  "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]

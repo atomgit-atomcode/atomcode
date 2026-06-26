@@ -27,6 +27,7 @@ pub mod model_picker;
 pub mod onboarding_wizard;
 pub mod plugin_manager;
 mod qr;
+pub mod password;
 pub mod provider_wizard;
 pub mod session_picker;
 pub use dir_picker::DirPicker;
