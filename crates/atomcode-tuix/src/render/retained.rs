@@ -533,6 +533,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// When Some, `paint_frame` paints the overlay cells after the normal
     /// body+footer, so the diff sees the combined frame.
     modal_overlay: Option<ModalOverlayState>,
+    /// Active copy-mode overlay. `Some` while the user is drag-selecting
+    /// text in the alt-screen; `None` in normal live mode. Populated by
+    /// `open_copy_mode`, cleared by `close_copy_mode`.
+    copy_mode: Option<crate::overlay::CopyMode>,
     /// Append-only log of the permanent body-producing `UiLine`s in
     /// render order — the semantic source needed to REFLOW the whole
     /// transcript when the terminal width changes. `body_lines` holds
@@ -686,6 +690,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_tool_rows: 0,
             live_group: None,
             modal_overlay: None,
+            copy_mode: None,
             body_log: Vec::new(),
             replaying: false,
             body_log_truncated: false,
@@ -3254,6 +3259,124 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.md_state.reset();
     }
 
+    // ── Copy-mode: alt-screen selection overlay ──────────────────────────
+
+    /// True while the user is drag-selecting text in the copy-mode overlay.
+    pub(crate) fn in_copy_mode(&self) -> bool {
+        self.copy_mode.is_some()
+    }
+
+    /// Enable (`on=true`) or disable (`on=false`) button-event + SGR mouse
+    /// coordinate reporting. Called by Task 8 wiring; NOT called in the
+    /// constructor — startup defers mouse handling to the terminal.
+    pub(crate) fn set_mouse_capture(&mut self, on: bool) {
+        let seq: &[u8] = if on {
+            b"\x1b[?1002h\x1b[?1006h"
+        } else {
+            b"\x1b[?1002l\x1b[?1006l"
+        };
+        let _ = self.out.write_all(seq);
+        let _ = self.out.flush();
+    }
+
+    /// Enter alt-screen copy mode: snapshot `body_lines`, initialise the
+    /// overlay, and emit the first frame inside a `?2026h … ?2026l` envelope.
+    pub(crate) fn open_copy_mode(&mut self) {
+        if self.copy_mode.is_some() {
+            return;
+        }
+        let w = self.screen.width();
+        let vh = self.screen.height();
+        let snapshot = self.body_lines.clone();
+        let mut cm = crate::overlay::CopyMode::new(snapshot, w, vh);
+        // Single outer DECSET 2026 envelope; the overlay's inner screen has
+        // sync_suppressed=true (set in CopyMode::new) so frame_bytes() does
+        // NOT emit its own ?2026h/?2026l — only the ones here exist.
+        let _ = self.out.write_all(b"\x1b[?2026h\x1b[?1049h\x1b[2J\x1b[H");
+        let bytes = cm.frame_bytes();
+        self.copy_mode = Some(cm);
+        let _ = self.out.write_all(&bytes);
+        let _ = self.out.write_all(b"\x1b[?2026l");
+        let _ = self.out.flush();
+    }
+
+    /// Repaint the overlay after a selection or scroll change.
+    fn repaint_copy_mode(&mut self) {
+        if let Some(cm) = self.copy_mode.as_mut() {
+            let bytes = cm.frame_bytes();
+            let _ = self.out.write_all(b"\x1b[?2026h");
+            let _ = self.out.write_all(&bytes);
+            let _ = self.out.write_all(b"\x1b[?2026l");
+            let _ = self.out.flush();
+        }
+    }
+
+    /// Drive a mouse/scroll event into the copy-mode overlay.
+    ///
+    /// Returns:
+    /// - `None` — event consumed, no selection finalised yet.
+    /// - `Some(n)` where `n < usize::MAX` — selection finalised, `n` chars
+    ///   copied to clipboard.
+    /// - `Some(usize::MAX)` — clipboard write failed (Task 8 maps this to
+    ///   `AutoCopyFailed`).
+    pub(crate) fn copy_mode_event(
+        &mut self,
+        ev: crate::overlay::CopyModeInput,
+    ) -> Option<usize> {
+        use crate::overlay::CopyModeInput as I;
+        // If not in copy mode, ignore silently.
+        self.copy_mode.as_ref()?;
+        match ev {
+            I::Press(c, row) => {
+                self.copy_mode.as_mut().unwrap().begin_selection(c, row);
+                self.repaint_copy_mode();
+                None
+            }
+            I::Drag(c, row) => {
+                self.copy_mode.as_mut().unwrap().update_selection(c, row);
+                self.repaint_copy_mode();
+                None
+            }
+            I::Scroll(d) => {
+                self.copy_mode.as_mut().unwrap().scroll(d);
+                self.repaint_copy_mode();
+                None
+            }
+            I::Cancel => {
+                self.close_copy_mode();
+                None
+            }
+            I::Release(c, row) => {
+                self.copy_mode.as_mut().unwrap().update_selection(c, row);
+                let has_sel = self.copy_mode.as_ref().unwrap().has_selection();
+                if has_sel {
+                    let text = self.copy_mode.as_ref().unwrap().selected_text();
+                    let n = text.chars().count();
+                    let ok = crate::event_loop::commands::copy_text_to_clipboard_osc52_via(
+                        &mut self.out,
+                        &text,
+                    );
+                    self.close_copy_mode();
+                    return Some(if ok { n } else { usize::MAX });
+                }
+                self.close_copy_mode();
+                None
+            }
+        }
+    }
+
+    /// Exit alt-screen copy mode: drop the overlay, restore the live screen,
+    /// and schedule a full live repaint.
+    pub(crate) fn close_copy_mode(&mut self) {
+        if self.copy_mode.take().is_none() {
+            return;
+        }
+        let _ = self.out.write_all(b"\x1b[?1049l");
+        let _ = self.out.flush();
+        // Force a full live repaint on the next flush_deferred tick.
+        self.screen.invalidate();
+        self.dirty = true;
+    }
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -12532,5 +12655,96 @@ mod tests {
                     .join("\n")
             );
         }
+    }
+
+    // ── Task 6: copy-mode renderer hooks ──────────────────────────────────
+
+    /// Open copy-mode, drag-select "hello" from an AssistantText body row,
+    /// release, and assert:
+    ///   - alt-screen entered (`?1049h` in output)
+    ///   - `in_copy_mode()` is true after open
+    ///   - Release returns `Some(5)` (five chars: "hello")
+    ///   - `in_copy_mode()` is false after release
+    ///   - alt-screen exited (`?1049l` in output)
+    ///
+    /// Body row layout: `push_markdown_body` prepends PAD_COL (2 spaces) to
+    /// the parsed cells. Input "hello world\n" → body_lines[0] =
+    /// [' ',' ','h','e','l','l','o',' ','w','o','r','l','d'].
+    /// 'h' is at col 2, 'o' at col 6 → Press(2,0)/Release(6,0) → "hello".
+    #[test]
+    fn copy_mode_enters_alt_screen_and_copies_selection() {
+        use crate::overlay::CopyModeInput;
+
+        let (mut r, buf) = new_capturing(40, 10);
+        // Seed one body row.  No leading spaces so 'h' lands at col 2
+        // (right after the PAD_COL=2 prefix that push_markdown_body adds).
+        r.render(UiLine::AssistantText("hello world\n".into()));
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // Enter copy mode — must emit ?1049h.
+        r.open_copy_mode();
+        assert!(r.in_copy_mode(), "must be in copy mode after open");
+        let s = String::from_utf8_lossy(&buf.lock().unwrap().clone()).to_string();
+        assert!(
+            s.contains("\x1b[?1049h"),
+            "open_copy_mode must enter alt screen: {s:?}"
+        );
+        // DECSET 2026 single-envelope guarantee: exactly one ?2026h and one
+        // ?2026l per frame (CopyMode::new sets sync_suppressed=true so the
+        // inner Screen::render_diff does NOT emit its own nested envelope).
+        let count_2026h = s.matches("\x1b[?2026h").count();
+        let count_2026l = s.matches("\x1b[?2026l").count();
+        assert_eq!(count_2026h, 1, "must have exactly one ?2026h, got {count_2026h}: {s:?}");
+        assert_eq!(count_2026l, 1, "must have exactly one ?2026l, got {count_2026l}: {s:?}");
+
+        // Press at 'h' (col 2, overlay row 0).
+        r.copy_mode_event(CopyModeInput::Press(2, 0));
+        // Release at 'o' (col 6, same row) — selects "hello" (5 chars).
+        let n = r.copy_mode_event(CopyModeInput::Release(6, 0));
+
+        assert_eq!(n, Some(5), "Release must return Some(5) for \"hello\"");
+        assert!(!r.in_copy_mode(), "must exit copy mode after Release");
+
+        let s2 = String::from_utf8_lossy(&buf.lock().unwrap().clone()).to_string();
+        assert!(
+            s2.contains("\x1b[?1049l"),
+            "close_copy_mode must exit alt screen: {s2:?}"
+        );
+    }
+
+    /// `set_mouse_capture(true)` must emit ?1002h?1006h;
+    /// `set_mouse_capture(false)` must emit ?1002l?1006l.
+    /// Neither must be triggered by the constructor (verified by the
+    /// existing `retained_with_writer_does_not_enable_mouse_capture` test).
+    #[test]
+    fn set_mouse_capture_emits_correct_sequences() {
+        let (mut r, buf) = new_capturing(80, 24);
+        buf.lock().unwrap().clear();
+
+        r.set_mouse_capture(true);
+        let on_bytes = buf.lock().unwrap().clone();
+        let on_s = String::from_utf8_lossy(&on_bytes);
+        assert!(
+            on_s.contains("\x1b[?1002h"),
+            "enable must emit ?1002h: {on_s:?}"
+        );
+        assert!(
+            on_s.contains("\x1b[?1006h"),
+            "enable must emit ?1006h: {on_s:?}"
+        );
+
+        buf.lock().unwrap().clear();
+        r.set_mouse_capture(false);
+        let off_bytes = buf.lock().unwrap().clone();
+        let off_s = String::from_utf8_lossy(&off_bytes);
+        assert!(
+            off_s.contains("\x1b[?1002l"),
+            "disable must emit ?1002l: {off_s:?}"
+        );
+        assert!(
+            off_s.contains("\x1b[?1006l"),
+            "disable must emit ?1006l: {off_s:?}"
+        );
     }
 }

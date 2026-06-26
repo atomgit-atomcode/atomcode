@@ -3,6 +3,16 @@ use crate::render::screen::Screen;
 
 const PAD_COL: usize = 2;
 
+/// Input events driven into `CopyMode` by the renderer.
+/// `(col, row)` coordinates are in **overlay viewport** space (0-based).
+pub enum CopyModeInput {
+    Press(u16, u16),
+    Drag(u16, u16),
+    Release(u16, u16),
+    Scroll(i32),
+    Cancel,
+}
+
 pub struct CopyMode {
     snapshot: Vec<Vec<Cell>>,
     screen: Screen,
@@ -17,7 +27,11 @@ impl CopyMode {
         let vh = viewport_h.max(1) as usize;
         // Show the tail (most recent rows), like the live view.
         let top = snapshot.len().saturating_sub(vh);
-        let screen = Screen::new(width, viewport_h);
+        let mut screen = Screen::new(width, viewport_h);
+        // The caller (RetainedRenderer) always wraps frame_bytes() inside its
+        // own ?2026h … ?2026l envelope. Suppress the inner per-frame envelope
+        // so we never emit a nested ?2026l that would close the outer one early.
+        screen.set_sync_suppressed(true);
         Self { snapshot, screen, viewport_h, top, anchor: None, cursor: None }
     }
 
