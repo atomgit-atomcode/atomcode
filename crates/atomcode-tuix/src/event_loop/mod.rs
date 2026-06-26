@@ -916,6 +916,12 @@ pub struct LoopCtx {
     pub reasoning_effort: Option<String>,
     /// Transient status-line hint with auto-dismiss.
     pub transient_hint: std::sync::Arc<std::sync::Mutex<Option<TransientHint>>>,
+    /// Receiver for password-prompt requests forwarded by the askpass server.
+    /// `Some` when the TUI is running an askpass-capable session (Task 10 wires
+    /// the real value); `None` means the arm is inert. Unix-only — sudo/SSH
+    /// askpass is not supported on Windows.
+    #[cfg(unix)]
+    pub askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_askpass::server::AskpassPrompt>>,
 }
 
 /// A transient hint shown on the status line, with auto-dismiss deadline.
@@ -3818,6 +3824,26 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         runtime_event.event,
                         &ctx.session_manager,
                     );
+                }
+            }
+
+            // ── Askpass password prompt ──
+            // Fired by the askpass server when a child process (sudo/ssh)
+            // asks for a password. Installs the PasswordModal so the user
+            // can type their password without it ever touching the main
+            // input buffer or history. When `askpass_rx` is `None` (the
+            // common case — Task 10 wires it only in askpass sessions) the
+            // async block resolves to `std::future::pending()` which never
+            // fires, making the arm completely inert at zero cost.
+            Some(p) = async {
+                match ctx.askpass_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                install_password_modal(&mut app, p.prompt, p.reply);
+                if let Some(m) = app.active_modal.as_ref() {
+                    m.draw(&app.buf, &app.state, &ctx, renderer);
                 }
             }
 
@@ -9672,4 +9698,45 @@ pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
         && atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
             &ctx.model_name,
         )
+}
+
+/// Install a [`crate::modals::password::PasswordModal`] as the active modal on
+/// `app`. Called from the `askpass_rx` select! arm and from the test below.
+#[cfg(unix)]
+pub(crate) fn install_password_modal(
+    app: &mut App,
+    prompt: String,
+    reply: tokio::sync::oneshot::Sender<Option<String>>,
+) {
+    app.active_modal = Some(Box::new(
+        crate::modals::password::PasswordModal::new(prompt, reply),
+    ));
+}
+
+#[cfg(test)]
+mod install_password_modal_tests {
+    use super::*;
+
+    fn caps_for_test() -> crate::terminal::TerminalCaps {
+        crate::terminal::TerminalCaps {
+            tty: false,
+            colors: false,
+            spinner: false,
+            bracketed_paste: false,
+            raw_mode: false,
+            scroll_region: false,
+            unicode_symbols: false,
+            legacy_conhost: false,
+            jediterm: false,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_password_modal_sets_active_modal() {
+        let mut app = App::new(&caps_for_test());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        install_password_modal(&mut app, "[sudo] password:".into(), tx);
+        assert!(app.active_modal.is_some(), "modal installed");
+    }
 }

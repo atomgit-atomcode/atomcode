@@ -694,6 +694,9 @@ pub async fn run(
         sync_forwarder: None,
         reasoning_effort: None,
         transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        // Task 10 will wire the real value when an askpass-capable session is started.
+        #[cfg(unix)]
+        askpass_rx: None,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current
