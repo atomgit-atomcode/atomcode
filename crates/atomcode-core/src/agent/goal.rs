@@ -84,23 +84,44 @@ pub fn summarize_for_goal(messages: &[Message], prev_verdict: Option<&str>) -> S
         sections.push(format!("Previous round verdict: {v}"));
     }
 
-    // 2) Recent tool results — newest first, failures kept preferentially.
-    let mut results: Vec<String> = Vec::new();
-    for msg in messages.iter().rev() {
+    // 2) Recent tool results — collect all, then select up to MAX_TOOL_RESULTS
+    // preferring FAILURES (newest-first within each priority), displayed
+    // chronologically. Failures are the signal that stops the evaluator from
+    // rubber-stamping a "done" prose claim, so a failure must never be crowded
+    // out by newer successes.
+    let mut collected: Vec<(usize, bool, String)> = Vec::new(); // (orig_idx, ok, snippet)
+    for (idx, msg) in messages.iter().enumerate() {
         if !msg.is_tool_result() {
             continue;
         }
         let ok = msg.tool_result_success().unwrap_or(true);
-        let out = msg.tool_result_output().unwrap_or("");
-        let snippet: String = out.chars().take(TOOL_CHARS).collect();
-        results.push(format!("- [{}] {}", if ok { "ok" } else { "FAILED" }, snippet.replace('\n', " ")));
-        if results.len() >= MAX_TOOL_RESULTS {
-            break;
+        let snippet: String =
+            msg.tool_result_output().unwrap_or("").chars().take(TOOL_CHARS).collect();
+        collected.push((idx, ok, snippet.replace('\n', " ")));
+    }
+    let mut selected: Vec<&(usize, bool, String)> = Vec::new();
+    for want_ok in [false, true] {
+        // failures first, then successes
+        for r in collected.iter().rev() {
+            // newest-first within each group
+            if selected.len() >= MAX_TOOL_RESULTS {
+                break;
+            }
+            if r.1 == want_ok && !selected.iter().any(|s| s.0 == r.0) {
+                selected.push(r);
+            }
         }
     }
-    results.reverse();
-    if !results.is_empty() {
-        sections.push(format!("Recent tool results (oldest → newest):\n{}", results.join("\n")));
+    selected.sort_by_key(|r| r.0); // chronological for display
+    if !selected.is_empty() {
+        let lines: Vec<String> = selected
+            .iter()
+            .map(|(_, ok, snip)| format!("- [{}] {}", if *ok { "ok" } else { "FAILED" }, snip))
+            .collect();
+        sections.push(format!(
+            "Recent tool results (oldest → newest, failures kept):\n{}",
+            lines.join("\n")
+        ));
     }
 
     // 3) Recent assistant replies (prose self-report — kept, but no longer the
@@ -296,6 +317,21 @@ mod tests {
         assert!(s.contains("FAILED") || s.contains("3 failed"), "failure signal missing: {s}");
         assert!(s.contains("all done"), "assistant prose missing: {s}");
         assert!(s.contains("no — keep going"), "prev verdict missing: {s}");
+    }
+
+    #[test]
+    fn summary_keeps_old_failure_over_newer_successes() {
+        // One FAILED result older than 5 newer successes — it must still surface.
+        let mut msgs = vec![
+            asst_with_call("ran the failing check", "bash", r#"{"command":"cargo test"}"#),
+            tool_result("t1", "test result: FAILED. 1 failed", false),
+        ];
+        for i in 0..5 {
+            msgs.push(asst_with_call("ok step", "bash", r#"{"command":"echo hi"}"#));
+            msgs.push(tool_result("t1", &format!("ok {i}"), true));
+        }
+        let s = summarize_for_goal(&msgs, None);
+        assert!(s.contains("FAILED"), "old failure must not be dropped: {s}");
     }
 
     #[test]
