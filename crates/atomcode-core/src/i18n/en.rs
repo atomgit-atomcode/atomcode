@@ -1101,6 +1101,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                  plain OpenAI-compatible endpoint with an api_key."
             ).into(),
         Msg::StreamStalled => "slow response · esc to cancel".into(),
+        Msg::ConhostScrollHint =>
+            "Tip: in the classic Windows console, scrolling up to view history is \
+             unavailable while a task is running (scrolling resumes once it finishes). \
+             To scroll during a task, use \x1b[1;96mWindows Terminal\x1b[0m."
+                .into(),
     }
 }
 
@@ -1138,5 +1143,12 @@ mod codingplan_crypto_tests {
     fn en_upgrade_required_is_non_empty() {
         let s = en(Msg::CpUpgradeRequired);
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn en_conhost_scroll_hint_recommends_windows_terminal() {
+        let s = en(Msg::ConhostScrollHint);
+        assert!(s.contains("Windows Terminal"));
+        assert!(s.to_lowercase().contains("scroll"));
     }
 }

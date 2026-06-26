@@ -1081,6 +1081,10 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                  或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
             ).into(),
         Msg::StreamStalled => "响应较慢 · esc 取消".into(),
+        Msg::ConhostScrollHint =>
+            "提示：当前为经典 Windows 控制台，任务执行中无法上滚查看历史（任务结束后即可正常滚动）。\
+             如需在执行过程中滚动，建议改用 \x1b[1;96mWindows Terminal\x1b[0m。"
+                .into(),
     }
 }
 
@@ -1118,5 +1122,12 @@ mod codingplan_crypto_tests {
     fn zh_upgrade_required_is_non_empty() {
         let s = zh_cn(Msg::CpUpgradeRequired);
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn zh_conhost_scroll_hint_recommends_windows_terminal() {
+        let s = zh_cn(Msg::ConhostScrollHint);
+        assert!(s.contains("Windows Terminal"));
+        assert!(s.contains("滚"));
     }
 }

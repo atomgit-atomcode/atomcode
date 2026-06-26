@@ -3345,6 +3345,20 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             ));
             app.setup_hint_shown = true;
         }
+        // One-shot legacy-conhost scroll hint. The classic Windows console
+        // host snaps the viewport back to the bottom on every write, so the
+        // live footer repaint during a running task makes scrolling up to
+        // read history impossible until the task ends — a conhost limitation
+        // we don't fix in-app. Show it once here at startup (this block runs
+        // exactly once per session) and ONLY on legacy conhost; Windows
+        // Terminal and every other terminal set `legacy_conhost = false`.
+        // Gated out of the plain renderer (CI / pipe) where there's no live
+        // footer and no human to read the hint.
+        if !ctx.is_plain_renderer && ctx.caps.legacy_conhost {
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::ConhostScrollHint).into_owned(),
+            ));
+        }
         renderer.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,

@@ -978,4 +978,15 @@ pub enum Msg<'a> {
     /// dropped connection), so the text does NOT blame the network — it just notes
     /// the slow response and that esc cancels. Reassures the user it isn't frozen.
     StreamStalled,
+
+    // ── legacy Windows console (conhost) one-shot hint ──
+    /// Shown once at startup ONLY on the classic Windows console host
+    /// (`TerminalCaps::legacy_conhost`), never on Windows Terminal or any
+    /// other terminal. Legacy conhost snaps the viewport back to the bottom
+    /// on every write, so the live footer repaint during a running task
+    /// makes scrolling up to read history impossible until the task ends.
+    /// This is a conhost limitation we don't fix in-app — the hint tells the
+    /// user that scrolling resumes when the task finishes, and that Windows
+    /// Terminal has no such limitation.
+    ConhostScrollHint,
 }
