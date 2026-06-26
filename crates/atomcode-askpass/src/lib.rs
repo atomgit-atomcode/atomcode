@@ -2,6 +2,8 @@ pub mod protocol;
 pub mod cache;
 #[cfg(unix)]
 pub mod server;
+#[cfg(unix)]
+pub mod wrapper;
 
 #[cfg(unix)]
 use std::sync::OnceLock;
