@@ -221,9 +221,13 @@ impl Default for PluginConfig {
     }
 }
 
+fn default_auto_copy_on_select() -> bool {
+    !cfg!(windows)
+}
+
 /// UI section of the config — currently just the theme switch driving
 /// the TUIX colour palette. Persisted as a top-level `[ui]` table.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
     /// Colour palette to use for markdown / code-block / chrome
     /// rendering. `dark` keeps the legacy palette (designed for dark
@@ -232,6 +236,20 @@ pub struct UiConfig {
     /// configs see no behaviour change.
     #[serde(default)]
     pub theme: UiTheme,
+    /// Drag-select in the conversation auto-copies to the clipboard and
+    /// shows a notice. Opt-out via `/config`. Default off on Windows
+    /// (conhost QuickEdit conflict).
+    #[serde(default = "default_auto_copy_on_select")]
+    pub auto_copy_on_select: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            theme: UiTheme::default(),
+            auto_copy_on_select: default_auto_copy_on_select(),
+        }
+    }
 }
 
 /// UI colour palette selector.
@@ -699,6 +717,12 @@ mod tests {
             !cfg.auto_detect,
             "LSP auto_detect must default to false even if enabled flips on"
         );
+    }
+
+    #[test]
+    fn auto_copy_on_select_defaults_per_platform() {
+        let ui = UiConfig::default();
+        assert_eq!(ui.auto_copy_on_select, !cfg!(windows));
     }
 
     /// Migration: on-disk config that looks like it was auto-written by
