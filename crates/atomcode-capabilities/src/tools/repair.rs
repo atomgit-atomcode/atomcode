@@ -432,7 +432,7 @@ pub fn repair_json(s: &str) -> String {
     // Fix missing commas between key-value pairs: }" " → }", "
     // Pattern: value followed by whitespace then another key
     // e.g., {"path": "src" "depth": 2} → {"path": "src", "depth": 2}
-    let mut chars: Vec<char> = result.chars().collect();
+    let chars: Vec<char> = result.chars().collect();
     let mut insertions = Vec::new();
     let mut i = 0;
     while i < chars.len() {
