@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod custom_commands;
+pub mod overlay;
 pub mod event_loop;
 pub mod git;
 pub mod highlight;
