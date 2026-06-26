@@ -3832,18 +3832,31 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // asks for a password. Installs the PasswordModal so the user
             // can type their password without it ever touching the main
             // input buffer or history. When `askpass_rx` is `None` (the
-            // common case — Task 10 wires it only in askpass sessions) the
-            // async block resolves to `std::future::pending()` which never
-            // fires, making the arm completely inert at zero cost.
-            Some(p) = async {
+            // common case before Task 10 wires it, or after the channel
+            // closes) the async block resolves to `std::future::pending()`
+            // which never fires, making the arm completely inert at zero cost.
+            //
+            // The arm binds the raw `Option<AskpassPrompt>` so we can also
+            // handle the `None` / channel-closed case: once the sender half
+            // is dropped we set `askpass_rx = None` so subsequent iterations
+            // skip the inner `rx.recv()` and go straight back to `pending()`.
+            maybe_p = async {
                 match ctx.askpass_rx.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
             } => {
-                install_password_modal(&mut app, p.prompt, p.reply);
-                if let Some(m) = app.active_modal.as_ref() {
-                    m.draw(&app.buf, &app.state, &ctx, renderer);
+                match maybe_p {
+                    Some(p) => {
+                        install_password_modal(&mut app, p.prompt, p.reply);
+                        if let Some(m) = app.active_modal.as_ref() {
+                            m.draw(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    None => {
+                        // Channel closed — degrade back to the inert pending() path.
+                        ctx.askpass_rx = None;
+                    }
                 }
             }
 

@@ -629,6 +629,52 @@ pub async fn run(
         agent_client.clone(),
     );
 
+    // ── Askpass server startup (unix-only, TUI path) ────────────────────────
+    // Start the Unix-socket askpass server so that child processes (sudo, ssh)
+    // can forward password prompts to the TUI instead of reading from the tty.
+    // On failure we degrade gracefully: askpass simply isn't available, sudo
+    // will use its own fallback and the TUI will not crash.
+    //
+    // The guard MUST outlive run_loop — its Drop removes the socket file.
+    // We bind it in the outer `run()` scope and explicitly reference it after
+    // `run_loop` returns so the compiler does not drop it early.
+    #[cfg(unix)]
+    let _askpass_guard: Option<atomcode_askpass::server::AskpassServerGuard>;
+    #[cfg(unix)]
+    let askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_askpass::server::AskpassPrompt>>;
+
+    #[cfg(unix)]
+    {
+        let cache = std::sync::Arc::new(
+            atomcode_askpass::cache::PasswordCache::new(std::time::Duration::from_secs(300)),
+        );
+        match atomcode_askpass::server::start(cache) {
+            Ok((mut env, rx, guard)) => {
+                // Write the wrapper script next to the socket.  On failure,
+                // degrade (no askpass) rather than crashing the TUI.
+                let script_result = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| {
+                        env.sock_path
+                            .parent()
+                            .and_then(|dir| {
+                                atomcode_askpass::wrapper::write_askpass_script(&exe, dir).ok()
+                            })
+                    });
+                if let Some(script) = script_result {
+                    env.askpass_script = script;
+                    atomcode_askpass::set_env(env);
+                }
+                askpass_rx = Some(rx);
+                _askpass_guard = Some(guard);
+            }
+            Err(_) => {
+                askpass_rx = None;
+                _askpass_guard = None;
+            }
+        }
+    }
+
     let file_index_root = working_dir.clone();
     let ctx = LoopCtx {
         config,
@@ -694,9 +740,8 @@ pub async fn run(
         sync_forwarder: None,
         reasoning_effort: None,
         transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        // Task 10 will wire the real value when an askpass-capable session is started.
         #[cfg(unix)]
-        askpass_rx: None,
+        askpass_rx,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current
