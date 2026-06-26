@@ -20,7 +20,7 @@ mod global_tests {
     #[test]
     fn set_then_current_returns_env() {
         assert!(current_env().is_none());
-        set_env(server::AskpassEnv { sock_path: "/tmp/x.sock".into(), token: "tok".into() });
+        set_env(server::AskpassEnv { sock_path: "/tmp/x.sock".into(), token: "tok".into(), askpass_script: "/tmp/askpass.sh".into() });
         let e = current_env().expect("set");
         assert_eq!(e.token, "tok");
     }

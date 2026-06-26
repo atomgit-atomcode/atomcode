@@ -250,6 +250,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "atomcode-askpass",
  "atomcode-kernel",
  "base64",
  "bytes",

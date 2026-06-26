@@ -20,6 +20,9 @@ pub struct AskpassPrompt {
 pub struct AskpassEnv {
     pub sock_path: PathBuf,
     pub token: String,
+    /// Path to the wrapper script that sudo/ssh invoke as their ASKPASS helper.
+    /// Populated by Task 10 before calling `set_env`; empty placeholder until then.
+    pub askpass_script: PathBuf,
 }
 
 /// Removes the socket file when dropped.
@@ -179,7 +182,7 @@ pub fn start(
     let (tx, rx) = tokio::sync::mpsc::channel::<AskpassPrompt>(32);
 
     let guard = AskpassServerGuard { sock_path: sock_path.clone() };
-    let env = AskpassEnv { sock_path, token: token.clone() };
+    let env = AskpassEnv { sock_path, token: token.clone(), askpass_script: std::path::PathBuf::new() };
 
     tokio::spawn(async move {
         loop {

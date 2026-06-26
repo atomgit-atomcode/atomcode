@@ -120,6 +120,10 @@ session = ["dep:dirs", "dep:chrono"]
 # remember/forget tools. Opt-in (NOT default).
 memory = ["dep:dirs"]
 
+[target.'cfg(unix)'.dependencies]
+# Askpass: inject SUDO_ASKPASS/SSH_ASKPASS into bash children (unix only).
+atomcode-askpass = { path = "../atomcode-askpass" }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }
 # Local mock HTTP server for deterministic provider tests (retry / multi-round).

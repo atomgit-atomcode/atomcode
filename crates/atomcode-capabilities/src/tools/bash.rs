@@ -83,6 +83,28 @@ impl Tool for BashTool {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true); // dropping the wait future (cancel/timeout) SIGKILLs the child
 
+        // Unix only: detach from controlling tty (setsid) so sudo/ssh don't fight the TUI
+        // for /dev/tty, and inject the askpass env vars so they use our password prompt.
+        #[cfg(unix)]
+        {
+            if let Some(env) = atomcode_askpass::current_env() {
+                apply_askpass_env(&mut cmd, env);
+            }
+            // Mirror exactly how atomcode-core/src/tool/bash.rs attaches setsid:
+            // call the setsid(2) syscall in a pre_exec hook so every bash child gets a
+            // new session/pgroup and loses the controlling tty. Failure (already a
+            // pgroup leader) is harmless — ignore the return value.
+            unsafe {
+                cmd.pre_exec(|| {
+                    extern "C" {
+                        fn setsid() -> i32;
+                    }
+                    setsid();
+                    Ok(())
+                });
+            }
+        }
+
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return err(format!("bash: failed to spawn shell: {e}")),
@@ -137,6 +159,17 @@ fn shell_tool_description(is_windows: bool) -> &'static str {
     } else {
         base!()
     }
+}
+
+/// Set the five askpass/socket env vars on the command so sudo/ssh use our TUI
+/// password prompt instead of fighting the TUI for /dev/tty.
+#[cfg(unix)]
+fn apply_askpass_env(cmd: &mut tokio::process::Command, env: &atomcode_askpass::server::AskpassEnv) {
+    cmd.env("SUDO_ASKPASS", &env.askpass_script)
+        .env("SSH_ASKPASS", &env.askpass_script)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("ATOMCODE_ASKPASS_SOCK", &env.sock_path)
+        .env("ATOMCODE_ASKPASS_TOKEN", &env.token);
 }
 
 #[cfg(unix)]
@@ -605,6 +638,23 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn apply_askpass_env_sets_sudo_ssh_vars() {
+    use atomcode_askpass::server::AskpassEnv;
+    let env = AskpassEnv { sock_path: "/run/x.sock".into(), token: "tok".into(), askpass_script: "/run/askpass.sh".into() };
+    let mut cmd = tokio::process::Command::new("bash");
+    apply_askpass_env(&mut cmd, &env);
+    // std Command exposes get_envs(): assert the 5 vars are present with expected values.
+    let got: std::collections::HashMap<_,_> = cmd.as_std().get_envs()
+        .filter_map(|(k,v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string()))).collect();
+    assert_eq!(got.get("SUDO_ASKPASS").map(String::as_str), Some("/run/askpass.sh"));
+    assert_eq!(got.get("SSH_ASKPASS").map(String::as_str), Some("/run/askpass.sh"));
+    assert_eq!(got.get("SSH_ASKPASS_REQUIRE").map(String::as_str), Some("force"));
+    assert_eq!(got.get("ATOMCODE_ASKPASS_SOCK").map(String::as_str), Some("/run/x.sock"));
+    assert_eq!(got.get("ATOMCODE_ASKPASS_TOKEN").map(String::as_str), Some("tok"));
 }
 
 #[cfg(test)]
