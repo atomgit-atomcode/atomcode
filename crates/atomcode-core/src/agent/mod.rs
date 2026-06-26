@@ -2143,15 +2143,21 @@ impl AgentLoop {
         }
 
         while self.goal.active && !self.goal.is_evaluator_exhausted() {
-            // Carry over this turn's edits into the goal-level cumulative set
-            // so the evaluator's summary shows progress across many rounds.
-            for f in self.files_edited_this_turn.iter() {
-                if !self.goal_files_edited.contains(f) {
-                    self.goal_files_edited.push(f.clone());
-                }
+            if let Some(why) = self.goal.cap_reached() {
+                self.goal.active = false;
+                self.emit_goal_update(false, Some(format!("stopped: {why} — goal not met")));
+                break;
+            }
+            if self.goal.is_unproductive_exhausted() {
+                self.goal.active = false;
+                self.emit_goal_update(false, Some("stopped: too many failed rounds".into()));
+                break;
             }
 
-            let summary = self.summarize_recent_turns_for_goal();
+            let summary = goal::summarize_for_goal(
+                &self.conversation.messages,
+                self.goal.last_eval_reason.as_deref(),
+            );
 
             // Evaluator call. Pass our cancel_token so Esc fires immediately
             // rather than waiting the full 30s evaluator timeout (CR C5).
@@ -2225,10 +2231,8 @@ impl AgentLoop {
                     // ("stop"/"cancel"/"wrong") in the literal goal text don't
                     // trip discipline injections meant for real user feedback
                     // (CR M6).
-                    self.conversation.add_user_message(&format!(
-                        "Goal not yet met: {}\n\nContinue working toward this goal:\n```\n{}\n```",
-                        reason, self.goal.condition
-                    ));
+                    let msg = goal::goal_continuation_message(&reason, &self.goal.condition);
+                    self.conversation.add_user_message(&msg);
 
                     // Reset per-turn state for the next iteration.
                     self.turn_count = 0;
@@ -2240,7 +2244,11 @@ impl AgentLoop {
                     self.files_read_this_turn.clear();
 
                     stop_reason = self.run_turn_loop().await;
-
+                    match stop_reason {
+                        TurnStopReason::Natural => self.goal.note_productive(),
+                        TurnStopReason::Cancelled => {} // handled just below
+                        _ => self.goal.note_unproductive(),
+                    }
                     if matches!(stop_reason, TurnStopReason::Cancelled) {
                         self.finalize_goal_cancelled();
                         return;
@@ -3647,84 +3655,6 @@ impl AgentLoop {
         }
         self.goal.clear();
         self.emit_goal_update(false, Some("cancelled by user".to_owned()));
-    }
-
-    /// Compact summary of recent agent work for the goal evaluator. Includes:
-    /// - last 5 assistant text responses (truncated to ~200 chars), and
-    /// - cumulative facts (file edits, last evaluator reason) so evaluators
-    ///   see *progress over time* rather than a single-frame snapshot. At
-    ///   round 20 the evaluator was previously blind to "we already passed
-    ///   12/14 tests" — the cumulative summary fixes that (see CR M13).
-    fn summarize_recent_turns_for_goal(&self) -> String {
-        use crate::conversation::message::{MessageContent, Role};
-
-        let mut sections: Vec<String> = Vec::new();
-
-        // Cumulative facts across all rounds of this /goal session. The
-        // agent's `files_edited_this_turn` is reset at every turn boundary,
-        // so we maintain a separate `goal_files_edited` set on the wrapper.
-        // Round-over-round visibility: at round 20 the evaluator can see
-        // "we already wrote tests/auth.rs in round 3" instead of just the
-        // current frame's chatter (see CR M13).
-        if !self.goal_files_edited.is_empty() {
-            let head: Vec<&String> = self.goal_files_edited.iter().take(20).collect();
-            let more = self.goal_files_edited.len().saturating_sub(head.len());
-            let extra = if more > 0 {
-                format!(" (+{more} more)")
-            } else {
-                String::new()
-            };
-            sections.push(format!(
-                "Files edited this goal: {}{}",
-                head.iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                extra,
-            ));
-        }
-
-        if let Some(reason) = self.goal.last_eval_reason.as_deref() {
-            sections.push(format!(
-                "Previous round verdict (round {}): {}",
-                self.goal.round, reason
-            ));
-        }
-
-        // Recent assistant replies — newest first scan, drop empties, cap 5.
-        let mut recent: Vec<String> = Vec::new();
-        for msg in self.conversation.messages.iter().rev() {
-            if msg.role != Role::Assistant {
-                continue;
-            }
-            let text = match &msg.content {
-                MessageContent::Text(t) => t.clone(),
-                MessageContent::AssistantWithToolCalls { text, .. } => {
-                    text.clone().unwrap_or_default()
-                }
-                _ => continue,
-            };
-            if text.trim().is_empty() {
-                continue;
-            }
-            recent.push(text.chars().take(200).collect());
-            if recent.len() >= 5 {
-                break;
-            }
-        }
-        recent.reverse();
-        if !recent.is_empty() {
-            sections.push(format!(
-                "Recent assistant replies (oldest → newest):\n{}",
-                recent.join("\n---\n")
-            ));
-        }
-
-        if sections.is_empty() {
-            "(no agent work yet)".to_owned()
-        } else {
-            sections.join("\n\n")
-        }
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
