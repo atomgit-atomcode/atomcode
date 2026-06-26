@@ -1305,6 +1305,9 @@ fn apply_reload_provider(
     cfg.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
         provider.reasoning_effort.as_deref(),
     );
+    // Per-call output cap: pick up the (possibly changed) `max_tokens` so the respawned
+    // agent honors it; `None` clears it so build_provider's fallback applies.
+    cfg.chat_options.max_tokens = provider.max_tokens.map(|m| m as u32);
     // A /model swap can change the adapter kind + per-provider knobs entirely — refresh
     // them all so the rebuilt provider matches the new config.
     cfg.provider_type = provider.provider_type.clone();
@@ -1362,5 +1365,40 @@ mod tests {
         assert_eq!(cfg.thinking_enabled, Some(true));
         assert_eq!(cfg.thinking_type.as_deref(), Some("enabled"));
         assert_eq!(cfg.thinking_keep.as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn reload_provider_threads_max_tokens() {
+        // A /model swap to a provider with a configured `max_tokens` must update the per-call
+        // ChatOptions cap; switching to one without it clears the cap (fallback then applies).
+        let mut cfg = CodingAgentConfig::new("k", "https://e.example.com/v1", "m", "/tmp");
+        let mut provider = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: None,
+            model: "m".into(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 64_000,
+            max_tokens: Some(9_000),
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        };
+        apply_reload_provider(&mut cfg, &provider);
+        assert_eq!(
+            cfg.chat_options.max_tokens,
+            Some(9_000),
+            "/model swap must pick up the new provider's max_tokens"
+        );
+
+        provider.max_tokens = None;
+        apply_reload_provider(&mut cfg, &provider);
+        assert_eq!(cfg.chat_options.max_tokens, None, "unset must clear the per-call cap");
     }
 }

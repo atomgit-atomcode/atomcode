@@ -57,6 +57,10 @@ pub struct ShellConfig {
     pub interactive: bool,
     /// LSP diagnostics policy mapped from the driver's `[lsp]` config (off by default).
     pub lsp: LspSettings,
+    /// User-configured per-response output cap (`[providers.*] max_tokens`). `None` ⇒ the
+    /// adapter falls back to [`default_max_tokens`] of the context window. Threaded into the
+    /// per-call `ChatOptions` (which wins over the fallback).
+    pub max_tokens: Option<u32>,
 }
 
 /// Map core's `[lsp]` config DTO to the neutral [`LspSettings`] the coding/capabilities
@@ -118,6 +122,7 @@ impl ShellConfig {
             dangerously_skip_permissions,
             interactive,
             lsp: lsp_settings_from(lsp),
+            max_tokens: p.and_then(|p| p.max_tokens).map(|m| m as u32),
         }
     }
 }
@@ -141,6 +146,10 @@ pub fn coding_config(cfg: &ShellConfig) -> CodingAgentConfig {
     coding_cfg.thinking_enabled = cfg.thinking_enabled;
     coding_cfg.thinking_type = cfg.thinking_type.clone();
     coding_cfg.thinking_keep = cfg.thinking_keep.clone();
+    // Per-call output cap from the user's `[providers.*] max_tokens`. The provider adapter
+    // does `options.max_tokens.or(cfg.max_tokens)`, so this wins over the build_provider
+    // fallback; `None` here ⇒ the fallback applies.
+    coding_cfg.chat_options.max_tokens = cfg.max_tokens;
     // Interactive drivers PARK approvals (a present human must not be auto-denied for
     // thinking too long); headless keeps the configured fail-closed timeout.
     if cfg.interactive {
@@ -148,6 +157,15 @@ pub fn coding_config(cfg: &ShellConfig) -> CodingAgentConfig {
     }
     coding_cfg.lsp = cfg.lsp.clone();
     coding_cfg
+}
+
+/// Fallback per-response output cap when the user sets no `[providers.*] max_tokens`.
+/// Mirrors the legacy v1 engine + the deleted bridge: a quarter of the context window,
+/// clamped to `[8_000, 16_384]`. Without it, OpenAI-compat/gateway requests send NO
+/// `max_tokens` (the gateway then imposes its own small hidden cap → frequent
+/// `finish_reason=length` truncation) and Anthropic falls to its flat 4096 default.
+fn default_max_tokens(context_window: u32) -> u32 {
+    (context_window / 4).clamp(8_000, 16_384)
 }
 
 pub fn build_provider(
@@ -165,6 +183,9 @@ pub fn build_provider(
         "claude" | "anthropic" => {
             let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             ac.context_window = cfg.context_window;
+            // Fallback output cap (the per-call `chat_options.max_tokens` still wins). Replaces
+            // the flat 4096 default so a large context window gets a proportionate cap.
+            ac.max_tokens = default_max_tokens(cfg.context_window);
             // `/think on` → adaptive extended thinking. (v2 uses adaptive, so v1's
             // thinking_budget has no direct mapping — intentionally dropped.)
             ac.thinking = cfg.thinking_enabled.unwrap_or(false);
@@ -176,6 +197,8 @@ pub fn build_provider(
             let mut oc = OllamaConfig::new(&cfg.base_url, &cfg.model);
             oc.api_key = cfg.api_key.clone();
             oc.context_window = cfg.context_window;
+            // Fallback `num_predict` cap (the per-call `chat_options.max_tokens` still wins).
+            oc.max_tokens = Some(default_max_tokens(cfg.context_window));
             oc.think = cfg.thinking_enabled.unwrap_or(false);
             Ok(Arc::new(
                 OllamaProvider::new(oc).map_err(|e| anyhow::anyhow!(e.message))?,
@@ -185,6 +208,9 @@ pub fn build_provider(
         _ => {
             let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             pc.context_window = cfg.context_window;
+            // Fallback output cap so the gateway can't impose its own small hidden cap (the
+            // per-call `chat_options.max_tokens` still wins via `options.or(cfg)`).
+            pc.max_tokens = Some(default_max_tokens(cfg.context_window));
             // Honor the provider's `reasoning_history` override; unset ⇒ leave `None` so the
             // adapter auto-detects by model. A typo fails fast (parity with the legacy engine).
             pc.reasoning_policy = ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
@@ -224,7 +250,7 @@ pub fn provider_factory() -> atomcode_coding::ProviderFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_provider, coding_config, ShellConfig};
+    use super::{build_provider, coding_config, default_max_tokens, ShellConfig};
     use atomcode_coding::CodingAgentConfig;
 
     #[test]
@@ -246,6 +272,7 @@ mod tests {
             dangerously_skip_permissions: false,
             interactive: true,
             lsp: Default::default(),
+            max_tokens: None,
         };
         let cc = coding_config(&shell_cfg);
         assert_eq!(cc.provider_type, "claude");
@@ -308,6 +335,43 @@ mod tests {
         assert!(res.is_err(), "a reasoning_history typo must fail provider construction");
         let err = res.err().unwrap().to_string();
         assert!(err.contains("reasoning_history"), "expected a reasoning_history error, got: {err}");
+    }
+
+    #[test]
+    fn default_max_tokens_is_quarter_context_clamped() {
+        // Restores the bridge's per-provider output-cap fallback: ctx/4 clamped to [8k, 16384].
+        assert_eq!(default_max_tokens(0), 8_000); // tiny context → floor
+        assert_eq!(default_max_tokens(40_000), 10_000); // ctx/4 within range
+        assert_eq!(default_max_tokens(1_000_000), 16_384); // huge context → ceiling
+    }
+
+    #[test]
+    fn max_tokens_flows_from_provider_to_chat_options() {
+        // A user-configured per-provider `max_tokens` must reach the per-call ChatOptions —
+        // it was dropped in the native rewrite, capping replies at the adapter default.
+        let mut pc = sample_provider();
+        pc.max_tokens = Some(12_000);
+        let lsp = atomcode_core::config::LspConfig::default();
+        let shell =
+            ShellConfig::from_provider(Some(&pc), &lsp, std::path::Path::new("/w"), None, false, false);
+        assert_eq!(shell.max_tokens, Some(12_000), "from_provider must carry provider.max_tokens");
+        let cc = coding_config(&shell);
+        assert_eq!(
+            cc.chat_options.max_tokens,
+            Some(12_000),
+            "coding_config must thread it into ChatOptions"
+        );
+    }
+
+    #[test]
+    fn max_tokens_unset_leaves_chat_options_none() {
+        // Unset ⇒ no per-call cap; the adapter's `default_max_tokens` fallback then applies.
+        let pc = sample_provider(); // max_tokens: None
+        let lsp = atomcode_core::config::LspConfig::default();
+        let shell =
+            ShellConfig::from_provider(Some(&pc), &lsp, std::path::Path::new("/w"), None, false, false);
+        assert_eq!(shell.max_tokens, None);
+        assert_eq!(coding_config(&shell).chat_options.max_tokens, None);
     }
 
     fn sample_provider() -> atomcode_core::config::provider::ProviderConfig {
