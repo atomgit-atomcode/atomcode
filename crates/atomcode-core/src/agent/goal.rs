@@ -1,5 +1,7 @@
 use std::time::Instant;
 
+use crate::conversation::message::{Message, MessageContent, Role};
+
 /// Consecutive evaluator failures before the wrapper gives up on the goal.
 pub const MAX_EVAL_FAILURES: u32 = 3;
 
@@ -36,6 +38,114 @@ pub enum GoalResult {
     /// gives up after `MAX_EVAL_FAILURES`. Holding `anyhow::Error` preserves
     /// the underlying source chain for diagnostics.
     Error(anyhow::Error),
+}
+
+/// Build the evaluator's view of recent work. Unlike a prose-only summary, this
+/// folds in the ACTUAL signals the judge needs to avoid rubber-stamping the
+/// model's self-report: which files were edited and the most recent tool
+/// results (failures first). Used by both the v1 wrapper and the v2 bridge.
+pub fn summarize_for_goal(messages: &[Message], prev_verdict: Option<&str>) -> String {
+    const MAX_REPLIES: usize = 5;
+    const MAX_TOOL_RESULTS: usize = 5;
+    const REPLY_CHARS: usize = 200;
+    const TOOL_CHARS: usize = 240;
+
+    let mut sections: Vec<String> = Vec::new();
+
+    // 1) Files edited (scan assistant tool_calls; lenient file_path extraction).
+    let mut files: Vec<String> = Vec::new();
+    for msg in messages {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+            for tc in tool_calls {
+                if matches!(
+                    tc.name.as_str(),
+                    "write_file" | "edit_file" | "search_replace" | "parallel_edit" | "create_file"
+                ) {
+                    if let Some(p) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        .ok()
+                        .and_then(|v| v.get("file_path").and_then(|x| x.as_str()).map(str::to_owned))
+                    {
+                        if !files.contains(&p) {
+                            files.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !files.is_empty() {
+        let head: Vec<&str> = files.iter().take(20).map(String::as_str).collect();
+        let more = files.len().saturating_sub(head.len());
+        let extra = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+        sections.push(format!("Files edited this goal: {}{}", head.join(", "), extra));
+    }
+
+    if let Some(v) = prev_verdict {
+        sections.push(format!("Previous round verdict: {v}"));
+    }
+
+    // 2) Recent tool results — newest first, failures kept preferentially.
+    let mut results: Vec<String> = Vec::new();
+    for msg in messages.iter().rev() {
+        if !msg.is_tool_result() {
+            continue;
+        }
+        let ok = msg.tool_result_success().unwrap_or(true);
+        let out = msg.tool_result_output().unwrap_or("");
+        let snippet: String = out.chars().take(TOOL_CHARS).collect();
+        results.push(format!("- [{}] {}", if ok { "ok" } else { "FAILED" }, snippet.replace('\n', " ")));
+        if results.len() >= MAX_TOOL_RESULTS {
+            break;
+        }
+    }
+    results.reverse();
+    if !results.is_empty() {
+        sections.push(format!("Recent tool results (oldest → newest):\n{}", results.join("\n")));
+    }
+
+    // 3) Recent assistant replies (prose self-report — kept, but no longer the
+    // only evidence).
+    let mut recent: Vec<String> = Vec::new();
+    for msg in messages.iter().rev() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        let text = match &msg.content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::AssistantWithToolCalls { text, .. } => text.clone().unwrap_or_default(),
+            _ => continue,
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        recent.push(text.chars().take(REPLY_CHARS).collect());
+        if recent.len() >= MAX_REPLIES {
+            break;
+        }
+    }
+    recent.reverse();
+    if !recent.is_empty() {
+        sections.push(format!("Recent assistant replies (oldest → newest):\n{}", recent.join("\n---\n")));
+    }
+
+    if sections.is_empty() {
+        "(no agent work yet)".to_owned()
+    } else {
+        sections.join("\n\n")
+    }
+}
+
+/// The prompt re-injected to continue an unmet goal. Unlike the old "Continue
+/// working toward this goal" wording, this explicitly tells the model NOT to
+/// pause for user input — so a clarifying-question turn doesn't stall the loop.
+pub fn goal_continuation_message(verdict: &str, condition: &str) -> String {
+    format!(
+        "Goal not yet met: {verdict}\n\n\
+         Keep working toward this goal autonomously. Do NOT ask the user questions \
+         or wait for input — make reasonable assumptions and proceed; when genuinely \
+         blocked, pick the most sensible option and continue.\n\n\
+         Goal:\n```\n{condition}\n```"
+    )
 }
 
 impl GoalState {
@@ -153,6 +263,48 @@ impl Default for GoalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::message::{Message, MessageContent, Role};
+    use crate::tool::{ToolCall, ToolResult};
+
+    fn asst_with_call(text: &str, name: &str, args: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: Some(text.into()),
+                tool_calls: vec![ToolCall { id: "t1".into(), name: name.into(), arguments: args.into() }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+        }
+    }
+    fn tool_result(call_id: &str, output: &str, success: bool) -> Message {
+        Message { role: Role::Tool, content: MessageContent::ToolResult(ToolResult {
+            call_id: call_id.into(), output: output.into(), success }), synthetic: false }
+    }
+
+    #[test]
+    fn summary_includes_edited_files_and_failed_tool_output() {
+        let msgs = vec![
+            asst_with_call("writing the file", "write_file", r#"{"file_path":"src/app.rs","content":"x"}"#),
+            tool_result("t1", "wrote 1 line", true),
+            asst_with_call("running tests, all done!", "bash", r#"{"command":"cargo test"}"#),
+            tool_result("t1", "test result: FAILED. 2 passed; 3 failed", false),
+        ];
+        let s = summarize_for_goal(&msgs, Some("no — keep going"));
+        assert!(s.contains("src/app.rs"), "edited file missing: {s}");
+        assert!(s.contains("FAILED") || s.contains("3 failed"), "failure signal missing: {s}");
+        assert!(s.contains("all done"), "assistant prose missing: {s}");
+        assert!(s.contains("no — keep going"), "prev verdict missing: {s}");
+    }
+
+    #[test]
+    fn continuation_message_forbids_asking_user() {
+        let m = goal_continuation_message("no — tests failing", "make all tests pass");
+        assert!(m.to_lowercase().contains("do not ask") || m.contains("不要"), "must discourage questions: {m}");
+        assert!(m.contains("make all tests pass"), "must restate the goal: {m}");
+        assert!(m.contains("tests failing"), "must include the verdict: {m}");
+    }
 
     #[test]
     fn new_sets_active_and_resets_counters() {
