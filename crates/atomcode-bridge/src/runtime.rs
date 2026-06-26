@@ -13,7 +13,7 @@ use atomcode_coding::{
 use atomcode_core::agent::{
     AgentClient, AgentCommand as CoreCmd, AgentEvent as CoreEv, AgentPhase, TurnStopReason,
 };
-use atomcode_core::agent::goal::{GoalResult, GoalState};
+use atomcode_core::agent::goal::{goal_continuation_message, summarize_for_goal, GoalResult, GoalState};
 use atomcode_core::agent::goal_evaluator::{EvalOutcome, GoalEvaluator};
 use atomcode_core::conversation::ConversationSnapshot;
 use tokio_util::sync::CancellationToken;
@@ -462,9 +462,7 @@ impl Bridge {
                 };
                 let ev = goal_update_ev(self.goal.as_ref().unwrap());
                 self.emit(ev);
-                let text = format!(
-                    "Goal not yet met: {verdict}\n\nContinue working toward this goal:\n```\n{cond}\n```"
-                );
+                let text = goal_continuation_message(&verdict, &cond);
                 self.start_turn_stats();
                 let _ = self.handle.commands.send(KCmd::SendMessage { text, images: vec![] });
             }
@@ -496,7 +494,7 @@ impl Bridge {
                     }
                     let ev = goal_update_ev(self.goal.as_ref().unwrap());
                     self.emit(ev);
-                    let text = format!("Continue working toward this goal:\n```\n{cond}\n```");
+                    let text = goal_continuation_message("(evaluator error; retrying)", &cond);
                     self.start_turn_stats();
                     let _ = self.handle.commands.send(KCmd::SendMessage { text, images: vec![] });
                 }
@@ -951,7 +949,11 @@ impl Bridge {
                 } else {
                     // Fresh cancel token per goal so a prior goal's cancel can't kill this one.
                     self.goal_cancel = CancellationToken::new();
-                    let state = GoalState::new(condition);
+                    let max_rounds = (self.coding_cfg.goal_max_rounds != 0)
+                        .then_some(self.coding_cfg.goal_max_rounds);
+                    let max_duration = (self.coding_cfg.goal_max_duration_secs != 0)
+                        .then(|| Duration::from_secs(self.coding_cfg.goal_max_duration_secs));
+                    let state = GoalState::new_with_limits(condition, max_rounds, max_duration);
                     let ev = goal_update_ev(&state);
                     self.emit(ev);
                     self.goal = Some(state);
@@ -1426,11 +1428,58 @@ impl Bridge {
                     // Spawn the evaluator OFF this loop (so Cancel stays responsive);
                     // the turn is held open until `on_goal_eval_result` decides to
                     // continue (inject) or finish.
-                    if matches!(reason, StopReason::Stopped)
-                        && self.goal.as_ref().map_or(false, |g| g.active)
-                    {
-                        self.spawn_goal_eval(reason, messages);
-                        return;
+                    if self.goal.as_ref().map_or(false, |g| g.active) {
+                        let (cap, exhausted) = {
+                            let g = self.goal.as_ref().unwrap();
+                            (g.cap_reached(), g.is_unproductive_exhausted())
+                        };
+                        match goal_turn_disposition(reason.clone(), cap, exhausted) {
+                            GoalDisposition::Evaluate => {
+                                if let Some(g) = self.goal.as_mut() {
+                                    g.note_productive();
+                                }
+                                self.spawn_goal_eval(reason, messages);
+                                return;
+                            }
+                            GoalDisposition::ReinjectNoEval => {
+                                let cond = {
+                                    let g = self.goal.as_mut().unwrap();
+                                    g.note_unproductive();
+                                    g.round += 1;
+                                    g.last_eval_reason =
+                                        Some(format!("round ended early ({reason:?}), retrying"));
+                                    g.condition.clone()
+                                };
+                                self.emit(goal_update_ev(self.goal.as_ref().unwrap()));
+                                let text = goal_continuation_message(
+                                    "(previous round ended early; retrying)",
+                                    &cond,
+                                );
+                                self.start_turn_stats();
+                                let _ = self
+                                    .handle
+                                    .commands
+                                    .send(KCmd::SendMessage { text, images: vec![] });
+                                return;
+                            }
+                            GoalDisposition::StopGoal(why) => {
+                                if let Some(g) = self.goal.as_mut() {
+                                    g.active = false;
+                                    g.last_eval_reason = Some(format!("stopped: {why}"));
+                                }
+                                if let Some(g) = self.goal.take() {
+                                    self.emit(goal_update_ev(&g));
+                                }
+                                self.emit(CoreEv::Warning(format!(
+                                    "goal stopped: {why} — goal not met; run /goal again to continue"
+                                )));
+                                self.finish_turn(reason, messages);
+                                return;
+                            }
+                            GoalDisposition::EndTurn => {
+                                // fall through to finish_turn below
+                            }
+                        }
                     }
                     self.finish_turn(reason, messages);
                 } else if let Some(nth) = self.pending_undo.take() {
@@ -1543,67 +1592,62 @@ fn goal_update_ev(g: &GoalState) -> CoreEv {
     }
 }
 
-/// Build the goal evaluator provider (reused by v1's `GoalEvaluator`) from config:
-/// the `evaluator_provider` entry if set, else the default provider. `None` if the
-/// config can't load or the provider can't be constructed. Minimal port: no
-/// fallback to the active /chat model — set `evaluator_provider` to pin a fast
-/// judge, exactly as the `/goal` help documents.
+/// Pure policy for what to do when a goal-active turn ends. Extracted so the
+/// continue-vs-stop decision is unit-tested without a live Runtime.
+#[derive(Debug, PartialEq)]
+enum GoalDisposition {
+    /// Model did a round of work and stopped — run the evaluator.
+    Evaluate,
+    /// Recoverable transient failure — re-inject a continuation WITHOUT spending
+    /// an evaluator call (the round clearly didn't complete the goal).
+    ReinjectNoEval,
+    /// A cap (round/time) or the unproductive fuse tripped — stop with a notice.
+    StopGoal(&'static str),
+    /// User/hard terminal — end the turn and the goal.
+    EndTurn,
+}
+
+fn goal_turn_disposition(
+    reason: StopReason,
+    cap: Option<&'static str>,
+    unproductive_exhausted: bool,
+) -> GoalDisposition {
+    if let Some(why) = cap {
+        return GoalDisposition::StopGoal(why);
+    }
+    if unproductive_exhausted {
+        return GoalDisposition::StopGoal("too many failed rounds");
+    }
+    match reason {
+        StopReason::Stopped | StopReason::MaxContinuations => GoalDisposition::Evaluate,
+        StopReason::Timeout | StopReason::ProviderError | StopReason::MaxRounds => {
+            GoalDisposition::ReinjectNoEval
+        }
+        StopReason::Cancelled | StopReason::PromptRejected => GoalDisposition::EndTurn,
+        _ => GoalDisposition::EndTurn,
+    }
+}
+
+/// Build the goal evaluator provider from config. Prefers the configured
+/// `evaluator_provider`; on ANY failure falls back to the default provider so
+/// `/goal` always arms when `/chat` works. Only a totally unloadable config disarms.
 fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
     let config =
         atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
-    let key = config
-        .evaluator_provider
-        .as_ref()
-        .unwrap_or(&config.default_provider);
-    let pcfg = config.providers.get(key)?;
-    let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
-    Some(Arc::from(provider))
-}
-
-/// Compact the conversation into a plain-text summary for the evaluator, mirroring
-/// v1's `summarize_recent_turns_for_goal`: the previous round's verdict (so the
-/// judge sees what it asked for last time) plus the last 5 non-empty assistant
-/// replies (200 chars each, oldest → newest) — the agent's own account of what it
-/// did, which is the signal the evaluator rules on.
-fn summarize_for_goal(
-    messages: &[atomcode_core::conversation::message::Message],
-    prev_verdict: Option<&str>,
-) -> String {
-    use atomcode_core::conversation::message::{MessageContent, Role};
-    let mut sections: Vec<String> = Vec::new();
-    if let Some(v) = prev_verdict {
-        sections.push(format!("Previous round verdict: {v}"));
-    }
-    let mut recent: Vec<String> = Vec::new();
-    for msg in messages.iter().rev() {
-        if msg.role != Role::Assistant {
-            continue;
-        }
-        let text = match &msg.content {
-            MessageContent::Text(t) => t.clone(),
-            MessageContent::AssistantWithToolCalls { text, .. } => text.clone().unwrap_or_default(),
-            _ => continue,
-        };
-        if text.trim().is_empty() {
-            continue;
-        }
-        recent.push(text.chars().take(200).collect());
-        if recent.len() >= 5 {
-            break;
+    let try_key = |key: &str| -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
+        let pcfg = config.providers.get(key)?;
+        let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
+        Some(Arc::from(provider))
+    };
+    // Prefer the configured evaluator_provider; on ANY failure fall back to the
+    // default provider so /goal always arms (a working /chat config ⇒ a working
+    // judge). Only a totally unloadable config disarms.
+    if let Some(ek) = config.evaluator_provider.as_ref() {
+        if let Some(p) = try_key(ek) {
+            return Some(p);
         }
     }
-    recent.reverse();
-    if !recent.is_empty() {
-        sections.push(format!(
-            "Recent assistant replies (oldest → newest):\n{}",
-            recent.join("\n---\n")
-        ));
-    }
-    if sections.is_empty() {
-        "(no agent work yet)".to_owned()
-    } else {
-        sections.join("\n\n")
-    }
+    try_key(&config.default_provider)
 }
 
 /// Escape `<`/`>`/`&` so command output can't forge the `<bash-*>` tags the model
@@ -2423,5 +2467,27 @@ mod cancel_tests {
     fn nothing_to_release_when_no_approval_is_parked() {
         let mut pending: Option<(u64, String)> = None;
         assert!(take_deny_cmd(&mut pending).is_none());
+    }
+}
+
+#[cfg(test)]
+mod goal_disposition_tests {
+    use super::{goal_turn_disposition, GoalDisposition};
+
+    #[test]
+    fn goal_disposition_classifies_stop_reasons() {
+        use atomcode_kernel::event::StopReason::*;
+        // recoverable, model worked → evaluate
+        assert!(matches!(goal_turn_disposition(Stopped, None, false), GoalDisposition::Evaluate));
+        assert!(matches!(goal_turn_disposition(MaxContinuations, None, false), GoalDisposition::Evaluate));
+        // recoverable transient failure → reinject without an eval call
+        assert!(matches!(goal_turn_disposition(Timeout, None, false), GoalDisposition::ReinjectNoEval));
+        assert!(matches!(goal_turn_disposition(ProviderError, None, false), GoalDisposition::ReinjectNoEval));
+        // terminal → end the goal/turn
+        assert!(matches!(goal_turn_disposition(Cancelled, None, false), GoalDisposition::EndTurn));
+        assert!(matches!(goal_turn_disposition(PromptRejected, None, false), GoalDisposition::EndTurn));
+        // caps / exhaustion override the reason
+        assert!(matches!(goal_turn_disposition(Stopped, Some("round limit"), false), GoalDisposition::StopGoal("round limit")));
+        assert!(matches!(goal_turn_disposition(Stopped, None, true), GoalDisposition::StopGoal(_)));
     }
 }
