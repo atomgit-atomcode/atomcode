@@ -1435,8 +1435,18 @@ impl Bridge {
                         };
                         match goal_turn_disposition(reason.clone(), cap, exhausted) {
                             GoalDisposition::Evaluate => {
+                                // Only a clean natural stop is "productive" and resets
+                                // the unproductive fuse. A MaxContinuations turn still
+                                // gets evaluated (it may have finished), but it is a
+                                // runaway edit-verify loop signal — count it so a
+                                // sustained continuation-fuse thrash trips the 5-strike
+                                // unproductive fuse instead of being reset every round.
                                 if let Some(g) = self.goal.as_mut() {
-                                    g.note_productive();
+                                    if matches!(reason, StopReason::Stopped) {
+                                        g.note_productive();
+                                    } else {
+                                        g.note_unproductive();
+                                    }
                                 }
                                 self.spawn_goal_eval(reason, messages);
                                 return;
@@ -1477,6 +1487,19 @@ impl Bridge {
                                 return;
                             }
                             GoalDisposition::EndTurn => {
+                                // User/hard terminal (Cancelled / PromptRejected / a
+                                // future StopReason via the `_` arm): clear the goal so
+                                // it can't resurrect and hijack a later unrelated turn.
+                                // (Cancelled already cleared it in the Cancel handler;
+                                // this covers PromptRejected + unknown variants where the
+                                // goal is still active here.)
+                                if let Some(g) = self.goal.as_mut() {
+                                    g.active = false;
+                                    g.last_eval_reason = Some(format!("ended: {reason:?}"));
+                                }
+                                if let Some(g) = self.goal.take() {
+                                    self.emit(goal_update_ev(&g));
+                                }
                                 // fall through to finish_turn below
                             }
                         }

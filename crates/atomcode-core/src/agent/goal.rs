@@ -57,17 +57,40 @@ pub fn summarize_for_goal(messages: &[Message], prev_verdict: Option<&str>) -> S
     for msg in messages {
         if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
             for tc in tool_calls {
-                if matches!(
+                if !matches!(
                     tc.name.as_str(),
-                    "write_file" | "edit_file" | "search_replace" | "parallel_edit" | "create_file"
+                    "write_file"
+                        | "edit_file"
+                        | "search_replace"
+                        | "parallel_edit_files"
+                        | "create_file"
                 ) {
-                    if let Some(p) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                        .ok()
-                        .and_then(|v| v.get("file_path").and_then(|x| x.as_str()).map(str::to_owned))
-                    {
-                        if !files.contains(&p) {
-                            files.push(p);
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&tc.arguments) else {
+                    continue;
+                };
+                // Single-file tools carry a top-level `file_path`; parallel_edit_files
+                // carries a `files` array of `{ file_path | path, … }` entries — collect
+                // both so batch edits still count as progress.
+                let mut candidates: Vec<String> = Vec::new();
+                if let Some(p) = v.get("file_path").and_then(|x| x.as_str()) {
+                    candidates.push(p.to_owned());
+                }
+                if let Some(arr) = v.get("files").and_then(|x| x.as_array()) {
+                    for item in arr {
+                        if let Some(p) = item
+                            .get("file_path")
+                            .or_else(|| item.get("path"))
+                            .and_then(|x| x.as_str())
+                        {
+                            candidates.push(p.to_owned());
                         }
+                    }
+                }
+                for p in candidates {
+                    if !p.is_empty() && !files.contains(&p) {
+                        files.push(p);
                     }
                 }
             }
@@ -332,6 +355,19 @@ mod tests {
         }
         let s = summarize_for_goal(&msgs, None);
         assert!(s.contains("FAILED"), "old failure must not be dropped: {s}");
+    }
+
+    #[test]
+    fn summary_captures_parallel_edit_files_array() {
+        // parallel_edit_files (the real registered name) carries a `files` array of
+        // { path, … } — those edits must appear in the "Files edited" line.
+        let msgs = vec![asst_with_call(
+            "batch editing",
+            "parallel_edit_files",
+            r#"{"files":[{"path":"a.rs","instruction":"x"},{"path":"b.rs","instruction":"y"}]}"#,
+        )];
+        let s = summarize_for_goal(&msgs, None);
+        assert!(s.contains("a.rs") && s.contains("b.rs"), "parallel-edit files missing: {s}");
     }
 
     #[test]
