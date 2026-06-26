@@ -27,6 +27,7 @@ enum KeyOutcome {
 
 // ── Test-seam action (mirrors ModalAction but constructible without Renderer) ─
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalActionTest {
     Continue,
@@ -76,6 +77,7 @@ impl PasswordModal {
 
     // ── Test seams (no LoopCtx / Renderer needed) ────────────────────────────
 
+    #[cfg(test)]
     pub fn feed_for_test(&mut self, code: KeyCode, mods: KeyModifiers) -> ModalActionTest {
         match self.apply_key(code, mods) {
             KeyOutcome::Submit => {
@@ -94,6 +96,7 @@ impl PasswordModal {
         }
     }
 
+    #[cfg(test)]
     pub fn render_line_for_test(&self) -> String {
         self.masked_line()
     }
@@ -102,6 +105,13 @@ impl PasswordModal {
 // ── Modal trait impl ─────────────────────────────────────────────────────────
 
 impl Modal for PasswordModal {
+    /// The password modal installs mid-turn (phase == Streaming), so it must
+    /// capture every key/paste regardless of phase — otherwise typed chars leak
+    /// into the type-ahead buffer and Esc/Ctrl+C cancel the turn.
+    fn captures_all_keys(&self) -> bool {
+        true
+    }
+
     fn handle_key(
         &mut self,
         code: KeyCode,
@@ -184,6 +194,16 @@ mod tests {
         m.feed_for_test(KeyCode::Char('x'), KeyModifiers::NONE);
         assert_eq!(m.feed_for_test(KeyCode::Esc, KeyModifiers::NONE), ModalActionTest::Close);
         assert_eq!(rx.blocking_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn captures_all_keys_is_true() {
+        // The password modal MUST capture keys regardless of UiPhase (it installs
+        // mid-turn while a tool runs). The trait default is false; this override
+        // is what makes the Streaming-phase routing in the event loop fire.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let m = PasswordModal::new("p".into(), tx);
+        assert!(m.captures_all_keys());
     }
 
     #[test]

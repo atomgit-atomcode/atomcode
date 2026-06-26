@@ -1051,7 +1051,9 @@ async fn run() -> Result<i32> {
                 (Some(s), Some(t)) => {
                     match atomcode::askpass::run_askpass(prompt, Path::new(&s), &t) {
                         Some(pw) => {
+                            use std::io::Write;
                             print!("{pw}");
+                            let _ = std::io::stdout().flush();
                             return Ok(0);
                         }
                         None => return Ok(1),

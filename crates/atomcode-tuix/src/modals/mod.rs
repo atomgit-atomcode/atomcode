@@ -93,6 +93,17 @@ pub trait Modal: Send {
         Ok(ModalAction::Continue)
     }
 
+    /// Whether this modal must receive ALL key/paste events regardless of the
+    /// current `UiPhase`. The default Idle-only modal routing assumes the modal
+    /// was opened from the prompt while idle; but the password modal installs
+    /// mid-turn (phase == `Streaming`) when sudo/ssh asks for a password, so it
+    /// must capture keys even while a tool runs — otherwise the typed password
+    /// leaks into the type-ahead buffer and Esc cancels the turn instead of the
+    /// modal. Default: `false` (preserve existing Idle-only behavior).
+    fn captures_all_keys(&self) -> bool {
+        false
+    }
+
     /// Notify the modal that an async plugin job finished, so it can refresh
     /// any cached lists it is displaying. Default: ignore. Only the
     /// interactive `/plugin` manager overrides this. The event loop calls it

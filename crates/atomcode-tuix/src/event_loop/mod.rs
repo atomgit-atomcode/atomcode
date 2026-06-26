@@ -3497,7 +3497,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+            // Skip the spinner repaint while a capturing modal (the password
+            // prompt) is up — the spinner repaints the same footer/input
+            // region the modal draws, and would clobber the masked line.
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming)
+                && app.active_modal.as_ref().map_or(true, |m| !m.captures_all_keys()) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
             }
 
@@ -3911,6 +3915,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     // rather than shut down the whole application.
                     crate::tuix_trace!("KEY", "windows ctrl_c signal -> Cancel (streaming)");
                     cancel_active_turn(&ctx);
+                    clear_capturing_modal_on_cancel(&mut app);
                     restore_cancelled_message_to_buf(&mut app, renderer, &ctx);
                 } else {
                     crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
@@ -3927,7 +3932,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+            // Skip the spinner repaint while a capturing modal (the password
+            // prompt) is up — the spinner repaints the same footer/input
+            // region the modal draws, and would clobber the masked line.
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming)
+                && app.active_modal.as_ref().map_or(true, |m| !m.captures_all_keys()) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
             }
 
@@ -4590,6 +4599,34 @@ fn handle_input(
             // where pasting URLs / API keys / tokens is the natural UX.
             // Modals that don't want paste can override `handle_paste`
             // to drop it; the default inserts into `buf` + redraws.
+            //
+            // A capturing modal (the password prompt) installs mid-turn while a
+            // tool runs (phase == Streaming), so route paste to it regardless of
+            // phase — otherwise the pasted password leaks into `buf`. Non-
+            // capturing modals keep their Idle-only routing below.
+            if app.active_modal.as_ref().is_some_and(|m| m.captures_all_keys()) {
+                let streaming = matches!(app.state.phase, UiPhase::Streaming);
+                if let Some(modal) = app.active_modal.as_mut() {
+                    let action =
+                        modal.handle_paste(&text, &mut app.buf, &mut app.state, ctx, renderer)?;
+                    if matches!(action, crate::modals::ModalAction::Close) {
+                        app.active_modal = None;
+                        if streaming {
+                            draw_spinner_now(
+                                &mut app.state,
+                                &app.buf,
+                                ctx,
+                                renderer,
+                                app.message_queue.len(),
+                                app.menu.selected,
+                            );
+                        } else {
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        }
+                    }
+                }
+                return Ok(());
+            }
             if matches!(app.state.phase, UiPhase::Idle) {
                 if let Some(modal) = app.active_modal.as_mut() {
                     let action =
@@ -4667,6 +4704,42 @@ fn handle_input(
             modifiers,
             ..
         }) => {
+            // A capturing modal (the password prompt) installs mid-turn while a
+            // tool runs (phase == Streaming). It must receive EVERY key
+            // regardless of phase — otherwise typed chars leak into the
+            // type-ahead `buf` and Esc/Ctrl+C cancel the whole turn instead of
+            // the modal, so the modal's oneshot never fires and the askpass
+            // server hangs. Route here BEFORE any phase dispatch. Non-capturing
+            // modals (the default) keep their Idle-only routing below.
+            if app.active_modal.as_ref().is_some_and(|m| m.captures_all_keys()) {
+                let streaming = matches!(app.state.phase, UiPhase::Streaming);
+                if let Some(modal) = app.active_modal.as_mut() {
+                    let action = modal.handle_key(
+                        code,
+                        modifiers,
+                        &mut app.buf,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                    )?;
+                    if matches!(action, ModalAction::Close) {
+                        app.active_modal = None;
+                        if streaming {
+                            draw_spinner_now(
+                                &mut app.state,
+                                &app.buf,
+                                ctx,
+                                renderer,
+                                app.message_queue.len(),
+                                app.menu.selected,
+                            );
+                        } else {
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        }
+                    }
+                }
+                return Ok(());
+            }
             // Modal trumps phase handlers when it's installed — /model,
             // /provider, /resume all install a modal and the event loop
             // funnels every keystroke through it until it reports Close.
@@ -5175,6 +5248,7 @@ fn handle_idle_key(
         let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
         if is_ctrl_c || is_bare_esc {
             cancel_active_turn(ctx);
+            clear_capturing_modal_on_cancel(app);
             crate::tuix_trace!(
                 "KEY",
                 "idle goal-active {} -> Cancel",
@@ -6374,6 +6448,7 @@ fn handle_streaming_key(
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         let send_ok = cancel_active_turn(ctx);
+        clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
             "streaming Ctrl+C -> Cancel send_ok={} spinner={:?}",
@@ -6390,6 +6465,7 @@ fn handle_streaming_key(
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
         let send_ok = cancel_active_turn(ctx);
+        clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
             "streaming Esc -> Cancel send_ok={} spinner={:?}",
@@ -6529,6 +6605,7 @@ fn handle_streaming_key(
             if let Some((cmd, arg)) = streaming_executable_slash(&line) {
                 if matches!(cmd.as_str(), "quit" | "exit") {
                     cancel_active_turn(ctx);
+                    clear_capturing_modal_on_cancel(app);
                 }
                 commands::execute_slash_command(
                     &cmd,
@@ -6646,6 +6723,7 @@ fn handle_streaming_key(
             // Ctrl+C on empty buf during streaming — treat as cancel
             // (consistent with the explicit Ctrl+C branch above).
             cancel_active_turn(ctx);
+            clear_capturing_modal_on_cancel(app);
             restore_cancelled_message_to_buf(app, renderer, ctx);
         }
     }
@@ -6667,6 +6745,21 @@ fn arm_shutdown_watchdog(ctx: &mut LoopCtx) {
     // earliest deadline so spamming the key can't indefinitely defer the exit.
     if ctx.shutdown_deadline.is_none() {
         ctx.shutdown_deadline = Some(std::time::Instant::now() + SHUTDOWN_WATCHDOG);
+    }
+}
+
+/// Drop a capturing modal (the password prompt) when the turn it is attached to
+/// is being cancelled. Dropping `PasswordModal` drops its `reply` Sender, which
+/// resolves the askpass server's `reply_rx.await` to `Err` → the helper (and
+/// thus sudo) gets a clean failure instead of hanging forever, and the server
+/// task doesn't leak. No-op for non-capturing modals and when none is installed.
+fn clear_capturing_modal_on_cancel(app: &mut App) {
+    if app
+        .active_modal
+        .as_ref()
+        .is_some_and(|m| m.captures_all_keys())
+    {
+        app.active_modal = None;
     }
 }
 
