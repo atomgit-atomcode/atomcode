@@ -200,6 +200,11 @@ pub struct CreateSessionRequest {
     /// Optional session title
     #[serde(default)]
     pub title: Option<String>,
+    /// Whether the caller (webui) has sync enabled. Only when true do we broadcast
+    /// the new session to other views (sync-mode TUI / other webui tabs) so they follow.
+    /// Defaults to false so sync-off webui新建对话不会牵连 TUI 新建（issue #850）。
+    #[serde(default)]
+    pub sync: bool,
 }
 
 /// Response for created session
@@ -1502,8 +1507,11 @@ async fn create_session(
     };
 
     // Broadcast new session creation to other views (sync-mode TUI / other webui tabs)
-    // so they follow: create new session with the same ID.
-    crate::live_api::live_switch_session(session.id.clone());
+    // so they follow: create new session with the same ID. Only when the caller has
+    // sync enabled — sync-off webui新建对话不应牵连 TUI 新建（issue #850）。
+    if req.sync {
+        crate::live_api::live_switch_session(session.id.clone());
+    }
 
     (StatusCode::CREATED, Json(response)).into_response()
 }

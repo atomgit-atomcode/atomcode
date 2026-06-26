@@ -220,10 +220,16 @@ export interface CreateSessionResponse {
   created_at: number;
 }
 
-export async function createSession(workingDir?: string, title?: string): Promise<CreateSessionResponse> {
-  const body: Record<string, string> = {};
+export async function createSession(
+  workingDir?: string,
+  title?: string,
+  sync?: boolean,
+): Promise<CreateSessionResponse> {
+  const body: Record<string, string | boolean> = {};
   if (workingDir) body.working_dir = workingDir;
   if (title) body.title = title;
+  // 仅在 webui 开启同步时让后端广播会话切换，使 sync 模式 TUI 跟随新建（issue #850）。
+  if (sync) body.sync = true;
   const resp = await fetch('/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },

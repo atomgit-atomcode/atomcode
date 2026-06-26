@@ -705,7 +705,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     setSync((prev) => {
       const next = !prev;
       if (next) {
-        startLiveStream();
+        // 重新开启同步：先把当前会话广播给 TUI，再启动本端实时流。
+        // 关闭同步期间 webui 可能已切换/新建到别的会话（不广播），此时全局 LiveSession
+        // 仍绑在旧会话、TUI 也订阅着旧实例。若直接 startLiveStream，/live 会以新 session_id
+        // 替换全局 LiveSession 却不通知旧实例的订阅者，TUI 就此被孤立、停在旧会话不跟随。
+        // 故必须先 postLiveSwitchSession：它在「旧」全局实例上广播 SessionSwitched，TUI 据此
+        // 加载本端会话并把实时总线重绑到新实例——与侧栏切换会话的同步路径一致。
+        // 顺序关键：必须等广播发出（落在 TUI 仍订阅的旧实例上）后再启动会替换全局的实时流。
+        const sid = activeIdRef.current;
+        if (sid) {
+          postLiveSwitchSession(sid).catch(() => {}).finally(() => startLiveStream());
+        } else {
+          startLiveStream();
+        }
       } else {
         stopLiveStream();
       }
