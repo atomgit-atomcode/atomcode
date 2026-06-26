@@ -49,6 +49,11 @@ fn auto_copy_enabled() -> bool {
 
 const PAD_COL: usize = 2;
 
+/// How long the "copied N chars" notice row stays visible in the footer before
+/// it auto-dismisses via TTL. Three seconds gives the user time to read the
+/// notice without it cluttering the footer indefinitely.
+const COPY_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Max body_lines kept in the in-app scrollback buffer (matches alt-screen).
 /// Bounded so memory doesn't grow without limit on long sessions.
 pub const MAX_SCROLLBACK_ROWS: usize = 5000;
@@ -537,6 +542,14 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// text in the alt-screen; `None` in normal live mode. Populated by
     /// `open_copy_mode`, cleared by `close_copy_mode`.
     copy_mode: Option<crate::overlay::CopyMode>,
+    /// Transient notice shown in the footer after an automatic clipboard copy
+    /// (e.g. "copied 42 chars to clipboard · disable auto-copy in /config").
+    /// Auto-dismisses after `COPY_NOTICE_TTL`; also cleared on the next key
+    /// event (wired in Task 8). `None` when no notice is pending.
+    copy_notice: Option<String>,
+    /// Instant at which `copy_notice` was last set. Used by
+    /// `copy_notice_active()` to enforce the TTL without a timer event.
+    copy_notice_at: Option<std::time::Instant>,
     /// Append-only log of the permanent body-producing `UiLine`s in
     /// render order — the semantic source needed to REFLOW the whole
     /// transcript when the terminal width changes. `body_lines` holds
@@ -691,6 +704,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             live_group: None,
             modal_overlay: None,
             copy_mode: None,
+            copy_notice: None,
+            copy_notice_at: None,
             body_log: Vec::new(),
             replaying: false,
             body_log_truncated: false,
@@ -1579,8 +1594,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
         let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
+        let notice_rows = usize::from(self.copy_notice_active());
         let total_rows =
-            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + status_rows;
+            1 + middle_rows + 1 + attachment_rows + menu_rows + notice_rows + goal_rows + status_rows;
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
         // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
@@ -1692,9 +1708,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(menu_top + i, 0, &padded);
         }
-        // Goal row sits directly above the status line (between the menu and
-        // the status row), so `· menu / goal / status ·`.
-        let goal_top = menu_top + menu_rows;
+        // Notice row sits directly above the goal/status rows (between menu
+        // and goal), so `· menu / notice / goal / status ·`. When no notice
+        // is active `notice_rows == 0` and notice_top == goal_top.
+        let notice_top = menu_top + menu_rows;
+        if notice_rows > 0 {
+            if let Some(text) = self.copy_notice.clone() {
+                let notice_row = build_one_row(
+                    &text,
+                    &CellStyle { faint: true, ..Default::default() },
+                    self.screen.width(),
+                );
+                let mut padded = notice_row;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(notice_top, 0, &padded);
+            }
+        }
+        // Goal row sits directly above the status line (between the notice and
+        // the status row), so `· menu / notice / goal / status ·`.
+        let goal_top = notice_top + notice_rows;
         if let Some(gr) = goal_cells {
             let mut padded = gr;
             Self::pad_row_to_width(&mut padded, w);
@@ -1760,10 +1792,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // input can't make the footer exceed the screen.
         let capped_middle = middle_rows
             .min(Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows));
-        // 1 top rule + middle + 1 bot rule + attachments + menu + goal + status.
+        // 1 top rule + middle + 1 bot rule + attachments + menu + notice + goal + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + status_rows
+        1 + capped_middle + 1 + attachment_rows + menu_rows + usize::from(self.copy_notice_active()) + goal_rows + status_rows
     }
 
     /// Max rows the input box may DISPLAY before scrolling internally. Bounds
@@ -3376,6 +3408,38 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Force a full live repaint on the next flush_deferred tick.
         self.screen.invalidate();
         self.dirty = true;
+    }
+
+    // ── Task 7: transient copy-notice footer row ──────────────────────────
+
+    /// Show a transient dim notice row above the goal/status rows in the
+    /// footer. Replaces any previously active notice. The row auto-dismisses
+    /// after [`COPY_NOTICE_TTL`] (3 s) without requiring a timer event —
+    /// `copy_notice_active()` checks `elapsed() < TTL` on every paint.
+    /// Call `clear_copy_notice()` to dismiss instantly (e.g. on the next
+    /// key event — wired in Task 8).
+    pub fn set_copy_notice(&mut self, text: String) {
+        self.copy_notice = Some(text);
+        self.copy_notice_at = Some(std::time::Instant::now());
+        self.dirty = true;
+    }
+
+    /// Dismiss the copy notice immediately. No-op when no notice is set.
+    pub fn clear_copy_notice(&mut self) {
+        if self.copy_notice.take().is_some() {
+            self.copy_notice_at = None;
+            self.dirty = true;
+        }
+    }
+
+    /// True when a notice is set AND it has not yet expired (elapsed <
+    /// [`COPY_NOTICE_TTL`]). Used by `current_footer_rows` and `paint_footer`
+    /// to decide whether to reserve/draw the notice row.
+    fn copy_notice_active(&self) -> bool {
+        match self.copy_notice_at {
+            Some(t) => t.elapsed() < COPY_NOTICE_TTL && self.copy_notice.is_some(),
+            None => false,
+        }
     }
 }
 
@@ -12655,6 +12719,59 @@ mod tests {
                     .join("\n")
             );
         }
+    }
+
+    // ── Task 7: transient copy-notice footer row ──────────────────────────
+
+    /// `set_copy_notice` renders a dim notice row above the goal/status rows,
+    /// and `current_footer_rows()` increases by exactly 1 while the notice is
+    /// active. `clear_copy_notice()` removes the row immediately (the TTL
+    /// mechanism — `COPY_NOTICE_TTL = 3s` — is not tested here because it
+    /// would require sleeping; a comment in the implementation documents it).
+    #[test]
+    fn copy_notice_renders_above_input_and_clears() {
+        let (mut r, buf) = new_capturing(60, 10);
+        // Render an InputPrompt to establish the baseline footer geometry.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let baseline_rows = r.current_footer_rows();
+
+        // Set the notice and flush — the footer must grow by 1.
+        buf.lock().unwrap().clear();
+        r.set_copy_notice(
+            "copied 5 chars to clipboard · disable auto-copy in /config".into(),
+        );
+        r.flush_deferred();
+
+        let s = String::from_utf8_lossy(&buf.lock().unwrap().clone()).to_string();
+        assert!(
+            s.contains("copied 5 chars to clipboard"),
+            "flushed bytes must contain the notice text; got {s:?}"
+        );
+        let active_rows = r.current_footer_rows();
+        assert_eq!(
+            active_rows,
+            baseline_rows + 1,
+            "footer must grow by exactly 1 row while notice is active \
+             (baseline={baseline_rows}, active={active_rows})"
+        );
+
+        // Clearing the notice immediately removes the extra row (TTL is 3s
+        // and will also dismiss it after expiry, but clear is instant).
+        r.clear_copy_notice();
+        let cleared_rows = r.current_footer_rows();
+        assert_eq!(
+            cleared_rows,
+            baseline_rows,
+            "footer must return to baseline after clear \
+             (baseline={baseline_rows}, cleared={cleared_rows})"
+        );
     }
 
     // ── Task 6: copy-mode renderer hooks ──────────────────────────────────
