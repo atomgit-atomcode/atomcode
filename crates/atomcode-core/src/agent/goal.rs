@@ -3,6 +3,12 @@ use std::time::Instant;
 /// Consecutive evaluator failures before the wrapper gives up on the goal.
 pub const MAX_EVAL_FAILURES: u32 = 3;
 
+/// Consecutive non-`Stopped` turn-ends (timeout / provider error / continuation
+/// fuse) before the goal loop gives up. SEPARATE from `MAX_EVAL_FAILURES`
+/// (malformed evaluator verdicts) — a flaky provider and a flaky judge fail
+/// independently.
+pub const MAX_UNPRODUCTIVE: u32 = 5;
+
 #[derive(Debug)]
 pub struct GoalState {
     pub condition: String,
@@ -12,6 +18,14 @@ pub struct GoalState {
     pub last_eval_reason: Option<String>,
     pub tokens_used: u64,
     pub evaluator_consecutive_failures: u32,
+    /// User-settable round cap (None = unbounded). Stops the loop with a clear
+    /// notice rather than running forever or dying on a per-turn fuse.
+    pub max_rounds: Option<u32>,
+    /// Wall-clock deadline (None = unbounded), set from a configured duration at
+    /// goal start.
+    pub deadline: Option<Instant>,
+    /// Consecutive non-productive turn-ends; reset by any productive round.
+    pub consecutive_unproductive: u32,
 }
 
 #[derive(Debug)]
@@ -26,14 +40,28 @@ pub enum GoalResult {
 
 impl GoalState {
     pub fn new(condition: String) -> Self {
+        Self::new_with_limits(condition, None, None)
+    }
+
+    /// Construct an active goal with optional round / duration caps. `deadline`
+    /// is computed from `max_duration` relative to now.
+    pub fn new_with_limits(
+        condition: String,
+        max_rounds: Option<u32>,
+        max_duration: Option<std::time::Duration>,
+    ) -> Self {
+        let started_at = Instant::now();
         Self {
             condition,
             active: true,
             round: 0,
-            started_at: Instant::now(),
+            started_at,
             last_eval_reason: None,
             tokens_used: 0,
             evaluator_consecutive_failures: 0,
+            max_rounds,
+            deadline: max_duration.map(|d| started_at + d),
+            consecutive_unproductive: 0,
         }
     }
 
@@ -43,6 +71,39 @@ impl GoalState {
 
     pub fn is_evaluator_exhausted(&self) -> bool {
         self.evaluator_consecutive_failures >= MAX_EVAL_FAILURES
+    }
+
+    /// A round that ended naturally (model worked + stopped) — reset the
+    /// transient-failure counter.
+    pub fn note_productive(&mut self) {
+        self.consecutive_unproductive = 0;
+    }
+
+    /// A round that ended with a recoverable non-`Stopped` reason (timeout /
+    /// provider error / continuation fuse).
+    pub fn note_unproductive(&mut self) {
+        self.consecutive_unproductive = self.consecutive_unproductive.saturating_add(1);
+    }
+
+    pub fn is_unproductive_exhausted(&self) -> bool {
+        self.consecutive_unproductive >= MAX_UNPRODUCTIVE
+    }
+
+    /// `Some(reason)` when a configured cap is hit, else `None`. Checked before
+    /// each continuation so the loop stops with a clear message instead of
+    /// running unbounded.
+    pub fn cap_reached(&self) -> Option<&'static str> {
+        if let Some(max) = self.max_rounds {
+            if self.round >= max {
+                return Some("round limit");
+            }
+        }
+        if let Some(dl) = self.deadline {
+            if Instant::now() >= dl {
+                return Some("time limit");
+            }
+        }
+        None
     }
 
     pub fn elapsed_secs(&self) -> u64 {
@@ -61,9 +122,13 @@ impl GoalState {
         let mins = elapsed / 60;
         let secs = elapsed % 60;
         let reason = self.last_eval_reason.as_deref().unwrap_or("(not yet evaluated)");
+        let round = match self.max_rounds {
+            Some(max) => format!("{}/{}", self.round, max),
+            None => self.round.to_string(),
+        };
         format!(
             "Goal: {}\nRound: {}\nElapsed: {}m {}s\nTokens used: {}\nLast evaluation: {}",
-            self.condition, self.round, mins, secs, self.tokens_used, reason
+            self.condition, round, mins, secs, self.tokens_used, reason
         )
     }
 }
@@ -78,6 +143,9 @@ impl Default for GoalState {
             last_eval_reason: None,
             tokens_used: 0,
             evaluator_consecutive_failures: 0,
+            max_rounds: None,
+            deadline: None,
+            consecutive_unproductive: 0,
         }
     }
 }
@@ -157,5 +225,46 @@ mod tests {
         let g = GoalState::default();
         assert!(!g.active);
         assert_eq!(g.round, 0);
+    }
+
+    #[test]
+    fn unproductive_counter_trips_at_max() {
+        let mut g = GoalState::new("c".into());
+        assert!(!g.is_unproductive_exhausted());
+        for _ in 0..MAX_UNPRODUCTIVE {
+            g.note_unproductive();
+        }
+        assert!(g.is_unproductive_exhausted());
+        g.note_productive();
+        assert_eq!(g.consecutive_unproductive, 0, "a productive round resets the counter");
+        assert!(!g.is_unproductive_exhausted());
+    }
+
+    #[test]
+    fn cap_reached_on_round_and_time() {
+        // round cap
+        let mut g = GoalState::new_with_limits("c".into(), Some(3), None);
+        g.round = 2;
+        assert_eq!(g.cap_reached(), None);
+        g.round = 3;
+        assert_eq!(g.cap_reached(), Some("round limit"));
+        // no caps ⇒ never
+        let g2 = GoalState::new_with_limits("c".into(), None, None);
+        assert_eq!(g2.cap_reached(), None);
+        // time cap: a deadline already in the past
+        let mut g3 = GoalState::new_with_limits("c".into(), None, Some(std::time::Duration::from_secs(0)));
+        // deadline = now + 0 ⇒ already reached
+        g3.round = 0;
+        assert_eq!(g3.cap_reached(), Some("time limit"));
+    }
+
+    #[test]
+    fn status_line_shows_denominator_when_bounded() {
+        let mut g = GoalState::new_with_limits("write tests".into(), Some(200), None);
+        g.round = 3;
+        assert!(g.status_line().contains("Round: 3/200"), "bounded goal shows denominator: {}", g.status_line());
+        // unbounded keeps the old terse form
+        let g2 = GoalState::new("c".into());
+        assert!(!g2.status_line().contains("/"), "unbounded has no denominator");
     }
 }
