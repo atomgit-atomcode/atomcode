@@ -115,6 +115,87 @@ async fn rate_limit_pause_emits_ratelimited_not_error() {
     );
 }
 
+// ── mid-stream 429 provider: open succeeds, stream emits partial text then Error(429) ──
+
+struct MidStream429Provider {
+    calls: AtomicU32,
+}
+
+impl MidStream429Provider {
+    fn new() -> Self {
+        Self { calls: AtomicU32::new(0) }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for MidStream429Provider {
+    fn model_name(&self) -> &str {
+        "mid-stream-429"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // First call: stream some text then 429 mid-stream
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta("partial".into()),
+                StreamEvent::Error(ProviderError {
+                    retryable: true,
+                    http_status: Some(429),
+                    message: "rate limited mid-stream".into(),
+                    ..Default::default()
+                }),
+            ])))
+        } else {
+            // Second call: normal completion continuing from committed partial
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta(" done".into()),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+}
+
+// ── test 3: mid-stream WaitAndRetry{secs:0} → partial committed, turn resumes ─
+
+#[tokio::test]
+async fn mid_stream_429_wait_and_retry_resumes() {
+    let provider = Arc::new(MidStream429Provider::new());
+    let hook = Arc::new(ScriptedRateLimitHook::new(RateLimitDecision::WaitAndRetry { secs: 0 }));
+
+    let handle = spawn_agent(provider, hook);
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut collected: Vec<AgentEvent> = Vec::new();
+    while let Some(ev) = events.recv().await {
+        let done = matches!(ev, AgentEvent::TurnComplete { .. });
+        collected.push(ev);
+        if done {
+            break;
+        }
+    }
+
+    assert!(
+        collected.iter().any(|e| matches!(e, AgentEvent::RateLimited { .. })),
+        "must emit RateLimited on mid-stream 429: {collected:?}"
+    );
+    assert!(
+        !collected.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "must NOT emit Error when WaitAndRetry succeeds: {collected:?}"
+    );
+    assert!(
+        collected
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnComplete { reason: StopReason::Stopped })),
+        "turn must complete with Stopped after mid-stream 429 retry: {collected:?}"
+    );
+}
+
 // ── test 2: WaitAndRetry{secs:0} → re-issues round, turn succeeds with "ok" ─
 
 #[tokio::test]

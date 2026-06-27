@@ -42,6 +42,14 @@ const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 /// (auth / 400 / balance) never enter this path — they fail fast.
 const MAX_PROVIDER_RETRIES: u32 = 3;
 
+/// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
+/// single turn before the kernel forces a `Pause` stop (RateLimited), regardless
+/// of what the host hook returns. Guards against a livelock if the host hook is
+/// broken or the rate-limit window never reopens. This is a LAST-RESORT backstop,
+/// not the normal path — a real window recovery will cause the next OPEN to succeed,
+/// resetting this counter to 0 before it is ever reached in practice.
+const MAX_RATE_LIMIT_WAITS: u32 = 20;
+
 /// How many times the agent loop re-issues a round after the provider returns a
 /// COMPLETELY EMPTY but otherwise-successful completion (a 200 with no text, no
 /// tool calls, no reasoning). This is a DISTINCT tier from `MAX_PROVIDER_RETRIES`
@@ -842,6 +850,12 @@ impl RunningAgent {
         // visible re-open after a retryable provider error; reset to 0 on a successful
         // open so every round gets its own fresh budget.
         let mut provider_retry: u32 = 0;
+        // RATE-LIMIT WaitAndRetry counter for the WHOLE turn: incremented on each
+        // WaitAndRetry sleep (OPEN or mid-stream); reset to 0 on a successful open
+        // (the window has reopened). Capped at MAX_RATE_LIMIT_WAITS to prevent a
+        // livelock if the host hook is broken or the window never opens — at that
+        // point the kernel forces a Pause stop rather than spinning indefinitely.
+        let mut rate_limit_waits: u32 = 0;
         // EMPTY-RESPONSE retry counter for the WHOLE turn: incremented on each re-issue
         // after a content-free 200. UNLIKE the two above it is NOT reset per round —
         // the budget is per-turn (mirrors v1's per-user-message `empty_response_retries`)
@@ -948,6 +962,7 @@ impl RunningAgent {
                 Ok(s) => {
                     overflow_attempt = 0; // a successful open resets the per-round counter
                     provider_retry = 0; // ditto for the transient-failure budget
+                    rate_limit_waits = 0; // window reopened — reset the livelock fuse
                     s
                 }
                 // HARD OVERFLOW recovery (OFF the normal path): the prompt exceeded the
@@ -985,6 +1000,20 @@ impl RunningAgent {
                         .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
                     match decision {
                         crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
+                            rate_limit_waits += 1;
+                            if rate_limit_waits > MAX_RATE_LIMIT_WAITS {
+                                // Livelock fuse: the host hook has returned WaitAndRetry
+                                // MAX_RATE_LIMIT_WAITS times without the window reopening.
+                                // Force a clean Pause stop to prevent spinning indefinitely
+                                // (e.g. a broken hook that always returns WaitAndRetry).
+                                self.rt.emit(AgentEvent::RateLimited {
+                                    reset_at_display: String::new(),
+                                    reset_label: String::new(),
+                                    secs_until_reset: None,
+                                });
+                                self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                                return;
+                            }
                             self.rt.emit(AgentEvent::RateLimited {
                                 reset_at_display: String::new(),
                                 reset_label: String::new(),
@@ -998,6 +1027,7 @@ impl RunningAgent {
                                 }
                                 _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
                             }
+                            provider_retry = 0; // 429 must not consume the generic transient-retry budget
                             round -= 1; // re-issue this round, not a new one
                             continue;
                         }
@@ -1209,6 +1239,18 @@ impl RunningAgent {
                             .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
                         match decision {
                             crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
+                                rate_limit_waits += 1;
+                                if rate_limit_waits > MAX_RATE_LIMIT_WAITS {
+                                    // Livelock fuse (mid-stream path): same guard as the OPEN
+                                    // path — force a clean Pause stop rather than spinning.
+                                    self.rt.emit(AgentEvent::RateLimited {
+                                        reset_at_display: String::new(),
+                                        reset_label: String::new(),
+                                        secs_until_reset: None,
+                                    });
+                                    self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                                    return;
+                                }
                                 self.rt.emit(AgentEvent::RateLimited {
                                     reset_at_display: String::new(),
                                     reset_label: String::new(),
@@ -1222,6 +1264,33 @@ impl RunningAgent {
                                     }
                                     _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
                                 }
+                                // I-1: Commit any accumulated partial content (text, reasoning,
+                                // tool calls) to the conversation BEFORE re-issuing the round.
+                                // Without this the re-issued round presents the same bare user
+                                // prompt to the model, which then re-generates from scratch and
+                                // emits duplicate TextDelta events (the partial stream already
+                                // in the UI is irrecoverable — gateways usually reject at the
+                                // header layer so true mid-stream 429s are rare). With the
+                                // partial message committed, a well-behaved model continues from
+                                // the committed text rather than restarting. Known residual
+                                // limitation: already-emitted TextDelta events cannot be
+                                // recalled from the UI — if the model re-generates identical
+                                // content the user will see it twice. Full rollback would
+                                // require a streaming-rewind mechanism beyond this scope.
+                                if !assistant_text.is_empty()
+                                    || !reasoning.is_empty()
+                                    || !pending_calls.is_empty()
+                                {
+                                    let mut partial = crate::message::Message::assistant(
+                                        assistant_text.clone(),
+                                        pending_calls.clone(),
+                                    );
+                                    partial.reasoning =
+                                        if reasoning.is_empty() { None } else { Some(reasoning.clone()) };
+                                    partial.reasoning_blocks = reasoning_blocks.clone();
+                                    convo.push(partial);
+                                }
+                                provider_retry = 0; // 429 must not consume the generic transient-retry budget
                                 retry_this_round = true;
                                 break; // exit stream loop; outer loop will re-issue round
                             }
