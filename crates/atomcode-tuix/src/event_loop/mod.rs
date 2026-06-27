@@ -1447,6 +1447,31 @@ mod buffer_tests {
     }
 
     #[test]
+    fn first_empty_bare_esc_is_consumed_and_arms_undo() {
+        let now = std::time::Instant::now();
+        let mut pending = None;
+
+        assert_eq!(
+            intercept_empty_bare_esc(&mut pending, now),
+            EmptyEscIntercept::Consumed
+        );
+        assert_eq!(pending, Some(now));
+    }
+
+    #[test]
+    fn second_empty_bare_esc_triggers_undo_and_clears_pending() {
+        let first = std::time::Instant::now();
+        let second = first + DOUBLE_ESC_UNDO_WINDOW;
+        let mut pending = Some(first);
+
+        assert_eq!(
+            intercept_empty_bare_esc(&mut pending, second),
+            EmptyEscIntercept::TriggerUndo
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
     fn spinner_label_surfaces_network_stall_hint_then_clears_on_activity() {
         // End-to-end on the REAL spinner renderer: a model stream silent past the
         // threshold must put the localized "network may be down · esc" hint into the
@@ -3030,8 +3055,27 @@ pub struct App {
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
 const DOUBLE_ESC_UNDO_WINDOW: Duration = Duration::from_secs(2);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyEscIntercept {
+    Consumed,
+    TriggerUndo,
+}
+
 fn second_esc_triggers_undo(pending: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     pending.is_some_and(|t| now.duration_since(t) <= DOUBLE_ESC_UNDO_WINDOW)
+}
+
+fn intercept_empty_bare_esc(
+    pending: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> EmptyEscIntercept {
+    if second_esc_triggers_undo(*pending, now) {
+        *pending = None;
+        EmptyEscIntercept::TriggerUndo
+    } else {
+        *pending = Some(now);
+        EmptyEscIntercept::Consumed
+    }
 }
 
 /// Grace period after a quit request before the force-exit watchdog fires. The
@@ -5431,15 +5475,18 @@ fn handle_idle_key(
         && menu_items.is_none()
         && app.buf.text.is_empty()
     {
-        let now = std::time::Instant::now();
-        if second_esc_triggers_undo(app.esc_undo_pending, now) {
-            app.esc_undo_pending = None;
-            app.exit_pending = None;
-            dispatch_undo("", &app.state, ctx, renderer);
-            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-            return Ok(());
+        match intercept_empty_bare_esc(&mut app.esc_undo_pending, std::time::Instant::now()) {
+            EmptyEscIntercept::Consumed => {
+                app.exit_pending = None;
+                return Ok(());
+            }
+            EmptyEscIntercept::TriggerUndo => {
+                app.exit_pending = None;
+                dispatch_undo("", &app.state, ctx, renderer);
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
         }
-        app.esc_undo_pending = Some(now);
     }
 
     // Ctrl+V: try clipboard image first, fall back to text paste.
