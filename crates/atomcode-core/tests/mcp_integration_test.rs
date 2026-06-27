@@ -7,15 +7,36 @@ use atomcode_core::mcp::transport_stdio::StdioClient;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// Point `ATOMCODE_HOME` at an empty tempdir for the duration of the test so
+/// `load_mcp_config` (which always merges the *user* config at
+/// `config_dir()/mcp.json`) can't pick up the developer's real
+/// `~/.atomcode/mcp.json`. Removes the var on drop. Pair with `#[serial]` —
+/// the env var is process-global, so concurrent tests would race the guard.
+struct EmptyHome(#[allow(dead_code)] tempfile::TempDir);
+impl Drop for EmptyHome {
+    fn drop(&mut self) {
+        std::env::remove_var("ATOMCODE_HOME");
+    }
+}
+fn isolated_empty_home() -> EmptyHome {
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", tmp.path());
+    EmptyHome(tmp)
+}
+
 #[test]
+#[serial_test::serial]
 fn test_config_parsing() {
+    let _home = isolated_empty_home();
     // Non-existent config should return empty vec
     let configs = load_mcp_config(Path::new("/nonexistent")).unwrap();
     assert!(configs.is_empty());
 }
 
 #[test]
+#[serial_test::serial]
 fn test_config_env_var_expansion() {
+    let _home = isolated_empty_home();
     // Test via the public API: load_mcp_config
     // The expand_env_vars function is tested internally in config.rs
     // This test verifies the public config loading path works correctly
