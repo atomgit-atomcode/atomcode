@@ -9,7 +9,6 @@ pub mod ctx;
 pub mod graph;
 pub mod hook;
 pub mod i18n;
-pub mod input_history;
 pub mod live;
 pub mod locale;
 pub mod lsp;
