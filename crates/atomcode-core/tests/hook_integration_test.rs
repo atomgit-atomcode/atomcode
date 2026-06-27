@@ -188,22 +188,9 @@ fn test_config() -> Config {
         },
     );
     Config {
-        default_provider: "mock".to_string(),
-        evaluator_provider: None,
-        default_workdir: None,
-        providers,
-        datalog: Default::default(),
         auto_update: false,
-        subagent: Default::default(),
-        vision_preprocessor_provider: None,
-        language: None,
-        ui: Default::default(),
-        plugin: Default::default(),
-        web_search: Default::default(),
-        notifications: Default::default(),
-        telemetry: Default::default(),
-        lsp: Default::default(),
-        auto_commit: false,
+        providers,
+        ..Config::with_default_provider("mock")
     }
 }
 

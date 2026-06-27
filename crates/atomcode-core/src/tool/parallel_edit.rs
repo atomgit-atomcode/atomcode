@@ -518,25 +518,7 @@ mod validate_args_tests {
     }
 
     fn blank_config() -> Config {
-        Config {
-            default_provider: String::new(),
-            evaluator_provider: None,
-            default_workdir: None,
-            network: Default::default(),
-            providers: std::collections::HashMap::new(),
-            datalog: Default::default(),
-            auto_update: true,
-            notifications: Default::default(),
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
-        }
+        Config::default()
     }
 
     fn tool() -> ParallelEditTool {

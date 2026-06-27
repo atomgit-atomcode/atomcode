@@ -5,7 +5,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1313,47 +1312,11 @@ async fn run() -> Result<i32> {
     let mut config = if config_path.exists() {
         Config::load(&config_path).unwrap_or_else(|e| {
             eprintln!("Warning: failed to load config ({}), using defaults", e);
-            Config {
-                default_provider: String::new(),
-                evaluator_provider: None,
-                default_workdir: None,
-                providers: HashMap::new(),
-                datalog: Default::default(),
-                notifications: Default::default(),
-                network: Default::default(),
-                auto_update: true,
-                telemetry: Default::default(),
-                lsp: Default::default(),
-                auto_commit: false,
-                subagent: Default::default(),
-                vision_preprocessor_provider: None,
-                language: None,
-                ui: Default::default(),
-                plugin: Default::default(),
-                web_search: Default::default(),
-            }
+            Config::default()
         })
     } else {
         // No config yet — TUI Welcome screen will guide first-run setup
-        Config {
-            default_provider: String::new(),
-            evaluator_provider: None,
-            default_workdir: None,
-            providers: HashMap::new(),
-            datalog: Default::default(),
-            notifications: Default::default(),
-            network: Default::default(),
-            auto_update: true,
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
-        }
+        Config::default()
     };
     atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
@@ -3121,25 +3084,7 @@ fn run_codingplan_core(
     // so the flow can still add AtomGit providers to a fresh config.toml.
     let mut config = match Config::load(&path) {
         Ok(c) => c,
-        Err(_) => Config {
-            default_provider: String::new(),
-            evaluator_provider: None,
-            default_workdir: None,
-            providers: std::collections::HashMap::new(),
-            datalog: Default::default(),
-            auto_update: true,
-            notifications: Default::default(),
-            network: Default::default(),
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
-        },
+        Err(_) => Config::default(),
     };
     atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
