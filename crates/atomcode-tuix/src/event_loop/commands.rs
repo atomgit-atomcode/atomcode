@@ -44,6 +44,37 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
     }
 }
 
+pub(super) fn dispatch_undo(arg: &str, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    if state.phase != crate::state::UiPhase::Idle {
+        renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBusy).into_owned()));
+        renderer.flush();
+        return;
+    }
+
+    let a = arg.trim();
+    // None = bare /undo (last turn); Some(n) = /undo n; Err = bad arg.
+    let parsed: Result<Option<usize>, ()> = if a.is_empty() {
+        Ok(None)
+    } else {
+        match a.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(Some(n)),
+            _ => Err(()),
+        }
+    };
+    match parsed {
+        Ok(nth) => {
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::UndoToPrompt { nth })
+                .ok();
+        }
+        Err(()) => {
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBadArg).into_owned()));
+            renderer.flush();
+        }
+    }
+}
+
 fn render_welcome(renderer: &mut dyn Renderer, ctx: &LoopCtx) {
     let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     renderer.render(UiLine::Welcome {
@@ -827,33 +858,7 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "undo" => {
-            if state.phase != crate::state::UiPhase::Idle {
-                renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBusy).into_owned()));
-                renderer.flush();
-            } else {
-                let a = arg.trim();
-                // None = bare /undo (last turn); Some(n) = /undo n; Err = bad arg.
-                let parsed: Result<Option<usize>, ()> = if a.is_empty() {
-                    Ok(None)
-                } else {
-                    match a.parse::<usize>() {
-                        Ok(n) if n >= 1 => Ok(Some(n)),
-                        _ => Err(()),
-                    }
-                };
-                match parsed {
-                    Ok(nth) => {
-                        ctx.agent
-                            .cmd_tx
-                            .send(AgentCommand::UndoToPrompt { nth })
-                            .ok();
-                    }
-                    Err(()) => {
-                        renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBadArg).into_owned()));
-                        renderer.flush();
-                    }
-                }
-            }
+            dispatch_undo(arg, state, ctx, renderer);
         }
         "cost" => {
             let total = state.prompt_tokens + state.completion_tokens;
