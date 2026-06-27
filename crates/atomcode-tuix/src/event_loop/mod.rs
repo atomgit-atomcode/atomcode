@@ -9826,6 +9826,14 @@ mod auto_copy_tests {
             !app.copy_mode_active,
             "copy_mode_active must be false after any key while overlay is open"
         );
+        // The key must have fallen through to the input buffer (proving normal
+        // processing resumed after the overlay was cancelled).
+        assert!(
+            app.buf.text.contains('a'),
+            "non-Esc key must fall through to input buffer after overlay is closed, \
+             expected 'a' in buffer but got: {:?}",
+            app.buf.text
+        );
     }
 
     /// While `copy_mode_active`, Esc must:

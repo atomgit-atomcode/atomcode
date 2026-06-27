@@ -4962,6 +4962,16 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
+        // If the alt-screen copy-mode overlay is open, exit it first so the
+        // resize wipe and repaint operate on the main screen. Without this,
+        // the CUP+EL sequence below would corrupt the alt-screen content and
+        // the live view would be painted at stale (pre-resize) dimensions.
+        // This must run BEFORE the size-unchanged early-return so that
+        // same-size Resize events (tab toggles, font cycles, focus events)
+        // still exit the overlay while skipping the physical resize work.
+        if self.copy_mode.is_some() {
+            self.close_copy_mode();
+        }
         // No-op if size unchanged. Some terminals fire `Resize` for
         // shape changes that don't actually alter the cell grid (tab
         // toggles, font-size cycles, focus events on multiplexers);
@@ -4973,11 +4983,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if cols == self.screen.width() && rows == self.screen.height() {
             return;
         }
-        // If the alt-screen copy-mode overlay is open, exit it first so the
-        // resize wipe and repaint operate on the main screen. Without this,
-        // the CUP+EL sequence below would corrupt the alt-screen content and
-        // the live view would be painted at stale (pre-resize) dimensions.
-        self.close_copy_mode();
         // Diagnostic (opt-in via ATOMCODE_TUIX_LOG): trace each resize phase
         // BEFORE the corresponding console write, so a conhost fastfail during
         // a window drag still leaves the killing phase as the last RSZ line.
@@ -13080,6 +13085,30 @@ mod tests {
             "on_resize must exit alt screen (?1049l) when copy_mode is open: {s:?}"
         );
         assert!(!r.in_copy_mode(), "in_copy_mode() must be false after on_resize");
+    }
+
+    /// Same-size Resize events (tab toggles, font cycles, focus events on
+    /// multiplexers) must still close the copy-mode overlay even though they
+    /// skip the physical resize work. Without this fix, the overlay gets
+    /// stranded open with no way to Esc out.
+    #[test]
+    fn same_size_resize_still_exits_copy_mode() {
+        let (mut r, buf) = new_capturing(40, 10);
+        r.render(UiLine::AssistantText("hello\n".into()));
+        r.flush_deferred();
+        r.open_copy_mode();
+        assert!(r.in_copy_mode(), "precondition: must be in copy mode");
+        buf.lock().unwrap().clear();
+
+        // Call on_resize with the SAME cols/rows as the current screen.
+        r.on_resize(40, 10);
+
+        let s = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            s.contains("\x1b[?1049l"),
+            "on_resize must exit alt screen (?1049l) even when size unchanged: {s:?}"
+        );
+        assert!(!r.in_copy_mode(), "in_copy_mode() must be false after same-size resize");
     }
 
     /// After `set_mouse_capture(true)` → `suspend_for_external()` →
