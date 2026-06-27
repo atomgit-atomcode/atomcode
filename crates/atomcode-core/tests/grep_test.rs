@@ -39,28 +39,10 @@ async fn test_simple_pattern() {
 
 #[tokio::test]
 async fn test_regex_or() {
-    // First: verify rg works directly via Command
-    let direct = tokio::process::Command::new("rg")
-        .args(&[
-            "--line-number",
-            "--no-heading",
-            "--color=never",
-            "GrepTool|BashTool",
-            "src/tool",
-        ])
-        .current_dir(&wd())
-        .output()
-        .await
-        .unwrap();
-    let direct_out = String::from_utf8_lossy(&direct.stdout);
-    eprintln!(
-        "DIRECT rg: {} lines, exit={:?}",
-        direct_out.lines().count(),
-        direct.status.code()
-    );
-    assert!(!direct_out.is_empty(), "direct rg should find results");
-
-    // Then: verify via grep tool
+    // The grep tool uses a pure-Rust walker (`grep_walk`), not ripgrep, so we test
+    // the tool directly. (An earlier `Command::new("rg")` sanity-check preamble was
+    // removed: it depended on a real `rg` binary on PATH, which fails where `rg` is a
+    // shell function / absent, even though the tool itself never shells out to it.)
     let result = run_grep("GrepTool|BashTool", "src/tool", &wd()).await;
     assert!(
         result.success,
