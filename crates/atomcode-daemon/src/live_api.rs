@@ -1136,7 +1136,25 @@ pub(crate) struct LiveMessageReq {
 /// 非视觉主模型（如 deepseek-v4-flash）在 sync/live 下看不到图片。任何 config/provider
 /// 加载失败都降级为原文，不阻断发送。`provider_name` 为本轮已解析的主 provider（与
 /// `KernelTurnExecutor::run_turn` 同源），仅用其模型名判定是否原生支持视觉。
-async fn preprocess_live_caption(
+/// Resolve a /chat user input after VL captioning. When `captioned` differs from the
+/// `original` text (a non-vision model captioned the images, or captioning failed), the
+/// raw images are DROPPED — the kernel must not forward them to a non-vision provider
+/// adapter (which 400s on raw image data). When the caption is a passthrough (vision model,
+/// or no VL configured), the images are kept so the vision-capable model sees them.
+/// Mirrors the /live `KernelTurnExecutor::preprocess_input` behavior.
+pub(crate) fn resolve_chat_input(
+    original: &str,
+    captioned: String,
+    images: Vec<ImagePart>,
+) -> (String, Vec<ImagePart>) {
+    if images.is_empty() || captioned != original {
+        (captioned, Vec::new())
+    } else {
+        (original.to_string(), images)
+    }
+}
+
+pub(crate) async fn preprocess_live_caption(
     message: &str,
     images: &[ImagePart],
     provider_name: Option<&str>,
@@ -1382,6 +1400,36 @@ mod tests {
     async fn preprocess_live_caption_is_passthrough_without_images() {
         let out = preprocess_live_caption("看下这个图片", &[], None).await;
         assert_eq!(out, "看下这个图片");
+    }
+
+    fn one_image() -> Vec<ImagePart> {
+        vec![ImagePart { media_type: "image/png".into(), data: "AAAA".into() }]
+    }
+
+    // 非视觉模型：VL 把图转成文字（caption != 原文）⇒ 存纯文本并丢弃原图，
+    // 否则 kernel 会把原图发给不支持视觉的模型导致 400。
+    #[test]
+    fn resolve_chat_input_drops_images_when_captioned() {
+        let (text, kept) =
+            resolve_chat_input("看图", "看图\n\n[图片内容（由 vl 识别）]\n一只猫".to_string(), one_image());
+        assert_eq!(text, "看图\n\n[图片内容（由 vl 识别）]\n一只猫");
+        assert!(kept.is_empty(), "captioned ⇒ raw images must be dropped");
+    }
+
+    // 视觉模型 / 未配置 VL：caption 原样返回 ⇒ 保留原图直传 kernel。
+    #[test]
+    fn resolve_chat_input_keeps_images_for_vision_model() {
+        let (text, kept) = resolve_chat_input("看图", "看图".to_string(), one_image());
+        assert_eq!(text, "看图");
+        assert_eq!(kept.len(), 1, "passthrough ⇒ keep images for the vision model");
+    }
+
+    // 无图：纯文本，images 恒空。
+    #[test]
+    fn resolve_chat_input_text_only_when_no_images() {
+        let (text, kept) = resolve_chat_input("hi", "hi".to_string(), Vec::new());
+        assert_eq!(text, "hi");
+        assert!(kept.is_empty());
     }
 
     // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，

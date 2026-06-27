@@ -2294,9 +2294,9 @@ async fn process_chat_request(
 
     // Create conversation from session messages
     let conversation = Arc::new(tokio::sync::Mutex::new(session.to_conversation()));
-    // 构造用户消息：无图则纯文本；带图走 MultiPart。原文 + 原图直接交给引擎——
-    // run_chat_turn_v2 把图片透传给 kernel（由模型/适配器处理，当前 /chat 不做
-    // VL 文字化预处理）；conversation 中保留原图用于 webui 缩略图渲染。
+    // 构造用户消息。带图时先做视觉预处理（镜像 /live 与 TUI）：主模型不支持视觉时，
+    // 配置的 VL 模型把图转成文字，原图被丢弃（否则 kernel 会把原图发给非视觉适配器导致
+    // 400）；视觉模型则原样保留图片直传。无图走纯文本。
     {
         use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
 
@@ -2309,15 +2309,19 @@ async fn process_chat_request(
             })
             .collect();
 
+        let captioned =
+            live_api::preprocess_live_caption(&req.message, &images, Some(&provider_name)).await;
+        let (text, images) = live_api::resolve_chat_input(&req.message, captioned, images);
+
         let mut conv = conversation.lock().await;
         if images.is_empty() {
-            conv.add_user_message(&req.message);
+            conv.add_user_message(&text);
         } else {
             let idx = conv.messages.len();
             conv.messages.push(Message {
                 role: Role::User,
                 content: MessageContent::MultiPart {
-                    text: if req.message.is_empty() { None } else { Some(req.message.clone()) },
+                    text: if text.is_empty() { None } else { Some(text.clone()) },
                     images,
                 },
                 synthetic: false,
