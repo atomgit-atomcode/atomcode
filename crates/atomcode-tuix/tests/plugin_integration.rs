@@ -80,7 +80,9 @@ fn add_install_reload_flow() {
     reg.reload(working.path());
     assert!(reg.get("e2e:sk").is_some(), "missing skill e2e:sk");
 
-    // Verify CustomCommandRegistry sees `e2e:c`.
-    let creg = atomcode_core::commands::CustomCommandRegistry::load(working.path());
+    // Verify CustomCommandRegistry sees `e2e:c`. The registry moved to
+    // atomcode-tuix (refactor: driver-only modules out of core); the plugin
+    // install + skill reload it exercises still live in atomcode_core.
+    let creg = atomcode_tuix::custom_commands::CustomCommandRegistry::load(working.path());
     assert!(creg.get("e2e:c").is_some(), "missing command e2e:c");
 }

@@ -32,7 +32,7 @@ async fn stdio_client_skips_plain_text_stdout_between_protocol_messages() {
     );
     let mut client = StdioClient::new(
         "noisy-test-server".to_string(),
-        env!("CARGO_BIN_EXE_mcp-test-server").to_string(),
+        env!("CARGO_BIN_EXE_mcp-test-server-core").to_string(),
         Vec::new(),
         env,
         Some(5_000),
@@ -50,7 +50,7 @@ async fn stdio_client_works_without_noise() {
     // Baseline: server that doesn't print noise should work fine
     let mut client = StdioClient::new(
         "clean-test-server".to_string(),
-        env!("CARGO_BIN_EXE_mcp-test-server").to_string(),
+        env!("CARGO_BIN_EXE_mcp-test-server-core").to_string(),
         Vec::new(),
         BTreeMap::new(),
         Some(5_000),
