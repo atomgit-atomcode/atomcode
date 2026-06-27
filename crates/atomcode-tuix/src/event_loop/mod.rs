@@ -1528,6 +1528,38 @@ mod buffer_tests {
         assert_eq!(b.expand_pastes("plain text"), "plain text");
     }
 
+    /// The conversation scrollback echoes the SAME expanded text the agent
+    /// receives (`expand_pastes` output) — the full pasted body, never the
+    /// `[Pasted #N …]` placeholder — while the input box and Up-arrow history
+    /// keep the folded form. Regression guard for "对话框里还显示
+    /// [Pasted #1 +N lines]"; documents the asymmetry both submit-echo sites
+    /// rely on (they render `expanded.clone()`, history stores folded `line`).
+    #[test]
+    fn conversation_echo_uses_expanded_payload_not_placeholder() {
+        let mut b = Buffer::new();
+        let body = "line of pasted code\n".repeat(11);
+        b.insert_paste(body.clone());
+
+        // Input box + Up-arrow history: folded placeholder.
+        let folded = b.text.clone();
+        assert!(
+            folded.contains("[Pasted #1 +11 lines]"),
+            "input/history must keep the compact placeholder: {folded:?}"
+        );
+
+        // Agent payload AND conversation echo: fully expanded (no placeholder).
+        let expanded = b.expand_pastes(&folded);
+        assert!(expanded.contains(&body), "echo/payload must carry the full body");
+        assert!(
+            !expanded.contains("[Pasted #"),
+            "no placeholder may survive in the echo/payload: {expanded:?}"
+        );
+        assert_ne!(
+            expanded, folded,
+            "echo (expanded) and input/history (folded) must differ for a folded paste"
+        );
+    }
+
     #[test]
     fn slash_command_arg_expands_folded_paste() {
         // Regression: `/goal <pasted body>` must hand the command the
@@ -6076,8 +6108,15 @@ fn handle_idle_key(
                     &mut kept_markers,
                 );
                 if ctx.sync_session.is_none() {
+                    // Echo the EXACT text the agent receives (`expanded`): the
+                    // full pasted body with `[Pasted #N …]` placeholders expanded
+                    // and typed image paths already rewritten to `[Image #N]`
+                    // markers — never the opaque placeholder. The input box and
+                    // Up-arrow history below stay folded (compact `line`). Sync
+                    // mode echoes via AgentEvent::UserEcho, so this branch is the
+                    // local-TUI path only.
                     renderer.render(UiLine::UserWithAttachments {
-                        text: line.clone(),
+                        text: expanded.clone(),
                         attachments: kept_markers.clone(),
                     });
                 }
@@ -6781,8 +6820,12 @@ fn handle_streaming_key(
                 }
             }
             if ctx.sync_session.is_none() {
+                // Same as the idle submit path: echo the EXACT text queued for
+                // the agent (`expanded`) — the full pasted body, no
+                // `[Pasted #N …]` placeholder — while history keeps the folded
+                // `line` for compact Up-arrow recall.
                 renderer.render(UiLine::UserWithAttachments {
-                    text: line.clone(),
+                    text: expanded.clone(),
                     attachments: q_markers.clone(),
                 });
             }
