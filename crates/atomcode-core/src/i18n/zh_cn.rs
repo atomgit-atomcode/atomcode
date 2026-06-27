@@ -192,6 +192,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── 会话 ──
     Ctrl+C                           取消当前轮 / 关闭弹层
+    Esc Esc                          撤销上一轮
     Ctrl+D                           退出 atomcode
     Ctrl+L                           清屏
     Ctrl+O                           切换工具实时输出
