@@ -325,6 +325,14 @@ pub enum AgentEvent {
     /// Currently sourced from the OpenAI provider's truncation detector
     /// when the proxy reports implausibly few prompt_tokens.
     Warning(String),
+    /// A 429 rate-limit PAUSE — driver renders a non-error pause line with the
+    /// reset time. Empty strings / None when no usage data was available.
+    /// Forwarded from the kernel's `AgentEvent::RateLimited` via the bridge.
+    RateLimited {
+        reset_at_display: String,
+        reset_label: String,
+        secs_until_reset: Option<u64>,
+    },
     /// Unified compaction UI lifecycle, decoupled from the kernel's byte-level
     /// `Compacted` audit. Drives the TUI's spinner takeover (`Begin`/`End`) and
     /// the dim scrollback marker (`Mark`, label already localized by the
@@ -2809,6 +2817,8 @@ impl AgentLoop {
                                     *phase = AgentPhase::WaitingApproval;
                                     let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
                                 }
+                                // TODO(task-7): render pause banner with reset_at_display / reset_label.
+                                TurnEvent::RateLimited { .. } => {}
                             }
                         }
 

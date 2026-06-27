@@ -9088,6 +9088,8 @@ fn handle_agent_event(
                 attach_live_session(ctx, renderer, session, false);
             }
         }
+        // TODO(task-7): render pause banner with reset_at_display / reset_label.
+        AgentEvent::RateLimited { .. } => {}
     }
 }
 

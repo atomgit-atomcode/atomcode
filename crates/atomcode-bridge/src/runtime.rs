@@ -1516,6 +1516,9 @@ impl Bridge {
                 }
             }
             KEv::Warning(w) => self.emit(CoreEv::Warning(w)),
+            KEv::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
+                self.emit(CoreEv::RateLimited { reset_at_display, reset_label, secs_until_reset });
+            }
             KEv::Error { message, http_status, .. } => {
                 let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
                 self.emit(CoreEv::Error { error, snapshot: ConversationSnapshot::default() });
@@ -2512,5 +2515,18 @@ mod goal_disposition_tests {
         // caps / exhaustion override the reason
         assert!(matches!(goal_turn_disposition(Stopped, Some("round limit"), false), GoalDisposition::StopGoal("round limit")));
         assert!(matches!(goal_turn_disposition(Stopped, None, true), GoalDisposition::StopGoal(_)));
+    }
+}
+
+#[cfg(test)]
+mod ratelimited_mapping_tests {
+    #[test]
+    fn ratelimited_event_variant_exists() {
+        // Compile-time guard: core side variant is constructible.
+        let _ = atomcode_core::turn::event::TurnEvent::RateLimited {
+            reset_at_display: "18:09".into(),
+            reset_label: "5h".into(),
+            secs_until_reset: Some(7200),
+        };
     }
 }

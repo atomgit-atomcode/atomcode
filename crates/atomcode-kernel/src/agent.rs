@@ -61,6 +61,23 @@ const MAX_RATE_LIMIT_WAITS: u32 = 20;
 /// pure latency). Mirrors v1's `EMPTY_RESPONSE_MAX_RETRIES`.
 const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
 
+/// How many times a turn may auto-continue after the model's output was cut off at
+/// the token limit (`finish_reason=length`) with no tool call. A truncated response
+/// is almost always unfinished work; v1 (atomcode-core/src/agent/mod.rs:3064) nudged
+/// the model to resume rather than silently ending the turn. BOUNDED (tightly — the
+/// nudge tells the model to switch to incremental file writes, so it should not need
+/// many) so a model that truncates every round cannot livelock the loop.
+const MAX_TRUNCATION_CONTINUATIONS: u32 = 2;
+
+/// Synthetic user message injected after an output-limit truncation. Mirrors v1's
+/// wording but steers toward INCREMENTAL file writes (the durable fix for output
+/// that exceeds a single response's token budget) instead of re-emitting it all.
+const TRUNCATION_RESUME_NUDGE: &str =
+    "Output limit hit — your last response was cut off before finishing. If the task is \
+     already complete, reply with a short summary and stop (no tool calls). Otherwise resume \
+     where you left off, writing the remaining content INCREMENTALLY to a file (append the \
+     next section with edit_file) rather than re-emitting it all in one response.";
+
 /// Short, human reason for the visible "retrying" advisory. Branches on the
 /// STRUCTURED fields (`http_status`) where possible, falling back to a coarse
 /// message sniff for transport errors that carry no status. Mirrors v1's
@@ -843,6 +860,10 @@ impl RunningAgent {
         // `max_rounds` is None — the model never regains agency to stop. Bounded by
         // `max_continuations` (default Some(50)).
         let mut continuations: u32 = 0;
+        // SAFETY FUSE counter: how many times THIS turn auto-continued after an
+        // output-limit truncation (`finish_reason=length`). Bounded by
+        // `MAX_TRUNCATION_CONTINUATIONS` so endless truncation cannot livelock.
+        let mut truncation_continuations: u32 = 0;
         // OVERFLOW recovery counter for the CURRENT round: incremented each time a hard
         // context-overflow triggers a compact-and-retry; reset to 0 on a successful open.
         let mut overflow_attempt: u8 = 0;
@@ -1472,6 +1493,17 @@ impl RunningAgent {
             let pending_calls = assistant_msg.tool_calls.clone();
             convo.push(assistant_msg);
             if pending_calls.is_empty() {
+                // TRUNCATION auto-continuation (v1 parity). The response was cut off at
+                // the OUTPUT-token limit with no tool call ⇒ almost certainly unfinished.
+                // Nudge the model to resume (or to summarize+stop if it is actually done)
+                // instead of silently ending the turn. BOUNDED so endless truncation can't
+                // livelock. Runs BEFORE `offer_continuation` so a discipline hook's nudge
+                // does not pre-empt finishing the truncated content.
+                if truncated && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
+                    truncation_continuations += 1;
+                    convo.push(Message::user(TRUNCATION_RESUME_NUDGE.to_string()));
+                    continue;
+                }
                 if let Some(reminder) = self.hooks.offer_continuation(convo).await {
                     // SAFETY FUSE: a `offer_continuation` that always continues is an infinite
                     // kernel-driven loop with no model agency to stop. Before

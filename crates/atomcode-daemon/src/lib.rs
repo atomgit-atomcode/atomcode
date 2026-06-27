@@ -2912,6 +2912,8 @@ async fn process_chat_request(
                     arguments: call.arguments,
                 });
             }
+            // TODO(task-6): forward as ChatEvent::RateLimited to the webui.
+            TurnEvent::RateLimited { .. } => {}
         }
     }
 
