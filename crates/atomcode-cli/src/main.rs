@@ -1513,6 +1513,16 @@ async fn run() -> Result<i32> {
         );
     }
 
+    // `ATOMCODE_ENABLE_CD` re-exposed the `change_dir` tool to the model on the legacy
+    // stack. It is not honored on the current engine (the tool is not in the default
+    // toolset — weak models looped on it). Tell anyone who still sets it instead of
+    // silently ignoring it.
+    if std::env::var_os("ATOMCODE_ENABLE_CD").is_some() {
+        eprintln!(
+            "[tools] ATOMCODE_ENABLE_CD is no longer honored: change_dir is not exposed on the current engine; the working directory is pinned per session."
+        );
+    }
+
     // tuix now consumes the kernel NATIVELY: `spawn_native_tui` drives a
     // `spawn_native_runtime` (the relocated bridge state machine, in tuix) and presents
     // it as the `(AgentClient, UiEvent receiver)` pair the TUI speaks. The bridge
@@ -1647,7 +1657,13 @@ async fn run() -> Result<i32> {
                     cli.dangerously_skip_permissions,
                     false, // headless ⇒ keep the fail-closed approval timeout
                 );
-                let coding_cfg = atomcode_shell::coding_config(&shell_cfg);
+                let mut coding_cfg = atomcode_shell::coding_config(&shell_cfg);
+                // `--max-turns N` force-stops the agent loop after N continuations (the
+                // kernel's active per-turn fuse). Restores the bound the removed v1 path
+                // honored; unset keeps the default (50). Mainly for eval / CI cost-bounding.
+                if let Some(n) = cli.max_turns {
+                    coding_cfg.max_continuations = n as u32;
+                }
                 let opts = atomcode_coding::PrepareOptions {
                     disabled_tools: disabled_tools.clone(),
                     // `-c` / `--continue` ⇒ resume the latest session (load its snapshot,
