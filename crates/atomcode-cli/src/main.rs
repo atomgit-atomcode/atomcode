@@ -1650,6 +1650,15 @@ async fn run() -> Result<i32> {
                 let coding_cfg = atomcode_shell::coding_config(&shell_cfg);
                 let opts = atomcode_coding::PrepareOptions {
                     disabled_tools: disabled_tools.clone(),
+                    // `-c` / `--continue` ⇒ resume the latest session (load its snapshot,
+                    // append to its `.jsonl`) so the headless turn persists under — and
+                    // continues from — the SAME session telemetry was bound to above
+                    // (`telemetry.set_session_id`). Without this the runtime ran Fresh under a
+                    // new id while telemetry pointed at the old one. Mirrors the TUI + clix.
+                    session: match &session_to_continue {
+                        Some(s) => atomcode_coding::SessionMode::Resume(s.id.as_str().to_string()),
+                        None => atomcode_coding::SessionMode::Fresh,
+                    },
                     ..Default::default()
                 };
                 let factory = atomcode_shell::provider_factory();
@@ -1664,6 +1673,8 @@ async fn run() -> Result<i32> {
                             capture,
                             cli.dangerously_skip_permissions,
                             is_admin,
+                            config.notifications.clone(),
+                            working_dir.clone(),
                         )
                         .await
                     }
@@ -1927,6 +1938,8 @@ async fn run_headless_native(
     capture: bool,
     skip_permissions: bool,
     is_admin: bool,
+    notifications: atomcode_core::config::NotificationConfig,
+    working_dir: std::path::PathBuf,
 ) -> Result<(i32, Option<String>)> {
     use atomcode_kernel::event::{AgentCommand as KCmd, AgentEvent as KE, StopReason};
 
@@ -2088,6 +2101,28 @@ async fn run_headless_native(
             }
             KE::TurnComplete { reason } => {
                 close_thinking_line(&mut thinking_line_open);
+                // Desktop turn-finished notification (parity with the pre-native headless
+                // path). Synthesized from the tallied TurnStats since the kernel
+                // `TurnComplete` carries only `reason`; `notify_turn_finished` no-ops when
+                // notifications are disabled in config.
+                let stop_reason = match &reason {
+                    StopReason::Stopped => atomcode_core::agent::TurnStopReason::Natural,
+                    StopReason::MaxRounds => atomcode_core::agent::TurnStopReason::TurnLimit,
+                    StopReason::MaxContinuations => atomcode_core::agent::TurnStopReason::StepLimit,
+                    StopReason::Cancelled => atomcode_core::agent::TurnStopReason::Cancelled,
+                    _ => atomcode_core::agent::TurnStopReason::Error,
+                };
+                atomcode_core::notify::notify_turn_finished(
+                    &notifications,
+                    atomcode_core::notify::TurnNotification {
+                        duration: stats.duration(),
+                        turn_count: stats.rounds(),
+                        tool_call_count: stats.tool_calls(),
+                        total_tokens: Some(stats.total_tokens()),
+                        stop_reason,
+                        working_dir: Some(&working_dir),
+                    },
+                );
                 if matches!(reason, StopReason::Cancelled) {
                     eprintln!("[cancelled]");
                     exit_code = 130;
