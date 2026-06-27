@@ -22,7 +22,7 @@ mkdir -p .atomcode/hooks
 
 ```bash
 #!/bin/bash
-# 通 过 stdin 接收上下文 JSON
+# 通过 stdin 接收上下文 JSON
 INPUT=$(cat)
 
 # 解析关键信息（推荐安装 jq：brew install jq / apt-get install jq）
@@ -270,6 +270,62 @@ atomcode hooks paths
 # 测试单个 hook
 atomcode hooks test my-hook
 ```
+---
+
+## 调试技巧
+
+### 手动测试 hook 脚本
+
+TOML ScriptHook 通过 stdin 接收上下文 JSON：
+
+```bash
+# 构造测试上下文
+echo '{"tool_name":"read_file","event":"post_tool"}' | bash path/to/hook.sh
+```
+
+JSON CC 兼容 Hook 通过环境变量接收：
+
+```bash
+# 导出环境变量模拟运行环境
+export ATOMCODE_HOOK_EVENT="post_tool_use"
+export ATOMCODE_TOOL_NAME="read_file"
+export ATOMCODE_HOOK_CONTEXT='{"tool_name":"read_file"}'
+python path/to/hook.py
+```
+
+### 配置文件语法校验
+
+```bash
+# TOML 格式校验
+python -c "import tomllib; tomllib.load(open('path/to/hooks.toml','rb'))"
+
+# JSON 格式校验
+python -c "import json; json.load(open('path/to/hooks.json'))"
+```
+
+### CLI 排查命令
+
+```bash
+# 查看当前加载的所有 hook
+atomcode hooks list
+
+# 查看 hook 配置路径
+atomcode hooks paths
+
+# 测试单个 hook 是否正常触发
+atomcode hooks test <hook-name>
+```
+
+### Hook 不触发的 6 步排查清单
+
+| 步骤 | 检查项 | 常见问题 |
+|------|--------|---------|
+| 1 | 文件路径是否存在 | `~` 不会自动展开，需用绝对路径 |
+| 2 | `enabled = true` | 默认 `true`，检查是否意外设为 `false` |
+| 3 | `trigger` / `event` 拼写正确 | 参考上方事件表，大小写敏感 |
+| 4 | 脚本有执行权限 | Linux/macOS 需 `chmod +x` |
+| 5 | 脚本没有超时 | TOML 默认 2s，JSON 默认 10s |
+| 6 | 项目级 hook 覆盖了全局 hook | 项目 hook 优先级更高 |
 
 ---
 
@@ -280,6 +336,7 @@ atomcode hooks test my-hook
 3. **脚本执行有超时** — TOML ScriptHook 默认 2 秒，JSON 默认 10 秒，Webhook 默认 10 秒
 4. **脚本在用户权限下运行** — 注意脚本本身的安全性
 5. **超时/崩溃 fail-open** — 脚本超时或崩溃时视为 `ok`，不阻塞流程
+6. **Windows 兼容性** — `~` 不会自动展开为家目录，需使用完整路径（如 `C:\Users\...`）；路径分隔符使用 `\\` 或 `/`；建议为 Python 脚本显式指定解释器路径
 
 ---
 

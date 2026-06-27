@@ -50,3 +50,32 @@ mode = "no_proxy"
 # https = "http://127.0.0.1:7890"
 # all = "socks5://127.0.0.1:7890"
 # no_proxy = "localhost,127.0.0.1"
+
+# Lifecycle hooks — run custom scripts on key events.
+# See docs/hooks.md for full reference.
+#
+# Hooks support two configuration formats:
+#   TOML: ~/.atomcode/hooks/hooks.toml (recommended, supports ScriptHook + Webhook)
+#   JSON: ~/.atomcode/hooks.json (CC-compatible, lightweight)
+#
+# Available events:
+#   pre_tool_use    — before each tool call (can block via stdout {"action":"block"})
+#   post_tool_use   — after each tool call
+#   user_prompt_submit — when the user submits a prompt
+#   session_start   — when a new session begins
+#   session_end     — when a session ends
+#
+# The script receives context via env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME,
+# ATOMCODE_HOOK_CONTEXT (JSON string). PreToolUse stdout supports:
+#   {"action":"allow"} or {"action":"block","reason":"..."} or {"action":"modify","tool_input":{...}}
+#
+# Example ~/.atomcode/hooks.json:
+# {
+#   "hooks": {
+#     "verify-gate": {
+#       "event": "post_tool_use",
+#       "command": "python ~/.atomcode/scripts/verify-gate.py",  # Windows: use full path like C:\\Users\\you\\.atomcode\\scripts\\verify-gate.py
+#       "timeout_ms": 30000  # default is 10000 (10s); set 30s here because verify may be slow
+#     }
+#   }
+# }
