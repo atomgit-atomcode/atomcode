@@ -1079,6 +1079,20 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn install_git_subdir_clones_only_subtree() {
+        // git-subdir installs use `git sparse-checkout` (git >= 2.25). Skip where the
+        // git binary predates it so the suite stays green on old git instead of
+        // failing inside the unwrap below.
+        let sparse_ok = std::process::Command::new("git")
+            .args(["sparse-checkout", "-h"])
+            .output()
+            .map(|o| !String::from_utf8_lossy(&o.stderr).contains("is not a git command"))
+            .unwrap_or(false);
+        if !sparse_ok {
+            eprintln!(
+                "skip install_git_subdir_clones_only_subtree: git lacks sparse-checkout (need git >= 2.25)"
+            );
+            return;
+        }
         let _home = isolated_home();
         let (upstream, branch) = make_subdir_upstream("pkg/tool");
         let upstream_url = format!("file://{}", upstream.display());

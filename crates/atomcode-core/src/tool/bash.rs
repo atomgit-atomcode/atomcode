@@ -2081,14 +2081,18 @@ mod exit_code_tests {
             .await
             .unwrap();
         assert!(r.success);
+        // Match whole output lines, not substrings: the tool appends a
+        // "[cwd: <working_dir>]" annotation whose temp path can contain stray
+        // 'a'/'b' characters, which would trip a naive `.contains("a")` check.
+        let out_lines: Vec<&str> = r.output.lines().map(|l| l.trim()).collect();
         // Should contain only "c" — the tail actually ran.
         assert!(
-            r.output.contains("c"),
+            out_lines.contains(&"c"),
             "tail -1 must produce 'c'; got:\n{}",
             r.output
         );
         assert!(
-            !r.output.contains("a") || !r.output.contains("b"),
+            !out_lines.contains(&"a") && !out_lines.contains(&"b"),
             "tail -1 must NOT include earlier lines; got:\n{}",
             r.output
         );

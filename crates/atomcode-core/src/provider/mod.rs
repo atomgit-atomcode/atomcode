@@ -698,7 +698,12 @@ mod tests {
     /// This prevents regressions where OAuth login token persistence breaks
     /// after program restart due to path mismatch.
     #[test]
+    #[serial_test::serial]
     fn test_auth_token_path_consistency() {
+        // `#[serial]`: `auth_file_path()` honours the process-global `ATOMCODE_HOME`,
+        // which other (serial) tests set to a tempdir and clear on drop. Without
+        // serialising, this test can observe their value and see a temp path instead
+        // of `~/.atomcode/auth.toml`.
         // Both paths should resolve to the same location: ~/.atomcode/auth.toml
         let auth_module_path = crate::auth::auth_file_path();
         let expected_path = crate::tool::real_home_dir()
