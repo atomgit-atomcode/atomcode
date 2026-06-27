@@ -825,6 +825,12 @@ pub enum Msg<'a> {
     /// newline are part of the template.
     CtrlCAgainToExit,
 
+    /// Discovery hint after the first bare Esc on an empty idle buffer.
+    /// A second Esc within the window rolls the conversation back a turn.
+    /// "  (press Esc again to undo last turn)\n" — leading indent +
+    /// trailing newline are part of the template.
+    EscAgainToUndo,
+
     /// Startup hint shown on terminals where Kitty CSI-u keyboard
     /// disambiguation isn't available, telling the user the
     /// guaranteed-works `\<Enter>` multi-line trick. Multi-line

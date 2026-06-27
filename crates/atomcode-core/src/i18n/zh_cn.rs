@@ -959,6 +959,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "[warning] 正在以管理员权限运行 — 模型可能可以访问系统文件。".into(),
 
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
+        Msg::EscAgainToUndo => "  （再次按 Esc 撤销上一轮）\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} 多行输入：在行尾加 `\\` 再按 Enter。\n    \
             所有终端均可用。（Shift / Alt / Ctrl + Enter 在部分终端也支持，\n    \

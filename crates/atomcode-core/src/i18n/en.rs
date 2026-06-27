@@ -978,6 +978,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "[warning] Running with Administrator privileges — model may have access to system files.".into(),
 
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
+        Msg::EscAgainToUndo => "  (press Esc again to undo last turn)\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \
             Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \

@@ -5808,6 +5808,15 @@ fn handle_idle_key(
         match intercept_empty_bare_esc(&mut app.esc_undo_pending, std::time::Instant::now()) {
             EmptyEscIntercept::Consumed => {
                 app.exit_pending = None;
+                // Surface the second-press affordance, mirroring the
+                // "press Ctrl+C again to exit" hint — otherwise the first
+                // Esc is silently swallowed and the undo gesture is
+                // undiscoverable (and a reflexive double-tap surprises).
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::EscAgainToUndo).into_owned(),
+                ));
+                renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
             EmptyEscIntercept::TriggerUndo => {
