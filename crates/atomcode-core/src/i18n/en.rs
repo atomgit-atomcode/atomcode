@@ -201,6 +201,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── Session ──
     Ctrl+C                           Cancel current turn / dismiss modal
+    Esc Esc                          Undo the previous turn
     Ctrl+D                           Exit AtomCode
     Ctrl+L                           Clear screen
     Ctrl+O                           Toggle tool real-time output

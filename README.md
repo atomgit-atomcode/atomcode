@@ -293,6 +293,7 @@ Then just type what you want:
 | `Alt+Enter` | New line (most terminals; see compatibility note below) |
 | `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
 | `Esc` | Clear input / Cancel stream |
+| `Esc` ×2 | Undo the previous turn |
 | `Up/Down` | Browse input history |
 | `Tab` | Accept suggestion |
 | `Ctrl+U` | Clear line |

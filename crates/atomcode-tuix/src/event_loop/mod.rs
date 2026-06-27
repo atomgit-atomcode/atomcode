@@ -20,8 +20,7 @@ pub(crate) mod live_sync;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
-use commands::execute_slash_command;
-use commands::attach_live_session;
+use commands::{attach_live_session, dispatch_undo, execute_slash_command};
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
@@ -1431,6 +1430,21 @@ fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[test]
+    fn second_esc_within_window_triggers_undo() {
+        let first = std::time::Instant::now();
+        let second = first + DOUBLE_ESC_UNDO_WINDOW;
+        assert!(second_esc_triggers_undo(Some(first), second));
+    }
+
+    #[test]
+    fn second_esc_after_window_does_not_trigger_undo() {
+        let first = std::time::Instant::now();
+        let second = first + DOUBLE_ESC_UNDO_WINDOW + Duration::from_millis(1);
+        assert!(!second_esc_triggers_undo(Some(first), second));
+        assert!(!second_esc_triggers_undo(None, second));
+    }
 
     #[test]
     fn spinner_label_surfaces_network_stall_hint_then_clears_on_activity() {
@@ -2985,6 +2999,9 @@ pub struct App {
     /// Requires a second press within `CTRL_C_EXIT_WINDOW` to actually
     /// exit — protects against accidental single-tap exits.
     pub exit_pending: Option<std::time::Instant>,
+    /// Timestamp of the first bare Esc press on an empty idle buffer.
+    /// A second Esc within `DOUBLE_ESC_UNDO_WINDOW` triggers `/undo`.
+    pub esc_undo_pending: Option<std::time::Instant>,
     /// Set by `/fixissue <url>` while the agent is resolving that issue.
     /// On `TurnComplete` the text buffered in `fixissue_buffer` is posted
     /// back as an issue comment + the `fixed` label is applied. Cleared
@@ -3011,6 +3028,11 @@ pub struct App {
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
+const DOUBLE_ESC_UNDO_WINDOW: Duration = Duration::from_secs(2);
+
+fn second_esc_triggers_undo(pending: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    pending.is_some_and(|t| now.duration_since(t) <= DOUBLE_ESC_UNDO_WINDOW)
+}
 
 /// Grace period after a quit request before the force-exit watchdog fires. The
 /// graceful path (engine teardown closes `cmd_tx`) normally completes in well
@@ -3030,6 +3052,7 @@ impl App {
             think: ThinkStripper::new(),
             pending_tools: std::collections::HashMap::new(),
             exit_pending: None,
+            esc_undo_pending: None,
             fixissue_pending: None,
             fixissue_buffer: String::new(),
             setup_pending: false,
@@ -5403,6 +5426,22 @@ fn handle_idle_key(
         return Ok(());
     }
 
+    if code == KeyCode::Esc
+        && modifiers.is_empty()
+        && menu_items.is_none()
+        && app.buf.text.is_empty()
+    {
+        let now = std::time::Instant::now();
+        if second_esc_triggers_undo(app.esc_undo_pending, now) {
+            app.esc_undo_pending = None;
+            app.exit_pending = None;
+            dispatch_undo("", &app.state, ctx, renderer);
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            return Ok(());
+        }
+        app.esc_undo_pending = Some(now);
+    }
+
     // Ctrl+V: try clipboard image first, fall back to text paste.
     if code == KeyCode::Char('v') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         if let Some((img, hash)) = try_paste_clipboard_image() {
@@ -5513,6 +5552,9 @@ fn handle_idle_key(
     // across arbitrary edits, defeating the point of a short time window.
     if !matches!(result, BufferResult::Exit) {
         app.exit_pending = None;
+    }
+    if code != KeyCode::Esc || !modifiers.is_empty() || !app.buf.text.is_empty() {
+        app.esc_undo_pending = None;
     }
     match result {
         BufferResult::NoOp => {}
