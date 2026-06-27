@@ -7,11 +7,44 @@
 //!
 //! Multi-line inputs are encoded by escaping `\\` → `\\\\` and `\n` → `\\n` so
 //! each entry occupies exactly one line on disk.
+//!
+//! # Concurrency
+//!
+//! An advisory file lock (`input_history.lock`) serialises concurrent `append`
+//! calls from multiple processes (e.g. `/bg` background sessions). The lock
+//! covers the read–trim–rewrite window so no entry is lost between the size
+//! check and the file replacement.
 
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
+use fs2::FileExt;
+
 const MAX_ENTRIES: usize = 1000;
+
+/// Lock file path — sibling to the data file so they share the same directory
+/// and mount point.
+fn lock_path() -> PathBuf {
+    InputHistory::path().with_extension("txt.lock")
+}
+
+/// Acquire an exclusive advisory lock on the lock file, returning the open
+/// handle. The lock is released when the handle is dropped.
+fn lock_exclusive() -> Option<File> {
+    let lp = lock_path();
+    // Ensure the parent directory exists (may not have been created yet).
+    if let Some(parent) = lp.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lp)
+        .ok()?;
+    f.lock_exclusive().ok()?;
+    Some(f)
+}
 
 pub struct InputHistory;
 
@@ -33,6 +66,10 @@ impl InputHistory {
     }
 
     /// Append a new entry, trimming the file if it exceeds `MAX_ENTRIES`.
+    ///
+    /// Uses an advisory file lock so concurrent `append` calls (e.g. from
+    /// `/bg` background sessions or multiple atomcode instances) do not
+    /// corrupt the history file or lose entries.
     pub fn append(entry: &str) {
         if entry.trim().is_empty() {
             return;
@@ -45,7 +82,12 @@ impl InputHistory {
         let mut line = encode_line(entry);
         line.push('\n');
 
-        let append_ok = std::fs::OpenOptions::new()
+        // The lock is held during **both** the append and the trim so that
+        // between reading the file for the size check and replacing it with
+        // the trimmed content no other writer can slip in.
+        let _lock = lock_exclusive();
+
+        let append_ok = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
@@ -62,12 +104,15 @@ impl InputHistory {
                 let keep = &lines[lines.len() - MAX_ENTRIES..];
                 let mut new_content = keep.join("\n");
                 new_content.push('\n');
+                // Write to a temp file in the SAME directory so rename is
+                // always on the same mount point (atomic & cross-fs safe).
                 let tmp = path.with_extension("txt.tmp");
                 if std::fs::write(&tmp, new_content).is_ok() {
                     let _ = std::fs::rename(&tmp, &path);
                 }
             }
         }
+        // _lock is dropped here → lock released
     }
 }
 
