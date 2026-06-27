@@ -5,6 +5,7 @@ const PAD_COL: usize = 2;
 
 /// Input events driven into `CopyMode` by the renderer.
 /// `(col, row)` coordinates are in **overlay viewport** space (0-based).
+#[derive(Debug, PartialEq, Clone)]
 pub enum CopyModeInput {
     Press(u16, u16),
     Drag(u16, u16),

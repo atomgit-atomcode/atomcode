@@ -427,6 +427,13 @@ pub async fn run(
     };
     let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));
 
+    // Enable SGR mouse button + coordinate reporting when auto-copy-on-select
+    // is active. The existing Drop / panic restore sequence already emits
+    // `?1002l?1006l`, so disable-on-exit is handled automatically.
+    if config.ui.auto_copy_on_select {
+        renderer.set_mouse_capture(true);
+    }
+
     // Input thread (only spawn when raw-mode/TTY available; pipe mode
     // reads stdin directly). `reader_handle` exposes Pause / Resume so
     // the OAuth login flow (and any future child-process handoff) can

@@ -603,7 +603,9 @@ pub(super) fn execute_slash_command(
                  ```\n\
                  \n\
                  Full reference: docs/config.example.toml (every field, every provider flavour).\n\
-                 Edit the file, then run /reload — no restart needed.\n",
+                 Edit the file, then run /reload — no restart needed.\n\
+                 \n\
+                 [ui] auto_copy_on_select = true   # drag-select auto-copies; set false to disable\n",
             );
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();

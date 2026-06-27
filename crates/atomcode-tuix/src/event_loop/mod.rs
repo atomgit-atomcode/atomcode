@@ -3007,6 +3007,12 @@ pub struct App {
     /// session. Flipped to `true` after the first render; subsequent
     /// redraws skip the check entirely.
     pub setup_hint_shown: bool,
+    /// True while the auto-copy-on-select overlay is tracking a drag
+    /// selection. The event loop owns this flag because the TaskRenderer
+    /// proxy cannot synchronously query the worker thread's CopyMode state
+    /// (`in_copy_mode()` returns false on the proxy). Reset to false on
+    /// MouseUp, Esc-cancel, or any other termination of a gesture.
+    pub copy_mode_active: bool,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -3035,6 +3041,7 @@ impl App {
             setup_pending: false,
             reasoning_buffer: String::new(),
             setup_hint_shown: false,
+            copy_mode_active: false,
         }
     }
 }
@@ -4393,14 +4400,22 @@ fn handle_input(
         }
     );
 
+    use crate::overlay::copy_mode::CopyModeInput;
     match ev {
+        // When auto-copy-on-select is enabled, scroll events enter the
+        // copy-mode overlay for scrollable history navigation instead of
+        // being delegated to the terminal's native scrollback.
+        InputEvent::MouseScroll(delta) if ctx.config.ui.auto_copy_on_select => {
+            renderer.copy_gesture(CopyModeInput::Scroll(delta));
+            app.copy_mode_active = true;
+        }
         InputEvent::MouseScroll(delta) => {
             // Mouse wheel is a no-op: SGR mouse capture (`?1002h` /
-            // `?1006h`) is intentionally NOT enabled, so wheel ticks
-            // resolve at the terminal level (native scrollback) before
-            // reaching us. This arm survives only as a defensive
-            // catch-all for terminals that forward wheel events
-            // outside the SGR mouse protocol.
+            // `?1006h`) is intentionally NOT enabled (flag-off path),
+            // so wheel ticks resolve at the terminal level (native
+            // scrollback) before reaching us. This arm survives only as
+            // a defensive catch-all for terminals that forward wheel
+            // events outside the SGR mouse protocol.
             renderer.scroll_body(delta);
         }
         InputEvent::Resize(mut cols, mut rows) => {
@@ -4506,8 +4521,23 @@ fn handle_input(
             }
         }
         InputEvent::Eof => {}
-        // Mouse events for auto-copy-on-select feature (Task 7+).
-        // Currently no-op; real selection tracking is implemented in Task 8.
+        // Auto-copy-on-select: forward mouse button events to the renderer's
+        // copy-mode orchestrator when the feature is enabled. The event loop
+        // tracks `copy_mode_active` because TaskRenderer cannot synchronously
+        // query the worker thread's CopyMode state.
+        InputEvent::MouseDown { col, row } if ctx.config.ui.auto_copy_on_select => {
+            renderer.copy_gesture(CopyModeInput::Press(col, row));
+            app.copy_mode_active = true;
+        }
+        InputEvent::MouseDrag { col, row } if app.copy_mode_active => {
+            renderer.copy_gesture(CopyModeInput::Drag(col, row));
+        }
+        InputEvent::MouseUp { col, row } if app.copy_mode_active => {
+            renderer.copy_gesture(CopyModeInput::Release(col, row));
+            app.copy_mode_active = false;
+        }
+        // Flag-off fallback: mouse events reach here when auto-copy is
+        // disabled, keeping wheel/selection terminal-native.
         InputEvent::MouseDown { .. } | InputEvent::MouseDrag { .. } | InputEvent::MouseUp { .. } => {}
         // Act on Press AND Repeat. Release is dropped (it would double-fire
         // every handler on Windows, where crossterm emits all three kinds
@@ -5024,6 +5054,14 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // If the copy-mode overlay is active, Esc cancels the selection and
+    // is swallowed — the user is closing the copy overlay, not the turn.
+    if app.copy_mode_active && code == KeyCode::Esc {
+        use crate::overlay::copy_mode::CopyModeInput;
+        renderer.copy_gesture(CopyModeInput::Cancel);
+        app.copy_mode_active = false;
+        return Ok(());
+    }
     // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
     // so the TUI can legitimately sit in Idle while the agent keeps looping
     // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
@@ -6233,6 +6271,14 @@ fn handle_streaming_key(
         return Ok(());
     }
 
+    // If the copy-mode overlay is active, Esc cancels the selection and
+    // is swallowed — the user is closing the selection, not the turn.
+    if app.copy_mode_active && code == KeyCode::Esc {
+        use crate::overlay::copy_mode::CopyModeInput;
+        renderer.copy_gesture(CopyModeInput::Cancel);
+        app.copy_mode_active = false;
+        return Ok(());
+    }
     // Esc also cancels a running turn (CC-style). Placed before the
     // menu-nav block so Streaming + menu-open Esc still cancels the
     // stream — mid-stream the higher-value action is "stop the agent",
@@ -9440,6 +9486,284 @@ fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
 }
 
 /// Persist the current reasoning_effort to config.toml
+#[cfg(test)]
+mod auto_copy_tests {
+    use super::*;
+    use crate::overlay::copy_mode::CopyModeInput;
+    use crate::render::{Renderer, UiLine};
+    use std::sync::Arc;
+
+    // ── recording renderer ──────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct RecordingRenderer {
+        pub copy_gestures: Vec<CopyModeInput>,
+        pub mouse_capture_calls: Vec<bool>,
+    }
+
+    impl Renderer for RecordingRenderer {
+        fn render(&mut self, _line: UiLine) {}
+        fn flush(&mut self) {}
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+        fn scroll_body(&mut self, _delta: i32) {}
+        fn pop_approval_prompt(&mut self) {}
+        fn copy_gesture(&mut self, g: CopyModeInput) {
+            self.copy_gestures.push(g);
+        }
+        fn set_mouse_capture(&mut self, on: bool) {
+            self.mouse_capture_calls.push(on);
+        }
+    }
+
+    // ── minimal LoopCtx builder ─────────────────────────────────────────────
+
+    fn make_test_ctx(auto_copy: bool) -> LoopCtx {
+        use atomcode_core::agent::{AgentClient, AgentRuntimeFactory};
+        use atomcode_core::session::{Session, SessionManager};
+        use atomcode_core::config::Config;
+        use std::path::PathBuf;
+
+        let mut config = Config::default();
+        config.ui.auto_copy_on_select = auto_copy;
+
+        let tool_registry =
+            Arc::new(atomcode_core::tool::ToolRegistry::new());
+        let skill_registry = Arc::new(std::sync::RwLock::new(
+            atomcode_core::skill::SkillRegistry::new(),
+        ));
+
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent_client = AgentClient {
+            cmd_tx,
+            tool_registry: tool_registry.clone(),
+            skill_registry: skill_registry.clone(),
+        };
+
+        let working_dir = PathBuf::from("/tmp");
+        let runtime_id = bg_runtime::RuntimeId::new(1);
+        let session = Session::default_session(working_dir.clone());
+        let bg_manager = bg_runtime::BgRuntimeManager::new(
+            session.clone(),
+            runtime_id,
+            agent_client.clone(),
+        );
+
+        let (runtime_event_tx, runtime_event_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let (_input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
+        let (oauth_event_tx, oauth_event_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (plugin_job_tx, plugin_job_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        let runtime_factory = AgentRuntimeFactory::new_for_test(
+            config.clone(),
+            working_dir.clone(),
+            tool_registry,
+            skill_registry.clone(),
+        );
+
+        let telemetry = {
+            let cfg = atomcode_telemetry::ResolvedConfig {
+                state: atomcode_telemetry::TelemetryState::Disabled("test"),
+                endpoint: "http://localhost/v1/events".into(),
+                atomcode_dir: working_dir.clone(),
+            };
+            atomcode_telemetry::Telemetry::init(cfg, "test".into())
+        };
+
+        LoopCtx {
+            config,
+            model_name: "test-model".into(),
+            agent: agent_client,
+            shutdown_deadline: None,
+            runtime_factory,
+            runtime_spawn_override: None,
+            bg_manager,
+            foreground_runtime_id: runtime_id,
+            runtime_event_tx,
+            runtime_event_rx,
+            working_dir: working_dir.clone(),
+            previous_dir: None,
+            recent_dirs: vec![],
+            history: crate::input::history::History::load("/tmp/atomcode_test_history_nonexistent"),
+            input_rx,
+            commands: crate::commands::CommandRegistry::builtin(),
+            session_manager: SessionManager::new(&working_dir),
+            current_session: session,
+            update_hint: Arc::new(std::sync::Mutex::new(None)),
+            monitor_warning: Arc::new(std::sync::Mutex::new(None)),
+            hook_warning_hint: Arc::new(std::sync::Mutex::new(None)),
+            monitor_last_check_at: None,
+            usage_slot: Arc::new(std::sync::Mutex::new(None)),
+            usage_last_check_at: None,
+            // Seed with current on-disk marker so refresh_after_cross_process_codingplan_sync
+            // short-circuits ("not advanced") and never reloads config from disk during tests.
+            monitor_last_sync_seen: atomcode_core::coding_plan::read_last_sync(),
+            wake_rx,
+            wake_tx,
+            oauth_event_rx,
+            oauth_event_tx,
+            reader: None,
+            upgrade_tx,
+            upgrade_rx,
+            plugin_job_tx,
+            plugin_job_rx,
+            pending_new_issue: None,
+            pending_run_login_setup: false,
+            pending_open_provider_wizard: false,
+            mcp_registry: None,
+            mcp_connect_rx: None,
+            mcp_reload: None,
+            lsp_connect_rx: None,
+            telemetry,
+            worktree_original_dir: None,
+            custom_commands: crate::custom_commands::CustomCommandRegistry::load(
+                &working_dir,
+            ),
+            skill_registry,
+            caps: crate::terminal::TerminalCaps {
+                tty: false,
+                colors: false,
+                spinner: false,
+                bracketed_paste: false,
+                raw_mode: false,
+                scroll_region: false,
+                unicode_symbols: false,
+                legacy_conhost: false,
+                jediterm: false,
+            },
+            replay_on_start: None,
+            file_index: file_index::FileIndex::new(working_dir.clone()),
+            current_session_id: None,
+            clipboard_check: Arc::new(std::sync::Mutex::new(
+                ClipboardCheckState::default(),
+            )),
+            sync_session: None,
+            sync_forwarder: None,
+            is_plain_renderer: true,
+            dangerously_skip_permissions: false,
+            is_admin: false,
+            pending_guide_topic: None,
+            reasoning_effort: None,
+            transient_hint: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    // ── tests ───────────────────────────────────────────────────────────────
+
+    /// With auto_copy_on_select ON: Press → Drag → Release sends the three
+    /// corresponding CopyModeInput variants to the renderer, and
+    /// copy_mode_active ends as false.
+    #[test]
+    fn flag_on_copy_gestures_reach_renderer() {
+        let mut ctx = make_test_ctx(true);
+        let caps = crate::terminal::TerminalCaps {
+            tty: false,
+            colors: false,
+            spinner: false,
+            bracketed_paste: false,
+            raw_mode: false,
+            scroll_region: false,
+            unicode_symbols: false,
+            legacy_conhost: false,
+            jediterm: false,
+        };
+        let mut app = App::new(&caps);
+        let mut renderer = RecordingRenderer::default();
+
+        handle_input(
+            &mut app,
+            &mut ctx,
+            &mut renderer,
+            InputEvent::MouseDown { col: 2, row: 0 },
+        )
+        .unwrap();
+        assert!(app.copy_mode_active, "copy_mode_active must be set after Press");
+
+        handle_input(
+            &mut app,
+            &mut ctx,
+            &mut renderer,
+            InputEvent::MouseDrag { col: 6, row: 0 },
+        )
+        .unwrap();
+
+        handle_input(
+            &mut app,
+            &mut ctx,
+            &mut renderer,
+            InputEvent::MouseUp { col: 6, row: 0 },
+        )
+        .unwrap();
+
+        assert_eq!(renderer.copy_gestures.len(), 3, "expect Press+Drag+Release");
+        assert_eq!(renderer.copy_gestures[0], CopyModeInput::Press(2, 0));
+        assert_eq!(renderer.copy_gestures[1], CopyModeInput::Drag(6, 0));
+        assert_eq!(renderer.copy_gestures[2], CopyModeInput::Release(6, 0));
+        assert!(!app.copy_mode_active, "copy_mode_active must reset after Release");
+    }
+
+    /// With auto_copy_on_select OFF: mouse events are no-ops and the renderer
+    /// never receives any copy_gesture call.
+    #[test]
+    fn flag_off_no_copy_gestures() {
+        let mut ctx = make_test_ctx(false);
+        let caps = crate::terminal::TerminalCaps {
+            tty: false,
+            colors: false,
+            spinner: false,
+            bracketed_paste: false,
+            raw_mode: false,
+            scroll_region: false,
+            unicode_symbols: false,
+            legacy_conhost: false,
+            jediterm: false,
+        };
+        let mut app = App::new(&caps);
+        let mut renderer = RecordingRenderer::default();
+
+        handle_input(
+            &mut app,
+            &mut ctx,
+            &mut renderer,
+            InputEvent::MouseDown { col: 2, row: 0 },
+        )
+        .unwrap();
+        handle_input(
+            &mut app,
+            &mut ctx,
+            &mut renderer,
+            InputEvent::MouseDrag { col: 6, row: 0 },
+        )
+        .unwrap();
+        handle_input(
+            &mut app,
+            &mut ctx,
+            &mut renderer,
+            InputEvent::MouseUp { col: 6, row: 0 },
+        )
+        .unwrap();
+
+        assert!(
+            renderer.copy_gestures.is_empty(),
+            "flag OFF: no copy_gesture calls expected, got: {:?}",
+            renderer.copy_gestures
+        );
+        assert!(
+            !app.copy_mode_active,
+            "copy_mode_active must stay false when flag is off"
+        );
+    }
+}
+
 fn persist_reasoning_effort(ctx: &mut LoopCtx) {
     let path = Config::default_path();
     let default_provider = ctx.config.default_provider.clone();
