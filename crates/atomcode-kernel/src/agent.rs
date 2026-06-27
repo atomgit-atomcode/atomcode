@@ -73,6 +73,18 @@ fn retry_reason(e: &crate::stream::ProviderError) -> &'static str {
     }
 }
 
+/// Best-effort parse of a "try again in N seconds" hint from a provider error
+/// message (some OpenAI-compatible gateways embed it on a 429). Returns None
+/// when no such hint is found — the host hook is the authoritative reset source;
+/// this is only a fallback for the default (no-host) path.
+fn parse_retry_after_secs(msg: &str) -> Option<u64> {
+    let lower = msg.to_ascii_lowercase();
+    let idx = lower.find("try again in ")? + "try again in ".len();
+    let rest = &lower[idx..];
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num.parse::<u64>().ok()
+}
+
 /// Build the user-facing message shown when the empty-response retry budget is
 /// exhausted. Honest about cause: a content-free 200 from some OpenAI-compatible
 /// gateways is a LIKELY symptom of an over-/near-window request, so when the
@@ -954,7 +966,57 @@ impl RunningAgent {
                     round -= 1; // a RETRY of the same logical round, not a new one
                     continue;
                 }
-                // TRANSIENT failure (429/5xx/transport — `retryable` is set by the
+                // 429 RATE LIMIT: defer to the host's usage-aware verdict instead of
+                // the blind 3/6/9s transient retry (useless for a 5-hour window).
+                // WaitAndRetry => cancellable sleep then re-issue this round.
+                // Pause       => clean RateLimited stop preserving already-produced
+                //                content (NOT a red Error).
+                // Placed BEFORE the generic retryable branch so a 429 never enters
+                // the blind 3/6/9s path.
+                Err(e) if e.http_status == Some(429) => {
+                    let hint = crate::hook::RateLimitHint {
+                        http_status: e.http_status,
+                        retry_after_secs: parse_retry_after_secs(&e.message),
+                    };
+                    let decision = self
+                        .hooks
+                        .on_rate_limit(&hint)
+                        .await
+                        .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
+                    match decision {
+                        crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
+                            self.rt.emit(AgentEvent::RateLimited {
+                                reset_at_display: String::new(),
+                                reset_label: String::new(),
+                                secs_until_reset: Some(secs),
+                            });
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    return;
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
+                            }
+                            round -= 1; // re-issue this round, not a new one
+                            continue;
+                        }
+                        crate::hook::RateLimitDecision::Pause {
+                            reset_at_display,
+                            reset_label,
+                            secs_until_reset,
+                        } => {
+                            self.rt.emit(AgentEvent::RateLimited {
+                                reset_at_display,
+                                reset_label,
+                                secs_until_reset,
+                            });
+                            self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                            return;
+                        }
+                    }
+                }
+                // TRANSIENT failure (5xx/transport — `retryable` is set by the
                 // provider's classifier, incl. `is_retryable_reqwest_error` covering
                 // the stale keep-alive ConnectionReset class). The transport layer
                 // already did its OWN fast retries (~1.5s); this is the SECOND,
@@ -963,7 +1025,8 @@ impl RunningAgent {
                 // connection — and the Warning tells the user a retry is underway
                 // (silent fast-fail read as "no retry happened at all"). NON-retryable
                 // errors (auth / 400 / balance) skip this and hard-fail below, so we
-                // never spin ~18s on an error that cannot recover.
+                // never spin ~18s on an error that cannot recover. 429 is handled
+                // above by the host hook before reaching this branch.
                 Err(e) if e.retryable && provider_retry < MAX_PROVIDER_RETRIES => {
                     provider_retry += 1;
                     let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
@@ -1021,6 +1084,9 @@ impl RunningAgent {
             // `StreamEvent::Malformed`)? Only used to flavor the empty-response retry
             // notice (malformed/garbled vs truly empty); it is NOT content.
             let mut saw_malformed = false;
+            // Set to true by the mid-stream 429 WaitAndRetry arm so we can break
+            // out of the inner stream loop and retry the round from the outer loop.
+            let mut retry_this_round = false;
             loop {
                 // MID-STREAM cancel checkpoint: cancellation stops stream
                 // consumption immediately. Carried from production runner.rs:420.
@@ -1130,6 +1196,50 @@ impl RunningAgent {
                     StreamEvent::ResponseId(id) => response_id = Some(id),
                     // A mid-stream error CLEANLY FAILS the turn: surface it and end —
                     // do NOT fall through to a fake empty-success completion.
+                    // 429 mid-stream: consult the host hook before emitting an Error.
+                    StreamEvent::Error(e) if e.http_status == Some(429) => {
+                        let hint = crate::hook::RateLimitHint {
+                            http_status: e.http_status,
+                            retry_after_secs: parse_retry_after_secs(&e.message),
+                        };
+                        let decision = self
+                            .hooks
+                            .on_rate_limit(&hint)
+                            .await
+                            .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
+                        match decision {
+                            crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
+                                self.rt.emit(AgentEvent::RateLimited {
+                                    reset_at_display: String::new(),
+                                    reset_label: String::new(),
+                                    secs_until_reset: Some(secs),
+                                });
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => {
+                                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                        return;
+                                    }
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
+                                }
+                                retry_this_round = true;
+                                break; // exit stream loop; outer loop will re-issue round
+                            }
+                            crate::hook::RateLimitDecision::Pause {
+                                reset_at_display,
+                                reset_label,
+                                secs_until_reset,
+                            } => {
+                                self.rt.emit(AgentEvent::RateLimited {
+                                    reset_at_display,
+                                    reset_label,
+                                    secs_until_reset,
+                                });
+                                self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                                return;
+                            }
+                        }
+                    }
                     StreamEvent::Error(e) => {
                         self.hooks.on_error(&e.message).await;
                         self.rt.emit(AgentEvent::Error { message: e.message, http_status: e.http_status, code: e.code });
@@ -1146,6 +1256,13 @@ impl RunningAgent {
                         break;
                     }
                 }
+            }
+            // MID-STREAM 429 WaitAndRetry: the stream loop set retry_this_round and
+            // broke out. Re-issue the same logical round (round was already
+            // incremented at the top of the outer loop, so decrement to neutralize).
+            if retry_this_round {
+                round -= 1;
+                continue;
             }
             // EMPTY-RESPONSE FAST RETRY (parity with v1 agent/mod.rs:3027): some
             // OpenAI-compatible gateways (notably the atomgit→DeepSeek path) sometimes
