@@ -4617,24 +4617,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.emit_mouse_capture(on);
     }
 
-    /// Drive a copy-mode mouse gesture through the orchestrator. The body is
-    /// inlined here (rather than delegating to `self.copy_gesture(g)`) to
-    /// eliminate any inherent/trait name-clash ambiguity — Rust would choose
-    /// the inherent method, but the explicit inline makes intent unambiguous
-    /// and rules out accidental infinite recursion at a glance.
+    /// Drive a copy-mode mouse gesture through the orchestrator. Delegates to
+    /// the inherent `copy_gesture` using fully-qualified syntax (UFCS) to avoid
+    /// ambiguity and prevent code duplication.
     fn copy_gesture(&mut self, g: crate::overlay::copy_mode::CopyModeInput) {
-        use crate::overlay::copy_mode::CopyModeInput as I;
-        if matches!(g, I::Press(..) | I::Scroll(..)) && self.copy_mode.is_none() {
-            self.open_copy_mode();
-        }
-        if let Some(n) = self.copy_mode_event(g) {
-            let text = if n == usize::MAX {
-                crate::i18n::t(crate::i18n::Msg::AutoCopyFailed).into_owned()
-            } else {
-                crate::i18n::t(crate::i18n::Msg::AutoCopyOk { chars: n }).into_owned()
-            };
-            self.set_copy_notice(text);
-        }
+        RetainedRenderer::copy_gesture(self, g);
     }
 
     fn in_copy_mode(&self) -> bool {
