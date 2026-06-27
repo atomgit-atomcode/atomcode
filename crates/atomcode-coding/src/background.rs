@@ -82,8 +82,8 @@ pub async fn run(
                 let _ = handle.commands.send(KCmd::Respond { id, value: serde_json::Value::Null });
             }
             KEv::ToolStarted { call } => {
-                if matches!(call.name.as_str(), "write_file" | "edit_file" | "parallel_edit") {
-                    if let Some(p) = extract_path(&call.arguments) {
+                if matches!(call.name.as_str(), "write_file" | "edit_file" | "parallel_edit_files") {
+                    for p in extract_paths(&call.name, &call.arguments) {
                         if !files.contains(&p) {
                             files.push(p);
                         }
@@ -109,13 +109,29 @@ pub async fn run(
     BackgroundOutcome { summary, files_edited: files, turns, success }
 }
 
-/// Pull the `path` out of a write/edit tool's JSON arguments, if present.
-fn extract_path(args: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(args)
-        .ok()?
-        .get("path")?
-        .as_str()
-        .map(|s| s.to_string())
+/// Pull the file path(s) a write/edit tool touched out of its JSON arguments.
+/// `write_file`/`edit_file` carry a single top-level `file_path`; `parallel_edit_files`
+/// carries a `files` array of `{ path, instruction }` entries.
+fn extract_paths(tool: &str, args: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
+        return Vec::new();
+    };
+    match tool {
+        "parallel_edit_files" => v
+            .get("files")
+            .and_then(|f| f.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("path").and_then(|p| p.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => v
+            .get("file_path")
+            .and_then(|p| p.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
+    }
 }
 
 #[cfg(test)]
@@ -123,12 +139,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_path_pulls_path_from_write_args() {
+    fn extract_paths_reads_file_path_for_single_file_tools() {
+        // write_file / edit_file carry a top-level `file_path` (NOT `path`).
         assert_eq!(
-            extract_path(r#"{"path":"src/x.rs","content":"hi"}"#),
-            Some("src/x.rs".to_string())
+            extract_paths("write_file", r#"{"file_path":"src/x.rs","content":"hi"}"#),
+            vec!["src/x.rs".to_string()]
         );
-        assert_eq!(extract_path(r#"{"no_path":1}"#), None);
-        assert_eq!(extract_path("not json"), None);
+        assert_eq!(
+            extract_paths("edit_file", r#"{"file_path":"a.rs","old_string":"a","new_string":"b"}"#),
+            vec!["a.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_paths_reads_nested_files_for_parallel_edit() {
+        // parallel_edit_files carries a `files` array of `{ path, instruction }`.
+        assert_eq!(
+            extract_paths(
+                "parallel_edit_files",
+                r#"{"files":[{"path":"a.rs","instruction":"x"},{"path":"b.rs","instruction":"y"}]}"#,
+            ),
+            vec!["a.rs".to_string(), "b.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_paths_empty_on_missing_or_malformed() {
+        assert!(extract_paths("write_file", r#"{"no_path":1}"#).is_empty());
+        assert!(extract_paths("write_file", "not json").is_empty());
+        assert!(extract_paths("parallel_edit_files", r#"{"files":[]}"#).is_empty());
     }
 }
