@@ -4449,6 +4449,11 @@ fn handle_input(
                     other => deferred.push(other),
                 }
             }
+            // on_resize closes copy_mode internally (so the resize wipe lands
+            // on the main screen). Keep the shadow flag in sync so the event
+            // loop doesn't try to send further copy_gesture calls to a now-
+            // closed overlay.
+            app.copy_mode_active = false;
             renderer.on_resize(cols, rows);
             // A resize invalidates any open modal's cached overlay
             // geometry (it was built for the old size). Rebuild it now so
@@ -4562,6 +4567,21 @@ fn handle_input(
             modifiers,
             ..
         }) => {
+            // Copy-mode global chokepoint: if the alt-screen overlay is open,
+            // close it on ANY key event.  Esc is swallowed (it only closes the
+            // overlay); any other key falls through to normal processing after
+            // the overlay is gone so the keypress still takes effect.
+            // This single chokepoint replaces the Esc-only branches that were
+            // previously duplicated in handle_idle_key and handle_streaming_key.
+            if app.copy_mode_active {
+                use crate::overlay::copy_mode::CopyModeInput;
+                renderer.copy_gesture(CopyModeInput::Cancel);
+                app.copy_mode_active = false;
+                if code == KeyCode::Esc {
+                    return Ok(());
+                }
+                // Non-Esc: fall through to normal key handling.
+            }
             // Modal trumps phase handlers when it's installed — /model,
             // /provider, /resume all install a modal and the event loop
             // funnels every keystroke through it until it reports Close.
@@ -5055,13 +5075,8 @@ fn handle_idle_key(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     // If the copy-mode overlay is active, Esc cancels the selection and
-    // is swallowed — the user is closing the copy overlay, not the turn.
-    if app.copy_mode_active && code == KeyCode::Esc {
-        use crate::overlay::copy_mode::CopyModeInput;
-        renderer.copy_gesture(CopyModeInput::Cancel);
-        app.copy_mode_active = false;
-        return Ok(());
-    }
+    // (Copy-mode Esc handling was here — now handled by the single chokepoint
+    // at the top of the Key event arm in handle_input.)
     // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
     // so the TUI can legitimately sit in Idle while the agent keeps looping
     // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
@@ -6271,14 +6286,8 @@ fn handle_streaming_key(
         return Ok(());
     }
 
-    // If the copy-mode overlay is active, Esc cancels the selection and
-    // is swallowed — the user is closing the selection, not the turn.
-    if app.copy_mode_active && code == KeyCode::Esc {
-        use crate::overlay::copy_mode::CopyModeInput;
-        renderer.copy_gesture(CopyModeInput::Cancel);
-        app.copy_mode_active = false;
-        return Ok(());
-    }
+    // (Copy-mode Esc handling was here — now handled by the single chokepoint
+    // at the top of the Key event arm in handle_input.)
     // Esc also cancels a running turn (CC-style). Placed before the
     // menu-nav block so Streaming + menu-open Esc still cancels the
     // stream — mid-stream the higher-value action is "stop the agent",
@@ -9760,6 +9769,110 @@ mod auto_copy_tests {
         assert!(
             !app.copy_mode_active,
             "copy_mode_active must stay false when flag is off"
+        );
+    }
+
+    // ── Terminal-safety: key chokepoint while copy_mode_active ─────────────
+
+    fn make_caps() -> crate::terminal::TerminalCaps {
+        crate::terminal::TerminalCaps {
+            tty: false,
+            colors: false,
+            spinner: false,
+            bracketed_paste: false,
+            raw_mode: false,
+            scroll_region: false,
+            unicode_symbols: false,
+            legacy_conhost: false,
+            jediterm: false,
+        }
+    }
+
+    /// While `copy_mode_active`, a non-Esc key must:
+    /// 1. Send `CopyModeInput::Cancel` to the renderer.
+    /// 2. Clear `copy_mode_active`.
+    /// 3. Fall through to normal processing (the key itself is NOT swallowed).
+    #[test]
+    fn non_esc_key_while_copy_mode_active_cancels_overlay_and_falls_through() {
+        let mut ctx = make_test_ctx(true);
+        let mut app = App::new(&make_caps());
+        let mut renderer = RecordingRenderer::default();
+
+        // Simulate overlay open via a prior press.
+        app.copy_mode_active = true;
+
+        // Send a non-Esc key (e.g. 'a').
+        handle_input(
+            &mut app,
+            &mut ctx,
+            &mut renderer,
+            InputEvent::Key(crossterm::event::KeyEvent {
+                kind: crossterm::event::KeyEventKind::Press,
+                code: KeyCode::Char('a'),
+                modifiers: crossterm::event::KeyModifiers::NONE,
+                state: crossterm::event::KeyEventState::NONE,
+            }),
+        )
+        .unwrap();
+
+        // Cancel must have been sent to renderer.
+        assert!(
+            renderer.copy_gestures.contains(&CopyModeInput::Cancel),
+            "non-Esc key must send Cancel to renderer: {:?}",
+            renderer.copy_gestures
+        );
+        // Shadow flag must be cleared.
+        assert!(
+            !app.copy_mode_active,
+            "copy_mode_active must be false after any key while overlay is open"
+        );
+    }
+
+    /// While `copy_mode_active`, Esc must:
+    /// 1. Send `CopyModeInput::Cancel` to the renderer.
+    /// 2. Clear `copy_mode_active`.
+    /// 3. Be SWALLOWED — it must NOT cancel an active turn (i.e. only the
+    ///    single Cancel gesture is sent, no further processing in phase handlers).
+    #[test]
+    fn esc_while_copy_mode_active_is_swallowed_not_turn_cancel() {
+        let mut ctx = make_test_ctx(true);
+        let mut app = App::new(&make_caps());
+        let mut renderer = RecordingRenderer::default();
+
+        // Put the app in Streaming so Esc would normally cancel the turn.
+        app.state.phase = crate::state::UiPhase::Streaming;
+        app.copy_mode_active = true;
+
+        handle_input(
+            &mut app,
+            &mut ctx,
+            &mut renderer,
+            InputEvent::Key(crossterm::event::KeyEvent {
+                kind: crossterm::event::KeyEventKind::Press,
+                code: KeyCode::Esc,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+                state: crossterm::event::KeyEventState::NONE,
+            }),
+        )
+        .unwrap();
+
+        // Cancel gesture must be sent.
+        assert!(
+            renderer.copy_gestures.contains(&CopyModeInput::Cancel),
+            "Esc must send Cancel to renderer: {:?}",
+            renderer.copy_gestures
+        );
+        // Shadow flag must be cleared.
+        assert!(
+            !app.copy_mode_active,
+            "copy_mode_active must be false after Esc"
+        );
+        // Exactly ONE copy_gesture call (the Cancel) — nothing else routed.
+        assert_eq!(
+            renderer.copy_gestures.len(),
+            1,
+            "Esc while overlay open must send exactly Cancel and be swallowed: {:?}",
+            renderer.copy_gestures
         );
     }
 }

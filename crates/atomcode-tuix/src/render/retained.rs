@@ -542,6 +542,15 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// text in the alt-screen; `None` in normal live mode. Populated by
     /// `open_copy_mode`, cleared by `close_copy_mode`.
     copy_mode: Option<crate::overlay::CopyMode>,
+    /// Remembered mouse-capture state set by `emit_mouse_capture`.
+    /// `true` after `set_mouse_capture(true)`, `false` after
+    /// `set_mouse_capture(false)` or initial construction. Used by
+    /// `resume_from_external` to re-arm capture after an OAuth / shell
+    /// round-trip without needing access to config. The
+    /// `suspend_for_external` disable writes raw bytes so this flag is
+    /// NOT cleared during suspend — it retains the last user-requested
+    /// state so resume can restore it faithfully.
+    mouse_capture_on: bool,
     /// Transient notice shown in the footer after an automatic clipboard copy
     /// (e.g. "copied 42 chars to clipboard · disable auto-copy in /config").
     /// Auto-dismisses after `COPY_NOTICE_TTL`; also cleared on the next key
@@ -704,6 +713,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             live_group: None,
             modal_overlay: None,
             copy_mode: None,
+            mouse_capture_on: false,
             copy_notice: None,
             copy_notice_at: None,
             body_log: Vec::new(),
@@ -3304,6 +3314,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             b"\x1b[?1002l\x1b[?1006l"
         };
+        self.mouse_capture_on = on;
         let _ = self.out.write_all(seq);
         let _ = self.out.flush();
     }
@@ -4471,6 +4482,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn shutdown(&mut self) {
+        // If the alt-screen copy-mode overlay is open, restore the live
+        // screen before any further teardown so the terminal is not left
+        // stranded in the alt buffer after /quit or Ctrl+C.
+        self.close_copy_mode();
         // Disable mouse capture (button-event + SGR coordinates) so the
         // terminal returns to default mouse behavior when atomcode exits.
         let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");        let _ = self.out.flush();
@@ -4518,6 +4533,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn reset(&mut self) {
+        // If the alt-screen copy-mode overlay is open, restore the live
+        // screen before wiping so the reset operates on the main screen
+        // rather than the alt buffer, and the user never sees the terminal
+        // stuck in the alt buffer after /session, /clear, or /resume.
+        self.close_copy_mode();
         // Terminal-side wipe + full state reset. `body_lines` is
         // also dropped so post-reset the screen truly starts clean
         // (old transcript stays in the terminal's own scrollback).
@@ -4637,11 +4657,20 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn suspend_for_external(&mut self) {
+        // If the alt-screen copy-mode overlay is open, restore the live
+        // screen before handing the terminal to the child process. Without
+        // this, /login or /shell launched while the overlay is active would
+        // print into the alt buffer, which is invisible to the user.
+        self.close_copy_mode();
         // Disable mouse capture so the external child process (OAuth browser,
         // shell prompt, etc.) runs with a clean terminal state. Disable order:
         // SGR first, then button-event. Mouse mode must be off before
         // raw_mode is disabled, so the child process sees the terminal with
         // mouse disabled.
+        // NOTE: write the raw bytes here (not via emit_mouse_capture) so that
+        // `mouse_capture_on` is NOT cleared — it retains the last user-
+        // requested state so resume_from_external can restore it faithfully
+        // when we take the terminal back.
         let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");        // Position cursor at the top of where the footer (input box +
         // status + menu) used to be, then clear from there to end of
         // screen. Without this, cursor stays wherever the last paint
@@ -4757,15 +4786,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
         }
         let _ = self.out.flush();
-        // Mouse capture intentionally NOT re-enabled on resume. We deferred
-        // mouse wheel / cmd+drag selection / cmd+C copy to the terminal's
-        // native handling at startup (see with_writer comment), so resume
-        // must keep that contract — re-enabling here would suddenly steal
-        // wheel events back from the terminal after the user returned from
-        // an external subprocess. The matching disable in
-        // suspend_for_external is still emitted so any subprocess that
-        // somehow turned capture on during its run gets cleaned up here.
-        let _ = self.out.flush();
+        // Re-arm mouse capture if it was enabled before the suspend.
+        // `mouse_capture_on` retains the last user-requested state because
+        // `suspend_for_external` disables mouse by writing raw bytes
+        // (not via emit_mouse_capture), so the flag is preserved across the
+        // suspend/resume cycle. When the auto-copy-on-select feature is
+        // active, `set_mouse_capture(true)` will have been called before
+        // any suspend — so returning from /login or /shell restores capture
+        // without requiring any config access here.
+        // When no one ever called set_mouse_capture(true), mouse_capture_on
+        // is false and we skip this, preserving the startup contract of
+        // deferring wheel/selection to the terminal's native handling.
+        if self.mouse_capture_on {
+            let _ = self.out.write_all(b"\x1b[?1002h\x1b[?1006h");
+            let _ = self.out.flush();
+        }
     }
 
     fn take_pending_scroll_flush(&mut self) -> bool {
@@ -4938,6 +4973,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if cols == self.screen.width() && rows == self.screen.height() {
             return;
         }
+        // If the alt-screen copy-mode overlay is open, exit it first so the
+        // resize wipe and repaint operate on the main screen. Without this,
+        // the CUP+EL sequence below would corrupt the alt-screen content and
+        // the live view would be painted at stale (pre-resize) dimensions.
+        self.close_copy_mode();
         // Diagnostic (opt-in via ATOMCODE_TUIX_LOG): trace each resize phase
         // BEFORE the corresponding console write, so a conhost fastfail during
         // a window drag still leaves the killing phase as the last RSZ line.
@@ -5092,6 +5132,13 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
         // (DevEco/IDEA) that armed state turns every mouse move into input-box
         // gibberish, so a panic here must never push. Popping a level we never
         // pushed is a harmless no-op (empty kitty stack).
+        // If the copy-mode alt-screen overlay is open (e.g. panic while the
+        // user was wheel-scrolling), exit the alt buffer first so the restore
+        // sequences below land on the main screen, not the invisible alt
+        // buffer. `?1049l` is idempotent when the alt screen is not active.
+        if self.copy_mode.is_some() {
+            let _ = self.out.write_all(b"\x1b[?1049l");
+        }
         let _ = self
             .out
             .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");        let _ = self.out.flush();
@@ -12965,6 +13012,99 @@ mod tests {
         assert!(
             r.copy_notice_text_for_test().is_none(),
             "must not set a notice on cancel-without-open"
+        );
+    }
+
+    // ── Terminal-safety regression tests (final review fixes) ─────────────
+
+    /// `shutdown()` while copy_mode is open must emit `?1049l` to exit the
+    /// alt screen so the user is not stranded in the alt buffer after /quit.
+    #[test]
+    fn shutdown_while_copy_mode_open_exits_alt_screen() {
+        let (mut r, buf) = new_capturing(40, 10);
+        r.render(UiLine::AssistantText("hello\n".into()));
+        r.flush_deferred();
+        r.open_copy_mode();
+        assert!(r.in_copy_mode(), "precondition: must be in copy mode");
+        buf.lock().unwrap().clear();
+
+        r.shutdown();
+
+        let s = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            s.contains("\x1b[?1049l"),
+            "shutdown must exit alt screen (?1049l) when copy_mode is open: {s:?}"
+        );
+        // After shutdown the overlay must be gone (close_copy_mode was called).
+        assert!(!r.in_copy_mode(), "copy_mode must be closed after shutdown");
+    }
+
+    /// `Drop` while copy_mode is open must emit `?1049l`. Verifies the
+    /// panic-path (Drop) restores the main screen even if shutdown() never ran.
+    #[test]
+    fn drop_while_copy_mode_open_exits_alt_screen() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        {
+            let sink = CapturingSink(buf.clone());
+            let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 40, 10);
+            r.render(UiLine::AssistantText("hello\n".into()));
+            r.flush_deferred();
+            r.open_copy_mode();
+            assert!(r.in_copy_mode(), "precondition: must be in copy mode");
+            buf.lock().unwrap().clear();
+            // Drop happens here — no explicit shutdown.
+        }
+        let s = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            s.contains("\x1b[?1049l"),
+            "Drop must emit ?1049l when copy_mode is open: {s:?}"
+        );
+    }
+
+    /// `on_resize` while copy_mode is open must emit `?1049l` and leave
+    /// `in_copy_mode()` false so the live resize repaint targets the main screen.
+    #[test]
+    fn on_resize_while_copy_mode_open_exits_alt_screen() {
+        let (mut r, buf) = new_capturing(40, 10);
+        r.render(UiLine::AssistantText("hello\n".into()));
+        r.flush_deferred();
+        r.open_copy_mode();
+        assert!(r.in_copy_mode(), "precondition: must be in copy mode");
+        buf.lock().unwrap().clear();
+
+        r.on_resize(60, 20);
+
+        let s = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            s.contains("\x1b[?1049l"),
+            "on_resize must exit alt screen (?1049l) when copy_mode is open: {s:?}"
+        );
+        assert!(!r.in_copy_mode(), "in_copy_mode() must be false after on_resize");
+    }
+
+    /// After `set_mouse_capture(true)` → `suspend_for_external()` →
+    /// `resume_from_external()`, mouse capture must be re-armed (emits
+    /// `?1002h`) because `mouse_capture_on` is preserved across suspend.
+    #[test]
+    fn mouse_capture_rearmed_after_suspend_resume() {
+        let (mut r, buf) = new_capturing(80, 24);
+        // Enable mouse capture (as auto-copy-on-select would do).
+        r.set_mouse_capture(true);
+        // Suspend: raw bytes disable capture WITHOUT clearing mouse_capture_on.
+        r.suspend_for_external();
+        // Clear accumulated bytes so we only inspect what resume emits.
+        buf.lock().unwrap().clear();
+
+        r.resume_from_external();
+
+        let s = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            s.contains("\x1b[?1002h"),
+            "resume must re-arm button-event capture (?1002h) after set_mouse_capture(true): {s:?}"
+        );
+        assert!(
+            s.contains("\x1b[?1006h"),
+            "resume must re-arm SGR coords (?1006h) after set_mouse_capture(true): {s:?}"
         );
     }
 }

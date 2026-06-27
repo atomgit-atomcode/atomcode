@@ -241,7 +241,11 @@ impl Drop for TerminalGuard {
 /// stack), so this stays unconditional and we needn't thread the
 /// `kbd_flags_pushed` state out of `TerminalGuard`.
 pub(crate) fn panic_restore_sequence() -> &'static [u8] {
-    b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\r\n"
+    // `?1049l` exits the alt screen (harmless no-op when not in alt screen).
+    // Must come FIRST so the subsequent restore sequences land on the main
+    // screen and are visible to the user, not silently applied to the hidden
+    // alt buffer. This covers a panic while the copy-mode overlay is open.
+    b"\x1b[?1049l\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\r\n"
 }
 
 /// Emit [`panic_restore_sequence`] to stdout and flush. Best-effort
@@ -789,5 +793,18 @@ mod panic_restore_tests {
         assert!(text.contains("\x1b[r"), "must release DECSTBM scroll region: {text:?}");
         assert!(text.contains("\x1b[?1002l"), "must disable button-event mouse: {text:?}");
         assert!(text.contains("\x1b[?1006l"), "must disable SGR mouse coords: {text:?}");
+        // ?1049l exits the alt screen (harmless no-op if not in alt screen) so a
+        // panic while the copy-mode overlay is open doesn't strand the user in the
+        // alt buffer. Must come before the other restore sequences.
+        assert!(
+            text.contains("\x1b[?1049l"),
+            "must exit alt screen (?1049l) in case copy-mode is open: {text:?}"
+        );
+        let pos_1049 = text.find("\x1b[?1049l").unwrap();
+        let pos_1002 = text.find("\x1b[?1002l").unwrap();
+        assert!(
+            pos_1049 < pos_1002,
+            "?1049l must come before ?1002l so restore lands on main screen: {text:?}"
+        );
     }
 }
