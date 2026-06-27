@@ -313,6 +313,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "atomcode-capabilities",
+ "atomcode-core",
  "atomcode-kernel",
  "atomcode-review",
  "atomcode-telemetry",

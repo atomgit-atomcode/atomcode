@@ -298,6 +298,11 @@ pub async fn prepare_with_plugin_hooks(
     // is skipped — see StatusReminderHook — to avoid a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
     hooks.push(Arc::new(VerifyCadenceHook::new()));
+    // Rate-limit hook: on a 429 it fetches CodingPlan usage windows and picks the
+    // right wait-vs-pause decision (decide_from_windows). Returns None for
+    // non-CodingPlan providers / fetch failures so the kernel falls back to its
+    // hint-based default with zero behavior change.
+    hooks.push(Arc::new(crate::rate_limit::RateLimitHook::new()) as Arc<dyn LifecycleHooks>);
     // CC external hooks: user/project `hooks.json` + plugin-contributed inline hooks
     // (`plugin_cc_hooks`, resolved by the driver) on the kernel seams — the port of core's
     // CC-parity hook engine onto the v2 engine. ONE instance serves both seams: pushed here
