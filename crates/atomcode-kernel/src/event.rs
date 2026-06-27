@@ -32,6 +32,9 @@ pub enum StopReason {
     Cancelled,
     /// A `user_prompt_submit` hook rejected the prompt — no turn ran.
     PromptRejected,
+    /// The provider returned 429 and the host chose to PAUSE (reset too far to
+    /// wait out). Not a failure — already-produced content is preserved.
+    RateLimited,
 }
 
 /// Driver → agent. Serializable so it crosses process/network boundaries
@@ -149,6 +152,16 @@ pub enum AgentEvent {
     Reasoning(String),
     /// Non-fatal advisory (e.g. a truncated response). The turn still completes.
     Warning(String),
+    /// A 429 rate-limit PAUSE (host decided the reset is too far to auto-wait).
+    /// A driver renders this as a non-error pause line with the reset time, NOT
+    /// as a red error. `secs_until_reset`/`reset_at_display` may be empty when the
+    /// host had no usage data.
+    RateLimited {
+        reset_at_display: String,
+        reset_label: String,
+        #[serde(default)]
+        secs_until_reset: Option<u64>,
+    },
     /// A compaction is ABOUT TO RUN — emitted before the strategy plans/summarizes
     /// (a manual `/compact` may make a slow one-shot LLM summary call here). Lets a
     /// driver show a "compacting…" progress line before the possibly multi-second
