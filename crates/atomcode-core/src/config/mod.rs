@@ -297,6 +297,19 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Create a `Config` with `default_provider` set and all other fields at
+    /// their defaults. Useful for tests and fallback paths: [`Default`] remains
+    /// the single source of truth when fields are added, while callers only
+    /// specify the provider name they actually care about.
+    pub fn with_default_provider(default_provider: impl Into<String>) -> Self {
+        Self {
+            default_provider: default_provider.into(),
+            ..Default::default()
+        }
+    }
+}
+
 /// Controls the per-turn markdown datalog writer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatalogConfig {
@@ -778,22 +791,8 @@ mod tests {
 
     fn blank_config_with_lsp(lsp: LspConfig) -> Config {
         Config {
-            default_provider: "x".into(),
-            evaluator_provider: None,
-            default_workdir: None,
-            providers: Default::default(),
-            datalog: Default::default(),
-            auto_update: true,
-            notifications: Default::default(),
-            telemetry: Default::default(),
             lsp,
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
+            ..Config::with_default_provider("x")
         }
     }
 
@@ -1160,22 +1159,8 @@ mod tests {
     fn saved_config_roundtrips_language() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut cfg = Config {
-            default_provider: "p".to_string(),
-            evaluator_provider: None,
-            default_workdir: None,
-            providers: HashMap::new(),
-            datalog: DatalogConfig::default(),
-            notifications: NotificationConfig::default(),
-            auto_update: true,
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
             language: Some(crate::locale::Locale::ZhCn),
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
+            ..Config::with_default_provider("p")
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1212,6 +1197,18 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.language, None);
+    }
+
+    #[test]
+    fn with_default_provider_only_sets_provider_name() {
+        let mut cfg = Config::with_default_provider("mock");
+        assert_eq!(cfg.default_provider, "mock");
+
+        cfg.default_provider.clear();
+        assert_eq!(
+            toml::to_string(&cfg).unwrap(),
+            toml::to_string(&Config::default()).unwrap()
+        );
     }
 
     #[test]
@@ -1265,22 +1262,9 @@ mod tests {
             },
         );
         Config {
-            default_provider: "active".into(),
-            evaluator_provider: None,
-            default_workdir: None,
             providers,
-            datalog: Default::default(),
-            auto_update: true,
-            notifications: Default::default(),
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
             vision_preprocessor_provider: preprocessor_key.map(|s| s.to_string()),
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
+            ..Config::with_default_provider("active")
         }
     }
 

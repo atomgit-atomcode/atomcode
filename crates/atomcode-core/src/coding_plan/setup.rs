@@ -1140,8 +1140,6 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
     /// Build a `ModelEntry` for tests that only care about the
     /// model name and want every other field to take its fallback
     /// (`base_url` → [`codingplan_llm_base_url`], `provider_type` →
@@ -1159,24 +1157,7 @@ mod tests {
     }
 
     fn blank_config() -> Config {
-        Config {
-            default_provider: String::new(),
-            evaluator_provider: None,
-            default_workdir: None,
-            providers: HashMap::new(),
-            datalog: Default::default(),
-            auto_update: true,
-            notifications: Default::default(),
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
-        }
+        Config::default()
     }
 
     #[test]
