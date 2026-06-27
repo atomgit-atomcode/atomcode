@@ -111,6 +111,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Real-time streaming** with markdown rendering and syntax highlighting
 - **Code blocks** with language labels, line numbers, and `base16-ocean.dark` theme
 - **Multi-line input** with Shift+Enter (or `\` + Enter), auto-growing height, input history
+- **Task completion notifications** — long-running tasks trigger terminal-native notifications first (kitty / WezTerm / iTerm2), falling back to OS-native alerts
 - **Text selection** with mouse drag, auto-scroll, and clipboard copy
 - **Slash commands** — `/model`, `/provider`, `/resume`, `/bg`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
 - **File attachment** — paste file paths to attach content as context
