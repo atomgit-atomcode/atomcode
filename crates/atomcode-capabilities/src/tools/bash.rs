@@ -166,7 +166,17 @@ fn shell_tool_description(is_windows: bool) -> &'static str {
              Windows: commands run via cmd.exe, NOT bash. Use cmd.exe syntax — do NOT use \
              bash-only constructs such as heredocs (<<EOF), command substitution $(...), or \
              printf '\\n'. Chain steps with &&. For multi-line text (e.g. a multi-line commit \
-             message) write it to a temp file and pass the file (e.g. git commit -F msg.txt)."
+             message) write it to a temp file and pass the file (e.g. git commit -F msg.txt).\n\
+             Default to ONE shell — cmd.exe — and do NOT randomly switch between shells mid-task. \
+             Do NOT use git-bash forms like `cmd //c`. Use PowerShell (`pwsh -Command ...`) ONLY \
+             when a task genuinely needs a PowerShell-only feature, never as a substitute for a \
+             cmd.exe builtin. Always quote paths \
+             containing spaces, e.g. `if exist \"C:\\Program Files\"` — an unquoted spaced path \
+             splits into two tokens and reports a false \"not found\".\n\
+             Prefer the dedicated tools over shell file operations: read_file to read a file, \
+             grep to search file contents, glob to list or find files by pattern — instead of \
+             cmd's type/find/dir. They are cross-platform and avoid all the cmd.exe quoting \
+             pitfalls above."
         )
     } else {
         base!()
@@ -841,6 +851,29 @@ mod tests {
 
         let unix = shell_tool_description(false);
         assert!(!unix.contains("cmd.exe"), "unix desc must not mention cmd.exe");
+    }
+
+    // The reported Windows pain: the model thrashes across cmd / pwsh / git-bash
+    // (`pwsh -Command`, `cmd //c`, `dir`) and mishandles spaced paths
+    // (`if exist "C:\Program Files"` wrongly reported as not existing). The
+    // description must (a) pin a single shell, (b) demand quoting spaced paths,
+    // and (c) steer file ops to the native read_file/grep/glob tools.
+    #[test]
+    fn windows_description_discourages_shell_mixing_and_steers_to_native_tools() {
+        let win = shell_tool_description(true);
+        let lc = win.to_lowercase();
+        // Don't switch shells: cmd.exe only, no PowerShell, no git-bash `cmd //c`.
+        assert!(lc.contains("powershell") || lc.contains("pwsh"), "must warn off PowerShell: {win}");
+        assert!(win.contains("//c"), "must warn off git-bash `cmd //c`: {win}");
+        // Quote paths containing spaces.
+        assert!(win.contains(r#""C:\Program Files""#), "must show quoting a spaced path: {win}");
+        // Prefer atomcode's native file tools over shell file ops.
+        assert!(win.contains("glob"), "must steer to glob: {win}");
+        assert!(win.contains("grep"), "must steer to grep: {win}");
+        assert!(win.contains("read_file"), "must steer to read_file: {win}");
+        // The unix description stays lean (no Windows shell noise).
+        let unix = shell_tool_description(false);
+        assert!(!unix.contains("PowerShell") && !unix.contains("//c"), "unix desc unchanged: {unix}");
     }
 
     #[test]
