@@ -412,6 +412,20 @@ body {
   white-space: pre-wrap;
 }
 
+/* Rate-limit pause card — neutral dark card, deliberately NOT red/amber.
+   Signals a temporary provider-side pause; completed work is preserved. */
+.rate-limited-notice {
+  color: var(--app-secondary-foreground);
+  background: var(--app-secondary-background);
+  border-left: 3px solid var(--app-secondary-foreground);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 8px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 /* Non-fatal advisory (e.g. "conversation compacted") — muted amber notice line,
    visually distinct from a red error and never merged into the reply text. */
 .msg-notice {

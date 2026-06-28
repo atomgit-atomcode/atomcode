@@ -586,6 +586,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'error': return { type: 'error', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
+      case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset };
       default: return null;
     }
   }
@@ -756,6 +757,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     });
   }
 
+  function pushRateLimitedToLastAssistant(text: string) {
+    setMessages((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      if (last.role !== 'assistant') return prev;
+      const parts: MsgPart[] = [...last.parts, { kind: 'rate_limited', text }];
+      return [...prev.slice(0, -1), { ...last, parts }];
+    });
+  }
+
   function updateToolInLastAssistant(
     id: string,
     update: Partial<ToolRow>,
@@ -884,6 +895,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         // 回复文本、不结束回合（任务继续）。对齐 TUI 的黄色 "!" 提示。
         pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }));
         break;
+
+      case 'rate_limited': {
+        // 限流暂停：渲染成暗色中性卡片，非红色 error 样式；保留已完成内容，不结束回合。
+        const time = event.reset_at_display;
+        const text = time
+          ? `${t('chat.rateLimited.paused', { time })} · ${t('chat.rateLimited.hint')}`
+          : t('chat.rateLimited.waiting', { secs: String(event.secs_until_reset ?? 0) });
+        pushRateLimitedToLastAssistant(text);
+        break;
+      }
 
       default:
         // Ignore tool_batch, artifact_*, etc.
@@ -1675,6 +1696,13 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
     } else if (p.kind === 'notice') {
       out.push(
         <div class="msg-notice" key={`nt-${i}`}>
+          {p.text}
+        </div>,
+      );
+      i++;
+    } else if (p.kind === 'rate_limited') {
+      out.push(
+        <div class="rate-limited-notice" key={`rl-${i}`}>
           {p.text}
         </div>,
       );

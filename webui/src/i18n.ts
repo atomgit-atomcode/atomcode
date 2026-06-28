@@ -93,6 +93,9 @@ const zh = {
   'chat.error': '[错误: {msg}]',
   'chat.warning': '⚠ {msg}',
   'chat.connError': '[连接错误: {msg}]',
+  'chat.rateLimited.paused': '5 小时窗口已用尽，约 {time} 恢复',
+  'chat.rateLimited.hint': '已保留已完成内容 · 可换模型或稍后重试',
+  'chat.rateLimited.waiting': '限流，{secs}s 后自动继续…',
 
   // Input attach (+) menu
   'attach.menu': '添加',
@@ -306,6 +309,9 @@ const en: Record<MsgKey, string> = {
   'chat.error': '[Error: {msg}]',
   'chat.warning': '⚠ {msg}',
   'chat.connError': '[Connection error: {msg}]',
+  'chat.rateLimited.paused': '5-hour window exhausted — resets around {time}',
+  'chat.rateLimited.hint': 'Completed work is preserved · switch model or retry later',
+  'chat.rateLimited.waiting': 'Rate limited — auto-continuing in {secs}s…',
 
   'attach.menu': 'Add',
   'attach.image': 'Upload image',

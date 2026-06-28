@@ -24,7 +24,8 @@ export interface ToolRow {
 export type MsgPart =
   | { kind: 'text'; text: string }
   | { kind: 'tool'; tool: ToolRow }
-  | { kind: 'notice'; text: string };
+  | { kind: 'notice'; text: string }
+  | { kind: 'rate_limited'; text: string };
 
 /**
  * Append `tool` as a new tool part, OR — when a tool part with the SAME `tool.id`
