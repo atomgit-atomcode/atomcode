@@ -782,6 +782,29 @@ pub enum Msg<'a> {
     /// Confirmation line after `/goal clear` (and its aliases).
     GoalCleared,
 
+    // ── /loop ──
+    /// `/loop` / `/loop status` while a loop is active. `label` is the loop
+    /// description (e.g. "30s · /foo"), `round`/`mins`/`secs` are counters.
+    LoopStatus { label: &'a str, round: u32, mins: u64, secs: u64 },
+    /// `/loop status` (or bare `/loop`) when no loop is active.
+    LoopNoActive,
+    /// Confirmation line after `/loop stop` (and its aliases).
+    LoopCleared,
+    /// Mid-loop turn-separator banner: `⚡ loop round N · stats`.
+    /// `round` is the 1-based round number; `stats` is the pre-formatted
+    /// stats string (tools · duration · tokens · cached%).
+    LoopRound { round: u32, stats: &'a str },
+    /// Emitted by `handle_loop_decision` when the consecutive-failure limit
+    /// is reached and the interval loop auto-stops.
+    LoopStopped,
+    /// End-of-loop banner emitted by the `LoopUpdate { active: false }` handler
+    /// when the loop ends with a non-cancellation reason.
+    /// `reason` is the internal English identifier from `emit_loop_update`
+    /// (e.g. "completed", "round limit (10)") — kept English as-is.
+    LoopEnded { reason: &'a str },
+    /// Description for the `/loop` slash command (shown in `/help`).
+    CmdDescLoop,
+
     /// Surfaced when the user pastes/attaches an image but the active
     /// model can't accept images AND no `vision_preprocessor_provider`
     /// is configured. `model` is the current model identifier.

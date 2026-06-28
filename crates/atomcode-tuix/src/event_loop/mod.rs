@@ -3112,7 +3112,7 @@ pub(crate) fn handle_loop_decision(
             state.loop_round = 0;
             state.loop_started_at = None;
             renderer.render(UiLine::CommandOutput(
-                "⚠ loop stopped (limit reached)\n".into(),
+                crate::i18n::t(crate::i18n::Msg::LoopStopped).into_owned(),
             ));
             renderer.flush();
         }
@@ -7071,14 +7071,18 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
         // Mid-loop continuation banner: `⚡ loop round N · stats`.
         // Uses state.loop_round directly (0-based internally; we show 1-based
         // by adding 1 and then taking max(1) so round 0 displays as 1).
-        format!(
-            "⚡ loop round {} · {} tools · {} · {} tokens{}",
-            (state.loop_round + 1).max(1),
+        let stats = format!(
+            "{} tools · {} · {} tokens{}",
             ps.tool_call_count,
             dur,
             crate::i18n::fmt_tokens(ps.total_tokens),
             cached,
-        )
+        );
+        crate::i18n::t(crate::i18n::Msg::LoopRound {
+            round: (state.loop_round + 1).max(1) as u32,
+            stats: &stats,
+        })
+        .into_owned()
     } else {
         // Reached only if a non-goal/non-loop turn was ever buffered (today
         // they render immediately). Kept as a correct fallback either way.
@@ -8400,15 +8404,13 @@ fn handle_agent_event(
             } else {
                 if state.loop_label.is_some() {
                     if let Some(reason) = last_reason.as_deref() {
-                        let banner = if reason.contains("cancelled")
-                            || reason.contains("cleared by user")
-                        {
-                            None
-                        } else {
-                            Some(format!("  ↻ Loop ended: {reason}\n"))
-                        };
-                        if let Some(line) = banner {
-                            renderer.render(UiLine::CommandOutput(line));
+                        let silent = reason.contains("cancelled")
+                            || reason.contains("cleared by user");
+                        if !silent {
+                            renderer.render(UiLine::CommandOutput(
+                                crate::i18n::t(crate::i18n::Msg::LoopEnded { reason })
+                                    .into_owned(),
+                            ));
                             renderer.flush();
                         }
                     }

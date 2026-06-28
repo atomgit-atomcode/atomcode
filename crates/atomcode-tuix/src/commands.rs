@@ -202,6 +202,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "paste" => Msg::CmdDescPaste,
         "copy" => Msg::CmdDescCopy,
         "view" => Msg::CmdDescView,
+        "loop" => Msg::CmdDescLoop,
         _ => return None,
     };
     Some(t(msg))

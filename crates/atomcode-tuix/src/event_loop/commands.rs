@@ -2096,17 +2096,18 @@ pub(super) fn execute_slash_command(
                             .unwrap_or(0);
                         let mins = secs / 60;
                         let secs_rem = secs % 60;
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "↻ loop: {} · round {} · {}m {}s\n",
-                            label,
-                            state.loop_round + 1,
-                            mins,
-                            secs_rem,
-                        )));
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LoopStatus {
+                                label: label.as_str(),
+                                round: (state.loop_round + 1) as u32,
+                                mins,
+                                secs: secs_rem,
+                            })
+                            .into_owned(),
+                        ));
                     } else {
                         renderer.render(UiLine::CommandOutput(
-                            "没有活跃的 /loop。用法：/loop <间隔> <命令> 或 /loop <任务>\n"
-                                .into(),
+                            crate::i18n::t(crate::i18n::Msg::LoopNoActive).into_owned(),
                         ));
                     }
                     renderer.flush();
@@ -2116,7 +2117,9 @@ pub(super) fn execute_slash_command(
                     state.loop_label = None;
                     state.loop_round = 0;
                     state.loop_started_at = None;
-                    renderer.render(UiLine::CommandOutput("已停止 /loop\n".into()));
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::LoopCleared).into_owned(),
+                    ));
                     renderer.flush();
                 }
                 LoopArg::SelfPaced { prompt } => {

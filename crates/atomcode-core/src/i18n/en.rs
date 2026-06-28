@@ -947,6 +947,20 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::GoalNoActive =>
             "  No active goal.\n  Usage: /goal <condition>   |   /goal help\n".into(),
         Msg::GoalCleared => "  Goal cleared.\n".into(),
+
+        // ── /loop ──
+        Msg::LoopStatus { label, round, mins, secs } =>
+            format!("  ↻ loop: {} · round {} · {}m {}s\n", label, round, mins, secs).into(),
+        Msg::LoopNoActive =>
+            "  No active /loop.\n  Usage: /loop <interval> <cmd>  or  /loop <prompt>\n".into(),
+        Msg::LoopCleared => "  /loop stopped.\n".into(),
+        Msg::LoopRound { round, stats } =>
+            format!("⚡ loop round {} · {}", round, stats).into(),
+        Msg::LoopStopped => "⚠ loop stopped (limit reached)\n".into(),
+        Msg::LoopEnded { reason } =>
+            format!("  ↻ Loop ended: {reason}\n").into(),
+        Msg::CmdDescLoop =>
+            "Repeat a prompt/command on an interval, or let the model self-pace".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "Current model \"{}\" does not support image input and no \
              vision_preprocessor_provider is configured. Use /model to \
