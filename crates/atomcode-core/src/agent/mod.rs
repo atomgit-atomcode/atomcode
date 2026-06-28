@@ -136,6 +136,10 @@ pub enum AgentCommand {
     },
     /// Clear the active goal.
     ClearGoal,
+    /// Start a self-paced /loop with the given prompt.
+    SetLoop { prompt: String },
+    /// Stop the active /loop.
+    ClearLoop,
     /// Shutdown the agent.
     Shutdown,
 }
@@ -386,6 +390,14 @@ pub enum AgentEvent {
         round: u32,
         elapsed_secs: u64,
         condition: String,
+        last_reason: Option<String>,
+    },
+    /// Self-paced /loop progress — TUI mirrors round/elapsed/label.
+    LoopUpdate {
+        active: bool,
+        round: u32,
+        elapsed_secs: u64,
+        label: String,
         last_reason: Option<String>,
     },
     /// `/background` task finished. `summary` is the final assistant text
@@ -654,6 +666,11 @@ pub struct AgentLoop {
 
     /// Active /goal state. Default is inactive (no goal set).
     goal: goal::GoalState,
+
+    /// Active /loop state. Default is inactive (no loop set).
+    loop_state: loop_state::LoopState,
+    /// Pending wakeup request from the last loop iteration.
+    pending_wakeup: Option<loop_state::WakeupRequest>,
 
     /// Files edited across all rounds of the current /goal session.
     /// `files_edited_this_turn` is reset every turn boundary, so we maintain
@@ -1159,6 +1176,8 @@ impl AgentLoop {
             cached_system_prompt_extensions: Vec::new(),
             cached_system_prompt: None,
             goal: goal::GoalState::default(),
+            loop_state: loop_state::LoopState::default(),
+            pending_wakeup: None,
             goal_files_edited: Vec::new(),
             goal_evaluator: None,
             last_stop_reason: TurnStopReason::Natural,
@@ -1365,6 +1384,9 @@ impl AgentLoop {
                     // "(cancelled)" cycles (CR C3).
                     if self.goal.active {
                         self.finalize_goal_cancelled();
+                    }
+                    if self.loop_state.active {
+                        self.finalize_loop_cancelled();
                     }
                     // Sync the preserved messages to TUI
                     let snapshot = self.conversation.snapshot();
@@ -1765,6 +1787,20 @@ impl AgentLoop {
                     self.goal.clear();
                     if prev_active {
                         self.emit_goal_update(false, Some("cleared by user".into()));
+                    }
+                }
+                AgentCommand::SetLoop { prompt } => {
+                    self.loop_state = loop_state::LoopState::new(prompt);
+                    self.loop_state.max_rounds = self.config.loop_config.max_rounds;
+                    self.pending_wakeup = None;
+                    self.emit_loop_update(None);
+                }
+                AgentCommand::ClearLoop => {
+                    let was = self.loop_state.active;
+                    self.loop_state.clear();
+                    self.pending_wakeup = None;
+                    if was {
+                        self.emit_loop_update(Some("cleared by user".into()));
                     }
                 }
                 AgentCommand::Shutdown => {
@@ -3629,6 +3665,25 @@ impl AgentLoop {
         }
         self.goal.clear();
         self.emit_goal_update(false, Some("cancelled by user".to_owned()));
+    }
+
+    fn emit_loop_update(&self, last_reason: Option<String>) {
+        let _ = self.event_tx.send(AgentEvent::LoopUpdate {
+            active: self.loop_state.active,
+            round: self.loop_state.round,
+            elapsed_secs: self.loop_state.elapsed_secs(),
+            label: self.loop_state.label.clone(),
+            last_reason,
+        });
+    }
+
+    fn finalize_loop_cancelled(&mut self) {
+        if !self.loop_state.active && self.loop_state.label.is_empty() {
+            return;
+        }
+        self.loop_state.clear();
+        self.pending_wakeup = None;
+        self.emit_loop_update(Some("cancelled by user".to_owned()));
     }
 
     /// Compact summary of recent agent work for the goal evaluator. Includes:
