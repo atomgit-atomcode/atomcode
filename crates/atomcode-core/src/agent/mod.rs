@@ -456,12 +456,6 @@ pub enum AgentEvent {
     ProviderChanged(String),
     /// 同步会话的另一视图（webui）创建了新会话。TUI 据此跟随切换到新会话。
     SessionSwitched(String),
-    /// Self-paced /loop: model scheduled a wakeup. UI can show "resuming in Xs".
-    WakeupScheduled {
-        delay_seconds: u32,
-        prompt: String,
-        reason: String,
-    },
 }
 
 /// The current phase of the agent (for UI display).
@@ -2548,6 +2542,10 @@ impl AgentLoop {
                 let session_files = &mut self.session_files;
                 let reindex_tx = &self.reindex_tx;
                 let emitted_tool_ids = &mut self.emitted_tool_ids;
+                // Self-paced /loop: disjoint &mut slot so the inline select! arm can
+                // stash a WakeupScheduled without borrowing self. Consumed by the
+                // loop wrapper after the turn; never forwarded to the TUI.
+                let pending_wakeup_slot = &mut self.pending_wakeup;
 
                 // Tool filtering: diagnosis phase uses read-only tools.
                 // All other turns have full tool access (including edit_file).
@@ -2830,7 +2828,8 @@ impl AgentLoop {
                                     let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
                                 }
                                 TurnEvent::WakeupScheduled { delay_seconds, prompt, reason } => {
-                                    let _ = event_tx.send(AgentEvent::WakeupScheduled {
+                                    // Stash for the loop wrapper (last-wins on repeat calls).
+                                    *pending_wakeup_slot = Some(loop_state::WakeupRequest {
                                         delay_seconds,
                                         prompt,
                                         reason,

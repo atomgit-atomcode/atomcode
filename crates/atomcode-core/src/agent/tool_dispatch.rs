@@ -265,10 +265,10 @@ impl AgentLoop {
                 prompt,
                 reason,
             } => {
-                // WakeupScheduled is consumed by the loop harness after
-                // the turn completes. Here we just forward to TUI so it
-                // can display a "wake up in Xs" notice.
-                let _ = self.event_tx.send(AgentEvent::WakeupScheduled {
+                // Self-paced /loop: stash for the wrapper to consume after the
+                // turn (drain path, for events still queued at break). Consumed
+                // in core; never forwarded to the TUI.
+                self.pending_wakeup = Some(crate::agent::loop_state::WakeupRequest {
                     delay_seconds,
                     prompt,
                     reason,
