@@ -8,6 +8,7 @@ pub mod git_checkpoint;
 pub mod compression;
 pub mod goal;
 pub mod goal_evaluator;
+pub mod loop_state;
 pub mod parallel_edit;
 pub mod subtask_driver;
 

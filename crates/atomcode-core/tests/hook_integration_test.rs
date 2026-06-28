@@ -189,11 +189,13 @@ fn test_config() -> Config {
     );
     Config {
         default_provider: "mock".to_string(),
+        evaluator_provider: None,
         default_workdir: None,
         providers,
         datalog: Default::default(),
         auto_update: false,
         subagent: Default::default(),
+        loop_config: Default::default(),
         vision_preprocessor_provider: None,
         language: None,
         ui: Default::default(),

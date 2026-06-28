@@ -310,6 +310,7 @@ mod tests {
             lsp: Default::default(),
             auto_commit: false,
             subagent: Default::default(),
+            loop_config: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),
