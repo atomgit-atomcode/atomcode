@@ -58,7 +58,23 @@ impl Tool for WriteFileTool {
         let path = resolve_path(&a.file_path, &ctx.working_dir);
 
         // Capture pre-existing line count for an overwrite diff message.
-        let old_lines = tokio::fs::read_to_string(&path).await.ok().map(|s| s.lines().count());
+        // Stream-count via BufReader instead of read_to_string to avoid
+        // loading the entire file into memory (OOM on large files).
+        // Skip counting for files > 10 MB — the line count is only a
+        // display hint and not worth the I/O cost.
+        let old_lines: Option<usize> = {
+            match tokio::fs::metadata(&path).await {
+                Ok(meta) if meta.len() <= 10 * 1024 * 1024 => {
+                    let p = path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        std::fs::File::open(&p).ok().map(|f| {
+                            std::io::BufReader::new(f).lines().filter_map(|l| l.ok()).count()
+                        })
+                    }).await.ok().flatten()
+                }
+                _ => None,
+            }
+        };
 
         if let Some(parent) = path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
