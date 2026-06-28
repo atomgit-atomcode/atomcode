@@ -371,31 +371,14 @@ impl SetupReport {
                     }
                 }
                 if !s.rate_limit_windows.is_empty() {
-                    // An exhausted long window (>5h, typically the 30d monthly
-                    // quota) means the user has hit the longer-period limit.
-                    // In that state the short 5h rolling window is moot —
-                    // even if it reads `0% · 重置于 2h 后`, the request
-                    // path is still gated by the monthly cap, so the user
-                    // can't actually issue calls until the long window
-                    // resets. The server hides that monthly window via
-                    // `show_enable=0` while still flagging `quota_exhausted`,
-                    // so we detect exhaustion by that flag (see
-                    // `blocking_exhausted_window`) and render only its line;
-                    // otherwise iterate visible short windows normally.
-                    if let Some(w) = blocking_exhausted_window(&s.rate_limit_windows) {
-                        out.push_str(&t(Msg::CpMonthlyQuotaExhausted {
+                    for w in s.rate_limit_windows.iter().filter(|w| w.show_enable == 1) {
+                        // All visible windows are short rolling (≤5h) —
+                        // standard usage line.
+                        out.push_str(&t(Msg::CpUsageLine {
+                            usage: &w.usage_status_desc,
+                            reset_at: &w.reset_at_display,
                             duration: &format_duration_secs(w.seconds_until_reset),
                         }));
-                    } else {
-                        for w in s.rate_limit_windows.iter().filter(|w| w.show_enable == 1) {
-                            // All visible windows are short rolling (≤5h) —
-                            // standard usage line.
-                            out.push_str(&t(Msg::CpUsageLine {
-                                usage: &w.usage_status_desc,
-                                reset_at: &w.reset_at_display,
-                                duration: &format_duration_secs(w.seconds_until_reset),
-                            }));
-                        }
                     }
                 } else {
                     // Backward-compat path for old server responses.
@@ -1035,27 +1018,6 @@ fn truncate_inline(msg: &str, max: usize) -> String {
 ///
 /// Pick the rate-limit window that is *actually blocking* the user, if any.
 ///
-/// The server reports an exhausted longer-period quota (e.g. the 30d monthly
-/// cap) with `quota_exhausted=true`, but it sets that window's `show_enable=0`
-/// (it hides the raw "本月 100%" line) while leaving the short 5h rolling
-/// window visible at a misleading `0%`. So exhaustion MUST be detected via
-/// `quota_exhausted`, never via `show_enable` (the old filter keyed on
-/// `show_enable==1` and missed the hidden monthly window entirely — surfacing
-/// the rolling window's false "用量约 0%" instead of "本月已耗尽").
-///
-/// Restricted to windows longer than 5h so the caller's "monthly" wording
-/// stays accurate. Returns the longest such window when several are exhausted.
-///
-/// `pub` so `/login` (here) and `/status` (atomcode-tuix) share one rule.
-pub fn blocking_exhausted_window(
-    windows: &[crate::coding_plan::types::RateLimitWindow],
-) -> Option<&crate::coding_plan::types::RateLimitWindow> {
-    windows
-        .iter()
-        .filter(|w| w.quota_exhausted && w.window_size_seconds / 3600 > 5)
-        .max_by_key(|w| w.window_size_seconds)
-}
-
 /// `pub` so the `/status` rendering in atomcode-tuix can share the same
 /// formatter — keeps the `用量 重置于 ...（2h 后）` line consistent
 /// between `/login`'s CodingPlan setup output and `/status`'s
@@ -2499,171 +2461,6 @@ mod tests {
         let out = status_only_report(s).render();
         assert!(out.contains("当前时间窗口用量约 2%"), "usage_status_desc missing: {}", out);
         assert!(out.contains("18:09"), "reset_at_display missing: {}", out);
-    }
-
-    #[test]
-    fn render_long_window_shows_monthly_exhausted() {
-        // window_size_seconds > 5h * 3600 = 18000 → monthly-exhausted message.
-        // Output: `用量：本月用量已耗尽，等 {duration} 后再使用` —
-        // the reset clock-time is intentionally dropped (it's typically a
-        // far-off "06-20 23:09" the user can't act on; the duration anchor
-        // `25d` reads more usefully).
-        let s = crate::coding_plan::types::StatusResponse {
-            rate_limit_windows: vec![
-                RateLimitWindow {
-                    rule_index: 1,
-                    show_enable: 1,
-                    window_size_seconds: 2592000, // 30 days
-                    window_hours: 720,
-                    call_limit: 16000,
-                    calls_used: 16000,
-                    usage_percent: 100.0,
-                    quota_exhausted: true,
-                    reset_at: "2026-06-20T23:09:30".into(),
-                    reset_at_display: "23:09".into(),
-                    seconds_until_reset: 2194080, // ~25.4d
-                    reset_label: String::new(),
-                    usage_status_desc: "当前时间窗口用量约 100%".into(),
-                },
-            ],
-            ..blank_status_response()
-        };
-        let out = status_only_report(s).render();
-        assert!(
-            out.contains("本月用量已耗尽") || out.contains("monthly quota exhausted"),
-            "long-window message missing: {}",
-            out
-        );
-        // Duration anchor present, clock time absent.
-        assert!(
-            out.contains("25d") || out.contains("in 25d"),
-            "duration anchor missing: {}",
-            out
-        );
-        assert!(!out.contains("23:09"), "clock-time should be dropped: {}", out);
-    }
-
-    /// User-reported scenario: monthly quota at 100% AND server also
-    /// reports a fresh 5h rolling window at 0%. Showing both produces
-    /// the misleading `用量 0% 重置于 2h / ⚠ 本月用量已耗尽 12d` pair
-    /// (the 0%-line gave false hope — even with 5h capacity the user
-    /// can't issue calls because the monthly cap gates everything).
-    /// Expected: collapse to the single monthly-exhausted line.
-    #[test]
-    fn render_monthly_exhausted_suppresses_short_window_line() {
-        let s = crate::coding_plan::types::StatusResponse {
-            rate_limit_windows: vec![
-                // 5h rolling, fresh — show_enable=1 from server.
-                RateLimitWindow {
-                    rule_index: 0,
-                    show_enable: 1,
-                    window_size_seconds: 18000,
-                    window_hours: 5,
-                    call_limit: 500,
-                    calls_used: 0,
-                    usage_percent: 0.0,
-                    quota_exhausted: false,
-                    reset_at: "2026-05-28T22:49:00".into(),
-                    reset_at_display: "22:49".into(),
-                    seconds_until_reset: 7200, // 2h
-                    reset_label: String::new(),
-                    usage_status_desc: "当前时间窗口用量约 0%".into(),
-                },
-                // 30d monthly, exhausted. The real server HIDES this window
-                // (show_enable=0) while still flagging quota_exhausted=true —
-                // exhaustion must be detected via the flag, not show_enable.
-                RateLimitWindow {
-                    rule_index: 1,
-                    show_enable: 0,
-                    window_size_seconds: 2592000,
-                    window_hours: 720,
-                    call_limit: 16000,
-                    calls_used: 16000,
-                    usage_percent: 100.0,
-                    quota_exhausted: true,
-                    reset_at: "2026-06-09T22:49:00".into(),
-                    reset_at_display: "06-09 22:49".into(),
-                    seconds_until_reset: 1036800, // 12d
-                    reset_label: String::new(),
-                    usage_status_desc: "本月用量约 100%".into(),
-                },
-            ],
-            ..blank_status_response()
-        };
-        let out = status_only_report(s).render();
-        // Monthly exhausted line present.
-        assert!(
-            out.contains("本月用量已耗尽") || out.contains("monthly quota exhausted"),
-            "monthly-exhausted line missing: {}",
-            out
-        );
-        // Short-window 0% line SUPPRESSED — the whole point of this fix.
-        assert!(
-            !out.contains("用量约 0%") && !out.contains("Usage: 当前时间窗口用量约 0%"),
-            "short-window 0% line must be suppressed when monthly exhausted: {}",
-            out
-        );
-        // Short window's `2h` reset duration should not leak either —
-        // would tell the user a stale "你还有 2 小时" anchor.
-        assert!(
-            !out.contains("（2h 后）") && !out.contains("(in 2h)"),
-            "short-window 2h duration must not leak: {}",
-            out
-        );
-        // Monthly window's 12d duration is what shows.
-        assert!(
-            out.contains("12d"),
-            "monthly 12d duration missing: {}",
-            out
-        );
-    }
-
-    #[test]
-    fn blocking_exhausted_window_detects_hidden_monthly() {
-        // Exact shape the server returns once the 30d monthly quota is spent:
-        // the 5h rolling window is visible at 0%, the exhausted monthly is
-        // HIDDEN (show_enable=0) but flagged quota_exhausted=true.
-        let windows = vec![
-            RateLimitWindow {
-                rule_index: 0,
-                show_enable: 1,
-                window_size_seconds: 18000,
-                window_hours: 5,
-                call_limit: 500,
-                calls_used: 0,
-                usage_percent: 0.0,
-                quota_exhausted: false,
-                reset_at: "2026-06-01T17:58:32".into(),
-                reset_at_display: "17:58".into(),
-                seconds_until_reset: 14716,
-                reset_label: String::new(),
-                usage_status_desc: "当前时间窗口用量约 0%".into(),
-            },
-            RateLimitWindow {
-                rule_index: 1,
-                show_enable: 0,
-                window_size_seconds: 2592000,
-                window_hours: 720,
-                call_limit: 8000,
-                calls_used: 8000,
-                usage_percent: 100.0,
-                quota_exhausted: true,
-                reset_at: "2026-06-26T07:58:32".into(),
-                reset_at_display: "07:58".into(),
-                seconds_until_reset: 2138716,
-                reset_label: String::new(),
-                usage_status_desc: "当前时间窗口用量约 100%".into(),
-            },
-        ];
-        // Despite show_enable=0, the exhausted monthly window is detected.
-        let blocking = super::blocking_exhausted_window(&windows);
-        assert!(blocking.is_some(), "hidden exhausted monthly must be detected");
-        assert_eq!(blocking.unwrap().rule_index, 1);
-
-        // No exhaustion → None (so the rolling usage line renders normally).
-        let mut fresh = windows.clone();
-        fresh[1].quota_exhausted = false;
-        assert!(super::blocking_exhausted_window(&fresh).is_none());
     }
 
     #[test]

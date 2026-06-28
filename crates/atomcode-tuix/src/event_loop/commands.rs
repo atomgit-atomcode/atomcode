@@ -2929,28 +2929,19 @@ fn render_codingplan_status_for_status_cmd() -> String {
     })
     .into_owned();
     // Prefer the per-window `rate_limit_windows` schema when present, mirroring
-    // `/login` (setup.rs). When the monthly cap is exhausted the server flags it
-    // via `quota_exhausted` while hiding the window (`show_enable=0`) and leaving
-    // the 5h rolling window visible at a misleading 0% — so we detect exhaustion
-    // via `blocking_exhausted_window` and suppress the rolling-window usage line.
+    // `/login` (setup.rs). Iterate visible short windows (show_enable=1) normally.
     if !status.rate_limit_windows.is_empty() {
-        use atomcode_core::coding_plan::setup::{blocking_exhausted_window, format_duration_secs};
-        if let Some(w) = blocking_exhausted_window(&status.rate_limit_windows) {
-            out.push_str(&t(Msg::StatusCpMonthlyExhausted {
+        use atomcode_core::coding_plan::setup::format_duration_secs;
+        for w in status
+            .rate_limit_windows
+            .iter()
+            .filter(|w| w.show_enable == 1)
+        {
+            out.push_str(&t(Msg::StatusCpUsage {
+                usage: &w.usage_status_desc,
+                reset_at: &w.reset_at_display,
                 duration: &format_duration_secs(w.seconds_until_reset),
             }));
-        } else {
-            for w in status
-                .rate_limit_windows
-                .iter()
-                .filter(|w| w.show_enable == 1)
-            {
-                out.push_str(&t(Msg::StatusCpUsage {
-                    usage: &w.usage_status_desc,
-                    reset_at: &w.reset_at_display,
-                    duration: &format_duration_secs(w.seconds_until_reset),
-                }));
-            }
         }
     } else if status.window_quota_exhausted {
         // Legacy backward-compat path (old server, no `rate_limit_windows`):
