@@ -681,6 +681,7 @@ pub async fn run(
         sync_forwarder: None,
         reasoning_effort: None,
         transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        loop_ctrl: None,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

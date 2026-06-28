@@ -17,6 +17,7 @@ pub(crate) mod bg_runtime;
 pub(crate) mod commands;
 pub(crate) mod file_index;
 pub(crate) mod live_sync;
+pub(crate) mod loop_ctrl;
 pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
@@ -917,6 +918,9 @@ pub struct LoopCtx {
     pub reasoning_effort: Option<String>,
     /// Transient status-line hint with auto-dismiss.
     pub transient_hint: std::sync::Arc<std::sync::Mutex<Option<TransientHint>>>,
+    /// Active fixed-interval loop controller. `None` when no `/loop N …` is
+    /// running. Task 12 wires the timer that flips `due` and fires the payload.
+    pub loop_ctrl: Option<loop_ctrl::LoopController>,
 }
 
 /// A transient hint shown on the status line, with auto-dismiss deadline.
