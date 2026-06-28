@@ -468,6 +468,10 @@ pub struct StatusLine {
     /// condition text — so users couldn't reliably see the goal while tool
     /// output scrolled. Its own row fixes that.
     pub goal: Option<GoalStatus>,
+    /// When a `/loop` is active, this carries its live status for the dedicated
+    /// footer loop row (its own full-width line, shown instead of the goal row
+    /// — only one of goal/loop is active at a time). `None` ⇒ no loop running.
+    pub loop_status: Option<LoopStatus>,
 }
 
 /// Live status of an active autonomous `/goal` loop, rendered on the dedicated
@@ -481,6 +485,20 @@ pub struct GoalStatus {
     /// The caller adds 1 to the engine's 0-based internal round.
     pub round: u32,
     /// Wall-clock seconds since the goal was set.
+    pub elapsed_secs: u64,
+}
+
+/// Live status of an active `/loop`, rendered on the dedicated footer loop row.
+/// Mirrors `GoalStatus` exactly: the renderer width-truncates `label` to fit,
+/// while `round` and elapsed always survive.
+#[derive(Debug, Clone)]
+pub struct LoopStatus {
+    /// The loop label text (truncated with `…` to fit the row width).
+    pub label: String,
+    /// Round number AS DISPLAYED — 1-based (the first attempt reads `round 1`).
+    /// The caller adds 1 to the engine's 0-based internal round.
+    pub round: u32,
+    /// Wall-clock seconds since the loop was started.
     pub elapsed_secs: u64,
 }
 

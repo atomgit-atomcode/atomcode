@@ -350,6 +350,9 @@ pub struct PendingSeparator {
     /// Whether the turn ran inside an active `/goal` (decides `↻` vs `✓`
     /// when flushed without a goal-end event).
     pub was_goal_round: bool,
+    /// Whether the turn ran inside an active `/loop` (decides `⚡ loop round N`
+    /// vs the normal summary when flushed mid-loop).
+    pub was_loop_round: bool,
     /// Whether the turn ended with `TurnStopReason::Error`. Lets the deferred
     /// flush render the ✗ "stopped" summary instead of a celebratory ✓ under
     /// the red Error line (preserves the pre-/goal-merge behaviour).

@@ -7067,9 +7067,21 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
             crate::i18n::fmt_tokens(ps.total_tokens),
             cached,
         )
+    } else if ps.was_loop_round {
+        // Mid-loop continuation banner: `⚡ loop round N · stats`.
+        // Uses state.loop_round directly (0-based internally; we show 1-based
+        // by adding 1 and then taking max(1) so round 0 displays as 1).
+        format!(
+            "⚡ loop round {} · {} tools · {} · {} tokens{}",
+            (state.loop_round + 1).max(1),
+            ps.tool_call_count,
+            dur,
+            crate::i18n::fmt_tokens(ps.total_tokens),
+            cached,
+        )
     } else {
-        // Reached only if a non-goal turn was ever buffered (today they
-        // render immediately). Kept as a correct fallback either way.
+        // Reached only if a non-goal/non-loop turn was ever buffered (today
+        // they render immediately). Kept as a correct fallback either way.
         turn_summary_label(
             state,
             ps.errored,
@@ -7315,6 +7327,9 @@ fn handle_agent_event(
             | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::CallingTool(_))
             | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::WaitingApproval)
             | AgentEvent::GoalUpdate { active: true, .. }
+            // LoopUpdate(active=true) signals a new loop round beginning — flush any
+            // buffered separator as `⚡ loop round N` before the round's first event.
+            | AgentEvent::LoopUpdate { active: true, .. }
             | AgentEvent::TurnCancelled { .. }
             | AgentEvent::Error { .. }
     );
@@ -7783,14 +7798,27 @@ fn handle_agent_event(
                     tool_call_count,
                     total_tokens,
                     was_goal_round: true,
+                    was_loop_round: false,
+                    errored,
+                    cached_pct,
+                });
+            } else if state.loop_label.is_some() {
+                // A /loop is active: DEFER the separator. The next event can be
+                // a new LLM turn start (flushed by should_flush_now as
+                // `⚡ loop round N · stats`) or a LoopUpdate(active=false) that
+                // signals the loop ended (handled by the LoopUpdate branch itself).
+                state.pending_separator = Some(crate::state::PendingSeparator {
+                    duration,
+                    turn_count,
+                    tool_call_count,
+                    total_tokens,
+                    was_goal_round: false,
+                    was_loop_round: true,
                     errored,
                     cached_pct,
                 });
             } else {
-                // No active goal: render the turn summary immediately, exactly
-                // as before the /goal merge — the line lands at the bottom of
-                // the turn that just finished instead of waiting for the next
-                // event. Same i18n + Error-aware label as the deferred path.
+                // No active goal or loop: render the turn summary immediately.
                 let dur = crate::render::fmt_dur(duration);
                 let label = turn_summary_label(
                     state,
@@ -8388,6 +8416,10 @@ fn handle_agent_event(
                 state.loop_label = None;
                 state.loop_round = 0;
                 state.loop_started_at = None;
+                // Flush any buffered separator as a bare stats line — the
+                // loop-end banner above already conveyed what happened, the
+                // separator just visually closes the last turn.
+                flush_pending_separator(state, renderer, /* as_goal_end */ true);
             }
         }
         AgentEvent::ToolBatchCompleted {
@@ -9010,6 +9042,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         round: state.goal_round + 1,
         elapsed_secs: state.goal_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
     });
+    // Active /loop → the dedicated footer loop row. Mirrors GoalStatus exactly,
+    // using the loop label as the condition equivalent. Goal takes priority if
+    // somehow both are active simultaneously (they shouldn't be).
+    let loop_status = state.loop_label.as_ref().map(|label| crate::render::LoopStatus {
+        label: label.clone(),
+        // Display 1-based: the engine's round is 0-based internally.
+        round: state.loop_round + 1,
+        elapsed_secs: state.loop_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+    });
     crate::render::StatusLine {
         model,
         cwd,
@@ -9025,6 +9066,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         },
         session_name,
         goal,
+        loop_status,
     }
 }
 
