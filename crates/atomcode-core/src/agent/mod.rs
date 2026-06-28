@@ -1361,17 +1361,26 @@ impl AgentLoop {
 
         while let Some(cmd) = self.cmd_rx.recv().await {
             crate::ctrace!("AGT", "outer cmd_rx pop: {:?}", std::mem::discriminant(&cmd));
-            match cmd {
+            if self.dispatch_one(cmd).await {
+                break;
+            }
+        }
+    }
+
+    /// Handle one command dispatched from the outer loop.
+    /// Returns `true` if the agent should shut down (loop should break).
+    async fn dispatch_one(&mut self, cmd: AgentCommand) -> bool {
+        match cmd {
                 AgentCommand::SendMessage { text, images, image_markers } => {
                     self.handle_send_message(text, images, image_markers).await;
                     if self.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
-                        break;
+                        return true;
                     }
                 }
                 AgentCommand::LocalShell { cmd } => {
                     self.handle_local_shell(cmd).await;
                     if self.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
-                        break;
+                        return true;
                     }
                 }
                 AgentCommand::Cancel => {
@@ -1822,10 +1831,10 @@ impl AgentLoop {
                         provider_name: self.config.default_provider.clone(),
                     };
                     self.turn_runner.hook_engine.trigger_session_end(&session_ctx).await;
-                    break;
+                    return true;
                 }
             }
-        }
+        false
     }
 
     // -------------------------------------------------------------------------
