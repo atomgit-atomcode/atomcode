@@ -417,7 +417,8 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 
 ## Architecture
 
-AtomCode is a Rust workspace with four crates:
+AtomCode is a Rust workspace with the following crates (12+,
+covering the agent loop, terminal UI, CLI, daemon, and more):
 
 ```
 atomcode/
@@ -437,11 +438,35 @@ atomcode/
       render/          # Cell-based renderer, diff, retained-mode frame loop
       modals/          # Picker UIs (dir, model, session, provider, issue)
 
-    atomcode-cli/      # Binary entry point (TUI + headless -p mode)
+    atomcode-cli/      # Binary entry point (TUI + headless -p mode) — `atomcode`
       main.rs          # CLI args, first-run wizard, launch
       auth/            # AtomGit OAuth client
 
     atomcode-daemon/   # HTTP/SSE API server over atomcode-core
+
+    atomcode-clix/     # Standalone new-stack CLI — `atomcodex`
+      code.rs          # Coding agent driver
+      review/          # Code-review agent driver
+
+    atomcode-bridge/   # Engine bridge — adapts old-stack drivers to new stack
+
+    atomcode-kernel/   # L0 neutral agent kernel
+      agent.rs         # Generic agent loop
+      middleware/      # Middleware pipeline
+      provider/        # LlmProvider trait
+      tool/            # Tool trait
+      message.rs       # Message types
+
+    atomcode-capabilities/  # L1 capabilities
+      tools/           # Built-in tool implementations
+      mcp/             # MCP support
+      skills/          # User-defined skills
+
+    atomcode-coding/   # L2 coding specialization
+
+    atomcode-review/   # L2 code-review specialization
+
+    atomcode-telemetry/ # Anonymous telemetry
 ```
 
 ### Design Principles

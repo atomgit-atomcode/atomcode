@@ -6,8 +6,16 @@
 |-------|------|
 | **atomcode-core** | Agent 引擎 — 工具、上下文、语义分析、LLM 通信 |
 | **atomcode-tuix** | 终端 UI — retained-mode 渲染、input、modal 选择器、命令分发 |
-| **atomcode-cli** | CLI 入口 — 参数解析、OAuth 登录 |
+| **atomcode-cli** | CLI 入口 — 参数解析、OAuth 登录、`atomcode` 二进制 |
 | **atomcode-daemon** | 后台服务 — HTTP API 服务（独立部署） |
+| **atomcode-clix** | 独立新栈 CLI — `atomcodex` 二进制，驱动 coding 与 review agent |
+| **atomcode-bridge** | 引擎桥接 — 将旧栈 driver 协议适配到新栈（kernel + capabilities + coding） |
+| **atomcode-kernel** | L0 中立 agent 内核 — provider、工具、消息、中间件、事件驱动 |
+| **atomcode-capabilities** | L1 能力层 — 真实 provider 适配器、内置工具、MCP、skills |
+| **atomcode-coding** | L2 编码特化 — 将中立内核 + 能力组装为可运行的自修正编码 agent |
+| **atomcode-review** | L2 代码审查特化 — 只读代码审查 agent，输出结构化发现 |
+| **atomcode-telemetry** | 匿名遥测 — 用量统计与上报 |
+| **atomcode-codingplan-crypto** | 闭源请求签名 — AtomGit LLM 网关专用（仅官方构建包含） |
 
 ---
 

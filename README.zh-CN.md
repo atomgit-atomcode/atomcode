@@ -414,7 +414,8 @@ atomcode --prompt-file task.md
 
 ## 架构
 
-AtomCode 是一个 Rust workspace，由四个 crate 组成：
+AtomCode 是一个 Rust workspace，包含以下 crate（12+ 个，
+覆盖 agent 循环、终端 UI、CLI、daemon 等）：
 
 ```
 atomcode/
@@ -434,11 +435,35 @@ atomcode/
       render/          # cell-level 渲染器、diff、retained-mode 帧循环
       modals/          # 各种 picker（dir、model、session、provider、issue）
 
-    atomcode-cli/      # 可执行入口（TUI + headless -p 模式）
+    atomcode-cli/      # 可执行入口（TUI + headless -p 模式）— `atomcode`
       main.rs          # CLI 参数、首次运行向导、启动
       auth/            # AtomGit OAuth 客户端
 
     atomcode-daemon/   # 基于 atomcode-core 的 HTTP/SSE API 服务
+
+    atomcode-clix/     # 独立新栈 CLI — `atomcodex`
+      code.rs          # Coding agent 驱动
+      review/          # 代码审查 agent 驱动
+
+    atomcode-bridge/   # 引擎桥接 — 旧栈 driver 适配到新栈
+
+    atomcode-kernel/   # L0 中立 agent 内核
+      agent.rs         # 通用 agent 循环
+      middleware/      # 中间件流水线
+      provider/        # LlmProvider trait
+      tool/            # Tool trait
+      message.rs       # 消息类型
+
+    atomcode-capabilities/  # L1 能力层
+      tools/           # 内置工具实现
+      mcp/             # MCP 支持
+      skills/          # 用户自定义 skill
+
+    atomcode-coding/   # L2 编码特化
+
+    atomcode-review/   # L2 代码审查特化
+
+    atomcode-telemetry/ # 匿名遥测
 ```
 
 ### 设计原则
