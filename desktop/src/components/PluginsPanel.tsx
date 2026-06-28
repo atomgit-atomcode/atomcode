@@ -6,7 +6,7 @@ import {
   getAllPlugins,
   installPlugin,
   uninstallPlugin,
-  PluginIpc,
+  setPluginEnabled,
 } from '../plugins/pluginManager';
 import type { PluginPackage } from '../plugins/types';
 
@@ -76,6 +76,22 @@ export function PluginsPanel({ apiBaseUrl: _apiBaseUrl }: PluginsPanelProps) {
     }
   }
 
+  async function handleToggleDisable(pkg: PluginPackage) {
+    const newState = !pkg.disabled;
+    showStatus('info', newState ? `Enabling ${pkg.display}...` : `Disabling ${pkg.display}...`);
+    try {
+      const result = await setPluginEnabled(pkg.name, newState);
+      if (result.success) {
+        showStatus('success', `${pkg.display} ${newState ? 'enabled' : 'disabled'} (reload file to apply)`);
+        await refresh();
+      } else {
+        showStatus('error', `❌ ${result.error || 'Toggle failed'}`);
+      }
+    } catch (err: any) {
+      showStatus('error', `❌ ${err.message}`);
+    }
+  }
+
   const builtinPlugins = plugins.filter((p) => p.builtin);
   const installedPlugins = plugins.filter((p) => !p.builtin);
 
@@ -84,7 +100,7 @@ export function PluginsPanel({ apiBaseUrl: _apiBaseUrl }: PluginsPanelProps) {
       {/* Header */}
       <div className="pl-header">
         <h2 className="pl-title">Plugins</h2>
-        <span className="pl-count">{plugins.length} loaded</span>
+        <span className="pl-count">{plugins.length} total</span>
       </div>
 
       {/* Status */}
@@ -117,16 +133,25 @@ export function PluginsPanel({ apiBaseUrl: _apiBaseUrl }: PluginsPanelProps) {
         ) : (
           <div className="pl-list">
             {builtinPlugins.map((pkg) => (
-              <div className="pl-card pl-card-builtin" key={pkg.name}>
-                <div className="pl-card-icon">✨</div>
+              <div className={'pl-card pl-card-builtin' + (pkg.disabled ? ' pl-card-disabled' : '')} key={pkg.name}>
+                <div className="pl-card-icon">{pkg.disabled ? '⚫' : '✨'}</div>
                 <div className="pl-card-body">
                   <div className="pl-card-name">{pkg.display}</div>
                   <div className="pl-card-id">{pkg.name}@{pkg.version}</div>
                   <div className="pl-card-langs">
                     <code>{pkg.languages?.join(', ')}</code>
                   </div>
+                  {pkg.description && (
+                    <div className="pl-card-desc">{pkg.description}</div>
+                  )}
                 </div>
-                <span className="pl-badge pl-badge-builtin">built-in</span>
+                <button
+                  className={'pl-toggle-btn' + (pkg.disabled ? ' pl-toggle-btn-disabled' : '')}
+                  onClick={() => handleToggleDisable(pkg)}
+                  title={pkg.disabled ? 'Enable' : 'Disable'}
+                >
+                  {pkg.disabled ? 'Enable' : 'Disable'}
+                </button>
               </div>
             ))}
           </div>
@@ -148,8 +173,8 @@ export function PluginsPanel({ apiBaseUrl: _apiBaseUrl }: PluginsPanelProps) {
         ) : (
           <div className="pl-list">
             {installedPlugins.map((pkg) => (
-              <div className="pl-card" key={pkg.name}>
-                <div className="pl-card-icon">📦</div>
+              <div className={'pl-card' + (pkg.disabled ? ' pl-card-disabled' : '')} key={pkg.name}>
+                <div className="pl-card-icon">{pkg.disabled ? '⚫' : '📦'}</div>
                 <div className="pl-card-body">
                   <div className="pl-card-name">{pkg.display || pkg.name}</div>
                   <div className="pl-card-id">{pkg.name}@{pkg.version}</div>
@@ -162,6 +187,13 @@ export function PluginsPanel({ apiBaseUrl: _apiBaseUrl }: PluginsPanelProps) {
                     <div className="pl-card-desc">{pkg.description}</div>
                   )}
                 </div>
+                <button
+                  className={'pl-toggle-btn' + (pkg.disabled ? ' pl-toggle-btn-disabled' : '')}
+                  onClick={() => handleToggleDisable(pkg)}
+                  title={pkg.disabled ? 'Enable' : 'Disable'}
+                >
+                  {pkg.disabled ? 'Enable' : 'Disable'}
+                </button>
                 <button
                   className="pl-uninstall-btn"
                   onClick={() => handleUninstall(pkg)}
@@ -181,7 +213,7 @@ export function PluginsPanel({ apiBaseUrl: _apiBaseUrl }: PluginsPanelProps) {
         <code>package.json</code>
         <span>and</span>
         <code>grammar.json</code>
-        <span>to add syntax highlighting for more languages.</span>
+        <span>to add syntax highlighting. Disabled plugins take effect after reload.</span>
       </div>
     </div>
   );

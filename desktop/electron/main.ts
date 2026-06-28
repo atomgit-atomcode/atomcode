@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, Menu, MenuItemConstructorOptions } from 'electron';
 import * as path from 'path';
 import { DaemonManager } from './daemon';
-import { listPlugins, installPluginFromZip, uninstallPlugin, readGrammar } from './plugins';
+import { listPlugins, installPluginFromZip, uninstallPlugin, readGrammar, isPluginDisabled, setPluginDisabled } from './plugins';
 
 let mainWindow: BrowserWindow | null = null;
 let daemon: DaemonManager | null = null;
@@ -23,7 +23,7 @@ function createMenu() {
       label: 'File',
       submenu: [
         {
-          label: 'Open Folder...',
+          label: 'Open Folder...', 
           accelerator: 'CmdOrCtrl+O',
           click: async () => {
             const result = await dialog.showOpenDialog(mainWindow!, {
@@ -188,6 +188,15 @@ ipcMain.handle('plugins:uninstall', (_event, name: string) => {
 
 ipcMain.handle('plugins:readGrammar', (_event, name: string) => {
   return readGrammar(name);
+});
+
+ipcMain.handle('plugins:isDisabled', (_event, name: string) => {
+  return isPluginDisabled(name);
+});
+
+ipcMain.handle('plugins:setDisabled', (_event, name: string, disabled: boolean) => {
+  setPluginDisabled(name, disabled);
+  return { success: true };
 });
 
 ipcMain.handle('app:getVersion', () => {

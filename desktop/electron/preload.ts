@@ -24,5 +24,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     installPlugin: (): Promise<any> => ipcRenderer.invoke('plugins:install'),
     uninstallPlugin: (name: string): Promise<any> => ipcRenderer.invoke('plugins:uninstall', name),
     readGrammar: (name: string): Promise<any> => ipcRenderer.invoke('plugins:readGrammar', name),
+    isDisabled: (name: string): Promise<boolean> => ipcRenderer.invoke('plugins:isDisabled', name),
+    setDisabled: (name: string, disabled: boolean): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('plugins:setDisabled', name, disabled),
   },
 });

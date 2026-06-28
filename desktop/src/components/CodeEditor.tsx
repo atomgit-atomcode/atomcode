@@ -121,6 +121,9 @@ export function CodeEditor({ filePath, content, language, apiBaseUrl, onSave }: 
             automaticLayout: true,
             bracketPairColorization: { enabled: true },
             padding: { top: 8 },
+            // 启用语义 Token（叠加插件高亮的关键）
+            // Monaco 类型定义里 semanticTokens 是 readonly 字段，运行时设置仍生效
+            ...({ semanticTokens: true } as any),
           }}
         />
       </div>

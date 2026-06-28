@@ -5,6 +5,8 @@ interface PluginIpc {
   installPlugin: () => Promise<{ success: boolean; plugin?: any; error?: string }>;
   uninstallPlugin: (name: string) => Promise<{ success: boolean; error?: string }>;
   readGrammar: (name: string) => Promise<any>;
+  isDisabled: (name: string) => Promise<boolean>;
+  setDisabled: (name: string, disabled: boolean) => Promise<{ success: boolean }>;
 }
 
 interface ElectronAPI {

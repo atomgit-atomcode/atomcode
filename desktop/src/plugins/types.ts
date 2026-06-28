@@ -24,10 +24,12 @@ export interface PluginPackage {
   description?: string;
   /** 适用的 Monaco 语言 ID，如 ["typescript", "javascript"] */
   languages: string[];
-  /** 是否随应用内置（不可卸载） */
+  /** 是否随应用内置（不可卸载，但可禁用） */
   builtin?: boolean;
   /** 安装日期（时间戳） */
   installedAt?: number;
+  /** 是否被禁用（持久化在 ~/.atomcode/plugins/config.json） */
+  disabled?: boolean;
 }
 
 // ============================================================================

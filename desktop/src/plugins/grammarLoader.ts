@@ -3,9 +3,11 @@
  *
  * 管理语法规则 Worker，通过 Monaco 的 registerDocumentSemanticTokensProvider
  * 为各语言注册语义 Token 提供者，将额外的高亮叠加在内置语法高亮之上。
+ *
+ * 注意：Monaco 必须先 loader.init() 完成后才能注册 provider。
+ *      ensureProvider 会等待 Monaco 实例就绪。
  */
 
-import type { editor as monacoEditor } from 'monaco-editor';
 import { loader } from '@monaco-editor/react';
 import type {
   GrammarRule,
@@ -16,7 +18,6 @@ import type {
 import {
   SEMANTIC_TOKEN_LEGEND,
   TOKEN_TYPE_MAP,
-  TOKEN_MODIFIER_MAP,
 } from './types';
 
 // ============================================================================
@@ -83,7 +84,20 @@ export function getGrammarRules(language: string): GrammarRule[] {
 // Monaco Semantic Tokens Provider
 // ============================================================================
 
-let providersRegistered = new Set<string>();
+const providersRegistered = new Set<string>();
+let monacoInstance: any = null;
+let monacoReadyPromise: Promise<any> | null = null;
+
+async function getMonaco(): Promise<any> {
+  if (monacoInstance) return monacoInstance;
+  if (!monacoReadyPromise) {
+    monacoReadyPromise = loader.init().then((m) => {
+      monacoInstance = m;
+      return m;
+    });
+  }
+  return monacoReadyPromise;
+}
 
 /**
  * 为指定语言注册语义 Token 提供者（如果尚未注册）
@@ -92,7 +106,7 @@ async function ensureProvider(language: string): Promise<void> {
   if (providersRegistered.has(language)) return;
   providersRegistered.add(language);
 
-  const monaco = await loader.init();
+  const monaco = await getMonaco();
 
   monaco.languages.registerDocumentSemanticTokensProvider(language, {
     getLegend: () => ({
@@ -143,9 +157,10 @@ async function ensureProvider(language: string): Promise<void> {
 }
 
 /**
- * 初始化语法加载器：为所有已注册的语言注册提供者
+ * 初始化语法加载器：等待 Monaco 就绪后为所有已注册的语言注册提供者
  */
 export async function initializeGrammarLoader(): Promise<void> {
+  await getMonaco();
   for (const lang of languageRules.keys()) {
     await ensureProvider(lang);
   }
@@ -155,9 +170,9 @@ export async function initializeGrammarLoader(): Promise<void> {
  * 加载插件后，为新语言注册提供者
  */
 export async function refreshGrammarProviders(): Promise<void> {
-  const registered = new Set(providersRegistered);
+  await getMonaco();
   for (const lang of languageRules.keys()) {
-    if (!registered.has(lang)) {
+    if (!providersRegistered.has(lang)) {
       await ensureProvider(lang);
     }
   }

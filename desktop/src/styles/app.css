@@ -1088,6 +1088,23 @@ html, body, #root {
 .pl-uninstall-btn:hover { background: rgba(244,71,71,0.15); }
 .pl-uninstall-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
+.pl-toggle-btn {
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 3px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: var(--font-size-xs);
+  font-family: inherit;
+  flex-shrink: 0;
+}
+.pl-toggle-btn:hover { background: var(--bg-hover); border-color: var(--accent); }
+.pl-toggle-btn-disabled { color: var(--success); border-color: var(--success); }
+.pl-toggle-btn-disabled:hover { background: rgba(78,201,176,0.15); }
+
+.pl-card-disabled { opacity: 0.5; }
+
 .pl-badge {
   font-size: 10px;
   padding: 2px 8px;
