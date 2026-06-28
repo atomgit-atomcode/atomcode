@@ -456,6 +456,12 @@ pub enum AgentEvent {
     ProviderChanged(String),
     /// 同步会话的另一视图（webui）创建了新会话。TUI 据此跟随切换到新会话。
     SessionSwitched(String),
+    /// Self-paced /loop: model scheduled a wakeup. UI can show "resuming in Xs".
+    WakeupScheduled {
+        delay_seconds: u32,
+        prompt: String,
+        reason: String,
+    },
 }
 
 /// The current phase of the agent (for UI display).
@@ -906,6 +912,10 @@ impl AgentLoop {
             tool_registry.register_sync(Box::new(UseSkillTool {
                 registry: skill_registry.clone(),
             }));
+        }
+
+        if internal_enabled("schedule_wakeup") {
+            tool_registry.register_sync(Box::new(crate::tool::schedule_wakeup::ScheduleWakeupTool));
         }
 
         // Graph query tools: not exposed to model (adds 5 tool definitions that
@@ -2818,6 +2828,13 @@ impl AgentLoop {
                                     });
                                     *phase = AgentPhase::WaitingApproval;
                                     let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
+                                }
+                                TurnEvent::WakeupScheduled { delay_seconds, prompt, reason } => {
+                                    let _ = event_tx.send(AgentEvent::WakeupScheduled {
+                                        delay_seconds,
+                                        prompt,
+                                        reason,
+                                    });
                                 }
                             }
                         }

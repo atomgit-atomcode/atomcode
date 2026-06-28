@@ -260,6 +260,20 @@ impl AgentLoop {
                 // mid-turn persistence; the approval flow itself is
                 // managed by the `approval_req_rx` channel.
             }
+            TurnEvent::WakeupScheduled {
+                delay_seconds,
+                prompt,
+                reason,
+            } => {
+                // WakeupScheduled is consumed by the loop harness after
+                // the turn completes. Here we just forward to TUI so it
+                // can display a "wake up in Xs" notice.
+                let _ = self.event_tx.send(AgentEvent::WakeupScheduled {
+                    delay_seconds,
+                    prompt,
+                    reason,
+                });
+            }
         }
     }
 
