@@ -2448,7 +2448,11 @@ impl AgentLoop {
             // standing instruction so the model keeps planning instead of
             // dumping the implementation inline (the read-only tool gate blocks
             // file writes, but not writing code into the reply).
-            let turn_reminder = plan_mode_turn_reminder(self.plan_mode);
+            let turn_reminder = format!(
+                "{}{}",
+                plan_mode_turn_reminder(self.plan_mode),
+                loop_mode_turn_reminder(self.loop_state.active),
+            );
             let cancel = self.cancel_token.clone();
 
             // Context compression: when > 70% budget, pause and compress
@@ -4409,6 +4413,18 @@ fn plan_mode_turn_reminder(plan_mode: bool) -> String {
      implementation — not even as code blocks in your reply. Investigate with read-only tools, \
      then present a concise implementation plan and STOP, waiting for the user to review and \
      switch to build mode. Writing the full solution now defeats the purpose of plan mode.\n\
+     </system-reminder>"
+        .to_string()
+}
+
+fn loop_mode_turn_reminder(in_loop: bool) -> String {
+    if !in_loop {
+        return String::new();
+    }
+    "<system-reminder>\n\
+     你在一个自定步调循环（/loop）中。完成本轮后，若任务尚未结束、需要再跑一轮，就调用 \
+     schedule_wakeup 安排下次唤醒（给出 delay_seconds 与要 verbatim 传回的 prompt）；\
+     若任务已完成或无需再跑，就不要调用它——不安排即结束。一轮只需调用一次。\n\
      </system-reminder>"
         .to_string()
 }
