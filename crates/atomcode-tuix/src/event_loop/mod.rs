@@ -3483,6 +3483,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }, if loop_next_fire.is_some() => {
                 if let Some(c) = ctx.loop_ctrl.as_mut() {
                     c.due = true;
+                    // Re-arm next_fire_at: if the payload turn runs longer than
+                    // the interval, leaving next_fire_at in the past makes this
+                    // biased arm perpetually-ready, starving the agent-event arm
+                    // below it (UI freeze + CPU spin). The latched `due` still
+                    // drives the single catch-up fire on the next idle edge.
+                    c.next_fire_at = Some(std::time::Instant::now() + c.interval);
                 }
             }
 
@@ -3896,6 +3902,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }, if loop_next_fire.is_some() => {
                 if let Some(c) = ctx.loop_ctrl.as_mut() {
                     c.due = true;
+                    // Re-arm next_fire_at: if the payload turn runs longer than
+                    // the interval, leaving next_fire_at in the past makes this
+                    // biased arm perpetually-ready, starving the agent-event arm
+                    // below it (UI freeze + CPU spin). The latched `due` still
+                    // drives the single catch-up fire on the next idle edge.
+                    c.next_fire_at = Some(std::time::Instant::now() + c.interval);
                 }
             }
 

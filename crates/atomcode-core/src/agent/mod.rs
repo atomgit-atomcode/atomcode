@@ -2176,6 +2176,10 @@ impl AgentLoop {
         // and left the indicator spinning forever (CR C3).
         if matches!(stop_reason, TurnStopReason::Cancelled) {
             self.finalize_goal_cancelled();
+            // First-turn cancel of a self-paced /loop must also halt the loop
+            // (the continuation-turn branch already does; this one was missed,
+            // else loop_state/pending_wakeup leak and the footer stays stuck).
+            self.finalize_loop_cancelled();
             return;
         }
 
