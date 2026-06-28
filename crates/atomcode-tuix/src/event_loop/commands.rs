@@ -3686,7 +3686,8 @@ mod rate_limited_tests {
             line.contains("可换模型") || line.contains("稍后重试"),
             "should contain retry suggestion"
         );
-        assert!(!line.contains("error"), "must not contain 'error'");
+        assert!(!line.starts_with('!'), "must not start with '!' prefix");
+        assert!(line.contains('⏸'), "must contain pause glyph ⏸");
         assert!(line.contains("2h0m"), "should format 7200s as 2h0m");
     }
 

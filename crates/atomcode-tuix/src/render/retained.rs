@@ -3980,6 +3980,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let body = format!("! {}", scrub_controls(&msg));
                 self.push_body_text(&body, &warn_style);
             }
+            UiLine::Muted(msg) => {
+                // Dim, non-bold informational line — no forced prefix.
+                // Same DarkGrey palette as CompactionMark so it recedes
+                // into scrollback without reading as a warning or error.
+                let style = CellStyle {
+                    fg: Some(crossterm::style::Color::DarkGrey),
+                    bold: false,
+                    ..CellStyle::default()
+                };
+                self.push_body_text(&scrub_controls(&msg), &style);
+            }
             UiLine::CompactionMark(label) => {
                 // Dim, left-aligned rule marking where compaction folded
                 // history. Faint DarkGrey (not bold) so it reads as structure,

@@ -329,6 +329,13 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     reset
                 );
             }
+            UiLine::Muted(msg) => {
+                self.drop_transient();
+                // Dim (no bold, no prefix) — same visual weight as CompactionMark.
+                let dim = if self.caps.colors { SGR_DIM } else { "" };
+                let reset = if self.caps.colors { SGR_RESET } else { "" };
+                let _ = writeln!(self.out, "{}{}{}", dim, scrub_controls(&msg), reset);
+            }
             UiLine::CompactionMark(label) => {
                 self.drop_transient();
                 let dim = if self.caps.colors { "\x1b[2m" } else { "" };

@@ -9092,11 +9092,11 @@ fn handle_agent_event(
             // Non-error pause line: dim/plain body row, never red.
             // WaitAndRetry (empty reset_at_display, small secs): "⏳ 限流，Ns 后自动继续…"
             // Pause (reset_at_display non-empty, >2 min): "⏸ 5小时窗口已用尽，约 HH:MM 恢复…"
-            // UiLine::Warning is the closest advisory (non-red) body variant available.
-            // CompactionMark has dash-rule semantics; CommandOutput has no visual emphasis.
-            // Warning (yellow, non-bold for rate-limit) signals a notable but non-fatal pause.
+            // UiLine::Muted: dim DarkGrey, no forced prefix, non-bold.
+            // Rate-limit is a pause, not an error/warning — it must not
+            // render with the yellow `! ` prefix that Warning applies.
             let line = format_rate_limited_line(&reset_at_display, &reset_label, secs_until_reset);
-            renderer.render(UiLine::Warning(line));
+            renderer.render(UiLine::Muted(line));
             renderer.flush();
         }
     }

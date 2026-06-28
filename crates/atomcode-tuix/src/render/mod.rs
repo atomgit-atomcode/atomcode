@@ -129,6 +129,12 @@ pub enum UiLine {
     /// know" apart from "the turn died." Currently used by the OpenAI
     /// provider's truncation detector.
     Warning(String),
+    /// Dim, non-bold informational line with no forced prefix. Used for
+    /// notable but non-alarming status lines that should not read as
+    /// warnings or errors — e.g. a rate-limit pause announcement. Rendered
+    /// in DarkGrey (same palette as `CompactionMark`) so it recedes into
+    /// the scrollback without grabbing attention.
+    Muted(String),
     /// A compaction occurred here — a dim, left-aligned dash rule marking the
     /// scrollback point where history was folded/summarized. Unified across
     /// auto-compaction and manual `/compact`. Payload is the localized label
