@@ -156,7 +156,7 @@ fn generate_commit_message(files: &[String]) -> String {
     // Extract short file names for the message
     let short_names: Vec<&str> = files
         .iter()
-        .map(|f| f.rsplit('/').next().unwrap_or(f))
+        .map(|f| Path::new(f).file_name().and_then(|n| n.to_str()).unwrap_or(f))
         .collect();
 
     if file_count == 1 {
