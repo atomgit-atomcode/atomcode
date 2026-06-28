@@ -1,0 +1,9 @@
+{
+  "name": "ts-extra",
+  "display": "TypeScript Extra Highlight",
+  "version": "1.0.0",
+  "author": "AtomCode",
+  "description": "Additional syntax highlighting for TypeScript: function names, class names, type annotations, variables, decorators, and more.",
+  "languages": ["typescript", "javascript"],
+  "grammar": "grammar.json"
+}

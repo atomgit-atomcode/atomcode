@@ -3925,6 +3925,163 @@ async fn fs_mkdir(
     }
 }
 
+// ============================================================================
+// Filesystem API for desktop IDE — /fs/tree, /fs/read, /fs/write
+// ============================================================================
+
+/// 递归构建目录树（用于 IDE 文件浏览器）。
+/// 受 `max_depth` 限制；超过深度时挂一个 `type: "limit"` 节点提示"展开被截断"。
+fn build_fs_tree(
+    dir: &std::path::Path,
+    depth: u32,
+    max_depth: u32,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(it) => it.filter_map(|e| e.ok()).collect(),
+        Err(_) => return out,
+    };
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = match entry.file_name().to_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        // 跳过隐藏条目 + 显式忽略掉版本控制目录,避免递归进 .git
+        if name.starts_with('.') {
+            continue;
+        }
+        if name == "node_modules" || name == "target" || name == "dist" {
+            // 大目录直接跳过,IDE 文件浏览器无需进入
+            continue;
+        }
+        let path = entry.path();
+        let ftype = match entry.file_type() {
+            Ok(t) if t.is_dir() => "directory",
+            Ok(_) => "file",
+            Err(_) => continue,
+        };
+        let mut node = serde_json::json!({
+            "name": name,
+            "path": path.to_string_lossy(),
+            "type": ftype,
+        });
+        if ftype == "directory" {
+            if depth + 1 < max_depth {
+                let children = build_fs_tree(&path, depth + 1, max_depth);
+                node["children"] = serde_json::Value::Array(children);
+            } else {
+                // 标记截断
+                node["children"] = serde_json::json!([{
+                    "name": "...",
+                    "path": "",
+                    "type": "limit",
+                }]);
+            }
+        }
+        out.push(node);
+    }
+    out
+}
+
+#[derive(serde::Deserialize)]
+pub struct FsTreeQuery {
+    pub path: String,
+}
+
+/// `GET /fs/tree?path=<dir>` — 返回目录树（供 IDE 文件浏览器）
+async fn fs_tree(
+    State(_state): State<AppState>,
+    Query(q): Query<FsTreeQuery>,
+) -> impl IntoResponse {
+    let expanded = normalize_dir_arg(&q.path);
+    let dir = expanded.canonicalize().unwrap_or(expanded);
+    let dir = atomcode_core::tool::strip_verbatim_prefix_path(&dir);
+    let tree = build_fs_tree(&dir, 0, 3);
+    Json(serde_json::json!({
+        "path": dir.to_string_lossy(),
+        "tree": tree,
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct FsReadQuery {
+    pub path: String,
+}
+
+/// `GET /fs/read?path=<file>` — 读取文件内容（供 IDE 编辑器）
+async fn fs_read(
+    State(state): State<AppState>,
+    Query(q): Query<FsReadQuery>,
+) -> impl IntoResponse {
+    let project = state.project.read().await;
+    let wd = &project.working_dir;
+    let expanded = normalize_dir_arg(&q.path);
+    // 相对路径用 project working_dir 拼接
+    let resolved = if expanded.is_absolute() {
+        expanded
+    } else {
+        wd.join(&expanded)
+    };
+    let path = resolved.canonicalize().unwrap_or(resolved);
+    let path = atomcode_core::tool::strip_verbatim_prefix_path(&path);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            // language 字段返回原始扩展名(不含 .),前端会做映射
+            let lang = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string();
+            Json(serde_json::json!({
+                "path": path.to_string_lossy(),
+                "content": content,
+                "language": lang,
+                "size": content.len(),
+            }))
+            .into_response()
+        }
+        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("Failed to read file: {e}"))
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct FsWriteRequest {
+    pub path: String,
+    pub content: String,
+}
+
+/// `POST /fs/write` — 写入文件内容（供 IDE 编辑器保存）
+async fn fs_write(
+    State(state): State<AppState>,
+    Json(req): Json<FsWriteRequest>,
+) -> impl IntoResponse {
+    let project = state.project.read().await;
+    let wd = &project.working_dir;
+    let expanded = normalize_dir_arg(&req.path);
+    let resolved = if expanded.is_absolute() {
+        expanded
+    } else {
+        wd.join(&expanded)
+    };
+    let path = atomcode_core::tool::strip_verbatim_prefix_path(&resolved);
+    // 确保父目录存在
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, &req.content) {
+        Ok(()) => Json(serde_json::json!({
+            "success": true,
+            "path": path.to_string_lossy(),
+        }))
+        .into_response(),
+        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("Failed to write file: {e}"))
+            .into_response(),
+    }
+}
+
 /// Options controlling how [`run_server`] builds and runs the API server.
 ///
 /// Field types intentionally mirror the tuple returned by the binary's
@@ -4125,6 +4282,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Filesystem API
         .route("/fs/list", get(fs_list))
         .route("/fs/mkdir", post(fs_mkdir))
+        .route("/fs/tree", get(fs_tree))
+        .route("/fs/read", get(fs_read))
+        .route("/fs/write", post(fs_write))
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))

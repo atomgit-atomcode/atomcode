@@ -1,0 +1,17 @@
+{
+  "scope": "typescript",
+  "rules": [
+    { "match": "\\b(function\\s+)?([a-zA-Z_$][\\w$]*)\\s*(?=\\()", "capture": 2, "token": "function" },
+    { "match": "\\(\\s*([a-zA-Z_$][\\w$]*)\\s*(?:[,)])", "capture": 1, "token": "parameter" },
+    { "match": "\\b(class|interface|type)\\s+([a-zA-Z_$][\\w$]*)", "capture": 2, "token": "class" },
+    { "match": "\\bextends\\s+([a-zA-Z_$][\\w$]*)", "capture": 1, "token": "class" },
+    { "match": "\\bimplements\\s+([a-zA-Z_$][\\w$]*)", "capture": 1, "token": "interface" },
+    { "match": ":\\s*(string|number|boolean|void|null|undefined|any|never|unknown|bigint|symbol)", "capture": 1, "token": "type" },
+    { "match": ":\\s*([A-Z][\\w$]*)", "capture": 1, "token": "type" },
+    { "match": "\\b(const|let|var)\\s+([a-zA-Z_$][\\w$]*)", "capture": 2, "token": "variable" },
+    { "match": "\\b([a-zA-Z_$][\\w$]*)\\s*:", "capture": 1, "token": "property" },
+    { "match": "\\benum\\s+([a-zA-Z_$][\\w$]*)", "capture": 1, "token": "enumMember" },
+    { "match": "\\b(namespace|module)\\s+([a-zA-Z_$][\\w$]*)", "capture": 2, "token": "namespace" },
+    { "match": "(@[a-zA-Z_$][\\w$]*)", "capture": 1, "token": "decorator" }
+  ]
+}
