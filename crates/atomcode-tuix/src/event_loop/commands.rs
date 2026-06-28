@@ -3638,6 +3638,91 @@ pub(crate) fn encode_osc52(buffer: &str, text: &str) -> String {
     format!("\x1b]52;{};{}\x1b\\", buffer, b64)
 }
 
+/// Build the non-error rate-limit pause body line. Two branches:
+/// - `reset_at_display` non-empty → user must wait (Pause); shows reset
+///   time and remaining duration.
+/// - `reset_at_display` empty + small `secs_until_reset` → kernel is
+///   auto-retrying (WaitAndRetry); shows a countdown.
+///
+/// Kept as a pure function so it is unit-testable without a renderer.
+pub(crate) fn format_rate_limited_line(
+    reset_at_display: &str,
+    _reset_label: &str,
+    secs_until_reset: Option<u64>,
+) -> String {
+    if reset_at_display.is_empty() {
+        let n = secs_until_reset.unwrap_or(0);
+        return format!("⏳ 限流，{n}s 后自动继续…");
+    }
+    let tail = match secs_until_reset {
+        Some(s) => format!("（还有 {}）", fmt_dur(s)),
+        None => String::new(),
+    };
+    format!(
+        "⏸ 5小时窗口已用尽，约 {reset_at_display} 恢复{tail} · 已保留已完成内容 · 可换模型或稍后重试"
+    )
+}
+
+/// Format a duration in seconds as a compact human string: "2h11m" / "45m" / "30s".
+fn fmt_dur(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+#[cfg(test)]
+mod rate_limited_tests {
+    use super::*;
+
+    #[test]
+    fn rate_limited_renders_non_error_pause_line() {
+        let line = format_rate_limited_line("18:09", "（每 5 小时一个窗口）", Some(7200));
+        assert!(line.contains("18:09"), "should contain reset time");
+        assert!(
+            line.contains("可换模型") || line.contains("稍后重试"),
+            "should contain retry suggestion"
+        );
+        assert!(!line.contains("error"), "must not contain 'error'");
+        assert!(line.contains("2h0m"), "should format 7200s as 2h0m");
+    }
+
+    #[test]
+    fn rate_limited_wait_shows_countdown() {
+        let line = format_rate_limited_line("", "", Some(45));
+        assert!(line.contains("45"), "should contain countdown seconds");
+        assert!(line.contains("自动继续"), "should mention auto-continue");
+    }
+
+    #[test]
+    fn fmt_dur_hours_and_minutes() {
+        assert_eq!(fmt_dur(7931), "2h12m"); // 2h 12m 11s → floor minutes
+        assert_eq!(fmt_dur(3600), "1h0m");
+    }
+
+    #[test]
+    fn fmt_dur_minutes_only() {
+        assert_eq!(fmt_dur(90), "1m");
+        assert_eq!(fmt_dur(120), "2m");
+    }
+
+    #[test]
+    fn fmt_dur_seconds() {
+        assert_eq!(fmt_dur(45), "45s");
+        assert_eq!(fmt_dur(0), "0s");
+    }
+
+    #[test]
+    fn rate_limited_no_secs_shows_no_duration() {
+        let line = format_rate_limited_line("23:59", "", None);
+        assert!(line.contains("23:59"));
+        assert!(!line.contains("还有"));
+    }
+}
+
 #[cfg(test)]
 mod qr_style_tests {
     use super::*;

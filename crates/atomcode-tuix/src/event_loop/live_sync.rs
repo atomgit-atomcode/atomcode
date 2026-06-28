@@ -33,14 +33,14 @@ pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
         TurnEvent::Warning(w) => AgentEvent::Warning(w),
         TurnEvent::ApprovalRequested { tool_name, reason, call, snapshot } =>
             AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot },
+        TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } =>
+            AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset },
         // 不需要的：忽略
         TurnEvent::ToolCallStreaming { .. }
         | TurnEvent::ToolBatchStarted { .. }
         | TurnEvent::ToolBatchCompleted { .. }
         | TurnEvent::ContextStats { .. }
-        | TurnEvent::WorkingDirChanged(_)
-        // TODO(task-7): map to AgentEvent::RateLimited once TUI handles it.
-        | TurnEvent::RateLimited { .. } => return None,
+        | TurnEvent::WorkingDirChanged(_) => return None,
     })
 }
 

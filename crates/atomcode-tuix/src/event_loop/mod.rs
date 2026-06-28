@@ -20,7 +20,7 @@ pub(crate) mod live_sync;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
-use commands::{attach_live_session, dispatch_undo, execute_slash_command};
+use commands::{attach_live_session, dispatch_undo, execute_slash_command, format_rate_limited_line};
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
@@ -9088,8 +9088,17 @@ fn handle_agent_event(
                 attach_live_session(ctx, renderer, session, false);
             }
         }
-        // TODO(task-7): render pause banner with reset_at_display / reset_label.
-        AgentEvent::RateLimited { .. } => {}
+        AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
+            // Non-error pause line: dim/plain body row, never red.
+            // WaitAndRetry (empty reset_at_display, small secs): "⏳ 限流，Ns 后自动继续…"
+            // Pause (reset_at_display non-empty, >2 min): "⏸ 5小时窗口已用尽，约 HH:MM 恢复…"
+            // UiLine::Warning is the closest advisory (non-red) body variant available.
+            // CompactionMark has dash-rule semantics; CommandOutput has no visual emphasis.
+            // Warning (yellow, non-bold for rate-limit) signals a notable but non-fatal pause.
+            let line = format_rate_limited_line(&reset_at_display, &reset_label, secs_until_reset);
+            renderer.render(UiLine::Warning(line));
+            renderer.flush();
+        }
     }
 }
 

@@ -260,8 +260,13 @@ impl AgentLoop {
                 // mid-turn persistence; the approval flow itself is
                 // managed by the `approval_req_rx` channel.
             }
-            // TODO(task-7): render pause banner with reset_at_display / reset_label.
-            TurnEvent::RateLimited { .. } => {}
+            TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
+                let _ = self.event_tx.send(AgentEvent::RateLimited {
+                    reset_at_display,
+                    reset_label,
+                    secs_until_reset,
+                });
+            }
         }
     }
 

@@ -2817,8 +2817,13 @@ impl AgentLoop {
                                     *phase = AgentPhase::WaitingApproval;
                                     let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
                                 }
-                                // TODO(task-7): render pause banner with reset_at_display / reset_label.
-                                TurnEvent::RateLimited { .. } => {}
+                                TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
+                                    let _ = event_tx.send(AgentEvent::RateLimited {
+                                        reset_at_display,
+                                        reset_label,
+                                        secs_until_reset,
+                                    });
+                                }
                             }
                         }
 
