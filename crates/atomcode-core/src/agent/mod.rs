@@ -1517,6 +1517,12 @@ impl AgentLoop {
                     // Clear the conversation history in the agent loop.
                     self.conversation = Conversation::new();
                     self.datalog.clear();
+                    // /clear also halts an active self-paced /loop in case a
+                    // turn is mid-flight (not sleeping between rounds) when
+                    // the command arrives.
+                    if self.loop_state.active {
+                        self.finalize_loop_cancelled();
+                    }
                     // New session → re-snapshot the system prompt next turn.
                     self.cached_system_prompt = None;
                     // session_id is NOT reset here: /session pairs this with

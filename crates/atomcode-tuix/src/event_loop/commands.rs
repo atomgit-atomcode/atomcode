@@ -387,6 +387,19 @@ pub(crate) fn fire_interval_payload(
     }
 }
 
+/// Fully stop any active `/loop`: sends `ClearLoop` to halt the core
+/// self-paced loop engine AND clears the TUI fixed-interval controller plus
+/// all three mirror fields. Idempotent — safe to call when no loop is active.
+pub(crate) fn stop_active_loop(state: &mut UiState, ctx: &mut LoopCtx) {
+    if ctx.loop_ctrl.is_some() || state.loop_label.is_some() {
+        ctx.agent.cmd_tx.send(AgentCommand::ClearLoop).ok();
+        ctx.loop_ctrl = None;
+        state.loop_label = None;
+        state.loop_round = 0;
+        state.loop_started_at = None;
+    }
+}
+
 /// Start a fixed-interval `/loop`: parse the raw payload into a
 /// `LoopPayload`, install a fresh `LoopController` on `ctx`, seed the
 /// status-bar label/round/start-clock, and fire the first iteration
@@ -2113,18 +2126,16 @@ pub(super) fn execute_slash_command(
                     renderer.flush();
                 }
                 LoopArg::Stop => {
-                    ctx.agent.cmd_tx.send(AgentCommand::ClearLoop).ok();
-                    state.loop_label = None;
-                    state.loop_round = 0;
-                    state.loop_started_at = None;
+                    stop_active_loop(state, ctx);
                     renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::LoopCleared).into_owned(),
                     ));
                     renderer.flush();
                 }
                 LoopArg::SelfPaced { prompt } => {
-                    // Replace any existing loop before setting a new one.
-                    ctx.agent.cmd_tx.send(AgentCommand::ClearLoop).ok();
+                    // Replace any existing loop (both self-paced core and
+                    // fixed-interval TUI controller) before setting a new one.
+                    stop_active_loop(state, ctx);
                     ctx.agent
                         .cmd_tx
                         .send(AgentCommand::SetLoop { prompt: prompt.clone() })
@@ -2143,10 +2154,13 @@ pub(super) fn execute_slash_command(
                     state.on_submit();
                 }
                 LoopArg::Interval { secs, payload } => {
-                    // Fixed-interval mode: install a wall-clock LoopController
-                    // and fire the first iteration now. The TUI event loop's
-                    // deadline arm + TurnComplete hook re-fire it on schedule
-                    // while the agent is idle (see run_loop / handle_loop_decision).
+                    // Fixed-interval mode: stop any currently running loop
+                    // (self-paced or fixed-interval) first, then install a
+                    // fresh wall-clock LoopController and fire the first
+                    // iteration now. The TUI event loop's deadline arm +
+                    // TurnComplete hook re-fire it on schedule while the agent
+                    // is idle (see run_loop / handle_loop_decision).
+                    stop_active_loop(state, ctx);
                     start_interval_loop(
                         state,
                         ctx,
@@ -3417,6 +3431,11 @@ pub(crate) fn reset_to_new_session(
     renderer: &mut dyn Renderer,
 ) {
     ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+    // /clear and /session must also halt any active /loop (both self-paced
+    // core and fixed-interval TUI controller).  stop_active_loop sends its
+    // own ClearLoop which is harmless to duplicate — it arrives after
+    // ClearConversation and is idempotent on the core side.
+    stop_active_loop(state, ctx);
     ctx.current_session_id = None;
     state.total_tokens = 0;
     state.prompt_tokens = 0;
