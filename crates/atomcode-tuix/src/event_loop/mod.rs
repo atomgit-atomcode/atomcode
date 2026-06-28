@@ -3062,6 +3062,63 @@ pub enum ExitReason {
     UpgradeRestart { exe: std::path::PathBuf },
 }
 
+/// Drive one decision step of a fixed-interval `/loop`.
+///
+/// Turn-completion driven: this is the *only* place an interval payload
+/// actually fires. The wall-clock deadline arm in `run_loop` merely flips
+/// `due = true` and calls us; we ask the controller's pure `decide(idle)`:
+///
+/// - `Fire`  → idle + due: re-fire the payload (and re-arm the next deadline).
+/// - `Skip`  → either not due yet, or busy (a turn is mid-flight). We do
+///   nothing now; when that turn finishes the TurnComplete path calls us
+///   again and — if still due — fires then. This is what prevents a livelock
+///   when the payload's runtime exceeds the interval: a missed deadline
+///   collapses into a single catch-up fire on the next idle edge, never a
+///   backlog.
+/// - `Stop`  → round/max or 3 consecutive failures: tear the loop down and
+///   surface a notice.
+///
+/// `idle` is derived from `UiPhase::Idle` so "the agent finished its turn"
+/// and "safe to fire" are the same gate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_loop_decision(
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    active_modal: &mut Option<Box<dyn crate::modals::Modal>>,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
+    setup_pending: &mut bool,
+) {
+    let idle = matches!(state.phase, UiPhase::Idle);
+    let action = match ctx.loop_ctrl.as_ref() {
+        Some(c) => c.decide(idle),
+        None => return,
+    };
+    match action {
+        crate::event_loop::loop_ctrl::LoopAction::Fire => commands::fire_interval_payload(
+            state,
+            ctx,
+            renderer,
+            active_modal,
+            fixissue_pending,
+            fixissue_buffer,
+            setup_pending,
+        ),
+        crate::event_loop::loop_ctrl::LoopAction::Skip => {}
+        crate::event_loop::loop_ctrl::LoopAction::Stop => {
+            ctx.loop_ctrl = None;
+            state.loop_label = None;
+            state.loop_round = 0;
+            state.loop_started_at = None;
+            renderer.render(UiLine::CommandOutput(
+                "⚠ loop stopped (limit reached)\n".into(),
+            ));
+            renderer.flush();
+        }
+    }
+}
+
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
 
@@ -3374,6 +3431,18 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     sync_reasoning_effort_from_provider(&mut ctx);
 
     loop {
+        // ── Fixed-interval /loop deadline ──
+        // Snapshot the next wall-clock fire instant BEFORE select! so the
+        // timer arm's future borrows this local `Instant` rather than `ctx`
+        // (the other arms already hold `&mut ctx.<field>` borrows; a second
+        // `&ctx` inside the macro's future-construction phase would conflict).
+        // Recomputed every loop turn — `fire_interval_payload` re-arms
+        // `next_fire_at`, so the snapshot stays in lock-step with the
+        // controller. `None` when no interval loop is active → the arm's
+        // future parks on `pending()` and its `if` guard keeps it inert.
+        let loop_next_fire: Option<std::time::Instant> =
+            ctx.loop_ctrl.as_ref().and_then(|c| c.next_fire_at);
+
         #[cfg(unix)]
         tokio::select! {
             // Biased ordering: spinner first so whenever a tick is
@@ -3396,6 +3465,25 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+            }
+
+            // ── Fixed-interval /loop deadline ──
+            // The wall-clock instant when the active interval loop is next
+            // due. Firing is turn-completion driven, so this arm ONLY flips
+            // `due = true`; the actual re-fire happens after the select! in
+            // the shared `handle_loop_decision` call (which checks idleness).
+            // When busy, `decide` returns Skip and `due` stays latched until
+            // the in-flight turn completes — that's what stops a slow payload
+            // (runtime > interval) from livelocking into a backlog.
+            _ = async {
+                match loop_next_fire {
+                    Some(t) => tokio::time::sleep_until(t.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if loop_next_fire.is_some() => {
+                if let Some(c) = ctx.loop_ctrl.as_mut() {
+                    c.due = true;
+                }
             }
 
             // ── Terminal input ──
@@ -3795,6 +3883,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
             }
 
+            // ── Fixed-interval /loop deadline ──
+            // Mirror of the unix arm: flip `due = true` when the wall-clock
+            // deadline passes; the shared post-select! `handle_loop_decision`
+            // does the idle-gated re-fire. See the unix arm for the
+            // anti-livelock rationale.
+            _ = async {
+                match loop_next_fire {
+                    Some(t) => tokio::time::sleep_until(t.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if loop_next_fire.is_some() => {
+                if let Some(c) = ctx.loop_ctrl.as_mut() {
+                    c.due = true;
+                }
+            }
+
             // ── Terminal input ──
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
@@ -4111,6 +4215,26 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     );
                 }
             }
+        }
+
+        // ── Fixed-interval /loop decision (turn-completion driven) ──
+        // Runs after EVERY select! wakeup, so it sees both edges that matter:
+        //   • the deadline arm just latched `due = true` → fire now if idle;
+        //   • a TurnComplete just flipped the phase to Idle → fire a `due`
+        //     payload that was deferred while the previous turn was running.
+        // `decide(idle)` collapses both into one gate: Fire only when idle
+        // AND due, Skip otherwise (no livelock), Stop at the round/failure
+        // limit. No-op when no interval loop is active.
+        if ctx.loop_ctrl.is_some() {
+            handle_loop_decision(
+                &mut app.state,
+                &mut ctx,
+                renderer,
+                &mut app.active_modal,
+                &mut app.fixissue_pending,
+                &mut app.fixissue_buffer,
+                &mut app.setup_pending,
+            );
         }
 
         if matches!(app.state.phase, UiPhase::Idle) && ctx.agent.cmd_tx.is_closed() {
