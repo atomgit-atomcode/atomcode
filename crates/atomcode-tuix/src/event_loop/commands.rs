@@ -432,6 +432,8 @@ pub(crate) fn start_interval_loop(
     };
     let mut c = crate::event_loop::loop_ctrl::LoopController::new_interval(secs, p);
     c.next_fire_at = Some(std::time::Instant::now() + c.interval);
+    // Honor configured max_rounds (parity with self-paced mode).
+    c.max_rounds = ctx.config.loop_config.max_rounds;
     ctx.loop_ctrl = Some(c);
     state.loop_label = Some(format!("{secs}s · {payload}"));
     state.loop_round = 0;
