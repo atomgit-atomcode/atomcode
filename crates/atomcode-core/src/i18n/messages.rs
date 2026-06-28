@@ -983,9 +983,11 @@ pub enum Msg<'a> {
 
     // ── streaming liveness (atomcode-tuix spinner) ──
     /// Spinner hint shown when a streaming response has gone silent past the stall
-    /// threshold. The cause is UNKNOWN (slow first byte, a slow gateway, or a
-    /// dropped connection), so the text does NOT blame the network — it just notes
-    /// the slow response and that esc cancels. Reassures the user it isn't frozen.
+    /// threshold. A silent stretch is OFTEN legitimate (slow first-byte prefill or
+    /// long high-effort reasoning at large context), so the text makes NO judgment
+    /// about speed — labelling it "slow" reads as a malfunction ("is it stuck?")
+    /// when it usually isn't. The elapsed timer already conveys duration; this adds
+    /// only the one thing not otherwise surfaced mid-stream — that esc cancels.
     StreamStalled,
 
     // ── legacy Windows console (conhost) one-shot hint ──

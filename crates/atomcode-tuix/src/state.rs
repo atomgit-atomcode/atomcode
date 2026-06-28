@@ -664,8 +664,15 @@ impl UiState {
     }
 
     pub fn on_tool_call_streaming(&mut self, name: &str) {
+        // The kernel emits a ToolCallStreaming per streamed argument delta, so this is
+        // called repeatedly while a single tool call's args stream in (and again as the
+        // name fills in). Anchor the spinner clock ONLY on the transition INTO the
+        // preparing phase — resetting it on every delta made the elapsed ping-pong
+        // 0ms↔Nms (reported "Preparing … · 7ms" snapping back to 0, reading as a stuck
+        // loop). Mirrors the parallel-batch anchor (`on_tool_batch_started`).
+        let entering = !self.spinner_label.starts_with("Preparing");
         self.spinner_label = format!("Preparing {}", name);
-        if self.active_tool_batches.is_empty() {
+        if entering && self.active_tool_batches.is_empty() {
             self.phase_started_at = Some(std::time::Instant::now());
         }
     }
@@ -924,6 +931,37 @@ mod tests {
         assert!(s.stream_stalled(), "silent model stream past threshold must warn");
         s.on_tool_call_started("Bash"); // spinner = "Running Bash" — not a thinking label
         assert!(!s.stream_stalled(), "a slow tool must NOT trip the network warning");
+    }
+
+    #[test]
+    fn streaming_tool_args_anchor_the_clock_once_not_per_delta() {
+        // The kernel emits a ToolCallStreaming per streamed argument delta. Resetting
+        // the phase clock on each made the spinner elapsed ping-pong 0ms↔Nms (user
+        // report: "Preparing … · 7ms" snapping back to 0, looking like a stuck loop).
+        // The clock must anchor ONCE when the tool-call streaming BEGINS and then tick
+        // steadily across the remaining deltas — mirroring the parallel-batch anchor.
+        let mut s = UiState::new();
+        s.on_submit(); // spinner = a THINKING label
+        s.on_tool_call_streaming(""); // first delta: name unknown yet → "Preparing …"
+        let anchored = s
+            .phase_started_at
+            .expect("clock anchored on the first streaming delta");
+        s.on_tool_call_streaming(""); // more arg deltas of the SAME call …
+        s.on_tool_call_streaming("Bash"); // … then the name fills in
+        assert_eq!(
+            s.phase_started_at,
+            Some(anchored),
+            "the phase clock must NOT reset on each streamed delta (would flicker 0ms)"
+        );
+
+        // A genuinely new tool call (after the prior one ran) DOES re-anchor.
+        s.on_tool_call_started("Bash"); // "Running Bash"
+        s.on_tool_call_streaming(""); // a new call begins streaming
+        assert_ne!(
+            s.phase_started_at,
+            Some(anchored),
+            "a new tool call must re-anchor the clock"
+        );
     }
 
     #[test]

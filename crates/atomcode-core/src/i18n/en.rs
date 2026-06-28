@@ -1102,7 +1102,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                  authenticate against. Use the official binary, or point the provider at a \
                  plain OpenAI-compatible endpoint with an api_key."
             ).into(),
-        Msg::StreamStalled => "slow response · esc to cancel".into(),
+        Msg::StreamStalled => "esc to cancel".into(),
         Msg::ConhostScrollHint =>
             "Tip: in the classic Windows console, scrolling up to view history is \
              unavailable while a task is running (scrolling resumes once it finishes). \

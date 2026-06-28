@@ -1424,13 +1424,12 @@ impl RunningAgent {
                 self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
                 return;
             }
-            // Truncation is observable via a Warning; the round still finishes
-            // normally (continuation is a separate follow-up task).
-            if truncated {
-                self.rt.emit(AgentEvent::Warning(
-                    "response truncated: finish_reason=length".into(),
-                ));
-            }
+            // Truncation (`finish_reason=length`) is recorded on the message meta
+            // below. The user-facing Warning is DEFERRED: it fires only if the
+            // truncation actually ENDS the turn with unfinished work (see the
+            // StopReason::Stopped path below). When the kernel auto-continues to
+            // finish the cut-off output, a red "response truncated" alarm would be
+            // misleading, so it is suppressed on the recovered path.
             let ctx_window = self.provider.context_window();
             // Prefer the provider's EXACT prompt count. FALL BACK to a byte estimate over
             // the OUTGOING request (`messages`, post-`pre_request`) when the provider omits
@@ -1522,6 +1521,15 @@ impl RunningAgent {
                     continuations += 1;
                     convo.push(Message::user(reminder));
                     continue;
+                }
+                // The turn is ENDING. If it ends because the output was truncated and
+                // we could NOT recover (auto-continuation budget exhausted, no hook
+                // continuation), surface the warning now — this is the one case the
+                // user needs to see: real work was cut off and is not being finished.
+                if truncated {
+                    self.rt.emit(AgentEvent::Warning(
+                        "response truncated: finish_reason=length".into(),
+                    ));
                 }
                 self.finish_turn(convo, StopReason::Stopped, &turn_ctx).await;
                 return;

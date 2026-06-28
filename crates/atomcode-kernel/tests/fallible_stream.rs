@@ -140,12 +140,14 @@ async fn reasoning_is_emitted() {
 }
 
 // A Done { truncated: true } with no tool call (output cut off at the token
-// limit) must (a) surface a Warning AND (b) auto-continue: inject a synthetic
-// "resume" nudge and make a follow-up LLM call rather than silently ending the
-// turn (v1 parity — atomcode-core/src/agent/mod.rs:3064). Otherwise a model that
-// tries to write a large file in one shot dies the moment it truncates.
+// limit) auto-continues: inject a synthetic "resume" nudge and make a follow-up
+// LLM call rather than silently ending the turn (v1 parity —
+// atomcode-core/src/agent/mod.rs:3064). When that recovery happens, the scary
+// "response truncated" warning is SUPPRESSED — the work is being finished, so a
+// red alarm would be misleading. (The warning is reserved for the unrecoverable
+// case; see `repeated_truncation_is_bounded`.)
 #[tokio::test]
-async fn truncated_done_warns_and_auto_continues() {
+async fn recovered_truncation_continues_without_warning() {
     let reg = ToolRegistry::new();
     let provider = Arc::new(MockProvider::new(vec![
         // round 1: output is cut off at the token limit
@@ -184,8 +186,8 @@ async fn truncated_done_warns_and_auto_continues() {
     let _ = handle.task.await;
 
     assert!(
-        warning.as_deref().is_some_and(|w| w.contains("truncated")),
-        "a truncated Done must surface an AgentEvent::Warning; got {warning:?}"
+        warning.is_none(),
+        "a truncation that auto-recovers must NOT surface the scary warning; got {warning:?}"
     );
     assert!(completed, "the turn still completes after the continuation");
 
@@ -232,10 +234,15 @@ async fn repeated_truncation_is_bounded() {
     handle.commands.send(send("go")).unwrap();
 
     let mut completed = false;
+    let mut warning: Option<String> = None;
     while let Some(ev) = handle.events.recv().await {
-        if let AgentEvent::TurnComplete { .. } = ev {
-            completed = true;
-            break;
+        match ev {
+            AgentEvent::Warning(w) => warning = Some(w),
+            AgentEvent::TurnComplete { .. } => {
+                completed = true;
+                break;
+            }
+            _ => {}
         }
     }
     handle.commands.send(AgentCommand::Shutdown).unwrap();
@@ -247,6 +254,12 @@ async fn repeated_truncation_is_bounded() {
         calls.len() <= 4,
         "truncation continuations must be tightly bounded; got {} LLM calls",
         calls.len()
+    );
+    // UNRECOVERABLE truncation (budget exhausted, turn actually stops) MUST warn —
+    // this is the one case the user needs to see, and the only case that should.
+    assert!(
+        warning.as_deref().is_some_and(|w| w.contains("truncated")),
+        "an exhausted, turn-ending truncation must surface the warning; got {warning:?}"
     );
 }
 

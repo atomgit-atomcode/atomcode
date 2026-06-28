@@ -1082,7 +1082,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\
                  或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
             ).into(),
-        Msg::StreamStalled => "响应较慢 · esc 取消".into(),
+        Msg::StreamStalled => "按 esc 可取消".into(),
         Msg::ConhostScrollHint =>
             "提示：当前为经典 Windows 控制台，任务执行中无法上滚查看历史（任务结束后即可正常滚动）。\
              如需在执行过程中滚动，建议改用 \x1b[1;96mWindows Terminal\x1b[0m。"

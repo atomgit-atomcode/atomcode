@@ -227,6 +227,35 @@ mod tests {
     }
 
     #[test]
+    fn content_transformation_steers_to_incremental_writes_not_one_shot() {
+        // A large translate/rewrite must NOT be dumped in one response or one
+        // write_file call — that hits the OUTPUT-token cap and truncates mid-content
+        // (the reported "I'll write it in one go" → finish_reason=length failure).
+        // The persona must steer toward INCREMENTAL file writes instead. Guard the
+        // exact failure mode so nobody re-introduces the one-shot advice.
+        let p = coding_persona("m");
+        assert!(
+            p.contains("## CONTENT-TRANSFORMATION:"),
+            "content-transformation section must exist"
+        );
+        assert!(
+            p.contains("INCREMENTALLY"),
+            "large transforms must be steered to incremental writes: {p}"
+        );
+        assert!(
+            p.contains("edit_file"),
+            "the incremental path must name edit_file for appending sections"
+        );
+        // The old, harmful advice ("write it to a file with write_file" as the
+        // escape hatch for over-budget output) must be gone — a single write_file
+        // is subject to the SAME output cap, so it does not escape truncation.
+        assert!(
+            !p.contains("write it to a file with `write_file` and report the path"),
+            "must not advise a one-shot whole-file write for over-budget output"
+        );
+    }
+
+    #[test]
     fn persona_drops_compaction_claim() {
         // MVP has no compaction — must NOT promise unlimited context.
         let p = coding_persona("m");
