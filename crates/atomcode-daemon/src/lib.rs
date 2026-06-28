@@ -1925,6 +1925,14 @@ pub enum ChatEvent {
     /// `Error` so clients render a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Rate-limit hit: provider has throttled requests. Carries display-ready reset
+    /// time and label so the client can render a countdown notice.
+    #[serde(rename = "rate_limited")]
+    RateLimited {
+        reset_at_display: String,
+        reset_label: String,
+        secs_until_reset: Option<u64>,
+    },
 }
 
 /// Artifact detector for code blocks and HTML in streaming text
@@ -2912,8 +2920,17 @@ async fn process_chat_request(
                     arguments: call.arguments,
                 });
             }
-            // TODO(task-6): forward as ChatEvent::RateLimited to the webui.
-            TurnEvent::RateLimited { .. } => {}
+            TurnEvent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+            } => {
+                let _ = event_tx.send(ChatEvent::RateLimited {
+                    reset_at_display,
+                    reset_label,
+                    secs_until_reset,
+                });
+            }
         }
     }
 

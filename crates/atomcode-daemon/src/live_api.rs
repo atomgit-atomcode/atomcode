@@ -1307,6 +1307,14 @@ pub(crate) enum LiveWireEvent {
     /// path display + session-list filter to follow. Carries the absolute path.
     #[serde(rename = "working_dir")]
     WorkingDir { working_dir: String },
+    /// Rate-limit hit: provider has throttled requests. Carries display-ready reset
+    /// time and label so the webui can render a countdown notice instead of a generic error.
+    #[serde(rename = "rate_limited")]
+    RateLimited {
+        reset_at_display: String,
+        reset_label: String,
+        secs_until_reset: Option<u64>,
+    },
 }
 
 /// Map one LiveEvent → 0/1 wire events (variants the frontend doesn't need → None).
@@ -1387,13 +1395,20 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 call_id: call.id,
                 arguments: call.arguments,
             },
+            TE::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+            } => LiveWireEvent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+            },
             TE::ToolCallStreaming { .. }
             | TE::ToolBatchStarted { .. }
             | TE::ToolBatchCompleted { .. }
             | TE::ContextStats { .. }
-            | TE::WorkingDirChanged(_)
-            // TODO(task-6): map to a LiveWireEvent::RateLimited variant.
-            | TE::RateLimited { .. } => return None,
+            | TE::WorkingDirChanged(_) => return None,
         },
     })
 }
@@ -1839,6 +1854,21 @@ mod tests {
         ));
         assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Begin)).is_none());
         assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::End)).is_none());
+    }
+
+    // 限流事件必须作为独立的 rate_limited 线事件下发，带 reset_at_display/reset_label/
+    // secs_until_reset 字段，供 webui 渲染倒计时提示而非普通错误。
+    #[test]
+    fn rate_limited_serializes_as_its_own_type() {
+        let wire = to_wire(LiveEvent::Turn(TurnEvent::RateLimited {
+            reset_at_display: "18:09".into(),
+            reset_label: "5h".into(),
+            secs_until_reset: Some(7200),
+        }))
+        .expect("should map");
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains(r#""type":"rate_limited""#), "wire type must be rate_limited: {json}");
+        assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
     }
 
     // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，
