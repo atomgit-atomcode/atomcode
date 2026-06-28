@@ -977,6 +977,14 @@ impl Bridge {
                     self.finish_turn(StopReason::Cancelled, messages);
                 }
             }
+            CoreCmd::SetLoop { prompt: _ } => {
+                // Loop mode is handled in the v1 (atomcode-core) agent path.
+                // The v2 bridge does not implement loop continuation yet.
+            }
+            CoreCmd::ClearLoop => {
+                // Loop mode is handled in the v1 (atomcode-core) agent path.
+                // The v2 bridge does not implement loop continuation yet.
+            }
             CoreCmd::Shutdown => {
                 self.goal_cancel.cancel();
                 return true;

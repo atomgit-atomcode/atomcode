@@ -2417,6 +2417,9 @@ async fn run_headless(
             AgentEvent::GoalUpdate { .. } => {
                 // Goal progress — headless mode ignores for now.
             }
+            AgentEvent::LoopUpdate { .. } => {
+                // Loop progress — headless mode ignores for now.
+            }
         }
     }
 

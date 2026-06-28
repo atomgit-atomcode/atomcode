@@ -17,6 +17,7 @@ pub(crate) mod bg_runtime;
 pub(crate) mod commands;
 pub(crate) mod file_index;
 pub(crate) mod live_sync;
+pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
@@ -8231,6 +8232,34 @@ fn handle_agent_event(
                 // the verdict above already conveys what happened, the
                 // separator just visually closes the turn.
                 flush_pending_separator(state, renderer, /* as_goal_end */ true);
+            }
+        }
+        AgentEvent::LoopUpdate { active, round, label, last_reason, .. } => {
+            if active {
+                state.loop_label = Some(label);
+                state.loop_round = round;
+                if state.loop_started_at.is_none() {
+                    state.loop_started_at = Some(std::time::Instant::now());
+                }
+            } else {
+                if state.loop_label.is_some() {
+                    if let Some(reason) = last_reason.as_deref() {
+                        let banner = if reason.contains("cancelled")
+                            || reason.contains("cleared by user")
+                        {
+                            None
+                        } else {
+                            Some(format!("  ↻ Loop ended: {reason}\n"))
+                        };
+                        if let Some(line) = banner {
+                            renderer.render(UiLine::CommandOutput(line));
+                            renderer.flush();
+                        }
+                    }
+                }
+                state.loop_label = None;
+                state.loop_round = 0;
+                state.loop_started_at = None;
             }
         }
         AgentEvent::ToolBatchCompleted {

@@ -1962,6 +1962,74 @@ pub(super) fn execute_slash_command(
                 }
             }
         }
+        "loop" => {
+            use crate::event_loop::loop_parse::{parse_loop_arg, LoopArg};
+            match parse_loop_arg(arg) {
+                LoopArg::Status => {
+                    if let Some(ref label) = state.loop_label.clone() {
+                        let secs = state
+                            .loop_started_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let mins = secs / 60;
+                        let secs_rem = secs % 60;
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "↻ loop: {} · round {} · {}m {}s\n",
+                            label,
+                            state.loop_round + 1,
+                            mins,
+                            secs_rem,
+                        )));
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            "没有活跃的 /loop。用法：/loop <间隔> <命令> 或 /loop <任务>\n"
+                                .into(),
+                        ));
+                    }
+                    renderer.flush();
+                }
+                LoopArg::Stop => {
+                    ctx.agent.cmd_tx.send(AgentCommand::ClearLoop).ok();
+                    state.loop_label = None;
+                    state.loop_round = 0;
+                    state.loop_started_at = None;
+                    renderer.render(UiLine::CommandOutput("已停止 /loop\n".into()));
+                    renderer.flush();
+                }
+                LoopArg::SelfPaced { prompt } => {
+                    // Replace any existing loop before setting a new one.
+                    ctx.agent.cmd_tx.send(AgentCommand::ClearLoop).ok();
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SetLoop { prompt: prompt.clone() })
+                        .ok();
+                    state.loop_label = Some(prompt.clone());
+                    state.loop_round = 0;
+                    state.loop_started_at = Some(std::time::Instant::now());
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: prompt,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                    state.on_submit();
+                }
+                LoopArg::Interval { secs, payload } => {
+                    // Fixed-interval mode is implemented in Task 12 (TUI timer).
+                    let _ = (secs, payload);
+                    renderer.render(UiLine::CommandOutput(
+                        "固定间隔模式将在后续实现（当前仅支持自定步调：/loop <任务>）\n".into(),
+                    ));
+                    renderer.flush();
+                }
+                LoopArg::Error(msg) => {
+                    renderer.render(UiLine::Error(msg));
+                    renderer.flush();
+                }
+            }
+        }
         "plugin" => {
             // Bare `/plugin` opens the interactive manager; subcommands
             // (`marketplace …`, `install x@mp`, …) keep their old behavior.
