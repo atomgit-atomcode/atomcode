@@ -4391,6 +4391,22 @@ mod tests {
         );
     }
 
+    // 回归：限流事件必须作为独立的 `rate_limited` ChatEvent 下发（非 error/warning），
+    // 携带 reset_at_display/reset_label/secs_until_reset，供 webui 渲染倒计时提示。
+    #[test]
+    fn chat_rate_limited_serializes_as_its_own_type() {
+        let json = serde_json::to_string(&ChatEvent::RateLimited {
+            reset_at_display: "18:09".into(),
+            reset_label: "5h".into(),
+            secs_until_reset: Some(7200),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"rate_limited","reset_at_display":"18:09","reset_label":"5h","secs_until_reset":7200}"#
+        );
+    }
+
     #[test]
     fn first_query_value_extracts_token() {
         assert_eq!(first_query_value("token=abc", "token"), Some("abc".into()));

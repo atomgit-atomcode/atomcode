@@ -1869,6 +1869,8 @@ mod tests {
         let json = serde_json::to_string(&wire).unwrap();
         assert!(json.contains(r#""type":"rate_limited""#), "wire type must be rate_limited: {json}");
         assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
+        assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
+        assert!(json.contains(r#""reset_label":"5h""#), "{json}");
     }
 
     // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，
