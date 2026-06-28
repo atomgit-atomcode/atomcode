@@ -2314,6 +2314,92 @@ impl AgentLoop {
                 }
             }
         }
+
+        // ── Self-paced /loop wrapper ──
+        // Mirrors the goal loop, but continuation is gated on the model calling
+        // schedule_wakeup (→ self.pending_wakeup) and we sleep the requested
+        // delay between rounds. Because delay can be up to 1h and the outer
+        // run() loop is blocked on this await, the sleep MUST select cmd_rx
+        // itself to stay responsive to Cancel/ClearLoop/new messages.
+        while self.loop_state.active {
+            let wake = match self.pending_wakeup.take() {
+                Some(w) => w,
+                None => {
+                    // Model didn't schedule a wakeup → loop is done
+                    // (CC "omit schedule_wakeup to end the loop").
+                    self.loop_state.active = false;
+                    self.emit_loop_update(Some("completed".into()));
+                    break;
+                }
+            };
+            self.loop_state.round += 1;
+            if self.loop_state.round_limit_reached() {
+                self.loop_state.active = false;
+                self.emit_loop_update(Some(format!(
+                    "round limit ({})",
+                    self.loop_state.max_rounds
+                )));
+                break;
+            }
+            self.emit_loop_update(Some(wake.reason.clone()));
+
+            // Cancel-aware, command-responsive sleep. cancel_token is cloned so
+            // the select! only borrows self.cmd_rx (not self.cancel_token),
+            // avoiding a double &mut self borrow inside the macro.
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_secs(wake.delay_seconds as u64);
+            let ct = self.cancel_token.clone();
+            enum LoopWake {
+                Timeout,
+                Cmd(AgentCommand),
+                Closed,
+            }
+            let w = tokio::select! {
+                biased;
+                _ = ct.cancelled() => { self.finalize_loop_cancelled(); return; }
+                _ = tokio::time::sleep_until(deadline) => LoopWake::Timeout,
+                cmd = self.cmd_rx.recv() => match cmd {
+                    Some(c) => LoopWake::Cmd(c),
+                    None => LoopWake::Closed,
+                },
+            };
+            match w {
+                LoopWake::Closed => {
+                    self.finalize_loop_cancelled();
+                    return;
+                }
+                LoopWake::Cmd(c) => {
+                    // User intervened during the wait: stop the loop and handle
+                    // the command normally (Cancel/ClearLoop/SendMessage/…).
+                    // Box::pin breaks the handle_send_message → dispatch_one →
+                    // handle_send_message async recursion cycle (E0733); an
+                    // unboxed call would make the future infinitely sized.
+                    self.finalize_loop_cancelled();
+                    Box::pin(self.dispatch_one(c)).await;
+                    return;
+                }
+                LoopWake::Timeout => {} // fall through to continue the loop
+            }
+
+            // Continue: re-inject the model's verbatim prompt as the next round.
+            self.conversation.add_user_message(&wake.prompt);
+
+            // Reset per-turn state for the next iteration. Mirrors the goal
+            // wrapper's reset block exactly (see GoalResult::NotMet above).
+            self.turn_count = 0;
+            self.tool_call_count = 0;
+            self.retry_count = 0;
+            self.empty_response_retries = 0;
+            self.cancel_token = CancellationToken::new();
+            self.files_edited_this_turn.clear();
+            self.files_read_this_turn.clear();
+
+            let stop = self.run_turn_loop().await;
+            if matches!(stop, TurnStopReason::Cancelled) {
+                self.finalize_loop_cancelled();
+                return;
+            }
+        }
     }
 
     // needs_planning replaced by task_classifier::TaskType::needs_planning()
@@ -4767,6 +4853,200 @@ mod agent_handle_tests {
 
         assert_eq!(factory.next_runtime_label(), "runtime-2");
         assert_eq!(cloned.next_runtime_label(), "runtime-3");
+    }
+}
+
+#[cfg(test)]
+mod self_paced_loop_tests {
+    //! End-to-end tests for the self-paced `/loop` wrapper in
+    //! `handle_send_message`. They drive a scripted `SequencedMockProvider`
+    //! through the real turn loop so `schedule_wakeup` populates
+    //! `pending_wakeup`, then assert the wrapper's continue / stop / cancel
+    //! behaviour.
+    use super::loop_state;
+    use super::{AgentCommand, AgentEvent, AgentLoop};
+    use crate::stream::{StreamEvent, TokenUsage};
+    use crate::tool::{ToolCall, ToolContext, ToolRegistry};
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    /// Multi-turn mock: returns the i-th scripted `Vec<StreamEvent>` on the
+    /// i-th `chat_stream` call (mirrors turn::tests::SequencedMockProvider).
+    struct SequencedMockProvider {
+        sequences: std::sync::Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+    }
+    impl SequencedMockProvider {
+        fn new(sequences: Vec<Vec<StreamEvent>>) -> Self {
+            Self { sequences: std::sync::Mutex::new(sequences.into()) }
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::provider::LlmProvider for SequencedMockProvider {
+        fn chat_stream(
+            &self,
+            _messages: &[crate::conversation::message::Message],
+            _tools: Option<&[crate::tool::ToolDef]>,
+        ) -> anyhow::Result<
+            Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>>,
+        > {
+            let next = self
+                .sequences
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| vec![StreamEvent::Done { truncated: false }]);
+            let events: Vec<anyhow::Result<StreamEvent>> = next.into_iter().map(Ok).collect();
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+        fn model_name(&self) -> &str {
+            "sequenced-mock"
+        }
+    }
+
+    fn schedule_wakeup_events(call_id: &str, delay: u32, reason: &str, prompt: &str) -> Vec<StreamEvent> {
+        let args = serde_json::json!({
+            "delay_seconds": delay,
+            "reason": reason,
+            "prompt": prompt,
+        })
+        .to_string();
+        vec![
+            StreamEvent::ToolCallStart { id: call_id.into(), name: "schedule_wakeup".into() },
+            StreamEvent::ToolCallDelta(args.clone()),
+            StreamEvent::ToolCallDone(ToolCall {
+                id: call_id.into(),
+                name: "schedule_wakeup".into(),
+                arguments: args,
+            }),
+            StreamEvent::Usage(TokenUsage { prompt_tokens: 10, completion_tokens: 8, cached_tokens: 0 }),
+            StreamEvent::Done { truncated: false },
+        ]
+    }
+
+    fn text_only_events(text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::Delta(text.into()),
+            StreamEvent::Usage(TokenUsage { prompt_tokens: 10, completion_tokens: 5, cached_tokens: 0 }),
+            StreamEvent::Done { truncated: false },
+        ]
+    }
+
+    /// Build an AgentLoop wired to a scripted provider with only the
+    /// `schedule_wakeup` tool registered, and an active `/loop` state.
+    async fn build_loop(
+        sequences: Vec<Vec<StreamEvent>>,
+        wd: std::path::PathBuf,
+    ) -> (AgentLoop, super::AgentHandle) {
+        let tools = ToolRegistry::new();
+        tools
+            .register(Box::new(crate::tool::schedule_wakeup::ScheduleWakeupTool))
+            .await;
+        let (mut loop_, handle) = AgentLoop::new_with_shared_parts(
+            crate::config::Config::default(),
+            Box::new(SequencedMockProvider::new(sequences)),
+            Arc::new(tools),
+            Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+            Some("loop-test".to_string()),
+            ToolContext::new(wd),
+            crate::conversation::Conversation::new(),
+        );
+        // Activate the /loop exactly as AgentCommand::StartLoop would.
+        loop_.loop_state = loop_state::LoopState::new("watch CI".into());
+        loop_.pending_wakeup = None;
+        (loop_, handle)
+    }
+
+    /// Turn 1 calls schedule_wakeup (→ pending_wakeup set); turn 2 does NOT →
+    /// the wrapper runs exactly one continuation round then stops. Paused time
+    /// auto-advances past the (clamped ≥60s) sleep with no real waiting.
+    #[tokio::test(start_paused = true)]
+    async fn self_paced_loop_continues_then_stops() {
+        let wd = std::path::PathBuf::from(format!(
+            "/tmp/atomcode_loop_cont_{}",
+            std::process::id()
+        ));
+        let (mut loop_, _handle) = build_loop(
+            vec![
+                // Turn 1: schedule a wakeup so the loop continues.
+                schedule_wakeup_events("c1", 60, "poll CI", "keep watching CI"),
+                // Turn 2: plain text, NO schedule_wakeup → loop ends.
+                text_only_events("CI is green, done."),
+            ],
+            wd,
+        )
+        .await;
+
+        loop_
+            .handle_send_message("watch CI".into(), vec![], vec![])
+            .await;
+
+        assert!(
+            !loop_.loop_state.active,
+            "loop must stop once a turn omits schedule_wakeup"
+        );
+        assert_eq!(
+            loop_.loop_state.round, 1,
+            "exactly one continuation round should have run"
+        );
+        assert!(
+            loop_.pending_wakeup.is_none(),
+            "the consumed wakeup must be cleared"
+        );
+    }
+
+    /// Turn 1 schedules a long wakeup; a Cancel arrives on cmd_tx while the
+    /// wrapper is asleep → the loop finalizes and NO round 2 runs. Driven with
+    /// `join!` (not spawn) so the cancel is delivered deterministically during
+    /// the sleep without advancing the paused clock (the sleep never fires).
+    #[tokio::test(start_paused = true)]
+    async fn self_paced_loop_cancel_during_sleep() {
+        let wd = std::path::PathBuf::from(format!(
+            "/tmp/atomcode_loop_cancel_{}",
+            std::process::id()
+        ));
+        let (mut loop_, mut handle) = build_loop(
+            vec![
+                // Turn 1: schedule a long wakeup, then the wrapper sleeps.
+                schedule_wakeup_events("c1", 3600, "long poll", "keep watching CI"),
+                // Turn 2 must never run; if it did it would be text-only.
+                text_only_events("should not run"),
+            ],
+            wd,
+        )
+        .await;
+
+        let cmd_tx = handle.client.cmd_tx.clone();
+
+        // Watcher: wait until the wrapper enters round 1 (it emits a LoopUpdate
+        // with round==1 right before sleeping), then cancel. Polled cooperatively
+        // by join!; the paused-time sleep stays pending, so the cancel is the
+        // only thing that can wake the select.
+        let watcher = async {
+            while let Some(ev) = handle.event_rx.recv().await {
+                if let AgentEvent::LoopUpdate { round, active, .. } = ev {
+                    if active && round == 1 {
+                        let _ = cmd_tx.send(AgentCommand::Cancel);
+                        break;
+                    }
+                }
+            }
+        };
+
+        let agent = loop_.handle_send_message("watch CI".into(), vec![], vec![]);
+        tokio::join!(agent, watcher);
+
+        assert!(
+            !loop_.loop_state.active,
+            "cancel during sleep must finalize the loop"
+        );
+        assert_eq!(
+            loop_.loop_state.round, 1,
+            "round 2 must not run after a mid-sleep cancel"
+        );
+        assert!(
+            loop_.pending_wakeup.is_none(),
+            "finalize_loop_cancelled clears any pending wakeup"
+        );
     }
 }
 
