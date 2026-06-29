@@ -2877,6 +2877,44 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn parse_todo_titles_extracts_id_to_content() {
+        let mut map = std::collections::HashMap::new();
+        // The full-list shape every todo result returns, with a preamble
+        // line that must be ignored.
+        let output = "Task #4 'Write tests' updated to 'completed'\n\
+                      [x] 4. Write tests\n\
+                      [>] 5. Fix the parser\n\
+                      [ ] 6. Update docs";
+        parse_todo_titles_into(&mut map, output);
+        assert_eq!(map.get(&4).map(String::as_str), Some("Write tests"));
+        assert_eq!(map.get(&5).map(String::as_str), Some("Fix the parser"));
+        assert_eq!(map.get(&6).map(String::as_str), Some("Update docs"));
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn enrich_todo_detail_splices_title_into_update() {
+        let mut titles = std::collections::HashMap::new();
+        titles.insert(4u64, "Write tests".to_string());
+        let args = r#"{"action":"update","id":4,"status":"completed"}"#;
+        let base = format_tool_detail("todo", args); // "#4 → completed"
+        let out = enrich_todo_detail("todo", args, &base, &titles);
+        assert_eq!(out, "#4 Write tests \u{2192} completed");
+    }
+
+    #[test]
+    fn enrich_todo_detail_falls_back_without_title() {
+        let titles = std::collections::HashMap::new();
+        let args = r#"{"action":"update","id":4,"status":"completed"}"#;
+        let base = format_tool_detail("todo", args);
+        // Unknown id ⇒ unchanged id-only detail.
+        assert_eq!(enrich_todo_detail("todo", args, &base, &titles), base);
+        // Non-update actions and non-todo tools pass through untouched.
+        assert_eq!(enrich_todo_detail("todo", r#"{"action":"add","content":"x"}"#, "x", &titles), "x");
+        assert_eq!(enrich_todo_detail("bash", r#"{"command":"ls"}"#, "ls", &titles), "ls");
+    }
+
+    #[test]
     fn format_tool_detail_todo_list_shows_list_all() {
         let args = r#"{"action":"list"}"#;
         let out = format_tool_detail("todo", args);
@@ -7815,6 +7853,7 @@ fn handle_agent_event(
             arguments,
         } => {
             let detail = format_tool_detail(&name, &arguments);
+            let detail = enrich_todo_detail(&name, &arguments, &detail, &state.todo_titles);
             let display = display_tool_name(&name);
 
             // If this call is part of an active batch, the
@@ -7884,6 +7923,14 @@ fn handle_agent_event(
             // a displaced second approval, or a cancel). Retract the orphaned "Waiting for
             // approval" row first so it doesn't linger above the result.
             retract_stale_approval(state, renderer);
+            // Learn task id → content from every todo result (each action
+            // returns the full list). This is what later `todo update`
+            // rows look up to show the task NAME instead of a bare id.
+            // Parsed before the batch early-return below so both batched
+            // and single todo results feed the map.
+            if name == "todo" {
+                parse_todo_titles_into(&mut state.todo_titles, &output);
+            }
             // If this call belongs to an active batch, the group header
             // already accounts for it; emit a single-line `  ↳ ✓ / ✗`
             // child completion and skip the full ▸ + ⎿ body render.
@@ -8757,9 +8804,24 @@ fn handle_agent_event(
                         let action = serde_json::from_str::<serde_json::Value>(&c.arguments)
                             .ok()
                             .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string));
-                        if action.as_deref() == Some("add") {
-                            todo_add_counter += 1;
-                            return format!("#{} {}", todo_add_counter, detail);
+                        match action.as_deref() {
+                            Some("add") => {
+                                todo_add_counter += 1;
+                                return format!("#{} {}", todo_add_counter, detail);
+                            }
+                            // Upgrade `#4 → completed` to `#4 Write tests →
+                            // completed` using the title learned from earlier
+                            // todo results (issue: parallel updates showed no
+                            // task name).
+                            Some("update") => {
+                                return enrich_todo_detail(
+                                    &c.name,
+                                    &c.arguments,
+                                    detail,
+                                    &state.todo_titles,
+                                );
+                            }
+                            _ => {}
                         }
                     }
                     detail.clone()
@@ -9744,6 +9806,74 @@ pub fn display_tool_name_short(snake: &str) -> String {
         .find_map(|s| snake.strip_suffix(s))
         .unwrap_or(snake);
     display_tool_name(trimmed)
+}
+
+/// Parse the full task list every `todo` result returns into `map`
+/// (id → content). The list renders as `{icon} {id}. {content}` lines
+/// (see `todo.rs::render`); we match that shape and ignore everything
+/// else (the "Added task #N: …" / "Task #N '…' updated" preamble lines
+/// don't match and are skipped). Both the core and capabilities todo
+/// tools share this line format, so one parser covers both.
+pub(crate) fn parse_todo_titles_into(
+    map: &mut std::collections::HashMap<u64, String>,
+    output: &str,
+) {
+    for line in output.lines() {
+        let line = line.trim_start();
+        // "[<icon>] <id>. <content>"
+        let Some(rest) = line.strip_prefix('[') else {
+            continue;
+        };
+        let Some((_icon, after)) = rest.split_once("] ") else {
+            continue;
+        };
+        let Some((id_str, content)) = after.split_once(". ") else {
+            continue;
+        };
+        let Ok(id) = id_str.trim().parse::<u64>() else {
+            continue;
+        };
+        let content = content.trim();
+        if !content.is_empty() {
+            map.insert(id, content.to_string());
+        }
+    }
+}
+
+/// Splice the known task title into a `todo update` detail so the row
+/// shows the NAME, not just the id: `#4 → completed` becomes
+/// `#4 Write tests → completed`. Returns `base` unchanged for non-todo
+/// tools, non-update actions, or ids whose title we haven't learned yet
+/// (graceful fallback to the id-only form).
+pub(crate) fn enrich_todo_detail(
+    name: &str,
+    args_json: &str,
+    base: &str,
+    titles: &std::collections::HashMap<u64, String>,
+) -> String {
+    if name != "todo" {
+        return base.to_string();
+    }
+    let repaired = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) else {
+        return base.to_string();
+    };
+    if v.get("action").and_then(|a| a.as_str()) != Some("update") {
+        return base.to_string();
+    }
+    let Some(id) = v.get("id").and_then(|x| x.as_u64()) else {
+        return base.to_string();
+    };
+    let Some(title) = titles.get(&id) else {
+        return base.to_string();
+    };
+    let title = crate::width::truncate_with_ellipsis(title, 80);
+    // `base` is `#<id> → <status>` (or bare `#<id>`); insert the title
+    // right after the id so the arrow keeps pointing at the status.
+    match base.split_once(" \u{2192} ") {
+        Some((head, tail)) => format!("{} {} \u{2192} {}", head, title, tail),
+        None => format!("{} {}", base, title),
+    }
 }
 
 pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
