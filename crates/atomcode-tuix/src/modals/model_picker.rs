@@ -150,6 +150,14 @@ impl Modal for ModelPicker {
                     .unwrap_or_else(|| chosen.clone());
                 ctx.config.default_provider = chosen.clone();
                 ctx.model_name = display.clone();
+                // Refresh the footer's context window NOW. The `used/window`
+                // pair comes from the cached ContextStats snapshot, which is
+                // only updated during a turn — switching models fires none, so
+                // without this the denominator stays pinned to the previous
+                // model's window (e.g. 10.1k/200k after switching to a 128k
+                // model). `default_provider` was just set above, so the lookup
+                // returns the new model's window.
+                state.on_model_window_changed(ctx.config.default_context_window());
                 // Persist to config.toml + notify agent. Without this,
                 // the switch lives only in memory and the next startup
                 // reverts to whatever was last saved.

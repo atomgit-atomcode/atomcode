@@ -69,12 +69,27 @@ impl Tool for McpToolAdapter {
         self.schema.clone()
     }
 
-    /// MCP servers are external, untrusted code; always `Risky` so the
-    /// specialization's approval middleware gates the call (the kernel never
-    /// sandboxes — see its trust-model contract). The `mcp__{server}__{tool}`
-    /// name conveys the origin to the approval prompt.
+    /// MCP servers are external code, so `Risky` by default — the approval middleware
+    /// gates the call (the kernel never sandboxes). EXCEPTION: a server configured
+    /// `trust: true`, or a tool on its `autoApprove` allowlist (or granted "Always"),
+    /// is `Safe` so it skips the prompt — this is what makes `.mcp.json` trust actually
+    /// take effect (it was silently ignored before). The `mcp__{server}__{tool}` name
+    /// conveys the origin to the prompt when it does fire.
     fn risk(&self, _args: &str) -> RiskLevel {
-        RiskLevel::Risky
+        if self.registry.is_server_trusted(&self.server)
+            || self.registry.is_tool_auto_approved(&self.full_name)
+        {
+            RiskLevel::Safe
+        } else {
+            RiskLevel::Risky
+        }
+    }
+
+    /// "Always" approves THIS tool (`mcp__{server}__{tool}`) regardless of the call's
+    /// arguments — an empty scope keys the grant on the tool name alone. Without this
+    /// the default per-args grant means a differing query re-prompts every time.
+    fn always_grant_scope(&self, _args: &str) -> String {
+        String::new()
     }
 
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
@@ -110,5 +125,51 @@ impl Tool for McpToolAdapter {
                 is_error: true,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(server: &str, tool: &str) -> McpToolInfo {
+        McpToolInfo {
+            server_name: server.to_string(),
+            tool_name: tool.to_string(),
+            description: String::new(),
+            input_schema: json!({}),
+        }
+    }
+
+    #[test]
+    fn trusted_server_makes_its_tools_safe() {
+        let reg = Arc::new(McpRegistry::new());
+        reg.mark_server_trusted("docs");
+        let adapter = McpToolAdapter::new(reg, info("docs", "query"));
+        assert_eq!(adapter.risk("{}"), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn untrusted_server_tool_is_risky() {
+        let reg = Arc::new(McpRegistry::new());
+        let adapter = McpToolAdapter::new(reg, info("docs", "query"));
+        assert_eq!(adapter.risk("{}"), RiskLevel::Risky);
+    }
+
+    #[test]
+    fn auto_approved_tool_is_safe_but_only_that_tool() {
+        let reg = Arc::new(McpRegistry::new());
+        reg.mark_tool_auto_approved("mcp__docs__query");
+        assert_eq!(McpToolAdapter::new(reg.clone(), info("docs", "query")).risk("{}"), RiskLevel::Safe);
+        // A different tool from the same server is NOT covered.
+        assert_eq!(McpToolAdapter::new(reg, info("docs", "search")).risk("{}"), RiskLevel::Risky);
+    }
+
+    #[test]
+    fn always_grant_scope_is_tool_wide_not_per_args() {
+        let adapter = McpToolAdapter::new(Arc::new(McpRegistry::new()), info("docs", "query"));
+        // Same scope regardless of args → "Always" persists across differing calls.
+        assert_eq!(adapter.always_grant_scope(r#"{"q":"a"}"#), adapter.always_grant_scope(r#"{"q":"b"}"#));
+        assert_eq!(adapter.always_grant_scope("{}"), "");
     }
 }

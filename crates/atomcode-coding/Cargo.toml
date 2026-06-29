@@ -11,6 +11,10 @@ atomcode-kernel = { path = "../atomcode-kernel" }
 # embedders, not for this crate).
 atomcode-capabilities = { path = "../atomcode-capabilities", features = [
     "provider", "tools", "web", "codeintel", "skills", "mcp", "session", "memory",
+    # CC-compatible external hooks (hooks.json): production parity with the legacy
+    # core engine, which always ran them. Zero overhead when no hooks.json exists
+    # (prepare skips registration — see CCExternalHooks::is_empty).
+    "cc-hooks",
 ] }
 # The review specialization, mounted as a `code_review` sub-agent TOOL so the coding
 # agent can review the current changes in-session (L2 composing a sibling L2).
@@ -26,6 +30,9 @@ atomcode-telemetry = { path = "../atomcode-telemetry" }
 # Fresh session-id allocation (the assembly is the session_id's single owner).
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
+# Day-granular date anchor frozen into the persona (system prompt) so the model
+# has a current-date reference on every round — v1 prompt.rs parity.
+chrono = "0.4"
 
 [dev-dependencies]
 serde_json = "1"

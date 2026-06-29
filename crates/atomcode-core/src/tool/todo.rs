@@ -119,9 +119,10 @@ impl Tool for TodoTool {
                 };
                 self.items.lock().await.push(item);
 
+                let list = Self::format_list(&self.items).await;
                 Ok(ToolResult {
                     call_id: String::new(),
-                    output: format!("Added task #{}: {}", id, content),
+                    output: format!("Added task #{}: {}\n{}", id, content, list),
                     success: true,
                 })
             }
@@ -131,10 +132,25 @@ impl Tool for TodoTool {
 
                 let mut items = self.items.lock().await;
                 if let Some(item) = items.iter_mut().find(|i| i.id == id) {
+                    let content = item.content.clone();
                     item.status = status.clone();
+                    // Build the list while we still hold the lock (format_list
+                    // would deadlock because it tries to reacquire it).
+                    let list = {
+                        let mut out = String::new();
+                        for it in items.iter() {
+                            let icon = match it.status.as_str() {
+                                "completed" => "[x]",
+                                "in_progress" => "[>]",
+                                _ => "[ ]",
+                            };
+                            out.push_str(&format!("{} {}. {}\n", icon, it.id, it.content));
+                        }
+                        out
+                    };
                     Ok(ToolResult {
                         call_id: String::new(),
-                        output: format!("Task #{} updated to '{}'", id, status),
+                        output: format!("Task #{} '{}' updated to '{}'\n{}", id, content, status, list),
                         success: true,
                     })
                 } else {

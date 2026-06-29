@@ -259,6 +259,13 @@ pub trait Renderer: Send {
     /// frame inside it). Default no-op. Must be paired with `begin_sync()`.
     fn end_sync(&mut self) {}
 
+    /// Suppress automatic clipboard copy during history replay so that
+    /// `/resume`, `/undo` and `atomcode -c` don't overwrite the user's
+    /// clipboard or inject stale "Copied" hints into the replay output
+    /// (issue #699). Default no-op — only the retained renderer implements
+    /// this.
+    fn set_suppress_auto_copy(&mut self, _suppress: bool) {}
+
     /// Hand the terminal off to a non-TUI child process (blocking OAuth
     /// flow, `/shell`, etc.): disable raw mode + bracketed paste, finish
     /// any pending writes. After this returns, the child is free to use

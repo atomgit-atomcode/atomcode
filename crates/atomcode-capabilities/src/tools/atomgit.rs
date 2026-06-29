@@ -223,6 +223,8 @@ async fn clone_repo(
         cmd.arg(d);
     }
     cmd.current_dir(&ctx.working_dir).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // No console-window flash for git when spawned from a console-less daemon (Windows-only).
+    crate::process_utils::suppress_console_window(&mut cmd);
     match cmd.output().await {
         Ok(out) if out.status.success() => ok(format!("Cloned {owner}/{repo}")),
         Ok(out) => err(format!("git clone failed: {}", String::from_utf8_lossy(&out.stderr).trim())),

@@ -2,17 +2,20 @@ package com.atomcode.jetbrains.ui.header
 
 import com.atomcode.jetbrains.daemon.ConnectionState
 import com.intellij.ui.JBColor
+import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
 import java.awt.FlowLayout
 import javax.swing.BorderFactory
 import javax.swing.JLabel
 import javax.swing.JPanel
+import javax.swing.UIManager
 
 /**
  * 极简 Header：仅状态指示器 + 应用名。
  * 会话管理和设置入口由 Tab 栏的 titleActions 提供。
  */
 class HeaderPanel : JPanel(BorderLayout()) {
+    private var initialized = false
 
     private val statusDot = JLabel("●").apply {
         foreground = DISCONNECTED_COLOR
@@ -27,12 +30,8 @@ class HeaderPanel : JPanel(BorderLayout()) {
 
     init {
         isOpaque = true
-        // JBColor(亮色, 暗色)
-        background = JBColor(0xF0F0F0, 0x252525)
-        border = BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 1, 0, JBColor(0xCCCCCC, 0x3C3C3C)),
-            BorderFactory.createEmptyBorder(5, 10, 5, 8),
-        )
+        initialized = true
+        applyTheme()
 
         val left = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply {
             isOpaque = false
@@ -40,6 +39,26 @@ class HeaderPanel : JPanel(BorderLayout()) {
             add(title)
         }
         add(left, BorderLayout.WEST)
+    }
+
+    override fun updateUI() {
+        super.updateUI()
+        if (initialized) applyTheme()
+    }
+
+    private fun applyTheme() {
+        background = UIUtil.getPanelBackground()
+        title.foreground = UIUtil.getLabelForeground()
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(
+                0,
+                0,
+                1,
+                0,
+                UIManager.getColor("Component.borderColor") ?: JBColor.border(),
+            ),
+            BorderFactory.createEmptyBorder(5, 10, 5, 8),
+        )
     }
 
     fun updateConnectionState(state: ConnectionState) {

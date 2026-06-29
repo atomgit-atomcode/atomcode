@@ -148,6 +148,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // `attach_image_to_input` pipeline directly so the user has a
     // terminal-agnostic way to attach an image. Works on every OS.
     Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false },
+    Command { name: "copy",    desc: "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all)", needs_args: false },
     Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true },
 ];
 
@@ -201,6 +202,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "skills" => Msg::CmdDescSkills,
         "plugin" => Msg::CmdDescPlugin,
         "paste" => Msg::CmdDescPaste,
+        "copy" => Msg::CmdDescCopy,
         "view" => Msg::CmdDescView,
         _ => return None,
     };

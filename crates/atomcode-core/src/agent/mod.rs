@@ -495,6 +495,13 @@ pub struct AgentLoop {
     /// TurnRunner owns the provider, tools, and context.
     pub turn_runner: TurnRunner,
     pub permission_store: std::sync::Arc<std::sync::RwLock<PermissionStore>>,
+    /// `--dangerously-skip-permissions` / `-y`: auto-approve every tool without
+    /// prompting. Stored here (not just on the decider) so `AgentRuntimeFactory`
+    /// can read it back via `from_initial_loop` and propagate the bypass to every
+    /// runtime it re-spawns (/session, /resume, /bg). Without it, a re-spawned
+    /// runtime silently re-enabled approval prompts while the ⚠ BYPASS badge
+    /// stayed on (issue #714).
+    pub dangerously_skip_permissions: bool,
     pub config: Config,
     /// Context construction strategy for the active provider. Selected
     /// at construction via `ctx::for_provider` and rebuilt on
@@ -708,6 +715,9 @@ pub struct AgentRuntimeFactory {
     pub shared_tools: std::sync::Arc<ToolRegistry>,
     pub skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
     pub max_turns: Option<usize>,
+    /// Propagated to every runtime this factory spawns so a `/session` /
+    /// `/resume` / `/bg` re-spawn inherits the launch-time `-y` bypass (issue #714).
+    pub dangerously_skip_permissions: bool,
     runtime_counter: std::sync::Arc<AtomicU64>,
 }
 
@@ -757,7 +767,7 @@ impl AgentRuntimeFactory {
         ));
         tool_context.lsp = self.lsp.clone();
 
-        let (mut loop_, handle) = AgentLoop::new_with_shared_parts(
+        let (mut loop_, handle) = AgentLoop::new_with_shared_parts_skip(
             self.config.clone(),
             provider,
             self.shared_tools.clone(),
@@ -765,6 +775,7 @@ impl AgentRuntimeFactory {
             Some(runtime_label),
             tool_context,
             conversation,
+            self.dangerously_skip_permissions,
         );
         loop_.set_max_turns(self.max_turns);
 
@@ -793,6 +804,7 @@ impl AgentRuntimeFactory {
             shared_tools: agent_loop.tool_registry.clone(),
             skill_registry: agent_loop.skill_registry.clone(),
             max_turns,
+            dangerously_skip_permissions: agent_loop.dangerously_skip_permissions,
             runtime_counter: std::sync::Arc::new(AtomicU64::new(1)),
         }
     }
@@ -812,6 +824,7 @@ impl AgentRuntimeFactory {
             shared_tools,
             skill_registry,
             max_turns: None,
+            dangerously_skip_permissions: false,
             runtime_counter: std::sync::Arc::new(AtomicU64::new(1)),
         }
     }
@@ -933,7 +946,7 @@ impl AgentLoop {
         tool_context: ToolContext,
         conversation: Conversation,
     ) -> (Self, AgentHandle) {
-        Self::new_from_shared_bootstrap(
+        Self::new_with_shared_parts_skip(
             config,
             provider,
             shared_tools,
@@ -942,6 +955,34 @@ impl AgentLoop {
             tool_context,
             conversation,
             false,
+        )
+    }
+
+    /// Same as [`new_with_shared_parts`] but carries the
+    /// `--dangerously-skip-permissions` / `-y` bypass. Used by
+    /// [`AgentRuntimeFactory::spawn_runtime`] so a runtime re-spawned for
+    /// `/session` / `/resume` / `/bg` keeps the launch-time bypass instead of
+    /// silently re-enabling approval prompts (issue #714).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_shared_parts_skip(
+        config: Config,
+        provider: Box<dyn LlmProvider>,
+        shared_tools: std::sync::Arc<ToolRegistry>,
+        skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
+        runtime_label: Option<String>,
+        tool_context: ToolContext,
+        conversation: Conversation,
+        skip_permissions: bool,
+    ) -> (Self, AgentHandle) {
+        Self::new_from_shared_bootstrap(
+            config,
+            provider,
+            shared_tools,
+            skill_registry,
+            runtime_label,
+            tool_context,
+            conversation,
+            skip_permissions,
         )
     }
 
@@ -1079,6 +1120,7 @@ impl AgentLoop {
             tool_registry: shared_tools.clone(),
             turn_runner,
             permission_store,
+            dangerously_skip_permissions: skip_permissions,
             config,
             ctx,
             env_snapshot,
@@ -2234,11 +2276,60 @@ impl AgentLoop {
     // auto_diagnose_errors → diagnose.rs
     // find_file_in_project → diagnose.rs
 
+    /// Finalize a user-cancelled turn (Esc / stop button).
+    ///
+    /// Shared by two paths: (1) `run_with_filter` returning
+    /// `TurnResult::Cancelled` because the in-flight LLM stream was interrupted
+    /// mid-turn, and (2) the top-of-loop guard in `run_turn_loop` catching a
+    /// cancellation that landed *between* turns (the previous round finished as
+    /// `UsedTools`/`Responded` before the cancel was observed). Both must leave
+    /// the conversation in a valid state and emit `TurnCancelled` exactly once,
+    /// WITHOUT emitting `TurnComplete` (which would buffer a stale "✓ done · N
+    /// rounds" line that fires on the user's next submission).
+    ///
+    /// Sets `last_stop_reason = Cancelled` FIRST so callers (notably the /goal
+    /// wrapper) see Cancelled and break out of their auto-continuation loop.
+    fn finalize_cancelled(&mut self) -> TurnStopReason {
+        self.last_stop_reason = TurnStopReason::Cancelled;
+        // If AgentCommand::Cancel already marked the turn Completed (the outer
+        // run() handler path calls cancel_current_turn itself), there is nothing
+        // left to backfill — just return.
+        if self.conversation.turn_tracker.active_turn().is_none() {
+            return self.last_stop_reason;
+        }
+        // Preserve completed content + backfill (cancelled) for unpaired tool calls.
+        self.conversation.cancel_current_turn();
+        let snapshot = self.conversation.snapshot();
+        let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
+        // finish_turn's bookkeeping without emitting TurnComplete (see doc above).
+        self.datalog.end_turn(self.turn_tokens, self.tool_call_count);
+        self.turn_start = None;
+        self.phase = AgentPhase::Idle;
+        let _ = self
+            .event_tx
+            .send(AgentEvent::PhaseChange(AgentPhase::Idle));
+        self.conversation.save(&Conversation::history_path());
+        self.last_stop_reason
+    }
+
     /// Multi-turn execution loop using TurnRunner.
     /// Each iteration calls TurnRunner.run() for one LLM turn, then applies
     /// discipline (reminders, step limits) and decides whether to continue.
     async fn run_turn_loop(&mut self) -> TurnStopReason {
         loop {
+            // User-cancellation guard. The cancel token stays cancelled across
+            // iterations (the inner Cancel handler no longer resets it), so a
+            // stop that landed while the previous round was finishing as
+            // UsedTools/Responded — i.e. *between* turns, before the cancel was
+            // observed by the LLM stream — is caught here instead of silently
+            // starting another reasoning/tool round. Without this the user had
+            // to press stop once per round to fully halt a multi-step task.
+            // The token is reset to a fresh one by handle_send_message (and the
+            // /goal loop) before the next run_turn_loop, so this is only true
+            // for a genuine in-progress cancellation.
+            if self.cancel_token.is_cancelled() {
+                return self.finalize_cancelled();
+            }
             // Turn budget check BEFORE incrementing, so the reported
             // turn_count equals the number of turns actually executed
             // (not including the "would-be" next turn we refuse to run).
@@ -2712,8 +2803,19 @@ impl AgentLoop {
                             match cmd {
                                 AgentCommand::Cancel => {
                                     crate::ctrace!("AGT", "inner Cancel -> cancel_token.cancel() (was_cancelled={})", cancel_token.is_cancelled());
+                                    // Cancel the in-flight turn. Do NOT reset the
+                                    // token to a fresh one here: it must stay
+                                    // cancelled so the outer turn loop's
+                                    // top-of-loop guard halts the *whole* task
+                                    // instead of starting the next reasoning/tool
+                                    // round. Previously the reset meant one Cancel
+                                    // only interrupted the current step — if the
+                                    // turn finished as UsedTools/Responded the loop
+                                    // continued with a clean token and the user had
+                                    // to press stop once per round. A fresh token is
+                                    // installed by handle_send_message on the next
+                                    // user message.
                                     cancel_token.cancel();
-                                    *cancel_token = CancellationToken::new();
                                 }
                                 AgentCommand::ApproveTool => {
                                     *phase = AgentPhase::Thinking;
@@ -3177,41 +3279,12 @@ impl AgentLoop {
                     }
                 }
                 TurnResult::Cancelled => {
-                    // Mark stop reason FIRST so callers (notably the /goal
-                    // wrapper) see Cancelled and break out of their auto-
-                    // continuation loop. Without this the field keeps the
-                    // previous turn's value (typically Natural), so the
-                    // wrapper thinks the turn ended cleanly and immediately
-                    // schedules another round — producing repeated
-                    // "(cancelled)" cycles when the user keeps hitting Esc.
-                    self.last_stop_reason = TurnStopReason::Cancelled;
-                    // Check if turn was already cancelled by AgentCommand::Cancel
-                    // (which marks the turn as Completed immediately)
-                    if self.conversation.turn_tracker.active_turn().is_none() {
-                        // Already handled by AgentCommand::Cancel - just return
-                        return self.last_stop_reason;
-                    }
-                    // Preserve completed content + backfill (cancelled) for unpaired tool calls
-                    self.conversation.cancel_current_turn();
-                    // Send TurnCancelled event for TUI to sync
-                    let snapshot = self.conversation.snapshot();
-                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
-                    // Do finish_turn's bookkeeping WITHOUT emitting TurnComplete.
-                    // TurnCancelled already tells the TUI the turn ended; emitting
-                    // TurnComplete on top buffers a stale "✓ done · N rounds" line
-                    // that fires the next time the TUI's phase becomes Streaming —
-                    // i.e. right after the user's next submission.
-                    // Note: cancel_current_turn() already marks the turn Completed,
-                    // so complete_current() is a no-op; kept as defensive safety net.
-                    self.datalog
-                        .end_turn(self.turn_tokens, self.tool_call_count);
-                    self.turn_start = None;
-                    self.phase = AgentPhase::Idle;
-                    let _ = self
-                        .event_tx
-                        .send(AgentEvent::PhaseChange(AgentPhase::Idle));
-                    self.conversation.save(&Conversation::history_path());
-                    return self.last_stop_reason;
+                    // In-flight stream interrupted mid-turn. Shared finalize:
+                    // marks Cancelled first (so the /goal wrapper breaks out of
+                    // its auto-continuation loop instead of scheduling another
+                    // "(cancelled)" round), backfills unpaired tool calls, and
+                    // emits TurnCancelled without a stale TurnComplete.
+                    return self.finalize_cancelled();
                 }
             }
         }
@@ -4388,6 +4461,64 @@ mod agent_handle_tests {
 
         assert_eq!(factory.config.default_provider, "fresh");
         assert_eq!(factory.working_dir, std::path::PathBuf::from("/tmp/new"));
+    }
+
+    /// Issue #714: launching with `-y` / `--dangerously-skip-permissions` must
+    /// keep the bypass across runtime re-spawns (/session, /resume, /bg). The
+    /// factory is built from the initial loop, so it must read the flag back
+    /// and a runtime it spawns must inherit it — otherwise approval prompts
+    /// silently return while the ⚠ BYPASS badge stays on.
+    #[test]
+    fn factory_propagates_skip_permissions_from_initial_loop() {
+        let mut config = crate::config::Config::default();
+        config.providers.clear();
+        let tool_context = crate::tool::ToolContext::new(std::path::PathBuf::from("/tmp/p714"));
+
+        // Initial loop launched WITH the bypass (mirrors `atomcode -y`).
+        let (loop_, _handle) = super::AgentLoop::new_with_skip_permissions(
+            config,
+            crate::provider::unavailable_provider("test"),
+            crate::tool::ToolRegistry::new(),
+            tool_context,
+            crate::conversation::Conversation::new(),
+            true,
+        );
+        assert!(
+            loop_.dangerously_skip_permissions,
+            "the initial loop must record the launch-time -y bypass"
+        );
+
+        // The factory built from that loop must carry the flag forward...
+        let factory = AgentRuntimeFactory::from_initial_loop(&loop_, None);
+        assert!(
+            factory.dangerously_skip_permissions,
+            "factory must inherit the bypass so re-spawns honor -y (issue #714)"
+        );
+
+        // ...and the runtime it constructs must, too. `will_auto_approve` is the
+        // observable signal: under bypass it returns true for a normally-gated call.
+        let (spawned, _h) = super::AgentLoop::new_with_shared_parts_skip(
+            factory.config.clone(),
+            factory.build_provider(),
+            factory.shared_tools.clone(),
+            factory.skill_registry.clone(),
+            Some("runtime-1".to_string()),
+            crate::tool::ToolContext::new(factory.working_dir.clone()),
+            crate::conversation::Conversation::new(),
+            factory.dangerously_skip_permissions,
+        );
+        let call = crate::tool::ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        assert!(
+            spawned.turn_runner.permission.will_auto_approve(
+                &call,
+                &crate::tool::ApprovalRequirement::RequireApprovalAlways("sudo".into()),
+            ),
+            "a factory-spawned runtime must auto-approve under -y, even RequireApprovalAlways"
+        );
     }
 
     /// Part-2 regression (system-prompt prefix-cache stability): the system

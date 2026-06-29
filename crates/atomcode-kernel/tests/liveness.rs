@@ -20,7 +20,7 @@ use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{
-    ApprovalMiddleware, EchoTool, RecorderHook, RiskyWriteTool, ScriptedProvider,
+    ApprovalMiddleware, EchoTool, MockProvider, RecorderHook, RiskyWriteTool, ScriptedProvider,
     SilentStreamProvider,
 };
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
@@ -121,11 +121,19 @@ async fn request_timeout_degrades_to_null_and_unblocks_turn() {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(RiskyWriteTool));
 
-    // One round: a risky tool_call (triggers approval), then Done. After the tool
-    // is blocked, the turn has no calls left → a normal completion.
-    let provider = Arc::new(ScriptedProvider::events(vec![
-        StreamEvent::ToolCall(tool_call("c1", "risky_write", "{\"path\":\"notes.md\"}")),
-        StreamEvent::Done { truncated: false },
+    // Round 1: a risky tool_call (triggers approval), then Done. After the tool is
+    // blocked, the turn loops to round 2 where the model gives a content-bearing
+    // final answer → a normal completion. (Round 2 must carry text: a content-free
+    // round 2 would now be retried as an empty-200 instead of completing.)
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(tool_call("c1", "risky_write", "{\"path\":\"notes.md\"}")),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let mut handle = Agent::builder()

@@ -76,6 +76,10 @@ impl Tool for BashTool {
         let dur = Duration::from_secs(secs);
 
         let mut cmd = build_command(&a.command);
+        // No console-window flash per command on Windows: in headless/daemon mode (e.g.
+        // the WeChat clawbot bridge) there's no console to inherit, so each cmd.exe would
+        // otherwise allocate a NEW console window on the desktop. No-op off Windows.
+        super::suppress_console_window(&mut cmd);
         cmd.current_dir(&ctx.working_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -120,9 +124,70 @@ fn build_command(command: &str) -> tokio::process::Command {
     cmd
 }
 
+/// Decode subprocess output to text. UTF-8 is the fast path; if that fails we fall
+/// back to the console's OEM codepage (Windows) so CJK tools like `keytool`/`javac`
+/// are readable instead of `◇◇◇` mojibake. Off Windows there is no OEM codepage, so
+/// `console_codepage()` returns 0 and `decode_oem` degrades to lossy UTF-8 (the prior
+/// behavior, unchanged).
+fn decode_output(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => return s.to_string(),
+        // A truncated multibyte tail (no `error_len`) means the valid prefix IS real
+        // UTF-8 — lossy it rather than re-routing the whole buffer through a legacy
+        // codepage and garbling the good prefix.
+        Err(e) if e.error_len().is_none() => return String::from_utf8_lossy(bytes).into_owned(),
+        Err(_) => {}
+    }
+    decode_oem(bytes, console_codepage())
+}
+
+/// Decode `bytes` with a Windows OEM/ANSI codepage number. Pure and platform-independent
+/// (so it is unit-testable off Windows). Mirrors `atomcode-core`'s decoder: when the OEM
+/// codepage is 65001 ("Beta: Use Unicode UTF-8") the JVM/cmd.exe still emit legacy CJK
+/// bytes, so try the CJK codepages; a codepage decode is only trusted when it does not
+/// produce mostly replacement characters, else fall back to lossy UTF-8.
+fn decode_oem(bytes: &[u8], codepage: u32) -> String {
+    // 65001 is UTF-8 (already tried by the caller) → probe the common CJK codepages.
+    let candidates: &[u32] = if codepage == 65001 { &[936, 950, 932, 949] } else { &[codepage] };
+    for &cp in candidates {
+        let enc = match cp {
+            936 => encoding_rs::GB18030, // Simplified Chinese (GBK superset)
+            950 => encoding_rs::BIG5,    // Traditional Chinese
+            932 => encoding_rs::SHIFT_JIS, // Japanese
+            949 => encoding_rs::EUC_KR,  // Korean
+            _ => continue,
+        };
+        let (decoded, _, had_errors) = enc.decode(bytes);
+        if !had_errors {
+            return decoded.into_owned();
+        }
+        // A mostly-clean decode (a few stray bytes) still beats all-U+FFFD UTF-8; but a
+        // decode that is mostly garbage means this wasn't the right codepage.
+        let replacements = decoded.chars().filter(|&c| c == '\u{FFFD}').count();
+        if replacements > 0 && replacements < decoded.chars().count() / 2 {
+            return decoded.into_owned();
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(windows)]
+fn console_codepage() -> u32 {
+    extern "system" {
+        fn GetOEMCP() -> u32;
+    }
+    // SAFETY: GetOEMCP takes no args and only reads a process-global codepage value.
+    unsafe { GetOEMCP() }
+}
+
+#[cfg(not(windows))]
+fn console_codepage() -> u32 {
+    0 // no OEM codepage off Windows → decode_oem yields lossy UTF-8
+}
+
 fn format_output(output: &std::process::Output) -> ToolResult {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_output(&output.stdout);
+    let stderr = decode_output(&output.stderr);
     let mut s = String::new();
     if !stdout.is_empty() {
         s.push_str(&stdout);
@@ -577,6 +642,31 @@ mod tests {
     #[test]
     fn unparseable_args_are_conservatively_risky() {
         assert_eq!(BashTool.risk("not json"), RiskLevel::Risky);
+    }
+
+    #[test]
+    fn decodes_gbk_console_bytes() {
+        // "你好" encoded as GBK / CP936 (0xC4 0xE3 0xBA 0xC3) — NOT valid UTF-8, so a
+        // naive from_utf8_lossy would render `◇◇◇`. A CJK Windows console (keytool,
+        // javac, …) emits exactly these bytes.
+        let gbk = [0xC4u8, 0xE3, 0xBA, 0xC3];
+        assert_eq!(decode_oem(&gbk, 936), "你好");
+    }
+
+    #[test]
+    fn utf8_beta_codepage_falls_back_to_cjk() {
+        // Windows' "Beta: Use Unicode UTF-8" sets OEMCP=65001, yet cmd.exe / JVM
+        // resource strings still arrive in the legacy CJK codepage. We must try the
+        // CJK codepages, not punt to lossy UTF-8 (which reproduces the `◇◇◇` bug).
+        let gbk = [0xC4u8, 0xE3, 0xBA, 0xC3]; // "你好" in CP936
+        assert_eq!(decode_oem(&gbk, 65001), "你好");
+    }
+
+    #[test]
+    fn decode_output_passes_utf8_through_and_lossy_off_windows() {
+        assert_eq!(decode_output("héllo".as_bytes()), "héllo");
+        // codepage 0 (the non-Windows sentinel) → lossy UTF-8, never GBK.
+        assert_eq!(decode_oem(&[0xC4, 0xE3, 0xBA, 0xC3], 0), "\u{FFFD}\u{FFFD}\u{FFFD}");
     }
 
     #[tokio::test]

@@ -67,6 +67,9 @@ pub struct CodeArgs {
     /// Config file path (default: ~/.atomcode/config.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Disable anonymous usage telemetry for this invocation.
+    #[arg(long = "no-telemetry")]
+    pub no_telemetry: bool,
     /// Max seconds to wait for each stream event (liveness guard).
     #[arg(long, default_value_t = 180)]
     pub stream_timeout: u64,
@@ -134,6 +137,12 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     let mut cfg = CodingAgentConfig::new(api_key, base_url, &model, &dir);
     cfg.context_window = entry.and_then(|e| e.context_window).unwrap_or(128_000);
     cfg.stream_timeout = std::time::Duration::from_secs(args.stream_timeout);
+    // Telemetry: the full host-loop instrumentation (turn-level TelemetryHook + tool
+    // middleware + the review-slot MeteredProvider) lights up purely from setting this —
+    // a disabled sink makes every emit a no-op. Flushed to disk on exit (below).
+    let telemetry = crate::tel::build_sink(args.config.as_deref(), args.no_telemetry);
+    crate::tel::maybe_show_notice(telemetry.is_enabled());
+    cfg.telemetry = Some(telemetry.clone());
 
     // Session mode: --resume <id> / --continue (latest) / fresh.
     let session = if let Some(id) = &args.resume {
@@ -192,6 +201,7 @@ pub async fn code(args: CodeArgs) -> Result<()> {
         let _ = handle.commands.send(AgentCommand::SendMessage { text: p, images: vec![] });
         let reason = drive_turn(&mut handle, &mut input, args.yolo, &mut sigint).await;
         finish(handle, session_id).await?;
+        telemetry.shutdown(crate::tel::FLUSH_TIMEOUT).await;
         return match reason {
             Some(StopReason::Stopped) => Ok(()),
             Some(other) => bail!("turn did not complete normally: {other:?}"),
@@ -238,7 +248,9 @@ pub async fn code(args: CodeArgs) -> Result<()> {
             break;
         }
     }
-    finish(handle, session_id).await
+    let r = finish(handle, session_id).await;
+    telemetry.shutdown(crate::tel::FLUSH_TIMEOUT).await;
+    r
 }
 
 /// One process-wide SIGINT listener feeding a channel — every prompt/select in the
@@ -344,12 +356,12 @@ async fn drive_turn(
             AgentEvent::Error { message, .. } => eprintln!("\n[error] {message}"),
             AgentEvent::Warning(w) => eprintln!("[warn] {w}"),
             AgentEvent::CompactionStarted { trigger } => {
-                // The kernel only fires this when a real drain/summary will run; show a
-                // progress line for a user-typed `/compact` (matches the bridge/TUI).
-                // Auto/overflow stay silent in a headless CLI.
-                if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
-                    eprintln!("[compacting …]");
-                }
+                // The kernel fires this ONLY when a real drain/summary (a multi-second
+                // LLM call) will run — manual `/compact`, overflow tier 2, OR an auto
+                // compaction that escalated past the high-water mark. Show a progress
+                // line for ALL of them so a headless run isn't silently blocked.
+                let _ = &trigger;
+                eprintln!("[compacting …]");
             }
             AgentEvent::Compacted { committed, .. } => {
                 eprintln!("[compacted{}]", if committed { "" } else { " — refused (no gain)" });

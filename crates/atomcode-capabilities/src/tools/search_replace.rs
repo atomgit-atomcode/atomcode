@@ -4,7 +4,7 @@
 //! the L1 `ToolContext` has none of that. The (blocking) `ignore` walk + per-file reads
 //! run on `spawn_blocking` so a hung filesystem can't stall the async worker.
 
-use super::{err, is_skip_dir, ok, resolve_path};
+use super::{coerce_eol, err, is_skip_dir, ok, resolve_path};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use globset::{Glob, GlobMatcher};
@@ -69,20 +69,24 @@ impl Tool for SearchReplaceTool {
                 ))
             }
         };
+        if a.search.is_empty() {
+            return err("search_replace: search is empty — an empty pattern would corrupt every file.".to_string());
+        }
         let root = resolve_path(a.path.as_deref().unwrap_or("."), &ctx.working_dir);
         if !root.exists() {
             return err(format!("search_replace: directory not found: {}", root.display()));
         }
 
-        // Build the matcher: literal patterns are regex-escaped so they match verbatim.
+        // Regex mode compiles the pattern; literal mode matches the raw string verbatim
+        // (no regex, so `$1` in the replacement stays literal and an EOL mismatch can be
+        // tolerated per-file — see sr_scan).
         let re = if a.regex {
             match regex::Regex::new(&a.search) {
-                Ok(r) => r,
+                Ok(r) => Some(r),
                 Err(e) => return err(format!("search_replace: invalid regex '{}': {e}", a.search)),
             }
         } else {
-            // escape() output is always a valid regex.
-            regex::Regex::new(&regex::escape(&a.search)).expect("escaped literal is valid regex")
+            None
         };
         let glob_filter = match a.glob.as_deref() {
             Some(p) => match FileGlob::new(p) {
@@ -94,9 +98,10 @@ impl Tool for SearchReplaceTool {
 
         // Phase 1: walk + read + compute replacements off the async worker.
         let scan_root = root.clone();
+        let search = a.search.clone();
         let replace = a.replace.clone();
         let (modified, scanned) = tokio::task::spawn_blocking(move || {
-            sr_scan(&scan_root, &re, glob_filter.as_ref(), &replace)
+            sr_scan(&scan_root, re.as_ref(), &search, &replace, glob_filter.as_ref())
         })
         .await
         .unwrap_or_else(|_| (Vec::new(), 0));
@@ -131,12 +136,14 @@ impl Tool for SearchReplaceTool {
 
 /// Synchronous walk + read + replace computation (runs inside `spawn_blocking`). Does NOT
 /// write — returns `(path, new_content, replacement_count)` per changed file plus the
-/// count of files scanned.
+/// count of files scanned. `re.is_some()` ⇒ regex mode (capture-group `replace`); else
+/// literal mode (verbatim `search`/`replace`, with per-file CRLF/LF tolerance).
 fn sr_scan(
     root: &Path,
-    re: &regex::Regex,
-    glob_filter: Option<&FileGlob>,
+    re: Option<&regex::Regex>,
+    search: &str,
     replace: &str,
+    glob_filter: Option<&FileGlob>,
 ) -> (Vec<(PathBuf, String, usize)>, usize) {
     let walk = WalkBuilder::new(root)
         .hidden(true)
@@ -170,11 +177,34 @@ fn sr_scan(
             Err(_) => continue, // skip binary / unreadable
         };
         scanned += 1;
-        if !re.is_match(&content) {
-            continue;
-        }
-        let count = re.find_iter(&content).count();
-        let new_content = re.replace_all(&content, replace).to_string();
+        let (new_content, count) = match re {
+            Some(re) => {
+                if !re.is_match(&content) {
+                    continue;
+                }
+                (re.replace_all(&content, replace).to_string(), re.find_iter(&content).count())
+            }
+            None => {
+                // Literal mode. Match verbatim first; on a literal hit the search already
+                // agrees with the file's bytes, so search/replace are used as-is. Only if
+                // that fails do we coerce BOTH to THIS file's EOL — rescuing an LF-copied
+                // multi-line search against a CRLF file without injecting mixed endings.
+                // Plain string replace keeps `$1` etc. verbatim (no capture-group expansion).
+                let literal = content.matches(search).count();
+                let (needle, repl, count) = if literal > 0 {
+                    (search.to_string(), replace.to_string(), literal)
+                } else {
+                    let file_eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+                    let n = coerce_eol(search, file_eol);
+                    let c = content.matches(&n).count();
+                    (n, coerce_eol(replace, file_eol), c)
+                };
+                if count == 0 {
+                    continue;
+                }
+                (content.replace(&needle, &repl), count)
+            }
+        };
         if new_content != content {
             modified.push((path.to_path_buf(), new_content, count));
         }
@@ -250,6 +280,51 @@ mod tests {
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(std::fs::read_to_string(d.path().join("x.css")).unwrap(), "colour");
         assert_eq!(std::fs::read_to_string(d.path().join("keep.md")).unwrap(), "color", "md untouched");
+    }
+
+    #[tokio::test]
+    async fn literal_multiline_matches_crlf_file_and_preserves_crlf() {
+        // A literal multi-line search whose break is `\n` (what read_file shows the
+        // model) must still match a CRLF file, and the file must stay CRLF.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "alpha\r\nbeta\r\n").unwrap();
+        let r = SearchReplaceTool
+            .execute(r#"{"search":"alpha\nbeta","replace":"ALPHA\nbeta"}"#, &ctx(d.path()))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "ALPHA\r\nbeta\r\n");
+    }
+
+    #[tokio::test]
+    async fn literal_match_writes_verbatim_no_crlf_injection() {
+        // Mostly-LF file with one stray CRLF line. A literal multi-line replace of an LF
+        // region must match it verbatim and NOT force the result to CRLF.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("m.txt"), "head\r\nfoo\nbar\n").unwrap();
+        let r = SearchReplaceTool
+            .execute(r#"{"search":"foo\nbar","replace":"foo\nBAR"}"#, &ctx(d.path()))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("m.txt")).unwrap(), "head\r\nfoo\nBAR\n");
+    }
+
+    #[tokio::test]
+    async fn empty_search_is_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "abc").unwrap();
+        let r = SearchReplaceTool.execute(r#"{"search":"","replace":"X"}"#, &ctx(d.path())).await;
+        assert!(r.is_error, "empty search must be refused (would corrupt every file): {}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "abc", "unchanged");
+    }
+
+    #[tokio::test]
+    async fn literal_replace_does_not_expand_dollar_groups() {
+        // Literal mode must treat `$1` in the replacement verbatim (not a capture ref).
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "key=val").unwrap();
+        let r = SearchReplaceTool.execute(r#"{"search":"val","replace":"$1x"}"#, &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "key=$1x");
     }
 
     #[tokio::test]

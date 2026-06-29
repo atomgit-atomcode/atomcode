@@ -39,7 +39,15 @@ impl ToolMiddleware for PlanModeGate {
         tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if self.active.load(Ordering::Relaxed) && tool.risk(&call.arguments) == RiskLevel::Risky {
+        // Block `Risky` tools, AND every MCP tool (`mcp__*`) regardless of its risk:
+        // an MCP server is external code whose side effects we can't verify, and a
+        // `trust: true` server now reports `Safe` — without the name check a trusted
+        // MCP write/exec tool would slip past plan mode's read-only guarantee. (MCP
+        // tools were already blocked here before trust existed, since they were all
+        // `Risky`; this preserves that.)
+        if self.active.load(Ordering::Relaxed)
+            && (tool.risk(&call.arguments) == RiskLevel::Risky || call.name.starts_with("mcp__"))
+        {
             return BeforeOutcome::deny(format!(
                 "plan mode is active — `{}` would modify the workspace and is blocked. Only \
                  read-only tools are allowed: explore and present a plan for the user to approve \
@@ -117,6 +125,19 @@ mod tests {
         assert!(gate.before(&mut call, &risky, &rt()).await.is_deny());
         let mut safe_call = ToolCall { id: "c".into(), name: "echo".into(), arguments: "{}".into() };
         assert!(!gate.before(&mut safe_call, &safe, &rt()).await.is_deny());
+    }
+
+    /// A `trust: true` MCP tool now reports `Safe`, but plan mode must STILL block it
+    /// (an MCP server's side effects can't be verified). Uses a Safe tool with an
+    /// `mcp__*` call name so the only possible reason for the deny is the name check.
+    #[tokio::test]
+    async fn blocks_mcp_tools_in_plan_mode_even_when_safe() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let gate = PlanModeGate::new(flag);
+        let safe: Arc<dyn Tool> = Arc::new(EchoTool); // risk() == Safe
+        let mut mcp_call =
+            ToolCall { id: "c".into(), name: "mcp__docs__query".into(), arguments: "{}".into() };
+        assert!(gate.before(&mut mcp_call, &safe, &rt()).await.is_deny());
     }
 
     #[tokio::test]

@@ -812,6 +812,12 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescSkills => "Browse loaded skills".into(),
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
+        Msg::CmdDescCopy => "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all)".into(),
+        Msg::CopyOk { lines, chars } => format!("Copied code block to clipboard ({lines} lines, {chars} chars)").into(),
+        Msg::CopyNoCodeBlock => "No code block in the last reply to copy".into(),
+        Msg::CopyBadIndex { count } => format!("No such code block — the last reply has {count} (use /copy N, 1..={count})").into(),
+        Msg::CopyFailed => "Clipboard unavailable — could not copy".into(),
+        Msg::CodeBlockCopied => "📋 Copied code block to clipboard".into(),
         Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
         Msg::CmdDescView => "View file content in an overlay modal".into(),
         Msg::ViewUsage => "Usage: /view <filepath>".into(),
@@ -958,7 +964,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "\u{26a0} BYPASS".into(),
 
         Msg::AdminWarningBanner =>
-            "\x1b[33m\u{26a0} Warning: Running with Administrator privileges.\n   The model may have access to system files.\n   Use \"Trusted Directories\" in /codingplan to restrict file access.\x1b[39m\n".into(),
+            "\x1b[33m\u{26a0} Warning: Running with Administrator privileges.\n   The model may have access to system files.\n   Consider running without elevation, inside a scoped working directory.\x1b[39m\n".into(),
         Msg::AdminWarningHeadless =>
             "[warning] Running with Administrator privileges — model may have access to system files.".into(),
 

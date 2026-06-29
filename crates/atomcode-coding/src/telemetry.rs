@@ -127,6 +127,7 @@ fn classify_llm_error(reason: &str) -> LlmErrorKind {
 
 /// Shared attribution + emit path for the telemetry adapters. Fixes the
 /// provider/host/model envelope at assembly; both adapters track within its scope.
+#[derive(Clone)]
 struct Attribution {
     telemetry: Arc<Telemetry>,
     provider: Option<String>,
@@ -136,6 +137,9 @@ struct Attribution {
     /// falling back to the process launch id. `None` for a Disabled-session agent or
     /// an id that isn't a uuid.
     session_id: Option<uuid::Uuid>,
+    /// Logical origin tag (e.g. `"code_review"`) → `Envelope.surface`. `None` = the
+    /// primary agent loop. Set via [`MeteredProvider::with_surface`].
+    surface: Option<String>,
 }
 
 impl Attribution {
@@ -157,6 +161,7 @@ impl Attribution {
             provider_host,
             model: model.into(),
             session_id: session_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
+            surface: None,
         }
     }
 
@@ -166,6 +171,7 @@ impl Attribution {
             provider_host: self.provider_host.clone(),
             model: Some(self.model.clone()),
             session_id: self.session_id,
+            surface: self.surface.clone(),
             ..Default::default()
         }
     }
@@ -432,27 +438,32 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
 }
 
 /// An [`LlmProvider`] decorator that records one [`Event::LlmChat`] for each call made
-/// THROUGH it. Its job: count the [`OverflowCompaction`] tier-2 summary LLM call, which
-/// otherwise bypasses the turn-level [`TelemetryHook`] entirely — it is an INTERNAL
-/// capability call (history summarization), not an agent round, so `on_request` /
-/// `on_model_response` never fire for it and its token spend was invisible. This is the
-/// v2 port of core's `run_llm_summary` telemetry (`c58427a3`).
+/// THROUGH it. Its job: meter LLM calls that run OUTSIDE the instrumented host agent
+/// loop, where the turn-level [`TelemetryHook`] (which fires on `on_request` /
+/// `on_model_response`) never sees them and their token spend would be invisible. Three
+/// such call sites wrap their provider with this:
+///   - the [`OverflowCompaction`] tier-2 summary call (history summarization — the v2
+///     port of core's `run_llm_summary` telemetry, `c58427a3`);
+///   - the in-session `code_review` sub-agent (assembled in [`assemble`](crate::assemble));
+///   - the standalone `atomcodex review` agent (wrapped by the clix driver).
+///
+/// The latter two run their own kernel loop with no telemetry hooks of their own.
 ///
 /// The emitted event is a plain `LlmChat` (the telemetry `Event` enum has no
-/// compaction-specific variant) carrying the call's REAL token usage (folded from the
+/// sub-agent-specific variant) carrying the call's REAL token usage (folded from the
 /// stream's [`StreamEvent::Usage`] events) and wall-clock duration. The per-zone
-/// breakdown is folded into the message zone (an internal summary call has no
-/// system/tool zones) so zones still sum to the prompt total. Wrapping is opt-in at
-/// assembly — only when a telemetry sink is configured — so a telemetry-free embedder
-/// keeps a zero-telemetry kernel AND an undecorated summary provider.
+/// breakdown is folded into the message zone (these out-of-loop calls have no
+/// separately-measured system/tool zones) so zones still sum to the prompt total.
+/// Wrapping is opt-in at assembly — only when a telemetry sink is configured — so a
+/// telemetry-free embedder keeps a zero-telemetry kernel AND an undecorated provider.
 ///
 /// [`OverflowCompaction`]: atomcode_capabilities::compaction::OverflowCompaction
-pub struct CompactionTelemetryProvider {
+pub struct MeteredProvider {
     inner: Arc<dyn LlmProvider>,
     attr: Arc<Attribution>,
 }
 
-impl CompactionTelemetryProvider {
+impl MeteredProvider {
     pub fn new(
         inner: Arc<dyn LlmProvider>,
         telemetry: Arc<Telemetry>,
@@ -463,10 +474,19 @@ impl CompactionTelemetryProvider {
     ) -> Self {
         Self { inner, attr: Arc::new(Attribution::new(telemetry, vendor, base_url, model, session_id)) }
     }
+
+    /// Tag every event this provider emits with a `surface` (e.g. `"code_review"`), so
+    /// the backend can attribute an out-of-loop sub-agent's token spend to its feature
+    /// rather than commingling it with the host session's primary-loop rounds.
+    pub fn with_surface(self, surface: impl Into<String>) -> Self {
+        let mut attr = (*self.attr).clone();
+        attr.surface = Some(surface.into());
+        Self { inner: self.inner, attr: Arc::new(attr) }
+    }
 }
 
 #[async_trait]
-impl LlmProvider for CompactionTelemetryProvider {
+impl LlmProvider for MeteredProvider {
     fn model_name(&self) -> &str {
         self.inner.model_name()
     }
@@ -840,7 +860,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_provider_records_summary_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let dec = CompactionTelemetryProvider::new(
+        let dec = MeteredProvider::new(
             Arc::new(CannedSummary { fail: false }),
             tel,
             "openai",
@@ -876,10 +896,64 @@ mod tests {
         assert_eq!(records[0].envelope.model.as_deref(), Some("deepseek-v4"));
     }
 
+    // A MeteredProvider tagged `with_surface` stamps every emitted event's envelope
+    // with that surface, so the backend can attribute an out-of-loop sub-agent's spend
+    // (e.g. the code_review tool) instead of commingling it with the host session.
+    #[tokio::test]
+    async fn metered_provider_tags_surface() {
+        // Tagged → surface flows to the envelope.
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        let dec = MeteredProvider::new(
+            Arc::new(CannedSummary { fail: false }),
+            tel,
+            "openai",
+            "https://x/v1",
+            "deepseek-v4",
+            None,
+        )
+        .with_surface("code_review");
+        let mut stream = dec
+            .chat_stream(&[Message::user("review this")], &[], &ChatOptions::default())
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].envelope.surface.as_deref(),
+            Some("code_review"),
+            "a with_surface provider must stamp envelope.surface"
+        );
+
+        // Untagged → surface stays None (the primary-loop default).
+        let (tel2, captured2) = Telemetry::in_memory("test".into());
+        let plain = MeteredProvider::new(
+            Arc::new(CannedSummary { fail: false }),
+            tel2,
+            "openai",
+            "https://x/v1",
+            "deepseek-v4",
+            None,
+        );
+        let mut s2 = plain
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .unwrap();
+        while s2.next().await.is_some() {}
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records2 = captured2.lock().await;
+        assert_eq!(records2.len(), 1);
+        assert_eq!(
+            records2[0].envelope.surface, None,
+            "an untagged provider must leave envelope.surface None"
+        );
+    }
+
     #[tokio::test]
     async fn compaction_provider_marks_had_error_on_stream_error() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let dec = CompactionTelemetryProvider::new(
+        let dec = MeteredProvider::new(
             Arc::new(CannedSummary { fail: true }),
             tel,
             "openai",

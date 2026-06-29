@@ -28,6 +28,13 @@ pub mod hooks;
 /// Dependency-free, so it is always available regardless of capability features.
 pub mod reminder;
 
+/// Claude-Code-compatible EXTERNAL hooks ([`cc_hooks::CCExternalHooks`]) — runs the
+/// user's `hooks.json` commands on the kernel's [`LifecycleHooks`]/[`ToolMiddleware`]
+/// seams (the port of core's hook engine onto the v2 engine). Opt-in: spawns
+/// subprocesses, so it pulls `tokio/process` + `dirs`.
+#[cfg(feature = "cc-hooks")]
+pub mod cc_hooks;
+
 /// Cache-friendly history compaction strategy ([`compaction::StubCompaction`]) — a
 /// [`atomcode_kernel::message::CompactionStrategy`] that stubs old tool results in place.
 /// Kernel-only deps, so it is always available regardless of capability features.
@@ -39,6 +46,11 @@ pub mod compaction;
 /// `provider` also needs it: the byte-level wire dump lands under `config_dir()/wire-dump`.
 #[cfg(any(feature = "mcp", feature = "session", feature = "memory", feature = "provider"))]
 pub(crate) mod paths;
+
+/// Kernel-only (L0) console-window suppressors — a local copy of
+/// `core::process_utils` so spawn sites here can stop the Windows
+/// console-window flash without `capabilities` depending on `core`.
+pub(crate) mod process_utils;
 
 #[cfg(feature = "provider")]
 pub mod provider;

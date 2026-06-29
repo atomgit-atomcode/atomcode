@@ -159,6 +159,27 @@ pub struct UiState {
     pub turn_prompt_tokens: usize,
     pub turn_completion_tokens: usize,
     pub turn_cached_tokens: usize,
+    /// Whether the CURRENT turn has rendered any visible assistant text (a
+    /// non-empty post-think-strip `TextDelta`). Reset at turn start/end. Read on
+    /// `TurnComplete` to detect a turn that finished with NO visible answer —
+    /// e.g. a reasoning-only / `<think>`-only completion the TUI would otherwise
+    /// show as a blank bubble — so it can surface a notice instead.
+    pub turn_rendered_visible_text: bool,
+    /// Whether the CURRENT turn produced any reasoning (a `ReasoningDelta`),
+    /// regardless of `show_reasoning`. Reset at turn start/end. Lets the blank-
+    /// turn notice say "only reasoning, press Ctrl+O" vs "no output at all".
+    pub turn_saw_reasoning: bool,
+    /// Verbatim accumulation of the CURRENT/most-recent assistant reply's
+    /// visible markdown (post think-strip), reassembled from `TextDelta`s.
+    /// `/copy` extracts fenced code blocks from this — it must read the
+    /// ORIGINAL unwrapped text, not the body cells, which are already
+    /// hard-wrapped + PAD-indented and would corrupt a copied command.
+    /// Cleared lazily: the first delta after [`UiState::response_finalized`]
+    /// wipes it, so between turns it still holds the last reply for `/copy`.
+    pub last_assistant_response: String,
+    /// Set on TurnComplete / TurnCancelled / Error to seal
+    /// `last_assistant_response`; the next turn's first delta clears it.
+    pub response_finalized: bool,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
     /// While waiting on a tool approval, holds the `"Running {Tool}"`
@@ -380,6 +401,10 @@ impl UiState {
             turn_prompt_tokens: 0,
             turn_completion_tokens: 0,
             turn_cached_tokens: 0,
+            turn_rendered_visible_text: false,
+            turn_saw_reasoning: false,
+            last_assistant_response: String::new(),
+            response_finalized: false,
             prior_phase: None,
             prior_spinner_label: None,
             thinking_idx: 0,
@@ -480,6 +505,24 @@ impl UiState {
         }
     }
 
+    /// Refresh the cached context window after a model switch.
+    ///
+    /// The footer renders `used/window` from `last_context`, but that
+    /// snapshot is only refreshed by `on_context_stats` during a turn.
+    /// Switching models via the picker fires no turn, so without this the
+    /// denominator stays pinned to the PREVIOUS model's window (e.g.
+    /// `10.1k/200k` after switching to a 128k model). Update the window in
+    /// place — keeping the used count — so the footer follows immediately;
+    /// the next turn's real `ContextStats` then re-confirms it. Seeds a
+    /// fresh snapshot when none exists yet so a pre-turn switch still shows
+    /// the new model's window (used = 0).
+    pub fn on_model_window_changed(&mut self, ctx_window: usize) {
+        let snap = self
+            .last_context
+            .get_or_insert_with(ContextSnapshot::default);
+        snap.ctx_window = ctx_window;
+    }
+
     /// Elapsed wall time since the current turn began, if a turn is
     /// active. Returns None when idle.
     pub fn turn_elapsed(&self) -> Option<std::time::Duration> {
@@ -526,6 +569,10 @@ impl UiState {
         let now = std::time::Instant::now();
         self.turn_started_at = Some(now);
         self.phase_started_at = Some(now);
+        // Fresh turn: no visible text or reasoning seen yet (drives the
+        // blank-turn notice on TurnComplete).
+        self.turn_rendered_visible_text = false;
+        self.turn_saw_reasoning = false;
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
         self.last_stream_activity = Some(now);
@@ -541,6 +588,8 @@ impl UiState {
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
+        self.turn_rendered_visible_text = false;
+        self.turn_saw_reasoning = false;
         // Turn finished normally — no need to offer resubmit of the
         // message any more. (On cancel, the streaming-key handler
         // already took() the Option before the TurnCancelled event
@@ -557,6 +606,8 @@ impl UiState {
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
+        self.turn_rendered_visible_text = false;
+        self.turn_saw_reasoning = false;
     }
 
     pub fn on_error(&mut self) {
@@ -564,6 +615,10 @@ impl UiState {
         self.spinner_label.clear();
         self.turn_started_at = None;
         self.phase_started_at = None;
+        // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
+        // flags so an errored turn can't leak a stale notice into a reused turn.
+        self.turn_rendered_visible_text = false;
+        self.turn_saw_reasoning = false;
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
@@ -802,6 +857,34 @@ mod tests {
         // NOT awaiting the model (tool running / approval / idle) → never warn, even
         // after long silence: a slow local tool is not a network stall.
         assert!(!stream_stalled_for(false, Some(STREAM_STALL_HINT * 100)));
+    }
+
+    #[test]
+    fn model_switch_refreshes_cached_ctx_window_without_a_turn() {
+        // Footer shows `used/window` from the cached ContextStats snapshot.
+        // Switching models updates the window immediately (no turn runs), so
+        // the denominator must follow while the used count stays put.
+        let mut s = UiState::new();
+        // Prior turn on a 200k-window model.
+        s.on_context_stats(0, 10_100, 0, 0, 0, 200_000, "", "");
+        assert_eq!(s.last_context.as_ref().unwrap().ctx_window, 200_000);
+        // User switches to a 128k model via the picker (no turn fired).
+        s.on_model_window_changed(128_000);
+        let snap = s.last_context.as_ref().unwrap();
+        assert_eq!(snap.ctx_window, 128_000, "window must follow the new model");
+        assert_eq!(snap.sent_tokens, 10_100, "used count must be preserved");
+    }
+
+    #[test]
+    fn model_switch_with_no_prior_snapshot_seeds_the_window() {
+        // Switching before any turn should still surface the new model's
+        // window (used=0) rather than leaving the footer window-less.
+        let mut s = UiState::new();
+        assert!(s.last_context.is_none());
+        s.on_model_window_changed(1_000_000);
+        let snap = s.last_context.as_ref().expect("snapshot seeded");
+        assert_eq!(snap.ctx_window, 1_000_000);
+        assert_eq!(snap.sent_tokens, 0);
     }
 
     #[test]

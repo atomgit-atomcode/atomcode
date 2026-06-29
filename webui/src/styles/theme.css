@@ -18,7 +18,7 @@
   --app-menu-background:#30302e; --app-menu-border:#454340; --app-menu-foreground:#e8e6df; --app-menu-selection-background:#3a2f28;
   --app-success-foreground:#74c991; --app-error-foreground:#f14c4c; --app-warning-accent:#e5a54b;
   --app-timeline-end-dot:var(--app-warning-accent); --app-spinner-foreground:var(--app-brand); --app-disabled-foreground:#777777;
-  --app-link-color:#4daafc; --app-modal-background:#000000bf; --app-transparent-inner-border:#ffffff1a;
+  --app-link-color:#4daafc; --app-modal-background:#00000073; --app-transparent-inner-border:#ffffff1a;
   --app-diff-deletion-foreground:#f14c4c; --app-diff-addition-foreground:#74c991;
   --app-spacing-small:4px; --app-spacing-medium:8px; --app-spacing-large:12px; --app-spacing-xlarge:16px;
   --corner-radius-small:6px; --corner-radius-medium:10px; --corner-radius-large:14px;

@@ -144,7 +144,7 @@ Before writing the closing summary, do ONE more targeted pass over the diff for 
 2. Hot-path costs: per-call allocations, repeated compilation/loading, and lock scope inside frequently-invoked methods — report concrete ones at P3 even when impact is uncertain (lower `confidence`, do not drop).
 3. Co-located secondary defects: re-read the exact lines and neighborhood of every finding you ALREADY reported — the same few lines frequently hide a second, independent problem (a different defect class at the same location). Having reported one issue there does not exhaust that location. In particular, a flashier defect (an injection, a panic-prone assertion, a missing check) often MASKS a quieter LOGIC bug on the same line — swapped/transposed indices or arguments, reversed comparisons, wrong field/element picked, off-by-one in which value is used. For each reported location, explicitly ask: independent of the issue I reported, is the VALUE/INDEX/ORDER/FIELD semantics of this line itself correct against what the names and the contract promise?
 
-Report anything this sweep surfaces using the same rules as above, then conclude.
+Do this sweep SILENTLY — do NOT narrate it (no "let me do a final pass…" / "now let me verify…" prose). Report anything it surfaces via the tool using the same rules as above, then go STRAIGHT into the Closing Summary with no transitional text before it.
 
 ## X. When No Issues Are Found
 

@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
+use atomcode_coding::{
+    assemble, prepare, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
+};
 use atomcode_core::agent::{
     AgentClient, AgentCommand as CoreCmd, AgentEvent as CoreEv, AgentPhase, TurnStopReason,
 };
@@ -32,6 +34,11 @@ pub struct BridgeConfig {
     pub model: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
+    /// User-configured per-response output cap (`provider.max_tokens`). `None` ⇒ the engine
+    /// derives a fallback from the context window in `build_provider`. Threaded so v2 honors
+    /// the same per-provider knob the legacy engine reads (previously dropped → the gateway's
+    /// hidden default truncated long replies with `finish_reason=length`).
+    pub max_tokens: Option<u32>,
     /// Disable MCP connection (mirrors the legacy `--no-mcp` style switches).
     pub mcp: bool,
     /// Telemetry sink forwarded to the coding assembly (→ a `LlmChat`-emitting
@@ -101,6 +108,19 @@ pub fn spawn_bridged_runtime(
     (client, ev_rx)
 }
 
+/// Wait for the kernel agent task to finish after a `Shutdown`, bounded by
+/// `grace`. `Bridge::run` returns only after this await, and the interactive
+/// driver's `/quit` completes only once that task ends and the CoreCmd channel
+/// closes — so a wedged kernel teardown (a tool or SessionEnd hook that never
+/// returns) would otherwise hang `/quit` forever. On timeout we `abort()` the
+/// task and return regardless; a backstop TUI watchdog covers the (now far
+/// rarer) case where even this isn't enough.
+async fn await_kernel_or_abort(task: &mut tokio::task::JoinHandle<()>, grace: Duration) {
+    if tokio::time::timeout(grace, &mut *task).await.is_err() {
+        task.abort();
+    }
+}
+
 /// Per-turn statistics backing the legacy `TurnComplete` payload.
 #[derive(Default)]
 struct TurnStats {
@@ -110,9 +130,33 @@ struct TurnStats {
     total_tokens: usize,
 }
 
+/// Resolve CC hooks contributed INLINE by installed plugins into the kernel-stack hook
+/// config. The bridge is the one driver that may depend on `atomcode-core`'s plugin loader
+/// (L1 / `atomcode-coding` cannot), so this mapping lives here: core hands back neutral
+/// [`PluginCcHook`](atomcode_core::plugin::loader::PluginCcHook) specs and we lift each into
+/// an `atomcode_coding::cc_hooks::HookConfig`. Gathered once per bridge (it reads installed
+/// plugin manifests from disk) and reused across respawns.
+fn gather_plugin_cc_hooks() -> Vec<atomcode_coding::cc_hooks::HookConfig> {
+    atomcode_core::plugin::loader::installed_plugin_cc_hooks()
+        .into_iter()
+        .filter_map(|h| {
+            atomcode_coding::cc_hooks::HookConfig::from_plugin_spec(
+                &h.event,
+                h.matcher,
+                h.command,
+                h.timeout_secs,
+                h.plugin_root,
+            )
+        })
+        .collect()
+}
+
 struct Bridge {
     coding_cfg: CodingAgentConfig,
     opts_template: PrepareOptions,
+    /// Plugin-contributed inline CC hooks, resolved once and threaded into every
+    /// `prepare` (initial + respawns) so plugin hooks survive a model swap / reload.
+    plugin_cc_hooks: Vec<atomcode_coding::cc_hooks::HookConfig>,
     parts: atomcode_coding::CodingParts,
     handle: atomcode_kernel::agent::AgentHandle,
     ev_tx: mpsc::UnboundedSender<CoreEv>,
@@ -189,6 +233,9 @@ impl Bridge {
             &cfg.working_dir,
         );
         coding_cfg.context_window = cfg.context_window;
+        // User-configured per-call output cap (parity with `apply_reload_provider`); `None` ⇒
+        // the per-provider fallback in `build_provider` applies.
+        coding_cfg.chat_options.max_tokens = cfg.max_tokens;
         coding_cfg.telemetry = cfg.telemetry.clone();
         coding_cfg.reasoning_history = cfg.reasoning_history.clone();
         // `/effort`: thread the per-provider reasoning_effort into the per-call ChatOptions
@@ -218,8 +265,17 @@ impl Bridge {
             // command + model self-invocation). Reuses this agent's signed provider.
             review: true,
         };
+        // Inline CC hooks from installed plugins (resolved here — only the bridge can reach
+        // the core plugin loader). Reused across respawns via the Bridge struct below.
+        let plugin_cc_hooks = gather_plugin_cc_hooks();
 
-        let mut parts = match prepare(&coding_cfg, opts_template.clone()).await {
+        let mut parts = match prepare_with_plugin_hooks(
+            &coding_cfg,
+            opts_template.clone(),
+            plugin_cc_hooks.clone(),
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 let _ = ev_tx.send(CoreEv::Error {
@@ -267,6 +323,7 @@ impl Bridge {
         let mut bridge = Bridge {
             coding_cfg,
             opts_template,
+            plugin_cc_hooks,
             parts,
             handle,
             ev_tx,
@@ -328,7 +385,7 @@ impl Bridge {
             }
         }
         let _ = bridge.handle.commands.send(KCmd::Shutdown);
-        let _ = bridge.handle.task.await;
+        await_kernel_or_abort(&mut bridge.handle.task, Duration::from_secs(5)).await;
     }
 
     fn emit(&self, ev: CoreEv) {
@@ -736,11 +793,11 @@ impl Bridge {
                                     let new_handle = a.spawn();
                                     // Shut down old handle and swap.
                                     let _ = self.handle.commands.send(KCmd::Shutdown);
-                                    let old_task = std::mem::replace(
+                                    let mut old_task = std::mem::replace(
                                         &mut self.handle.task,
                                         tokio::spawn(async {}),
                                     );
-                                    let _ = old_task.await;
+                                    await_kernel_or_abort(&mut old_task, Duration::from_secs(5)).await;
                                     self.handle = new_handle;
                                     self.degraded = false;
                                     // Clear any stale state that may have accumulated
@@ -990,15 +1047,21 @@ impl Bridge {
             self.finish_turn(StopReason::Cancelled, Vec::new());
         }
         let _ = self.handle.commands.send(KCmd::Shutdown);
-        let task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
-        let _ = task.await;
+        let mut task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
+        await_kernel_or_abort(&mut task, Duration::from_secs(5)).await;
         let mut opts = self.opts_template.clone();
         opts.session = session;
 
         // Try the requested session mode first; if that fails (e.g. Resume could
         // not find the snapshot), fall back to Fresh before giving up entirely.
         // This prevents a broken snapshot from crashing the whole bridge.
-        let mut parts = match prepare(&self.coding_cfg, opts.clone()).await {
+        let mut parts = match prepare_with_plugin_hooks(
+            &self.coding_cfg,
+            opts.clone(),
+            self.plugin_cc_hooks.clone(),
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 // Don't retry Fresh if the caller already asked for Fresh — that
@@ -1013,7 +1076,13 @@ impl Bridge {
                     return;
                 }
                 opts.session = SessionMode::Fresh;
-                match prepare(&self.coding_cfg, opts).await {
+                match prepare_with_plugin_hooks(
+                    &self.coding_cfg,
+                    opts,
+                    self.plugin_cc_hooks.clone(),
+                )
+                .await
+                {
                     Ok(p) => p,
                     Err(e2) => {
                         self.emit(CoreEv::Error {
@@ -1379,26 +1448,30 @@ impl Bridge {
                 let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
                 self.emit(CoreEv::Error { error, snapshot: ConversationSnapshot::default() });
             }
-            // A manual `/compact` may make a slow one-shot LLM summary call; announce it
-            // so the user sees a progress line while it runs (v1 streamed the same
-            // "(compacting with LLM summary...)" text). Auto/Overflow stub silently — no
-            // LLM call, no user action to acknowledge — so they stay quiet here.
+            // The kernel emits CompactionStarted ONLY when a slow one-shot LLM summary
+            // will actually run (manual `/compact`, overflow tier 2, or auto-compaction
+            // that escalated past the high-water mark). Always show a progress line so
+            // the user isn't staring at a frozen UI during the multi-second call. A
+            // user-typed `/compact` streams it as a TextDelta (its command handler
+            // renders these inline, v1 parity); auto/overflow — which the user did not
+            // invoke — surface it as a transient Warning instead.
             KEv::CompactionStarted { trigger } => {
+                let text =
+                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting).into_owned();
                 if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
-                    self.emit(CoreEv::TextDelta(
-                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::CompactStarting)
-                            .into_owned(),
-                    ));
+                    self.emit(CoreEv::TextDelta(text));
+                } else {
+                    self.emit(CoreEv::Warning(text));
                 }
             }
             KEv::Compacted { committed, trigger, removed, bytes_before, bytes_after, .. } => {
+                // The kernel measures BYTES; token figures are derived from the last
+                // provider usage report. Capture it BEFORE mutating `last_usage` below.
+                let before_tokens =
+                    self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
                 if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
                     // v1 parity: stream the authoritative result as a plain TextDelta line
-                    // (the TUI's `/compact` handler renders these directly). The kernel
-                    // measures BYTES, so the token figures are derived from the last
-                    // provider usage report (see `manual_compact_result`).
-                    let before_tokens =
-                        self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
+                    // (the TUI's `/compact` handler renders these directly).
                     self.emit(CoreEv::TextDelta(manual_compact_result(
                         committed,
                         removed,
@@ -1406,22 +1479,23 @@ impl Bridge {
                         bytes_after,
                         before_tokens,
                     )));
-                    if committed {
-                        // v1 parity: refresh the cached context size so the footer /
-                        // `/context` reflect the shrunk conversation immediately. v1
-                        // recomputes via `build_messages`; the kernel only tracks bytes,
-                        // so update `last_usage` to the same estimate the result line
-                        // shows. The next real turn overwrites it with the exact count.
-                        if let Some(meta) = self.last_usage.as_mut() {
-                            meta.used_tokens =
-                                estimate_after_tokens(before_tokens, bytes_before, bytes_after)
-                                    as u32;
-                        }
-                        self.emit_context_stats();
-                    }
                 } else if let Some(msg) = compaction_advisory(committed, &trigger) {
                     // Auto/Overflow keep the terse one-line advisory.
                     self.emit(CoreEv::Warning(msg));
+                }
+                if committed {
+                    // Refresh the cached context size so the footer / `/context` reflect
+                    // the shrunk conversation IMMEDIATELY — for ANY committed compaction,
+                    // not just Manual. Previously Auto/Overflow skipped this, so an auto
+                    // drain+summarize's reduction lagged a full turn (footer stayed at the
+                    // pre-compaction number until the next real usage report). The kernel
+                    // only tracks bytes, so estimate the post-shrink tokens from the byte
+                    // ratio; the next real turn overwrites it with the exact count.
+                    if let Some(meta) = self.last_usage.as_mut() {
+                        meta.used_tokens =
+                            estimate_after_tokens(before_tokens, bytes_before, bytes_after) as u32;
+                    }
+                    self.emit_context_stats();
                 }
             }
             KEv::TurnComplete { reason } => {
@@ -1710,7 +1784,7 @@ async fn run_background_task(
         }
     }
     let _ = handle.commands.send(KCmd::Shutdown);
-    let _ = handle.task.await;
+    await_kernel_or_abort(&mut handle.task, Duration::from_secs(5)).await;
     let summary = if summary.trim().is_empty() {
         "(background task finished with no text output)".to_string()
     } else {
@@ -1776,6 +1850,10 @@ fn apply_reload_provider(
         cfg.api_key = api_key.clone();
     }
     cfg.context_window = provider.context_window as u32;
+    // A user-configured `max_tokens` is the per-call output cap; thread it into ChatOptions
+    // so v2 forwards it (the provider's `options.max_tokens.or(cfg.max_tokens)` then honors it).
+    // `None` ⇒ leave it to the provider-config fallback derived in `build_provider`.
+    cfg.chat_options.max_tokens = provider.max_tokens.map(|m| m as u32);
     // `/effort` / `/think` write the provider config then ReloadConfig: pick
     // up the (possibly changed) reasoning_effort so the respawned agent's
     // ChatOptions reflect it. (`reasoning_history` is a model-property, set
@@ -1789,6 +1867,15 @@ fn apply_reload_provider(
     cfg.thinking_enabled = provider.thinking_enabled;
     cfg.thinking_type = provider.thinking_type.clone();
     cfg.thinking_keep = provider.thinking_keep.clone();
+}
+
+/// Provider-config fallback output cap when neither the per-call `ChatOptions` nor an explicit
+/// user setting provides one. Mirrors the legacy v1 engine (`core::provider::{openai,claude}`):
+/// a quarter of the context window, clamped to `[8_000, 16_384]`. Without this, v2 sent NO
+/// `max_tokens` for OpenAI-compat (the gateway then applied its own small hidden cap →
+/// frequent `finish_reason=length` truncation) and a flat 4096 for Anthropic.
+fn default_max_tokens(context_window: u32) -> u32 {
+    (context_window / 4).clamp(8_000, 16_384)
 }
 
 fn build_provider(
@@ -1806,6 +1893,9 @@ fn build_provider(
         "claude" | "anthropic" => {
             let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             ac.context_window = cfg.context_window;
+            // Fallback output cap (the per-call `chat_options.max_tokens` still wins). Replaces
+            // the flat 4096 default so a large context window gets a proportionate cap.
+            ac.max_tokens = default_max_tokens(cfg.context_window);
             // `/think on` → adaptive extended thinking. (v2 uses adaptive, so v1's
             // thinking_budget has no direct mapping — intentionally dropped.)
             ac.thinking = cfg.thinking_enabled.unwrap_or(false);
@@ -1817,6 +1907,8 @@ fn build_provider(
             let mut oc = OllamaConfig::new(&cfg.base_url, &cfg.model);
             oc.api_key = cfg.api_key.clone();
             oc.context_window = cfg.context_window;
+            // Fallback `num_predict` cap (the per-call `chat_options.max_tokens` still wins).
+            oc.max_tokens = Some(default_max_tokens(cfg.context_window));
             oc.think = cfg.thinking_enabled.unwrap_or(false);
             Ok(Arc::new(
                 OllamaProvider::new(oc).map_err(|e| anyhow::anyhow!(e.message))?,
@@ -1826,6 +1918,9 @@ fn build_provider(
         _ => {
             let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             pc.context_window = cfg.context_window;
+            // Fallback `max_tokens` (the per-call `chat_options.max_tokens` still wins). Without
+            // this v2 sent NO max_tokens and the gateway's hidden default truncated long replies.
+            pc.max_tokens = Some(default_max_tokens(cfg.context_window));
             // Honor the provider's `reasoning_history` override; unset ⇒ leave `None` so the
             // adapter auto-detects by model. A typo fails fast (parity with the legacy engine).
             pc.reasoning_policy = ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
@@ -2006,7 +2101,8 @@ mod goal_summary_tests {
 mod undo_tests {
     use super::{
         apply_reload_provider, build_provider, compaction_advisory, compute_undo,
-        estimate_after_tokens, fmt_k_tokens, friendly_provider_error, manual_compact_result,
+        default_max_tokens, estimate_after_tokens, fmt_k_tokens, friendly_provider_error,
+        manual_compact_result,
     };
     use atomcode_core::config::provider::ProviderConfig;
     use atomcode_coding::CodingAgentConfig;
@@ -2147,6 +2243,17 @@ mod undo_tests {
     }
 
     #[test]
+    fn default_max_tokens_mirrors_v1_clamp() {
+        // Parity with the legacy core engine (openai.rs / claude.rs): a quarter of the
+        // context window, clamped to [8_000, 16_384]. v2 previously sent NO max_tokens for
+        // OpenAI-compat (gateway applied its own small hidden cap → finish_reason=length).
+        assert_eq!(default_max_tokens(16_000), 8_000); // 4_000 → floor
+        assert_eq!(default_max_tokens(64_000), 16_000); // in range
+        assert_eq!(default_max_tokens(128_000), 16_384); // 32_000 → ceil
+        assert_eq!(default_max_tokens(1_000_000), 16_384); // huge window → ceil
+    }
+
+    #[test]
     fn reload_provider_refreshes_context_window_and_provider_knobs() {
         let mut cfg = CodingAgentConfig::new("old-key", "https://old.example.com/v1", "old-model", "/tmp");
         cfg.context_window = 16_000;
@@ -2164,7 +2271,7 @@ mod undo_tests {
             system_prompt: None,
             user_agent: None,
             context_window: 64_000,
-            max_tokens: None,
+            max_tokens: Some(5_000),
             thinking_type: Some("enabled".into()),
             thinking_keep: Some("all".into()),
             reasoning_history: Some("include".into()),
@@ -2181,6 +2288,9 @@ mod undo_tests {
         assert_eq!(cfg.base_url, "https://new.example.com/v1");
         assert_eq!(cfg.api_key, "new-key");
         assert_eq!(cfg.context_window, 64_000);
+        // A user-configured `max_tokens` must thread into the per-call ChatOptions so v2
+        // actually sends it (previously dropped → gateway applied its own hidden output cap).
+        assert_eq!(cfg.chat_options.max_tokens, Some(5_000));
         assert_eq!(cfg.provider_type, "claude");
         assert_eq!(cfg.reasoning_history.as_deref(), Some("include"));
         assert_eq!(cfg.chat_options.reasoning_effort, Some(ReasoningEffort::Max));
@@ -2252,6 +2362,33 @@ mod undo_tests {
             super::run_local_shell("exit 3", std::path::Path::new(".")).await;
         assert!(!success);
         assert!(ctx.contains("<bash-exit-code>3</bash-exit-code>"), "ctx={ctx}");
+    }
+
+    // A wedged kernel teardown (a tool / SessionEnd hook that never returns) must
+    // NOT hang the bridge: the bounded wait has to return, and abort the task, so
+    // `Bridge::run` ends and the driver's /quit can complete. This is the core of
+    // the "/quit can't exit" fix.
+    #[tokio::test]
+    async fn await_kernel_or_abort_times_out_and_aborts_a_wedged_task() {
+        let mut task = tokio::spawn(async { std::future::pending::<()>().await });
+        let start = std::time::Instant::now();
+        super::await_kernel_or_abort(&mut task, std::time::Duration::from_millis(50)).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "must return on timeout, not hang on the wedged task"
+        );
+        // The task was cancelled, not left running — awaiting it yields a cancel error.
+        assert!(task.await.is_err(), "wedged task must be aborted");
+    }
+
+    // The happy path: a kernel that shuts down cleanly is awaited to completion
+    // (no abort), well within the grace window.
+    #[tokio::test]
+    async fn await_kernel_or_abort_returns_when_task_ends_cleanly() {
+        let mut task = tokio::spawn(async {});
+        super::await_kernel_or_abort(&mut task, std::time::Duration::from_secs(5)).await;
+        // The helper awaited it to completion within the grace window (no abort).
+        assert!(task.is_finished(), "clean task must finish normally, not be aborted");
     }
 
     #[test]

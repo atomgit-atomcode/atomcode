@@ -127,8 +127,8 @@ impl LiveSession {
         let (events, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let turn_state = Arc::new(Mutex::new(TurnState::Idle));
-        let approver = Arc::new(Mutex::new(None));
         let current_cancel = Arc::new(Mutex::new(None));
+        let approver = Arc::new(Mutex::new(None));
         let turn_buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let session = Arc::new(Self {
@@ -136,8 +136,8 @@ impl LiveSession {
             events: events.clone(),
             input_tx,
             turn_state: turn_state.clone(),
-            approver: approver.clone(),
             current_cancel: current_cancel.clone(),
+            approver: approver.clone(),
             turn_buffer: turn_buffer.clone(),
         });
 
@@ -148,8 +148,8 @@ impl LiveSession {
             events,
             input_rx,
             turn_state,
-            approver,
             current_cancel,
+            approver,
             turn_buffer,
         ));
 
@@ -199,6 +199,17 @@ impl LiveSession {
     /// 当前 turn 状态。
     pub async fn state(&self) -> TurnState {
         *self.turn_state.lock().await
+    }
+
+    /// Cancel the currently running turn. Returns `false` when the session is idle.
+    pub async fn cancel_current_turn(&self) -> bool {
+        let cancel = self.current_cancel.lock().await.clone();
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+            true
+        } else {
+            false
+        }
     }
 
     /// 投递一条用户输入。返回 `false` 表示总线已关闭（协调器任务已退出）。
@@ -282,15 +293,22 @@ async fn coordinator(
     events: broadcast::Sender<LiveEvent>,
     mut input_rx: mpsc::UnboundedReceiver<UserInput>,
     turn_state: Arc<Mutex<TurnState>>,
-    approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
     turn_buffer: Arc<std::sync::Mutex<Vec<LiveEvent>>>,
 ) {
+    // Diagnostics via `ctrace!` (file sink, gated by ATOMCODE_TRACE), never
+    // eprintln: under /webui this coordinator runs in the TUI process, so a
+    // stray stderr write lands on the raw-mode terminal and corrupts the
+    // display (DEC-graphics mojibake / flooding). See trace.rs.
+    crate::ctrace!("LIVE", "coordinator START");
     while let Some(input) = input_rx.recv().await {
+        crate::ctrace!("LIVE", "coordinator received input: {} chars", input.text.len());
         // 单写者守卫：运行中直接忽略本次输入（不排队，避免乱序）。
         {
             let mut st = turn_state.lock().await;
             if *st == TurnState::Running {
+                crate::ctrace!("LIVE", "coordinator REJECTED input: already running");
                 let _ = events.send(LiveEvent::Turn(TurnEvent::Warning(
                     "对方正在对话，已忽略本次输入".to_string(),
                 )));
@@ -298,6 +316,7 @@ async fn coordinator(
             }
             *st = TurnState::Running;
         }
+        crate::ctrace!("LIVE", "coordinator ACCEPTED input, broadcasting StateChanged(Running)");
         // 回合开始：清回放缓冲并记入 Running——锁内一并广播，与
         // join_with_replay 的「订阅+克隆」互斥，保证晚加入者不丢不重。
         {
@@ -410,8 +429,10 @@ async fn coordinator(
             )));
         }
         *turn_state.lock().await = TurnState::Idle;
+        crate::ctrace!("LIVE", "coordinator turn done, broadcasting StateChanged(Idle)");
         let _ = events.send(LiveEvent::StateChanged(TurnState::Idle));
     }
+    crate::ctrace!("LIVE", "coordinator EXIT (input_rx closed)");
 }
 
 #[cfg(test)]
@@ -426,6 +447,21 @@ mod tests {
         calls: Arc<AtomicUsize>,
         reply: String,
         delay_ms: u64,
+    }
+
+    struct CancellableExecutor;
+
+    #[async_trait]
+    impl TurnExecutor for CancellableExecutor {
+        async fn run_turn(
+            &self,
+            _conv: &Arc<Mutex<Conversation>>,
+            _events: broadcast::Sender<LiveEvent>,
+            _approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+            cancel: CancellationToken,
+        ) {
+            cancel.cancelled().await;
+        }
     }
 
     #[async_trait]
@@ -519,6 +555,26 @@ mod tests {
         assert!(session.send_input(UserInput { text: "third".into(), images: vec![] }));
         let _ = drain_until_idle(&mut rx).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "运行中投的第二条应被丢弃，仅 first+third 执行");
+    }
+
+    #[tokio::test]
+    async fn cancel_current_turn_stops_running_executor() {
+        let session = LiveSession::new(Arc::new(CancellableExecutor), Vec::new());
+        let mut rx = session.subscribe();
+
+        assert!(session.send_input(UserInput { text: "cancel me".into(), images: vec![] }));
+        loop {
+            if let Ok(LiveEvent::StateChanged(TurnState::Running)) = rx.recv().await {
+                break;
+            }
+        }
+
+        assert!(session.cancel_current_turn().await);
+        let events = tokio::time::timeout(std::time::Duration::from_secs(1), drain_until_idle(&mut rx))
+            .await
+            .expect("cancelled turn should become idle promptly");
+        assert!(matches!(events.last(), Some(LiveEvent::StateChanged(TurnState::Idle))));
+        assert!(!session.cancel_current_turn().await);
     }
 
     #[tokio::test]

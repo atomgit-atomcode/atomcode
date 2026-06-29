@@ -29,6 +29,9 @@ pub struct CurrentContext {
     pub repo_origin: Option<RepoOrigin>,
     pub mode: Option<crate::event::SessionMode>,
     pub session_id: Option<Uuid>,
+    /// Logical origin of the call (e.g. `"code_review"`); flows into `Envelope.surface`.
+    /// `None` = the primary agent loop. See [`crate::event::Envelope::surface`].
+    pub surface: Option<String>,
 }
 
 tokio::task_local! {
@@ -398,6 +401,7 @@ impl Telemetry {
             mode: ctx
                 .mode
                 .or_else(|| self.default_mode.read().ok().and_then(|g| *g)),
+            surface: ctx.surface,
         }
     }
 

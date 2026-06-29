@@ -3,7 +3,7 @@
 
 import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -103,6 +103,18 @@ interface ChatProps {
   restoring?: boolean;
   /** /live turn 完成后通知 App 刷新侧栏列表（session 已落盘，列表需更新）。 */
   onLiveTurnDone?: () => void;
+  /** 首条消息发出瞬间上报标题（取消息前 10 字），供 App 乐观插入侧栏，
+   *  让会话即时出现；待后端落盘并自动命名后，列表刷新会换成真实标题。 */
+  onOptimisticSession?: (title: string) => void;
+  /** 打开工作目录选择器（cwd 面包屑已从顶栏移到输入框下方，由本组件渲染）。 */
+  onOpenCwd?: () => void;
+  /** 另一端（TUI /cd、worktree、其他 webui tab）切了工作目录：实时流送来 working_dir
+   *  事件时上报新路径，供 App 更新 cwd 面包屑 + 侧栏目录过滤。 */
+  onCwdChanged?: (dir: string) => void;
+  /** 上报是否处于落地（空对话）态，供 App 决定是否显示会话标题头。 */
+  onLanding?: (landing: boolean) => void;
+  /** 侧栏「技能」菜单选中的技能：变化时把 `/name ` 插入输入框。 */
+  skillInsert?: { name: string; seq: number } | null;
 }
 
 function formatArgs(args: unknown): string {
@@ -217,6 +229,19 @@ function formatToolDetail(name: string, argsJson: string): string {
         .filter((x): x is string => x !== null)
         .join(', ');
     }
+    case 'todo': {
+      const action = getStr('action');
+      if (action === 'add') return getStr('content');
+      if (action === 'update') {
+        const id = typeof v.id === 'number' ? v.id : '';
+        const status = getStr('status');
+        if (id && status) return `#${id} → ${status}`;
+        if (id) return `#${id}`;
+        return status;
+      }
+      if (action === 'list') return 'list all';
+      return '';
+    }
     case 'use_skill':
       return getStr('name');
     default: {
@@ -256,7 +281,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -289,6 +314,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -304,6 +330,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 查看的就是这个实时会话时才把输出渲染进画布——否则用户从侧栏打开了别的历史会话，
   // 实时输出会串进错误页面、且刷新即消失（刷新会按真实会话重载）。
   const liveSessionIdRef = useRef<string | null>(null);
+  // 是否已为「当前会话」上报过乐观侧栏条目。每次切换/新建会话时复位，
+  // 避免同一会话第二条消息（尤其 sync 路径本地不落消息）重复上报、改写标题。
+  const optimisticFiredRef = useRef(false);
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
   // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
@@ -314,6 +343,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (sessionId !== activeIdRef.current) {
       activeIdRef.current = sessionId;
       loadedForRef.current = null;
+      optimisticFiredRef.current = false;
       abortRef.current?.abort();
       setBusy(false);
       setMessages([]);
@@ -479,6 +509,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 把 sync 状态写回 URL 的 ?sync 参数，使刷新后能保持当前开/关状态
+  // （否则关掉同步后 URL 仍带 sync=1，刷新一下又被重新开启 —— issue #816）。
+  // 覆盖所有改变 sync 的入口：toggleSync、以及实时流出错时的自动关闭。
+  // 用 replaceState 避免在浏览器历史里堆积条目。
+  useEffect(() => {
+    try {
+      const url = new URL(location.href);
+      if (sync) url.searchParams.set('sync', '1');
+      else url.searchParams.delete('sync');
+      history.replaceState(history.state, '', url.toString());
+    } catch { /* URL/history 不可用时忽略 */ }
+  }, [sync]);
+
   // ── Shared history → display conversion (reused by session load AND live snapshot) ──
   function sessionMessagesToDisplay(msgs: SessionMessage[]): Message[] {
     const loaded: Message[] = [];
@@ -535,6 +578,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'error': return { type: 'error', message: e.message };
+      case 'warning': return { type: 'warning', message: e.message };
       default: return null;
     }
   }
@@ -562,6 +606,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 模型切换是进程级（全局），与正在查看哪个会话无关 → 不门控，始终更新下拉框。
     if (e.type === 'provider') {
       setProvider(e.provider);
+      return;
+    }
+    // 工作目录切换是进程级（另一端 /cd），与查看哪个会话无关 → 不门控，始终上报
+    // 让 App 更新 cwd 面包屑 + 侧栏目录过滤。会话本身不变（对话保留）。
+    if (e.type === 'working_dir') {
+      onCwdChanged?.(e.working_dir);
       return;
     }
     // 会话切换：另一端（webui 新建对话 / TUI /session）创建了新会话，
@@ -664,6 +714,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         // chronological order (…tool → text…) is preserved.
         parts.push({ kind: 'text', text: content });
       }
+      return [...prev.slice(0, -1), { ...last, parts }];
+    });
+  }
+
+  // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
+  // never styled as an error). Mirrors appendToLastAssistant's last-assistant guard.
+  function pushNoticeToLastAssistant(text: string) {
+    setMessages((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      if (last.role !== 'assistant') return prev;
+      const parts: MsgPart[] = [...last.parts, { kind: 'notice', text }];
       return [...prev.slice(0, -1), { ...last, parts }];
     });
   }
@@ -791,6 +853,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         onPermissionResolved?.(null);
         break;
 
+      case 'warning':
+        // 非致命提示（如"已自动压缩上下文"）：渲染成淡色 notice 行 —— 不染红、不并进
+        // 回复文本、不结束回合（任务继续）。对齐 TUI 的黄色 "!" 提示。
+        pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }));
+        break;
+
       default:
         // Ignore tool_batch, artifact_*, etc.
         break;
@@ -799,6 +867,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // 实际投递一条消息（同步 / 常规两条路径）；busy 由各自的事件流复位。
   async function deliver(text: string, images: ImageData[]) {
+    // 本会话首条消息：用消息前 10 字做临时标题，立刻通知 App 乐观插入侧栏，
+    // 让会话「一发送就出现在左侧」。回合 done 后列表刷新会换成后端自动命名。
+    if (!optimisticFiredRef.current && messages.length === 0) {
+      optimisticFiredRef.current = true;
+      const title = (text.split('\n')[0]?.trim() ?? '').slice(0, 10);
+      if (title) onOptimisticSession?.(title);
+    }
+
     if (sync) {
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
@@ -825,11 +901,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     const controller = new AbortController();
     abortRef.current = controller;
+    const requestId = crypto.randomUUID();
+    requestIdRef.current = requestId;
 
     try {
       const body = {
         message: text,
         ...(sessionId ? { session_id: sessionId } : {}),
+        request_id: requestId,
         ...(cwd ? { working_dir: cwd } : {}),
         ...(provider ? { provider } : {}),
         ...(images.length ? { images } : {}),
@@ -850,6 +929,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       onPermissionResolved?.(null);
     } finally {
       abortRef.current = null;
+      if (requestIdRef.current === requestId) requestIdRef.current = null;
     }
   }
 
@@ -944,8 +1024,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
   }
 
-  function handleStop() {
-    abortRef.current?.abort();
+  async function handleStop() {
+    try {
+      if (sync) {
+        await postLiveStop();
+      } else if (requestIdRef.current) {
+        await stopChat(requestIdRef.current);
+      }
+    } catch {
+      // If the cancellation endpoint itself is unavailable, at least restore
+      // the local UI instead of leaving the stop button stuck indefinitely.
+      abortRef.current?.abort();
+      setBusy(false);
+      setQueued([]);
+      onPermissionResolved?.(null);
+    }
   }
 
   // 从光标前的 / 替换为选中的技能名。
@@ -1059,21 +1152,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   }
 
   // 在 textarea 光标处插入文本（skill 命令 / 文件路径），并复位高度、聚焦。
-  function insertAtCursor(text: string) {
+  // 若 `replaceSkill` 为 true，先清空输入框再插入，避免反复选择技能时累加。
+  function insertAtCursor(text: string, replaceSkill = false) {
     const ta = textareaRef.current;
-    if (!ta) {
+    if (replaceSkill) {
+      setInput(text);
+    } else if (!ta) {
       setInput((v) => v + text);
-      return;
+    } else {
+      const start = ta.selectionStart ?? ta.value.length;
+      const end = ta.selectionEnd ?? ta.value.length;
+      setInput(ta.value.slice(0, start) + text + ta.value.slice(end));
     }
-    const start = ta.selectionStart ?? ta.value.length;
-    const end = ta.selectionEnd ?? ta.value.length;
-    const next = ta.value.slice(0, start) + text + ta.value.slice(end);
-    setInput(next);
     requestAnimationFrame(() => {
       const el = textareaRef.current;
       if (!el) return;
       el.focus();
-      const pos = start + text.length;
+      const pos = replaceSkill ? text.length : (ta?.selectionStart ?? el.value.length) + text.length;
       el.setSelectionRange(pos, pos);
       el.style.height = 'auto';
       el.style.height = Math.min(el.scrollHeight, 160) + 'px';
@@ -1137,6 +1232,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 抑制条件：正在拉历史（loading，避免切到有内容会话时闪屏）、restoring（刷新还原中）、
   // 已有 historyHint（无法加载、提示去 TUI/磁盘续聊）。
   const landing = messages.length === 0 && !historyHint && !restoring && !loading;
+
+  // 上报落地态给 App（决定是否显示会话标题头）。
+  useEffect(() => {
+    onLanding?.(landing);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [landing]);
+
+  // 侧栏「技能」菜单选中 → 把 `/name ` 插入输入框（按 seq 去重，避免重复插入）。
+  // replaceSkill=true 会先清除已有的技能前缀，避免反复选择时累加。
+  const lastSkillSeqRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!skillInsert) return;
+    if (lastSkillSeqRef.current === skillInsert.seq) return;
+    lastSkillSeqRef.current = skillInsert.seq;
+    insertAtCursor(`/${skillInsert.name} `, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skillInsert]);
 
   // 落地页副标题：项目名 + 缩写路径。
   const cleanCwd = cwd.replace(/\/+$/, '');
@@ -1240,7 +1352,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           aria-label={t('sync.toggle')}
           aria-pressed={sync}
         >
-          ⇄
+          {/* lucide `arrow-left-right` — matches the pencil design's sync icon. */}
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M8 3 4 7l4 4" />
+            <path d="M4 7h16" />
+            <path d="m16 21 4-4-4-4" />
+            <path d="M20 17H4" />
+          </svg>
         </button>
         <span class="footer-spacer" />
         {tokens && (
@@ -1289,6 +1417,29 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     </div>
   );
 
+  // 输入框下方副栏：左 cwd 面包屑（点击切目录），右键盘提示（对齐设计的 Input Footer）。
+  const inputSubbar = (
+    <div class="input-subbar">
+      <button class="input-cwd" onClick={() => onOpenCwd?.()} title={t('header.switchCwd')}>
+        <svg class="input-cwd-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M1.8 4.2c0-.66.54-1.2 1.2-1.2h2.7l1.3 1.5h5.2c.66 0 1.2.54 1.2 1.2v5.9c0 .66-.54 1.2-1.2 1.2H3c-.66 0-1.2-.54-1.2-1.2z"
+            stroke="currentColor"
+            stroke-width="1.2"
+            stroke-linejoin="round"
+          />
+        </svg>
+        {cwd ? (
+          <span class="input-cwd-path">{projPath}</span>
+        ) : (
+          <span class="input-cwd-path muted">{t('header.noCwd')}</span>
+        )}
+        <span class="input-cwd-chevron">▾</span>
+      </button>
+      <span class="input-hint">{t('chat.kbdHint')}</span>
+    </div>
+  );
+
   // 文件选择器模态（落地态与常规态共用一份）。
   const filePickerModal = showFilePicker && (
     <FilePicker
@@ -1308,19 +1459,50 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     />
   );
 
+  // 落地页快捷提示胶囊：点击把文本填入输入框并聚焦（不自动发送，便于二次编辑）。
+  const quickChips: { label: string; insert: string }[] = [
+    { label: t('chat.chipReview'), insert: '/code-review ' },
+    { label: t('chat.chipExplain'), insert: t('chat.chipExplain') },
+    { label: t('chat.chipTest'), insert: t('chat.chipTest') },
+  ];
+  function fillInput(text: string) {
+    setInput(text);
+    requestAnimationFrame(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      const pos = text.length;
+      ta.setSelectionRange(pos, pos);
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+    });
+  }
+
   if (landing) {
     return (
       <>
         <div class="chat-landing">
           <div class="landing-inner">
-            <div class="landing-brand">AtomCode</div>
-            {cwd && (
-              <div class="landing-subtitle">
-                <span class="landing-project">{projName}</span>
-                <span class="landing-path">{projPath}</span>
-              </div>
-            )}
-            {inputBox}
+            <div class="landing-brand">
+              {/* <span class="landing-brand-logo" aria-hidden="true">
+                <svg width="34" height="34" viewBox="0 0 24 24" fill="none">
+                  <rect x="6.4" y="6.4" width="11.2" height="11.2" rx="2.6" transform="rotate(45 12 12)" stroke="currentColor" stroke-width="1.8" />
+                </svg>
+              </span> */}
+              <span class="landing-brand-name">AtomCode</span>
+            </div>
+            <div class="landing-tagline">{t('chat.greeting')}</div>
+            <div class="landing-input">
+              {inputBox}
+              {inputSubbar}
+            </div>
+            <div class="landing-chips">
+              {quickChips.map((c) => (
+                <button key={c.label} class="landing-chip" onClick={() => fillInput(c.insert)}>
+                  {c.label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
         {filePickerModal}
@@ -1333,6 +1515,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     <>
       {/* Message timeline */}
       <div class="messages-container">
+        <div class="timeline-inner">
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
             <div>
@@ -1422,10 +1605,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         ))}
 
         <div ref={bottomRef} />
+        </div>
       </div>
 
       {/* Floating input */}
-      <div class="input-container">{inputBox}</div>
+      <div class="input-container">
+        <div class="input-wrap">
+          {inputBox}
+          {inputSubbar}
+        </div>
+      </div>
       {filePickerModal}
       {livePermissionCard}
     </>
@@ -1457,6 +1646,13 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
           ))}
         </div>,
       );
+    } else if (p.kind === 'notice') {
+      out.push(
+        <div class="msg-notice" key={`nt-${i}`}>
+          {p.text}
+        </div>,
+      );
+      i++;
     } else {
       if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} />);
       i++;
@@ -1514,6 +1710,144 @@ function UserMessageView({ msg }: { msg: Message }) {
   );
 }
 
+// Map a tool's wire name to a leading line-icon category (mirrors the inline
+// design: file / search / edit / terminal / globe / folder …).
+function toolCategory(name: string): string {
+  if (name.startsWith('mcp__')) return 'mcp';
+  switch (name) {
+    case 'read_file':
+    case 'read_symbol':
+    case 'list_symbols':
+    case 'file_dependencies':
+      return 'file';
+    case 'edit_file':
+    case 'write_file':
+    case 'create_file':
+    case 'search_replace':
+    case 'parallel_edit_files':
+      return 'edit';
+    case 'grep':
+    case 'glob':
+    case 'find_references':
+    case 'trace_callees':
+    case 'trace_callers':
+    case 'trace_chain':
+    case 'blast_radius':
+      return 'search';
+    case 'bash':
+      return 'terminal';
+    case 'web_fetch':
+    case 'web_search':
+      return 'globe';
+    case 'list_directory':
+    case 'change_dir':
+      return 'folder';
+    case 'use_skill':
+      return 'skill';
+    case 'todo':
+      return 'todo';
+    default:
+      return 'default';
+  }
+}
+
+const TOOL_ICON_PATHS: Record<string, VNode> = {
+  file: (
+    <>
+      <path d="M9 1.75H4.5A1.5 1.5 0 0 0 3 3.25v9.5a1.5 1.5 0 0 0 1.5 1.5h7a1.5 1.5 0 0 0 1.5-1.5V5.75L9 1.75Z" />
+      <path d="M9 1.75v4h4" />
+    </>
+  ),
+  edit: <path d="M11.4 2.6l2 2L6 12l-2.6.6L4 10l7.4-7.4Z" />,
+  search: (
+    <>
+      <circle cx="7" cy="7" r="4.25" />
+      <path d="M10.2 10.2 14 14" />
+    </>
+  ),
+  terminal: (
+    <>
+      <rect x="2" y="3" width="12" height="10" rx="1.5" />
+      <path d="M4.5 6.5 7 8.5 4.5 10.5" />
+      <path d="M8.5 10.5h3" />
+    </>
+  ),
+  globe: (
+    <>
+      <circle cx="8" cy="8" r="6" />
+      <path d="M2 8h12" />
+      <path d="M8 2c2.2 2.2 2.2 9.8 0 12-2.2-2.2-2.2-9.8 0-12Z" />
+    </>
+  ),
+  folder: (
+    <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.5l1.3 1.6h5.2A1.5 1.5 0 0 1 14 6.1v5.9a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12V4.5Z" />
+  ),
+  skill: <path d="M9 1.5 3.5 9H7.5L7 14.5 12.5 7H8.5L9 1.5Z" />,
+  todo: (
+    <>
+      <path d="M6.5 4.5H13M6.5 8H13M6.5 11.5H13" />
+      <path d="M2.5 4.4l.8.8 1.5-1.7" />
+      <circle cx="3.3" cy="8" r="0.5" fill="currentColor" stroke="none" />
+      <circle cx="3.3" cy="11.5" r="0.5" fill="currentColor" stroke="none" />
+    </>
+  ),
+  mcp: (
+    <>
+      <rect x="3" y="3" width="4.5" height="4.5" rx="1" />
+      <rect x="8.5" y="8.5" width="4.5" height="4.5" rx="1" />
+      <path d="M7.5 5.25h2A1.5 1.5 0 0 1 11 6.75v1.75" />
+    </>
+  ),
+  default: <circle cx="8" cy="8" r="2.5" />,
+};
+
+function ToolTypeIcon({ name }: { name: string }) {
+  return (
+    <svg
+      class="tool-type-icon"
+      width="14"
+      height="14"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.4"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      {TOOL_ICON_PATHS[toolCategory(name)] ?? TOOL_ICON_PATHS.default}
+    </svg>
+  );
+}
+
+// Status glyph: a check when done, a cross on error, otherwise a spinner that
+// animates while the call is pending / awaiting approval.
+function ToolStatusIcon({ cls }: { cls: string }) {
+  const spin = cls === 'pending' || cls === 'waiting';
+  return (
+    <svg
+      class={'tool-status-icon' + (spin ? ' spin' : '')}
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.6"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      {cls === 'success' ? (
+        <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
+      ) : cls === 'error' ? (
+        <path d="M4 4l8 8M12 4l-8 8" />
+      ) : (
+        <path d="M8 2.5a5.5 5.5 0 1 1-5.18 3.65" />
+      )}
+    </svg>
+  );
+}
+
 function ToolRowView({ tool }: { tool: ToolRow }) {
   const t = useT();
   const [expanded, setExpanded] = useState(false);
@@ -1536,10 +1870,14 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
   return (
     <div class="tool-body">
       <div class="tool-header" onClick={() => setExpanded((e) => !e)}>
+        <ToolTypeIcon name={tool.name} />
         <span class="tool-name">{displayToolName(tool.name)}</span>
         <span class="tool-name-secondary">{abbreviateArgs(formatToolDetail(tool.name, tool.args))}</span>
         {annotation && (
-          <span class={'tool-annotation ' + annotation.cls}>{annotation.label}</span>
+          <span class={'tool-annotation ' + annotation.cls}>
+            <ToolStatusIcon cls={annotation.cls} />
+            {annotation.label}
+          </span>
         )}
         {hasDetail && (
           <span class={'tool-chevron' + (expanded ? ' expanded' : '')}>▾</span>

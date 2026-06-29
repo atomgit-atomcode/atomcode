@@ -27,6 +27,8 @@ use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
+use crate::markdown::{fence_start, is_closing_fence};
+
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
 
@@ -411,6 +413,42 @@ pub(super) fn execute_slash_command(
     result
 }
 
+/// 解析 `/app` 要拉起的 relay-client 二进制路径。优先级：
+///
+/// 1. `ATOMCODE_RELAY_CLIENT_BIN` 环境变量 —— 显式覆盖（联调/特殊布局）。
+/// 2. **与 atomcode 自身可执行文件同目录** —— 同一机制同时覆盖两件事：
+///    捆绑分发（安装包/zip 把两个二进制放一起，解压到任意目录都能找到）
+///    和本地开发（把 relay-client 拷到 dev 版 atomcode 旁边即可），与 PATH 无关。
+/// 3. 裸名 `atomcode-relay-client` —— PATH 兜底（独立 install.sh 落在
+///    `~/.local/bin`，该目录既在 PATH 上、又恰好与 atomcode 同目录）。
+fn resolve_relay_client_bin() -> String {
+    const BARE: &str = "atomcode-relay-client";
+
+    // 1) 显式环境变量覆盖（非空才采纳）。
+    if let Ok(p) = std::env::var("ATOMCODE_RELAY_CLIENT_BIN") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+
+    // 2) 与自身同目录。Windows 带 .exe 后缀；命中文件才返回绝对路径。
+    let exe_name = if cfg!(windows) {
+        "atomcode-relay-client.exe"
+    } else {
+        BARE
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sibling) = exe.parent().map(|dir| dir.join(exe_name)) {
+            if sibling.is_file() {
+                return sibling.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    // 3) PATH 兜底。
+    BARE.to_string()
+}
+
 fn execute_slash_command_impl(
     cmd: &str,
     arg: &str,
@@ -453,7 +491,38 @@ fn execute_slash_command_impl(
 
     match cmd {
         "quit" | "exit" => {
-            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            super::arm_shutdown_watchdog(ctx);
+        }
+        "copy" => {
+            // Copy a fenced code block from the most recent assistant reply to
+            // the system clipboard, VERBATIM — terminal-native selection copies
+            // the hard-wrapped + PAD-indented body cells, which breaks long
+            // commands; this reads the original markdown instead.
+            //   /copy        → the last code block (the command just shown)
+            //   /copy N      → the Nth code block (1-based)
+            //   /copy all    → every code block, blank-line separated
+            match resolve_copy(&state.last_assistant_response, arg) {
+                CopyResolve::NoBlocks => {
+                    renderer.render(UiLine::Warning(t(Msg::CopyNoCodeBlock).into_owned()));
+                }
+                CopyResolve::BadIndex(count) => {
+                    renderer.render(UiLine::Warning(
+                        t(Msg::CopyBadIndex { count }).into_owned(),
+                    ));
+                }
+                CopyResolve::Text(payload) => {
+                    let lines = payload.lines().count().max(1);
+                    let chars = payload.chars().count();
+                    if copy_text_to_clipboard_osc52(&payload) {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::CopyOk { lines, chars }).into_owned(),
+                        ));
+                    } else {
+                        renderer.render(UiLine::Error(t(Msg::CopyFailed).into_owned()));
+                    }
+                }
+            }
+            renderer.flush();
         }
         "help" => {
             if arg.trim() == "commands" {
@@ -695,6 +764,10 @@ fn execute_slash_command_impl(
                     ctx.config = new_cfg.clone();
                     ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
+                    // Refresh the footer context window now (see model_picker
+                    // Enter handler) — no turn fires here either, so the cached
+                    // snapshot's denominator would otherwise stay on the old model.
+                    state.on_model_window_changed(ctx.config.default_context_window());
                     ctx.agent
                         .cmd_tx
                         .send(AgentCommand::ReloadConfig(new_cfg))
@@ -1154,8 +1227,7 @@ fn execute_slash_command_impl(
                                     .or_else(|| std::env::var("COMPUTERNAME").ok());
                                 // 4) 拉起 relay-client 子进程；自身即 daemon，故
                                 //    --no-supervise-daemon。kill_on_drop：TUI 退出随之清理。
-                                let bin = std::env::var("ATOMCODE_RELAY_CLIENT_BIN")
-                                    .unwrap_or_else(|_| "atomcode-relay-client".to_string());
+                                let bin = resolve_relay_client_bin();
                                 let daemon_url = format!("http://127.0.0.1:{port}");
                                 let mut cmd = tokio::process::Command::new(&bin);
                                 cmd.arg("run")
@@ -1189,9 +1261,10 @@ fn execute_slash_command_impl(
                                 }
                                 match cmd.spawn() {
                                     Err(e) => format!(
-                                        "启动 relay-client 失败（{e}）。请确认 `{bin}` \
-                                         可执行（在 PATH 中，或用 ATOMCODE_RELAY_CLIENT_BIN \
-                                         指定其路径）。"
+                                        "启动 relay-client 失败（{e}）。已尝试路径 `{bin}`。\
+                                         relay-client 应随安装包捆绑在 atomcode 同目录；若手动安装，\
+                                         请确认它在 PATH 中或与 atomcode 同目录，\
+                                         也可用 ATOMCODE_RELAY_CLIENT_BIN 指定其路径。"
                                     ),
                                     Ok(child) => {
                                         if let Some(mut old) = ctx.app_relay_child.take() {
@@ -3571,6 +3644,22 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     // Without this, the popup continues showing files from the original
     // startup directory after the user runs `/cd`.
     ctx.file_index.reset(path.clone());
+    // Rebuild the session manager for the new project directory.
+    // `SessionManager::new` derives a `project_hash` from the working dir,
+    // which determines the bucket (`~/.atomcode/sessions/<hash>/`) that
+    // `/resume` lists. Without this, `/resume` after `/cd` still shows
+    // sessions from the old project because the manager still points at the
+    // old hash bucket.
+    ctx.session_manager = SessionManager::new(&path);
+    // Sync mode: drive the in-process LiveSession's working dir so (a) the live
+    // executor runs the next turn in the new dir (LIVE_WORKING_DIR override, #755)
+    // and (b) every webui tab follows the switch over the /live SSE wire. Mirrors
+    // the webui /cd endpoint (change_dir → live_set_working_dir). Self-echo is
+    // harmless: the broadcast loops back as ProjectSwitched but no-ops because
+    // ctx.working_dir already equals `path`.
+    if ctx.sync_session.is_some() {
+        atomcode_daemon::live_set_working_dir(path.clone());
+    }
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
 }
@@ -3614,33 +3703,13 @@ pub(crate) fn save_recent_dirs(dirs: &[PathBuf]) {
     let _ = std::fs::write(&path, content);
 }
 
-fn resolve_cd(
+pub(crate) fn resolve_cd(
     arg: &str,
     cwd: &std::path::Path,
     prev: Option<&std::path::Path>,
 ) -> std::result::Result<PathBuf, String> {
     let home = crate::platform::home_dir();
-    let target = if arg.is_empty() {
-        home.ok_or_else(|| "home directory not known".to_string())?
-    } else if arg == "-" {
-        prev.map(|p| p.to_path_buf())
-            .ok_or_else(|| "No previous directory".to_string())?
-    } else if let Some(rest) = arg.strip_prefix('~') {
-        let home = home.ok_or_else(|| "home directory not known".to_string())?;
-        let rest = rest.strip_prefix('/').unwrap_or(rest);
-        if rest.is_empty() {
-            home
-        } else {
-            home.join(rest)
-        }
-    } else {
-        let p = PathBuf::from(arg);
-        if p.is_absolute() {
-            p
-        } else {
-            cwd.join(p)
-        }
-    };
+    let target = expand_cd_target(arg, home.as_deref(), cwd, prev)?;
     let canon = target
         .canonicalize()
         .map_err(|e| format!("{}: {}", target.display(), e))?;
@@ -3651,6 +3720,40 @@ fn resolve_cd(
         .into_owned());
     }
     Ok(canon)
+}
+
+/// Expand a `/cd` argument to a target path WITHOUT touching the filesystem (no
+/// canonicalize / existence check — the caller does that). Handles `~`, `~/sub`,
+/// `~\sub` (Windows backslash), `-` (previous dir), absolute, and relative-to-cwd.
+/// Pure (filesystem-free) so the path logic is unit-testable; `resolve_cd` wraps
+/// it with the canonicalize + is_dir validation.
+pub(crate) fn expand_cd_target(
+    arg: &str,
+    home: Option<&std::path::Path>,
+    cwd: &std::path::Path,
+    prev: Option<&std::path::Path>,
+) -> std::result::Result<PathBuf, String> {
+    if arg.is_empty() {
+        return home
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| "home directory not known".to_string());
+    }
+    if arg == "-" {
+        return prev
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| "No previous directory".to_string());
+    }
+    if let Some(rest) = arg.strip_prefix('~') {
+        let home = home.ok_or_else(|| "home directory not known".to_string())?;
+        // Strip the leading separator(s) after `~` — BOTH `/` and `\` so a Windows
+        // user can type `~\Desktop` like `~/Desktop`, and ALL of them so a doubled
+        // separator (`~//x`, easy typo) doesn't leave an absolute remnant that
+        // `home.join` would treat as a root and escape the home dir.
+        let rest = rest.trim_start_matches(['/', '\\']);
+        return Ok(if rest.is_empty() { home.to_path_buf() } else { home.join(rest) });
+    }
+    let p = PathBuf::from(arg);
+    Ok(if p.is_absolute() { p } else { cwd.join(p) })
 }
 
 /// Build the OAuth-prompt body shown in scrollback while waiting for
@@ -3775,6 +3878,137 @@ fn decide_qr_style(
         return None;
     }
     Some(QrStyle::Dense1x2)
+}
+
+/// Extract the verbatim bodies of fenced (```` ``` ```` / `~~~`) code blocks
+/// from markdown, in document order. Used by `/copy` to recover the ORIGINAL
+/// unwrapped command text — never the rendered body cells, which are already
+/// hard-wrapped + PAD-indented and would corrupt a pasted command.
+///
+/// A fence opens on a line whose trimmed form starts with three or more of the
+/// fence char (an info string like ```` ```bash ```` is fine) and closes on a
+/// line that is ONLY fence chars of the same kind. Inner lines are kept
+/// verbatim (their own indentation preserved). An unterminated fence (a reply
+/// truncated mid-stream) still yields what was captured.
+fn extract_code_blocks(md: &str) -> Vec<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut inner: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    let mut fence_char = '`';
+    let mut fence_len = 3;
+    for line in md.lines() {
+        let t = line.trim();
+        if !in_block {
+            if let Some((c, len)) = fence_start(t) {
+                in_block = true;
+                fence_char = c;
+                fence_len = len;
+                inner.clear();
+            }
+        } else if is_closing_fence(t, fence_char, fence_len) {
+            blocks.push(inner.join("\n"));
+            in_block = false;
+        } else {
+            inner.push(line);
+        }
+    }
+    if in_block {
+        blocks.push(inner.join("\n"));
+    }
+    blocks
+}
+
+/// Outcome of resolving a `/copy [arg]` request against a reply's markdown.
+enum CopyResolve {
+    /// The text to place on the clipboard.
+    Text(String),
+    /// The reply has no fenced code block (or there's no reply yet).
+    NoBlocks,
+    /// `/copy N` referenced an out-of-range index; carries the block count.
+    BadIndex(usize),
+}
+
+/// Map `/copy [arg]` to the text to copy. `""` → last block (the common
+/// "copy the command just shown" case); `all` → every block joined by a blank
+/// line; `N` (1-based) → the Nth block.
+fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
+    let blocks = extract_code_blocks(md);
+    if blocks.is_empty() {
+        return CopyResolve::NoBlocks;
+    }
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return CopyResolve::Text(blocks.last().cloned().unwrap_or_default());
+    }
+    if arg.eq_ignore_ascii_case("all") {
+        return CopyResolve::Text(blocks.join("\n\n"));
+    }
+    match arg.parse::<usize>() {
+        Ok(n) if (1..=blocks.len()).contains(&n) => CopyResolve::Text(blocks[n - 1].clone()),
+        _ => CopyResolve::BadIndex(blocks.len()),
+    }
+}
+
+/// Write `text` to the system clipboard. Tries arboard (system clipboard
+/// API) first; falls back to OSC 52 emitted to `stdout` for headless / SSH
+/// sessions where no windowing system is available.
+///
+/// OSC 52 format: `\x1b]52;c;<base64>\x1b\\`
+///
+/// This is the public entry-point used by both the `/copy` command and the
+/// retained renderer's auto-copy path (issue #699).
+pub(crate) fn copy_text_to_clipboard_osc52(text: &str) -> bool {
+    // Tier 1: system clipboard via arboard (desktop)
+    if try_arboard_clipboard(text) {
+        return true;
+    }
+    // Tier 2: OSC 52 escape sequence. Only emit when stdout is a real
+    // terminal — piping OSC bytes into a file or another process is
+    // meaningless (issue #699 P4).
+    use std::io::IsTerminal as _;
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    write_osc52_clipboard_to(&mut std::io::stdout(), text)
+}
+
+/// Variant of [`copy_text_to_clipboard_osc52`] that emits the OSC 52
+/// fallback through `writer` instead of raw stdout.  Retained-mode
+/// renderers should use this with their own `BufWriter<Stdout>` so the
+/// escape sequence stays ordered with buffered body/content writes.
+pub(crate) fn copy_text_to_clipboard_osc52_via(
+    writer: &mut impl std::io::Write,
+    text: &str,
+) -> bool {
+    if try_arboard_clipboard(text) {
+        return true;
+    }
+    write_osc52_clipboard_to(writer, text)
+}
+
+fn try_arboard_clipboard(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text.to_string()))
+        .is_ok()
+}
+
+/// Emit an OSC 52 escape sequence through `writer`.
+fn write_osc52_clipboard_to(writer: &mut impl std::io::Write, text: &str) -> bool {
+    let seq = encode_osc52("c", text);
+    writer.write_all(seq.as_bytes()).is_ok() && writer.flush().is_ok()
+}
+
+/// Build an OSC 52 escape sequence: `ESC ]52;<buffer>;<base64> ST`.
+/// `buffer` is typically `"c"` (clipboard) or `"p"` (primary selection).
+///
+/// Note: some terminals cap OSC payloads at ~4096 bytes. For code blocks
+/// longer than ~3 KB the OSC 52 path may be silently truncated; the arboard
+/// desktop path (tier 1) has no such limit and will succeed first on any
+/// machine with a windowing system.
+pub(crate) fn encode_osc52(buffer: &str, text: &str) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;{};{}\x1b\\", buffer, b64)
 }
 
 #[cfg(test)]
@@ -4134,6 +4368,10 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
             ctx.model_name = p.model.clone();
         }
+        // NOTE: the footer context window is NOT refreshed here — `run_login_flow`
+        // has no `UiState` handle. The post-login window self-corrects on the
+        // first turn's ContextStats; threading state through just for this rare
+        // path isn't worth it. The /model picker + reload paths do refresh it.
         // Clear any stale drift warning now that we've just
         // re-synced. Also reset the cooldown so the next
         // pre-turn trigger (if conditions change) can fire
@@ -4153,6 +4391,160 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     renderer.render(UiLine::CommandOutput(report.render()));
     renderer.flush();
     Ok(())
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::{extract_code_blocks, resolve_copy, CopyResolve};
+
+    const REPLY: &str = "Run cmake + build:\n\
+        ```\n\
+        cmake D:\\proj -DBUILD=ON -DLONG=\"a very long windows path here\"\n\
+        ```\n\
+        then:\n\
+        ```bash\n\
+        cmake --build . --target demo -j4\n\
+        ```";
+
+    #[test]
+    fn extracts_blocks_verbatim_in_order() {
+        let blocks = extract_code_blocks(REPLY);
+        assert_eq!(blocks.len(), 2);
+        // No hard-wrap, no PAD indent — the command is one logical line.
+        assert_eq!(
+            blocks[0],
+            "cmake D:\\proj -DBUILD=ON -DLONG=\"a very long windows path here\""
+        );
+        assert_eq!(blocks[1], "cmake --build . --target demo -j4");
+    }
+
+    #[test]
+    fn multiline_block_preserves_inner_newlines_and_indent() {
+        let md = "```\nline1\n  indented2\nline3\n```";
+        let blocks = extract_code_blocks(md);
+        assert_eq!(blocks, vec!["line1\n  indented2\nline3".to_string()]);
+    }
+
+    #[test]
+    fn unterminated_fence_still_yields_partial() {
+        // A reply truncated mid-stream — still copyable.
+        let md = "```\nhalf a command";
+        assert_eq!(extract_code_blocks(md), vec!["half a command".to_string()]);
+    }
+
+    #[test]
+    fn no_fence_yields_nothing() {
+        assert!(extract_code_blocks("just prose, `inline code` only").is_empty());
+    }
+
+    #[test]
+    fn longer_fence_can_contain_a_shorter_fence() {
+        let md = "````markdown\n```rust\nfn main() {}\n```\n````";
+        assert_eq!(
+            extract_code_blocks(md),
+            vec!["```rust\nfn main() {}\n```".to_string()]
+        );
+    }
+
+    #[test]
+    fn tilde_fence_requires_a_matching_marker() {
+        let md = "~~~text\n```\nstill inside\n~~~";
+        assert_eq!(extract_code_blocks(md), vec!["```\nstill inside".to_string()]);
+    }
+
+    #[test]
+    fn resolve_default_picks_last_block() {
+        match resolve_copy(REPLY, "") {
+            CopyResolve::Text(t) => assert_eq!(t, "cmake --build . --target demo -j4"),
+            _ => panic!("default should resolve to the last block"),
+        }
+    }
+
+    #[test]
+    fn resolve_index_is_one_based() {
+        match resolve_copy(REPLY, "1") {
+            CopyResolve::Text(t) => assert!(t.starts_with("cmake D:\\proj")),
+            _ => panic!("/copy 1 should pick the first block"),
+        }
+    }
+
+    #[test]
+    fn resolve_all_joins_every_block() {
+        match resolve_copy(REPLY, "all") {
+            CopyResolve::Text(t) => {
+                assert!(t.contains("-DBUILD=ON"));
+                assert!(t.contains("--build ."));
+            }
+            _ => panic!("/copy all should join blocks"),
+        }
+    }
+
+    #[test]
+    fn resolve_bad_index_reports_count() {
+        assert!(matches!(resolve_copy(REPLY, "9"), CopyResolve::BadIndex(2)));
+        assert!(matches!(resolve_copy(REPLY, "0"), CopyResolve::BadIndex(2)));
+        assert!(matches!(resolve_copy(REPLY, "x"), CopyResolve::BadIndex(2)));
+    }
+
+    #[test]
+    fn resolve_no_blocks_when_reply_has_none() {
+        assert!(matches!(resolve_copy("plain reply", ""), CopyResolve::NoBlocks));
+        assert!(matches!(resolve_copy("", ""), CopyResolve::NoBlocks));
+    }
+}
+
+#[cfg(test)]
+mod expand_cd_target_tests {
+    use super::expand_cd_target;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn tilde_accepts_forward_and_back_slash() {
+        let home = PathBuf::from("/home/u");
+        let cwd = PathBuf::from("/work");
+        // `~/Desktop` and `~\Desktop` (Windows) must both expand to <home>/Desktop.
+        assert_eq!(
+            expand_cd_target("~/Desktop", Some(&home), &cwd, None).unwrap(),
+            home.join("Desktop")
+        );
+        assert_eq!(
+            expand_cd_target("~\\Desktop", Some(&home), &cwd, None).unwrap(),
+            home.join("Desktop")
+        );
+        assert_eq!(expand_cd_target("~", Some(&home), &cwd, None).unwrap(), home);
+    }
+
+    #[test]
+    fn tilde_strips_all_leading_separators_no_home_escape() {
+        // `~//Desktop` / `~\\Desktop` (double separator, easy typo) must stay
+        // home-relative — NOT degrade to the absolute `/Desktop` that a single
+        // `strip_prefix` would leave (Path::join with an absolute arg drops home).
+        let home = PathBuf::from("/home/u");
+        let cwd = PathBuf::from("/work");
+        assert_eq!(
+            expand_cd_target("~//Desktop", Some(&home), &cwd, None).unwrap(),
+            home.join("Desktop")
+        );
+        assert_eq!(
+            expand_cd_target("~\\\\Desktop", Some(&home), &cwd, None).unwrap(),
+            home.join("Desktop")
+        );
+    }
+
+    #[test]
+    fn relative_joins_cwd_absolute_kept() {
+        let cwd = PathBuf::from("/work");
+        assert_eq!(expand_cd_target("sub", None, &cwd, None).unwrap(), cwd.join("sub"));
+        assert_eq!(expand_cd_target("/abs/path", None, &cwd, None).unwrap(), Path::new("/abs/path"));
+    }
+
+    #[test]
+    fn dash_uses_previous_dir() {
+        let cwd = PathBuf::from("/work");
+        let prev = PathBuf::from("/old");
+        assert_eq!(expand_cd_target("-", None, &cwd, Some(&prev)).unwrap(), prev);
+        assert!(expand_cd_target("-", None, &cwd, None).is_err());
+    }
 }
 
 #[cfg(test)]

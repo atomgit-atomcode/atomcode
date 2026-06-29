@@ -4,6 +4,7 @@
 //! `.log` files are skipped. Neutral core — the production graph/semantic annotations
 //! are dropped.
 
+use super::read::lenient_usize;
 use super::{err, is_skip_dir, ok, resolve_path};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
@@ -24,9 +25,9 @@ struct Args {
     pattern: String,
     #[serde(default)]
     path: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_usize")]
     max_results: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_usize")]
     context: Option<usize>,
 }
 
@@ -204,6 +205,21 @@ mod tests {
         let r = GrepTool.execute(r#"{"pattern":"TODO","path":"."}"#, &ctx(d.path())).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("a.rs:2:"), "{}", r.content);
+    }
+
+    // Issue #722 parity (v2): weak models send max_results/context as a string ("50")
+    // or float (50.0 / "3.0") instead of an integer; the args must still deserialize.
+    #[test]
+    fn args_accept_lenient_numeric_max_results_and_context() {
+        let a: Args =
+            serde_json::from_str(r#"{"pattern":"x","max_results":"50","context":3.0}"#)
+                .expect("string max_results + float context must deserialize");
+        assert_eq!(a.max_results, Some(50));
+        assert_eq!(a.context, Some(3));
+
+        let b: Args = serde_json::from_str(r#"{"pattern":"x","max_results":"50.0"}"#)
+            .expect("float-string max_results must deserialize");
+        assert_eq!(b.max_results, Some(50));
     }
 
     #[tokio::test]

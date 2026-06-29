@@ -94,11 +94,12 @@ impl SessionContextHook {
     }
 
     fn git(&self, args: &[&str]) -> Option<String> {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&self.working_dir)
-            .output()
-            .ok()?;
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(args).current_dir(&self.working_dir);
+        // No console-window flash for the session-start git snapshot when run from a
+        // console-less daemon (mirrors core's ctx/env); no-op off Windows.
+        crate::process_utils::suppress_console_window_sync(&mut cmd);
+        let out = cmd.output().ok()?;
         if !out.status.success() {
             return None;
         }

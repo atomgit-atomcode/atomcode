@@ -1,9 +1,11 @@
 package com.atomcode.jetbrains.actions
 
-import com.atomcode.jetbrains.core.AtomCodeProjectController
 import com.atomcode.jetbrains.security.PathSensitivity
 import com.atomcode.jetbrains.security.SensitivePathClassifier
 import com.atomcode.jetbrains.settings.AtomCodeSettingsState
+import com.atomcode.jetbrains.ui.ChatContextItem
+import com.atomcode.jetbrains.ui.createAtomCodeChatContent
+import com.atomcode.jetbrains.ui.selectedAtomCodeChatPanel
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
@@ -35,22 +37,23 @@ internal object EditorAtomCodeActions {
             .takeIf { settings.state.sendRelativePathWithSelection }
             ?: path
         val language = virtualFile?.extension ?: "text"
-        val prompt = buildString {
-            appendLine(instruction)
-            appendLine()
-            appendLine("File: $displayPath")
-            appendLine("Language: $language")
-            appendLine()
-            appendLine("```$language")
-            appendLine(selection)
-            appendLine("```")
-        }
+        val startLine = editor.document.getLineNumber(editor.selectionModel.selectionStart) + 1
+        val endLine = editor.document.getLineNumber(editor.selectionModel.selectionEnd) + 1
+        val context = ChatContextItem(
+            path = path,
+            displayName = displayPath,
+            language = language,
+            content = selection,
+            selection = selection,
+            startLine = startLine,
+            endLine = endLine,
+        )
 
-        ToolWindowManager.getInstance(project).getToolWindow("AtomCode")?.activate {
-            AtomCodeProjectController.getInstance(project).activeChatStore?.submitPrompt(
-                text = prompt,
-                workingDir = project.basePath,
-            )
+        val toolWindow = ToolWindowManager.getInstance(project).getToolWindow("AtomCode") ?: return
+        toolWindow.activate {
+            val panel = selectedAtomCodeChatPanel(project)
+                ?: createAtomCodeChatContent(project, toolWindow, closeable = true)
+            panel.composePrompt(instruction, context)
         }
     }
 
@@ -85,21 +88,20 @@ internal object EditorAtomCodeActions {
             null
         }
 
-        ToolWindowManager.getInstance(project).getToolWindow("AtomCode")?.activate {
-            val contextPrefix = buildString {
-                appendLine("File: $displayName")
-                if (startLine != null && endLine != null) {
-                    appendLine("Lines: $startLine-$endLine")
-                }
-                appendLine()
-                appendLine("```${virtualFile.extension ?: "text"}")
-                appendLine(content)
-                appendLine("```")
-            }
-            AtomCodeProjectController.getInstance(project).activeChatStore?.submitPrompt(
-                text = contextPrefix,
-                contextFiles = listOf(path),
-                workingDir = project.basePath,
+        val toolWindow = ToolWindowManager.getInstance(project).getToolWindow("AtomCode") ?: return
+        toolWindow.activate {
+            val panel = selectedAtomCodeChatPanel(project)
+                ?: createAtomCodeChatContent(project, toolWindow, closeable = true)
+            panel.addContext(
+                ChatContextItem(
+                    path = path,
+                    displayName = displayName,
+                    language = virtualFile.extension ?: "text",
+                    content = content,
+                    selection = selectedText,
+                    startLine = startLine,
+                    endLine = endLine,
+                )
             )
         }
     }

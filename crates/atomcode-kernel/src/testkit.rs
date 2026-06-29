@@ -229,6 +229,41 @@ impl LlmProvider for SilentStreamProvider {
     }
 }
 
+/// Always opens OK and yields the SAME non-empty stop response (`TextDelta(text)`
+/// then `Done`) on EVERY call — a model that produces a normal, CONTENT-BEARING
+/// stop (no tool calls) every round, forever. Distinct from `MockProvider::new(
+/// vec![])` (a CONTENT-FREE `Done`, which the kernel now treats as a transient
+/// empty-200 and RETRIES): this is a legitimate completion, so it exercises the
+/// `offer_continuation` / continuation-fuse paths over many rounds without
+/// tripping the empty-response retry.
+pub struct AlwaysStopProvider {
+    text: String,
+}
+
+impl AlwaysStopProvider {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AlwaysStopProvider {
+    fn model_name(&self) -> &str {
+        "always-stop"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        Ok(Box::pin(futures::stream::iter(vec![
+            StreamEvent::TextDelta(self.text.clone()),
+            StreamEvent::Done { truncated: false },
+        ])))
+    }
+}
+
 /// A safe tool.
 pub struct EchoTool;
 

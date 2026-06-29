@@ -26,7 +26,8 @@ export type SSEEvent =
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string }
   | { type: 'stopped' }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  | { type: 'warning'; message: string };
 
 export interface ModelInfo {
   provider: string;
@@ -54,9 +55,19 @@ export interface ImageData {
 export interface StreamChatBody {
   message: string;
   session_id?: string;
+  request_id?: string;
   working_dir?: string;
   provider?: string;
   images?: ImageData[];
+}
+
+export async function stopChat(requestId: string): Promise<void> {
+  const resp = await fetch('/chat/stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ session_id: requestId }),
+  });
+  if (!resp.ok) throw new Error(`stop chat failed: ${resp.status}`);
 }
 
 export async function streamChat(
@@ -305,6 +316,25 @@ export async function getProject(): Promise<ProjectState> {
 }
 
 
+// --- MCP server status ---
+
+export interface McpServerInfo {
+  name: string;
+  status: string;
+  tool_count?: number;
+  error?: string;
+}
+
+export interface McpStatusInfo {
+  servers: McpServerInfo[];
+}
+
+export async function getMcpStatus(): Promise<McpStatusInfo> {
+  const resp = await fetch('/mcp/status', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`mcp status failed: ${resp.status}`);
+  return resp.json();
+}
+
 // --- User-invocable skills (for the input "+" attach menu) ---
 
 export interface SkillInfo {
@@ -479,8 +509,10 @@ export type LiveWireEvent =
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'state'; running: boolean }
   | { type: 'error'; message: string }
+  | { type: 'warning'; message: string }
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
-  | { type: 'session_switched'; session_id: string };
+  | { type: 'session_switched'; session_id: string }
+  | { type: 'working_dir'; working_dir: string };
 
 export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,
@@ -525,6 +557,14 @@ export async function postLiveMessage(
       ...(sessionId ? { session_id: sessionId } : {}),
     }),
   });
+}
+
+export async function postLiveStop(): Promise<void> {
+  const resp = await fetch('/live/stop', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`stop live chat failed: ${resp.status}`);
 }
 
 /** Sync-mode model switch: notify the daemon immediately when the dropdown

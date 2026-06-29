@@ -50,6 +50,23 @@ static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
 /// CurrentContext.mode，确保 live 路径发出的遥测事件携带正确的 client 来源。
 static LIVE_MODE: StdMutex<Option<atomcode_telemetry::SessionMode>> = StdMutex::new(None);
 
+/// 当前 LiveSession 生效的工作目录。None=用执行器创建时的目录。
+/// webui 的 /cd（change_dir → live_set_working_dir）更新；两个执行器每轮读取，
+/// 因此 sync/live 模式下 /cd 切目录才能对下一轮生效——执行器是 Arc<dyn> 且其
+/// working_dir 在创建时冻结，故沿用 LIVE_PROVIDER 的进程级覆盖模式（issue #755）。
+/// 会话创建/替换时（ensure_live_session_global）同步为新会话的目录，避免上一次
+/// /cd 的残留值污染在另一项目里新建的会话。
+static LIVE_WORKING_DIR: StdMutex<Option<std::path::PathBuf>> = StdMutex::new(None);
+
+/// 读取当前生效的工作目录覆盖（无则回退到 `fallback`，即执行器创建时的目录）。
+fn live_current_working_dir(fallback: &Path) -> std::path::PathBuf {
+    LIVE_WORKING_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
 /// 设置当前 LiveSession 选中的 provider（None 时不覆盖，保留既有选择）。
 fn set_live_provider(provider: Option<String>) {
     if let Some(p) = provider {
@@ -72,6 +89,9 @@ pub fn live_set_provider(provider: String) {
 /// daemon 无 TUI 附着）。跨进程（独立 daemon + 浏览器）不覆盖——那条路需要 TUI
 /// 作为 /live 网络客户端订阅。
 pub fn live_set_working_dir(dir: std::path::PathBuf) {
+    // 记录进程级覆盖，供两个执行器下一轮读取（修复 #755：sync 模式下 /cd 后模型
+    // 仍报旧目录——执行器的 working_dir 在创建时冻结，仅靠广播无法让引擎切目录）。
+    *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
     if let Some(s) = current_live_session() {
         s.notify_working_dir_changed(dir);
     }
@@ -175,13 +195,25 @@ pub(crate) fn ensure_live_session_global(
             None => true,
         };
         if dominated {
+            // Diagnostics via core's `ctrace!` (file sink, gated by
+            // ATOMCODE_TRACE), never eprintln: under /webui the embedded
+            // HTTP server runs in the TUI process, so stderr lands on the
+            // raw-mode terminal and corrupts the display. See core trace.rs.
+            atomcode_core::ctrace!("LIVE", "ensure_global REUSE existing session, dominated=true, req_id={:?} live_id={:?}", session_id, LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
             return s.clone();
         }
         // session_id 不匹配 → 当前 LiveSession 属于旧会话，需要替换。
+        atomcode_core::ctrace!("LIVE", "ensure_global REPLACE old session, dominated=false, req_id={:?} live_id={:?}", session_id, LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
+    } else {
+        atomcode_core::ctrace!("LIVE", "ensure_global CREATE new session, no existing, req_id={:?}", session_id);
     }
     let session_id = session_id.unwrap_or_default();
     // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
     *LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
+    // 新会话的目录即为当前生效目录：重置 /cd 覆盖，避免上一会话的 /cd 残留值
+    // 污染在另一项目里新建/替换的会话（issue #755）。仅在确实新建/替换时执行，
+    // 复用既有会话的分支已在上方提前 return，不会走到这里。
+    *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(working_dir.clone());
     let executor: Arc<dyn atomcode_core::live::TurnExecutor> = if live_engine_v2() {
         eprintln!("[engine v2] daemon live turns on the new stack");
         Arc::new(KernelTurnExecutor::new(
@@ -460,8 +492,12 @@ impl TurnExecutor for DaemonTurnExecutor {
         // 优先用 webui 选中的 provider（LIVE_PROVIDER），回退到执行器默认（self.provider_name）。
         let live_provider = LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
+        // 每轮解析当前生效目录（LIVE_WORKING_DIR 覆盖 → 执行器创建时目录），使 sync
+        // 模式下 /cd 切目录对下一轮的 system prompt / 工具 cwd / 会话落盘全部生效
+        // （issue #755）。v1 每轮重建 parts，故读到新目录即重建出新的 system prompt。
+        let working_dir = live_current_working_dir(&self.working_dir);
         let parts = match build_turn_parts(
-            &self.working_dir,
+            &working_dir,
             provider_name,
             &self.mcp_cache,
             self.telemetry.clone(),
@@ -512,7 +548,7 @@ impl TurnExecutor for DaemonTurnExecutor {
         // Load configured hooks for this session (JSON/TOML/builtins/webhooks),
         // mirroring the TUI agent so LiveSession turns stay hook-aware.
         let mut hook_engine = atomcode_core::hook::HookEngine::new();
-        hook_engine.load_all(&self.working_dir);
+        hook_engine.load_all(&working_dir);
         let mut runner = TurnRunner {
             provider: parts.provider,
             tools: parts.tools,
@@ -596,10 +632,10 @@ impl TurnExecutor for DaemonTurnExecutor {
         {
             use atomcode_core::session::{Session, SessionManager};
             let conv_guard = conv.lock().await;
-            let manager = SessionManager::new(&self.working_dir);
+            let manager = SessionManager::new(&working_dir);
             let mut session = manager
                 .load(&self.session_id)
-                .unwrap_or_else(|_| Session::new(self.working_dir.clone()));
+                .unwrap_or_else(|_| Session::new(working_dir.clone()));
             session.id = self.session_id.clone();
             session.update_from_conversation(&conv_guard);
             session.auto_name_from_messages();
@@ -654,6 +690,13 @@ struct BridgeState {
     /// `LIVE_PROVIDER` on each `run_turn` to detect model switches
     /// that require a `ReloadConfig` to the bridge runtime.
     provider_name: String,
+    /// The working directory this bridge is currently rooted at. Compared
+    /// against `LIVE_WORKING_DIR` on each `run_turn` to detect a `/cd` that
+    /// requires a `ChangeDir` (→ bridge respawn(Fresh)) so the new project's
+    /// system prompt / context bind. Without this, a sync-mode `/cd` updates
+    /// the override but the bridge's frozen session context still names the
+    /// old project — the model reports the stale cwd (issue #755).
+    working_dir: std::path::PathBuf,
 }
 
 impl KernelTurnExecutor {
@@ -697,8 +740,11 @@ impl KernelTurnExecutor {
             api_key: p.api_key.clone().unwrap_or_default(),
             base_url: p.base_url.clone().unwrap_or_default(),
             model: p.model.clone(),
-            working_dir: self.working_dir.clone(),
+            // Honor a live `/cd` override (issue #755) when first building the bridge;
+            // falls back to the executor's creation dir.
+            working_dir: live_current_working_dir(&self.working_dir),
             context_window: p.context_window as u32,
+            max_tokens: p.max_tokens.map(|m| m as u32),
             mcp: true,
             telemetry: Some(self.telemetry.clone()),
             reasoning_history: p.reasoning_history.clone(),
@@ -771,8 +817,15 @@ impl TurnExecutor for KernelTurnExecutor {
                 return;
             };
             let provider_name = self.resolve_provider_name();
+            let working_dir = live_current_working_dir(&self.working_dir);
             let (client, rx) = atomcode_bridge::spawn_bridged_runtime(cfg);
-            *guard = Some(BridgeState { client, events: rx, seeded: false, provider_name });
+            *guard = Some(BridgeState {
+                client,
+                events: rx,
+                seeded: false,
+                provider_name,
+                working_dir,
+            });
         }
 
         // Detect model switch: if LIVE_PROVIDER changed since this bridge was built,
@@ -789,6 +842,23 @@ impl TurnExecutor for KernelTurnExecutor {
                 );
             }
             state.provider_name = current_provider;
+        }
+
+        // Detect working-dir switch: a sync-mode `/cd` updated LIVE_WORKING_DIR but the
+        // persistent bridge is still rooted at the old project (its session context is
+        // frozen at prepare time). Send ChangeDir so the bridge respawn(Fresh)es into the
+        // new dir — the SAME mechanism the TUI uses — rebinding persona/context/cwd.
+        // Mirrors the model-switch detection above (issue #755). NOTE: respawn(Fresh)
+        // starts the new project's conversation empty; `seeded` stays true so we do NOT
+        // re-push the old project's history (matches /cd = a fresh session in the new dir).
+        let current_dir = live_current_working_dir(&self.working_dir);
+        if current_dir != state.working_dir {
+            let _ = state.client.cmd_tx.send(
+                atomcode_core::agent::AgentCommand::ChangeDir(
+                    current_dir.to_string_lossy().into_owned(),
+                ),
+            );
+            state.working_dir = current_dir;
         }
 
         let client = state.client.clone();
@@ -951,15 +1021,21 @@ impl TurnExecutor for KernelTurnExecutor {
 
         // Persist (stable session id → one file per session). Mirrors the legacy
         // executor so /resume sees the conversation after a quit.
+        // Load the existing session from disk (if any) instead of creating a
+        // fresh one, so that `user_renamed` and other accumulated fields
+        // (turn_stats, cold_summaries, etc.) are preserved.
         {
             use atomcode_core::session::{Session, SessionManager};
             let conv_guard = conv.lock().await;
-            let mut session = Session::new(self.working_dir.clone());
+            let manager = SessionManager::new(&self.working_dir);
+            let mut session = manager
+                .load(&self.session_id)
+                .unwrap_or_else(|_| Session::new(self.working_dir.clone()));
             session.id = self.session_id.clone();
             session.messages = conv_guard.messages.clone();
             session.auto_name_from_messages();
             session.touch();
-            if let Err(e) = SessionManager::new(&self.working_dir).save(&session) {
+            if let Err(e) = manager.save(&session) {
                 eprintln!("Warning: failed to save live session (v2): {e}");
             }
         }
@@ -1031,6 +1107,7 @@ pub(crate) fn chat_bridge_config(
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
         working_dir: working_dir.to_path_buf(),
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
+        max_tokens: p.and_then(|p| p.max_tokens).map(|m| m as u32),
         mcp: true,
         telemetry: Some(telemetry),
         reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
@@ -1211,6 +1288,10 @@ pub(crate) enum LiveWireEvent {
     State { running: bool },
     #[serde(rename = "error")]
     Error { message: String },
+    /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
+    /// `Error` so a client can render it as a muted notice instead of a red error.
+    #[serde(rename = "warning")]
+    Warning { message: String },
     #[serde(rename = "permission_request")]
     PermissionRequest {
         tool_name: String,
@@ -1220,6 +1301,10 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
+    /// Working directory switched (any view's `/cd`). Every webui tab updates its
+    /// path display + session-list filter to follow. Carries the absolute path.
+    #[serde(rename = "working_dir")]
+    WorkingDir { working_dir: String },
 }
 
 /// Map one LiveEvent → 0/1 wire events (variants the frontend doesn't need → None).
@@ -1240,10 +1325,12 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
             running: matches!(s, TurnState::Running),
         },
         LiveEvent::ProviderChanged(p) => LiveWireEvent::Provider { provider: p },
-        // Other webui tabs following a cwd switch is out of scope for now; the
-        // sync-mode TUI follows it directly via the in-process LiveEvent. Skip
-        // the SSE wire (would need a dedicated LiveWireEvent + frontend handler).
-        LiveEvent::WorkingDirChanged(_) => return None,
+        // Carry a cwd switch (TUI `/cd`, webui `/cd`, worktree command) to every
+        // webui tab so its path display + session-list filter follow. The
+        // sync-mode TUI follows the same LiveEvent in-process via live_sync.
+        LiveEvent::WorkingDirChanged(p) => LiveWireEvent::WorkingDir {
+            working_dir: p.to_string_lossy().to_string(),
+        },
         // 会话切换：通知所有 webui tab 跟随切换到新会话。
         LiveEvent::SessionSwitched(session_id) => LiveWireEvent::SessionSwitched { session_id },
         // 仅进程内：由 TUI 执行，结果走 CommandOutput 回来。
@@ -1286,9 +1373,10 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 total: total_tokens,
             },
             TE::Error(message) => LiveWireEvent::Error { message },
-            TE::Warning(w) => LiveWireEvent::Error {
-                message: format!("[warning] {w}"),
-            },
+            // Non-fatal advisory (e.g. "conversation compacted") — its OWN wire type so
+            // the webui renders it as a muted notice, NOT a red "[错误: …]" error glued
+            // into the assistant bubble. No "[warning]" prefix: the type conveys severity.
+            TE::Warning(w) => LiveWireEvent::Warning { message: w },
             TE::ApprovalRequested {
                 tool_name,
                 reason,
@@ -1487,7 +1575,10 @@ pub(crate) async fn live_message(
     set_live_provider(req.provider);
     // #561 修复：把调用方的 session_id 传递给 LiveSession，使 sync 与常规会话统一。
     // 历史惰性加载——会话已存在且匹配时直接复用，不会为被丢弃的历史读盘。
+    let req_session_id = req.session_id.clone();
     let sid = parse_session_id(req.session_id);
+    let current_live_id = LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    atomcode_core::ctrace!("LIVE", "live_message req.session_id={:?} parsed_sid={:?} current_LIVE_SESSION_ID={:?}", req_session_id, sid, current_live_id);
     let load_dir = working_dir.clone();
     let load_sid = sid.clone();
     let session = ensure_live_session_global(
@@ -1500,6 +1591,8 @@ pub(crate) async fn live_message(
             None => (Vec::new(), Vec::new()),
         },
     );
+    let after_live_id = LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    atomcode_core::ctrace!("LIVE", "live_message after ensure: LIVE_SESSION_ID={:?} session_ptr={:p}", after_live_id, Arc::as_ptr(&session));
     // 视觉预处理在 coordinator 经 executor.preprocess_input 统一做（TUI / webui 共享），
     // 此处只负责投递原始输入。
     let ok = session.send_input(UserInput {
@@ -1513,7 +1606,17 @@ pub(crate) async fn live_message(
             })
             .collect(),
     });
+    atomcode_core::ctrace!("LIVE", "live_message send_input accepted={}", ok);
     Json(serde_json::json!({ "accepted": ok }))
+}
+
+/// POST /live/stop — cancel the turn shared by the TUI and synchronized webui tabs.
+pub(crate) async fn live_stop() -> impl IntoResponse {
+    let accepted = match current_live_session() {
+        Some(session) => session.cancel_current_turn().await,
+        None => false,
+    };
+    Json(serde_json::json!({ "accepted": accepted }))
 }
 
 #[derive(serde::Deserialize)]
@@ -1705,11 +1808,59 @@ mod tests {
         assert_eq!(LIVE_PROVIDER.lock().unwrap().as_deref(), Some("openai"));
     }
 
+    // 回归 #755：sync/live 模式下 /cd（live_set_working_dir）必须更新 LIVE_WORKING_DIR
+    // 进程级覆盖，使两个执行器下一轮读到新目录（否则模型仍报旧 cwd）。同时验证
+    // live_current_working_dir 的「覆盖 → 回退」解析，这正是执行器检测 /cd 的依据。
+    #[test]
+    fn cd_updates_working_dir_override_and_resolution() {
+        let dir_a = std::path::PathBuf::from("/tmp/atomcode-test-a");
+        let dir_b = std::path::PathBuf::from("/tmp/atomcode-test-b");
+
+        // 无覆盖时回退到执行器创建目录。
+        *LIVE_WORKING_DIR.lock().unwrap() = None;
+        assert_eq!(live_current_working_dir(&dir_a), dir_a);
+
+        // /cd → live_set_working_dir 写入覆盖；解析返回新目录、忽略 fallback。
+        live_set_working_dir(dir_b.clone());
+        assert_eq!(
+            LIVE_WORKING_DIR.lock().unwrap().clone(),
+            Some(dir_b.clone())
+        );
+        assert_eq!(live_current_working_dir(&dir_a), dir_b);
+
+        // 这正是执行器里的 /cd 检测条件：current(dir_b) != bridge_built_with(dir_a)
+        // → 触发 ChangeDir / 重建 parts。
+        assert_ne!(live_current_working_dir(&dir_a), dir_a);
+
+        // 清理进程级状态，避免污染同进程其他测试。
+        *LIVE_WORKING_DIR.lock().unwrap() = None;
+    }
+
     // 回归：无图时视觉预处理是直通的——caption 原样返回，不触碰 config/网络。
     // （有图的 VL 路径依赖真实 config/provider，覆盖在 vision_preprocessor 的单测里。）
     #[tokio::test]
     async fn preprocess_live_caption_is_passthrough_without_images() {
         let out = preprocess_live_caption("看下这个图片", &[], None).await;
         assert_eq!(out, "看下这个图片");
+    }
+
+    // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，
+    // 不能被当成 error —— webui 会把 error 渲染成红色「[错误: …]」并塞进回复气泡，
+    // 让一条善意提示看起来像任务出错（用户实测报的 bug）。
+    #[test]
+    fn turn_warning_maps_to_its_own_wire_event_not_error() {
+        let wire = to_wire(LiveEvent::Turn(TurnEvent::Warning(
+            "conversation compacted".into(),
+        )))
+        .expect("a warning must produce a wire event");
+        let json = serde_json::to_string(&wire).unwrap();
+        // Its own severity type — NOT error.
+        assert!(json.contains(r#""type":"warning""#), "wire type must be warning: {json}");
+        assert!(!json.contains(r#""type":"error""#), "warning must not be sent as error: {json}");
+        // The type conveys severity; no "[warning]" string prefix smuggled into the message.
+        assert_eq!(
+            json,
+            r#"{"type":"warning","message":"conversation compacted"}"#
+        );
     }
 }

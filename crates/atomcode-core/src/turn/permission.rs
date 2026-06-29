@@ -175,11 +175,23 @@ impl PermissionDecider for InteractivePermissionDecider {
             scope: scope.clone(),
         };
         if self.request_tx.send(request).is_err() {
+            eprintln!(
+                "[permission] approval request channel closed for tool '{}' — \
+                 denying due to internal channel failure, not a user denial",
+                call.name
+            );
             return PermissionDecision::Deny;
         }
         let resp = {
             let mut rx = self.response_rx.lock().await;
-            rx.recv().await.unwrap_or(PermissionDecision::Deny)
+            rx.recv().await.unwrap_or_else(|| {
+                eprintln!(
+                    "[permission] approval response channel closed for tool '{}' — \
+                     denying due to internal channel failure, not a user denial",
+                    call.name
+                );
+                PermissionDecision::Deny
+            })
         };
         match resp {
             // "Always allow" from the responder: persist the grant for the

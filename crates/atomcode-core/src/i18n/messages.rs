@@ -598,6 +598,19 @@ pub enum Msg<'a> {
     /// users whose Ctrl+V is swallowed by Windows Terminal / conhost
     /// before reaching the app, but works on every platform.
     CmdDescPaste,
+    /// Description for the `/copy` slash command — copies a code block from the
+    /// last reply to the clipboard.
+    CmdDescCopy,
+    /// `/copy`: confirmation after a code block lands on the clipboard.
+    CopyOk { lines: usize, chars: usize },
+    /// `/copy`: the last reply has no fenced code block to copy.
+    CopyNoCodeBlock,
+    /// `/copy N`: the requested index is out of range; `count` blocks exist.
+    CopyBadIndex { count: usize },
+    /// `/copy`: the clipboard write failed (no arboard backend — headless/SSH).
+    CopyFailed,
+    /// Hint shown after a code block is auto-copied to clipboard (issue #699).
+    CodeBlockCopied,
     /// Description for the `/guide` slash command — asks atomcode-guide a question.
     CmdDescGuide,
     /// Description for the `/view` slash command — opens an overlay modal showing file content.

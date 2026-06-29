@@ -1,5 +1,5 @@
 package com.atomcode.jetbrains.actions
 
 class ExplainSelectionAction : EditorSelectionCommandAction(
-    "Please explain this code. What does it do, and why?",
+    "请解释这段代码。它做了什么，为什么这样实现？",
 )

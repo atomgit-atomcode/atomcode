@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode"
-version = "4.25.3"
+version = "4.25.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -243,6 +243,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dirs 6.0.0",
+ "encoding_rs",
  "futures",
  "globset",
  "ignore",
@@ -278,11 +279,14 @@ name = "atomcode-clix"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "atomcode-capabilities",
  "atomcode-coding",
  "atomcode-kernel",
  "atomcode-review",
+ "atomcode-telemetry",
  "clap",
+ "futures",
  "serde",
  "serde_json",
  "tempfile",
@@ -299,6 +303,7 @@ dependencies = [
  "atomcode-kernel",
  "atomcode-review",
  "atomcode-telemetry",
+ "chrono",
  "dirs 6.0.0",
  "futures",
  "serde_json",
@@ -321,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-core"
-version = "4.25.3"
+version = "4.25.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -378,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-daemon"
-version = "4.25.3"
+version = "4.25.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -428,11 +433,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
 name = "atomcode-telemetry"
-version = "4.25.3"
+version = "4.25.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -453,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-tuix"
-version = "4.25.3"
+version = "4.25.6"
 dependencies = [
  "anyhow",
  "arboard",
