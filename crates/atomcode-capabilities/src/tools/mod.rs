@@ -90,9 +90,17 @@ pub fn coding_tool_names() -> &'static [&'static str] {
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
-/// given specialization should expose to the model).
+/// given specialization should expose to the model). Vision support OFF — `read_file`
+/// reports images as binary (use [`register_coding_tools_with_vision`] for a VL model).
 pub fn register_coding_tools(reg: &mut ToolRegistry) {
-    reg.register(Arc::new(ReadFileTool));
+    register_coding_tools_with_vision(reg, false);
+}
+
+/// Like [`register_coding_tools`], but `vision` gates whether `read_file` hands an
+/// image file back to the model as an actual picture (a VISION model SEES it) instead
+/// of the "binary, cannot display" text. Detect it with [`is_vision_model`].
+pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
+    reg.register(Arc::new(ReadFileTool::new(vision)));
     reg.register(Arc::new(WriteFileTool));
     reg.register(Arc::new(EditFileTool));
     reg.register(Arc::new(ListDirTool));
@@ -179,6 +187,24 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "runs",
 ];
 
+/// Does `model` name a VISION-capable (multimodal) model? A name-based heuristic —
+/// the gateway exposes no capability metadata, so we match the well-known multimodal
+/// families by substring. Used to gate whether `read_file` base64-encodes an image
+/// back to the model (a vision model SEES it; a text-only model would reject the
+/// payload / waste tokens, so it keeps the plain "Binary file" text). Conservative:
+/// an unrecognized name is treated as TEXT-ONLY (no image injected). Case-insensitive.
+pub fn is_vision_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // Distinctive markers of multimodal families. `-vl`/`vl-` catches Qwen-VL
+    // (Qwen3-VL, Qwen2.5-VL) without the false positives a bare `vl` substring
+    // would invite; `internvl`/`llava` are spelled out for the same reason.
+    const VISION_MARKERS: &[&str] = &[
+        "-vl", "vl-", "vision", "gpt-4o", "gpt-5", "claude-3", "claude-4", "claude-opus-4",
+        "claude-sonnet-4", "gemini", "llava", "internvl", "pixtral", "phi-3-vision", "phi-4-multimodal",
+    ];
+    VISION_MARKERS.iter().any(|marker| m.contains(marker))
+}
+
 /// Should a directory with this name be skipped during a walk?
 pub(crate) fn is_skip_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name) || name.starts_with(".venv-")
@@ -203,17 +229,48 @@ pub(crate) fn looks_binary(bytes: &[u8]) -> bool {
 /// A successful tool result (`is_error: false`). `call_id` is filled by the kernel
 /// after `execute` returns.
 pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: false }
+    ToolResult { call_id: String::new(), content: content.into(), is_error: false, images: vec![] }
+}
+/// A successful tool result that also carries inline `images` for a VISION model to
+/// SEE (e.g. `read_file` returning a picture). The agent loop lifts these onto a
+/// follow-up `Role::User` message — the only role a provider serializes images on.
+pub(crate) fn ok_with_images(
+    content: impl Into<String>,
+    images: Vec<atomcode_kernel::message::ImageContent>,
+) -> ToolResult {
+    ToolResult { call_id: String::new(), content: content.into(), is_error: false, images }
 }
 /// A failed tool result (`is_error: true`) — surfaced to the model so it can recover.
 pub(crate) fn err(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: true }
+    ToolResult { call_id: String::new(), content: content.into(), is_error: true, images: vec![] }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolRegistry;
+
+    #[test]
+    fn is_vision_model_recognizes_known_multimodal_families() {
+        for m in [
+            "Qwen/Qwen3-VL-8B-Instruct",
+            "qwen2.5-vl-72b",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4-vision-preview",
+            "claude-3-5-sonnet",
+            "gemini-1.5-pro",
+            "llava-1.6",
+            "internvl2-8b",
+        ] {
+            assert!(is_vision_model(m), "expected vision-capable: {m}");
+        }
+        // Text-only models must NOT be treated as vision (else a base64 image is
+        // sent to a model that rejects it / wastes tokens).
+        for m in ["deepseek-v4", "deepseek-v4-flash", "glm-5.2", "qwen3-coder-480b", "gpt-4-turbo", "claude-2.1", ""] {
+            assert!(!is_vision_model(m), "expected text-only: {m}");
+        }
+    }
 
     #[test]
     fn resolve_path_treats_windows_drive_and_unc_as_absolute() {

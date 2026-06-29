@@ -27,7 +27,7 @@ impl Tool for ProgressTool {
     async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
         ctx.progress.emit("step 1");
         ctx.progress.emit("step 2");
-        ToolResult { call_id: String::new(), content: "done".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "done".into(), is_error: false, images: vec![] }
     }
 }
 

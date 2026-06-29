@@ -69,7 +69,7 @@ impl Tool for EmptyNameTool {
         json!({"type": "object"})
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
     }
 }
 
@@ -86,7 +86,7 @@ impl Tool for EmptyDescriptionTool {
         json!({"type": "object"})
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
     }
 }
 
@@ -106,7 +106,7 @@ impl Tool for UnstableSchemaTool {
         json!({"type": "object", "rev": rev})
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
     }
 }
 
@@ -132,7 +132,7 @@ impl Tool for FlakyRiskTool {
         }
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
     }
 }
 

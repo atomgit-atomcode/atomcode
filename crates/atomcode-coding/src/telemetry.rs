@@ -782,7 +782,7 @@ mod tests {
         let _ = mw.before(&mut call, &tool, &rt).await;
         // Approval denied upstream → the kernel hands `after` a "blocked: …" result.
         let mut result =
-            ToolResult { call_id: "c9".into(), content: "blocked: user denied".into(), is_error: true };
+            ToolResult { call_id: "c9".into(), content: "blocked: user denied".into(), is_error: true, images: vec![] };
         mw.after(&mut result).await;
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -809,7 +809,7 @@ mod tests {
         let rt = RequestCtx::new(tx, None);
         let mut call = ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() };
         let _ = mw.before(&mut call, &tool, &rt).await;
-        let mut result = ToolResult { call_id: "c1".into(), content: "ok".into(), is_error: false };
+        let mut result = ToolResult { call_id: "c1".into(), content: "ok".into(), is_error: false, images: vec![] };
         mw.after(&mut result).await;
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

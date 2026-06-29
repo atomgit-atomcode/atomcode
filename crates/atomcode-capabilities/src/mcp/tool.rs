@@ -104,6 +104,7 @@ impl Tool for McpToolAdapter {
                         call_id: String::new(),
                         content: format!("invalid MCP tool arguments: {e}"),
                         is_error: true,
+                        images: vec![],
                     };
                 }
             }
@@ -118,11 +119,13 @@ impl Tool for McpToolAdapter {
                 call_id: String::new(),
                 content,
                 is_error: false,
+                images: vec![],
             },
             Err(e) => ToolResult {
                 call_id: String::new(),
                 content: e.to_string(),
                 is_error: true,
+                images: vec![],
             },
         }
     }

@@ -30,8 +30,8 @@ use atomcode_capabilities::session::{
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
-    register_coding_tools, ApprovalMiddleware, OpenFileWorkspaceGate, SensitivePathGate, WebFetchTool,
-    WebSearchTool, WriteApprovalGate,
+    is_vision_model, register_coding_tools_with_vision, ApprovalMiddleware, OpenFileWorkspaceGate,
+    SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::hook::LifecycleHooks;
@@ -163,8 +163,9 @@ pub async fn prepare_with_plugin_hooks(
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
 
-    // Always-on core: neutral fs/bash toolset + codeintel.
-    register_coding_tools(&mut registry);
+    // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
+    // (e.g. Qwen3-VL) makes read_file hand image files to the model as pictures.
+    register_coding_tools_with_vision(&mut registry, is_vision_model(&cfg.model));
     names.extend(atomcode_capabilities::tools::coding_tool_names().iter().map(|s| s.to_string()));
     register_codeintel_tools(&mut registry);
     names.extend(

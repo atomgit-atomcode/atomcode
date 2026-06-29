@@ -1086,14 +1086,14 @@ mod tests {
         // before() records call_id "1" → "bash"; after() then matches matcher "bash".
         let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
         let _ = cc.before(&mut call, &tool, &rt).await;
-        let mut result = ToolResult { call_id: "1".into(), content: "orig".into(), is_error: false };
+        let mut result = ToolResult { call_id: "1".into(), content: "orig".into(), is_error: false, images: vec![] };
         cc.after(&mut result).await;
         assert_eq!(result.content, "REWRITTEN", "matcher 'bash' must fire for tool bash");
 
         // A different tool ("grep") does NOT match matcher "bash" → output untouched.
         let mut call = ToolCall { id: "2".into(), name: "grep".into(), arguments: "{}".into() };
         let _ = cc.before(&mut call, &tool, &rt).await;
-        let mut result = ToolResult { call_id: "2".into(), content: "orig".into(), is_error: false };
+        let mut result = ToolResult { call_id: "2".into(), content: "orig".into(), is_error: false, images: vec![] };
         cc.after(&mut result).await;
         assert_eq!(result.content, "orig", "matcher 'bash' must NOT fire for tool grep");
     }

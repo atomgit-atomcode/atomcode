@@ -275,7 +275,7 @@ impl Tool for EchoTool {
         serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}})
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: format!("echo: {args}"), is_error: false }
+        ToolResult { call_id: String::new(), content: format!("echo: {args}"), is_error: false, images: vec![] }
     }
 }
 
@@ -303,7 +303,7 @@ impl Tool for CountingTool {
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-        ToolResult { call_id: String::new(), content: format!("count#{n} args={args}"), is_error: false }
+        ToolResult { call_id: String::new(), content: format!("count#{n} args={args}"), is_error: false, images: vec![] }
     }
 }
 
@@ -355,7 +355,7 @@ impl Tool for InjectCommandTool {
                 tokio::task::yield_now().await;
             }
         }
-        ToolResult { call_id: String::new(), content: "injected".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "injected".into(), is_error: false, images: vec![] }
     }
 }
 
@@ -373,7 +373,7 @@ impl Tool for RiskyWriteTool {
         RiskLevel::Risky
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: format!("wrote: {args}"), is_error: false }
+        ToolResult { call_id: String::new(), content: format!("wrote: {args}"), is_error: false, images: vec![] }
     }
 }
 
@@ -573,7 +573,7 @@ impl Tool for DangerousBashTool {
         }
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: format!("ran: {args}"), is_error: false }
+        ToolResult { call_id: String::new(), content: format!("ran: {args}"), is_error: false, images: vec![] }
     }
 }
 
@@ -1003,6 +1003,7 @@ impl Tool for SubAgentTool {
             call_id: String::new(),
             content,
             is_error,
+            images: vec![],
         }
     }
 }
@@ -1028,6 +1029,7 @@ impl Tool for WorkingDirProbeTool {
             call_id: String::new(),
             content: ctx.working_dir.display().to_string(),
             is_error: false,
+            images: vec![],
         }
     }
 }
@@ -1067,6 +1069,7 @@ impl Tool for BlockUntilCancelTool {
             call_id: String::new(),
             content: "observed cancel".into(),
             is_error: false,
+            images: vec![],
         }
     }
 }

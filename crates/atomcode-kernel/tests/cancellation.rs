@@ -121,7 +121,7 @@ impl Tool for SelfCancelTool {
     }
     async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
         ctx.cancel.cancel();
-        ToolResult { call_id: String::new(), content: "did the work then cancelled".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "did the work then cancelled".into(), is_error: false, images: vec![] }
     }
 }
 
@@ -147,7 +147,7 @@ impl Tool for BlockUntilCancelTool {
     async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
         ctx.cancel.cancelled().await;
         self.observed_cancel.store(true, Ordering::SeqCst);
-        ToolResult { call_id: String::new(), content: "observed cancel".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "observed cancel".into(), is_error: false, images: vec![] }
     }
 }
 

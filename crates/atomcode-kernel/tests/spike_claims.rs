@@ -825,7 +825,7 @@ async fn shared_cwd_change_is_reflected_in_a_later_tool_call() {
         fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type":"object"}) }
         async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
             *self.cwd.write().unwrap() = self.target.clone();
-            ToolResult { call_id: String::new(), content: "set".into(), is_error: false }
+            ToolResult { call_id: String::new(), content: "set".into(), is_error: false, images: vec![] }
         }
     }
     // Records what working_dir the kernel handed it.
@@ -839,7 +839,7 @@ async fn shared_cwd_change_is_reflected_in_a_later_tool_call() {
         fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type":"object"}) }
         async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
             *self.seen.lock().unwrap() = Some(ctx.working_dir.clone());
-            ToolResult { call_id: String::new(), content: "got".into(), is_error: false }
+            ToolResult { call_id: String::new(), content: "got".into(), is_error: false, images: vec![] }
         }
     }
 

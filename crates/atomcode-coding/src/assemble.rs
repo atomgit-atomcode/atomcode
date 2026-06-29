@@ -7,8 +7,8 @@ use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_
 use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_capabilities::session::SessionContextHook;
 use atomcode_capabilities::tools::{
-    coding_tool_names, register_coding_tools, ApprovalMiddleware, OpenFileWorkspaceGate,
-    WriteApprovalGate,
+    coding_tool_names, is_vision_model, register_coding_tools_with_vision, ApprovalMiddleware,
+    OpenFileWorkspaceGate, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::provider::LlmProvider;
@@ -44,7 +44,7 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     let summary_provider = provider.clone(); // tier-2 overflow summary uses the same provider
     let mut builder = Agent::builder()
         .provider(provider)
-        .tools(mount_coding_tools())
+        .tools(mount_coding_tools(is_vision_model(&cfg.model)))
         .persona(coding_persona(&cfg.model))
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
@@ -82,9 +82,9 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
 
 /// Register the neutral coding tools + codeintel into a fresh registry and mount the
 /// union (everything visible to the model).
-fn mount_coding_tools() -> MountedTools {
+fn mount_coding_tools(vision: bool) -> MountedTools {
     let mut registry = ToolRegistry::new();
-    register_coding_tools(&mut registry);
+    register_coding_tools_with_vision(&mut registry, vision);
     register_codeintel_tools(&mut registry);
     let names: Vec<&str> =
         coding_tool_names().iter().chain(codeintel_tool_names().iter()).copied().collect();

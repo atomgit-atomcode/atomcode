@@ -41,6 +41,7 @@ impl Tool for HugeTool {
             call_id: String::new(),
             content: "a".repeat(self.size),
             is_error: false,
+            images: vec![],
         }
     }
 }

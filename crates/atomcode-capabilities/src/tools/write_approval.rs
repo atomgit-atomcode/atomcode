@@ -307,7 +307,7 @@ mod tests {
     #[tokio::test]
     async fn non_write_tool_is_not_ours() {
         let gate = WriteApprovalGate::pinned(std::env::temp_dir());
-        let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
         let mut call =
             ToolCall { id: "1".into(), name: "read_file".into(), arguments: r#"{"file_path":"a"}"#.into() };
         assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);

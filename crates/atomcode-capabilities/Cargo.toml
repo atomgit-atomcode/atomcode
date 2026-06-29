@@ -49,7 +49,9 @@ url = { version = "2", optional = true }
 # dirs replaces core's home-dir helper. Optional — a non-MCP embedder pulls none of this.
 anyhow = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
-base64 = { version = "0.22", optional = true }
+# base64 is non-optional: `read_file` always needs it to hand an image file to a
+# vision model (encode bytes → data URL). Also used by the `mcp` OAuth PKCE flow.
+base64 = { version = "0.22" }
 uuid = { version = "1", features = ["v4"], optional = true }
 dirs = { version = "6", optional = true }
 toml = { version = "0.8", optional = true }
@@ -103,7 +105,7 @@ e2e = ["provider"]
 # login/refresh flow; transport_http uses the async reqwest client. OAuth's callback
 # listener is std::net (no tokio/net needed).
 mcp = [
-    "dep:anyhow", "dep:sha2", "dep:base64", "dep:uuid", "dep:dirs", "dep:toml",
+    "dep:anyhow", "dep:sha2", "dep:uuid", "dep:dirs", "dep:toml",
     "dep:reqwest", "reqwest/blocking", "dep:url",
     "tokio/process", "tokio/io-util",
 ]

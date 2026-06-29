@@ -1635,6 +1635,10 @@ impl RunningAgent {
             let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut seen_calls: std::collections::HashSet<(String, String)> =
                 std::collections::HashSet::new();
+            // VISION: images a tool produced this batch (e.g. read_file on a picture),
+            // collected to attach to ONE follow-up user message AFTER every tool_result
+            // is in — see the injection at the loop's end for why this is deferred.
+            let mut turn_images: Vec<crate::message::ImageContent> = vec![];
             for mut call in pending_calls {
                 // BETWEEN-TOOLS cancel checkpoint: do not dispatch any remaining
                 // tool_call once cancelled. Under "cancel = undo" the whole turn is
@@ -1689,6 +1693,7 @@ impl RunningAgent {
                                   call this turn; result already returned above]"
                             .to_string(),
                         is_error: false,
+                        images: vec![],
                     };
                     result_ids.insert(call.id.clone());
                     self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
@@ -1705,6 +1710,7 @@ impl RunningAgent {
                         call_id: call.id.clone(),
                         content: format!("unknown or unmounted tool: {}", call.name),
                         is_error: true,
+                        images: vec![],
                     },
                     Some(tool) => {
                         // ToolMiddleware before-chain: may rewrite the call (&mut),
@@ -1736,6 +1742,7 @@ impl RunningAgent {
                                 call_id: call.id.clone(),
                                 content: format!("blocked: {reason}"),
                                 is_error: true,
+                                images: vec![],
                             }
                         } else {
                             executed = true;
@@ -1786,6 +1793,7 @@ impl RunningAgent {
                                     call_id: call.id.clone(),
                                     content: "(cancelled — side effects unknown)".into(),
                                     is_error: true,
+                                    images: vec![],
                                 },
                             };
                             r.call_id = call.id.clone();
@@ -1817,6 +1825,15 @@ impl RunningAgent {
                 }
                 self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
                 convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
+                // VISION: a tool may return inline images (read_file on a picture). The
+                // tool-result message itself stays TEXT — a provider rejects images in a
+                // tool message — so harvest them here and attach to a single follow-up
+                // user message once ALL of this assistant's tool_results are pushed
+                // (interleaving a user message between tool_results would be an
+                // API-invalid payload). Not size-capped: matches user-pasted images.
+                if !result.images.is_empty() {
+                    turn_images.append(&mut result.images);
+                }
                 // CC PostToolUse `decision: "block"`: feed the reason back to the
                 // model so it can course-correct. Hard turn-termination (stop before
                 // the next model call) needs a dedicated StopReason and lands with the
@@ -1849,6 +1866,18 @@ impl RunningAgent {
                     total: total_non_dup,
                     elapsed_ms: started_at.elapsed().as_millis() as u64,
                 });
+            }
+            // VISION: surface any images this batch's tools produced to the model via a
+            // SINGLE follow-up user message (collected above). Pushed AFTER all
+            // tool_results so the assistant's tool_calls stay contiguous (API-valid),
+            // and BEFORE the next round's model call so the model sees the pictures.
+            // `synthetic_user_with_images` marks it synthetic so `sacred_floor` never
+            // mistakes it for the real task prompt.
+            if !turn_images.is_empty() {
+                convo.push(Message::synthetic_user_with_images(
+                    "[Images returned by the tool calls above are attached for you to view.]",
+                    std::mem::take(&mut turn_images),
+                ));
             }
         }
     }
@@ -2262,7 +2291,7 @@ mod cap_tests {
     use crate::tool::ToolResult;
 
     fn res(content: &str) -> ToolResult {
-        ToolResult { call_id: "c1".into(), content: content.into(), is_error: false }
+        ToolResult { call_id: "c1".into(), content: content.into(), is_error: false, images: vec![] }
     }
 
     #[test]
