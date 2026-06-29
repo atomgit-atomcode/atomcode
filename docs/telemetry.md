@@ -28,15 +28,15 @@ Exactly 7 event types, each with a common "envelope" of identifiers/metadata.
 
 ### Events
 
-| event_id | type | 何时触发 | payload |
+| event_id | type | When triggered | payload |
 |---|---|---|---|
-| `open_atomcode` | / | 启动 atomcode（非 meta 命令）| 无 |
-| `llm_chat` | — | 每个 LLM turn 完成时 | `duration_ms, tool_calls_count, input_tokens, output_tokens, cached_tokens, had_error` |
-| `use_command` | 具体指令字符串 | 每次执行 slash 命令 | — |
-| `login_success` | / | OAuth 登录成功 | 无 |
-| `take_codingplan` | `success` / `fail` | `atomcode login` / `/login`（含隐藏的 `atomcode codingplan` 别名）结束 | — |
-| `panic` | / | 程序崩溃 | `location, message_head, thread, backtrace_top_5`（已 scrub） |
-| `telemetry_disabled` | / | 用户执行 `atomcode telemetry disable` 时（仅当原本是启用） | 无 |
+| `open_atomcode` | / | AtomCode launch (non-meta command) | none |
+| `llm_chat` | — | After each LLM turn completes | `duration_ms, tool_calls_count, input_tokens, output_tokens, cached_tokens, had_error` |
+| `use_command` | command string | Each slash command execution | — |
+| `login_success` | / | OAuth login succeeded | none |
+| `take_codingplan` | `success` / `fail` | `atomcode login` / `/login` (including hidden `atomcode codingplan` alias) finishes | — |
+| `panic` | / | Program crash | `location, message_head, thread, backtrace_top_5` (scrubbed) |
+| `telemetry_disabled` | / | User runs `atomcode telemetry disable` (only if previously enabled) | none |
 
 ### NEVER collected
 
