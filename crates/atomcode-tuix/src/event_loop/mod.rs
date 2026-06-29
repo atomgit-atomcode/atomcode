@@ -1517,21 +1517,48 @@ mod buffer_tests {
     }
 
     #[test]
-    fn spinner_label_surfaces_network_stall_hint_then_clears_on_activity() {
-        // End-to-end on the REAL spinner renderer: a model stream silent past the
-        // threshold must put the localized "network may be down · esc" hint into the
-        // footer label; a fresh chunk (note_stream_activity) must clear it.
+    fn spinner_label_never_shows_stall_hint() {
+        // The "· esc to cancel" stall hint was removed by request: even a model
+        // stream silent well past the threshold must NOT advertise it in the
+        // footer (esc still cancels — it's just not shown).
         let mut s = UiState::new();
         s.on_submit(); // phase=Streaming, spinner = a thinking label
         s.last_stream_activity =
             Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT * 2);
         let hint = crate::i18n::t(crate::i18n::Msg::StreamStalled);
         let stalled = format_spinner_label(&s, 0, None);
-        assert!(stalled.contains(&*hint), "stalled spinner must show the hint, got {stalled:?}");
+        assert!(
+            !stalled.contains(&*hint),
+            "stall hint must never appear in the spinner, got {stalled:?}"
+        );
+    }
 
-        s.note_stream_activity(); // a byte arrived → stream is alive again
-        let live = format_spinner_label(&s, 0, None);
-        assert!(!live.contains(&*hint), "live stream must not show the hint, got {live:?}");
+    #[test]
+    fn spinner_label_maps_tool_names_to_thinking_word() {
+        // Tool-execution labels must not flash tool names in the footer spinner;
+        // they map back to the turn's thinking word. The body ▸ rows carry the
+        // tool detail instead.
+        let mut s = UiState::new();
+        s.on_submit();
+        let thinking = format_spinner_label(&s, 0, None);
+
+        s.on_tool_call_streaming("ReadFile");
+        let preparing = format_spinner_label(&s, 0, None);
+        assert!(
+            !preparing.contains("ReadFile") && !preparing.contains("Preparing"),
+            "streaming spinner leaked a tool name: {preparing:?}"
+        );
+
+        s.on_tool_call_started("Bash");
+        let running = format_spinner_label(&s, 0, None);
+        assert!(
+            !running.contains("Bash") && !running.contains("Running"),
+            "running spinner leaked a tool name: {running:?}"
+        );
+        // …and it's the same thinking word the turn started with (minus the
+        // ticking elapsed suffix).
+        let word = |s: &str| s.split('…').next().unwrap_or("").to_string();
+        assert_eq!(word(&running), word(&thinking));
     }
 
     #[test]
@@ -9621,7 +9648,10 @@ fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Opt
         }
         return out;
     }
-    let base = &state.spinner_label;
+    // `display_spinner_label` maps `Running X` / `Preparing X` back to the
+    // thinking word so the footer never flashes tool names — tool progress is
+    // carried by the body `▸ Tool(detail)` rows. Other labels pass through.
+    let base = state.display_spinner_label();
     let mut out = format!("{}{}", base, state.ellipsis());
     // Order matters. The phase clock (`· 372ms`) ticks every frame, and any
     // segment AFTER a rapidly-changing field shifts on every redraw — which
@@ -9641,14 +9671,9 @@ fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Opt
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
     }
-    // Network-stall warning: a streaming response that's gone silent past the
-    // threshold (e.g. mid-stream network drop) reads as a freeze with no feedback.
-    // Surface a hint that it isn't frozen and esc cancels. Static text, placed
-    // BEFORE the ticking elapsed so its width never jitters the segments after it.
-    if state.stream_stalled() {
-        out.push_str(" · ");
-        out.push_str(&crate::i18n::t(crate::i18n::Msg::StreamStalled));
-    }
+    // (The mid-stream "· esc to cancel" stall hint was removed by request — esc
+    // still cancels, it's just no longer advertised in the spinner. The stall
+    // machinery (`stream_stalled`) stays for the compaction-slow variant.)
     // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
     // `Running ReadFile… 4s`. CC behaviour: timer resets on every phase
     // transition so the user reads "this thing has been running for N

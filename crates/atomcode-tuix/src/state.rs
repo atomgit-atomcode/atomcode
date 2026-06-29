@@ -581,6 +581,30 @@ impl UiState {
         THINKING_LABELS[self.thinking_idx % THINKING_LABELS.len()]
     }
 
+    /// The thinking word for the CURRENT turn — the one `on_thinking` re-displays.
+    /// `on_submit` bumps `thinking_idx` AFTER showing the word, so the active word
+    /// sits at `thinking_idx - 1` (mirrors the index `on_thinking` computes).
+    fn active_thinking_word(&self) -> &'static str {
+        let idx = self.thinking_idx.saturating_sub(1) % THINKING_LABELS.len();
+        THINKING_LABELS[idx]
+    }
+
+    /// The spinner word to DISPLAY. Tool-execution labels (`Running X`,
+    /// `Preparing X`) are mapped back to the turn's thinking word so the footer
+    /// spinner never flashes tool names — tool progress is shown by the body
+    /// `▸ Tool(detail)` rows instead. Every other label (`Sub-agents N/M`,
+    /// `Waiting approval`, …) passes through unchanged. Display-only: the stored
+    /// `spinner_label` and all phase-clock timing logic are untouched.
+    pub(crate) fn display_spinner_label(&self) -> &str {
+        if self.spinner_label.starts_with("Running ")
+            || self.spinner_label.starts_with("Preparing ")
+        {
+            self.active_thinking_word()
+        } else {
+            &self.spinner_label
+        }
+    }
+
     pub fn on_submit(&mut self) {
         self.phase = UiPhase::Streaming;
         self.spinner_label = self.current_thinking().to_string();
