@@ -64,6 +64,9 @@ pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
             .open(parent)
             .with_context(|| format!("atomic_write: open parent dir {}", parent.display()))?
     };
+    // POSIX durability: fsync the directory entry so dirent survives crash.
+    // Windows FlushFileBuffers does not support directory handles (ERROR_INVALID_HANDLE).
+    #[cfg(unix)]
     dir.sync_all()
         .with_context(|| format!("atomic_write: fsync parent {}", parent.display()))?;
 
