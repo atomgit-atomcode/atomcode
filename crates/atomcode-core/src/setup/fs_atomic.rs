@@ -2,6 +2,7 @@
 //! → parent dir fsync. POSIX durability + Windows MoveFileEx semantics.
 
 use anyhow::{Context, Result};
+#[cfg(not(windows))]
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -50,8 +51,22 @@ pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("atomic_write: persist({}): {}", path.display(), e.error))?;
 
     // POSIX durability: fsync the directory entry so dirent survives crash.
+    // Windows requires FILE_FLAG_BACKUP_SEMANTICS to open a directory handle.
+    #[cfg(not(windows))]
     let dir = File::open(parent)
         .with_context(|| format!("atomic_write: open parent dir {}", parent.display()))?;
+    #[cfg(windows)]
+    let dir = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
+            .open(parent)
+            .with_context(|| format!("atomic_write: open parent dir {}", parent.display()))?
+    };
+    // POSIX durability: fsync the directory entry so dirent survives crash.
+    // Windows FlushFileBuffers does not support directory handles (ERROR_INVALID_HANDLE).
+    #[cfg(unix)]
     dir.sync_all()
         .with_context(|| format!("atomic_write: fsync parent {}", parent.display()))?;
 
