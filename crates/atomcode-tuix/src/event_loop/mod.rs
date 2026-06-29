@@ -7301,15 +7301,7 @@ pub(super) fn handle_plugin_job_event(
                             .into_owned(),
                     ));
                     renderer.flush();
-                    state.on_submit();
-                    ctx.agent
-                        .cmd_tx
-                        .send(atomcode_core::agent::AgentCommand::SendMessage {
-                            text: rendered,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
+                    commands::submit_agent_turn(ctx, state, rendered);
                 } else {
                     renderer.render(UiLine::Error(
                         crate::i18n::t(crate::i18n::Msg::CmdGuideSkillNotFound).into_owned(),
@@ -7347,15 +7339,7 @@ pub(super) fn handle_plugin_job_event(
                             .into_owned(),
                     ));
                     renderer.flush();
-                    state.on_submit();
-                    ctx.agent
-                        .cmd_tx
-                        .send(atomcode_core::agent::AgentCommand::SendMessage {
-                            text: rendered,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
+                    commands::submit_agent_turn(ctx, state, rendered);
                 }
             }
             renderer.render(UiLine::CommandOutput(
@@ -9152,6 +9136,15 @@ fn handle_agent_event(
             // 到「按指定 id 建空白会话」的旧行为。
             crate::tuix_trace!("TUI", "SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
             let sid = atomcode_core::session::SessionId::from_string(session_id);
+            // 自回声守卫：TUI 自己发起的切换（/new、/resume 等，见 sync_local_session_switch）
+            // 会经 live_switch_session 广播、再经转发器回流到这里。此时本地切换已完成、
+            // ctx.current_session.id 已是目标 id，无需重复清场/回放/重挂——直接忽略，避免
+            // 双重渲染。仅「另一端发起」的切换（id 与当前不同）才走下面的完整跟随逻辑。
+            // 与 ProviderChanged 臂同款的自回声去重。
+            if ctx.current_session.id == sid {
+                crate::tuix_trace!("TUI", "SessionSwitched: self-echo for current session, ignoring");
+                return;
+            }
             let loaded = atomcode_core::session::SessionManager::load_any(&sid).ok();
 
             // 重置对话与计数（无论加载成功与否都先清场）。

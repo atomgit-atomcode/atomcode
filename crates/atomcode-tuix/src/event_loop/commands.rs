@@ -343,6 +343,70 @@ pub(crate) fn attach_live_session(
     ));
 }
 
+/// 同步模式下，TUI 本地切换会话（/new、/session、/resume 选择历史会话等）后，把这次
+/// 切换双向同步：既让所有 webui tab 跟随，也把进程内共享 LiveSession 重绑到新会话。
+/// 与 webui 侧栏切换（postLiveSwitchSession → /live/switch_session）方向对称——补齐了
+/// 此前只有 webui→TUI、没有 TUI→webui 的单向同步缺口。
+///
+/// 顺序要点：必须**先**在「当前（旧）」LiveSession 上广播 SessionSwitched，**再**替换它。
+/// webui 的 /live SSE 是 fetch 流、不会自动重连——只有先收到 session_switched 事件，它才
+/// 会主动停旧流、按新 session_id 重连（见 webui Chat.tsx 的 session_switched 分支）；若反过来
+/// 先替换旧 LiveSession，旧广播通道一关就直接掐断 webui 的流且不再恢复。
+///
+/// 自回声无害：广播经 live_sync 转发器回流成 AgentEvent::SessionSwitched，但此时本地切换
+/// 已完成、`ctx.current_session.id` 已等于目标 id，被该事件臂顶部的守卫 no-op（不重复
+/// 清场/回放/重挂）。与 ProviderChanged / apply_cd 的自回声去重同款。
+///
+/// 非同步模式（`sync_session` 为 None）直接跳过——没有视图需要跟随。
+pub(crate) fn sync_local_session_switch(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    if ctx.sync_session.is_none() {
+        return;
+    }
+    // 1. 在旧 LiveSession 上广播，使每个 webui tab 的 SSE 重连到新会话（含其历史）。
+    atomcode_daemon::live_switch_session(ctx.current_session.id.clone());
+    // 2. 用新会话（id + 历史）替换共享 LiveSession，并把 TUI 转发器重挂到它上面，
+    //    使 TUI 之后的输入落到正确的会话（否则仍写进旧会话的 LiveSession）。
+    //    render_snapshot=false：历史已由切换入口（reset_to_new_session / 选择器）回放过。
+    let session = atomcode_daemon::ensure_live_session(
+        ctx.working_dir.clone(),
+        ctx.telemetry.clone(),
+        Some(ctx.current_session.id.clone()),
+        ctx.current_session.messages.clone(),
+    );
+    attach_live_session(ctx, renderer, session, false);
+    renderer.flush();
+}
+
+/// 提交一条「由斜杠命令合成的用户回合」（如 /skills、/review、/guide、自定义命令展开的
+/// 模板）到当前生效的对话引擎。
+///
+/// 同步模式（`sync_session` 为 Some）下投递到共享 LiveSession——使这些命令展开出的回合像
+/// 普通输入一样跑在 daemon 执行器上并广播给 webui，补齐了「TUI 上 /skills 等命令不同步到
+/// webui」的缺口；否则走 TUI 本地 agent（原有行为）。统一收口，避免每个命令各写一遍
+/// sync 分支、再漏一个。
+///
+/// 这些命令的合成文本本身不在本地回显（命令各有自己的 CommandOutput 提示）；同步模式下
+/// LiveSession 会广播 UserMessage，经转发器回成 UserEcho 由两端统一渲染该回合的用户气泡，
+/// 与普通输入在同步模式下的回显路径一致。所有调用点均为纯文本（无图），故只收文本。
+pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String) {
+    if let Some(live) = &ctx.sync_session {
+        live.send_input(atomcode_core::live::UserInput {
+            text,
+            images: vec![],
+        });
+    } else {
+        ctx.agent
+            .cmd_tx
+            .send(AgentCommand::SendMessage {
+                text,
+                images: vec![],
+                image_markers: vec![],
+            })
+            .ok();
+    }
+    state.on_submit();
+}
+
 pub(super) fn execute_slash_command(
     cmd: &str,
     arg: &str,
@@ -476,15 +540,7 @@ pub(super) fn execute_slash_command(
             } else {
                 // Try expanding the "ask" skill inline first (fast path).
                 if let Some(rendered) = expand_skill(ctx, "ask", arg) {
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SendMessage {
-                            text: rendered,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
-                    state.on_submit();
+                    submit_agent_turn(ctx, state, rendered);
                 } else {
                     // "ask" skill is not installed — trigger async install
                     // and stash the topic so handle_plugin_job_event can
@@ -602,11 +658,7 @@ pub(super) fn execute_slash_command(
                      {{\"base\": \"{scope}\"}}, then give me a concise summary of its findings."
                 )
             };
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::SendMessage { text, images: vec![], image_markers: vec![] })
-                .ok();
-            state.on_submit();
+            submit_agent_turn(ctx, state, text);
         }
         "config" => {
             // Head: current active provider + config path so users know
@@ -2032,15 +2084,7 @@ pub(super) fn execute_slash_command(
                 // prefix here. A user-typed qualified name (`foo:bar`) still
                 // works because exact match runs first.
                 if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SendMessage {
-                            text: rendered,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
-                    state.on_submit();
+                    submit_agent_turn(ctx, state, rendered);
                 } else {
                     renderer.render(UiLine::Error(
                         t(Msg::SkillUnknown { name: skill_name }).into_owned(),
@@ -2066,16 +2110,8 @@ pub(super) fn execute_slash_command(
                         t(Msg::CmdSetupRunningSkill).into_owned(),
                     ));
                     renderer.flush();
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SendMessage {
-                            text: rendered,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
                     *setup_pending = true;
-                    state.on_submit();
+                    submit_agent_turn(ctx, state, rendered);
                 } else {
                     renderer.render(UiLine::Error(t(Msg::CmdSetupSkillMissing).into_owned()));
                     renderer.flush();
@@ -2120,16 +2156,8 @@ pub(super) fn execute_slash_command(
                                 t(Msg::CmdSetupRunningSkill).into_owned(),
                             ));
                             renderer.flush();
-                            ctx.agent
-                                .cmd_tx
-                                .send(AgentCommand::SendMessage {
-                                    text: rendered,
-                                    images: vec![],
-                                    image_markers: vec![],
-                                })
-                                .ok();
                             *setup_pending = true;
-                            state.on_submit();
+                            submit_agent_turn(ctx, state, rendered);
                         } else {
                             renderer
                                 .render(UiLine::Error(t(Msg::CmdSetupSkillMissing).into_owned()));
@@ -2154,25 +2182,9 @@ pub(super) fn execute_slash_command(
             // .atomcode/skills, etc.). Both expand to a prompt and dispatch
             // as a regular user message.
             if let Some(rendered) = ctx.custom_commands.render(other, arg) {
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::SendMessage {
-                        text: rendered,
-                        images: vec![],
-                        image_markers: vec![],
-                    })
-                    .ok();
-                state.on_submit();
+                submit_agent_turn(ctx, state, rendered);
             } else if let Some(rendered) = expand_skill(ctx, other, arg) {
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::SendMessage {
-                        text: rendered,
-                        images: vec![],
-                        image_markers: vec![],
-                    })
-                    .ok();
-                state.on_submit();
+                submit_agent_turn(ctx, state, rendered);
             } else {
                 // Unknown command — emit failure telemetry
                 let available_commands: Vec<&str> = vec![
@@ -3249,6 +3261,8 @@ pub(crate) fn reset_to_new_session(
     renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
     renderer.flush();
     renderer.end_sync();
+    // 同步模式：把这次「本地新建会话」双向同步到 webui，并把共享 LiveSession 重绑到新会话。
+    sync_local_session_switch(ctx, renderer);
 }
 
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
