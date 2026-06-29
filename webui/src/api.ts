@@ -517,7 +517,7 @@ export type LiveWireEvent =
   | { type: 'state'; running: boolean }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null }
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean }
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'session_switched'; session_id: string }
   | { type: 'working_dir'; working_dir: string };
