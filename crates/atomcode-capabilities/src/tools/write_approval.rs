@@ -127,6 +127,17 @@ fn canonical_key(raw: &str, cwd: &Path) -> String {
     std::fs::canonicalize(&resolved).unwrap_or(resolved).to_string_lossy().into_owned()
 }
 
+/// Grant key for an out-of-workspace write (see [`canonical_key`]). Free fn (no `self`)
+/// so it can run inside the off-thread, bounded classification in `before()`.
+fn grant_key(tool: &str, targets: &[String], cwd: &Path) -> String {
+    if matches!(tool, "edit_file" | "write_file") && targets.len() == 1 {
+        format!("{tool}::{}", canonical_key(&targets[0], cwd))
+    } else {
+        // No single target file → tool-wide (v1 routed these to its un-scoped tier).
+        format!("{tool}::")
+    }
+}
+
 /// Workspace-aware, per-path approval gate for the file-mutation tools. Clone-cheap (Arc-backed
 /// store + cwd handle).
 pub struct WriteApprovalGate {
@@ -156,16 +167,6 @@ impl WriteApprovalGate {
     /// Use a caller-supplied (e.g. shared / persisted) grant store.
     pub fn with_store(cwd: Arc<RwLock<PathBuf>>, store: Arc<dyn PermissionStore>) -> Self {
         Self { store, cwd, kind: APPROVAL_KIND.to_string() }
-    }
-
-    /// Grant key for an out-of-workspace write (see [`canonical_key`]).
-    fn grant_key(&self, tool: &str, targets: &[String], cwd: &Path) -> String {
-        if matches!(tool, "edit_file" | "write_file") && targets.len() == 1 {
-            format!("{tool}::{}", canonical_key(&targets[0], cwd))
-        } else {
-            // No single target file → tool-wide (v1 routed these to its un-scoped tier).
-            format!("{tool}::")
-        }
     }
 
     /// Round-trip the driver for an approval decision (same wire shape as [`ApprovalMiddleware`],
@@ -240,17 +241,32 @@ impl ToolMiddleware for WriteApprovalGate {
             return self.prompt_unremembered(call, tool, rt).await;
         }
 
+        // (2)+(3) classification CANONICALIZES paths (touches the filesystem). Run it OFF the
+        // async worker, bounded: if the workspace lives on a stalled mount (e.g. a hung network
+        // share as the cwd), `canonicalize()` can block for minutes — doing it inline freezes the
+        // kernel's turn loop so even Esc/Ctrl-C can't fire the cancel token. On timeout we degrade
+        // to "not in workspace, tool-wide grant key" → a normal approval prompt (safe, never hangs).
+        let (in_workspace, key) = {
+            let targets = targets.clone();
+            let cwd = cwd.clone();
+            let name = name.to_string();
+            let fallback = (false, format!("{name}::"));
+            super::run_bounded(super::GATE_FS_TIMEOUT, fallback, move || {
+                let in_ws = !targets.is_empty()
+                    && targets.iter().all(|t| !t.trim().is_empty() && path_in_workspace(t, &cwd));
+                (in_ws, grant_key(&name, &targets, &cwd))
+            })
+            .await
+        };
+
         // (2) Entirely in-workspace, non-sensitive → AUTO-APPROVE, no prompt (v1 parity). The
         // `!is_empty` + non-blank guards keep an unparseable / empty-path call from vacuously passing.
-        if !targets.is_empty()
-            && targets.iter().all(|t| !t.trim().is_empty() && path_in_workspace(t, &cwd))
-        {
+        if in_workspace {
             return BeforeOutcome::Allow { reason: Some("in-workspace write".into()) };
         }
 
         // (3) Out-of-workspace (or unparseable) non-sensitive → prompt; "Always" remembers per
         // canonical path (edit/write) or per tool (bulk/multi-file).
-        let key = self.grant_key(name, &targets, &cwd);
         if self.store.is_granted(&key) {
             return BeforeOutcome::Allow { reason: Some("previously granted this session".into()) };
         }

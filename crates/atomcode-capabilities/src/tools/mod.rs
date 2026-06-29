@@ -245,10 +245,52 @@ pub(crate) fn err(content: impl Into<String>) -> ToolResult {
     ToolResult { call_id: String::new(), content: content.into(), is_error: true, images: vec![] }
 }
 
+/// Max wall-clock a permission gate may spend on blocking filesystem classification
+/// (path canonicalization). The workspace can sit on a stalled mount (e.g. a hung
+/// network share) where `std::fs::canonicalize` blocks for minutes; bounding it keeps
+/// the kernel's turn loop responsive (Esc/Ctrl-C stay live) instead of freezing — the
+/// exact symptom of a `before()` gate hanging on `/Volumes/<share>`.
+pub(crate) const GATE_FS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run blocking `f` OFF the async worker (so a stalled syscall can't pin the runtime
+/// thread mid-poll), bounded by `timeout`. Returns `default` if `f` doesn't finish in
+/// time or its thread panics — a hung filesystem degrades to a safe fallback, never a
+/// hang. The orphaned blocking thread is abandoned (it finishes when the syscall
+/// eventually returns); acceptable for the rare stalled-mount case.
+pub(crate) async fn run_bounded<T, F>(timeout: std::time::Duration, default: T, f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(v)) => v,
+        _ => default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolRegistry;
+
+    #[tokio::test]
+    async fn run_bounded_yields_default_when_blocking_exceeds_timeout() {
+        // A stalled syscall (simulated by a long sleep on the blocking thread) must NOT
+        // hang the caller: the bound fires and returns the safe default well before the
+        // closure would finish.
+        let got = run_bounded(std::time::Duration::from_millis(50), false, || {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            true
+        })
+        .await;
+        assert!(!got, "exceeding the timeout must return the default, not block");
+    }
+
+    #[tokio::test]
+    async fn run_bounded_returns_value_when_fast() {
+        let got = run_bounded(std::time::Duration::from_secs(5), false, || true).await;
+        assert!(got, "a fast closure returns its real value");
+    }
 
     #[test]
     fn is_vision_model_recognizes_known_multimodal_families() {

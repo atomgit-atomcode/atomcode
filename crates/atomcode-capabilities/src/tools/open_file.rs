@@ -283,7 +283,19 @@ impl ToolMiddleware for OpenFileWorkspaceGate {
             Ok(g) => g.clone(),
             Err(_) => return BeforeOutcome::Proceed,
         };
-        if Self::target_in_workspace(&call.arguments, &cwd) {
+        // `target_in_workspace` CANONICALIZES paths (filesystem syscalls). Run it OFF the async
+        // worker, bounded: a stalled mount as the cwd would otherwise block `canonicalize()` for
+        // minutes inline and freeze the kernel turn loop (Esc/Ctrl-C dead). On timeout → `false`,
+        // the same conservative "can't decide → defer to approval" default the check already uses.
+        let in_workspace = {
+            let args = call.arguments.clone();
+            let cwd = cwd.clone();
+            super::run_bounded(super::GATE_FS_TIMEOUT, false, move || {
+                Self::target_in_workspace(&args, &cwd)
+            })
+            .await
+        };
+        if in_workspace {
             BeforeOutcome::Allow { reason: Some("open_file target is inside the workspace".into()) }
         } else {
             BeforeOutcome::Proceed
