@@ -16,6 +16,9 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 # `provider` capability deps (HTTP + SSE). Optional so a downstream embedder that
 # only wants other capabilities does not pull in the TLS/HTTP stack.
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false, optional = true }
+# RFC 7231 HTTP-date parsing for `Retry-After` headers that use the date form (e.g. some
+# Anthropic 429s) instead of delta-seconds. Already in the tree via reqwest. provider-only.
+httpdate = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 async-stream = { version = "0.3", optional = true }
 # `tools` capability deps. gitignore-aware file walking (grep/glob), regex (grep),
@@ -64,7 +67,7 @@ chrono = { version = "0.4", optional = true }
 default = ["provider", "tools"]
 # Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …). `dirs` resolves the
 # wire-dump output dir (config_dir()/wire-dump) for the byte-level ATOMCODE_WIRE_DUMP.
-provider = ["dep:reqwest", "dep:bytes", "dep:async-stream", "dep:dirs"]
+provider = ["dep:reqwest", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
 tools = ["dep:ignore", "dep:regex", "dep:globset", "dep:encoding_rs", "tokio/fs", "tokio/process", "tokio/io-util"]
