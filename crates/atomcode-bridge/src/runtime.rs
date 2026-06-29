@@ -397,6 +397,11 @@ impl Bridge {
 
         loop {
             tokio::select! {
+                // Deterministic branch order: a loop wakeup/fire that's ready in the
+                // SAME poll as a kernel event MUST be processed first, so `pending_wakeup`
+                // is set before the turn-end Snapshot reads it (else a self-paced loop
+                // could be misjudged as "completed"). cmd_rx stays first for Cancel.
+                biased;
                 cmd = cmd_rx.recv() => match cmd {
                     Some(c) => {
                         if bridge.on_command(c).await {
@@ -569,16 +574,36 @@ impl Bridge {
     /// the loop was cleared/cancelled after the sleep was spawned but before this
     /// landed (the cancel token normally pre-empts the sleep; this guards the race).
     fn on_loop_fire(&mut self, wake: WakeupRequest) {
-        match self.loop_state.as_mut() {
+        // Mutate loop state inside a tight borrow, deciding whether this fire CONTINUES
+        // the loop or ENDS it (round-limit fuse). Emit happens AFTER the borrow drops so
+        // `self.emit` doesn't conflict with the `&mut self.loop_state` borrow.
+        let hit_limit = match self.loop_state.as_mut() {
             Some(l) if l.active => {
                 l.round += 1;
-                l.consecutive_failures = 0;
+                // `consecutive_failures` is a v1 LoopState field the bridge never
+                // increments (v2 has no evaluator/error retry path), so there is
+                // nothing to reset — left untouched on purpose.
                 l.last_reason = Some(wake.reason);
+                // Round-limit fuse (parity with v1 mod.rs:2345): stop the loop once
+                // `max_rounds` is reached instead of injecting another turn, so a
+                // runaway loop can't burn tokens forever. `max_rounds` defaults to
+                // LoopState's 100 (v2 has no loop config knob to override it).
+                if l.round_limit_reached() {
+                    l.active = false;
+                    l.last_reason = Some(format!("round limit ({})", l.max_rounds));
+                    true
+                } else {
+                    false
+                }
             }
             _ => return, // loop gone — drop the stale continuation
-        }
+        };
+        // Always reflect the new round/active state in the footer.
         let ev = loop_update_ev(self.loop_state.as_ref().unwrap());
         self.emit(ev);
+        if hit_limit {
+            return; // loop ended — do NOT inject another turn
+        }
         self.start_turn_stats();
         let _ = self
             .handle
@@ -1086,9 +1111,11 @@ impl Bridge {
                 // Snapshot hook + the model's `schedule_wakeup` calls. No provider /
                 // evaluator to build (the model paces itself).
                 //
-                // Fresh cancel token per loop so a prior loop's cancel can't kill this
-                // one's pending continuation. A stale wakeup from a previous loop is
-                // discarded so it can't be mistaken for THIS loop's schedule.
+                // Fresh cancel token per loop. Cancel the OLD token first so a prior
+                // loop's in-flight sleep is pre-empted (defensive: the TUI sends
+                // ClearLoop first, but don't rely on caller discipline). A stale wakeup
+                // from a previous loop is discarded so it can't be mistaken for THIS one.
+                self.loop_cancel.cancel();
                 self.loop_cancel = CancellationToken::new();
                 self.pending_wakeup = None;
                 let state = LoopState::new(prompt);
@@ -1229,6 +1256,10 @@ impl Bridge {
                         });
                         self.handle = Self::noop_handle();
                         self.degraded = true;
+                        // Stop any active loop on prepare failure too (parity with Ok).
+                        self.loop_cancel.cancel();
+                        self.loop_state = None;
+                        self.pending_wakeup = None;
                         return;
                     }
                 }
@@ -1279,6 +1310,12 @@ impl Bridge {
                 // recv() never returns None and kills the process.
                 self.handle = Self::noop_handle();
                 self.degraded = true;
+                // Stop any active loop too (parity with the Ok branch): a respawn
+                // failure must not leave a pending continuation firing into a dead
+                // handle with the footer still showing the loop active.
+                self.loop_cancel.cancel();
+                self.loop_state = None;
+                self.pending_wakeup = None;
             }
         }
     }
@@ -1368,6 +1405,10 @@ impl Bridge {
         // non-natural terminal — MaxRounds/error — or the loop already ended). Drop it so
         // it can't bleed into a later turn.
         self.pending_wakeup = None;
+        // Drain extra queued wakeups: a turn that called schedule_wakeup more than once
+        // leaves N-1 requests in the channel; without this they'd surface in a LATER
+        // turn's select and be mistaken for that turn's schedule (ghost loop).
+        while self.wakeup_rx.try_recv().is_ok() {}
         let duration = self.stats.started.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
         match reason {
             StopReason::Cancelled => {
