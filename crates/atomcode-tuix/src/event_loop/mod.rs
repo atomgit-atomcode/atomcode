@@ -8956,12 +8956,10 @@ fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Opt
         out.push_str(" · ");
         out.push_str(&crate::i18n::t(crate::i18n::Msg::StreamStalled));
     }
-    // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
-    // `Running ReadFile… 4s`. CC behaviour: timer resets on every phase
-    // transition so the user reads "this thing has been running for N
-    // seconds", not "the whole turn so far is 1301s". LAST, so its per-frame
-    // width changes never shift anything after it.
-    if let Some(d) = state.phase_elapsed() {
+    // Turn elapsed — `Pondering… 8s`,
+    // `Running ReadFile… 12s`. Cumulative turn time so the user
+    // sees total wait time, not per-phase flicker.
+    if let Some(d) = state.turn_elapsed() {
         out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
     }
     out

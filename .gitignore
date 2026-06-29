@@ -42,8 +42,8 @@ site/index-new.html
 *.swp
 *.swo
 
-# Config with secrets
-config.toml
+# Config with secrets (root-only — .cargo/config.toml is tracked)
+/config.toml
 
 # Personal project instructions (loaded by AtomCode, never committed)
 .atomcode.user.md
