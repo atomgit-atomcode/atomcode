@@ -297,10 +297,10 @@ echo '{"tool_name":"read_file","tool_args":"{}","working_dir":"/tmp","session_id
 echo '{"hook_context":{"tool_name":"read_file","tool_args":"{}","working_dir":"/tmp","session_id":"s1","turn_number":1},"result_context":{"tool_name":"read_file","tool_args":"{}","result":"File content here","success":true,"duration_ms":12}}' | bash path/to/hook.sh
 ```
 
-JSON CC 兼容 Hook 通过环境变量接收：
+JSON CC 兼容 Hook 通过环境变量接收（TOML ScriptHook 不适用，TOML 用 stdin）：
 
 ```bash
-# 导出环境变量模拟运行环境
+# 导出环境变量模拟运行环境（仅 JSON CC 格式）
 export ATOMCODE_HOOK_EVENT="post_tool_use"
 export ATOMCODE_TOOL_NAME="read_file"
 export ATOMCODE_HOOK_CONTEXT='{"tool_name":"read_file"}'
@@ -311,10 +311,10 @@ python path/to/hook.py
 
 ```bash
 # TOML 格式校验（需要 Python ≥ 3.11；旧版请 pip install tomli 并将 tomllib 替换为 tomli）
-python -c "import tomllib; tomllib.load(open('path/to/hooks.toml','rb'))"
+python -c "from pathlib import Path; import tomllib; tomllib.load(Path('path/to/hooks.toml').open('rb'))"
 
 # JSON 格式校验
-python -c "import json; json.load(open('path/to/hooks.json'))"
+python -c "from pathlib import Path; import json; json.load(Path('path/to/hooks.json').open('rb'))"
 ```
 
 ### CLI 排查命令

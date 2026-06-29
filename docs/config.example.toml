@@ -66,10 +66,10 @@ mode = "no_proxy"
 #
 # JSON CC scripts receive context via env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME,
 # ATOMCODE_HOOK_CONTEXT (JSON string). TOML ScriptHook uses stdin instead — see docs/hooks.md.
-# PreToolUse stdout supports:
+# JSON CC PreToolUse stdout supports (TOML ScriptHook uses text protocol ok/deny:/modify: — see docs/hooks.md):
 #   {"action":"allow"} or {"action":"block","reason":"..."} or {"action":"modify","args":{...}}
 #
-# Example ~/.atomcode/hooks.json:
+# Example ~/.atomcode/hooks.json (JSON CC format; TOML uses [[hooks]] with trigger/script/timeout_secs — see docs/hooks.md):
 # {
 #   "hooks": {
 #     "verify-gate": {
