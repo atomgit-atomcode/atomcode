@@ -471,3 +471,99 @@ async fn cancel_mid_round_halts_the_whole_multi_round_turn() {
         "the multi-round turn must end Cancelled, not roll on to the next round"
     );
 }
+
+// CLAIM 17e: with `keep_interrupted_context(true)`, a between-tools cancel PRESERVES
+// the interrupted turn — the second turn's first request must still carry turn 1's
+// user message + assistant tool_calls, and every dangling tool_call must be backfilled
+// with a `(cancelled)` result (no dangling — API stays valid).
+#[tokio::test]
+async fn cancel_preserves_turn_when_keep_interrupted_context() {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(SelfCancelTool));
+    reg.register(Arc::new(EchoTool));
+
+    let provider = Arc::new(RecordingProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(tool_call("c_cancel", "self_cancel", "{}")),
+            StreamEvent::ToolCall(tool_call("c_echo", "echo", "{\"text\":\"hi\"}")),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![StreamEvent::TextDelta("second turn done".into()), StreamEvent::Done { truncated: false }],
+    ]));
+    let calls = provider.calls();
+
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["self_cancel", "echo"]))
+        .keep_interrupted_context(true)
+        .build()
+        .spawn();
+
+    handle.commands.send(AgentCommand::SendMessage { text: "do two things".into(), images: vec![] }).unwrap();
+    while let Some(ev) = handle.events.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) { break; }
+    }
+    handle.commands.send(AgentCommand::SendMessage { text: "again".into(), images: vec![] }).unwrap();
+    while let Some(ev) = handle.events.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) { break; }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let calls = calls.lock().unwrap();
+    let history = &calls[1].0; // second turn's first request = post-cancel history
+    // (1) the cancelled turn is PRESERVED.
+    assert!(
+        history.iter().any(|m| m.text.contains("do two things")),
+        "preserved: cancelled user message must remain: {history:?}"
+    );
+    assert!(
+        history.iter().any(|m| m.tool_calls.iter().any(|tc| tc.id == "c_cancel")),
+        "preserved: cancelled assistant tool_calls must remain: {history:?}"
+    );
+    // (2) still API-valid: every tool_call has a result (c_echo was never run → backfilled).
+    assert_no_dangling_tool_calls(history);
+    let result_ids: std::collections::HashSet<&str> =
+        history.iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+    assert!(
+        result_ids.contains("c_echo"),
+        "the skipped tool_call must be backfilled with a (cancelled) result: {history:?}"
+    );
+}
+
+// CLAIM 17f: in preserve mode, finish_cancelled appends a synthetic USER-role marker so
+// the next turn's request explicitly tells the model the prior turn was user-interrupted.
+// User role is wire-safe on all adapters (non-leading system messages are rejected/dropped
+// on many openai-compat gateways; Anthropic lifts all system to top-level field).
+#[tokio::test]
+async fn preserve_mode_injects_interruption_marker() {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(SelfCancelTool));
+    let provider = Arc::new(RecordingProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(tool_call("c_cancel", "self_cancel", "{}")),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done { truncated: false }],
+    ]));
+    let calls = provider.calls();
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["self_cancel"]))
+        .keep_interrupted_context(true)
+        .build()
+        .spawn();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    while let Some(ev) = handle.events.recv().await { if matches!(ev, AgentEvent::TurnComplete { .. }) { break; } }
+    handle.commands.send(AgentCommand::SendMessage { text: "next".into(), images: vec![] }).unwrap();
+    while let Some(ev) = handle.events.recv().await { if matches!(ev, AgentEvent::TurnComplete { .. }) { break; } }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let calls = calls.lock().unwrap();
+    let history = &calls[1].0;
+    let marker = history.iter().find(|m| m.text.contains("interrupted by the user"))
+        .expect("expected an interruption marker user message");
+    assert_eq!(marker.role, Role::User, "marker must be Role::User (wire-safe on all adapters)");
+    assert!(marker.synthetic, "marker must be synthetic so /undo and compaction skip it in prompt counting");
+}

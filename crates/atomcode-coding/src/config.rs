@@ -81,6 +81,11 @@ pub struct CodingAgentConfig {
     /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
     /// tool was hardwired to Exa with no way to opt into DDG.
     pub web_search_provider: Option<String>,
+    /// On Ctrl-C / cancel: `false` (default) ⇒ CANCEL = UNDO (roll back the interrupted
+    /// turn). `true` ⇒ PRESERVE the partial turn + backfill dangling tool_calls + inject
+    /// an interruption marker, forwarded to the kernel `Agent` builder
+    /// (`keep_interrupted_context`). Sourced from `Config::keep_interrupted_context`.
+    pub keep_interrupted_context: bool,
 }
 
 /// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
@@ -134,6 +139,7 @@ impl CodingAgentConfig {
             thinking_keep: None,
             compact_threshold: 0.7,
             web_search_provider: None,
+            keep_interrupted_context: false,
         }
     }
 }

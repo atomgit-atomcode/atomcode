@@ -76,6 +76,9 @@ pub struct BridgeConfig {
     /// answered approval can't park a turn forever. Maps to the kernel agent's
     /// `request_timeout` (None vs the configured bound) — approval is the only round-trip.
     pub interactive: bool,
+    /// Preserve a cancelled turn's partial work in history (default false). Mapped
+    /// from `Config::keep_interrupted_context`.
+    pub keep_interrupted_context: bool,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -254,6 +257,7 @@ impl Bridge {
         if cfg.interactive {
             coding_cfg.request_timeout = None;
         }
+        coding_cfg.keep_interrupted_context = cfg.keep_interrupted_context;
 
         let opts_template = PrepareOptions {
             session: SessionMode::Fresh,
@@ -1226,12 +1230,6 @@ impl Bridge {
                     StopReason::MaxRounds => TurnStopReason::TurnLimit,
                     StopReason::MaxContinuations => TurnStopReason::StepLimit,
                     StopReason::Cancelled => TurnStopReason::Cancelled,
-                    // A 429 rate-limit Pause is NOT a failure — the user already saw the
-                    // ⏸ RateLimited pause line. Classify as Natural (not Error) so the turn
-                    // summary isn't flagged red and telemetry doesn't count it as a failed
-                    // turn. No dedicated TurnStopReason variant to avoid cascading across
-                    // the 60+ existing match sites.
-                    StopReason::RateLimited => TurnStopReason::Natural,
                     _ => TurnStopReason::Error,
                 };
                 // NOTE: a provider/stream error already surfaced as a `CoreEv::Error`
@@ -1656,11 +1654,6 @@ fn goal_turn_disposition(
             GoalDisposition::ReinjectNoEval
         }
         StopReason::Cancelled | StopReason::PromptRejected => GoalDisposition::EndTurn,
-        // A 429 rate-limit Pause: stop the goal WITH a user-facing notice instead of the
-        // silent `_ => EndTurn`. Re-injecting (ReinjectNoEval) would immediately 429 again
-        // and busy-loop through pauses; StopGoal emits "goal stopped: rate limited …" so
-        // the user knows to re-run /goal after the 5h window resets.
-        StopReason::RateLimited => GoalDisposition::StopGoal("rate limited (5h window)"),
         _ => GoalDisposition::EndTurn,
     }
 }
@@ -2470,6 +2463,41 @@ mod undo_tests {
         assert_eq!(p.prompts_before, 2);
         assert_eq!(p.restored_prompt, "second question");
     }
+
+    #[test]
+    fn interruption_marker_synthetic_user_not_counted_as_prompt() {
+        // Regression guard: the keep_interrupted_context marker injected by finish_cancelled
+        // uses Message::synthetic_user (synthetic=true). It must NOT be counted as a real
+        // prompt by compute_undo — otherwise /undo would restore the bracketed marker text
+        // into the input box and truncate at the wrong boundary.
+        //
+        // History: system | user("q1") | asst | marker(synthetic_user) | user("q2") | asst
+        // Expected: 2 real prompts, undo target = "q2" (not the marker).
+        let mut msgs = convo(); // system, user1, asst1, user2, asst2
+        let marker = Message::synthetic_user(
+            "[The previous response was interrupted by the user before completing. \
+             Reconsider the approach in light of this interruption before continuing.]",
+        );
+        // Insert marker between asst1 (index 2) and user2 (index 3).
+        msgs.insert(3, marker);
+        let p = compute_undo(&msgs, None).unwrap();
+        // The marker must be invisible to compute_undo: still 2 real prompts.
+        assert_eq!(p.prompts_before, 2, "marker must not be counted as a real prompt");
+        assert_eq!(p.restored_prompt, "second question", "undo must target the real prompt, not the marker");
+    }
+
+    #[test]
+    fn bridge_config_maps_keep_interrupted_context() {
+        // BridgeConfig.keep_interrupted_context must flow through to CodingAgentConfig.
+        // Emulate the one-liner in Bridge::run: `coding_cfg.keep_interrupted_context =
+        // cfg.keep_interrupted_context;` — this proves the field exists on both sides
+        // and survives the assignment (stronger than a build-only check).
+        let mut coding = CodingAgentConfig::new("sk-x", "https://api.example.com/v1", "m", "/tmp");
+        assert!(!coding.keep_interrupted_context, "default must be false");
+        let bridge_flag = true; // stands in for BridgeConfig.keep_interrupted_context
+        coding.keep_interrupted_context = bridge_flag;
+        assert!(coding.keep_interrupted_context, "flag must propagate to CodingAgentConfig");
+    }
 }
 
 #[cfg(test)]
@@ -2523,12 +2551,6 @@ mod goal_disposition_tests {
         // terminal → end the goal/turn
         assert!(matches!(goal_turn_disposition(Cancelled, None, false), GoalDisposition::EndTurn));
         assert!(matches!(goal_turn_disposition(PromptRejected, None, false), GoalDisposition::EndTurn));
-        // 429 rate-limit Pause → StopGoal WITH a notice (not the silent EndTurn that would
-        // kill the goal invisibly, nor ReinjectNoEval that would busy-loop on 429s)
-        assert!(matches!(
-            goal_turn_disposition(RateLimited, None, false),
-            GoalDisposition::StopGoal("rate limited (5h window)")
-        ));
         // caps / exhaustion override the reason
         assert!(matches!(goal_turn_disposition(Stopped, Some("round limit"), false), GoalDisposition::StopGoal("round limit")));
         assert!(matches!(goal_turn_disposition(Stopped, None, true), GoalDisposition::StopGoal(_)));

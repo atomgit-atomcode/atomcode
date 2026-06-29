@@ -1993,6 +1993,7 @@ fn bridge_config_from(
         thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
         dangerously_skip_permissions,
         interactive,
+        keep_interrupted_context: config.keep_interrupted_context,
     }
 }
 

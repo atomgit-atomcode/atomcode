@@ -48,7 +48,13 @@ const MAX_PROVIDER_RETRIES: u32 = 3;
 /// broken or the rate-limit window never reopens. This is a LAST-RESORT backstop,
 /// not the normal path — a real window recovery will cause the next OPEN to succeed,
 /// resetting this counter to 0 before it is ever reached in practice.
-const MAX_RATE_LIMIT_WAITS: u32 = 20;
+///
+/// Worst-case in-turn blocking = `MAX_RATE_LIMIT_WAITS` × the host's per-wait cap
+/// (`atomcode_kernel::hook::RATE_LIMIT_AUTO_WAIT_SECS`, 120s) = 5 × 120s = 10 min.
+/// Kept on the scale of the other per-turn fuses (`MAX_PROVIDER_RETRIES` = 3,
+/// `EMPTY_RESPONSE_MAX_RETRIES` = 5) rather than the old 20 (which permitted a
+/// 40-minute hang from a broken hook, far past the 300s `stream_timeout`).
+const MAX_RATE_LIMIT_WAITS: u32 = 5;
 
 /// How many times the agent loop re-issues a round after the provider returns a
 /// COMPLETELY EMPTY but otherwise-successful completion (a 200 with no text, no
@@ -337,6 +343,10 @@ pub struct Agent {
     /// TIME-determinism seam (default [`SystemClock`]; a `FixedClock` makes a run's
     /// snapshots byte-reproducible for eval/replay). See [`crate::clock`].
     clock: Arc<dyn Clock>,
+    /// When `true`, a cancelled turn PRESERVES its partial assistant/tool work in
+    /// history (backfilled to stay API-valid) instead of rolling back. Default
+    /// `false` = CANCEL = UNDO. See `AgentBuilder::keep_interrupted_context`.
+    keep_interrupted_context: bool,
 }
 
 impl Agent {
@@ -388,6 +398,7 @@ impl Agent {
             turn_counter: AtomicU64::new(turn_seed),
             request_counter: AtomicU64::new(request_seed),
             clock: self.clock,
+            keep_interrupted_context: self.keep_interrupted_context,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -477,6 +488,8 @@ struct RunningAgent {
     request_counter: AtomicU64,
     /// Injectable monotonic clock for `elapsed_ms` (see [`crate::clock`]).
     clock: Arc<dyn Clock>,
+    /// See `Agent::keep_interrupted_context`.
+    keep_interrupted_context: bool,
 }
 
 impl RunningAgent {
@@ -822,8 +835,39 @@ impl RunningAgent {
     /// than risk cutting compacted history at a stale index. Funnels through
     /// `finish_turn` so the `turn_complete` hook + `TurnComplete` event still fire
     /// (on the now-clean conversation).
+    /// Cancel funnel: called by all 7 cancel sites. Two modes:
+    /// - `keep_interrupted_context = false` (default): CANCEL = UNDO — roll back to before
+    ///   the user message so the cancelled prompt + partial work leaves NO trace.
+    /// - `keep_interrupted_context = true`: PRESERVE — keep this turn's partial
+    ///   assistant/tool work; backfill a `(cancelled)` result for every dangling
+    ///   tool_call so the wire stays API-valid. APPEND-ONLY — prefix-cache safe.
     async fn finish_cancelled(&self, convo: &mut Conversation, rollback_len: usize, ctx: &TurnCtx) {
-        convo.messages.truncate(rollback_len);
+        if self.keep_interrupted_context {
+            // PRESERVE: keep this turn's partial assistant/tool work; backfill a
+            // `(cancelled)` result for every dangling tool_call so the wire stays
+            // API-valid. APPEND-ONLY — prefix-cache safe. Mirrors v1's
+            // `Conversation::cancel_current_turn`.
+            convo.backfill_cancelled_tool_results();
+            // Inject a SYNTHETIC user-role interruption marker — wire-safe on all
+            // adapters. A system message placed mid-conversation is rejected or silently
+            // dropped by many openai-compat gateways (non-leading system), and the
+            // Anthropic adapter lifts ALL system messages to the top-level `system`
+            // field, detaching this marker from its position. A user-role message merges
+            // cleanly into the next user prompt on Anthropic and is valid consecutive-user
+            // on openai-compat.
+            // `synthetic_user` (not `user`) so the marker is excluded from prompt
+            // counting: `compute_undo` in the bridge skips `synthetic = true` messages
+            // when locating the /undo target, and compaction's `active_turn_start`
+            // skip synthetic messages when computing keep-recent-turns boundaries.
+            convo.push(Message::synthetic_user(
+                "[The previous response was interrupted by the user before completing. \
+                 Reconsider the approach in light of this interruption before continuing.]",
+            ));
+        } else {
+            // CANCEL = UNDO (default): roll back to before the user message so the
+            // cancelled prompt + partial work leaves NO trace.
+            convo.messages.truncate(rollback_len);
+        }
         self.rt.emit(AgentEvent::Cancelled);
         self.finish_turn(convo, StopReason::Cancelled, ctx).await;
     }
@@ -1031,7 +1075,7 @@ impl RunningAgent {
                                     reset_at_display: String::new(),
                                     reset_label: String::new(),
                                     secs_until_reset: None,
-                                    auto_resuming: false, // livelock fuse → forced Pause
+                                    auto_resuming: false,
                                 });
                                 self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
                                 return;
@@ -1040,7 +1084,7 @@ impl RunningAgent {
                                 reset_at_display: String::new(),
                                 reset_label: String::new(),
                                 secs_until_reset: Some(secs),
-                                auto_resuming: true, // WaitAndRetry: kernel will sleep then retry
+                                auto_resuming: true,
                             });
                             tokio::select! {
                                 biased;
@@ -1063,7 +1107,7 @@ impl RunningAgent {
                                 reset_at_display,
                                 reset_label,
                                 secs_until_reset,
-                                auto_resuming: false, // Pause: kernel stops, user must act
+                                auto_resuming: false,
                             });
                             self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
                             return;
@@ -1271,7 +1315,7 @@ impl RunningAgent {
                                         reset_at_display: String::new(),
                                         reset_label: String::new(),
                                         secs_until_reset: None,
-                                        auto_resuming: false, // livelock fuse → forced Pause
+                                        auto_resuming: false,
                                     });
                                     self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
                                     return;
@@ -1280,7 +1324,7 @@ impl RunningAgent {
                                     reset_at_display: String::new(),
                                     reset_label: String::new(),
                                     secs_until_reset: Some(secs),
-                                    auto_resuming: true, // WaitAndRetry mid-stream: kernel will retry
+                                    auto_resuming: true,
                                 });
                                 tokio::select! {
                                     biased;
@@ -1329,7 +1373,7 @@ impl RunningAgent {
                                     reset_at_display,
                                     reset_label,
                                     secs_until_reset,
-                                    auto_resuming: false, // Pause mid-stream: kernel stops, user must act
+                                    auto_resuming: false,
                                 });
                                 self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
                                 return;
@@ -1838,6 +1882,8 @@ pub struct AgentBuilder {
     session_id: Option<Arc<str>>,
     /// Injectable monotonic clock (see [`crate::clock`]). Default [`SystemClock`].
     clock: Arc<dyn Clock>,
+    /// See `Agent::keep_interrupted_context`. Default `false`.
+    keep_interrupted_context: bool,
 }
 
 impl Default for AgentBuilder {
@@ -1882,6 +1928,8 @@ impl Default for AgentBuilder {
             // NEUTRAL default: the real monotonic clock. An eval/replay swaps in a
             // FixedClock so the elapsed_ms sidecar (and thus snapshots) is reproducible.
             clock: Arc::new(SystemClock::new()),
+            // NEUTRAL default: preserve OFF → CANCEL = UNDO (current behavior).
+            keep_interrupted_context: false,
         }
     }
 }
@@ -2097,6 +2145,11 @@ impl AgentBuilder {
         self.clock = clock;
         self
     }
+    /// Opt into preserving a cancelled turn's partial work in history (default off).
+    pub fn keep_interrupted_context(mut self, yes: bool) -> Self {
+        self.keep_interrupted_context = yes;
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -2121,6 +2174,7 @@ impl AgentBuilder {
             cancel_token: self.cancel_token,
             session_id: self.session_id,
             clock: self.clock,
+            keep_interrupted_context: self.keep_interrupted_context,
         }
     }
 }

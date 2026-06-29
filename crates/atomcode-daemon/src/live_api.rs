@@ -760,6 +760,7 @@ impl KernelTurnExecutor {
             // Keep the fail-closed approval timeout for the daemon (current behavior); the
             // interactive PARK behavior is wired for the cli TUI path for now.
             interactive: false,
+            keep_interrupted_context: config.keep_interrupted_context,
         })
     }
 }
@@ -1133,6 +1134,7 @@ pub(crate) fn chat_bridge_config(
         dangerously_skip_permissions: false,
         // Keep the fail-closed approval timeout for the daemon (current behavior).
         interactive: false,
+        keep_interrupted_context: config.keep_interrupted_context,
     }
 }
 

@@ -529,7 +529,9 @@ pub fn assemble(
         )))
         .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
-        .max_continuations(cfg.max_continuations);
+        .max_continuations(cfg.max_continuations)
+        // Ctrl-C semantics: false = UNDO (default), true = PRESERVE the interrupted turn.
+        .keep_interrupted_context(cfg.keep_interrupted_context);
     // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
     // answered (interactive — a present human must not be auto-denied). The kernel defaults
     // to unbounded when `.request_timeout` is never set, so None = park.
