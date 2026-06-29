@@ -29,32 +29,58 @@
 //    for in-process integration tests without spawning a binary.
 //    Exposed publicly in the crate root (re-exported from jsonrpc).
 
+pub mod dispatch;
 pub mod engine;
 pub mod translate;
 
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, InitializeRequest, InitializeResponse, PromptCapabilities,
+    AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+    PromptCapabilities,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Stdio};
+use atomcode_kernel::provider::LlmProvider;
+
+use crate::dispatch::{handle_new_session, Sessions};
 
 /// Options for the ACP stdio server.
 ///
-/// Fields grow in later tasks as session dispatch, provider selection, and
-/// model configuration are wired in.
-#[derive(Debug, Clone, Default)]
+/// `engine` supplies provider config; `provider` is the pre-built (signed)
+/// provider for AtomGit gateway sessions.  The CLI (Task 10) sets both from the
+/// active user config; integration tests (Task 11) inject a stub provider and
+/// can leave `engine` as `None` if `provider` is `Some`.
 pub struct AcpServeOptions {
-    /// Override the provider name (e.g. "openai", "anthropic").  `None` → use
-    /// the globally configured default.
-    pub provider: Option<String>,
-    /// Override the model name.  `None` → use the provider default.
-    pub model: Option<String>,
+    /// Provider + model config for session spawning.  `None` → handler returns
+    /// an error telling the user to run via `atomcode acp`.
+    pub engine: Option<crate::engine::EngineConfig>,
+    /// Pre-built (authenticated) provider, e.g. the AtomGit gateway signer.
+    /// When `Some`, forwarded to each `spawn_session` call verbatim.
+    /// When `None`, `engine::build_provider` builds a fallback per session.
+    pub provider: Option<Arc<dyn LlmProvider>>,
+}
+
+impl Default for AcpServeOptions {
+    fn default() -> Self {
+        Self {
+            engine: None,
+            provider: None,
+        }
+    }
 }
 
 /// Run the ACP agent server on stdin/stdout until the connection closes.
 ///
 /// **stdout is reserved exclusively for the ACP JSON-RPC stream.**
 /// All diagnostics must go to stderr.
-pub async fn serve_stdio(_opts: AcpServeOptions) -> anyhow::Result<()> {
+pub async fn serve_stdio(opts: AcpServeOptions) -> anyhow::Result<()> {
+    // Shared state for all session handlers (Tasks 6-9).
+    let sessions: Sessions = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let counter = Arc::new(AtomicU64::new(0));
+    let engine = Arc::new(opts.engine);
+    let provider = opts.provider;
+
     Agent
         .builder()
         .name("atomcode")
@@ -67,6 +93,31 @@ pub async fn serve_stdio(_opts: AcpServeOptions) -> anyhow::Result<()> {
                             .prompt_capabilities(PromptCapabilities::new().image(true)),
                     ),
                 )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = Arc::clone(&sessions);
+                let counter = Arc::clone(&counter);
+                let engine = Arc::clone(&engine);
+                let provider = provider.clone();
+                async move |req: NewSessionRequest, responder, _cx: ConnectionTo<Client>| {
+                    let engine_ref = engine.as_ref().as_ref().ok_or_else(|| {
+                        agent_client_protocol::util::internal_error(
+                            "acp: no engine configured; run via `atomcode acp`",
+                        )
+                    })?;
+                    let resp = handle_new_session(
+                        engine_ref,
+                        provider.clone(),
+                        &sessions,
+                        &counter,
+                        req,
+                    )
+                    .await?;
+                    responder.respond(resp)
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
