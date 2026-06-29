@@ -3074,6 +3074,46 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn web_search_domains_from_ddg_output() {
+        // DuckDuckGo backend: explicit URL lines under each numbered result.
+        let out = "Search results for \"北京建筑大学 录取分数线\":\n\n\
+            1. 北京建筑大学2024录取分数\n   https://www.eol.cn/beijing/123\n   snippet\n\n\
+            2. 院校库\n   https://gaokao.com/school/456?ref=x\n   snippet\n\n\
+            3. 阳光高考\n   https://gaokao.com/school/789\n   snippet\n";
+        // www. stripped, gaokao.com deduped, first-seen order preserved.
+        assert_eq!(web_search_source_domains(out), vec!["eol.cn", "gaokao.com"]);
+    }
+
+    #[test]
+    fn web_search_domains_from_inline_text() {
+        // Exa-style blob: URLs embedded mid-sentence with trailing punctuation.
+        let out = "See (https://bjeea.cn/page) and http://dxsbb.com/a, also https://bjeea.cn/other.";
+        assert_eq!(web_search_source_domains(out), vec!["bjeea.cn", "dxsbb.com"]);
+    }
+
+    #[test]
+    fn web_search_domains_empty_when_no_links() {
+        // A link-less Exa text blob or an error message yields no domains.
+        assert!(web_search_source_domains("Exa returned a prose summary with no links.").is_empty());
+        assert!(web_search_source_domains("").is_empty());
+    }
+
+    #[test]
+    fn web_search_suffix_collapses_extra_sources() {
+        let out = "a https://eol.cn/1 b https://gaokao.com/2 c https://bjeea.cn/3 d https://dxsbb.com/4";
+        // Two shown, the rest collapse into +N.
+        assert_eq!(
+            web_search_result_suffix(out).as_deref(),
+            Some("eol.cn, gaokao.com +2")
+        );
+    }
+
+    #[test]
+    fn web_search_suffix_none_without_links() {
+        assert_eq!(web_search_result_suffix("no links here"), None);
+    }
+
+    #[test]
     fn plan_mode_block_reason_detects_gate_blocks() {
         // A PlanModeGate block → calm hint (reason without the `blocked: ` prefix).
         assert_eq!(
@@ -7846,12 +7886,21 @@ fn handle_agent_event(
                 // between batched and single tool-call paths.
                 let child_glyph = "\u{2514}";
                 let arrow = "\u{2192}";
-                let suffix = if success {
+                // web_search shows the result SOURCE domains (e.g. `→ eol.cn,
+                // gaokao.com +3`) so the user can see which sites the data came
+                // from; every other tool (and a link-less search result) falls
+                // back to the generic line count.
+                let web_sources = (name == "web_search" && success)
+                    .then(|| web_search_result_suffix(&output))
+                    .flatten();
+                let suffix = if !success {
+                    format!(" {} \u{2717}", arrow)
+                } else if let Some(srcs) = web_sources {
+                    format!(" {} {}", arrow, srcs)
+                } else {
                     let n = output.lines().count().max(1);
                     let unit = if n == 1 { "line" } else { "lines" };
                     format!(" {} {} {}", arrow, n, unit)
-                } else {
-                    format!(" {} \u{2717}", arrow)
                 };
                 // Reuse the original Tool(arg) prefix the
                 // ToolBatchStarted handler painted. pending_tools
@@ -7923,7 +7972,17 @@ fn handle_agent_event(
                 if let Some(reason) = plan_mode_block_reason(&output, success) {
                     renderer.render(UiLine::CommandOutput(format!("  ○ {reason}\n")));
                 } else {
-                    let summary = summarise(&output);
+                    // A single web_search call gets the same source-domain
+                    // summary as the parallel child rows (`sources: eol.cn,
+                    // gaokao.com +3`); fall back to the generic snippet when no
+                    // links are present or on failure.
+                    let summary = if name == "web_search" && success {
+                        web_search_result_suffix(&output)
+                            .map(|s| format!("sources: {s}"))
+                            .unwrap_or_else(|| summarise(&output))
+                    } else {
+                        summarise(&output)
+                    };
                     renderer.render(UiLine::ToolResult { success, summary });
                 }
             }
@@ -10026,6 +10085,69 @@ pub(crate) fn fmt_elapsed(ms: u64) -> String {
 /// 512-col cap that remains is a pure safety bound: it only trips for a
 /// pathological multi-KB single line (e.g. a minified file) so it can't
 /// wrap into dozens of rows. Real first lines are far shorter.
+/// Extract the unique result source domains from a `web_search` tool result.
+///
+/// Scans the output text for `http(s)://` URLs, keeps each host, strips a
+/// leading `www.`, and dedupes preserving first-seen order. Works for the
+/// DuckDuckGo backend (explicit `url` lines) and the Exa backend (URLs are
+/// embedded in the LLM-ready text blob). Returns `[]` when the output carries
+/// no URLs (an Exa blob without links, or an error message) so the caller can
+/// fall back to the generic line count.
+pub(crate) fn web_search_source_domains(output: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut rest = output;
+    while let Some(pos) = rest.find("http") {
+        let after = &rest[pos..];
+        let scheme_len = if after.starts_with("https://") {
+            8
+        } else if after.starts_with("http://") {
+            7
+        } else {
+            // "http" not part of a URL scheme — step past it (ASCII, so the
+            // byte offset is a valid char boundary) and keep scanning.
+            rest = &rest[pos + 4..];
+            continue;
+        };
+        let host_part = &after[scheme_len..];
+        // Host ends at the first path / query / port / delimiter byte. All
+        // candidates are ASCII, so the split stays on a char boundary even if
+        // the host itself contains non-ASCII (IDN) bytes.
+        let end = host_part
+            .find(|c: char| {
+                matches!(c, '/' | '?' | '#' | ':' | ')' | ']' | '"' | '\'' | '>' | '<' | ',')
+                    || c.is_whitespace()
+            })
+            .unwrap_or(host_part.len());
+        let host = host_part[..end].trim_end_matches('.');
+        let host = host.strip_prefix("www.").unwrap_or(host);
+        if host.contains('.') && seen.insert(host.to_string()) {
+            out.push(host.to_string());
+        }
+        rest = &host_part[end..];
+    }
+    out
+}
+
+/// Build the ` → src1, src2 +N` summary suffix for a completed `web_search`
+/// call. Shows up to two source domains; any remainder collapses to `+N`.
+/// Returns `None` when no domains could be extracted, so the caller keeps the
+/// generic line-count suffix.
+pub(crate) fn web_search_result_suffix(output: &str) -> Option<String> {
+    const SHOWN: usize = 2;
+    let domains = web_search_source_domains(output);
+    if domains.is_empty() {
+        return None;
+    }
+    let head = domains.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    let extra = domains.len().saturating_sub(SHOWN);
+    Some(if extra > 0 {
+        format!("{head} +{extra}")
+    } else {
+        head
+    })
+}
+
 pub(crate) fn summarise(output: &str) -> String {
     let first = output.lines().next().unwrap_or("(no output)");
     let n = output.lines().count();
