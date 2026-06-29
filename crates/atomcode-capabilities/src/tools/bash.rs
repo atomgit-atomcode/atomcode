@@ -84,7 +84,10 @@ impl Tool for BashTool {
         #[cfg(not(unix))]
         let effective_command = a.command.clone();
 
-        let mut cmd = build_command(&effective_command);
+        let mut cmd = match build_command(&effective_command) {
+            Ok(c) => c,
+            Err(reason) => return err(reason),
+        };
         // No console-window flash per command on Windows: in headless/daemon mode (e.g.
         // the WeChat clawbot bridge) there's no console to inherit, so each cmd.exe would
         // otherwise allocate a NEW console window on the desktop. No-op off Windows.
@@ -305,26 +308,151 @@ fn sudo_opts_have_askpass_or_noninteractive(rest: &str) -> bool {
 }
 
 #[cfg(unix)]
-fn build_command(command: &str) -> tokio::process::Command {
+fn build_command(command: &str) -> Result<tokio::process::Command, String> {
     // Prefer bash for the bash-isms models emit; the OS PATH resolves it. If bash is
     // absent the spawn fails and the model sees a clear error (it can retry with sh).
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c").arg(command);
-    cmd
+    Ok(cmd)
 }
 
+// ─── Windows shell compatibility (#882, #883) ────────────────────────────────────
+//
+// Models (GLM-5.2, Claude, etc.) emit bash-semantic scripts: `$(...)`, `$VAR`, `&&`,
+// inline `python -c "..."`, heredocs, `<<<` here-strings, `< <(...)` process substitution.
+// The old Windows branch硬走 `cmd.exe /C`, which is NOT a POSIX shell — it silently
+// corrupts these constructs: `$` is literal (no expansion), inline Python gets its
+// quotes stripped → `SyntaxError: unterminated string literal`, multi-line `git commit
+// -m "..."` loses everything after the first newline. The model retries blindly, wasting
+// turns + API quota.
+//
+// Industrial fix: detect bash on Windows (Git Bash / WSL / MSYS2 are common), route
+// through `bash -c` to unify with the Unix path. Only when bash is genuinely absent do
+// we fall back to cmd.exe — and then we GUARD against unsupported bash constructs so the
+// model gets a clear "rewrite for cmd.exe" error instead of silent corruption.
+
+/// `C:\Windows\System32\bash.exe` (and SysWOW64 / Sysnative) is the WSL launcher, NOT a
+/// usable POSIX shell here: it runs the command INSIDE the Linux distro — different
+/// filesystem (`/mnt/c` vs `C:\`), Linux `python`/`node` (not the user's Windows ones),
+/// and a Windows `working_dir` it cannot `cd` into. Excluded from bash detection. Pure
+/// path check so it is unit-testable off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_wsl_launcher(path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy().to_ascii_lowercase();
+    s.contains(r"\windows\system32\")
+        || s.contains(r"\windows\syswow64\")
+        || s.contains(r"\windows\sysnative\")
+}
+
+/// Detect a Git Bash / MSYS2 bash on Windows. Checks PATH (`where bash`) then common
+/// install locations. Deliberately EXCLUDES the WSL launcher (see `is_wsl_launcher`) —
+/// only shells that inherit the Windows PATH and honor a Windows cwd are usable here.
+/// Returns the resolved path so the caller can `Command::new(path)`; `None` if no usable
+/// bash is available (cmd.exe fallback).
+///
+/// Cheap to call (one `where` + a few `stat`s); cached per-process via `std::sync::OnceLock`.
 #[cfg(windows)]
-fn build_command(command: &str) -> tokio::process::Command {
-    // Pass the command to cmd.exe VERBATIM via `raw_arg`. The normal `.arg()`
-    // applies std's `CommandLineToArgvW` quoting, which cmd.exe does NOT follow —
-    // embedded quotes (`node -e "..."`), `%VAR%`, `^` etc. would be mangled
-    // (the reported "cmd.exe 把双引号吞掉了"). Mirrors atomcode-core's
-    // process_utils::shell_command / tool/bash.rs.
+fn detect_windows_bash() -> Option<std::path::PathBuf> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        // 1. PATH lookup via `where bash` (cmd.exe builtin, always available). SKIP the
+        // WSL launcher — it is usually first on PATH but runs in the Linux distro.
+        let where_out = std::process::Command::new("where").arg("bash").output();
+        if let Ok(o) = where_out {
+            if o.status.success() {
+                let txt = String::from_utf8_lossy(&o.stdout);
+                for line in txt.lines() {
+                    let p = std::path::PathBuf::from(line.trim());
+                    if p.is_file() && !is_wsl_launcher(&p) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        // 2. Common install locations — Git for Windows / MSYS2 ONLY. Deliberately NOT
+        // `System32\bash.exe` (WSL): see `is_wsl_launcher`.
+        let candidates = [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            r"C:\msys64\usr\bin\bash.exe",
+            r"C:\msys32\usr\bin\bash.exe",
+        ];
+        for c in candidates {
+            let p = std::path::PathBuf::from(c);
+            if p.is_file() && !is_wsl_launcher(&p) {
+                return Some(p);
+            }
+        }
+        None
+    }).clone()
+}
+
+/// Detect bash constructs that cmd.exe cannot interpret. When bash is absent and we must
+/// fall back to cmd.exe, returning a clear error here (instead of letting cmd.exe silently
+/// corrupt the script) lets the model rewrite instead of retrying blindly. Returns
+/// `Some(reason)` when the command should NOT be routed through cmd.exe.
+///
+/// DELIBERATELY CONSERVATIVE — only flags constructs that cmd.exe provably mishandles AND
+/// that a substring match rarely false-positives on. We do NOT flag bare `$VAR` (matches
+/// ANY `$` — prices, regex, literals), backticks (markdown / commit messages), or bare
+/// `<<` heredocs (bit-shift `1<<4`, C++ `cout <<`): the false-positive rate would block
+/// valid cmd.exe commands. Those un-flagged constructs just fall through to cmd.exe
+/// (mangled, as before this guard) rather than being hard-errored. `&&` / `||` chains and
+/// `2>&1` work in cmd.exe and are left alone.
+///
+/// Pure / platform-independent so it is unit-testable off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn unsupported_bash_construct(command: &str) -> Option<&'static str> {
+    // Command substitution `$(...)` — cmd.exe has no `$()` syntax. (Small residual FP risk
+    // on e.g. awk `$(NF)` passed to a child; accepted for the high value of this one.)
+    if command.contains("$(") {
+        return Some("command substitution `$(...)` — cmd.exe has no `$()` syntax");
+    }
+    // Here-string `<<<` — cmd.exe has no here-string.
+    if command.contains("<<<") {
+        return Some("here-string `<<<` — cmd.exe does not support here-strings");
+    }
+    // Process substitution `< <(...)` / `>(...)` — cmd.exe has no /dev/fd.
+    if command.contains("< <(") || command.contains(">(") {
+        return Some("process substitution `< <(...)` / `>(...)` — cmd.exe has no /dev/fd");
+    }
+    None
+}
+
+/// Windows shell selection. Returns `Ok(Command)` ready to spawn, or `Err(reason)` when
+/// the command contains bash constructs that neither bash (absent) nor cmd.exe can handle
+/// safely — the caller surfaces that as a clear tool error so the model can rewrite.
+#[cfg(windows)]
+fn build_command(command: &str) -> Result<tokio::process::Command, String> {
+    if let Some(bash) = detect_windows_bash() {
+        // Bash available (Git Bash / WSL / MSYS2) — route through it, unifying with
+        // the Unix path. `bash -c "<script>"` honors bash quoting exactly as the model
+        // expects; no silent corruption of `$()`, inline Python, or multi-line strings.
+        let mut cmd = tokio::process::Command::new(bash);
+        cmd.arg("-c").arg(command);
+        return Ok(cmd);
+    }
+    // No bash — cmd.exe fallback. Guard against constructs cmd.exe will silently corrupt
+    // so the model gets a rewrite directive instead of a wasted turn (#883).
+    if let Some(reason) = unsupported_bash_construct(command) {
+        return Err(format!(
+            "bash is not installed and cmd.exe cannot run this command: {}. \
+             Rewrite for cmd.exe (use `%VAR%` for variables, avoid `$(...)`/backticks/\
+             heredocs, use `-F file` for multi-line git commit messages), or install \
+             Git Bash / WSL.",
+            reason
+        ));
+    }
+    // cmd.exe fallback — pass the command VERBATIM via `raw_arg` (preserves the pre-merge
+    // HEAD fix): std's `.arg()` applies `CommandLineToArgvW` quoting that cmd.exe does NOT
+    // follow, mangling embedded quotes (`node -e "..."`), `%VAR%`, `^`. Mirrors
+    // atomcode-core's process_utils::shell_command / tool/bash.rs.
     use std::os::windows::process::CommandExt;
     let mut cmd = tokio::process::Command::new("cmd.exe");
     cmd.arg("/C");
     cmd.as_std_mut().raw_arg(command);
-    cmd
+    Ok(cmd)
 }
 
 /// Decode subprocess output to text. UTF-8 is the fast path; if that fails we fall
