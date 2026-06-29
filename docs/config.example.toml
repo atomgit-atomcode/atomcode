@@ -60,7 +60,7 @@ mode = "no_proxy"
 # Available events:
 #   pre_tool_use    — before each tool call (can block via stdout {"action":"block","reason":"..."})
 #   post_tool_use   — after each tool call
-#   user_prompt_submit — when the user submits a prompt
+#   user_prompt_submit — when the user submits a prompt (can block via stdout {"decision":"block","reason":"..."} or inject context via {"hookSpecificOutput":{"additionalContext":"..."}})
 #   session_start   — when a new session begins
 #   session_end     — when a session ends
 #

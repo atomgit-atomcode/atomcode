@@ -106,10 +106,17 @@ AtomCode 支持 **三种** hook 实现，通过两个配置文件管理：
 }
 ```
 
-`post_tool` 会额外包含 `result_context`：
+`post_tool` 的 stdin 是嵌套结构，额外包含 `result_context`（与 `hook_context` 同级）：
 
 ```json
 {
+  "hook_context": {
+    "tool_name": "edit_file",
+    "tool_args": "{...}",
+    "working_dir": "/path/to/project",
+    "session_id": "session-123",
+    "turn_number": 5
+  },
   "result_context": {
     "tool_name": "edit_file",
     "tool_args": "{...}",
