@@ -59,7 +59,7 @@ mode = "no_proxy"
 #   JSON: ~/.atomcode/hooks.json (CC-compatible, lightweight)
 #
 # Available events:
-#   pre_tool_use    — before each tool call (can block via stdout {"action":"block"})
+#   pre_tool_use    — before each tool call (can block via stdout {"action":"block","reason":"..."})
 #   post_tool_use   — after each tool call
 #   user_prompt_submit — when the user submits a prompt
 #   session_start   — when a new session begins
