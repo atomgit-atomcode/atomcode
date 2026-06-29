@@ -121,6 +121,11 @@ fn build_command(command: &str) -> tokio::process::Command {
 fn build_command(command: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("cmd.exe");
     cmd.arg("/C").arg(command);
+    // 设置 PYTHONIOENCODING=utf-8 防止 Python 在 GBK 区域设置下崩溃。
+    // 当 Python 子进程输出包含二进制数据时，默认的 GBK 解码器会抛出
+    // UnicodeDecodeError。设置此环境变量强制 Python 使用 UTF-8 编码，
+    // 与 AtomCode 的 decode_output 函数的 UTF-8 优先策略一致。
+    cmd.env("PYTHONIOENCODING", "utf-8");
     cmd
 }
 
