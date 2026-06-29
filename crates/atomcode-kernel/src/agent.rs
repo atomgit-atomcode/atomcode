@@ -1545,9 +1545,26 @@ impl RunningAgent {
                 && !reasoning.trim().is_empty()
                 && pending_calls.is_empty()
                 && !truncated
+                // Only the PLAIN-text reasoning path (OpenAI-compatible / Qwen). A turn that
+                // carries SIGNED reasoning blocks (Anthropic-style) is left untouched —
+                // promoting the flat reasoning to content while signed blocks still hold the
+                // same text would desync the message (content == thinking) and make a
+                // thinking-block adapter echo BOTH a thinking and a text block (double-send).
+                && reasoning_blocks.is_empty()
             {
-                assistant_text = std::mem::take(&mut reasoning);
-                self.rt.emit(AgentEvent::TextDelta(assistant_text.clone()));
+                // Route the recovered answer through the SAME content-scrub seam a normal
+                // text delta passes (`on_text_delta`), so a hook that redacts/suppresses
+                // content treats the promoted answer identically — the live emit must not
+                // bypass the seam (its invariant: live stream AND storage are consistently
+                // transformed). Clone first so a hook that CLEARS the chunk leaves the
+                // reasoning intact to be STORED as reasoning (matching the no-promotion path).
+                let mut promoted = reasoning.clone();
+                self.hooks.on_text_delta(&mut promoted).await;
+                if !promoted.is_empty() {
+                    assistant_text = promoted;
+                    reasoning.clear(); // now the body; do not also store it as reasoning
+                    self.rt.emit(AgentEvent::TextDelta(assistant_text.clone()));
+                }
             }
             let mut assistant_msg = Message::assistant(assistant_text.clone(), pending_calls.clone());
             assistant_msg.meta = Some(meta);
