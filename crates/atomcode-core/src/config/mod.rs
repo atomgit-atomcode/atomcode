@@ -164,11 +164,12 @@ pub struct Config {
     /// HTML-scraping backend.
     #[serde(default)]
     pub web_search: WebSearchConfig,
-    /// On Ctrl-C / cancel: `false` (default) ⇒ CANCEL = UNDO (the interrupted turn is
-    /// rolled back). `true` ⇒ PRESERVE the partial turn (backfill dangling tool_calls,
-    /// inject an interruption marker) so the next message continues with that context.
-    /// Missing from older configs → `false` (legacy behaviour).
-    #[serde(default)]
+    /// On Ctrl-C / cancel: `true` (default) ⇒ PRESERVE the partial turn (backfill
+    /// dangling tool_calls, inject an interruption marker) so the next message continues
+    /// with that context. `false` ⇒ CANCEL = UNDO (the interrupted turn is rolled back).
+    /// Missing from config → `true` (preserve). Set `keep_interrupted_context = false`
+    /// to restore the legacy undo-on-cancel behaviour.
+    #[serde(default = "default_true")]
     pub keep_interrupted_context: bool,
 }
 
@@ -322,7 +323,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             plugin: PluginConfig::default(),
             web_search: WebSearchConfig::default(),
-            keep_interrupted_context: false,
+            keep_interrupted_context: true,
         }
     }
 }
