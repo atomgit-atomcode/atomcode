@@ -52,11 +52,10 @@ mode = "no_proxy"
 # no_proxy = "localhost,127.0.0.1"
 
 # Lifecycle hooks — run custom scripts on key events.
-# See docs/hooks.md for full reference.
-#
-# Hooks support two configuration formats:
+# Hooks are NOT configured in this file. Use separate config files instead:
 #   TOML: ~/.atomcode/hooks/hooks.toml (recommended, supports ScriptHook + Webhook)
 #   JSON: ~/.atomcode/hooks.json (CC-compatible, lightweight)
+# See docs/hooks.md for full reference.
 #
 # Available events:
 #   pre_tool_use    — before each tool call (can block via stdout {"action":"block","reason":"..."})
