@@ -226,9 +226,9 @@
   /* ---------- plugins ---------- */
   .plugins{padding:60px 30px 100px;background:linear-gradient(180deg,rgba(255,255,255,.015),transparent)}
   .plugin-wrap{width:min(1180px,100%);margin:0 auto}
-  .plugin-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
-  .plugin-grid>.plugin-install{height:100%}
-  .plugin-features{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .plugin-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:stretch}
+  .plugin-install-stack{display:grid;grid-template-rows:auto auto;gap:14px;height:100%}
+  .plugin-features{display:grid;grid-template-columns:1fr 1fr;gap:12px;grid-auto-rows:1fr}
   .plugin-feat{padding:22px 18px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,0));transition:border-color .25s,transform .3s cubic-bezier(.22,1,.36,1)}
   .plugin-feat:hover{border-color:rgba(232,160,80,.45);transform:translateY(-1px)}
   .plugin-feat .icon{width:32px;height:32px;border-radius:6px;background:rgba(232,160,80,.15);color:var(--accent);display:flex;align-items:center;justify-content:center;margin-bottom:10px;font-size:15px;font-weight:700}
@@ -242,17 +242,26 @@
   .plugin-install .pi-item .pi-url{display:block;padding:10px 12px;font-size:12px;color:var(--accent);text-decoration:none;line-height:1.5;word-break:break-all}
   .plugin-install .pi-item .pi-url:hover{text-decoration:underline}
   .plugin-install .pi-item .pi-cmd{margin:0;padding:10px 12px;font-size:12px;color:#e8e8e8;white-space:pre-wrap;line-height:1.5}
-  .pi-steps{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;padding:8px 12px;font-size:11px;color:rgba(255,255,255,.65)}
-  .pi-steps+.pi-steps{padding-top:0}
-  .pi-step-num{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;background:rgba(232,160,80,.18);color:var(--accent);font-size:7px;font-weight:600;flex-shrink:0}
-  .pi-steps .pi-url{display:block;width:100%;margin-top:4px;padding:0 0 0 24px;font-size:12px;color:var(--accent);text-decoration:none;word-break:break-all}
-  .pi-steps .pi-url:hover{text-decoration:underline}
-  .pi-steps .pi-cmd{width:100%;margin:4px 0 0 24px;font-size:12px;color:#e8e8e8;white-space:pre-wrap;line-height:1.5;font-family:var(--mono)}
   .pi-item .cp-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 6px 4px 12px;background:rgba(255,255,255,.025);border-bottom:1px solid rgba(255,255,255,.05)}
   .pi-item .cp-bar .label{font-family:var(--mono);font-size:10.5px;letter-spacing:.5px;color:rgba(255,255,255,.5);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .pi-item .cp-btn{opacity:.85}
   .pi-item:hover .cp-btn{opacity:1}
-  .pi-steps .cp-btn{flex-shrink:0;margin-left:auto}
+  .jb-market-card{padding:18px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(255,255,255,.015)}
+  .jb-market-top{display:flex;align-items:center;gap:13px}
+  .jb-logo{position:relative;width:42px;height:42px;flex-shrink:0;border-radius:8px;overflow:hidden;background:#111}
+  .jb-logo::before{content:"";position:absolute;inset:0;background:linear-gradient(135deg,#087cff 0 32%,#8b5cf6 33% 58%,#ff2d55 59% 72%,#ff9f0a 73% 100%)}
+  .jb-logo::after{content:"JB";position:absolute;left:8px;bottom:7px;width:21px;height:21px;display:flex;align-items:center;justify-content:center;background:#111;color:#fff;font-family:Inter,sans-serif;font-size:8px;font-weight:800;letter-spacing:0}
+  .jb-title{min-width:0;flex:1}
+  .jb-kicker{display:block;margin-bottom:3px;font-family:var(--mono);font-size:10px;letter-spacing:1.2px;color:var(--accent)}
+  .jb-title h3{margin:0;font-family:Inter,sans-serif;font-size:20px;line-height:1.2;font-weight:700;color:#fff}
+  .jb-status{display:inline-flex;align-items:center;height:24px;padding:0 8px;border:1px solid rgba(255,255,255,.12);border-radius:999px;font-family:var(--mono);font-size:10px;letter-spacing:1px;color:rgba(255,255,255,.55);white-space:nowrap}
+  .jb-market-card p{margin:16px 0 0;font-size:12px;line-height:1.65;color:rgba(255,255,255,.58)}
+  .jb-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
+  .jb-chip{display:inline-flex;align-items:center;height:24px;padding:0 8px;border:1px solid rgba(255,255,255,.10);border-radius:999px;background:rgba(255,255,255,.02);font-family:var(--mono);font-size:10.5px;color:rgba(255,255,255,.62)}
+  .jb-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+  .jb-actions a{min-height:42px;display:inline-flex;align-items:center;justify-content:center;padding:0 14px;border:1px solid rgba(255,255,255,.14);border-radius:6px;font-size:12px;font-weight:700;transition:background .2s,color .2s,border-color .2s,transform .2s}
+  .jb-actions a:hover{transform:translateY(-1px)}
+  .jb-actions .jb-action-primary{background:rgba(232,160,80,.08);color:var(--accent);border-color:rgba(232,160,80,.38)}
   .plugin-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:32px}
   .plugin-stat{padding:24px 20px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,0));text-align:center;transition:border-color .25s,transform .3s}
   .plugin-stat:hover{border-color:rgba(232,160,80,.45);transform:translateY(-3px)}
@@ -428,11 +437,15 @@
   html.light .plugin-install .pi-item .pi-label{background:rgba(0,0,0,.025);border-bottom-color:rgba(0,0,0,.05);color:rgba(0,0,0,.5)}
   html.light .plugin-install .pi-item .pi-url{color:#c87618}
   html.light .plugin-install .pi-item .pi-cmd{color:#0d0d0d}
-  html.light .pi-step-num{background:rgba(200,118,24,.12);color:#c87618}
-  html.light .pi-steps{color:rgba(0,0,0,.55)}
-  html.light .pi-steps .pi-url{color:#c87618}
   html.light .pi-item .cp-bar{background:rgba(0,0,0,.025);border-bottom-color:rgba(0,0,0,.05)}
   html.light .pi-item .cp-bar .label{color:rgba(0,0,0,.5)}
+  html.light .jb-market-card{border-color:rgba(0,0,0,.10);background:#fff}
+  html.light .jb-title h3{color:#0d0d0d}
+  html.light .jb-status{border-color:rgba(0,0,0,.10);color:rgba(0,0,0,.55)}
+  html.light .jb-market-card p{color:rgba(0,0,0,.58)}
+  html.light .jb-chip{border-color:rgba(0,0,0,.10);background:#fff;color:rgba(0,0,0,.62)}
+  html.light .jb-actions a{border-color:rgba(0,0,0,.12)}
+  html.light .jb-actions .jb-action-primary{background:rgba(200,118,24,.06);color:#8f4f00;border-color:rgba(200,118,24,.32)}
   html.light .plugin-stat{border-color:rgba(0,0,0,.10);background:#fff}
   html.light .plugin-stat:hover{border-color:rgba(200,118,24,.45)}
   html.light .plugin-stat .v{color:#0d0d0d}
@@ -608,7 +621,7 @@
     html.light .mb-drawer a.cta{background:#c87618;color:#fff;border-color:#c87618}
     html.light .mb-drawer a.cta:hover,html.light .mb-drawer a.cta:active{background:#0d0d0d;color:#fff}
     .plugin-grid{grid-template-columns:1fr}
-    .plugin-features{grid-template-columns:1fr}
+    .plugin-features{grid-template-columns:1fr;grid-auto-rows:auto}
     .plugins{padding:40px 16px 60px}
     .plugin-stats{grid-template-columns:1fr}
   }
@@ -840,7 +853,7 @@
 <section class="plugins" id="editor-plugins">
   <div class="section-head">
     <h2><span class="mono" data-i18n="sec.plug.tag">// 02 · 插件</span><span data-i18n="sec.plug.title">终端之外，在 IDE 里也能用</span></h2>
-    <div class="hint" data-i18n="sec.plug.hint">VS Code 插件已上架 · 终端级 AI 能力无缝接入编辑器</div>
+    <div class="hint" data-i18n="sec.plug.hint">VS Code / JetBrains 插件可用 · 终端级 AI 能力无缝接入编辑器</div>
   </div>
 
   <div class="plugin-wrap">
@@ -852,7 +865,7 @@
         <article class="plugin-feat">
           <div class="icon">▣</div>
           <h3 data-i18n="plug.sidebar.t">侧边栏聊天</h3>
-          <p data-i18n="plug.sidebar.d">在 Activity Bar 中打开 AtomCode 面板，不离开编辑器即可与 AI 对话</p>
+          <p data-i18n="plug.sidebar.d">在编辑器侧边栏打开 AtomCode 面板，不离开上下文即可与 AI 对话</p>
         </article>
 
         <article class="plugin-feat">
@@ -864,7 +877,7 @@
         <article class="plugin-feat">
           <div class="icon">⇅</div>
           <h3 data-i18n="plug.diff.t">Diff 代码预览</h3>
-          <p data-i18n="plug.diff.d">所有代码变更以 VS Code 原生 diff 视图展示，确认后才写入文件</p>
+          <p data-i18n="plug.diff.d">所有代码变更以 IDE 原生 diff 视图展示，确认后才写入文件</p>
         </article>
 
         <article class="plugin-feat">
@@ -888,7 +901,8 @@
       </div>
 
       <!-- right: install -->
-      <div class="plugin-install">
+      <div class="plugin-install-stack">
+        <div class="plugin-install">
           <div class="pi-head">●●● <span data-i18n="plug.install.head">安装 AtomCode for VS Code</span></div>
           <div class="pi-body">
             <div class="pi-item">
@@ -902,29 +916,44 @@
               </div>
               <pre class="pi-cmd">code --install-extension atomcode-tools.atomcode-tools</pre>
             </div>
-            <div class="pi-item">
-              <div class="cp-bar">
-                <span class="label" data-i18n="plug.install.vsix"># 或下载 .vsix 手动安装</span>
+          </div>
+        </div>
+
+        <div class="plugin-install">
+          <div class="pi-head">●●● <span data-i18n="plug.install.jb.head">安装 AtomCode for JetBrains</span></div>
+          <div class="pi-body">
+            <div class="jb-market-card">
+              <div class="jb-market-top">
+                <div class="jb-logo" aria-hidden="true"></div>
+                <div class="jb-title">
+                  <span class="jb-kicker">JetBrains Marketplace</span>
+                  <h3>AtomCode</h3>
+                </div>
+                <span class="jb-status" data-i18n="plug.install.jb.free">FREE</span>
               </div>
-              <div class="pi-steps">
-                <span class="pi-step-num">1</span>
-                <span data-i18n="plug.install.download">下载 .vsix 文件</span>
-                <a class="pi-url" href="https://marketplace.visualstudio.com/_apis/public/gallery/publishers/atomcode-tools/vsextensions/atomcode-tools/0.0.8/vspackage" target="_blank" rel="noopener" data-i18n="plug.install.dl-link">点击下载 atomcode-tools-0.0.8.vsix</a>
+              <p data-i18n="plug.install.jb.desc">本地 AI coding agent 接入 IntelliJ 系 IDE：侧边栏会话、编辑器上下文菜单、Diff 预览与多模型配置保持一致。</p>
+              <div class="jb-meta" role="group" aria-label="支持的 JetBrains IDE" data-i18n-aria-label="plug.install.jb.supported">
+                <span class="jb-chip">IntelliJ IDEA</span>
+                <span class="jb-chip">WebStorm</span>
+                <span class="jb-chip">PyCharm</span>
+                <span class="jb-chip">GoLand</span>
               </div>
-              <div class="pi-steps">
-                <span class="pi-step-num">2</span>
-                <span data-i18n="plug.install.run">运行安装命令</span>
-                <button class="cp-btn pi-cp" type="button" data-i18n="install.copy.short">📋 复制</button>
-                <pre class="pi-cmd">code --install-extension atomcode-tools-0.0.8.vsix</pre>
+              <div class="jb-actions">
+                <a class="jb-action-primary" href="https://plugins.jetbrains.com/plugin/32455-atomcode" target="_blank" rel="noopener noreferrer" data-i18n="plug.install.jb.open">打开 Marketplace</a>
               </div>
             </div>
           </div>
         </div>
+      </div>
 
     </div>
 
     <!-- stats -->
     <div class="plugin-stats">
+      <div class="plugin-stat">
+        <div class="v">2</div>
+        <div class="l" data-i18n="plug.stat.ide">IDE 平台</div>
+      </div>
       <div class="plugin-stat">
         <div class="v">10</div>
         <div class="l" data-i18n="plug.stat.cmds">内置命令</div>
@@ -932,10 +961,6 @@
       <div class="plugin-stat">
         <div class="v">8</div>
         <div class="l" data-i18n="plug.stat.slash">斜杠命令</div>
-      </div>
-      <div class="plugin-stat">
-        <div class="v">1.85<span class="suf">+</span></div>
-        <div class="l" data-i18n="plug.stat.vscode">VS Code 版本</div>
       </div>
     </div>
 
@@ -1161,7 +1186,7 @@ const T={
   'sec.cap.hint':{zh:'为需要 Claude Code 强大能力但想用任意大模型的开发者打造',en:'For developers who want Claude Code-level capability with any LLM'},
   'sec.plug.tag':{zh:'// 02 · 插件',en:'// 02 · Plugins'},
   'sec.plug.title':{zh:'终端之外，在 IDE 里也能用',en:'Beyond the terminal, inside your IDE'},
-  'sec.plug.hint':{zh:'VS Code 插件已上架 · 终端级 AI 能力无缝接入编辑器',en:'VS Code extension available · terminal-grade AI inside your editor'},
+  'sec.plug.hint':{zh:'VS Code / JetBrains 插件可用 · 终端级 AI 能力无缝接入编辑器',en:'VS Code / JetBrains plugins available · terminal-grade AI inside your editor'},
   'sec.cmp.tag':{zh:'// 03 · 对比',en:'// 03 · Compare'},
   'sec.cmp.title':{zh:'AtomCode 与 Claude Code 对比',en:'AtomCode vs Claude Code'},
   'sec.cmp.hint':{zh:'相同模型基准测试 · 基于真实编程任务测量',en:'Same-model benchmarks · measured on real coding tasks'},
@@ -1188,11 +1213,11 @@ const T={
   'feat.eco.d':{zh:'Skills 写你自己的斜杠命令；/plugin install <git-repo> 一键拿别人的命令、hook、skill —— 与 Claude Code 生态兼容。',
                 en:'Write your own slash commands as Skills; /plugin install <git-repo> grabs packs of commands, hooks, skills — Claude Code ecosystem compatible.'},
   'plug.sidebar.t':{zh:'侧边栏聊天',en:'Sidebar Chat'},
-  'plug.sidebar.d':{zh:'在 Activity Bar 中打开 AtomCode 面板，不离开编辑器即可与 AI 对话',en:'Open AtomCode in the Activity Bar and chat with AI without leaving the editor'},
+  'plug.sidebar.d':{zh:'在编辑器侧边栏打开 AtomCode 面板，不离开上下文即可与 AI 对话',en:'Open AtomCode in the editor sidebar and chat with AI without leaving context'},
   'plug.context.t':{zh:'右键菜单',en:'Context Menu'},
   'plug.context.d':{zh:'选中代码 → 右键 Explain / Fix / Optimize / Add to Chat，全语言支持',en:'Select code → right-click Explain / Fix / Optimize / Add to Chat, all languages'},
   'plug.diff.t':{zh:'Diff 代码预览',en:'Diff Preview'},
-  'plug.diff.d':{zh:'所有代码变更以 VS Code 原生 diff 视图展示，确认后才写入文件',en:'All code changes shown as VS Code native diffs, written only after approval'},
+  'plug.diff.d':{zh:'所有代码变更以 IDE 原生 diff 视图展示，确认后才写入文件',en:'All code changes shown as native IDE diffs, written only after approval'},
   'plug.model.t':{zh:'多模型 + Thinking',en:'Multi-Model + Thinking'},
   'plug.model.d':{zh:'Claude / OpenAI / DeepSeek / GLM / Qwen / Ollama，支持 thinking 参数配置',en:'Claude / OpenAI / DeepSeek / GLM / Qwen / Ollama, with thinking parameter support'},
   'plug.session.t':{zh:'会话管理',en:'Session Management'},
@@ -1202,14 +1227,16 @@ const T={
   'plug.install.head':{zh:'安装 AtomCode for VS Code',en:'Install AtomCode for VS Code'},
   'plug.install.mkt':{zh:'# 从 Marketplace 安装（推荐）',en:'# Install from Marketplace (recommended)'},
   'plug.install.cmd':{zh:'# 或通过命令行安装',en:'# Or install via command line'},
-  'plug.install.vsix':{zh:'# 或下载 .vsix 手动安装',en:'# Or download .vsix to install manually'},
-  'plug.install.download':{zh:'下载 .vsix 文件',en:'Download .vsix file'},
-  'plug.install.dl-link':{zh:'点击下载 atomcode-tools-0.0.8.vsix',en:'Download atomcode-tools-0.0.8.vsix'},
-  'plug.install.run':{zh:'运行安装命令',en:'Run install command'},
+  'plug.install.jb.head':{zh:'安装 AtomCode for JetBrains',en:'Install AtomCode for JetBrains'},
+  'plug.install.jb.free':{zh:'免费',en:'FREE'},
+  'plug.install.jb.desc':{zh:'本地 AI coding agent 接入 IntelliJ 系 IDE：侧边栏会话、编辑器上下文菜单、Diff 预览与多模型配置保持一致。',
+                          en:'Bring a local AI coding agent into IntelliJ-based IDEs: sidebar chat, editor context actions, diff preview, and multi-model configuration.'},
+  'plug.install.jb.open':{zh:'打开 Marketplace',en:'Open Marketplace'},
+  'plug.install.jb.supported':{zh:'支持的 JetBrains IDE',en:'Supported JetBrains IDEs'},
 
+  'plug.stat.ide':{zh:'IDE 平台',en:'IDE Platforms'},
   'plug.stat.cmds':{zh:'内置命令',en:'Built-in Commands'},
   'plug.stat.slash':{zh:'斜杠命令',en:'Slash Commands'},
-  'plug.stat.vscode':{zh:'VS Code 版本',en:'VS Code Version'},
   'plugin.review':{zh:'代码审阅',en:'Code review'},
   'plugin.test':{zh:'跑测试',en:'Run tests'},
   'plugin.security':{zh:'安全审查',en:'Security audit'},
@@ -1294,6 +1321,7 @@ function applyI18n(){
   const lb=document.getElementById('langBtn'); if(lb) lb.setAttribute('aria-label',t('aria.lang'));
   document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n);});
   document.querySelectorAll('[data-i18n-html]').forEach(el=>{el.innerHTML=t(el.dataset.i18nHtml);});
+  document.querySelectorAll('[data-i18n-aria-label]').forEach(el=>{el.setAttribute('aria-label',t(el.dataset.i18nAriaLabel));});
 }
 
 /* ========== data ========== */
@@ -1721,7 +1749,7 @@ window.applyWizardNav=null;
     document.addEventListener('click',e=>{
       const btn=e.target.closest('.pi-cp');
       if(!btn)return;
-      const pre=btn.closest('.pi-item, .pi-steps')?.querySelector('pre');
+      const pre=btn.closest('.pi-item')?.querySelector('pre');
       if(!pre)return;
       const text=pre.textContent||'';
       copyText(text);
