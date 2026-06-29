@@ -239,7 +239,11 @@ Authorization = "Bearer AUDIT_TOKEN"
 
 支持的 `event` 值：`pre_tool_use`、`post_tool_use`、`session_start`、`session_end`、`user_prompt_submit`。
 
-Hook 通过环境变量接收上下文（`ATOMCODE_HOOK_EVENT`、`ATOMCODE_HOOK_CONTEXT`、`ATOMCODE_TOOL_NAME` 等），stdout 需输出 `{"action": "allow" | "block" | "modify"}` JSON。
+Hook 通过环境变量接收上下文（`ATOMCODE_HOOK_EVENT`、`ATOMCODE_HOOK_CONTEXT`、`ATOMCODE_TOOL_NAME` 等），stdout 协议按事件区分：
+
+- **`pre_tool_use`** — 输出 `{"action":"allow"}` / `{"action":"block","reason":"..."}` / `{"action":"modify","args":{...}}`（`args` 替换工具调用参数）
+- **`user_prompt_submit`** — 输出 `{"decision":"block","reason":"..."}` 阻止提交，或 `{"hookSpecificOutput":{"additionalContext":"..."}}` 注入额外上下文；纯文本 stdout 视为 additionalContext 注入
+- **`post_tool_use` / `session_start` / `session_end`** — fire-and-forget，stdout 不影响流程
 
 ---
 
