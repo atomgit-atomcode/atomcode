@@ -180,13 +180,16 @@ dependencies = [
 
 [[package]]
 name = "atomcode"
-version = "4.25.4"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
- "atomcode-bridge",
+ "atomcode-capabilities",
+ "atomcode-coding",
  "atomcode-core",
  "atomcode-daemon",
+ "atomcode-kernel",
+ "atomcode-shell",
  "atomcode-telemetry",
  "atomcode-tuix",
  "clap",
@@ -211,24 +214,6 @@ dependencies = [
  "windows-sys 0.61.2",
  "winreg",
  "winresource",
-]
-
-[[package]]
-name = "atomcode-bridge"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "atomcode-capabilities",
- "atomcode-coding",
- "atomcode-core",
- "atomcode-kernel",
- "atomcode-telemetry",
- "getrandom 0.2.17",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "url",
 ]
 
 [[package]]
@@ -321,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-core"
-version = "4.25.4"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -378,12 +363,15 @@ dependencies = [
 
 [[package]]
 name = "atomcode-daemon"
-version = "4.25.4"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "atomcode-bridge",
+ "atomcode-capabilities",
+ "atomcode-coding",
  "atomcode-core",
+ "atomcode-kernel",
+ "atomcode-shell",
  "atomcode-telemetry",
  "axum",
  "dirs 5.0.1",
@@ -431,8 +419,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-shell"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atomcode-capabilities",
+ "atomcode-coding",
+ "atomcode-core",
+ "atomcode-kernel",
+ "atomcode-telemetry",
+ "getrandom 0.2.17",
+ "url",
+]
+
+[[package]]
 name = "atomcode-telemetry"
-version = "4.25.4"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -453,12 +455,15 @@ dependencies = [
 
 [[package]]
 name = "atomcode-tuix"
-version = "4.25.4"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "atomcode-capabilities",
+ "atomcode-coding",
  "atomcode-core",
  "atomcode-daemon",
+ "atomcode-kernel",
  "atomcode-telemetry",
  "base64",
  "crossterm",
@@ -475,6 +480,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml 0.8.23",
  "unicode-segmentation",
  "unicode-width",
