@@ -280,11 +280,14 @@ atomcode hooks test my-hook
 
 ### 手动测试 hook 脚本
 
-TOML ScriptHook 通过 stdin 接收上下文 JSON：
+TOML ScriptHook 通过 stdin 接收上下文 JSON（字段对应 `HookCtx`：`tool_name` / `tool_args` / `working_dir` / `session_id` / `turn_number`，无 `event` 字段）：
 
 ```bash
-# 构造测试上下文
-echo '{"tool_name":"read_file","event":"post_tool_use"}' | bash path/to/hook.sh
+# pre_tool 测试上下文（扁平结构）
+echo '{"tool_name":"read_file","tool_args":"{}","working_dir":"/tmp","session_id":"s1","turn_number":1}' | bash path/to/hook.sh
+
+# post_tool 测试上下文（嵌套结构，含 result_context）
+echo '{"hook_context":{"tool_name":"read_file","tool_args":"{}","working_dir":"/tmp","session_id":"s1","turn_number":1},"result_context":{"tool_name":"read_file","success":true,"duration_ms":12}}' | bash path/to/hook.sh
 ```
 
 JSON CC 兼容 Hook 通过环境变量接收：
