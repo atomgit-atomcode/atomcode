@@ -88,6 +88,20 @@ impl Tool for BashTool {
             Ok(c) => c,
             Err(reason) => return err(reason),
         };
+        // Windows GBK locale (CP936): a Python child the model runs (python -c, scripts)
+        // defaults its `subprocess` text pipes AND stdio to the console code page and
+        // CRASHES with UnicodeDecodeError on any non-GBK byte (binary / UTF-8 output) — see
+        // #876. Force Python UTF-8 mode for everything we spawn so the model's Python never
+        // hits this. `PYTHONUTF8=1` (PEP 540) is the one that actually fixes the reported
+        // crash: it flips `locale.getpreferredencoding()` to utf-8, which is what `subprocess`
+        // text pipes use; `PYTHONIOENCODING` alone only covers Python's OWN stdio, not the
+        // child pipes. Set HERE (not in build_command) so it covers BOTH the cmd.exe and the
+        // Git Bash shells. Mirrors AtomCode's own decode_output UTF-8-first policy.
+        #[cfg(windows)]
+        {
+            cmd.env("PYTHONUTF8", "1");
+            cmd.env("PYTHONIOENCODING", "utf-8");
+        }
         // No console-window flash per command on Windows: in headless/daemon mode (e.g.
         // the WeChat clawbot bridge) there's no console to inherit, so each cmd.exe would
         // otherwise allocate a NEW console window on the desktop. No-op off Windows.
