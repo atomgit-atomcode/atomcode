@@ -1005,6 +1005,9 @@ impl TurnExecutor for KernelTurnExecutor {
                     // NEXT turn. Surface the error and keep draining to the real end.
                     emit(TurnEvent::Error(error));
                 }
+                AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
+                    emit(TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset })
+                }
                 AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
                 AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
                 _ => {}
@@ -1092,6 +1095,9 @@ pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
         },
         AgentEvent::WorkingDirChanged(p) => TurnEvent::WorkingDirChanged(p),
         AgentEvent::Warning(w) => TurnEvent::Warning(w),
+        AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
+            TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset }
+        }
         AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
             TurnEvent::Warning(label)
         }
@@ -1854,6 +1860,26 @@ mod tests {
         ));
         assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Begin)).is_none());
         assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::End)).is_none());
+    }
+
+    // 回归：agent_to_turn 必须转发 AgentEvent::RateLimited 为 TurnEvent::RateLimited，
+    // 字段透传——历史上该臂缺失导致事件被 `_ => return None` 静默丢弃（dead code）。
+    #[test]
+    fn agent_to_turn_rate_limited_is_forwarded_not_dropped() {
+        use atomcode_core::agent::AgentEvent;
+        let result = agent_to_turn(AgentEvent::RateLimited {
+            reset_at_display: "18:09".into(),
+            reset_label: "5h".into(),
+            secs_until_reset: Some(7200),
+        });
+        match result {
+            Some(TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset }) => {
+                assert_eq!(reset_at_display, "18:09");
+                assert_eq!(reset_label, "5h");
+                assert_eq!(secs_until_reset, Some(7200));
+            }
+            other => panic!("expected Some(TurnEvent::RateLimited{{..}}), got {:?}", other),
+        }
     }
 
     // 限流事件必须作为独立的 rate_limited 线事件下发，带 reset_at_display/reset_label/
