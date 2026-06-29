@@ -98,7 +98,9 @@ pub fn register_coding_tools(reg: &mut ToolRegistry) {
 
 /// Like [`register_coding_tools`], but `vision` gates whether `read_file` hands an
 /// image file back to the model as an actual picture (a VISION model SEES it) instead
-/// of the "binary, cannot display" text. Detect it with [`is_vision_model`].
+/// of the "binary, cannot display" text. The caller decides the flag from the model
+/// (the coding layer uses `atomcode_core::provider::model_name_suggests_vision`, the
+/// same detector as the user-paste path) — kept out of this crate so it stays core-free.
 pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(ReadFileTool::new(vision)));
     reg.register(Arc::new(WriteFileTool));
@@ -187,24 +189,6 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "runs",
 ];
 
-/// Does `model` name a VISION-capable (multimodal) model? A name-based heuristic —
-/// the gateway exposes no capability metadata, so we match the well-known multimodal
-/// families by substring. Used to gate whether `read_file` base64-encodes an image
-/// back to the model (a vision model SEES it; a text-only model would reject the
-/// payload / waste tokens, so it keeps the plain "Binary file" text). Conservative:
-/// an unrecognized name is treated as TEXT-ONLY (no image injected). Case-insensitive.
-pub fn is_vision_model(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    // Distinctive markers of multimodal families. `-vl`/`vl-` catches Qwen-VL
-    // (Qwen3-VL, Qwen2.5-VL) without the false positives a bare `vl` substring
-    // would invite; `internvl`/`llava` are spelled out for the same reason.
-    const VISION_MARKERS: &[&str] = &[
-        "-vl", "vl-", "vision", "gpt-4o", "gpt-5", "claude-3", "claude-4", "claude-opus-4",
-        "claude-sonnet-4", "gemini", "llava", "internvl", "pixtral", "phi-3-vision", "phi-4-multimodal",
-    ];
-    VISION_MARKERS.iter().any(|marker| m.contains(marker))
-}
-
 /// Should a directory with this name be skipped during a walk?
 pub(crate) fn is_skip_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name) || name.starts_with(".venv-")
@@ -290,28 +274,6 @@ mod tests {
     async fn run_bounded_returns_value_when_fast() {
         let got = run_bounded(std::time::Duration::from_secs(5), false, || true).await;
         assert!(got, "a fast closure returns its real value");
-    }
-
-    #[test]
-    fn is_vision_model_recognizes_known_multimodal_families() {
-        for m in [
-            "Qwen/Qwen3-VL-8B-Instruct",
-            "qwen2.5-vl-72b",
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4-vision-preview",
-            "claude-3-5-sonnet",
-            "gemini-1.5-pro",
-            "llava-1.6",
-            "internvl2-8b",
-        ] {
-            assert!(is_vision_model(m), "expected vision-capable: {m}");
-        }
-        // Text-only models must NOT be treated as vision (else a base64 image is
-        // sent to a model that rejects it / wastes tokens).
-        for m in ["deepseek-v4", "deepseek-v4-flash", "glm-5.2", "qwen3-coder-480b", "gpt-4-turbo", "claude-2.1", ""] {
-            assert!(!is_vision_model(m), "expected text-only: {m}");
-        }
     }
 
     #[test]
@@ -415,5 +377,36 @@ mod tests {
         assert!(mounted.get("write_file").is_none(), "unmounted tool must not resolve");
         assert!(mounted.get("edit_file").is_none(), "unmounted tool must not resolve");
         assert!(mounted.get("open_file").is_none(), "unmounted tool must not resolve");
+    }
+
+    /// A `/model` swap re-registers `read_file` (see `coding::parts::assemble`) to refresh
+    /// its vision flag. This guards the mechanism that fix relies on: re-registering with a
+    /// new `vision` value OVERWRITES the prior `read_file`, so a model swap from text→vision
+    /// (or vision→text) actually changes how it treats an image — it does not go stale.
+    #[tokio::test]
+    async fn re_registering_read_file_overwrites_its_vision_flag() {
+        use atomcode_kernel::tool::{ToolContext, ProgressSink};
+        let d = tempfile::tempdir().unwrap();
+        // JPEG-ish blob with a NUL so `looks_binary` flags it.
+        std::fs::write(d.path().join("c.jpg"), [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00]).unwrap();
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+        };
+
+        // First mount: text-only model → read of an image stays the binary-text dead-end.
+        let mut reg = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg, false);
+        let r = reg.mount(&["read_file"]).get("read_file").unwrap()
+            .execute(r#"{"file_path":"c.jpg"}"#, &ctx).await;
+        assert!(r.images.is_empty() && r.content.starts_with("Binary file"), "{}", r.content);
+
+        // Re-register on the SAME registry as if the model swapped to a VL model → the read
+        // tool must now hand over the image, proving the swap takes effect (no stale flag).
+        register_coding_tools_with_vision(&mut reg, true);
+        let r = reg.mount(&["read_file"]).get("read_file").unwrap()
+            .execute(r#"{"file_path":"c.jpg"}"#, &ctx).await;
+        assert_eq!(r.images.len(), 1, "after re-register with vision, image must be attached: {}", r.content);
     }
 }

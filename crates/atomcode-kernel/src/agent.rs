@@ -1823,17 +1823,20 @@ impl RunningAgent {
                 } else if batch_start.is_some() {
                     batch_ok += 1;
                 }
-                self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
-                convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
                 // VISION: a tool may return inline images (read_file on a picture). The
                 // tool-result message itself stays TEXT — a provider rejects images in a
                 // tool message — so harvest them here and attach to a single follow-up
                 // user message once ALL of this assistant's tool_results are pushed
                 // (interleaving a user message between tool_results would be an
                 // API-invalid payload). Not size-capped: matches user-pasted images.
+                // Drained BEFORE the event/message below so the emitted ToolResult event
+                // (consumed only for its text/call_id/is_error) never clones the multi-MB
+                // base64 payload, and the stored tool_result message never carries it.
                 if !result.images.is_empty() {
                     turn_images.append(&mut result.images);
                 }
+                self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
+                convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
                 // CC PostToolUse `decision: "block"`: feed the reason back to the
                 // model so it can course-correct. Hard turn-termination (stop before
                 // the next model call) needs a dedicated StopReason and lands with the

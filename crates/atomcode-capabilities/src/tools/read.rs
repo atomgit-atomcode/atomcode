@@ -21,8 +21,9 @@ const SKELETON_THRESHOLD: usize = 300;
 
 /// `vision` = the active model can SEE images. When true, reading an image file
 /// returns the picture itself (base64) for the model instead of the "binary,
-/// cannot display" text dead-end. Detected from the model name at registration
-/// time (see [`super::is_vision_model`]). Default `false` (text-only).
+/// cannot display" text dead-end. The capability is decided at the coding layer
+/// and passed in as a plain flag — this crate stays model-agnostic (and core-free).
+/// Default `false` (text-only).
 #[derive(Default)]
 pub struct ReadFileTool {
     vision: bool,
@@ -42,7 +43,11 @@ const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// MIME type for an image file by extension, or `None` if not a recognized raster image.
 /// Gates which binaries `read_file` hands to a vision model — only true images, never a
-/// PDF / archive / executable (those keep the text recovery hint).
+/// PDF / archive / executable (those keep the text recovery hint). The set matches what
+/// the providers actually accept AND the user-paste path (png/jpg/jpeg/gif/webp); BMP is
+/// deliberately EXCLUDED — neither the OpenAI nor Anthropic vision wire format accepts it,
+/// so handing one over would be a hard gateway rejection, strictly worse than the
+/// binary-text dead-end it would replace.
 fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
@@ -50,7 +55,6 @@ fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
         "png" => "image/png",
         "gif" => "image/gif",
         "webp" => "image/webp",
-        "bmp" => "image/bmp",
         _ => return None,
     })
 }
@@ -189,19 +193,17 @@ impl Tool for ReadFileTool {
             // message, instead of the "cannot display" text dead-end. Gated on
             // `self.vision` (model capability) AND a recognized image type AND a sane
             // size; anything else keeps the existing binary-text + recovery hint.
-            if self.vision {
+            if self.vision && meta.len() <= MAX_IMAGE_BYTES {
                 if let Some(media_type) = image_media_type(&path) {
-                    if meta.len() <= MAX_IMAGE_BYTES {
-                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        return ok_with_images(
-                            format!(
-                                "[Image: {} ({} bytes) — attached below for the vision model]",
-                                a.file_path,
-                                bytes.len()
-                            ),
-                            vec![ImageContent { media_type: media_type.to_string(), data }],
-                        );
-                    }
+                    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    return ok_with_images(
+                        format!(
+                            "[Image: {} ({} bytes) — attached below for the vision model]",
+                            a.file_path,
+                            bytes.len()
+                        ),
+                        vec![ImageContent { media_type: media_type.to_string(), data }],
+                    );
                 }
             }
             return ok(format!(
