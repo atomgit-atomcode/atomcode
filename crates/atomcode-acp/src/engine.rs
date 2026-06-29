@@ -56,6 +56,16 @@ fn default_max_tokens(context_window: u32) -> u32 {
     (context_window / 4).clamp(8_000, 16_384)
 }
 
+/// Returns `true` if `base_url` points at the AtomGit AI gateway.
+///
+/// Used as a fail-fast guard inside `build_provider`: the fallback OpenAI-compat
+/// path cannot produce an authenticated (signed) request for the AtomGit gateway,
+/// so we bail out clearly instead of generating silent 401s.
+fn is_atomgit_gateway(base_url: &str) -> bool {
+    let lower = base_url.to_ascii_lowercase();
+    lower.contains("atomgit.com") || lower.contains("api-ai.gitcode.com")
+}
+
 /// Build a provider adapter for the given config.
 ///
 /// Mirrors `atomcode-bridge::runtime::build_provider` but without the AtomGit
@@ -102,8 +112,13 @@ pub fn build_provider(cfg: &CodingAgentConfig) -> anyhow::Result<Arc<dyn LlmProv
                     .map_err(|e| anyhow::anyhow!(e))?;
             pc.thinking_type = cfg.thinking_type.clone();
             pc.thinking_keep = cfg.thinking_keep.clone();
-            // NOTE: AtomGit gateway detection is intentionally omitted — this crate
-            // has no atomcode-core dependency. ACP sessions use plain api_key auth.
+            if is_atomgit_gateway(&cfg.base_url) {
+                anyhow::bail!(
+                    "ACP engine cannot build an authenticated provider for the AtomGit gateway ({}); \
+                     the CLI must supply a pre-built (signed) provider",
+                    cfg.base_url
+                );
+            }
             Ok(Arc::new(
                 OpenAiCompatProvider::new(pc).map_err(|e| anyhow::anyhow!(e.message))?,
             ))
@@ -115,14 +130,24 @@ pub fn build_provider(cfg: &CodingAgentConfig) -> anyhow::Result<Arc<dyn LlmProv
 ///
 /// Runs the two-phase `prepare → assemble → spawn` pipeline and returns a live
 /// [`AgentHandle`] the session dispatcher (Task 6) can drive.
-pub async fn spawn_session(engine: &EngineConfig, cwd: PathBuf) -> anyhow::Result<AgentHandle> {
+///
+/// `provider` — when `Some`, the pre-built (authenticated) provider is used
+/// directly; when `None`, [`build_provider`] constructs a fallback from the
+/// engine config (valid for non-gateway endpoints only).
+pub async fn spawn_session(
+    engine: &EngineConfig,
+    cwd: PathBuf,
+    provider: Option<Arc<dyn LlmProvider>>,
+) -> anyhow::Result<AgentHandle> {
     let cfg = engine.to_coding_config(cwd);
     // Production-parity defaults: MCP, memory, web, review, fresh session.
-    let opts = PrepareOptions::default();
-    let mut parts = prepare(&cfg, opts)
+    let mut parts = prepare(&cfg, PrepareOptions::default())
         .await
         .map_err(|e| anyhow::anyhow!("acp prepare failed: {e}"))?;
-    let provider = build_provider(&cfg)?;
+    let provider = match provider {
+        Some(p) => p,
+        None => build_provider(&cfg)?,
+    };
     let agent = assemble(&mut parts, &cfg, provider)
         .map_err(|e| anyhow::anyhow!("acp assemble failed: {e}"))?;
     Ok(agent.spawn())
