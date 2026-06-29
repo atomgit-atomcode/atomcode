@@ -98,4 +98,47 @@ mod tests {
         atomic_write(&path, b"deep", 0o644).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"deep");
     }
+
+    #[test]
+    fn atomic_write_overwrite_shorter_content_leaves_no_trailing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing.txt");
+
+        // Write 1000 bytes of 'A'
+        let long = vec![b'A'; 1000];
+        atomic_write(&path, &long, 0o644).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 1000);
+
+        // Overwrite with 10 bytes of 'B' — shorter than old content
+        let short = b"BBBBBBBBBB";
+        atomic_write(&path, short, 0o644).unwrap();
+
+        // File must be exactly 10 bytes, no trailing 'A' bytes
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 10, "file size must match new content exactly");
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(&read, short);
+        // Explicitly no old bytes
+        assert!(!read.iter().any(|&b| b == b'A'), "no trailing old bytes");
+    }
+
+    #[test]
+    fn atomic_write_overwrite_longer_content_leaves_no_stale_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.txt");
+
+        // Write 10 bytes
+        atomic_write(&path, b"0123456789", 0o644).unwrap();
+
+        // Overwrite with 1000 bytes of 'X'
+        let long = vec![b'X'; 1000];
+        atomic_write(&path, &long, 0o644).unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 1000);
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(&read, &long[..]);
+        assert!(!read.windows(10).any(|w| w == b"0123456789"));
+    }
 }

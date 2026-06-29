@@ -4,7 +4,7 @@
 //! third-party provider/tool/hook is held to.
 #![cfg(feature = "session")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use atomcode_capabilities::session::{
     RecallTool, SessionManager, SnapshotHook, StatusReminderHook, TranscriptHook,
@@ -13,12 +13,37 @@ use atomcode_kernel::conformance;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::tool::Tool;
 
+struct AtomcodeHomeGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl AtomcodeHomeGuard {
+    fn set(path: &std::path::Path) -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK.get_or_init(|| Mutex::new(()));
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("ATOMCODE_HOME");
+        std::env::set_var("ATOMCODE_HOME", path);
+        Self { _lock: guard, prev }
+    }
+}
+
+impl Drop for AtomcodeHomeGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn recall_tool_passes_kernel_tool_conformance() {
     // Isolate $ATOMCODE_HOME so the tool resolves an empty (temp) sessions tree rather
     // than the developer's real one.
     let home = tempfile::tempdir().unwrap();
-    std::env::set_var("ATOMCODE_HOME", home.path());
+    let _home = AtomcodeHomeGuard::set(home.path());
 
     let tool: Arc<dyn Tool> = Arc::new(RecallTool::new());
     conformance::tool::check(tool, &[r#"{"query":"oauth refresh"}"#, "{\"query\":\"\"}"])
