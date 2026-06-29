@@ -6152,6 +6152,21 @@ mod streaming_slash_tests {
     }
 
     #[test]
+    fn loop_halt_subcommands_run_mid_stream() {
+        // A running /loop (fixed-interval payload turn OR self-paced continuation)
+        // keeps the TUI in Streaming, where commands are otherwise blocked. So
+        // `/loop stop` (and aliases) MUST be whitelisted or the loop can't be
+        // stopped by command (only Esc), which is the reported bug.
+        for sub in ["stop", "off", "clear", "cancel", "reset", "none"] {
+            let got = exec(&format!("/loop {sub}"));
+            assert_eq!(got, Some(("loop".to_string(), sub.to_string())), "sub={sub}");
+        }
+        // bare /loop (status) and setting a new loop must NOT run mid-stream.
+        assert_eq!(exec("/loop"), None);
+        assert_eq!(exec("/loop 5m /diff"), None);
+    }
+
+    #[test]
     fn bg_no_arg_runs_but_setting_a_goal_does_not() {
         assert_eq!(exec("/bg"), Some(("bg".to_string(), String::new())));
         // Backgrounding a NEW message and SETTING a new goal must NOT run mid-stream.
@@ -6310,6 +6325,19 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
             "clear" | "stop" | "off" | "reset" | "none" | "cancel"
         ) {
             return Some(("goal".to_string(), arg.trim().to_string()));
+        }
+    }
+    // `/loop` halt sub-commands must also run mid-stream: a fixed-interval payload
+    // turn or a self-paced continuation keeps the TUI in Streaming, where commands are
+    // otherwise blocked — so a typed `/loop stop` had no effect (only Esc worked).
+    // A bare `/loop` (status) or `/loop <new spec>` is intentionally NOT whitelisted.
+    if cmd.eq_ignore_ascii_case("loop") {
+        let head = arg.trim().split_whitespace().next().unwrap_or("");
+        if matches!(
+            head.to_ascii_lowercase().as_str(),
+            "stop" | "off" | "clear" | "cancel" | "reset" | "none"
+        ) {
+            return Some(("loop".to_string(), arg.trim().to_string()));
         }
     }
     None

@@ -2974,6 +2974,16 @@ impl AgentLoop {
                                     // user message.
                                     cancel_token.cancel();
                                 }
+                                AgentCommand::ClearLoop => {
+                                    // `/loop stop` arriving mid-turn (the TUI whitelists
+                                    // it during Streaming). Treat it like Cancel: cancel
+                                    // the in-flight turn so the self-paced loop wrapper
+                                    // sees Cancelled and finalizes the loop. Without this
+                                    // the inner select swallows ClearLoop (`_ => {}`) and
+                                    // the loop keeps continuing — the reported bug.
+                                    crate::ctrace!("AGT", "inner ClearLoop -> cancel_token.cancel()");
+                                    cancel_token.cancel();
+                                }
                                 AgentCommand::ApproveTool => {
                                     *phase = AgentPhase::Thinking;
                                     let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
@@ -5056,6 +5066,57 @@ mod self_paced_loop_tests {
         assert!(
             loop_.pending_wakeup.is_none(),
             "finalize_loop_cancelled clears any pending wakeup"
+        );
+    }
+
+    /// `/loop stop` (ClearLoop) while the wrapper is asleep must halt the loop.
+    /// This is the COMMON case behind the reported "can't stop a running loop"
+    /// bug: a self-paced loop spends most of its time in the (≥60s) sleep, so a
+    /// user's `/loop stop` most often lands here. Mirrors cancel_during_sleep but
+    /// sends the exact command `/loop stop` emits (ClearLoop, not Cancel).
+    #[tokio::test(start_paused = true)]
+    async fn self_paced_loop_clear_during_sleep() {
+        let wd = std::path::PathBuf::from(format!(
+            "/tmp/atomcode_loop_clearsleep_{}",
+            std::process::id()
+        ));
+        let (mut loop_, mut handle) = build_loop(
+            vec![
+                // Turn 1: schedule a long wakeup, then the wrapper sleeps.
+                schedule_wakeup_events("c1", 3600, "long poll", "keep watching CI"),
+                // Turn 2 must never run.
+                text_only_events("should not run"),
+            ],
+            wd,
+        )
+        .await;
+
+        let cmd_tx = handle.client.cmd_tx.clone();
+        let watcher = async {
+            while let Some(ev) = handle.event_rx.recv().await {
+                if let AgentEvent::LoopUpdate { round, active, .. } = ev {
+                    if active && round == 1 {
+                        let _ = cmd_tx.send(AgentCommand::ClearLoop);
+                        break;
+                    }
+                }
+            }
+        };
+
+        let agent = loop_.handle_send_message("watch CI".into(), vec![], vec![]);
+        tokio::join!(agent, watcher);
+
+        assert!(
+            !loop_.loop_state.active,
+            "/loop stop during sleep must finalize the loop"
+        );
+        assert_eq!(
+            loop_.loop_state.round, 1,
+            "round 2 must not run after /loop stop during sleep"
+        );
+        assert!(
+            loop_.pending_wakeup.is_none(),
+            "ClearLoop clears any pending wakeup"
         );
     }
 }
