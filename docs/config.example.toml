@@ -67,7 +67,7 @@ mode = "no_proxy"
 #
 # The script receives context via env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME,
 # ATOMCODE_HOOK_CONTEXT (JSON string). PreToolUse stdout supports:
-#   {"action":"allow"} or {"action":"block","reason":"..."} or {"action":"modify","tool_input":{...}}
+#   {"action":"allow"} or {"action":"block","reason":"..."} or {"action":"modify","args":{...}}
 #
 # Example ~/.atomcode/hooks.json:
 # {
