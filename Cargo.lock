@@ -259,6 +259,7 @@ dependencies = [
  "encoding_rs",
  "futures",
  "globset",
+ "httpdate",
  "ignore",
  "regex",
  "reqwest",
