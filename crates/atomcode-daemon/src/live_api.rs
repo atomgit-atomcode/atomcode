@@ -273,6 +273,7 @@ impl KernelTurnExecutor {
         Some(atomcode_shell::ShellConfig::from_provider(
             Some(p),
             &config.lsp,
+            &config.web_search,
             &self.working_dir,
             Some(self.telemetry.clone()),
             false,
@@ -696,6 +697,7 @@ pub(crate) fn chat_shell_config(
     atomcode_shell::ShellConfig::from_provider(
         config.providers.get(provider_name),
         &config.lsp,
+        &config.web_search,
         working_dir,
         Some(telemetry),
         false,

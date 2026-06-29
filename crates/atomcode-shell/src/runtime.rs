@@ -61,6 +61,11 @@ pub struct ShellConfig {
     /// adapter falls back to [`default_max_tokens`] of the context window. Threaded into the
     /// per-call `ChatOptions` (which wins over the fallback).
     pub max_tokens: Option<u32>,
+    /// `web_search` backend from `[web_search] provider` — `Some` only when the user picked a
+    /// NON-default backend (so the `ATOMCODE_WEB_SEARCH_PROVIDER` env fallback still applies
+    /// for the default). `[web_search] api_key` for the Exa backend (env `EXA_API_KEY` wins).
+    pub web_search_provider: Option<String>,
+    pub web_search_api_key: Option<String>,
 }
 
 /// Map core's `[lsp]` config DTO to the neutral [`LspSettings`] the coding/capabilities
@@ -98,6 +103,7 @@ impl ShellConfig {
     pub fn from_provider(
         p: Option<&atomcode_core::config::provider::ProviderConfig>,
         lsp: &atomcode_core::config::LspConfig,
+        web_search: &atomcode_core::config::WebSearchConfig,
         working_dir: &std::path::Path,
         telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
         dangerously_skip_permissions: bool,
@@ -123,6 +129,10 @@ impl ShellConfig {
             interactive,
             lsp: lsp_settings_from(lsp),
             max_tokens: p.and_then(|p| p.max_tokens).map(|m| m as u32),
+            // Only a NON-default provider is authoritative; the default ("exa") is left None
+            // so the ATOMCODE_WEB_SEARCH_PROVIDER env fallback is not shadowed.
+            web_search_provider: (web_search.provider != "exa").then(|| web_search.provider.clone()),
+            web_search_api_key: web_search.api_key.clone(),
         }
     }
 }
@@ -150,6 +160,9 @@ pub fn coding_config(cfg: &ShellConfig) -> CodingAgentConfig {
     // does `options.max_tokens.or(cfg.max_tokens)`, so this wins over the build_provider
     // fallback; `None` here ⇒ the fallback applies.
     coding_cfg.chat_options.max_tokens = cfg.max_tokens;
+    // `[web_search]` provider/key (the tool reads these; env still fills the gaps).
+    coding_cfg.web_search_provider = cfg.web_search_provider.clone();
+    coding_cfg.web_search_api_key = cfg.web_search_api_key.clone();
     // Interactive drivers PARK approvals (a present human must not be auto-denied for
     // thinking too long); headless keeps the configured fail-closed timeout.
     if cfg.interactive {
@@ -273,6 +286,8 @@ mod tests {
             interactive: true,
             lsp: Default::default(),
             max_tokens: None,
+            web_search_provider: None,
+            web_search_api_key: None,
         };
         let cc = coding_config(&shell_cfg);
         assert_eq!(cc.provider_type, "claude");
@@ -299,7 +314,7 @@ mod tests {
                 root_markers: vec![],
             },
         );
-        let shell = ShellConfig::from_provider(None, &lsp, std::path::Path::new("/tmp"), None, false, true);
+        let shell = ShellConfig::from_provider(None, &lsp, &ws_default(), std::path::Path::new("/tmp"), None, false, true);
         let cc = coding_config(&shell);
         assert!(cc.lsp.enabled);
         assert!(cc.lsp.auto_detect);
@@ -311,8 +326,39 @@ mod tests {
     #[test]
     fn lsp_defaults_to_disabled() {
         let lsp = atomcode_core::config::LspConfig::default();
-        let shell = ShellConfig::from_provider(None, &lsp, std::path::Path::new("/tmp"), None, false, false);
+        let shell =
+            ShellConfig::from_provider(None, &lsp, &ws_default(), std::path::Path::new("/tmp"), None, false, false);
         assert!(!coding_config(&shell).lsp.enabled, "default config ⇒ LSP off");
+    }
+
+    fn ws_default() -> atomcode_core::config::WebSearchConfig {
+        atomcode_core::config::WebSearchConfig { provider: "exa".into(), api_key: None }
+    }
+
+    #[test]
+    fn web_search_non_default_provider_and_key_flow_to_coding() {
+        // A non-default `[web_search] provider` (+ api_key) must reach the coding config so
+        // the tool honors it (it was previously inert — only env vars worked).
+        let lsp = atomcode_core::config::LspConfig::default();
+        let ws = atomcode_core::config::WebSearchConfig {
+            provider: "duckduckgo".into(),
+            api_key: Some("exa-key".into()),
+        };
+        let shell =
+            ShellConfig::from_provider(None, &lsp, &ws, std::path::Path::new("/w"), None, false, false);
+        let cc = coding_config(&shell);
+        assert_eq!(cc.web_search_provider.as_deref(), Some("duckduckgo"));
+        assert_eq!(cc.web_search_api_key.as_deref(), Some("exa-key"));
+    }
+
+    #[test]
+    fn web_search_default_provider_left_none_to_preserve_env() {
+        // Default provider ("exa") ⇒ leave `web_search_provider` None so the
+        // ATOMCODE_WEB_SEARCH_PROVIDER env fallback still applies (no shadowing).
+        let lsp = atomcode_core::config::LspConfig::default();
+        let shell =
+            ShellConfig::from_provider(None, &lsp, &ws_default(), std::path::Path::new("/w"), None, false, false);
+        assert_eq!(coding_config(&shell).web_search_provider, None);
     }
 
     fn coding_cfg(reasoning_history: Option<&str>) -> CodingAgentConfig {
@@ -353,7 +399,7 @@ mod tests {
         pc.max_tokens = Some(12_000);
         let lsp = atomcode_core::config::LspConfig::default();
         let shell =
-            ShellConfig::from_provider(Some(&pc), &lsp, std::path::Path::new("/w"), None, false, false);
+            ShellConfig::from_provider(Some(&pc), &lsp, &ws_default(), std::path::Path::new("/w"), None, false, false);
         assert_eq!(shell.max_tokens, Some(12_000), "from_provider must carry provider.max_tokens");
         let cc = coding_config(&shell);
         assert_eq!(
@@ -369,7 +415,7 @@ mod tests {
         let pc = sample_provider(); // max_tokens: None
         let lsp = atomcode_core::config::LspConfig::default();
         let shell =
-            ShellConfig::from_provider(Some(&pc), &lsp, std::path::Path::new("/w"), None, false, false);
+            ShellConfig::from_provider(Some(&pc), &lsp, &ws_default(), std::path::Path::new("/w"), None, false, false);
         assert_eq!(shell.max_tokens, None);
         assert_eq!(coding_config(&shell).chat_options.max_tokens, None);
     }
@@ -400,7 +446,7 @@ mod tests {
         let pc = sample_provider();
         let lsp = atomcode_core::config::LspConfig::default();
         let shell_cfg =
-            ShellConfig::from_provider(Some(&pc), &lsp, std::path::Path::new("/work"), None, true, false);
+            ShellConfig::from_provider(Some(&pc), &lsp, &ws_default(), std::path::Path::new("/work"), None, true, false);
         assert_eq!(shell_cfg.api_key, "sk-1");
         assert_eq!(shell_cfg.base_url, "https://api.example.com/v1");
         assert_eq!(shell_cfg.model, "m-1");
@@ -420,7 +466,7 @@ mod tests {
     #[test]
     fn from_provider_none_uses_neutral_defaults() {
         let lsp = atomcode_core::config::LspConfig::default();
-        let shell_cfg = ShellConfig::from_provider(None, &lsp, std::path::Path::new("/w"), None, false, true);
+        let shell_cfg = ShellConfig::from_provider(None, &lsp, &ws_default(), std::path::Path::new("/w"), None, false, true);
         assert_eq!(shell_cfg.api_key, "");
         assert_eq!(shell_cfg.base_url, "");
         assert_eq!(shell_cfg.model, "");

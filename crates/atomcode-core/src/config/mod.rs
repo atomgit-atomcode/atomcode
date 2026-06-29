@@ -47,38 +47,6 @@ pub fn platform_rules() -> &'static str {
     }
 }
 
-/// Sub-agent execution policy (enable + resilience knobs).
-/// Drives `agent::parallel_edit::SubAgentTask::execute` and the
-/// `try_sub_agent_dispatch` config gate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SubAgentConfig {
-    /// Master switch. `false` makes `try_sub_agent_dispatch` return None
-    /// immediately and the parent agent falls back to serial execution.
-    pub enabled: bool,
-    /// Initial per-task turn budget. Adaptive logic may extend up to
-    /// `max_turns`. See `ResilienceConfig::initial_turns`.
-    pub initial_turns: usize,
-    /// Hard cap on per-task turns regardless of progress signals.
-    pub max_turns: usize,
-    /// Max parallel sub-agents per pool batch.
-    pub max_concurrent: usize,
-    /// Wall-time timeout for a single sub-agent (seconds).
-    pub timeout_secs: u64,
-}
-
-impl Default for SubAgentConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            initial_turns: 4,
-            max_turns: 12,
-            max_concurrent: 3,
-            timeout_secs: 300,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub default_provider: String,
@@ -118,14 +86,6 @@ pub struct Config {
     /// LSP integration configuration.
     #[serde(default)]
     pub lsp: LspConfig,
-    /// Automatically commit edited files after each agent turn completes.
-    /// Only applies when working inside a git repository.
-    #[serde(default)]
-    pub auto_commit: bool,
-    /// Sub-agent execution policy. Missing from older configs → defaults to
-    /// enabled=true, initial_turns=4, max_turns=12, max_concurrent=3, timeout_secs=300.
-    #[serde(default)]
-    pub subagent: SubAgentConfig,
     /// Provider key (matches a key in `Config.providers`) of a vision-language
     /// model used to preprocess images before forwarding to a non-vision main
     /// provider. When `None` or empty, image preprocessing is disabled — pasted
@@ -286,8 +246,6 @@ impl Default for Config {
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
             ui: UiConfig::default(),
@@ -868,8 +826,6 @@ mod tests {
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),
@@ -1084,8 +1040,6 @@ mod tests {
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: Some(crate::locale::Locale::ZhCn),
             ui: Default::default(),
@@ -1189,8 +1143,6 @@ mod tests {
             notifications: Default::default(),
             telemetry: Default::default(),
             lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
             vision_preprocessor_provider: preprocessor_key.map(|s| s.to_string()),
             language: None,
             ui: Default::default(),

@@ -189,17 +189,21 @@ pub async fn prepare_with_plugin_hooks(
 
     if opts.web {
         registry.register(Arc::new(WebFetchTool));
-        // web_search backend: explicit config wins; else the `ATOMCODE_WEB_SEARCH_PROVIDER`
-        // env knob (the zero-core path for legacy drivers, whose config types we can't
-        // extend); else Exa. `with_provider` maps unknown values to Exa, the safe default.
+        // web_search backend: explicit `[web_search] provider` wins; else the
+        // `ATOMCODE_WEB_SEARCH_PROVIDER` env knob; else Exa (the safe default).
         let provider = cfg
             .web_search_provider
             .clone()
             .or_else(|| std::env::var("ATOMCODE_WEB_SEARCH_PROVIDER").ok())
             .filter(|p| !p.trim().is_empty());
-        let web_search = match provider {
-            Some(p) => WebSearchTool::with_provider(&p),
-            None => WebSearchTool::new(),
+        // Exa key: `EXA_API_KEY` env takes precedence over `[web_search] api_key`; else keyless.
+        let exa_key = std::env::var("EXA_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| cfg.web_search_api_key.clone());
+        let web_search = match provider.as_deref().map(str::to_lowercase).as_deref() {
+            Some("duckduckgo") | Some("ddg") => WebSearchTool::duckduckgo(),
+            _ => WebSearchTool::exa(exa_key), // exa / unknown / unset → Exa, honoring the key
         };
         registry.register(Arc::new(web_search));
         names.push("web_fetch".into());
