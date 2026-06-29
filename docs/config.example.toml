@@ -74,7 +74,7 @@ mode = "no_proxy"
 #   "hooks": {
 #     "verify-gate": {
 #       "event": "post_tool_use",
-#       "command": "python ~/.atomcode/scripts/verify-gate.py",  # ~ won't expand; use absolute path like C:\\Users\\you\\.atomcode\\scripts\\verify-gate.py
+#       "command": "python ~/.atomcode/scripts/verify-gate.py",  # ~ 不会自动展开，需用绝对路径（如 C:\Users\you\.atomcode\scripts\verify-gate.py 或 /home/you/.atomcode/scripts/verify-gate.py）
 #       "timeout_ms": 30000  # default is 10000 (10s); set 30s here because verify may be slow
 #     }
 #   }
