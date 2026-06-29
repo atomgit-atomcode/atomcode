@@ -15,6 +15,7 @@ use atomcode_core::agent::{
 };
 use atomcode_core::agent::goal::{GoalResult, GoalState};
 use atomcode_core::agent::goal_evaluator::{EvalOutcome, GoalEvaluator};
+use atomcode_core::agent::loop_state::{LoopState, WakeupRequest};
 use atomcode_core::conversation::ConversationSnapshot;
 use tokio_util::sync::CancellationToken;
 use atomcode_kernel::event::{
@@ -218,6 +219,34 @@ struct Bridge {
     /// The spawned eval task reports its outcome here; drained by the main loop
     /// as a third event source so commands (Cancel) stay responsive during eval.
     goal_eval_tx: mpsc::UnboundedSender<EvalOutcome>,
+    /// Active self-paced `/loop` state (round/elapsed/label), or None. Reuses v1's
+    /// [`LoopState`]; mutually exclusive with `goal` (a session runs one or the other).
+    /// The loop is driven from the turn-end Snapshot hook — like goal, but continuation
+    /// is delay-driven (the model's `schedule_wakeup`) instead of an evaluator verdict.
+    loop_state: Option<LoopState>,
+    /// Cancels an in-flight `/loop` (fresh per `SetLoop`). Triggered by
+    /// ClearLoop/Cancel/Shutdown so a pending delayed continuation NEVER fires after
+    /// the loop is stopped (the spawned sleep `select!`s on this token).
+    loop_cancel: CancellationToken,
+    /// The wakeup the model requested THIS turn via `schedule_wakeup` (delivered over
+    /// `wakeup_rx`). Taken by the turn-end Snapshot hook to schedule the next
+    /// continuation; `None` at turn end ⇒ the model didn't reschedule ⇒ the loop ends.
+    pending_wakeup: Option<WakeupRequest>,
+    /// The bridge end of the channel the kernel-side [`ScheduleWakeupTool`] sends on.
+    /// Drained by the select loop (a wakeup arriving mid-turn is recorded into
+    /// `pending_wakeup`). The matching sender is mounted into the kernel via the tool.
+    wakeup_rx: mpsc::UnboundedReceiver<WakeupRequest>,
+    /// Sender handed to the `schedule_wakeup` tool at every (re)mount, so a respawn's
+    /// freshly-built tool still reaches THIS bridge. Kept on the struct to clone on
+    /// respawn.
+    wakeup_tx: mpsc::UnboundedSender<WakeupRequest>,
+    /// A delayed continuation reached its fire time: the spawned cancel-aware sleep
+    /// (started in the Snapshot hook) sends the wakeup here. The select loop then
+    /// bumps the round and injects the model's prompt as the next turn. Going through
+    /// the loop (instead of `await`ing the sleep inline) keeps commands responsive
+    /// during the wait — the same discipline as `goal_eval_tx`.
+    loop_fire_tx: mpsc::UnboundedSender<WakeupRequest>,
+    loop_fire_rx: mpsc::UnboundedReceiver<WakeupRequest>,
 }
 
 impl Bridge {
@@ -291,6 +320,16 @@ impl Bridge {
         };
         let bridge_session =
             parts.session.as_ref().map(|b| b.id.clone()).unwrap_or_default();
+        // /loop wiring (mirrors the goal channels): `wakeup_*` carries a model
+        // `schedule_wakeup` from the kernel-side tool back to the bridge; `loop_fire_*`
+        // carries a delayed continuation from its spawned sleep back to the select loop.
+        // Created here so the kernel `schedule_wakeup` tool can be mounted onto `parts`
+        // BEFORE `assemble` snapshots the toolset (an unmounted tool is invisible).
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel::<WakeupRequest>();
+        let (loop_fire_tx, loop_fire_rx) = mpsc::unbounded_channel::<WakeupRequest>();
+        parts.register_extra_tool(Arc::new(crate::schedule_wakeup::ScheduleWakeupTool::new(
+            wakeup_tx.clone(),
+        )));
         let provider = match build_provider(&coding_cfg) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -347,6 +386,13 @@ impl Bridge {
             goal_cancel: CancellationToken::new(),
             pending_goal: None,
             goal_eval_tx,
+            loop_state: None,
+            loop_cancel: CancellationToken::new(),
+            pending_wakeup: None,
+            wakeup_rx,
+            wakeup_tx,
+            loop_fire_tx,
+            loop_fire_rx,
         };
 
         loop {
@@ -363,6 +409,18 @@ impl Bridge {
                 // Cancel arriving mid-eval is still processed (cmd_rx stays live).
                 Some(outcome) = goal_eval_rx.recv() => {
                     bridge.on_goal_eval_result(outcome).await;
+                }
+                // The kernel-side schedule_wakeup tool just fired (mid-turn): record
+                // the request. The turn-end Snapshot hook reads `pending_wakeup` to
+                // decide whether to schedule a continuation or end the loop.
+                Some(wake) = bridge.wakeup_rx.recv() => {
+                    bridge.pending_wakeup = Some(wake);
+                }
+                // A delayed continuation reached its fire time (its spawned cancel-aware
+                // sleep sent it here). Inject the model's prompt as the next turn —
+                // off the select branch so it never blocks the loop.
+                Some(wake) = bridge.loop_fire_rx.recv() => {
+                    bridge.on_loop_fire(wake);
                 }
                 ev = bridge.handle.events.recv() => match ev {
                     Some(e) => bridge.on_kernel_event(e).await,
@@ -502,6 +560,30 @@ impl Bridge {
                 }
             }
         }
+    }
+
+    /// A /loop delayed continuation reached its fire time. Bump the round, emit a
+    /// LoopUpdate, and inject the model's chosen prompt as a fresh turn — the v2
+    /// analogue of goal's NotMet continuation, but the model (not an evaluator)
+    /// supplied the prompt and chose the delay. A `None`/inactive `loop_state` means
+    /// the loop was cleared/cancelled after the sleep was spawned but before this
+    /// landed (the cancel token normally pre-empts the sleep; this guards the race).
+    fn on_loop_fire(&mut self, wake: WakeupRequest) {
+        match self.loop_state.as_mut() {
+            Some(l) if l.active => {
+                l.round += 1;
+                l.consecutive_failures = 0;
+                l.last_reason = Some(wake.reason);
+            }
+            _ => return, // loop gone — drop the stale continuation
+        }
+        let ev = loop_update_ev(self.loop_state.as_ref().unwrap());
+        self.emit(ev);
+        self.start_turn_stats();
+        let _ = self
+            .handle
+            .commands
+            .send(KCmd::SendMessage { text: wake.prompt, images: vec![] });
     }
 
     // ---------------- legacy commands → kernel ----------------
@@ -654,6 +736,18 @@ impl Bridge {
                     let ev = goal_update_ev(&g);
                     self.emit(ev);
                 }
+                // Esc/Ctrl+C ALSO stops an active /loop (goal/loop are mutually
+                // exclusive, so at most one of these fires). Cancelling `loop_cancel`
+                // makes any in-flight delayed continuation NOT fire; clearing
+                // `pending_wakeup` drops a model schedule from the cancelled turn.
+                self.loop_cancel.cancel();
+                if let Some(mut l) = self.loop_state.take() {
+                    l.clear();
+                    l.last_reason = Some("cancelled".into());
+                    let ev = loop_update_ev(&l);
+                    self.emit(ev);
+                }
+                self.pending_wakeup = None;
                 // Release + clear any parked approval BEFORE forwarding Cancel: the
                 // kernel then backfills the cancelled tool's result, and clearing our
                 // mirror means a later /model swap (which re-reads the snapshot) can't
@@ -808,6 +902,13 @@ impl Bridge {
                                     self.pending_sync = false;
                                     self.pending_undo = None;
                                     self.pending_goal = None;
+                                    // A /model swap starts the new provider on the same
+                                    // conversation but a held-open loop turn is gone; drop
+                                    // the loop and cancel any pending continuation so it
+                                    // can't fire into the swapped session.
+                                    self.loop_cancel.cancel();
+                                    self.loop_state = None;
+                                    self.pending_wakeup = None;
                                 }
                                 Err(e) => {
                                     self.emit(CoreEv::Error {
@@ -977,16 +1078,43 @@ impl Bridge {
                     self.finish_turn(StopReason::Cancelled, messages);
                 }
             }
-            CoreCmd::SetLoop { prompt: _ } => {
-                // Loop mode is handled in the v1 (atomcode-core) agent path.
-                // The v2 bridge does not implement loop continuation yet.
+            CoreCmd::SetLoop { prompt } => {
+                // Self-paced /loop on v2 (parity with the v2 /goal path, but delay-driven
+                // instead of evaluator-judged): reuse v1's LoopState. `/loop <prompt>`
+                // also sends the prompt as a normal message, so the FIRST turn starts on
+                // its own; this just arms the loop, which is driven from the turn-end
+                // Snapshot hook + the model's `schedule_wakeup` calls. No provider /
+                // evaluator to build (the model paces itself).
+                //
+                // Fresh cancel token per loop so a prior loop's cancel can't kill this
+                // one's pending continuation. A stale wakeup from a previous loop is
+                // discarded so it can't be mistaken for THIS loop's schedule.
+                self.loop_cancel = CancellationToken::new();
+                self.pending_wakeup = None;
+                let state = LoopState::new(prompt);
+                let ev = loop_update_ev(&state);
+                self.emit(ev);
+                self.loop_state = Some(state);
             }
             CoreCmd::ClearLoop => {
-                // Loop mode is handled in the v1 (atomcode-core) agent path.
-                // The v2 bridge does not implement loop continuation yet.
+                // Cancel any pending delayed continuation IMMEDIATELY (the spawned sleep
+                // select!s on this token → it won't fire) and disarm the loop.
+                self.loop_cancel.cancel();
+                if let Some(mut l) = self.loop_state.take() {
+                    l.clear();
+                    l.last_reason = Some("cleared by user".into());
+                    let ev = loop_update_ev(&l);
+                    self.emit(ev);
+                }
+                self.pending_wakeup = None;
+                // Stop the turn running RIGHT NOW, not just the loop — `/loop clear`
+                // while a round is mid-tool (e.g. a long bash) must interrupt it, exactly
+                // like the goal ClearGoal / Cancel arms (which forward KCmd::Cancel).
+                let _ = self.handle.commands.send(KCmd::Cancel);
             }
             CoreCmd::Shutdown => {
                 self.goal_cancel.cancel();
+                self.loop_cancel.cancel();
                 return true;
             }
         }
@@ -1111,6 +1239,14 @@ impl Bridge {
         parts.approval = self.parts.approval.clone();
         // Plan mode survives a respawn (/resume, /clear, model swap).
         parts.plan_mode = self.parts.plan_mode.clone();
+        // Re-mount the kernel-side schedule_wakeup tool on the FRESH parts (a respawn
+        // rebuilds `parts` from scratch, so the tool registered in `run` is gone). Hand
+        // it the bridge's stored sender so the new agent's wakeups still reach THIS
+        // bridge. Must precede assemble (it snapshots the toolset). `/loop` therefore
+        // survives /cd, /resume, /clear, /model and /mcp reload.
+        parts.register_extra_tool(Arc::new(crate::schedule_wakeup::ScheduleWakeupTool::new(
+            self.wakeup_tx.clone(),
+        )));
 
         match build_provider(&self.coding_cfg)
             .and_then(|p| assemble(&mut parts, &self.coding_cfg, p).map_err(Into::into))
@@ -1126,6 +1262,13 @@ impl Bridge {
                 self.turn_running = false;
                 self.pending_approval = None;
                 self.degraded = false;
+                // A respawn (/cd, /clear, /resume, /undo, /mcp reload) resets or replaces
+                // the conversation, so a held-open loop turn no longer applies. Cancel any
+                // pending continuation and drop the loop so a stale wakeup can't fire into
+                // the new conversation.
+                self.loop_cancel.cancel();
+                self.loop_state = None;
+                self.pending_wakeup = None;
             }
             Err(e) => {
                 self.emit(CoreEv::Error {
@@ -1219,6 +1362,12 @@ impl Bridge {
         // may still be marked running.
         self.turn_running = false;
         self.pending_finish = None;
+        // A schedule_wakeup is strictly turn-scoped: the loop-continuation branch (in the
+        // Snapshot hook) `take()`s it and `return`s WITHOUT reaching here, so any wakeup
+        // still set when we finish belongs to a turn that is NOT continuing the loop (a
+        // non-natural terminal — MaxRounds/error — or the loop already ended). Drop it so
+        // it can't bleed into a later turn.
+        self.pending_wakeup = None;
         let duration = self.stats.started.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
         match reason {
             StopReason::Cancelled => {
@@ -1440,6 +1589,50 @@ impl Bridge {
                         self.spawn_goal_eval(reason, messages);
                         return;
                     }
+                    // Loop hook (goal/loop are mutually exclusive — only one of these
+                    // fires). A natural stop with an active /loop continues IF the model
+                    // scheduled the next wakeup this turn, ELSE the loop ends (CC parity:
+                    // omitting schedule_wakeup means "done").
+                    if matches!(reason, StopReason::Stopped)
+                        && self.loop_state.as_ref().map_or(false, |l| l.active)
+                    {
+                        match self.pending_wakeup.take() {
+                            Some(wake) => {
+                                // Model asked to resume → spawn a cancel-aware delay that
+                                // fires the continuation via `loop_fire_tx`. Spawned (NOT
+                                // awaited inline) so the select loop stays responsive to
+                                // commands during the wait — the same discipline as
+                                // `spawn_goal_eval`. ClearLoop/Cancel cancel `loop_cancel`,
+                                // which pre-empts the sleep so the continuation never fires.
+                                let delay = Duration::from_secs(wake.delay_seconds as u64);
+                                let cancel = self.loop_cancel.clone();
+                                let fire_tx = self.loop_fire_tx.clone();
+                                tokio::spawn(async move {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(delay) => {
+                                            let _ = fire_tx.send(wake);
+                                        }
+                                        _ = cancel.cancelled() => {} // loop stopped → no fire
+                                    }
+                                });
+                                // Hold the turn open (like goal) — do NOT finish_turn: the
+                                // driver stays "busy" until the continuation turn ends or
+                                // the loop is cleared.
+                                return;
+                            }
+                            None => {
+                                // No schedule → the loop is complete. Deactivate + emit,
+                                // then fall through to finish_turn so the driver returns
+                                // to Idle with the conversation snapshot.
+                                if let Some(mut l) = self.loop_state.take() {
+                                    l.active = false;
+                                    l.last_reason = Some("completed".into());
+                                    let ev = loop_update_ev(&l);
+                                    self.emit(ev);
+                                }
+                            }
+                        }
+                    }
                     self.finish_turn(reason, messages);
                 } else if let Some(nth) = self.pending_undo.take() {
                     self.do_undo(snapshot.messages, nth).await;
@@ -1554,6 +1747,19 @@ fn goal_update_ev(g: &GoalState) -> CoreEv {
         elapsed_secs: g.elapsed_secs(),
         condition: g.condition.clone(),
         last_reason: g.last_eval_reason.clone(),
+    }
+}
+
+/// Build the legacy `LoopUpdate` event from /loop state (free fn so callers don't
+/// borrow `self.loop_state` and `self` simultaneously). The parallel of
+/// [`goal_update_ev`] for the self-paced loop; the TUI mirrors round/elapsed/label.
+fn loop_update_ev(l: &LoopState) -> CoreEv {
+    CoreEv::LoopUpdate {
+        active: l.active,
+        round: l.round,
+        elapsed_secs: l.elapsed_secs(),
+        label: l.label.clone(),
+        last_reason: l.last_reason.clone(),
     }
 }
 

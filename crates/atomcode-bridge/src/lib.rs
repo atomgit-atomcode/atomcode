@@ -21,6 +21,7 @@
 
 pub mod convert;
 mod runtime;
+mod schedule_wakeup;
 mod sign;
 
 pub use runtime::{spawn_bridged_runtime, BridgeConfig};
