@@ -31,6 +31,7 @@
 
 pub mod dispatch;
 pub mod engine;
+pub mod permission;
 pub mod translate;
 
 use std::sync::atomic::AtomicU64;
