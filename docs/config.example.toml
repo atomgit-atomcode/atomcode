@@ -57,15 +57,16 @@ mode = "no_proxy"
 #   JSON: ~/.atomcode/hooks.json (CC-compatible, lightweight)
 # See docs/hooks.md for full reference.
 #
-# Available events:
+# Available events (JSON CC format; TOML ScriptHook uses different trigger names — see docs/hooks.md):
 #   pre_tool_use    — before each tool call (can block via stdout {"action":"block","reason":"..."})
 #   post_tool_use   — after each tool call
 #   user_prompt_submit — when the user submits a prompt (can block via stdout {"decision":"block","reason":"..."} or inject context via {"hookSpecificOutput":{"additionalContext":"..."}})
 #   session_start   — when a new session begins
 #   session_end     — when a session ends
 #
-# The script receives context via env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME,
-# ATOMCODE_HOOK_CONTEXT (JSON string). PreToolUse stdout supports:
+# JSON CC scripts receive context via env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME,
+# ATOMCODE_HOOK_CONTEXT (JSON string). TOML ScriptHook uses stdin instead — see docs/hooks.md.
+# PreToolUse stdout supports:
 #   {"action":"allow"} or {"action":"block","reason":"..."} or {"action":"modify","args":{...}}
 #
 # Example ~/.atomcode/hooks.json:
